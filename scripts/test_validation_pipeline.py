@@ -454,6 +454,91 @@ def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_odbc_runner_applies_marker_and_file_filter(tmp_path):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_plain.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    (tests / "test_stress.py").write_text(
+        "@pytest.mark.stress\ndef test_y(): pass\n", encoding="utf-8"
+    )
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    (tmp_path / "runner.sh").write_text(runner.read_text(encoding="utf-8"), newline="\n")
+    script = """
+    python() { return 0; }
+    timeout() {
+        local f=""
+        for a in "$@"; do case "$a" in tests/*) f="${a#tests/}" ;; esac; done
+        printf '%s\\n' "$@" > "$PWD/args-$f"
+    }
+    MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s \
+        PYTEST_MARK_EXPR="stress and not slow" PYTEST_FILE_GREP='pytest\\.mark\\.stress' \
+        source "$1"
+    """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name, "./runner.sh", "."],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "files: 1 |" in result.stdout
+    assert [p.name for p in tmp_path.glob("args-*")] == ["args-test_stress.py"]
+    args = (tmp_path / "args-test_stress.py").read_text(encoding="utf-8").splitlines()
+    pytest_args = args[args.index("tests/test_stress.py"):]
+    assert pytest_args[pytest_args.index("-m") + 1] == "stress and not slow"
+
+
+def test_mssql_python_odbc_stress_pass_is_wired_and_bounded():
+    steps = load_template("test-mssql-python-odbc-template.yml")["steps"]
+    names = [step.get("displayName") for step in steps]
+    functional = steps[names.index("Run mssql-python tests against mssql-odbc")]
+    stress = steps[names.index("Run mssql-python stress tests against mssql-odbc (advisory)")]
+    assert names.index(functional["displayName"]) < names.index(stress["displayName"])
+    assert "continueOnError" not in stress
+    assert "PYTEST_MARK_EXPR=\"${{ parameters.pytestStressMarker }}\"" in stress["script"]
+    assert "TEST_RESULTS_DIR=/workspace/test-results-stress" in stress["script"]
+
+    template = load_template("test-mssql-python-odbc-template.yml")
+    params = {p["name"]: p["default"] for p in template["parameters"]}
+    assert params["pytestStressMarker"] == "stress and not slow"
+
+    publishes = [s for s in steps if s.get("task") == "PublishTestResults@2"]
+    folders = {p["inputs"]["searchFolder"].rsplit("/", 1)[-1] for p in publishes}
+    assert folders == {"mssql-python-odbc-test-results", "mssql-python-odbc-stress-test-results"}
+    assert all(p["condition"] == "always()" for p in publishes)
+
+    stages = load_template("validation-stages.yml")["stages"]
+    stage = next(s for s in stages if s["stage"] == "Build_mssql_python")
+    job = next(j for j in stage["jobs"] if j.get("job") == "Test_mssql_python_on_mssql_odbc")
+    # Leave setup headroom so a server-side job timeout never skips publish/cleanup.
+    assert functional["timeoutInMinutes"] + stress["timeoutInMinutes"] + 20 <= job["timeoutInMinutes"]
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("exit_code", [0, 1, 2, 3, 125, 126, 127, 137])
+@pytest.mark.parametrize("reason", ["PullRequest", "IndividualCI", "Schedule", ""])
+def test_mssql_python_odbc_stress_failures_are_advisory_everywhere(tmp_path, exit_code, reason):
+    step = next(
+        step for step in load_template("test-mssql-python-odbc-template.yml")["steps"]
+        if step.get("displayName") == "Run mssql-python stress tests against mssql-odbc (advisory)"
+    )
+    script = re.sub(r"\$\{\{.*?\}\}", "10m", step["script"])
+    script_path = tmp_path / "run-step.sh"
+    script_path.write_text(
+        f"BUILD_REASON='{reason}'\ndocker() {{ return {exit_code}; }}\n{script}",
+        encoding="utf-8", newline="\n",
+    )
+    result = subprocess.run(
+        [_BASH, script_path.name], cwd=tmp_path, capture_output=True, text=True,
+    )
+    advisory = exit_code == 1
+    assert result.returncode == (0 if advisory else exit_code), result.stderr
+    assert ("task.complete result=SucceededWithIssues;" in result.stdout) == advisory
+    assert ("task.logissue type=error" in result.stdout) == (exit_code not in (0, 1))
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize(
     ("template", "display_name", "command"),
     [
