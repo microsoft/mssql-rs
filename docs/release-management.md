@@ -171,8 +171,11 @@ The YAML alone does nothing until a pipeline definition points at it:
 2. Add an **Exclusive lock** check to the
    `mssql-rs-version-bump-writer` environment. The YAML's sequential lock
    behavior then queues overlapping manual and scheduled runs.
-3. Do not add a schedule in the pipeline settings UI.
-4. Run it manually once to confirm the credential extraction works.
+3. Add an ADO **Branch control** check to the environment allowing only
+   `refs/heads/main`. The YAML also rejects the deployment stage on any other
+   source ref.
+4. Do not add a schedule in the pipeline settings UI.
+5. Run it manually once from `main` to confirm the credential extraction works.
 
 The pipeline runs on a Microsoft-hosted `ubuntu-latest` agent. It only runs git
 and Python, so it does not need the private Rust pools, which require a separate
@@ -228,7 +231,10 @@ This YAML also requires a permanent pipeline definition after the change reaches
 2. Set its YAML path to `.pipeline/bump-mssql-python-release.yml`.
 3. Add an **Exclusive lock** check to the
    `mssql-python-release-bump-writer` environment.
-4. Run it manually with a published version to verify access to
+4. Add an ADO **Branch control** check to the environment allowing only
+   `refs/heads/main`. Pipeline 2332 explicitly queues the worker from that ref,
+   and the worker YAML rejects any other source ref.
+5. Run it manually from `main` with a published version to verify access to
    `microsoft/mssql-python`.
 
 The exact pipeline name is part of the release contract: pipeline 2332 resolves

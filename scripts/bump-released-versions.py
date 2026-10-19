@@ -468,6 +468,16 @@ def branch_merged_into_base(root, branch_commit, base_sha):
     return merged.returncode == 0
 
 
+def managed_paths_changed(root, remote_commit, paths):
+    compared = git_try(root, "diff", "--quiet", remote_commit, "HEAD", "--", *paths)
+    if compared.returncode not in (0, 1):
+        raise RuntimeError(
+            f"Could not compare managed files with {remote_commit}: "
+            f"{compared.stderr.strip()}"
+        )
+    return compared.returncode == 1
+
+
 def inspect_bump_branch(root, branch, base_sha):
     repo = repository()
     base = os.environ["DEFAULT_BRANCH"]
@@ -513,10 +523,13 @@ def open_bump_pr(
     git(root, "add", "--", *paths)
     git(root, "commit", "--message", title)
 
-    # Every run rebuilds the commit, so its hash differs even when the content is
-    # identical. Push only on a real content change, otherwise an open PR would be
-    # force-updated on every run, restarting its validation and dismissing reviews.
-    if remote_tree == git(root, "rev-parse", "HEAD^{tree}").strip():
+    # Preserve a pending PR across unrelated base-branch changes. Only the managed
+    # manifests determine whether this writer needs to replace its commit.
+    if (
+        exists
+        and existing
+        and not managed_paths_changed(root, remote_commit, paths)
+    ):
         print(f"{branch} already has these versions; leaving it untouched.")
     else:
         expected = remote_commit if exists else ""

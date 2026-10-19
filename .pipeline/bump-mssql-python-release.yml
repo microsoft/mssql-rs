@@ -28,6 +28,7 @@ lockBehavior: sequential
 
 stages:
 - stage: UpdateMssqlPython
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
   - deployment: UpdateMssqlPython
     environment: mssql-python-release-bump-writer

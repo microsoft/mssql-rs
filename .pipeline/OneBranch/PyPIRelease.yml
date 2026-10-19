@@ -235,6 +235,13 @@ extends:
               }
 
               $body = @{
+                resources = @{
+                  repositories = @{
+                    self = @{
+                      refName = 'refs/heads/main'
+                    }
+                  }
+                }
                 templateParameters = @{
                   releasedVersion = "$(releaseVersion)"
                   sourceBuildId = "$(Build.BuildId)"

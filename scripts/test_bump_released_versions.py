@@ -517,21 +517,66 @@ def test_open_bump_pr_updates_existing_pull_request(tmp_path):
 
 
 def test_unchanged_branch_is_not_force_pushed(tmp_path):
-    """A rebuilt commit has a new hash but the same tree; pushing it would
-    restart validation and dismiss reviews on an open bump PR."""
     calls = []
     with patch.object(bump, "git", side_effect=lambda root, *args: (
-        calls.append(["git", *args]) or "sametree\n"
+        calls.append(["git", *args]) or "newtree\n"
     )), patch.object(
-        bump, "remote_branch_state", return_value=(True, "oldsha", "sametree", True)
+        bump, "remote_branch_state", return_value=(True, "oldsha", "oldtree", True)
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 724}]
+    ), patch.object(
+        bump, "managed_paths_changed", return_value=False
     ), patch.object(bump, "github_api", return_value=(200, {})):
         assert bump.open_bump_pr(
             tmp_path, bump.PYTHON_BRANCH, "abc123", "title", "body",
             lambda root: ["mssql-py-core/pyproject.toml"],
         ) == 724
     assert not any("push" in call for call in calls), calls
+
+
+def test_managed_version_change_force_pushes_pending_pull_request(tmp_path):
+    calls = []
+    with patch.object(bump, "git", side_effect=lambda root, *args: (
+        calls.append(["git", *args]) or "newtree\n"
+    )), patch.object(
+        bump, "remote_branch_state", return_value=(True, "oldsha", "oldtree", True)
+    ), patch.object(
+        bump, "github_paged", return_value=[{"number": 724}]
+    ), patch.object(
+        bump, "managed_paths_changed", return_value=True
+    ), patch.object(bump, "github_api", return_value=(200, {})):
+        assert bump.open_bump_pr(
+            tmp_path, bump.PYTHON_BRANCH, "newbase", "title", "body",
+            lambda root: ["mssql-py-core/pyproject.toml"],
+        ) == 724
+    assert any("push" in call for call in calls), calls
+
+
+@pytest.mark.parametrize(("returncode", "changed"), [(0, False), (1, True)])
+def test_managed_paths_compare_only_generated_files(tmp_path, returncode, changed):
+    result = subprocess.CompletedProcess("git", returncode, stdout="", stderr="")
+    with patch.object(bump, "git_try", return_value=result) as run:
+        assert bump.managed_paths_changed(
+            tmp_path,
+            "pending-sha",
+            ["mssql-tds/Cargo.toml", "mssql-mock-tds/Cargo.toml"],
+        ) is changed
+    assert run.call_args.args[1:] == (
+        "diff",
+        "--quiet",
+        "pending-sha",
+        "HEAD",
+        "--",
+        "mssql-tds/Cargo.toml",
+        "mssql-mock-tds/Cargo.toml",
+    )
+
+
+def test_managed_path_comparison_failure_propagates(tmp_path):
+    failure = subprocess.CompletedProcess("git", 128, stdout="", stderr="network down")
+    with patch.object(bump, "git_try", return_value=failure):
+        with pytest.raises(RuntimeError, match="network down"):
+            bump.managed_paths_changed(tmp_path, "pending-sha", ["Cargo.toml"])
 
 
 def test_changed_branch_is_force_pushed(tmp_path):
@@ -1190,6 +1235,9 @@ def test_cadence_day_windows_cover_exactly_the_first_and_third_tuesday():
 def test_pipeline_serializes_github_writers_with_an_environment_lock():
     pipeline = load_pipeline()
     assert pipeline["lockBehavior"] == "sequential"
+    assert pipeline["stages"][0]["condition"] == (
+        "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))"
+    )
     deployment = pipeline["stages"][0]["jobs"][0]
     assert deployment["deployment"] == "WriteVersionBumps"
     assert deployment["environment"] == "mssql-rs-version-bump-writer"

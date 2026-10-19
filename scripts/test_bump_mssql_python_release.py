@@ -736,6 +736,9 @@ def test_worker_token_extraction_finds_the_repo_scoped_key(tmp_path):
 def test_worker_serializes_github_writers_with_an_environment_lock():
     pipeline = yaml.safe_load(PIPELINE.read_text(encoding="utf-8"))
     assert pipeline["lockBehavior"] == "sequential"
+    assert pipeline["stages"][0]["condition"] == (
+        "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))"
+    )
     deployment = pipeline["stages"][0]["jobs"][0]
     assert deployment["deployment"] == "UpdateMssqlPython"
     assert deployment["environment"] == "mssql-python-release-bump-writer"
@@ -748,5 +751,6 @@ def test_pypi_release_queues_worker_only_after_real_publish():
         "Queue mssql-python dependency update"
     )
     assert "templateParameters" in text
+    assert "refName = 'refs/heads/main'" in text
     assert 'releasedVersion = "$(releaseVersion)"' in text
     assert "publishToPyPI" in text

@@ -41,6 +41,7 @@ lockBehavior: sequential
 
 stages:
 - stage: WriteVersionBumps
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
   - deployment: WriteVersionBumps
     environment: mssql-rs-version-bump-writer
