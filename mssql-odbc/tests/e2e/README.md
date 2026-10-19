@@ -208,7 +208,7 @@ executable is one ctest case, or two when it uses `ODBC_TEST_F` (`<name>` and
 on that entry name, not on individual gtest cases. A gtest skip is not a failure, so a case
 guarded by `SKIP_IF_COMPARING_MSODBCSQL()` leaves its binary passing on both
 legs: it shows up as `parity`, not `skipped`. The `skipped (not compared)`
-verdict only appears when an *entire* binary is skipped in one leg. Either way
+verdict only appears when an *entire* entry is skipped in one leg. Either way
 the divergent assertions never execute on the reference leg.
 
 CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
