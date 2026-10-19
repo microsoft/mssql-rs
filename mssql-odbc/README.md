@@ -57,6 +57,24 @@ implements it, and deliberate departures from msodbcsql are recorded in the
 [parity registry](docs/parity-deviations.md). Subsystem design notes live in
 [`docs/`](docs/).
 
+### Data-at-execution parameters
+
+PLP-capable values supplied through `SQLParamData`/`SQLPutData` are streamed to
+SQL Server as chunks rather than retained as a complete value. This includes
+`varchar(max)`, `nvarchar(max)`, `varbinary(max)`, XML, and CLR UDT parameters.
+Character input is transcoded incrementally when its application and wire
+encodings differ. XML uses UTF-16LE on the wire and is normalized to exactly one
+leading byte-order mark; CLR UDT chunks remain their opaque serialized bytes.
+
+Streaming keeps peak memory bounded by the active conversion and packet buffers
+when every remaining DAE parameter is streamable. Bind order is observable in a
+mixed sequence: a streamable parameter before a fixed-width or otherwise
+buffered parameter is collected whole until that later parameter is available,
+because `SQLParamData` tokens must remain in bind order. Once no buffered
+parameters remain, subsequent PLP values stream normally. Validation that
+depends on the completed value can occur during `SQLPutData` or when
+`SQLParamData` closes the parameter rather than at bind time.
+
 ## Platform artifacts
 
 | Platform | Driver Manager | Library |

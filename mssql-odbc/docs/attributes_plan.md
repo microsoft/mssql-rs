@@ -55,7 +55,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | Attribute | Set | Get | Note |
 |---|---|---|---|
 | `SQL_ATTR_LOGIN_TIMEOUT` | ✅ | ✅ | clamped to `0xFFFE`, `01S02` on clamp |
-| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | |
+| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds the internal `SQL_USER_NAME` and alias-type lookups, as msodbcsql's `GetNetIOTimeOut` does on the session; a busy connection's alias-type login and read are bounded too (deviation 32) |
 | `SQL_ATTR_PACKET_SIZE` | ✅ | ✅ | pre-connect only |
 | `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | |
 | `SQL_ATTR_AUTOCOMMIT` | ✅ | ✅ | |

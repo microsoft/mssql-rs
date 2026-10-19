@@ -371,6 +371,13 @@ pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
 /// [`QueryResponse::delay`] is consulted.
 pub const RPC_DELAY_KEY: &str = "__MOCK_TDS_RPC_DELAY__";
 
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to a
+/// `Login7` request, stalling the login handshake. Registered after a client
+/// has logged in, it stalls only later logins, such as a driver's secondary
+/// connection. Like [`TM_BEGIN_DELAY_KEY`], only its [`QueryResponse::delay`]
+/// is consulted.
+pub const LOGIN_DELAY_KEY: &str = "__MOCK_TDS_LOGIN_DELAY__";
+
 /// Registry of query responses
 pub struct QueryRegistry {
     responses: HashMap<String, QueryResponse>,
