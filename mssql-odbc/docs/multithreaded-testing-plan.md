@@ -476,13 +476,18 @@ local SQL Server:
   `GTEST_CATCH_EXCEPTIONS=0` and `MSSQL_ODBC_MT_DUMP_DIR`, and the process
   then dumps on an unhandled exception or `abort()` (CRT reports go to stderr,
   not a modal dialog) as well as on a hang. The dumps are published as the
-  `OdbcMtDumps_Windows_*` artifact. `__fastfail` exits (`/GS` failures, a Rust
+  `OdbcMtDumps_Windows_*` artifact, with the Rust driver and each `<name>_mt`
+  executable and their PDBs under `symbols\`. `__fastfail` exits (`/GS` failures, a Rust
   abort) bypass every handler and leave only the exit code `0xC0000409`.
 - **Unix evidence.** Stress runs start each `<name>_mt` entry under gdb
   (`run_mt_test.sh`), which prints every thread's stack into the test log on a
   crash, `abort()`, or watchdog timeout, and keeps the test's exit code.
   Docker's default seccomp profile allows this; no extra capability is needed
-  (measured in Ubuntu 24.04 and Alpine 3.21 containers).
+  (measured in Ubuntu 24.04 and Alpine 3.21 containers). The stress drops keep
+  the release driver's symbols and line tables (`keepDebugInfo`), so driver
+  frames are named.
+- A skipped mode reports a gtest skip; an entry whose variants are all skipped
+  exits 77, so ctest and the parity report show it as skipped, not passed.
 - msodbcsql has failed or exited without a result a few times at 8 x 20 or more
   (one `0xC0000409` in 41 runs; a chunk-fill failure and a silent exit in about
   16 runs at 16 x 50), none reproducible on demand. Dumps will tell a harness

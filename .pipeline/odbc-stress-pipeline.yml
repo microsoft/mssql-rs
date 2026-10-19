@@ -16,9 +16,11 @@
 # use one statement (unixODBC #243, fixed on master in ea454e49); see
 # mssql-odbc/tests/e2e/run_e2e.sh.
 #
-# Evidence: Windows hangs and crashes leave minidumps in the OdbcMtDumps_Windows
-# artifact; Linux legs run each entry under gdb and print every thread's stack
-# into the test log. Test results are published per leg.
+# Evidence: Windows hangs and crashes leave minidumps, with the matching driver,
+# test executables and PDBs, in the OdbcMtDumps_Windows artifact; Linux legs run
+# each entry under gdb and print every thread's stack into the test log, from a
+# release driver built with symbols and line tables. Test results are published
+# per leg.
 #
 # Plan: mssql-odbc/docs/multithreaded-testing-plan.md, "Stress Profiles". The
 # schedule targets GitHub main; this definition lives only in the mssql-rs
@@ -111,10 +113,12 @@ stages:
       parameters:
         architecture: x64
         artifactName: 'Odbc_Linux_x64'
+        keepDebugInfo: true
     - template: templates/build-odbc-alpine-template.yml
       parameters:
         architecture: x64
         artifactName: 'Odbc_Musl_x64'
+        keepDebugInfo: true
 
 - stage: Stress_Linux
   displayName: Stress Linux (unixODBC)

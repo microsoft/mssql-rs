@@ -362,6 +362,37 @@ function Restore-MtProfile {
     }
 }
 
+# A minidump names no binaries, so once the agent is gone it cannot be read
+# without the exact builds that produced it. When a stress run left dumps, copy
+# the Rust driver and every <name>_mt executable, each with its PDB, into
+# <dump dir>\symbols (msodbcsql's symbols come from the public symbol server).
+function Save-MtSymbols([string]$DriverDll) {
+    if (-not $script:MtStress -or -not (Test-Path $script:MtDumpDir)) { return }
+    if (-not (Get-ChildItem -Path $script:MtDumpDir -Filter '*.dmp' -File -ErrorAction SilentlyContinue)) { return }
+    $symbols = Join-Path $script:MtDumpDir 'symbols'
+    New-Item -ItemType Directory -Force -Path $symbols | Out-Null
+    $binaries = @()
+    if ($DriverDll) { $binaries += $DriverDll }
+    $buildDir = Join-Path $ScriptDir 'build'
+    if (Test-Path $buildDir) {
+        Push-Location $buildDir
+        try {
+            $entries = ctest -N -L mt -C Debug 2>$null | Select-String 'Test\s+#\d+:\s+(\S+)_mt\s*$'
+        } finally {
+            Pop-Location
+        }
+        foreach ($entry in $entries) {
+            $binaries += Join-Path $buildDir "Debug\$($entry.Matches[0].Groups[1].Value).exe"
+        }
+    }
+    foreach ($binary in $binaries) {
+        foreach ($file in @($binary, [IO.Path]::ChangeExtension($binary, '.pdb'))) {
+            if (Test-Path $file) { Copy-Item -Path $file -Destination $symbols -Force }
+        }
+    }
+    Write-Host "MT dumps: copied $((Get-ChildItem $symbols -File).Count) binaries and PDBs to $symbols"
+}
+
 # Run the (already-built) ctest suite, writing JUnit XML to $JunitName inside
 # the build dir. $LegEnv holds environment for this leg only. Returns ctest's
 # exit code without aborting the script.
@@ -387,6 +418,9 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
             # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
             # this only bounds an entry whose many phases all progress slowly.
             $ctestArgs += @('-L', 'mt', '--timeout', '3600')
+            # Set-MtProfile created it, but a dump directory inside build\ is gone
+            # if Remove-IncompatibleCMakeBuildTree deleted the tree since.
+            New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
         }
         if ($FilterTests) {
             $ctestArgs += @('-R', $FilterTests)
@@ -856,6 +890,8 @@ try {
     Write-Host "=== Both runs passed with full parity ==="
 }
 finally {
+    # Best effort: a failure here must not skip restoring the registry.
+    try { Save-MtSymbols $DriverPath } catch { Write-Warning "Could not save MT symbols: $_" }
     Restore-MtProfile
     Restore-Registration
 }

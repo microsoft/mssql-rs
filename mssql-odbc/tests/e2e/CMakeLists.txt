@@ -152,10 +152,14 @@ endif()
 # still runs every variant in <name> until CMake re-runs, so nothing is lost.
 # On Unix <name>_mt runs through run_mt_test.sh, which can run it under gdb so
 # a crash or watchdog abort prints every thread's stack (MSSQL_ODBC_MT_GDB=1).
+# Such executables link lib/odbc_skip_aware_main.cpp: MSSQL_ODBC_MT_SKIP_MODES
+# can skip every variant an entry selects, which must read as skipped (77), not
+# as a pass.
 # ---------------------------------------------------------------------------
 set(ODBC_MT_MODE_FILTER "*/CrossThread:*/SharedEnv:*/SharedDbc:*/SharedStmt")
 
-function(odbc_register_ctest TEST_NAME)
+# Sets ${OUT_VAR} to ON when any of the sources uses ODBC_TEST_F(_MODES).
+function(odbc_uses_concurrent_tests OUT_VAR)
     set(concurrent OFF)
     foreach(source IN LISTS ARGN)
         get_filename_component(path "${source}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -166,6 +170,11 @@ function(odbc_register_ctest TEST_NAME)
             endif()
         endif()
     endforeach()
+    set(${OUT_VAR} ${concurrent} PARENT_SCOPE)
+endfunction()
+
+function(odbc_register_ctest TEST_NAME)
+    odbc_uses_concurrent_tests(concurrent ${ARGN})
     if(concurrent)
         add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME} "--gtest_filter=-${ODBC_MT_MODE_FILTER}")
         if(UNIX)
@@ -188,8 +197,14 @@ endfunction()
 # Usage:  add_odbc_test(smoke_test tests/smoke_test.cpp)
 # ---------------------------------------------------------------------------
 function(add_odbc_test TEST_NAME)
-    add_executable(${TEST_NAME} ${ARGN})
-    target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib gtest_main)
+    odbc_uses_concurrent_tests(concurrent ${ARGN})
+    if(concurrent)
+        add_executable(${TEST_NAME} ${ARGN} lib/odbc_skip_aware_main.cpp)
+        target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib)
+    else()
+        add_executable(${TEST_NAME} ${ARGN})
+        target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib gtest_main)
+    endif()
     odbc_register_ctest(${TEST_NAME} ${ARGN})
 endfunction()
 
