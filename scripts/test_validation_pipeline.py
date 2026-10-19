@@ -501,7 +501,7 @@ def test_mssql_python_odbc_stress_pass_is_wired_and_bounded():
 
     template = load_template("test-mssql-python-odbc-template.yml")
     params = {p["name"]: p["default"] for p in template["parameters"]}
-    assert params["pytestStressMarker"] == "stress"  # TEMPORARY: revert before merge
+    assert params["pytestStressMarker"] == "stress and not slow"
 
     publishes = [s for s in steps if s.get("task") == "PublishTestResults@2"]
     folders = {p["inputs"]["searchFolder"].rsplit("/", 1)[-1] for p in publishes}
