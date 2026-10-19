@@ -1521,10 +1521,13 @@ fn fill_rowset(
         // being posted below: it all left the wire before anything the release
         // peek finds, and posting it afterward would invert the order
         // SQLGetDiagRec reports it in.
-        let (posted, preceding_ran, cancelled) =
+        let Ok((posted, preceding_ran, cancelled)) =
             release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
                 post_row_diagnostics(s, &info_messages, worst)
-            });
+            })
+        else {
+            return SQL_ERROR;
+        };
         (posted, preceding_ran, cancelled)
     } else {
         if !dbc.return_lease(client, LeaseReturn::KeepReservation) {

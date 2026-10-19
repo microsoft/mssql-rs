@@ -191,25 +191,24 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
         }
         Ok(result)
     });
-    let array_rc = super::execute::update_parameter_array(stmt, &mut client);
+    let array_update = super::execute::take_parameter_array_update(stmt, &mut client);
     match result {
         Ok(StatementResult::Rows) => {
             // Positioned on a new row-returning result set. Refresh metadata,
             // clear row state, keep CURSOR_OPEN and the wire reserved.
             let metadata = client.get_metadata().clone();
-            // Populated before `metadata` is moved into `begin_result_set`
-            // below, while it's still owned locally — avoids a clone purely
-            // to keep a copy alive across the STMT lock drop.
-            // `populate_ird` only ever touches the IRD's own DescHandle,
-            // independent of the STMT lock's poison state, so this can run
-            // before the poisoned-mutex check just below without changing
-            // what gets reported: a poisoned STMT mutex already returns
-            // SQL_ERROR unconditionally, and every other path still checks
-            // `ird_ok` before returning success.
+            let row_count = client.last_rows_affected();
+            let info_messages = client.take_info_messages();
+            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+                return SQL_ERROR;
+            }
+            let array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
             let ird_ok = populate_ird(stmt, &metadata).is_ok();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned advancing result set");
-                dbc.return_lease(client, LeaseReturn::Release);
                 return SQL_ERROR;
             };
             stmt_state.begin_result_set(metadata);
@@ -217,12 +216,9 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
             stmt_state.result_set_exhausted = false;
             stmt_state.batch_exhausted = false;
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
-            stmt_state.row_count = client.last_rows_affected();
-            // Drain INFO only after the lock is held.
-            let info_messages = client.take_info_messages();
+            stmt_state.row_count = row_count;
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            dbc.return_lease(client, LeaseReturn::KeepReservation);
             if !ird_ok {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     post_sql_error(
@@ -249,15 +245,24 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
             // (SQLFetch returns 24000), but it is a navigable result and may
             // carry diagnostic messages. The connection stays busy so a further
             // SQLMoreResults can advance past it. Matches msodbcsql.
+            let row_count = client.last_rows_affected();
+            let info_messages = client.take_info_messages();
+            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+                return SQL_ERROR;
+            }
+            let array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
+            let ird_ok = populate_ird(stmt, &[]).is_ok();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned on no-row result");
-                dbc.return_lease(client, LeaseReturn::Release);
                 return SQL_ERROR;
             };
             stmt_state.begin_result_set(Vec::new());
             // Surface this no-row statement's own affected-row count for
             // SQLRowCount now that we are positioned on it.
-            stmt_state.row_count = client.last_rows_affected();
+            stmt_state.row_count = row_count;
             stmt_state.reset_row_stream();
             // A stale `true` here (inherited from a previous result set this
             // statement fetched to exhaustion) would make SQLFetch report
@@ -266,11 +271,8 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
             // though there is nothing to fetch on this result itself.
             stmt_state.result_set_exhausted = false;
             stmt_state.batch_exhausted = false;
-            let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            let ird_ok = populate_ird(stmt, &[]).is_ok();
-            dbc.return_lease(client, LeaseReturn::KeepReservation);
             if !ird_ok {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     post_sql_error(
@@ -293,21 +295,26 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
         }
         Ok(StatementResult::End) => {
             // Batch exhausted. Close cursor state and release the connection.
+            let info_messages = client.take_info_messages();
+            let return_values = client.get_return_values();
+            let return_status = client.get_return_status();
+            if !dbc.return_lease(client, LeaseReturn::Release) {
+                return SQL_ERROR;
+            }
+            let array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned at batch end");
-                dbc.return_lease(client, LeaseReturn::Release);
                 return SQL_ERROR;
             };
             reset_cursor_state(&mut stmt_state);
-            // Drain INFO only after the lock is held.
-            let info_messages = client.take_info_messages();
             post_tds_info_messages(&mut stmt_state, &info_messages);
             // ODBC makes output parameters and the return status readable only
             // once every result set the procedure produced has been consumed,
             // which is exactly here. Writing back earlier would let an
             // application read a value the spec says is not available yet.
-            let return_values = client.get_return_values();
-            let return_status = client.get_return_status();
             let output_rc = unsafe {
                 write_back_output_params(
                     &mut stmt_state,
@@ -318,7 +325,6 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
                 )
             };
             drop(stmt_state);
-            dbc.return_lease(client, LeaseReturn::Release);
             debug!("SQLMoreResults: no more result sets");
             if array_rc == SQL_ERROR || output_rc == SQL_ERROR {
                 SQL_ERROR
@@ -332,14 +338,20 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
         }
         Err(e) => {
             error!(%e, "SQLMoreResults: advance failed");
+            let info_messages = client.take_info_messages();
+            if !dbc.return_lease(client, LeaseReturn::Release) {
+                return SQL_ERROR;
+            }
+            let _array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
-                let info_messages = client.take_info_messages();
                 post_tds_info_messages(&mut stmt_state, &info_messages);
             }
-            dbc.return_lease(client, LeaseReturn::Release);
             SQL_ERROR
         }
     }

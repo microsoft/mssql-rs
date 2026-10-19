@@ -544,9 +544,10 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: WireLease) {
 /// so it has to be recorded first; its return value reports whether it posted
 /// a server message. Callers with nothing pending pass `|_| false`.
 ///
-/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is `false` when
-/// the statement lock was poisoned and the closure therefore never ran, so a
-/// caller that relies on it having posted can fall back rather than assume.
+/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is
+/// `false` when the statement lock was poisoned and the closure therefore
+/// never ran, so a caller that relies on it having posted can fall back rather
+/// than assume. A stale lease returns `SQL_ERROR` without publishing state.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -558,7 +559,8 @@ pub(super) fn release_busy_if_row_exhausted(
     statement_handle: SqlHandle,
     mut client: WireLease,
     post_preceding: impl FnOnce(&mut StmtState) -> bool,
-) -> (bool, bool, bool) {
+) -> Result<(bool, bool, bool), SqlReturn> {
+    debug_assert_eq!(client.owner(), WireOwner::Statement(statement_handle));
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
@@ -608,13 +610,26 @@ pub(super) fn release_busy_if_row_exhausted(
     // the following result set, and would drop it outright if the application
     // never calls `SQLMoreResults` at all.
     let drained_info = client.take_info_messages();
+    let pending_output_params = if release && !cancelled {
+        Some((client.get_return_values(), client.get_return_status()))
+    } else {
+        None
+    };
+
+    let how = if release {
+        LeaseReturn::Release
+    } else {
+        LeaseReturn::KeepReservation
+    };
+    if !dbc.return_lease(client, how) {
+        return Err(SQL_ERROR);
+    }
 
     let mut has_server_info = false;
     let mut preceding_ran = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
-        if release && !cancelled {
-            stmt_state.pending_output_params =
-                Some((client.get_return_values(), client.get_return_status()));
+        if let Some(output_params) = pending_output_params {
+            stmt_state.pending_output_params = Some(output_params);
         }
         preceding_ran = true;
         has_server_info = post_preceding(&mut stmt_state);
@@ -635,14 +650,7 @@ pub(super) fn release_busy_if_row_exhausted(
             stmt_state.batch_exhausted = true;
         }
     }
-    // Capture outputs before publishing the idle client: another statement's
-    // execution clears the client's RETURNVALUE/RETURNSTATUS collections.
-    if release {
-        return_client_idle(dbc, statement_handle, client);
-    } else {
-        return_client_busy(dbc, client);
-    }
-    (has_server_info, preceding_ran, cancelled)
+    Ok((has_server_info, preceding_ran, cancelled))
 }
 
 /// The TDS read has settled or retired its transport and returned the client.
@@ -2325,7 +2333,11 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
+        assert!(
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
 
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         assert!(dbc.inner.lock().unwrap().wire.client().is_some());
@@ -2337,6 +2349,40 @@ mod tests {
              SQLMoreResults must also be able to fast-path without touching \
              the connection"
         );
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_publishes_nothing_from_a_stale_lease() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = {
+            let mut state = dbc.inner.lock().unwrap();
+            let client = state.wire.take_lease_for_test(h.stmt);
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+            client
+        };
+        let preceding_ran = std::cell::Cell::new(false);
+
+        assert_eq!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+                preceding_ran.set(true);
+                true
+            }),
+            Err(SQL_ERROR)
+        );
+
+        assert!(!preceding_ran.get());
+        let dbc_state = dbc.inner.lock().unwrap();
+        assert!(dbc_state.wire.client().is_some());
+        drop(dbc_state);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.result_set_exhausted);
+        assert!(!stmt_state.batch_exhausted);
+        assert!(stmt_state.diag_records.is_empty());
     }
 
     #[test]
@@ -2358,7 +2404,11 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
+        assert!(
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
 
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -2375,7 +2425,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -2414,7 +2464,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
         assert_eq!(
             dbc.inner.lock().unwrap().wire.statement_owner(),
@@ -2457,7 +2507,9 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0,
             "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
         );
 
@@ -2498,7 +2550,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
         assert!(
             dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
@@ -2552,7 +2604,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
         assert_eq!(
             dbc.inner.lock().unwrap().wire.statement_owner(),
@@ -2602,7 +2654,9 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0,
             "the caller must be told a server message was posted"
         );
 
@@ -2650,7 +2704,11 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        assert!(release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
 
         assert!(
             dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
@@ -2704,7 +2762,8 @@ mod tests {
             release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
                 ran.set(true);
                 true
-            });
+            })
+            .unwrap();
 
         assert!(!ran.get(), "the poisoned lock must skip the closure");
         assert!(
@@ -2749,6 +2808,7 @@ mod tests {
             release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
                 post_tds_info_messages(s, &earlier)
             })
+            .unwrap()
             .0
         );
 

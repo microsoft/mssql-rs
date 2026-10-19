@@ -715,19 +715,39 @@ fn finish_parameter_array(
     rc
 }
 
-pub(super) fn update_parameter_array(
+pub(super) struct ParameterArrayUpdate {
+    has_more: bool,
+    result: Option<PreparedBatchResult>,
+    current_set: Option<usize>,
+}
+
+pub(super) fn take_parameter_array_update(
     stmt: &StmtHandle,
     client: &mut mssql_tds::connection::tds_client::TdsClient,
-) -> SqlReturn {
+) -> Result<Option<ParameterArrayUpdate>, SqlReturn> {
     // The IPD pointers are read before the STMT lock (never nested), and only
     // when a batch is pending, so the common path takes no descriptor lock.
     let pending = match stmt.inner.lock() {
         Ok(stmt_state) => stmt_state.parameter_array.is_some(),
-        Err(_) => return SQL_ERROR,
+        Err(_) => return Err(SQL_ERROR),
     };
     if !pending {
-        return SQL_SUCCESS;
+        return Ok(None);
     }
+    Ok(Some(ParameterArrayUpdate {
+        has_more: client.has_open_batch(),
+        result: client.take_prepared_batch_results(),
+        current_set: client.current_parameter_set(),
+    }))
+}
+
+pub(super) fn apply_parameter_array_update(
+    stmt: &StmtHandle,
+    update: Option<ParameterArrayUpdate>,
+) -> SqlReturn {
+    let Some(update) = update else {
+        return SQL_SUCCESS;
+    };
     let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
     let (param_status_ptr, params_processed_ptr) = {
         let Ok(ipd_state) = ipd.inner.lock() else {
@@ -755,21 +775,31 @@ pub(super) fn update_parameter_array(
     };
     batch.outputs.param_status_ptr = param_status_ptr;
     batch.outputs.params_processed_ptr = params_processed_ptr;
-    let has_more = client.has_open_batch();
-    let rc = match client.take_prepared_batch_results() {
+    let rc = match update.result {
         Some(result) => report_parameter_array(
             &mut stmt_state,
             result,
             &mut batch,
-            client.current_parameter_set(),
-            has_more,
+            update.current_set,
+            update.has_more,
         ),
         None => SQL_SUCCESS,
     };
-    if has_more {
+    if update.has_more {
         stmt_state.parameter_array = Some(batch);
     }
     rc
+}
+
+#[cfg(test)]
+fn update_parameter_array(
+    stmt: &StmtHandle,
+    client: &mut mssql_tds::connection::tds_client::TdsClient,
+) -> SqlReturn {
+    match take_parameter_array_update(stmt, client) {
+        Ok(update) => apply_parameter_array_update(stmt, update),
+        Err(rc) => rc,
+    }
 }
 
 fn report_parameter_array(

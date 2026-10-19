@@ -350,32 +350,37 @@ fn drain_and_release_inner(
     };
     if let Err(e) = close_result {
         error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
+        if !dbc.return_lease(client, LeaseReturn::Release) {
+            return DrainOutcome::Failed;
+        }
         // Surface the failure as a diagnostic so the app is not told the close
         // succeeded when the stream did not drain cleanly.
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
         }
-        dbc.return_lease(client, LeaseReturn::Release);
         return DrainOutcome::Failed;
     }
 
-    let array_rc = super::execute::update_parameter_array(stmt, &mut client);
+    let array_update = super::execute::take_parameter_array_update(stmt, &mut client);
+    let info_messages = client.take_info_messages();
+
+    // Drain complete: return client and release busy claim before publishing
+    // anything derived from a session that may have been disconnected.
+    if !dbc.return_lease(client, LeaseReturn::Release) {
+        return DrainOutcome::Failed;
+    }
+
+    let array_rc = match array_update {
+        Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+        Err(rc) => rc,
+    };
     let has_server_info = match stmt.inner.lock() {
-        Ok(mut stmt_state) => {
-            // Drain INFO only after the lock is held so a poisoned mutex cannot
-            // silently drop the messages.
-            let info_messages = client.take_info_messages();
-            post_tds_info_messages(&mut stmt_state, &info_messages)
-        }
+        Ok(mut stmt_state) => post_tds_info_messages(&mut stmt_state, &info_messages),
         Err(_) => {
             error!("drain_and_release: stmt mutex poisoned while posting info messages");
-            dbc.return_lease(client, LeaseReturn::Release);
             return DrainOutcome::Failed;
         }
     };
-
-    // Drain complete: return client and release busy claim atomically.
-    dbc.return_lease(client, LeaseReturn::Release);
 
     if array_rc == SQL_ERROR {
         DrainOutcome::Failed
