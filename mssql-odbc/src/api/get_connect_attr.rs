@@ -35,6 +35,20 @@ use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 /// `SQL_ATTR_LOGIN_TIMEOUT`, which is what the connect path falls back to.
 const DEFAULT_LOGIN_TIMEOUT_SECS: u32 = DEFAULT_CONNECT_TIMEOUT_SECS;
 
+/// Writes an integer attribute and its four-byte width, as msodbcsql does for
+/// every integer connection attribute (`GetParamValue` and the shared tail of
+/// `SQLGetConnectAttrW`, `sqlcmisc.cpp`).
+///
+/// # Safety
+/// `value_ptr` must be writable for one `u32`, and `string_length_ptr` null or
+/// writable for one `SqlInteger`.
+unsafe fn write_u32_attr(value_ptr: SqlPointer, string_length_ptr: *mut SqlInteger, value: u32) {
+    unsafe {
+        write_if_some(value_ptr as *mut u32, value);
+        write_if_some(string_length_ptr, size_of::<u32>() as SqlInteger);
+    }
+}
+
 /// Retrieves a connection attribute.
 ///
 /// # Safety
@@ -178,7 +192,7 @@ fn sql_get_connect_attr_w_safe(
             // buffer. `Some(0)` reflects an app-set "wait indefinitely"; an
             // unset attribute reports the driver default.
             let secs = state.login_timeout.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS);
-            unsafe { write_if_some(value_ptr as *mut u32, secs) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, secs) };
             debug!(secs, "SQLGetConnectAttrW: login timeout returned");
             SQL_SUCCESS
         }
@@ -222,7 +236,7 @@ fn sql_get_connect_attr_w_safe(
                 // connection when connected, else the app-set attribute/default.
                 _ => state.effective_packet_size.unwrap_or(state.packet_size),
             };
-            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, value) };
             debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
             SQL_SUCCESS
         }
@@ -264,7 +278,7 @@ fn sql_get_connect_attr_w_safe(
                 SQL_COPT_SS_TNIR => settings.transparent_network_ip_resolution.unwrap_or(1),
                 _ => settings.integrated_security.unwrap_or(0),
             };
-            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, value) };
             debug!(
                 attribute,
                 value, "SQLGetConnectAttrW: vendor attribute returned"
@@ -303,7 +317,7 @@ fn sql_get_connect_attr_w_safe(
             } else {
                 SQL_CD_FALSE
             };
-            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, value) };
             debug!(value, "SQLGetConnectAttrW: connection-dead returned");
             SQL_SUCCESS
         }
@@ -970,5 +984,56 @@ mod tests {
             };
             assert_eq!(get, SQL_ERROR, "null value pointer for {attribute}");
         }
+    }
+
+    /// msodbcsql writes `sizeof(UDWORD)` for every integer connection attribute
+    /// (`GetParamValue` and the getter's shared tail, `sqlcmisc.cpp`); a failed
+    /// get leaves the caller's length alone.
+    #[test]
+    fn integer_gets_report_the_value_width() {
+        let h = TestHandles::with_env_dbc();
+        for attribute in [
+            SQL_ATTR_ACCESS_MODE,
+            SQL_ATTR_AUTOCOMMIT,
+            SQL_ATTR_LOGIN_TIMEOUT,
+            SQL_ATTR_CONNECTION_TIMEOUT,
+            SQL_ATTR_PACKET_SIZE,
+            SQL_ATTR_TXN_ISOLATION,
+            SQL_ATTR_CONNECTION_DEAD,
+            SQL_COPT_SS_TXN_ISOLATION,
+            SQL_COPT_SS_WARN_ON_CP_ERROR,
+            SQL_COPT_SS_ENCRYPT,
+            SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+            SQL_COPT_SS_INTEGRATED_SECURITY,
+            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+            SQL_COPT_SS_TNIR,
+        ] {
+            let mut value: u32 = 0;
+            let mut length: SqlInteger = -777;
+            let rc = unsafe {
+                crate::api::exports::SQLGetConnectAttrW(
+                    h.dbc,
+                    attribute,
+                    (&mut value as *mut u32).cast(),
+                    0,
+                    &mut length,
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "attribute {attribute}");
+            assert_eq!(length, 4, "attribute {attribute}");
+        }
+
+        let mut length: SqlInteger = -777;
+        let rc = unsafe {
+            crate::api::exports::SQLGetConnectAttrW(
+                h.dbc,
+                SQL_COPT_SS_TNIR,
+                std::ptr::null_mut(),
+                0,
+                &mut length,
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(length, -777);
     }
 }

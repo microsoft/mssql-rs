@@ -163,6 +163,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   or the login deadline expires. Before, those attempts kept their sockets
   open until the OS connect timeout (AB#49293).
 
+- `mssql-odbc`: `SQLGetConnectAttr` now writes the four-byte width of an
+  integer attribute to `StringLengthPtr`, as msodbcsql does. Before, the
+  caller's variable was left unchanged (AB#49293).
+
 - `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
   zero payload length now decodes as empty instead of NULL (AB#49220). In the
   legacy LOB wire format NULL is a zero *text-pointer* length; the decoder

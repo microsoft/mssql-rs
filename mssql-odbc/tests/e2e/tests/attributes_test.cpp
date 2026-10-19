@@ -1889,7 +1889,9 @@ TEST_F(AttributesTest, MaxRowsTruncatesARowsetRatherThanRoundingIt) {
 
 #define SQL_COPT_SS_INTEGRATED_SECURITY 1203
 #define SQL_COPT_SS_ENCRYPT 1223
+#define SQL_COPT_SS_TXN_ISOLATION 1227
 #define SQL_COPT_SS_TRUST_SERVER_CERTIFICATE 1228
+#define SQL_COPT_SS_WARN_ON_CP_ERROR 1243
 #define SQL_COPT_SS_MULTISUBNET_FAILOVER 1248
 #define SQL_COPT_SS_TNIR 1249
 
@@ -2205,4 +2207,38 @@ TEST_F(AttributesTest, TnirIsReportedOnByDefault) {
 
     SQLDisconnect(dbc);
     SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+}
+
+// -------------------------------------------------------------------
+// Variation 65 - the connection-attribute twin of variation 55: a
+// successful integer get writes the value's four-byte width into
+// StringLength. msodbcsql does for every one of these (GetParamValue and
+// the getter's shared tail, sqlcmisc.cpp); GetVendorAttr passes a null
+// length, so the variations above cannot see it.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ConnectionIntegerGetsReportTheValueWidth) {
+    const SQLINTEGER attributes[] = {
+        SQL_ATTR_ACCESS_MODE,
+        SQL_ATTR_AUTOCOMMIT,
+        SQL_ATTR_CONNECTION_TIMEOUT,
+        SQL_ATTR_PACKET_SIZE,
+        SQL_ATTR_TXN_ISOLATION,
+        SQL_COPT_SS_TXN_ISOLATION,
+        SQL_COPT_SS_WARN_ON_CP_ERROR,
+        SQL_COPT_SS_ENCRYPT,
+        SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+        SQL_COPT_SS_INTEGRATED_SECURITY,
+        SQL_COPT_SS_MULTISUBNET_FAILOVER,
+        SQL_COPT_SS_TNIR,
+    };
+
+    for (SQLINTEGER attribute : attributes) {
+        SCOPED_TRACE(attribute);
+        SQLUINTEGER value = 0;
+        SQLINTEGER written = -1;
+        EXPECT_SQL_OK(
+            SQLGetConnectAttr(dbc_, attribute, &value, sizeof(value), &written),
+            SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(static_cast<SQLINTEGER>(sizeof(SQLUINTEGER)), written);
+    }
 }
