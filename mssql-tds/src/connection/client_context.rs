@@ -410,6 +410,11 @@ pub struct ClientContext {
     // `ClientContext` so the connect future stays small.
     #[allow(clippy::box_collection)]
     pub(crate) trusted_master_key_paths: Option<Box<HashMap<String, Vec<String>>>>,
+    /// Data Classification version to *request* in LOGIN7 (feature `0x09`).
+    /// `None` (the default) omits the feature. The version the server enables
+    /// arrives in FEATUREEXTACK and may be lower than the one requested here.
+    pub(crate) requested_data_classification_version:
+        Option<crate::token::data_classification::DataClassificationVersion>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
 }
@@ -593,6 +598,7 @@ impl ClientContext {
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             trusted_master_key_paths: None,
+            requested_data_classification_version: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -658,6 +664,7 @@ impl ClientContext {
             ),
             cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
             trusted_master_key_paths: None,
+            requested_data_classification_version: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -668,6 +675,15 @@ impl ClientContext {
             self.tds_authentication_method,
             TdsAuthenticationMethod::SSPI
         )
+    }
+
+    /// Requests Data Classification `version` (1 or 2) in LOGIN7. The setting
+    /// stays crate-private until the public API is designed.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn request_data_classification_for_test(&mut self, version: u8) -> TdsResult<()> {
+        self.requested_data_classification_version = Some(version.try_into()?);
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -926,6 +942,7 @@ impl Clone for ClientContext {
                 .clone(),
             cek_cache: self.cek_cache.clone(),
             trusted_master_key_paths: self.trusted_master_key_paths.clone(),
+            requested_data_classification_version: self.requested_data_classification_version,
             user_agent: self.user_agent.clone(),
         }
     }

@@ -113,6 +113,13 @@ parameters:
 # To also publish images to GHCR, define a SECRET pipeline variable named
 # GHCR_TOKEN (a GitHub PAT with write:packages), settable at queue time. If
 # GHCR_TOKEN is not set, the GHCR publish steps are skipped entirely.
+# ghcrUsername must be a GitHub login (1-39 ASCII letters/digits, with single
+# internal hyphens and an optional managed-user _shortcode suffix).
+# ghcrOrg accepts any lowercase GitHub owner with the same syntax, optionally
+# followed by one lowercase repository component (1-100 characters): letters,
+# digits, separated by a dot, one/two underscores, or one/more hyphens.
+# Parameters are passed as environment data, never interpolated into Bash.
+# Invalid values fail before registry login when publishing is enabled.
 - name: ghcrUsername
   displayName: 'GitHub username for the PAT (required only when GHCR_TOKEN is set)'
   type: string
@@ -139,7 +146,6 @@ variables:
   ACR_NAME: 'tdslibrs'
   ACR_REGISTRY: 'tdslibrs.azurecr.io'
   GHCR_REGISTRY: 'ghcr.io'
-  GHCR_NAMESPACE: 'ghcr.io/${{ parameters.ghcrOrg }}'
 
 # =============================================================================
 # STAGE 1 (Import): Sync base images from public registries (incl. Docker Hub) to ACR
@@ -1305,8 +1311,7 @@ stages:
         TOKEN="${GHCR_TOKEN:-}"
         # Treat empty, or an unexpanded "$(...)" macro (contains '$' or '('), as
         # "not set". A real GitHub PAT only contains [A-Za-z0-9_], so these
-        # patterns never match a valid token. Do NOT reference $(GHCR_TOKEN)
-        # here: the agent macro-expands it into the script body before bash runs.
+        # patterns never match a valid token.
         case "$TOKEN" in
           ''|*'$'*|*'('*)
             echo "GHCR_TOKEN not set (empty or unexpanded macro); skipping GHCR publish."
@@ -1319,12 +1324,30 @@ stages:
           echo "Set the 'GitHub username for the PAT' parameter and re-run."
           exit 1
         fi
+        export LC_ALL=C
+        if [[ ${#GHCR_USER_INPUT} -gt 39 || ! "$GHCR_USER_INPUT" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*(_[A-Za-z0-9]+)?$ ]]; then
+          echo "ERROR: ghcrUsername must be a GitHub login (1-39 letters/digits, single internal hyphens, optional _shortcode)."
+          exit 1
+        fi
+        OWNER="${GHCR_ORG_INPUT%%/*}"
+        if [[ ${#OWNER} -gt 39 || ! "$OWNER" =~ ^[a-z0-9]+(-[a-z0-9]+)*(_[a-z0-9]+)?$ ]]; then
+          echo "ERROR: ghcrOrg must start with a lowercase GitHub owner (1-39 letters/digits, single internal hyphens, optional _shortcode)."
+          exit 1
+        fi
+        if [[ "$GHCR_ORG_INPUT" == */* ]]; then
+          REPO="${GHCR_ORG_INPUT#*/}"
+          if [[ ${#REPO} -gt 100 || ! "$REPO" =~ ^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$ ]]; then
+            echo "ERROR: ghcrOrg must be owner or owner/repo with a lowercase container repository component (1-100 characters)."
+            exit 1
+          fi
+        fi
         echo "##vso[task.setvariable variable=GHCR_ENABLED]true"
-        echo "GHCR publish enabled for namespace: $(GHCR_NAMESPACE)"
+        echo "GHCR publish enabled for namespace: ghcr.io/${GHCR_ORG_INPUT}"
       displayName: 'Check for GHCR_TOKEN'
       env:
         GHCR_TOKEN: $(GHCR_TOKEN)
         GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
+        GHCR_ORG_INPUT: ${{ parameters.ghcrOrg }}
 
     - script: |
         set -euo pipefail
@@ -1376,11 +1399,11 @@ stages:
         echo "Images to mirror to GHCR:"
         sed 's/^/  /' "$(Pipeline.Workspace)/ghcr/images.txt"
       displayName: 'Define image list'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
 
     - task: AzureCLI@2
       displayName: 'Login to ACR (read source images)'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
       inputs:
         azureSubscription: 'Magnitude Test'
         scriptType: 'bash'
@@ -1392,12 +1415,13 @@ stages:
 
     - script: |
         set -euo pipefail
-        echo "$GHCR_TOKEN" | docker login $(GHCR_REGISTRY) -u "${{ parameters.ghcrUsername }}" --password-stdin
+        printf '%s' "$GHCR_TOKEN" | docker login $(GHCR_REGISTRY) -u "$GHCR_USER_INPUT" --password-stdin
         echo "Logged in to GHCR."
       displayName: 'Login to GHCR (PAT)'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
       env:
         GHCR_TOKEN: $(GHCR_TOKEN)
+        GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
 
     - script: |
         set -euo pipefail
@@ -1405,7 +1429,7 @@ stages:
         while read -r img; do
           [ -z "$img" ] && continue
           src="$(ACR_REGISTRY)/${img}"
-          dst="$(GHCR_NAMESPACE)/${img}"
+          dst="ghcr.io/${GHCR_ORG_INPUT}/${img}"
           echo "==> mirroring ${src} -> ${dst}"
           if docker buildx imagetools create -t "$dst" "$src"; then
             echo "    OK"
@@ -1420,16 +1444,23 @@ stages:
         fi
         echo "All images mirrored to GHCR."
       displayName: 'Mirror images ACR -> GHCR'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
       retryCountOnTaskFailure: 3
+      env:
+        GHCR_ORG_INPUT: ${{ parameters.ghcrOrg }}
 
     - script: |
+        set -euo pipefail
         echo "======================================================"
-        echo "Mirrored to GHCR namespace: $(GHCR_NAMESPACE)"
+        echo "Mirrored to GHCR namespace: ghcr.io/${GHCR_ORG_INPUT}"
         echo "======================================================"
-        sed 's#^#  $(GHCR_NAMESPACE)/#' "$(Pipeline.Workspace)/ghcr/images.txt"
+        while read -r img; do
+          printf '  ghcr.io/%s/%s\n' "$GHCR_ORG_INPUT" "$img"
+        done < "$(Pipeline.Workspace)/ghcr/images.txt"
         echo ""
         echo "NOTE: each GHCR package must be set to Public for anonymous pulls:"
-        echo "  https://github.com/orgs/$(echo '${{ parameters.ghcrOrg }}' | cut -d/ -f1)/packages"
+        echo "  https://github.com/orgs/${GHCR_ORG_INPUT%%/*}/packages"
       displayName: 'GHCR summary'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
+      env:
+        GHCR_ORG_INPUT: ${{ parameters.ghcrOrg }}

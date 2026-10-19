@@ -411,9 +411,14 @@ configure_and_build_tests() {
 
     echo ""
     echo "=== Configuring e2e tests (CMake) ==="
+    local release_driver=OFF
+    if [ "$BUILD_TYPE" = "release" ]; then
+        release_driver=ON
+    fi
     # Linux/macOS default to platform TCHAR mode unless explicitly overridden.
     cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
-        -DODBC_E2E_FORCE_UNICODE="${ODBC_E2E_FORCE_UNICODE:-OFF}"
+        -DODBC_E2E_FORCE_UNICODE="${ODBC_E2E_FORCE_UNICODE:-OFF}" \
+        -DODBC_E2E_RELEASE_DRIVER="$release_driver"
 
     echo ""
     echo "=== Building e2e tests ==="
