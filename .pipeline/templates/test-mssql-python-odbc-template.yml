@@ -45,7 +45,7 @@ parameters:
   - name: pytestStressMarker
     type: string
     default: 'stress and not slow'
-  # Wall-clock budget for the stress pass. Healthy runs take an estimated 2-3m;
+  # Wall-clock budget for the stress pass. A healthy run takes ~1.5m;
   # the budget only bounds a driver that hangs, and keeps publish/cleanup inside
   # the job timeout.
   - name: pytestStressTotalBudget
@@ -282,7 +282,7 @@ steps:
     docker exec \
       -e DB_CONNECTION_STRING \
       -e PYTEST_MARK_EXPR="${{ parameters.pytestStressMarker }}" \
-      -e PYTEST_FILE_GREP='pytest\.mark\.stress' \
+      -e PYTEST_FILE_GREP='mark\.stress' \
       -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
       -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestStressTotalBudget }}" \
       -e TEST_RESULTS_DIR=/workspace/test-results-stress \

@@ -459,7 +459,7 @@ def test_odbc_runner_applies_marker_and_file_filter(tmp_path):
     tests.mkdir()
     (tests / "test_plain.py").write_text("def test_x(): pass\n", encoding="utf-8")
     (tests / "test_stress.py").write_text(
-        "@pytest.mark.stress\ndef test_y(): pass\n", encoding="utf-8"
+        "from pytest import mark\n@mark.stress\ndef test_y(): pass\n", encoding="utf-8"
     )
     runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
     (tmp_path / "runner.sh").write_text(runner.read_text(encoding="utf-8"), newline="\n")
@@ -472,7 +472,7 @@ def test_odbc_runner_applies_marker_and_file_filter(tmp_path):
     }
     MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
         PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s \
-        PYTEST_MARK_EXPR="stress and not slow" PYTEST_FILE_GREP='pytest\\.mark\\.stress' \
+        PYTEST_MARK_EXPR="stress and not slow" PYTEST_FILE_GREP='mark\\.stress' \
         source "$1"
     """
     script_path = tmp_path / "run-test.sh"

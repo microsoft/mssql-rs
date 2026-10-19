@@ -152,9 +152,9 @@ command-launch failures remain harness errors.
 After the functional suite, the ODBC job runs a second pass over upstream's
 `stress`-marked tests, which `pytest.ini` deselects by default. The runner sets
 `PYTEST_MARK_EXPR` (`stress and not slow` by default) and limits the run to files
-that contain `pytest.mark.stress` through `PYTEST_FILE_GREP`. This pass covers
+that contain `mark.stress` through `PYTEST_FILE_GREP`. This pass covers
 multithreaded load from 2 to 100 threads, pool exhaustion, GIL release, and
-large result sets, and adds an estimated 2–3 minutes (based on msodbcsql runs). The test failures it finds are
+large result sets, and adds about 1.5 minutes. The test failures it finds are
 advisory in every mode, including PRs, until mssql-odbc has a stable history on
 these tests. Harness failures still fail the job. Results are published as a
 separate test run. The `slow` 5-minute sustained-load test is left for a
