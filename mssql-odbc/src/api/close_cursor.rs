@@ -313,11 +313,7 @@ fn drain_and_release_inner(
             Some(other) if other != statement_handle => return DrainOutcome::Clean,
             _ => (
                 dbc_state.client.take(),
-                if dbc_state.connection_timeout == 0 {
-                    120
-                } else {
-                    dbc_state.connection_timeout
-                },
+                dbc_state.cancel_timeout_secs(),
                 dbc_state.active_stmt == Some(statement_handle),
             ),
         }
@@ -415,6 +411,108 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
     use crate::test_support::TestHandles;
+
+    #[test]
+    fn exhausted_parameter_array_publishes_completion_on_close_or_cancel() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::connection::tds_client::PreparedStatement;
+        use mssql_tds::test_client_support::{
+            done_in_proc_more, done_proc_no_more, tds_client_from_int_rows_with_trailing_tokens,
+        };
+
+        for cancel in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc = stmt.parent_dbc();
+            h.mark_dbc_connected();
+            let mut client = tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![2]],
+                vec![done_in_proc_more(), done_proc_no_more()],
+            );
+            let id = client.register_prepared_handle_for_test(42);
+            dbc.inner.lock().unwrap().client = Some(client);
+            let sql: Vec<u16> = "SELECT ?".encode_utf16().collect();
+            let mut values = [1i32, 2];
+            let mut indicators = [0isize; 2];
+            let mut statuses = [SQL_PARAM_UNUSED; 2];
+            let mut operations = [SQL_PARAM_IGNORE, SQL_PARAM_PROCEED];
+            let mut processed = 0usize;
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            });
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_LONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    values.as_mut_ptr().cast(),
+                    4,
+                    indicators.as_mut_ptr(),
+                )
+            });
+            for (attribute, value) in [
+                (SQL_ATTR_PARAMSET_SIZE, 2usize as SqlPointer),
+                (SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr().cast()),
+                (SQL_ATTR_PARAM_OPERATION_PTR, operations.as_mut_ptr().cast()),
+                (
+                    SQL_ATTR_PARAMS_PROCESSED_PTR,
+                    (&mut processed as *mut usize).cast(),
+                ),
+            ] {
+                assert_eq!(SQL_SUCCESS, unsafe {
+                    crate::api::SQLSetStmtAttrW(h.stmt, attribute, value, 0)
+                });
+            }
+            stmt.inner.lock().unwrap().prepared.as_mut().unwrap().stmt =
+                PreparedStatement::materialized_for_test("SELECT @P1", id);
+            assert_eq!(
+                SQL_SUCCESS,
+                unsafe { crate::api::SQLExecute(h.stmt) },
+                "{:?}",
+                stmt.inner.lock().unwrap().diag_records
+            );
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+            assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+            // Model wire exhaustion before the ODBC parameter-array completion
+            // has been published. SQLMoreResults would publish it immediately.
+            let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+            dbc.runtime.block_on(client.advance()).unwrap();
+            assert!(!client.has_open_batch());
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.client = Some(client);
+                state.active_stmt = None;
+            }
+            stmt.inner.lock().unwrap().batch_exhausted = true;
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert!(state.batch_exhausted);
+                assert!(state.parameter_array.is_some());
+            }
+            processed = 0;
+            assert_eq!(
+                if cancel {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_SUCCESS
+                },
+                unsafe {
+                    if cancel {
+                        crate::api::SQLCancel(h.stmt)
+                    } else {
+                        crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+                    }
+                }
+            );
+            assert_eq!(processed, 2);
+            assert_eq!(statuses, [SQL_PARAM_UNUSED, SQL_PARAM_SUCCESS]);
+            assert!(stmt.inner.lock().unwrap().parameter_array.is_none());
+        }
+    }
 
     #[test]
     fn close_cursor_null_handle() {

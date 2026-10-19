@@ -50,10 +50,22 @@ protected:
         return SQLBindParameter(hstmt, ordinal, SQL_PARAM_INPUT, SQL_C_SLONG,
                                 SQL_INTEGER, 0, 0, value, 0, indicator);
     }
+
+    SQLRETURN CancelIdleStatement() {
+        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+        const auto rc = SQLCancel(stmt_);
+        EXPECT_EQ(SQL_SUCCESS, rc);
+        SQLTCHAR state[6] = {};
+        SQLTCHAR message[256] = {};
+        EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRec(
+            SQL_HANDLE_STMT, stmt_, 1, state, nullptr, message,
+            static_cast<SQLSMALLINT>(sizeof(message) / sizeof(message[0])), nullptr));
+        return rc;
+    }
 };
 
 // Benefits-from-mock-tds: cancel.rs pins cursor reset and drain errors; this
-// checks connection reuse through the Driver Manager, which may suppress 01S05.
+// checks connection reuse and the Driver Manager's suppression of 01S05.
 ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelReleasesConnectionLikeFreeStmtClose) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
@@ -195,6 +207,46 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsPartiallyReadPlp) {
     EXPECT_EQ(0, count);
     ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
     ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_plp"), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: close_cursor.rs pins unpublished completion after
+// wire exhaustion; this checks the application's parameter-array outputs.
+ODBC_TEST_F(ConnectionBusyLiveTest, ClosingFetchedParameterArrayPublishesCompletion) {
+    SQLINTEGER values[] = {1000 + Worker() * 100 + Iteration(), 2000 + Worker() * 100 + Iteration()};
+    SQLLEN indicators[] = {0, 0};
+    SQLUSMALLINT statuses[] = {SQL_PARAM_UNUSED, SQL_PARAM_UNUSED};
+    SQLULEN processed = 0;
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? AS n"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                reinterpret_cast<SQLPOINTER>(2), 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, statuses, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                  0, 0, values, sizeof(values[0]), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        for (int set = 0; set < 2; ++set) {
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            SQLINTEGER value = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(values[set], value);
+            ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            if (set == 0) {
+                ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2u, processed);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, statuses[0]);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, statuses[1]);
+    }
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
 }
 
 // A first execution of a prepared statement uses sp_prepexec. Its output

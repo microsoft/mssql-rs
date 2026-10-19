@@ -272,7 +272,7 @@ Measured 2026-10-08 on both drivers unless noted.
   `SQLCancel` preserves the interrupted call's diagnostics.
 - An idle `SQLCancel` performs `SQLFreeStmt(SQL_CLOSE)`, releases the connection,
   and reports `SQL_SUCCESS_WITH_INFO` / `01S05` when close succeeds (AB#49386).
-  The Windows Driver Manager may suppress the warning, so the direct-entry
+  The Windows Driver Manager suppresses the warning, so the direct-entry
   Rust tests assert it while `ConnectionBusyLiveTest.IdleCancel*` checks the
   cursor cleanup and connection reuse through the Driver Manager. Close errors
   remain errors; running-command and parked-DAE cancellation are unchanged.
@@ -312,6 +312,18 @@ Measured 2026-10-08 on both drivers unless noted.
   `18.06.0001` (five iterations per concurrent mode). Direct-DLL probes against
   that native version and Rust `18.6.2.1` also passed the partial-PLP case:
   truncated `SQLGetData`, `01S05` after cancellation, and no trailing INSERT.
+  Remeasured on 2026-10-19 through temporary Windows user DSNs, with native
+  `SQL_DRIVER_VER=18.06.0001` and Rust `18.6.2.1`: never-executed, unfetched,
+  partially fetched, and exhausted statements all returned `SQL_SUCCESS` and
+  `SQLGetDiagRec` returned `SQL_NO_DATA`. The live fixture now asserts this
+  DM result rather than accepting either success code; direct-entry Rust
+  tests continue to require `SQL_SUCCESS_WITH_INFO` / `01S05`.
+  `ClosingFetchedParameterArrayPublishesCompletion` checks live close-time
+  status/count outputs for two parameter sets. The Rust close/cancel test
+  specifically models an exhausted wire with still-unpublished array results
+  using scripted tokens: removing the parameter-array exception makes its
+  output assertions fail. This state is modeled explicitly, since the current
+  public `SQLMoreResults` path publishes completion as it exhausts the batch.
 
 ## Scenarios
 
