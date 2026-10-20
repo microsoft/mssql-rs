@@ -37,6 +37,13 @@ parameters:
   - name: pytestTotalBudget
     type: string
     default: '110m'
+  # pytest `-m` expression, replacing upstream pytest.ini's `-m "not stress"`.
+  # 'not slow' adds the stress tests (multithreaded load, pool exhaustion, GIL
+  # release, large result sets) but leaves out the fixed 5-minute sustained-load
+  # test; '' selects every test.
+  - name: pytestMarker
+    type: string
+    default: 'not slow'
 
 steps:
 - template: generate-sql-password-template.yml
@@ -215,6 +222,7 @@ steps:
     rc=0
     docker exec \
       -e DB_CONNECTION_STRING \
+      -e PYTEST_MARK_EXPR="${{ parameters.pytestMarker }}" \
       -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
       -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestTotalBudget }}" \
       -e TEST_RESULTS_DIR=/workspace/test-results \

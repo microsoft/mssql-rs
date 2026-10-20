@@ -455,6 +455,48 @@ def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize(
+    ("env", "expected"),
+    [("", None), ("PYTEST_MARK_EXPR='not slow'", "not slow"), ("PYTEST_MARK_EXPR=''", "")],
+)
+def test_odbc_runner_forwards_marker_expression(tmp_path, env, expected):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").touch()
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    (tmp_path / "runner.sh").write_text(runner.read_text(encoding="utf-8"), newline="\n")
+    script = f"""
+    python() {{ return 0; }}
+    timeout() {{ printf '%s\\n' "$@" > "$PWD/args"; }}
+    {env} MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
+    """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name, "./runner.sh", "."],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (tmp_path / "args").read_text(encoding="utf-8").splitlines()
+    pytest_args = args[args.index("tests/test_a.py"):]
+    if expected is None:
+        assert "-m" not in pytest_args
+    else:
+        assert pytest_args[pytest_args.index("-m") + 1] == expected
+
+
+def test_mssql_python_odbc_job_includes_non_slow_stress_tests():
+    template = load_template("test-mssql-python-odbc-template.yml")
+    params = {p["name"]: p["default"] for p in template["parameters"]}
+    assert params["pytestMarker"] == "not slow"
+    step = next(
+        step for step in template["steps"]
+        if step.get("displayName") == "Run mssql-python tests against mssql-odbc"
+    )
+    assert 'PYTEST_MARK_EXPR="${{ parameters.pytestMarker }}"' in step["script"]
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
     ("template", "display_name", "command"),
     [
         ("test-mssql-python-macos-template.yml", "Run mssql-python tests", "pytest"),

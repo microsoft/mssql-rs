@@ -149,6 +149,14 @@ The ODBC runner treats per-file pytest exit 2 as a test failure because a driver
 import error can prevent collection. Pytest internal/usage errors (3/4) and
 command-launch failures remain harness errors.
 
+Upstream's `pytest.ini` deselects `stress`-marked tests by default. The ODBC job
+overrides that with `PYTEST_MARK_EXPR="not slow"` (template parameter
+`pytestMarker`), so the same pass also covers multithreaded load from 2 to 100
+threads, pool exhaustion, GIL release, and large result sets, under the same
+blocking policy as the rest of the suite. Only the `slow` tests, including the
+fixed 5-minute sustained-load test, are left out; `pytestMarker: ''` selects
+every test. Leaving `PYTEST_MARK_EXPR` unset keeps upstream's default.
+
 The macOS job owns the locally built Rust and source-matched ODBC wheels and
 installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
 third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a
