@@ -316,6 +316,17 @@ def branch_merged_into_base(root, branch_commit, base_sha):
     return merged.returncode == 0
 
 
+def closed_pull_request_merged(repo, base, owner, branch, branch_commit):
+    closed = github_paged(
+        f"/repos/{repo}/pulls?state=closed&base={base}&head={owner}:{branch}"
+    )
+    return any(
+        pull.get("merged_at")
+        and (pull.get("head") or {}).get("sha") == branch_commit
+        for pull in closed
+    )
+
+
 def remote_pin_versions(root, commit):
     versions = {}
     for path in (PYPI_PIN, NUGET_PIN):
@@ -349,7 +360,10 @@ def update_pull_request(root, version, changes, source_build_id):
                 f"PR #{number} untouched."
             )
             return number
-        if not branch_merged_into_base(root, remote_commit, base_sha):
+        merged = closed_pull_request_merged(
+            repo, base, owner, BRANCH, remote_commit
+        ) or branch_merged_into_base(root, remote_commit, base_sha)
+        if not merged:
             raise RuntimeError(
                 f"origin/{BRANCH} carries maintainer commits, has no open PR, and "
                 f"is not merged into origin/{base}; delete or rename that branch "

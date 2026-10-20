@@ -471,7 +471,12 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
         bump, "remote_branch_state", return_value=(False, None, None, True)
     ), patch.object(
-        bump, "github_paged", return_value=[]
+        bump,
+        "github_paged",
+        side_effect=[
+            [],
+            [{"merged_at": None, "head": {"sha": "theirsha"}}],
+        ],
     ), patch.object(
         bump, "github_api",
         return_value=(201, {"number": 700, "html_url": "https://example/700"}),
@@ -662,9 +667,19 @@ def test_closed_merged_maintainer_branch_is_recreated(tmp_path):
         "remote_branch_state",
         return_value=(True, "theirsha", "theirtree", False),
     ), patch.object(
-        bump, "github_paged", return_value=[]
+        bump,
+        "github_paged",
+        side_effect=[
+            [],
+            [
+                {
+                    "merged_at": "2026-10-20T00:00:00Z",
+                    "head": {"sha": "theirsha"},
+                }
+            ],
+        ],
     ), patch.object(
-        bump, "branch_merged_into_base", return_value=True
+        bump, "branch_merged_into_base", return_value=False
     ), patch.object(
         bump,
         "github_api",
@@ -679,6 +694,30 @@ def test_closed_merged_maintainer_branch_is_recreated(tmp_path):
             lambda root: ["mssql-py-core/pyproject.toml"],
         ) == 725
     assert any(args[0] == "push" for args in calls)
+
+
+def test_closed_pr_for_different_branch_sha_does_not_allow_recreation(tmp_path):
+    with patch.object(
+        bump,
+        "remote_branch_state",
+        return_value=(True, "current-sha", "theirtree", False),
+    ), patch.object(
+        bump,
+        "github_paged",
+        side_effect=[
+            [],
+            [
+                {
+                    "merged_at": "2026-10-20T00:00:00Z",
+                    "head": {"sha": "older-sha"},
+                }
+            ],
+        ],
+    ), patch.object(
+        bump, "branch_merged_into_base", return_value=False
+    ):
+        with pytest.raises(RuntimeError, match="delete or rename"):
+            bump.inspect_bump_branch(tmp_path, bump.PYTHON_BRANCH, "base")
 
 
 @pytest.mark.parametrize(

@@ -468,6 +468,17 @@ def branch_merged_into_base(root, branch_commit, base_sha):
     return merged.returncode == 0
 
 
+def closed_pull_request_merged(repo, base, owner, branch, branch_commit):
+    closed = github_paged(
+        f"/repos/{repo}/pulls?state=closed&base={base}&head={owner}:{branch}"
+    )
+    return any(
+        pull.get("merged_at")
+        and (pull.get("head") or {}).get("sha") == branch_commit
+        for pull in closed
+    )
+
+
 def managed_paths_changed(root, remote_commit, paths):
     compared = git_try(root, "diff", "--quiet", remote_commit, "HEAD", "--", *paths)
     if compared.returncode not in (0, 1):
@@ -489,7 +500,10 @@ def inspect_bump_branch(root, branch, base_sha):
         f"/repos/{repo}/pulls?state=open&base={base}&head={owner}:{branch}"
     )
     if exists and not owned and not existing:
-        if not branch_merged_into_base(root, remote_commit, base_sha):
+        merged = closed_pull_request_merged(
+            repo, base, owner, branch, remote_commit
+        ) or branch_merged_into_base(root, remote_commit, base_sha)
+        if not merged:
             raise RuntimeError(
                 f"origin/{branch} carries maintainer commits, has no open PR, and "
                 f"is not merged into origin/{base}; delete or rename that branch "

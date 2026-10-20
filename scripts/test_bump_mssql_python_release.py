@@ -241,7 +241,12 @@ def test_closed_unmerged_maintainer_branch_requires_cleanup(tmp_path):
     ), patch.object(
         bump, "remote_branch_state", return_value=(True, "their-sha", False)
     ), patch.object(
-        bump, "github_paged", return_value=[]
+        bump,
+        "github_paged",
+        side_effect=[
+            [],
+            [{"merged_at": None, "head": {"sha": "their-sha"}}],
+        ],
     ), patch.object(
         bump, "branch_merged_into_base", return_value=False
     ), patch.object(
@@ -277,9 +282,19 @@ def test_closed_merged_maintainer_branch_is_recreated(tmp_path):
             {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
         ],
     ), patch.object(
-        bump, "github_paged", return_value=[]
+        bump,
+        "github_paged",
+        side_effect=[
+            [],
+            [
+                {
+                    "merged_at": "2026-10-20T00:00:00Z",
+                    "head": {"sha": "their-sha"},
+                }
+            ],
+        ],
     ), patch.object(
-        bump, "branch_merged_into_base", return_value=True
+        bump, "branch_merged_into_base", return_value=False
     ), patch.object(
         bump, "ensure_issue", return_value=42
     ), patch.object(
@@ -292,6 +307,45 @@ def test_closed_merged_maintainer_branch_is_recreated(tmp_path):
             "123",
         ) == 100
     assert any(args[0] == "push" for args in calls)
+
+
+def test_closed_pr_for_different_branch_sha_does_not_allow_recreation(tmp_path):
+    target_repo(tmp_path)
+    with patch.object(
+        bump,
+        "git",
+        side_effect=[
+            subprocess.CompletedProcess("git", 0),
+            subprocess.CompletedProcess("git", 0, stdout="base\n"),
+        ],
+    ), patch.object(
+        bump,
+        "remote_pin_versions",
+        return_value={bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+    ), patch.object(
+        bump, "remote_branch_state", return_value=(True, "current-sha", False)
+    ), patch.object(
+        bump,
+        "github_paged",
+        side_effect=[
+            [],
+            [
+                {
+                    "merged_at": "2026-10-20T00:00:00Z",
+                    "head": {"sha": "older-sha"},
+                }
+            ],
+        ],
+    ), patch.object(
+        bump, "branch_merged_into_base", return_value=False
+    ):
+        with pytest.raises(RuntimeError, match="delete or rename"):
+            bump.update_pull_request(
+                tmp_path,
+                "0.4.0",
+                {bump.PYPI_PIN: ("0.3.0", "0.4.0")},
+                "123",
+            )
 
 
 def test_missing_remote_branch_is_distinguished_from_fetch_failure(tmp_path):
