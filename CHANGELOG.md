@@ -67,14 +67,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   a rejected or incomplete response, or one with no FEATUREEXTACK at all,
   leaves the cache unchanged (AB#49294).
 
+- `mssql-tds`: Enhanced Routing. LOGIN7 always advertises feature extension
+  `0x0F`, as msodbcsql does, and the client follows ENVCHANGE type 21 to the
+  routed server and logs in to the routed database. A type 21 route without
+  an Enhanced Routing acknowledgement of 1 fails the login, matching msodbcsql
+  (AB#49295).
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
 
-- `mssql-tds`: a routing ENVCHANGE during login now redirects once the rest of
-  the login response has been read through DONE, as MS-TDS requires, rather
-  than immediately. A malformed or truncated response after the routing token
-  now fails the login instead of being skipped (AB#49294).
+- `mssql-tds`: `Error::Redirection` has a new `database` field, set when the
+  server routes the connection with Enhanced Routing. Routing ENVCHANGEs are
+  now acted on after the whole login response is read rather than mid-stream.
+  A routing ENVCHANGE (type 20 or 21) must follow LOGINACK and be the only one
+  in the login response ([MS-TDS] 2.2.7.9); otherwise the login fails with a
+  protocol error instead of following a route, matching msodbcsql.
+  Both routing types now validate the token and routing-data lengths, empty
+  old value, TCP protocol, non-zero port, and bounded server name before
+  continuing to the next token. A malformed or truncated response after the
+  routing token fails the login instead of being skipped (AB#49294).
 
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,
@@ -146,6 +158,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-tds`: a route received over shared memory, the first transport tried
+  for a local named instance, is now followed over TCP like a route received
+  over any other transport. The connection previously failed with
+  `Error::Redirection`. A failed routed connection now returns the target's
+  error without retrying the gateway or falling back to SSRP, matching
+  msodbcsql. Retries before receiving a route are unchanged.
 
 - `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
   zero payload length now decodes as empty instead of NULL (AB#49220). In the
