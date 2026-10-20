@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Python bulk copy adapter for zero-copy TDS streaming.
+//! Python bulk copy adapter for streaming rows into TDS bulk load.
 //!
-//! This module provides adapters that bridge Python data to the zero-copy
-//! BulkLoadRow trait, enabling direct serialization to TDS packets without
-//! intermediate allocations.
+//! This module provides adapters that bridge Python data to the `BulkLoadRow`
+//! trait. Each row is materialized once into a temporary `Vec<ColumnValues>`
+//! while the GIL is held, then written to the TDS packet after the GIL is
+//! released; rows are not buffered at the batch level.
 
 use std::sync::Arc;
 
@@ -98,11 +99,11 @@ impl SourcePythonType {
     }
 }
 
-/// Adapter that wraps a Python tuple for zero-copy bulk insert.
+/// Adapter that wraps a Python tuple for bulk insert.
 ///
-/// This struct implements the `BulkLoadRow` trait, allowing Python tuples
-/// to be serialized directly to TDS packets without allocating intermediate
-/// Vec<ColumnValues>. The GIL is acquired only when reading Python values.
+/// This struct implements the `BulkLoadRow` trait. Each row's Python values
+/// are converted into one temporary `Vec<ColumnValues>` while the GIL is held,
+/// so the GIL can be released before the async packet writes.
 ///
 /// When destination metadata is provided, the adapter will attempt to perform
 /// type conversions (e.g., string to int) to match the target column types.
