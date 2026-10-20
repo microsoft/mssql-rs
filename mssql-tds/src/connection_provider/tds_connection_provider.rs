@@ -34,6 +34,18 @@ use std::sync::LazyLock;
 pub(crate) static PARSER_REGISTRY: LazyLock<GenericTokenParserRegistry> =
     LazyLock::new(GenericTokenParserRegistry::default);
 
+/// Redirects one login may follow before it fails.
+const MAX_REDIRECTS: u32 = 10;
+
+/// What a completed login yields, ready to become a [`TdsClient`].
+type ConnectionParts = (
+    AnyTransport,
+    crate::handler::handler_factory::NegotiatedSettings,
+    crate::connection::execution_context::ExecutionContext,
+    Vec<SqlInfoMessage>,
+    Vec<SessionStateToken>,
+);
+
 /// Factory for establishing TDS connections and producing [`TdsClient`] instances.
 pub struct TdsConnectionProvider;
 
@@ -165,6 +177,7 @@ impl TdsConnectionProvider {
                 1.. => Some(Instant::now() + Duration::from_secs(login_timeout.into())),
                 _ => None,
             };
+            let mut redirect_count = 0;
 
             // Try Shared Memory before SSRP for local named instances (Windows only).
             // SM doesn't need instance resolution — it uses the name directly.
@@ -191,7 +204,9 @@ impl TdsConnectionProvider {
                     },
                     None => connect_future.await,
                 };
-                match sm_result {
+                // A route received over shared memory is followed over TCP like
+                // any other, instead of surfacing as a permanent failure below.
+                match Self::follow_redirects(context, sm_result, deadline, &mut redirect_count).await {
                     Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                         debug!("Shared Memory connection succeeded, skipping SSRP");
                         let mut client = TdsClient::new(
@@ -205,15 +220,15 @@ impl TdsConnectionProvider {
                         return Ok(client);
                     }
                     Err(err) => {
-                        // Only transient (transport-level) shared-memory failures
-                        // fall through to SSRP/TCP. A definitive failure — e.g. the
+                        // Only transient failures before routing fall through to
+                        // SSRP/TCP. A definitive failure — e.g. the
                         // user cancelled interactive sign-in (`AuthenticationDenied`)
                         // or the login was rejected — would recur on every transport,
                         // and falling through would relaunch the interactive browser.
                         // Surface it immediately.
-                        if !err.is_transient_connect_error() {
+                        if redirect_count > 0 || !err.is_transient_connect_error() {
                             debug!(
-                                "Shared Memory failed permanently ({}), not falling through",
+                                "Shared Memory login or routed connection failed ({}), not falling through",
                                 err
                             );
                             return Err(err);
@@ -351,9 +366,6 @@ impl TdsConnectionProvider {
                     break;
                 }
 
-                let mut redirect_count = 0;
-                let max_redirects = 10;
-
                 // Try each transport context in order
                 for (transport_ctx, _action_timeout_ms) in &transport_contexts {
                     debug!("Attempt {}: connecting with {:?}", attempt, transport_ctx);
@@ -372,7 +384,7 @@ impl TdsConnectionProvider {
 
                     // Recompute remaining time budget before each timeout call
                     let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
-                    let mut connection_result = match remaining {
+                    let connection_result = match remaining {
                         Some(remaining) => {
                             match timeout(remaining, connect_future).await {
                                 Ok(result) => result,
@@ -384,64 +396,29 @@ impl TdsConnectionProvider {
                         None => connect_future.await,
                     };
 
-                    // Handle redirections
-                    loop {
-                        match connection_result {
-                            Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
-                                debug!("Connection successful via action chain");
-                                let mut client = TdsClient::new(
-                                    transport,
-                                    negotiated_settings,
-                                    execution_context,
-                                    context.clone(),
-                                    session_state_tokens,
-                                );
-                                client.extend_info_messages(info_messages);
-                                return Ok(client);
-                            }
-                            Err(Error::Redirection { host, port }) => {
-                                info!("Redirection to: {:?}, {:?}", host, port);
-                                redirect_count += 1;
-                                if redirect_count > max_redirects {
-                                    return Err(Error::ProtocolError(
-                                        "Received more redirection tokens than expected.".to_string(),
-                                    ));
-                                }
+                    match Self::follow_redirects(&context, connection_result, deadline, &mut redirect_count).await {
+                        Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
+                            debug!("Connection successful via action chain");
+                            let mut client = TdsClient::new(
+                                transport,
+                                negotiated_settings,
+                                execution_context,
+                                context.clone(),
+                                session_state_tokens,
+                            );
+                            client.extend_info_messages(info_messages);
+                            return Ok(client);
+                        }
+                        Err(err) => {
+                            debug!("Connection attempt failed: {}", err);
 
-                                let tcp_transport_context = TransportContext::from_routing_token(host, port);
-                                let redirect_future = Self::connect_with_transport_context(
-                                    &context,
-                                    &tcp_transport_context,
-                                    None,
-                                );
-                                // Recompute remaining time budget for redirected connect
-                                let remaining = deadline
-                                    .map(|dl| dl.saturating_duration_since(Instant::now()));
-                                connection_result = match remaining {
-                                    Some(remaining) => {
-                                        match timeout(remaining, redirect_future).await {
-                                            Ok(result) => result,
-                                            Err(_) => Err(TimeoutError(
-                                                TimeoutErrorType::String(
-                                                    "Timeout while connecting".to_string(),
-                                                ),
-                                            )),
-                                        }
-                                    }
-                                    None => redirect_future.await,
-                                };
+                            // A routed failure is terminal, as in msodbcsql's
+                            // OpenOrRedirectConnection; do not restart the gateway.
+                            if redirect_count > 0 || !err.is_transient_connect_error() {
+                                return Err(err);
                             }
-                            Err(err) => {
-                                debug!("Connection attempt failed: {}", err);
 
-                                // Permanent errors should not be retried
-                                if !err.is_transient_connect_error() {
-                                    return Err(err);
-                                }
-
-                                last_error = Some(err);
-                                break;
-                            }
+                            last_error = Some(err);
                         }
                     }
                 }
@@ -547,6 +524,63 @@ impl TdsConnectionProvider {
         Ok(())
     }
 
+    /// Follows routing ENVCHANGEs until a login completes or fails for another
+    /// reason. The shared-memory shortcut and the transport loop both hand
+    /// their login here, so a route is honored whichever transport carried it
+    /// (msodbcsql `OpenOrRedirectConnection`). `redirect_count` spans the
+    /// entire login, including the shared-memory shortcut.
+    async fn follow_redirects(
+        context: &ClientContext,
+        mut result: TdsResult<ConnectionParts>,
+        deadline: Option<Instant>,
+        redirect_count: &mut u32,
+    ) -> TdsResult<ConnectionParts> {
+        while let Err(Error::Redirection {
+            host,
+            port,
+            database,
+        }) = result
+        {
+            info!(
+                "Redirection to: {:?}, {:?}, database: {:?}",
+                host, port, database
+            );
+            *redirect_count += 1;
+            if *redirect_count > MAX_REDIRECTS {
+                return Err(Error::ProtocolError(
+                    "Received more redirection tokens than expected.".to_string(),
+                ));
+            }
+
+            let tcp_transport_context = TransportContext::from_routing_token(host, port);
+            // Enhanced Routing names the database for this hop; plain routing
+            // logs in to the original one (msodbcsql
+            // `CRoutingInfo::UpdateLoginStruct`).
+            let routed_context = database.map(|database| {
+                let mut routed = Box::new(context.clone());
+                routed.database = database;
+                routed
+            });
+            let redirect_future = Self::connect_with_transport_context(
+                routed_context.as_deref().unwrap_or(context),
+                &tcp_transport_context,
+                None,
+            );
+            // Recompute remaining time budget for redirected connect
+            let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
+            result = match remaining {
+                Some(remaining) => match timeout(remaining, redirect_future).await {
+                    Ok(result) => result,
+                    Err(_) => Err(TimeoutError(TimeoutErrorType::String(
+                        "Timeout while connecting".to_string(),
+                    ))),
+                },
+                None => redirect_future.await,
+            };
+        }
+        result
+    }
+
     /// Creates a new connection from the given transport context.
     /// This method will create a new transport and execute the session handler.
     /// If the session handler returns a redirection token, this method will return an error.
@@ -556,13 +590,7 @@ impl TdsConnectionProvider {
         context: &ClientContext,
         transport_context: &TransportContext,
         recovery_data: Option<Box<SessionRecoveryData>>,
-    ) -> TdsResult<(
-        AnyTransport,
-        crate::handler::handler_factory::NegotiatedSettings,
-        crate::connection::execution_context::ExecutionContext,
-        Vec<SqlInfoMessage>,
-        Vec<SessionStateToken>,
-    )> {
+    ) -> TdsResult<ConnectionParts> {
         if let Some(trace) = &context.connection_trace {
             trace.begin_transport_attempt();
         }

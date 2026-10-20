@@ -20,18 +20,18 @@
 # Caller contract:
 #   * The dependent test job must NOT add `dependsOn` on this job.
 #   * The dependent test job must call sql-host/poll-for-endpoint.sh with
-#     ARTIFACT_NAME='sql-ready-<instanceId>-$(System.StageAttempt)' before it
+#     ARTIFACT_NAME='sql-ready-<instanceId>-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)' before it
 #     tries to connect.
 #   * The dependent test job must publish a pipeline artifact whose name is
-#     '<sentinel>-$(System.StageAttempt)', where <sentinel> is listed in
+#     '<sentinel>-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)', where <sentinel> is listed in
 #     `expectedSentinels`, once it has finished using the SQL host (use
 #     `condition: always()` so cancellations and failures still release the
 #     host). The `-$(System.StageAttempt)` suffix namespaces the rendezvous per
 #     stage attempt so reruns don't collide with or match prior attempts; this
 #     job appends the same suffix to `expectedSentinels` via SENTINEL_SUFFIX.
-#   * The SA password is derived deterministically from build context by
-#     sql-host/derive-sql-password.sh, so the same script must be invoked
-#     in the dependent test job to recompute the same value.
+#   * The stage must depend directly on successful InitializeValidation.
+#     Host and consumers import its secret output, never regenerate it.
+#     The nonsecret generation ID isolates artifacts after reinitialization.
 #
 # Cross-pool reachability assumption: the configured x64 pool and the ARM
 # pool that consumes the endpoint share a VNet, and the IP we publish is
@@ -73,6 +73,8 @@ jobs:
       demands:
         - ${{ parameters.poolImageOverride }}
     variables:
+      SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
+      SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       INSTANCE_ID: ${{ parameters.instanceId }}
       SQL_IMAGE_TAG: ${{ parameters.sqlImageTag }}
       EXPECTED_SENTINELS: ${{ parameters.expectedSentinels }}
@@ -80,12 +82,12 @@ jobs:
     steps:
       - bash: |
           set -euo pipefail
-          bash .pipeline/scripts/sql-host/derive-sql-password.sh
-        displayName: 'Derive shared SQL_PASSWORD from build context'
+          bash .pipeline/scripts/sql-host/import-sql-password.sh
+        displayName: 'Import shared SQL credential'
         workingDirectory: '$(Build.SourcesDirectory)'
         env:
-          BUILD_BUILDID: $(Build.BuildId)
-          SYSTEM_COLLECTIONID: $(System.CollectionId)
+          SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
+          SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
 
       - task: DockerInstaller@0
         inputs:
@@ -104,6 +106,7 @@ jobs:
         workingDirectory: '$(Build.SourcesDirectory)'
         env:
           SQL_PASSWORD: $(SQL_PASSWORD)
+          SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
           INSTANCE_ID: $(INSTANCE_ID)
           SQL_IMAGE_TAG: $(SQL_IMAGE_TAG)
           BUILD_ARTIFACTSTAGINGDIRECTORY: $(Build.ArtifactStagingDirectory)
@@ -125,7 +128,7 @@ jobs:
           # artifact name instead of colliding with the prior attempt's, and
           # the paired poll-for-endpoint reads this attempt's endpoint (not a
           # stale one). Consumers append the same $(System.StageAttempt).
-          artifact: 'sql-ready-$(INSTANCE_ID)-$(System.StageAttempt)'
+          artifact: 'sql-ready-$(INSTANCE_ID)-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
           publishLocation: 'pipeline'
 
       - script: |
@@ -138,7 +141,7 @@ jobs:
           # Wait on this stage attempt's teardown sentinels (publishers suffix
           # their artifact names with the same value), so a rerun never matches
           # a previous attempt's leftover sentinels.
-          SENTINEL_SUFFIX: '-$(System.StageAttempt)'
+          SENTINEL_SUFFIX: '-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
           BUILD_BUILDID: $(Build.BuildId)
           SYSTEM_COLLECTIONURI: $(System.CollectionUri)
           SYSTEM_TEAMPROJECT: $(System.TeamProject)

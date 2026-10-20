@@ -30,7 +30,14 @@ def load_template(name):
     return yaml.safe_load((_TEMPLATES / name).read_text(encoding="utf-8"))
 
 
-def test_version_bump_tests_run_in_shared_validation():
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "scripts/test_bump_released_crate_versions.py",
+        "scripts/test_validation_pipeline.py",
+    ],
+)
+def test_pipeline_tests_run_in_shared_validation(selector):
     stages = load_template("validation-stages.yml")["stages"]
     build = next(stage for stage in stages if stage["stage"] == "Build")
     windows = next(job for job in build["jobs"] if job.get("job") == "Build_Windows")
@@ -39,9 +46,40 @@ def test_version_bump_tests_run_in_shared_validation():
         if step.get("displayName") == "Unit test packaging scripts and pipeline configuration"
     )
     command = next(line for line in step["pwsh"].splitlines() if "python -m pytest" in line)
-    assert "scripts/test_bump_released_crate_versions.py" in command.split()
+    assert selector in command.split()
     assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)
+
+
+@pytest.mark.parametrize(
+    ("service", "ports"),
+    [
+        ("dc", ["8053:53/tcp", "8053:53/udp", "8888:88/tcp", "8888:88/udp",
+                "8389:389", "8636:636"]),
+        ("mssql", ["1433:1433"]),
+    ],
+)
+def test_kerberos_matrix_preserves_ports_on_loopback(service, ports):
+    compose = yaml.safe_load(
+        (_ROOT / "kerberos-test" / "docker-compose-matrix.yml").read_text(encoding="utf-8")
+    )
+    assert compose["services"][service]["ports"] == [
+        f"127.0.0.1:{port}" for port in ports
+    ]
+
+
+def test_kerberos_matrix_only_publishes_infrastructure_on_loopback():
+    compose = yaml.safe_load(
+        (_ROOT / "kerberos-test" / "docker-compose-matrix.yml").read_text(encoding="utf-8")
+    )
+    published = {
+        name: service["ports"]
+        for name, service in compose["services"].items() if service.get("ports")
+    }
+    assert set(published) == {"dc", "mssql"}
+    for service, ports in published.items():
+        for port in ports:
+            assert isinstance(port, str) and port.startswith("127.0.0.1:"), (service, port)
 
 
 @pytest.mark.parametrize(
@@ -295,13 +333,14 @@ def test_pin_validation_is_not_path_filtered_or_optional():
     assert "pr" not in pipeline
     stages = load_template("validation-stages.yml")["stages"]
     stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
-    assert stage["dependsOn"] == ["EvaluateDuplicate"]
+    assert stage["dependsOn"] == ["InitializeValidation"]
     assert stage["condition"] == (
         "and(not(canceled()), "
+        "eq(dependencies.InitializeValidation.result, 'Succeeded'), "
         "eq('${{ parameters.RunFuzz }}', 'false'), "
         "eq('${{ parameters.RunLongHaul }}', 'false'), "
         "or(ne(variables['Build.Reason'], 'PullRequest'), "
-        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))"
+        "ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true')))"
     )
     for job in stage["jobs"]:
         assert "condition" not in job
@@ -413,6 +452,48 @@ def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_
     assert f"passed: {2 if pytest_exit == 0 else 1} |" in result.stdout
     assert f"harness errors: {int(runner_exit == 2)}" in result.stdout
     assert len(list((tmp_path / "test-results").glob("*.xml"))) == 2
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [("", None), ("PYTEST_MARK_EXPR='not slow'", "not slow"), ("PYTEST_MARK_EXPR=''", "")],
+)
+def test_odbc_runner_forwards_marker_expression(tmp_path, env, expected):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").touch()
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    (tmp_path / "runner.sh").write_text(runner.read_text(encoding="utf-8"), newline="\n")
+    script = f"""
+    python() {{ return 0; }}
+    timeout() {{ printf '%s\\n' "$@" > "$PWD/args"; }}
+    {env} MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
+    """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name, "./runner.sh", "."],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (tmp_path / "args").read_text(encoding="utf-8").splitlines()
+    pytest_args = args[args.index("tests/test_a.py"):]
+    if expected is None:
+        assert "-m" not in pytest_args
+    else:
+        assert pytest_args[pytest_args.index("-m") + 1] == expected
+
+
+def test_mssql_python_odbc_job_includes_non_slow_stress_tests():
+    template = load_template("test-mssql-python-odbc-template.yml")
+    params = {p["name"]: p["default"] for p in template["parameters"]}
+    assert params["pytestMarker"] == "not slow"
+    step = next(
+        step for step in template["steps"]
+        if step.get("displayName") == "Run mssql-python tests against mssql-odbc"
+    )
+    assert 'PYTEST_MARK_EXPR="${{ parameters.pytestMarker }}"' in step["script"]
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")

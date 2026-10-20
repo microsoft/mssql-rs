@@ -21,6 +21,7 @@
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
 #include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 
 #include <string>
 
@@ -49,7 +50,204 @@ protected:
         return SQLBindParameter(hstmt, ordinal, SQL_PARAM_INPUT, SQL_C_SLONG,
                                 SQL_INTEGER, 0, 0, value, 0, indicator);
     }
+
+    SQLRETURN CancelIdleStatement() {
+        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+        const auto rc = SQLCancel(stmt_);
+        EXPECT_EQ(SQL_SUCCESS, rc);
+        SQLTCHAR state[6] = {};
+        SQLTCHAR message[256] = {};
+        EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRec(
+            SQL_HANDLE_STMT, stmt_, 1, state, nullptr, message,
+            static_cast<SQLSMALLINT>(sizeof(message) / sizeof(message[0])), nullptr));
+        return rc;
+    }
 };
+
+// Benefits-from-mock-tds: cancel.rs pins cursor reset and drain errors; this
+// checks connection reuse and the Driver Manager's suppression of 01S05.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelReleasesConnectionLikeFreeStmtClose) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    Log("SQL_DRIVER_VER=" + std::string(reinterpret_cast<const char*>(version)));
+    const auto token = 1000 + Worker() * 100 + Iteration();
+    const auto query = "SELECT " + std::to_string(token) +
+                      " + n FROM (VALUES (1), (2), (3)) AS v(n) ORDER BY n";
+    SQLHSTMT other = AllocStmt();
+    for (bool cancel : {false, true}) {
+        for (int fetched : {0, 1, 3}) {
+            SCOPED_TRACE(::testing::Message() << "cancel=" << cancel << ", fetched=" << fetched);
+            ASSERT_SQL_OK(Run(stmt_, query), SQL_HANDLE_STMT, stmt_);
+            for (int row = 0; row < fetched; ++row) {
+                ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+            if (fetched < 3) {
+                ASSERT_EQ(SQL_ERROR, Run(other, "SELECT 42"));
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, other, "HY000");
+            } else {
+                ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            }
+            ASSERT_SQL_OK(cancel ? CancelIdleStatement() : SQLFreeStmt(stmt_, SQL_CLOSE),
+                          SQL_HANDLE_STMT, stmt_);
+            {
+                // These errors live in the DM's list, whose next-call cleanup
+                // occurs before unixODBC takes its statement lock.
+                std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+                SQLSMALLINT columns = -1;
+                EXPECT_EQ(SQL_ERROR, SQLNumResultCols(stmt_, &columns));
+                EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+                SQLULEN timeout = 0;
+                ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, &timeout, 0, nullptr),
+                              SQL_HANDLE_STMT, stmt_);
+            }
+            ASSERT_SQL_OK(Run(other, "SELECT " + std::to_string(token)),
+                          SQL_HANDLE_STMT, other);
+            ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+            SQLINTEGER value = 0;
+            ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                          SQL_HANDLE_STMT, other);
+            EXPECT_EQ(token, value);
+            ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+        }
+    }
+}
+
+// Benefits-from-mock-tds: verify reuse of the server prepare handle as well as
+// the observable preservation of the plan and application bindings.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelPreservesPreparedStatementAndBindings) {
+    SQLINTEGER parameter = 1000 + Worker() * 100 + Iteration();
+    SQLLEN indicator = 0;
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? FROM (VALUES (1), (2), (3)) AS v(n)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &indicator), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(parameter, value);
+        ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+        ++parameter;
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: cancel.rs pins ATTENTION and its acknowledgement;
+// this additionally proves cancellation prevents the delayed server-side write.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsDelayedBatchTail) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #idle_cancel_tail(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(Run(stmt_,
+        "SELECT REPLICATE('x',4000) FROM (VALUES(1),(2),(3)) AS v(n); "
+        "WAITFOR DELAY '00:00:05'; INSERT #idle_cancel_tail VALUES(1)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+    const auto cancelling = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_tail"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_tail"), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: CursorPhase::IdlePlp pins ATTENTION settlement;
+// this verifies partial MAX-value cancellation against the live server.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsPartiallyReadPlp) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #idle_cancel_plp(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    const auto token = WorkerToken("plp");
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(Run(stmt_, "SELECT REPLICATE(CAST('" + token +
+        "' AS varchar(max)),16000); WAITFOR DELAY '00:00:05'; "
+        "INSERT #idle_cancel_plp VALUES(1)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    std::vector<char> prefix(token.size() + 1);
+    SQLLEN length = 0;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_CHAR, prefix.data(),
+                         static_cast<SQLLEN>(prefix.size()), &length));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(token, std::string(prefix.data()));
+    EXPECT_TRUE(length == SQL_NO_TOTAL || length > static_cast<SQLLEN>(token.size()));
+    ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+
+    const auto cancelling = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_plp"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_plp"), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: close_cursor.rs pins unpublished completion after
+// wire exhaustion; this checks the application's parameter-array outputs.
+ODBC_TEST_F(ConnectionBusyLiveTest, ClosingFetchedParameterArrayPublishesCompletion) {
+    SQLINTEGER values[] = {1000 + Worker() * 100 + Iteration(), 2000 + Worker() * 100 + Iteration()};
+    SQLLEN indicators[] = {0, 0};
+    SQLUSMALLINT statuses[] = {SQL_PARAM_UNUSED, SQL_PARAM_UNUSED};
+    SQLULEN processed = 0;
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? AS n"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                reinterpret_cast<SQLPOINTER>(2), 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, statuses, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                  0, 0, values, sizeof(values[0]), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        for (int set = 0; set < 2; ++set) {
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            SQLINTEGER value = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(values[set], value);
+            ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            if (set == 0) {
+                ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2u, processed);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, statuses[0]);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, statuses[1]);
+    }
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}
 
 // A first execution of a prepared statement uses sp_prepexec. Its output
 // handle trails the row result on the wire, but it is part of the same RPC

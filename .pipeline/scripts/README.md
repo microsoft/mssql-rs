@@ -7,11 +7,20 @@ This directory contains scripts used by the Azure DevOps pipeline to configure a
 Boots a SQL Server docker container on an x64 1ES agent so ARM test jobs can
 run against a real SQL Server without depending on a static (ACI) IP address.
 The SQL host job and the ARM test jobs run concurrently and rendezvous through
-pipeline-artifact sentinels; the SA password is derived deterministically from
-the build context so no secret is transported between jobs.
+pipeline-artifact sentinels. `InitializeValidation` generates a cryptographically
+random SA password once and exposes it only as a secret-marked output variable.
+Only cross-pool SQL jobs map that output via `stageDependencies`; standalone
+SQL jobs retain job-local random passwords.
 
-- **start.sh** — Receives the SA password (derived by `derive-sql-password.sh`
-  in the YAML templates), generates certs (adding the host's private VNet IPv4
+- **generate-shared-password.py** — Runs in `InitializeValidation.Initialize`
+  after the PR duplicate check (CI explicitly reports nonduplicate). Produces
+  a SQL-policy prefix plus 192 random bits and an independent nonsecret
+  generation ID. RNG failure fails initialization; there is no fallback.
+- **import-sql-password.sh / Import-SqlPassword.ps1** — Validate explicitly
+  mapped `SHARED_SQL_PASSWORD` and `SQL_CREDENTIAL_GENERATION`, then establish
+  the job's secret `SQL_PASSWORD` and `SQL_PASSWORD_GENERATED` marker. Missing,
+  unresolved, or malformed outputs fail without regenerating a password.
+- **start.sh** — Receives the imported SA password, generates certs (adding the host's private VNet IPv4
   as an extra SAN via `EXTRA_IP_SAN`), starts the SQL container, and publishes
   the `sql-ready-<instanceId>` sentinel carrying the endpoint plus
   `ca.crt`/`mssql.pem`.
@@ -20,9 +29,133 @@ the build context so no secret is transported between jobs.
   once every expected sentinel has been published.
 - **teardown.sh** — Stops and removes the SQL container and network.
 
+Endpoint and teardown artifacts are namespaced by the nonsecret generation ID
+and stage attempt. Endpoints also carry the generation ID; both Linux and
+Windows pollers reject a mismatch before exposing the endpoint. Artifacts never
+contain the credential. Rerun the entire consuming stage to restart its host
+alongside tests, retaining the original initialization output. Do not rerun
+initialization while consumers are active; queue a new run when reinitializing.
+Local tests cover the contract, not Azure Pipelines' output retention or masking
+on retries; those require a scoped live validation.
+
+`scripts/test_shared_sql_credentials.py` runs in both the Windows packaging
+checks and a focused Linux build-job step. The suite requires PowerShell on
+Windows and Bash on Linux, so a missing native shell fails rather than silently
+skipping that platform's executable regressions. The other platform's shell
+cases may skip when its interpreter is unavailable.
+
 See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
+
+### docker-cargo-run.sh
+
+Wraps `docker run` and forwards the `MSSQL_RS_PUBLIC` and `MSSQL_RS` Cargo feed
+tokens with `cargo:token` providers only for non-PR execution. Azure Pipelines
+automatically supplies `BUILD_REASON`; `PullRequest` removes both feeds' token
+and provider variables from the Docker process environment and adds no Cargo
+credential arguments. Other reasons (or an unset reason for local use) retain
+authenticated forwarding for each populated token. Absent, empty, or unresolved
+Azure `$(...)` token values are omitted, including their providers. No token
+values, lengths, or presence diagnostics are logged.
+
+PR-only callers must not map feed secrets into their step environments. Shared
+PR/CI callers gate those mappings with
+`${{ if ne(variables['Build.Reason'], 'PullRequest') }}`; Cargo authentication and
+CI feed configuration are already non-PR-only. This wrapper is not a sandbox
+against arbitrary PR code, caller-supplied Docker arguments, mounted credentials,
+or credentials inherited from an agent. Keeping live feed secrets out of PR jobs,
+isolating agents, and limiting service-token permissions remain deployment
+requirements. Actual PR secret availability and live permissions have not been
+verified by this hardening.
+
+Run the mocked-Docker and template-gating regression tests without Docker or feed
+access using `python -m pytest scripts/test_docker_cargo_run.py -q` (Bash required).
+The Linux validation job enforces these executable tests; Windows runs the
+template checks and skips executable cases only when Bash is not installed.
+
+### stamp-crate-versions.ps1
+
+Stamps the selected crates (by default `mssql-tds` and `mssql-mock-tds`) from the
+first selected crate's source version and aligns the mock crate's inline
+`mssql-tds` dependency. Official builds retain the source SemVer, including
+prerelease/build metadata. Non-official scheduled builds append
+`-nightly.YYYYMMDD`; other non-official builds append `-dev.YYYYMMDD.BuildId`.
+Existing prerelease suffixes are retained. Non-official source build metadata
+is rejected because appending after `+` would not create a prerelease.
+
+```powershell
+.\.pipeline\scripts\stamp-crate-versions.ps1 -BuildReason Manual -BuildId 123 -WhatIf
+```
+
+`BuildId` must be a positive ASCII decimal integer without leading zeroes, even
+on official/scheduled builds. `BuildReason` is an ASCII alphanumeric identifier
+starting with a letter (for example `Manual`, `PullRequest`, or `Schedule`).
+`IsOfficial` accepts only `True`/`False` (case insensitive). Crate directory names
+must be unique bare names containing ASCII letters, digits, `_` or `-`, starting
+with a letter or digit; paths/traversal are not supported. `RepositoryRoot` must
+not contain control characters or Azure logging commands.
+
+The script deliberately supports a restricted manifest layout, not arbitrary
+TOML: one bare `[package]` table with one bare `version` key containing a
+double-quoted, single-line SemVer. Core components must fit Cargo's unsigned
+64-bit representation. Duplicate declarations, inherited versions, quoted
+package keys/table names, multiline package strings and already stamped source
+versions fail explicitly. The mock crate requires one single-line inline
+`mssql-tds` entry in `[dependencies]`, with bare keys, no escaped values and one
+literal SemVer `version`; quoted keys and multiline strings in any of the mock
+crate's dependency sections (including dev/build and target-specific sections)
+are unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
+Quoted dependency-name segments in dependency subtable headers are also
+unsupported. Target table kinds must be bare (for example
+`[target.'cfg(windows)'.dev-dependencies]`, not a quoted `dev-dependencies`
+segment); the target selector itself may still be quoted. This restriction also
+applies to dependency subtables and escaped quoted table-kind spellings.
+Root keys must be bare, and package/dependency/target declarations must use
+explicit table headers rather than root dotted or inline assignments.
+Target-parent tables (`[target]` or `[target.'cfg(...)']`) may contain only comments
+and whitespace; put dependency declarations under their explicit dependency
+table headers. These checks do not apply to similarly named metadata keys.
+Package metadata arrays of tables (such as cargo-release replacement arrays)
+are supported; arrays of package/version, dependency, or target tables are not.
+Quoted target selectors may contain closing brackets, and quoted dependency
+paths may contain braces; these characters are not treated as table delimiters.
+Nested arrays and multiline strings are rejected across the entire manifest
+(including package metadata) before section extraction, so array elements or
+string contents cannot hide or impersonate declarations. Use ordinary strings
+for metadata examples rather than multiline TOML strings. One-dimensional
+arrays remain supported. Backslashes in single-quoted literal dependency paths
+are preserved; escape sequences in double-quoted dependency values remain
+unsupported.
+Triple-quote text inside ordinary strings or comments is preserved;
+only actual multiline-string delimiters are rejected.
+Multiline arrays in package fields or unrelated dependencies are supported, as
+are inline feature arrays and comments on table headers. Dependency declarations
+are counted only in dependency tables, not in features or metadata. Inline
+dependency fields are separated outside quoted strings and arrays, so a
+version-like substring inside a path is never treated as the version field.
+Renamed dependencies whose `package` is `mssql-tds` are rejected in inline and
+table forms, including dev/build and target-specific dependencies, rather than
+leaving an alias on an incompatible source requirement. Other renamed packages
+remain supported. Dependency field keys must be bare and dependency `package`
+names must be unescaped literals so alternate spellings cannot hide an alias.
+The reserved `mssql-tds` dependency key must not contain a `package` field: it
+must identify `mssql-tds` directly, never rename another package to that key.
+
+All selected source versions and planned replacements are validated before
+printing versions, emitting pipeline variables or writing any manifest. A
+validation failure in a later manifest leaves earlier manifests unchanged.
+This is preflight validation, not a filesystem transaction: an I/O failure
+during the write phase can still leave some files updated. `-WhatIf` performs
+the same validation without writing files or emitting pipeline variables.
+Rejected values are not echoed in validation errors. These checks harden
+release inputs and logging; they do not establish a pipeline trust boundary.
+
+The executable regression cases run in the existing release-test CI selector:
+
+```powershell
+python -m pytest scripts/test_release_pipeline.py -k crate_stamp -q
+```
 
 ### clone-mssql-python.sh
 
@@ -65,6 +198,14 @@ published, including failed tests.
 The ODBC runner treats per-file pytest exit 2 as a test failure because a driver
 import error can prevent collection. Pytest internal/usage errors (3/4) and
 command-launch failures remain harness errors.
+
+Upstream's `pytest.ini` deselects `stress`-marked tests by default. The ODBC job
+overrides that with `PYTEST_MARK_EXPR="not slow"` (template parameter
+`pytestMarker`), so the same pass also covers multithreaded load from 2 to 100
+threads, pool exhaustion, GIL release, and large result sets, under the same
+blocking policy as the rest of the suite. Only the `slow` tests, including the
+fixed 5-minute sustained-load test, are left out; `pytestMarker: ''` selects
+every test. Leaving `PYTEST_MARK_EXPR` unset keeps upstream's default.
 
 The macOS job owns the locally built Rust and source-matched ODBC wheels and
 installs upstream editable with `--no-deps`. Its `requirements.txt` supplies

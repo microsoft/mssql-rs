@@ -207,10 +207,12 @@ impl ExecutionContext {
                     context: "capture_change_property".to_string(),
                 })
             }
-            EnvChangeTokenSubType::Routing => Err(crate::error::Error::UnimplementedFeature {
-                feature: "Routing environment change".to_string(),
-                context: "capture_change_property".to_string(),
-            }),
+            EnvChangeTokenSubType::Routing | EnvChangeTokenSubType::EnhancedRouting => {
+                Err(crate::error::Error::UnimplementedFeature {
+                    feature: "Routing environment change".to_string(),
+                    context: "capture_change_property".to_string(),
+                })
+            }
             EnvChangeTokenSubType::Unknown(value) => {
                 // Log unknown environment change subtypes but don't fail
                 info!("Unknown environment change subtype: {}", value);
@@ -593,6 +595,7 @@ mod tests {
             EnvChangeTokenSubType::TransactionEnded,
             EnvChangeTokenSubType::UserInstanceName,
             EnvChangeTokenSubType::Routing,
+            EnvChangeTokenSubType::EnhancedRouting,
         ];
         for sub_type in unimplemented_subtypes {
             let token = EnvChangeToken {

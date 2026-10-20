@@ -28,6 +28,9 @@ pub fn convert_tds_error(error: TdsError) -> PyErr {
             // Type conversion errors (e.g., decimal parsing, type mismatches)
             pyo3::exceptions::PyValueError::new_err(msg)
         }
+        TdsError::EncodedValueTooLong { .. } => {
+            pyo3::exceptions::PyValueError::new_err(error.to_string())
+        }
         TdsError::ProtocolError(msg) => {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Protocol Error: {}", msg))
         }
@@ -62,5 +65,22 @@ pub fn convert_tds_error(error: TdsError) -> PyErr {
             }
         }
         _ => pyo3::exceptions::PyRuntimeError::new_err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_value_overflow_is_a_value_error() {
+        let error = convert_tds_error(TdsError::EncodedValueTooLong {
+            actual: 2,
+            maximum: 1,
+        });
+
+        Python::attach(|py| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        });
     }
 }
