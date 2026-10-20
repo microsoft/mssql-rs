@@ -156,14 +156,6 @@ protected:
     // The number of `varchar` bytes the database collation needs for U+00E9, or
     // `std::nullopt` when the probe itself failed.
     //
-    // The ODBC layer validates a character parameter against its declared
-    // length in UTF-16 units, but the serializer writes collation bytes, and
-    // since AB#48437 those are the collation's own. Where a character needs
-    // more bytes than units, a value that fits a `varchar(n)` in units
-    // overflows it in bytes and is rejected during serialization - the gap
-    // AB#47584 tracks. A test whose premise is "this value fits" has to skip on
-    // such a collation rather than assert.
-    //
     // Measured rather than inferred from the name: `_UTF8` needs two bytes, and
     // so does any DBCS page that genuinely encodes the character rather than
     // substituting it - CP936 gives `A8 A6`, where CP932, CP949 and CP950 all
@@ -582,18 +574,9 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// A narrow parameter is measured in UTF-8 bytes, but varchar(n) bounds the bytes
-// of the database collation, which serialize_string only applies further down.
-// Under a single-byte collation the two disagree for any non-ASCII value: "cafe"
-// with an acute accent is five UTF-8 bytes and so fails varchar(4), even though
-// the four bytes that would have reached the server fit. Under a UTF-8 collation
-// the counts agree and the 22001 is correct. The second half pins the gap from
-// the passing side: the count validated is 5, the value stored is 4 long.
-//
-// A narrow source is measured in UTF-16 units, the same unit a wide source
-// uses, so the two C types agree on one value. Measuring SQL_C_CHAR in its own
-// UTF-8 bytes rejected "cafe"-with-an-acute from a varchar(4) that SQL_C_WCHAR
-// was allowed to fill, on data the server accepts - LEN returns 4 below.
+// varchar(n) bounds bytes in the database collation. The exact fitting size for
+// "cafe"-with-an-acute is therefore 3 plus the encoded width of U+00E9, for both
+// SQL_C_CHAR and SQL_C_WCHAR.
 //
 // Compare is skipped because msodbcsql's answer depends on the client code
 // page. TDS carries a collation with char data, so it normally ships SQL_C_CHAR
@@ -603,42 +586,22 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
 // pre-transcode UTF-8 bytes: it counts 5 and rejects a value that the 4 bytes it
 // actually sends would fit. That defect is deliberately not replicated.
 //
-// The count is still approximate, and now errs low rather than high: under a
-// DBCS or _UTF8 collation the server bound is larger than the units we counted,
-// so an over-long value reaches serialize_char_varchar_direct and fails there
-// with an opaque driver error rather than 22001 (AB#47584).
-//
-// Skipped wherever the collation needs more bytes for this value than the units
-// it was measured in. Since AB#48437 the narrow serializer writes the
-// collation's own encoding, so the five bytes `caf\u00E9` becomes under `_UTF8`
-// - or under a DBCS page that genuinely encodes U+00E9, such as CP936's
-// `A8 A6` - exceed the `varchar(4)` the four UTF-16 units were validated
-// against, and the first `SQLExecute` below is rejected. That over-length
-// rejection is AB#47584, not this probe's subject.
-//
-// Gated on the measured width rather than the collation name: CP932, CP949 and
-// CP950 substitute U+00E9 to a single `3F` and stay within the count, so a
-// name-based DBCS exclusion would skip tests that should run.
-TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf16Units) {
+TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInCollationBytes) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     const std::optional<int> eacute_bytes = DatabaseNarrowByteLengthOfEAcute();
     ASSERT_TRUE(eacute_bytes.has_value())
         << "probing the collation's byte width for U+00E9 failed; this is a defect, not a "
            "collation this probe cannot run on";
-    if (*eacute_bytes > 1) {
-        GTEST_SKIP() << "collation " << DatabaseCollation() << " needs " << *eacute_bytes
-                     << " bytes for U+00E9, so this value exceeds the varchar(4) it was "
-                        "measured into; the over-length rejection is AB#47584";
-    }
+    const SQLULEN encoded_size = static_cast<SQLULEN>(3 + *eacute_bytes);
 
     std::vector<SQLCHAR> value = {'c', 'a', 'f', 0xC3, 0xA9};
     SQLLEN ind = static_cast<SQLLEN>(value.size());
 
-    // Four characters, five UTF-8 bytes: a varchar(4) holds it.
+    // The exact encoded byte count fits.
     ASSERT_SQL_OK(Prepare("SELECT LEN(?) AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
-                                   SQL_VARCHAR, 4, 0, value.data(), ind, &ind),
+                                   SQL_VARCHAR, encoded_size, 0, value.data(), ind, &ind),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -646,10 +609,10 @@ TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf16Units) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
 
-    // One character less and it is truncation, measured in the same units.
+    // One destination byte less is truncation.
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
-                                   SQL_VARCHAR, 3, 0, value.data(), ind, &ind),
+                                   SQL_VARCHAR, encoded_size - 1, 0, value.data(), ind, &ind),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
@@ -663,7 +626,7 @@ TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf16Units) {
     SQLLEN wind = static_cast<SQLLEN>(wide.size() * sizeof(SQLWCHAR));
     ASSERT_SQL_OK(Prepare("SELECT LEN(?) AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR,
-                                   SQL_VARCHAR, 4, 0, wide.data(), wind, &wind),
+                                   SQL_VARCHAR, encoded_size, 0, wide.data(), wind, &wind),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -1751,23 +1714,19 @@ TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUs
     ExpectSameSessionStillUsable(spid);
 }
 
-// Strands this driver: the value passes our UTF-16 unit count at one unit, then
-// `serialize_string` rejects it against varchar(1) once the collation's code
-// page turns it into two bytes - after parameter 1 has flushed. msodbcsql
-// measures the converted bytes first and rejects it before sending anything, so
-// it never reaches the partial-send state here and the case is skipped on that
-// leg.
+// The value is one UTF-16 unit but two destination bytes. Both drivers reject
+// it before sending the RPC; this driver's RPC preflight must also leave the
+// connection usable even though an earlier parameter is large enough to flush
+// if serialization starts.
 //
 // Needs a DBCS collation. This used to run on Latin1, where U+65E5 was
 // unmappable and `encoding_rs` expanded it to the eight bytes of "&#26085;";
 // that expansion was itself the bug, and an unmappable character is now one '?'
 // byte (AB#47598), so nothing a Latin1 code page produces can outgrow the unit
 // count that let it through. A multi-byte *mappable* character is what is left.
-// The retraction mechanism itself is covered without a server by mssql-tds'
-// `a_send_site_retracts_when_serialization_fails_after_a_flush`, which binds
-// past the declared length directly and so does not need this gap.
-TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectionUsable) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+// Actual partial-send recovery is covered without a server by mssql-tds'
+// `cancel_streamed_write_after_partial_send_ignores_and_drains`.
+TEST_F(CharConversionLiveTest, PreflightEncodingFailureLeavesTheConnectionUsable) {
     const std::string collation = DatabaseCollation();
     // Japanese / Chinese / Korean collations select a DBCS code page, where a
     // single BMP character is two bytes.

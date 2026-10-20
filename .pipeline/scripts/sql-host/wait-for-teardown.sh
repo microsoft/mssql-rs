@@ -14,7 +14,7 @@
 #
 # Optional env:
 #   SENTINEL_SUFFIX       Appended to every expected sentinel name before
-#                         matching (e.g. "-2" from System.StageAttempt), so a
+#                         matching (credential generation + stage attempt), so a
 #                         stage rerun waits on that attempt's artifacts and
 #                         never matches a previous attempt's leftovers.
 #   POLL_INTERVAL_SECONDS Default 15.
@@ -48,7 +48,7 @@ project_enc="$(printf '%s' "${SYSTEM_TEAMPROJECT}" | sed 's/ /%20/g')"
 url="${collection}${project_enc}/_apis/build/builds/${BUILD_BUILDID}/artifacts?api-version=7.1"
 
 # Namespacing: publishers suffix their teardown-sentinel artifact names with
-# SENTINEL_SUFFIX (the stage attempt) so reruns neither collide with nor match
+# SENTINEL_SUFFIX (credential generation + stage attempt) so reruns neither collide with nor match
 # a prior attempt's artifacts. Apply the same suffix to what we wait for.
 SENTINEL_SUFFIX="${SENTINEL_SUFFIX:-}"
 IFS=',' read -r -a expected_base <<< "${EXPECTED_SENTINELS}"

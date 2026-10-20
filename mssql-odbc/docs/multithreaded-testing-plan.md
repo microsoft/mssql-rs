@@ -88,8 +88,15 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
   error to the main thread, which reports it after joining.
 - `SharedStmt` observers call only `SQLGetDiagRec` and `SQLGetDiagField`. Every
   other call clears the owner's diagnostics, and an idle `SQLCancel` also
-  aborts msodbcsql's open cursor. Cross-thread cancel has its own test,
+  closes the open cursor on both drivers. Cross-thread cancel has its own test,
   `multithreaded_tests/cancel_test.cpp`.
+- Idle-cancel bodies use `CancelIdleStatement()` to exclude diagnostic observers
+  during `SQLCancel`, whose DM diagnostic cleanup is not protected by unixODBC's
+  `Threading=1`. The post-close invalid-state probes also hold
+  `diagnostics_mutex_` until a harmless attribute read clears their DM-generated
+  errors. All other calls still overlap diagnostic reads, and no mode or
+  assertion is skipped. Rust cancellation tests cover driver-level statement
+  lock contention directly, without the unsafe DM overlap.
 - There is no mode that runs the whole body on one shared STMT or descriptor.
   Bound buffers live on each body's stack, and even without bindings a STMT
   holds one cursor:
@@ -261,11 +268,66 @@ Measured 2026-10-08 on both drivers unless noted.
   runs at 2 x 1 (WSL, unixODBC 2.3.9), and in none of 60 at 1. macOS CI hit
   it first; Linux CI passed by luck.
 - Every non-diagnostic call clears the handle's diagnostics, including an idle
-  `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`. For an idle
-  `SQLCancel` the Windows Driver Manager does the clearing; the driver itself
-  leaves them (#703). Measured again after #703 on Windows.
-- An idle `SQLCancel` leaves an open cursor alone in this driver, as ODBC 3.5
-  specifies; msodbcsql aborts it (next call `HY010`).
+  `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`. Cross-thread
+  `SQLCancel` preserves the interrupted call's diagnostics.
+- An idle `SQLCancel` performs `SQLFreeStmt(SQL_CLOSE)`, releases the connection,
+  and reports `SQL_SUCCESS_WITH_INFO` / `01S05` when close succeeds (AB#49386).
+  Driver Managers (Windows and unixODBC) suppress the warning, so the direct-entry
+  Rust tests assert it while `ConnectionBusyLiveTest.IdleCancel*` checks the
+  cursor cleanup and connection reuse through the Driver Manager. Close errors
+  remain errors; running-command and parked-DAE cancellation are unchanged.
+  unixODBC's `DriverManager/SQLCancel.c` scans the driver's diagnostic records
+  with `IsDiagRec01S05` and converts `SQL_SUCCESS_WITH_INFO` to `SQL_SUCCESS`
+  when it finds `01S05`. The Windows behavior is measured below; the unixODBC
+  behavior here is source-confirmed and asserted by the Linux/macOS e2e lanes.
+  Reference: `ExportImp::SQLCancel`, `odbc/sqlcmisc.cpp:779-791`, idle branch;
+  `ExportImp::SQLFreeStmt`, `odbc/sqlccmd.cpp:404-432`, `SQL_CLOSE` branch.
+  Measured on Windows on 2026-10-15 with msodbcsql `SQL_DRIVER_VER=18.06.0001`
+  and the AB#49386 Rust debug build (`18.6.2.1`): direct-DLL calls closed
+  unfetched, partially fetched, and exhausted cursors, returned `01S05`, and
+  allowed a second statement to execute. The native Driver Manager leg also
+  passed the eight `ConnectionBusyLiveTest.IdleCancel*` variants present on
+  that date (two bodies, each in four concurrency modes).
+  A Linux unixODBC 2.3.9 standalone mock-driver probe reproduced malformed
+  diagnostic records through the DM at `Threading=1`, without mssql-odbc or
+  SQL Server. Direct-driver observation avoided that DM corruption, but Windows
+  msodbcsql can treat cancellation overlapping its diagnostic lock as a no-op.
+  The e2e observer gate therefore excludes only those unsafe overlaps while
+  keeping the idle-close contract deterministic on both drivers.
+  Idle cancellation now abandons an owned pending response via ATTENTION,
+  using `SQL_ATTR_CONNECTION_TIMEOUT` (zero selects 120 seconds) for settlement.
+  It does not change the normal `SQLFreeStmt(SQL_CLOSE)` drain. The mock tests
+  hold back a response tail and DONE_ATTN independently, cover partially read
+  PLP data, and verify failed settlement retires the connection. The live
+  `IdleCancelAbandonsDelayedBatchTail` case checks that a five-second WAITFOR
+  and trailing INSERT are abandoned rather than completed by the close.
+  Measured on Windows on 2026-10-17 with native `SQL_DRIVER_VER=18.06.0001`
+  and the updated Rust debug DLL (`18.6.2.1`): both returned `01S05` in less
+  than one millisecond and left the temporary table empty. This follows native
+  `Cancel` (`sqlcmisc.cpp:847-851`) into the ATTENTION branch of
+  `ProcessTDSStream` (`sqlccmd.cpp:11718-11731`).
+  The live suite now also covers `IdleCancelAbandonsPartiallyReadPlp`: a
+  `varchar(max)` value is read only through its first truncated `SQLGetData`
+  chunk before cancellation, and a second statement verifies the delayed
+  INSERT never ran. Together with the delayed non-PLP tail case, the suite
+  contains four bodies in four modes (16 variants); the historical eight-case
+  measurement above predates both additions.
+  On 2026-10-17 all 16 variants passed through the Windows DM with native
+  `18.06.0001` (five iterations per concurrent mode). Direct-DLL probes against
+  that native version and Rust `18.6.2.1` also passed the partial-PLP case:
+  truncated `SQLGetData`, `01S05` after cancellation, and no trailing INSERT.
+  Remeasured on 2026-10-19 through temporary Windows user DSNs, with native
+  `SQL_DRIVER_VER=18.06.0001` and Rust `18.6.2.1`: never-executed, unfetched,
+  partially fetched, and exhausted statements all returned `SQL_SUCCESS` and
+  `SQLGetDiagRec` returned `SQL_NO_DATA`. The live fixture now asserts this
+  DM result rather than accepting either success code; direct-entry Rust
+  tests continue to require `SQL_SUCCESS_WITH_INFO` / `01S05`.
+  `ClosingFetchedParameterArrayPublishesCompletion` checks live close-time
+  status/count outputs for two parameter sets. The Rust close/cancel test
+  specifically models an exhausted wire with still-unpublished array results
+  using scripted tokens: removing the parameter-array exception makes its
+  output assertions fail. This state is modeled explicitly, since the current
+  public `SQLMoreResults` path publishes completion as it exhausts the batch.
 
 ## Scenarios
 
@@ -404,8 +466,8 @@ local SQL Server:
 - AB#49225: on a shared DBC, a concurrent execute sometimes fails with `HY000`
   "No active TDS client" instead of the busy error. Reproduced at 8x20 with the
   GetData pilot tests opted into `SharedDbc` locally.
-- Divergence, not a bug: msodbcsql aborts an open cursor on an idle `SQLCancel`;
-  ODBC 3.5 says it has no effect. Not yet asserted in e2e (AB#49258, below).
+- Fixed by AB#49386: idle `SQLCancel` now closes an open cursor and releases the
+  connection rather than leaving it busy. This is not a deliberate deviation.
 - Fixed: AB#49220 (empty `IMAGE` read as NULL), by PR #700; AB#49219 (`run_e2e`
   auto-detect used `sa` with no password), in this PR.
 
@@ -419,9 +481,8 @@ Tracked under AB#49256:
 2. **AB#49263:** CTest split, PR filter, nightly and weekly profiles, dumps.
 3. **AB#49260:** fetch and GetData suites, plus worker-token tests.
 4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
-   four cancel cases `cancel_test.cpp` does not cover, added to it:
-   - An idle cancel with an open cursor leaves it as it was (skip msodbcsql,
-     which aborts it).
+   remaining cancel cases `cancel_test.cpp` does not cover, added to it
+   (idle cursor cleanup is covered by `connection_busy_test.cpp`, AB#49386):
    - A cancel just before execute does not leak into that or the next
      execution, through a Driver Manager (the driver's unit tests cover it
      directly).

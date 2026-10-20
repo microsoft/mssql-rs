@@ -28,6 +28,8 @@
 #include <vector>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
+#include <shared_mutex>
 
 /// SQLTCHAR-based string type for ODBC API calls.
 using SqlTString = std::basic_string<SQLTCHAR>;
@@ -251,6 +253,14 @@ protected:
         lent_env_ = env;
         lent_dbc_ = dbc;
     }
+
+    // Only idle cancellation uses this gate; running-command cancellation must
+    // remain concurrent with the executing call.
+    SQLRETURN CancelIdleStatement() {
+        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+        return SQLCancel(stmt_);
+    }
+    std::shared_mutex diagnostics_mutex_;
 
 private:
     SQLHENV lent_env_ = SQL_NULL_HENV;
