@@ -1900,19 +1900,16 @@ impl BulkLoadRow for PythonRowAdapter {
     /// Write this row's column values directly to the TDS packet writer.
     ///
     /// This method acquires the GIL to read each Python value, converts it
-    /// to a ColumnValues variant, and writes it directly to the packet without
-    /// intermediate allocations.
+    /// to a ColumnValues variant, and writes it directly to the packet.
     ///
     /// The implementation strategy:
     /// 1. Acquire GIL and convert all Python values to Vec<ColumnValues>
     /// 2. Release GIL
     /// 3. Write each ColumnValues to packet asynchronously
     ///
-    /// Note: While this creates a temporary Vec, it's still more efficient than
-    /// the traditional BulkCopyRow approach because:
-    /// - We only allocate once per row (not per batch)
-    /// - The Vec is immediately consumed and dropped
-    /// - No intermediate buffering at the batch level
+    /// The temporary Vec is one allocation per row, consumed immediately; it
+    /// lets the GIL be released before the async packet writes, and nothing is
+    /// buffered at the batch level.
     ///
     /// # Arguments
     ///
