@@ -2357,6 +2357,7 @@ mod tests {
             let Err(error) = login_replaying(
                 gateway,
                 vec![
+                    login_ack(),
                     Tokens::EnvChange(env_token(
                         EnvChangeTokenSubType::Routing,
                         (None, Some(routing.clone())).into(),
@@ -2371,7 +2372,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    crate::error::Error::Redirection { host, port: 11000 } if host == "replica.sql.net"
+                    crate::error::Error::Redirection { host, port: 11000, .. } if host == "replica.sql.net"
                 ),
                 "{error:?}"
             );
