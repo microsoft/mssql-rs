@@ -48,19 +48,18 @@ parameters:
 
 steps:
 # ARM64 integration tests connect cross-pool to an on-demand x64 SQL host
-# (Sql_Host_build_arm). Derive the SA password from build context so this job
-# and the SQL host agree without sharing a secret. Runs before the generate
+# (Sql_Host_build_arm). Import the initialization secret before the generate
 # step, which then no-ops (it honors the SQL_PASSWORD_GENERATED marker).
 - ${{ if eq(parameters.architecture, 'ARM64') }}:
   - bash: |
       set -euo pipefail
-      bash .pipeline/scripts/sql-host/derive-sql-password.sh
-    displayName: 'Derive SQL_PASSWORD from build context (ARM cross-pool)'
-    condition: eq(variables['Build.Reason'], 'PullRequest')
+      bash .pipeline/scripts/sql-host/import-sql-password.sh
+    displayName: 'Import shared SQL credential (ARM cross-pool)'
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: '$(Build.SourcesDirectory)'
     env:
-      BUILD_BUILDID: $(Build.BuildId)
-      SYSTEM_COLLECTIONID: $(System.CollectionId)
+      SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
+      SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
 
 - template: generate-sql-password-template.yml
   parameters:
@@ -121,7 +120,7 @@ steps:
 
       # Start SQL Server
       docker run -e "ACCEPT_EULA=Y" \
-        -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
+        -e "MSSQL_SA_PASSWORD=$SQL_PASSWORD" \
         -p 1433:1433 \
         --hostname sql1 \
         --network testnet \
@@ -155,12 +154,13 @@ steps:
       set -euo pipefail
       bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
     displayName: Wait for cross-pool SQL host endpoint
-    condition: eq(variables['Build.Reason'], 'PullRequest')
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: '$(Build.SourcesDirectory)'
     env:
       # Suffix with the stage attempt so a stage rerun reads this attempt's
       # freshly-published endpoint, not a stale one from a prior attempt.
-      ARTIFACT_NAME: 'sql-ready-build_arm-$(System.StageAttempt)'
+      ARTIFACT_NAME: 'sql-ready-build_arm-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+      SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
       BUILD_BUILDID: $(Build.BuildId)
       BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
       SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -189,7 +189,7 @@ steps:
       -v $HOME/.cargo/registry:/root/.cargo/registry \
       -v $HOME/.cargo/git:/root/.cargo/git \
       -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
-      -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+      -e SQL_PASSWORD \
       -e DB_HOST="sql1" \
       -e CERT_HOST_NAME="sql1" \
       -e RUST_BACKTRACE=full \
@@ -247,7 +247,7 @@ steps:
         -v $HOME/.cargo/registry:/root/.cargo/registry \
         -v $HOME/.cargo/git:/root/.cargo/git \
         -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
-        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e SQL_PASSWORD \
         -e DB_HOST="sql1" \
         -e CERT_HOST_NAME="sql1" \
         -e RUST_BACKTRACE=full \
@@ -278,10 +278,10 @@ steps:
         -v $PWD:/workspace \
         -v $HOME/.cargo/registry:/root/.cargo/registry \
         -v $HOME/.cargo/git:/root/.cargo/git \
-        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e SQL_PASSWORD \
         -e ODBC_TEST_SERVER="sql1" \
         -e ODBC_TEST_UID="sa" \
-        -e ODBC_TEST_PWD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_PWD="$SQL_PASSWORD" \
         -e ODBC_TEST_TRUST_CERT="Yes" \
         -e ODBC_E2E_RETRIES="3" \
         -e ODBC_E2E_COVERAGE="${{ lower(parameters.collectRustCoverage) }}" \
@@ -311,7 +311,7 @@ steps:
         -v $HOME/.cargo/registry:/root/.cargo/registry \
         -v $HOME/.cargo/git:/root/.cargo/git \
         -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
-        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e SQL_PASSWORD \
         -e DB_USERNAME="sa" \
         -e DB_HOST="$(DB_HOST)" \
         -e DB_PORT="$(DB_PORT)" \
@@ -340,10 +340,10 @@ steps:
         -v $PWD:/workspace \
         -v $HOME/.cargo/registry:/root/.cargo/registry \
         -v $HOME/.cargo/git:/root/.cargo/git \
-        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e SQL_PASSWORD \
         -e ODBC_TEST_SERVER="$(DB_HOST),$(DB_PORT)" \
         -e ODBC_TEST_UID="sa" \
-        -e ODBC_TEST_PWD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_PWD="$SQL_PASSWORD" \
         -e ODBC_TEST_TRUST_CERT="Yes" \
         -e ODBC_E2E_RETRIES="3" \
         -e RUST_BACKTRACE=full \
@@ -462,7 +462,7 @@ steps:
         --network testnet \
         -v $PWD:/workspace \
         -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
-        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e SQL_PASSWORD \
         -e DB_HOST="sql1" \
         -e CERT_HOST_NAME="sql1" \
         -w /workspace \
@@ -531,7 +531,7 @@ steps:
       --network testnet \
       -v $PWD:/workspace \
       -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
-      -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+      -e SQL_PASSWORD \
       -e DB_HOST="sql1" \
       -e DB_USERNAME="sa" \
       -e SQL_SERVER="sql1" \
@@ -586,7 +586,7 @@ steps:
       # Suffix with the stage attempt so a rerun publishes a fresh name instead
       # of colliding with the prior attempt's artifact; the host waits on the
       # matching $(System.StageAttempt) via SENTINEL_SUFFIX.
-      artifact: 'build_arm-$(System.StageAttempt)'
+      artifact: 'build_arm-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
       publishLocation: 'pipeline'
 
 - script: |

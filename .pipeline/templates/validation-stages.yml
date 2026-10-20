@@ -71,12 +71,12 @@ parameters:
   default: RUST-UTIL-WUS3
 
 stages:
-- stage: EvaluateDuplicate
-  displayName: Evaluate PR duplicate
-  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+- stage: InitializeValidation
+  displayName: Initialize validation
+  condition: and(not(canceled()), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
   jobs:
-  - job: Evaluate
-    displayName: Check prior successful PR validation
+  - job: Initialize
+    displayName: Initialize validation
     pool:
       name: ${{ parameters.utilPoolName }}
       demands:
@@ -84,25 +84,37 @@ stages:
     steps:
     - bash: |
         set -euo pipefail
-        python3 .pipeline/scripts/evaluate-duplicate-pr.py
+        if [ "$BUILD_REASON" = "PullRequest" ]; then
+          python3 .pipeline/scripts/evaluate-duplicate-pr.py
+        else
+          echo "##vso[task.setvariable variable=skipDuplicate;isOutput=true]false"
+        fi
       name: SetDuplicateState
       displayName: Check duplicate PR head commit
       env:
+        BUILD_REASON: $(Build.Reason)
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    - bash: |
+        set -euo pipefail
+        python3 .pipeline/scripts/sql-host/generate-shared-password.py
+      name: GenerateSqlCredential
+      displayName: Generate shared SQL credential
+      condition: and(succeeded(), ne(variables['SetDuplicateState.skipDuplicate'], 'true'))
 - stage: Build
   displayName: Build Stage
   variables:
     miriToolchain: nightly-2026-09-06
   dependsOn:
-    - EvaluateDuplicate
+    - InitializeValidation
   condition: >-
     and(
       not(canceled()),
+      eq(dependencies.InitializeValidation.result, 'Succeeded'),
       eq('${{ parameters.RunFuzz }}', 'false'),
       eq('${{ parameters.RunLongHaul }}', 'false'),
       or(
         ne(variables['Build.Reason'], 'PullRequest'),
-        ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')
+        ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true')
       )
     )
   jobs:
@@ -142,7 +154,7 @@ stages:
       # Packaging and artifact gates must be tested even when PR runs skip them.
       - pwsh: |
           python -m pip install --quiet pytest pyyaml packaging
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_crate_versions.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_sync_pipeline.py scripts/test_benchmark_pipeline.py -q
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_shared_sql_credentials.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_crate_versions.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_sync_pipeline.py scripts/test_benchmark_pipeline.py -q
         displayName: 'Unit test packaging scripts and pipeline configuration'
       - template: build-template.yml
         parameters:
@@ -235,6 +247,9 @@ stages:
       demands:
         - imageOverride -equals RUST-WINSRV-ARM
     variables:
+      ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
+        SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
       CARGO_TARGET_DIR: C:\cargo_target_dir
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
@@ -317,6 +332,12 @@ stages:
           python -c 'import shutil; assert shutil.which("bash"), "Bash is required for sync regression tests"'
           python -m pytest scripts/test_sync_pipeline.py -q -rs
         displayName: Test ADO sync pipeline
+      - bash: |
+          set -euo pipefail
+          python3 -m venv "$AGENT_TEMPDIRECTORY/sql-credential-tests"
+          "$AGENT_TEMPDIRECTORY/sql-credential-tests/bin/python" -m pip install --quiet pytest pyyaml
+          "$AGENT_TEMPDIRECTORY/sql-credential-tests/bin/python" -m pytest scripts/test_shared_sql_credentials.py -q
+        displayName: Test shared SQL credential scripts (Linux)
       - bash: |
           set -euo pipefail
           venv="$(Agent.TempDirectory)/ghcr-parameter-tests"
@@ -403,6 +424,9 @@ stages:
       demands:
         - imageOverride -equals ${{ parameters.linuxArmImage }}
     variables:
+      ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
+        SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
     steps:
@@ -580,8 +604,8 @@ stages:
 - stage: Kerberos_Test_PR
   displayName: Kerberos Test (PR)
   dependsOn:
-    - EvaluateDuplicate
-  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
+    - InitializeValidation
+  condition: and(not(canceled()), eq(dependencies.InitializeValidation.result, 'Succeeded'), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true'))
   jobs:
     - template: kerberos-test-template.yml
       parameters:
@@ -598,9 +622,7 @@ stages:
   displayName: Kerberos Test (Full Matrix)
   dependsOn:
     - Build
-  # Scope success to the Build stage explicitly. Bare succeeded() evaluates the
-  # whole dependency graph, so the PR-only EvaluateDuplicate stage (skipped on
-  # non-PR CI runs) would otherwise make this stage skip in CI.
+  # Require the build artifacts before starting the full CI matrix.
   condition: and(succeeded('Build'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
   jobs:
     - template: kerberos-test-template.yml
@@ -803,8 +825,8 @@ stages:
 
 - stage: Build_mssql_python
   dependsOn:
-    - EvaluateDuplicate
-  condition: and(not(canceled()), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))
+    - InitializeValidation
+  condition: and(not(canceled()), eq(dependencies.InitializeValidation.result, 'Succeeded'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), or(ne(variables['Build.Reason'], 'PullRequest'), ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true')))
   displayName: Build mssql-python
   jobs:
   - job: Build_mssql_python_MacOS
@@ -886,7 +908,8 @@ stages:
 - stage: Test_alpine_arm64
   dependsOn: 
     - Build
-  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+    - InitializeValidation
+  condition: and(succeeded('Build'), eq(dependencies.InitializeValidation.result, 'Succeeded'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
   displayName: Test Alpine arm64
   jobs:
     # nextest (musl) and mssql-odbc (musl) arm64 both need a cross-pool x64 SQL
@@ -1049,7 +1072,8 @@ stages:
 - stage: Test_arm64
   dependsOn: 
     - Build
-  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+    - InitializeValidation
+  condition: and(succeeded('Build'), eq(dependencies.InitializeValidation.result, 'Succeeded'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
   displayName: Test Linux arm64
   jobs:
     # nextest and mssql-odbc arm64 both need a cross-pool x64 SQL host (arm
@@ -1392,9 +1416,7 @@ stages:
     displayName: Private Link Smoke Test
     dependsOn:
       - Build
-    # Scope success to the Build stage explicitly. Bare succeeded() evaluates the
-    # whole dependency graph, so the PR-only EvaluateDuplicate stage (skipped on
-    # non-PR CI runs) would otherwise make this stage skip in CI.
+    # Require the wheel artifacts produced by Build.
     condition: and(succeeded('Build'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
     jobs:
       - template: private-link-smoke-template.yml
