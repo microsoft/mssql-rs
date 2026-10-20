@@ -16,6 +16,7 @@
 // in units that differ per type, and a units bug survives every unit test that
 // builds the struct by hand -- it only shows up against a real server.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
 
@@ -132,19 +133,19 @@ protected:
     }
 };
 
-TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaGetData) {
+ODBC_TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaGetData) {
     CheckInvalidCharacterTemporalValues(false);
 }
 
-TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaBoundFetch) {
+ODBC_TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaBoundFetch) {
     CheckInvalidCharacterTemporalValues(true);
 }
 
-TEST_F(DateTimeTypesLiveTest, TimeToTimestampoffsetViaGetData) {
+ODBC_TEST_F(DateTimeTypesLiveTest, TimeToTimestampoffsetViaGetData) {
     CheckTimeToTimestampoffset(false);
 }
 
-TEST_F(DateTimeTypesLiveTest, TimeToTimestampoffsetViaBoundFetch) {
+ODBC_TEST_F(DateTimeTypesLiveTest, TimeToTimestampoffsetViaBoundFetch) {
     CheckTimeToTimestampoffset(true);
 }
 
@@ -152,7 +153,7 @@ TEST_F(DateTimeTypesLiveTest, TimeToTimestampoffsetViaBoundFetch) {
 // SQL_C_TYPE_DATE
 // ---------------------------------------------------------------------------
 
-TEST_F(DateTimeTypesLiveTest, DateToDateTargetViaGetData) {
+ODBC_TEST_F(DateTimeTypesLiveTest, DateToDateTargetViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('2024-02-29' AS DATE) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -167,7 +168,7 @@ TEST_F(DateTimeTypesLiveTest, DateToDateTargetViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DateTimeTypesLiveTest, DateToDateTargetViaBoundFetch) {
+ODBC_TEST_F(DateTimeTypesLiveTest, DateToDateTargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('2024-02-29' AS DATE) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQL_DATE_STRUCT d{};
@@ -187,7 +188,7 @@ TEST_F(DateTimeTypesLiveTest, DateToDateTargetViaBoundFetch) {
 // SQL_C_TYPE_TIME — no fractional field, so a TIME(7) source has to truncate
 // ---------------------------------------------------------------------------
 
-TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaGetData) {
+ODBC_TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('13:45:59' AS TIME(0)) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -201,7 +202,7 @@ TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaBoundFetch) {
+ODBC_TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('13:45:59' AS TIME(0)) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQL_TIME_STRUCT t{};
@@ -220,7 +221,7 @@ TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaBoundFetch) {
 // reaches this branch -- and ASSERT_SQL_OK would not have caught the difference
 // anyway, since it wraps SQL_SUCCEEDED and SQL_SUCCESS_WITH_INFO satisfies it.
 // The return code and SQLSTATE are the assertions that matter here.
-TEST_F(DateTimeTypesLiveTest, Time7ToTimeTargetTruncatesTheFraction) {
+ODBC_TEST_F(DateTimeTypesLiveTest, Time7ToTimeTargetTruncatesTheFraction) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('13:45:59.1234567' AS TIME(7)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -240,7 +241,7 @@ TEST_F(DateTimeTypesLiveTest, Time7ToTimeTargetTruncatesTheFraction) {
 // SQL_C_SS_TIME2 — the SQL Server target that keeps the fraction
 // ---------------------------------------------------------------------------
 
-TEST_F(DateTimeTypesLiveTest, Time7ToSsTime2TargetViaGetData) {
+ODBC_TEST_F(DateTimeTypesLiveTest, Time7ToSsTime2TargetViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('13:45:59.1234567' AS TIME(7)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -258,7 +259,7 @@ TEST_F(DateTimeTypesLiveTest, Time7ToSsTime2TargetViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DateTimeTypesLiveTest, Time7ToSsTime2TargetViaBoundFetch) {
+ODBC_TEST_F(DateTimeTypesLiveTest, Time7ToSsTime2TargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('13:45:59.1234567' AS TIME(7)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -279,7 +280,7 @@ TEST_F(DateTimeTypesLiveTest, Time7ToSsTime2TargetViaBoundFetch) {
 // SQL_C_SS_TIMESTAMPOFFSET — a negative offset, so a sign error cannot pass
 // ---------------------------------------------------------------------------
 
-TEST_F(DateTimeTypesLiveTest, DatetimeoffsetToSsTimestampoffsetViaGetData) {
+ODBC_TEST_F(DateTimeTypesLiveTest, DatetimeoffsetToSsTimestampoffsetViaGetData) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('2023-06-15 12:34:56.1234567 -05:30' AS DATETIMEOFFSET(7)) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -301,7 +302,7 @@ TEST_F(DateTimeTypesLiveTest, DatetimeoffsetToSsTimestampoffsetViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DateTimeTypesLiveTest, DatetimeoffsetToSsTimestampoffsetViaBoundFetch) {
+ODBC_TEST_F(DateTimeTypesLiveTest, DatetimeoffsetToSsTimestampoffsetViaBoundFetch) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('2023-06-15 12:34:56.1234567 -05:30' AS DATETIMEOFFSET(7)) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -329,7 +330,7 @@ TEST_F(DateTimeTypesLiveTest, DatetimeoffsetToSsTimestampoffsetViaBoundFetch) {
 // get_data_test.cpp)
 // ---------------------------------------------------------------------------
 
-TEST_F(DateTimeTypesLiveTest, Datetime2ToTimestampTargetViaBoundFetch) {
+ODBC_TEST_F(DateTimeTypesLiveTest, Datetime2ToTimestampTargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('2023-06-15 12:34:56.1234567' AS DATETIME2(7)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -349,7 +350,7 @@ TEST_F(DateTimeTypesLiveTest, Datetime2ToTimestampTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DateTimeTypesLiveTest, LegacyDatetimeRoundsFractionToMillisecondsOnBothPaths) {
+ODBC_TEST_F(DateTimeTypesLiveTest, LegacyDatetimeRoundsFractionToMillisecondsOnBothPaths) {
     const std::string query =
         "SELECT CAST('2024-05-20T12:34:56.127' AS DATETIME) AS c1";
 
@@ -404,7 +405,7 @@ TEST_F(DateTimeTypesLiveTest, LegacyDatetimeRoundsFractionToMillisecondsOnBothPa
 // A NULL date/time column must report SQL_NULL_DATA and leave the buffer alone,
 // on both paths. Covered once here rather than per type: the NULL path is in
 // the delivery layer, not per-conversion.
-TEST_F(DateTimeTypesLiveTest, NullDatetimeReportsNullOnBothPaths) {
+ODBC_TEST_F(DateTimeTypesLiveTest, NullDatetimeReportsNullOnBothPaths) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS DATETIME2(7)) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQL_TIMESTAMP_STRUCT bound{};

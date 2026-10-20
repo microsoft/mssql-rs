@@ -15,6 +15,7 @@
 // bytes are all distinct so the mixed-endian SQLGUID layout cannot come back
 // looking correct.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <cstring>
@@ -45,7 +46,7 @@ protected:
 // -- applies to SQL_C_STINYINT and to any other source. See fetch_convert.rs.
 // ---------------------------------------------------------------------------
 
-TEST_F(NumericTypesLiveTest, TinyintToTinyintTargetViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, TinyintToTinyintTargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(200 AS TINYINT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLCHAR v = 0;
@@ -57,7 +58,7 @@ TEST_F(NumericTypesLiveTest, TinyintToTinyintTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, SmallintToSshortTargetViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, SmallintToSshortTargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(-32768 AS SMALLINT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLSMALLINT v = 0;
@@ -70,7 +71,7 @@ TEST_F(NumericTypesLiveTest, SmallintToSshortTargetViaBoundFetch) {
 
 // BIGINT at its lower bound: the one value that cannot be negated, so a
 // sign-handling bug in the decode cannot round-trip it by accident.
-TEST_F(NumericTypesLiveTest, BigintMinViaGetData) {
+ODBC_TEST_F(NumericTypesLiveTest, BigintMinViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(-9223372036854775808 AS BIGINT) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -83,7 +84,7 @@ TEST_F(NumericTypesLiveTest, BigintMinViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, BigintMaxViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, BigintMaxViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(9223372036854775807 AS BIGINT) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -99,7 +100,7 @@ TEST_F(NumericTypesLiveTest, BigintMaxViaBoundFetch) {
 // BIT — both values, because a truthiness bug only shows on one of them
 // ---------------------------------------------------------------------------
 
-TEST_F(NumericTypesLiveTest, BitBothValuesViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, BitBothValuesViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS BIT) AS t, CAST(0 AS BIT) AS f"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -113,7 +114,7 @@ TEST_F(NumericTypesLiveTest, BitBothValuesViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, BitViaGetData) {
+ODBC_TEST_F(NumericTypesLiveTest, BitViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS BIT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -129,7 +130,7 @@ TEST_F(NumericTypesLiveTest, BitViaGetData) {
 // mistake (reading a REAL as a double or vice versa) cannot round-trip it.
 // ---------------------------------------------------------------------------
 
-TEST_F(NumericTypesLiveTest, RealToFloatTargetViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, RealToFloatTargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS REAL) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLREAL v = 0.0f;
@@ -141,7 +142,7 @@ TEST_F(NumericTypesLiveTest, RealToFloatTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, RealToFloatTargetViaGetData) {
+ODBC_TEST_F(NumericTypesLiveTest, RealToFloatTargetViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS REAL) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -152,7 +153,7 @@ TEST_F(NumericTypesLiveTest, RealToFloatTargetViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS FLOAT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLDOUBLE v = 0.0;
@@ -164,7 +165,7 @@ TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaGetData) {
+ODBC_TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS FLOAT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -180,7 +181,7 @@ TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaGetData) {
 // kept: msodbcsql's DoubleToChar writes it, while its decimal and money paths
 // strip it. Asserted here so the asymmetry is verified rather than only
 // described in a comment.
-TEST_F(NumericTypesLiveTest, FloatToCharKeepsItsLeadingZero) {
+ODBC_TEST_F(NumericTypesLiveTest, FloatToCharKeepsItsLeadingZero) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.5 AS FLOAT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -191,7 +192,7 @@ TEST_F(NumericTypesLiveTest, FloatToCharKeepsItsLeadingZero) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, RealToCharKeepsItsLeadingZero) {
+ODBC_TEST_F(NumericTypesLiveTest, RealToCharKeepsItsLeadingZero) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.5 AS REAL) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -209,7 +210,7 @@ TEST_F(NumericTypesLiveTest, RealToCharKeepsItsLeadingZero) {
 // that mistake cannot survive.
 // ---------------------------------------------------------------------------
 
-TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaBoundFetch) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -228,7 +229,7 @@ TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaGetData) {
+ODBC_TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaGetData) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -253,7 +254,7 @@ TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaGetData) {
 // normalising it away.
 // ---------------------------------------------------------------------------
 
-TEST_F(NumericTypesLiveTest, DecimalToCharKeepsScaleViaBoundFetch) {
+ODBC_TEST_F(NumericTypesLiveTest, DecimalToCharKeepsScaleViaBoundFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(123.4500 AS DECIMAL(10,4)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -267,7 +268,7 @@ TEST_F(NumericTypesLiveTest, DecimalToCharKeepsScaleViaBoundFetch) {
 
 // A negative decimal, since the sign is carried separately from the digits on
 // the wire.
-TEST_F(NumericTypesLiveTest, NegativeDecimalToCharViaGetData) {
+ODBC_TEST_F(NumericTypesLiveTest, NegativeDecimalToCharViaGetData) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(-0.0001 AS DECIMAL(10,4)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -287,7 +288,7 @@ TEST_F(NumericTypesLiveTest, NegativeDecimalToCharViaGetData) {
 // SQLGetData did not.
 // ---------------------------------------------------------------------------
 
-TEST_F(NumericTypesLiveTest, NullWithNoIndicatorViaBoundFetchIs22002) {
+ODBC_TEST_F(NumericTypesLiveTest, NullWithNoIndicatorViaBoundFetchIs22002) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLINTEGER v = 7;

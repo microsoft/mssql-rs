@@ -16,6 +16,7 @@
 // different path, so every case here is confirmed against both drivers rather
 // than assumed to follow.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
 
@@ -54,7 +55,7 @@ protected:
 // something an application must not read.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeIsOutOfRange) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeIsOutOfRange) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(2147483648 AS BIGINT) AS c1"));
 
     SQLINTEGER v = 4242;
@@ -67,7 +68,7 @@ TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeIsOutOfRange) {
 
 // The same value fits an unsigned target of the same width, so it succeeds --
 // the pair is what shows the range check is signedness-aware.
-TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeFitsUlong) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeFitsUlong) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(2147483648 AS BIGINT) AS c1"));
 
     SQLUINTEGER v = 0;
@@ -77,7 +78,7 @@ TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeFitsUlong) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeIsOutOfRange) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeIsOutOfRange) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(128 AS INT) AS c1"));
 
     signed char v = 77;
@@ -88,7 +89,7 @@ TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeIsOutOfRange) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeFitsUtinyint) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeFitsUtinyint) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(128 AS INT) AS c1"));
 
     unsigned char v = 0;
@@ -100,7 +101,7 @@ TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeFitsUtinyint) {
 }
 
 // A negative value into any unsigned target is out of range, however small.
-TEST_F(FetchErrorSemanticsLiveTest, NegativeIntoUnsignedIsOutOfRange) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, NegativeIntoUnsignedIsOutOfRange) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(-1 AS INT) AS c1"));
 
     SQLUINTEGER v = 31337;
@@ -117,7 +118,7 @@ TEST_F(FetchErrorSemanticsLiveTest, NegativeIntoUnsignedIsOutOfRange) {
 // point: the caller keeps the truncated value.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, FloatFractionIntoIntegerTargetTruncates) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, FloatFractionIntoIntegerTargetTruncates) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(1234.99 AS FLOAT) AS c1"));
 
     SQLINTEGER v = 0;
@@ -130,7 +131,7 @@ TEST_F(FetchErrorSemanticsLiveTest, FloatFractionIntoIntegerTargetTruncates) {
 
 // Truncating toward zero puts this in range for an unsigned target, so it is a
 // truncation rather than a range error even though the source is negative.
-TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoUnsignedTruncates) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoUnsignedTruncates) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(-0.01 AS FLOAT) AS c1"));
 
     unsigned char v = 9;
@@ -144,7 +145,7 @@ TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoUnsignedTruncates) 
 // SQL_C_BIT is carved out of that rule: msodbcsql's own table flags this cell
 // "this is treated specially" and answers 22003 where the unsigned integers
 // answer 01S07.
-TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoBitIsOutOfRange) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoBitIsOutOfRange) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(-0.01 AS FLOAT) AS c1"));
 
     unsigned char v = 9;
@@ -160,7 +161,7 @@ TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoBitIsOutOfRange) {
 // 22018, which means the pairing is legal but the data is not convertible.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, DateIntoNumericTargetIsRestricted) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, DateIntoNumericTargetIsRestricted) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('1996-01-01' AS DATE) AS c1"));
 
     SQLINTEGER v = 0;
@@ -170,7 +171,7 @@ TEST_F(FetchErrorSemanticsLiveTest, DateIntoNumericTargetIsRestricted) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, UnconvertibleCharacterDataIsInvalidCharacterValue) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, UnconvertibleCharacterDataIsInvalidCharacterValue) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('abc' AS VARCHAR(10)) AS c1"));
 
     SQLINTEGER v = 4242;
@@ -181,7 +182,7 @@ TEST_F(FetchErrorSemanticsLiveTest, UnconvertibleCharacterDataIsInvalidCharacter
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, DatetimeIntoFloatTargetIsRestricted) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, DatetimeIntoFloatTargetIsRestricted) {
     ASSERT_NO_FATAL_FAILURE(
         FetchOne("SELECT CAST('1996-01-01 12:00:00' AS DATETIME) AS c1"));
 
@@ -198,7 +199,7 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeIntoFloatTargetIsRestricted) {
 // that triggers it rather than the narrowing itself.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithTimeIntoDateTargetTruncates) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithTimeIntoDateTargetTruncates) {
     ASSERT_NO_FATAL_FAILURE(
         FetchOne("SELECT CAST('1996-01-01 01:00:00.010' AS DATETIME) AS c1"));
 
@@ -212,7 +213,7 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithTimeIntoDateTargetTruncates) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithZeroTimeIntoDateTargetIsClean) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithZeroTimeIntoDateTargetIsClean) {
     ASSERT_NO_FATAL_FAILURE(
         FetchOne("SELECT CAST('1996-01-01 00:00:00' AS DATETIME) AS c1"));
 
@@ -225,7 +226,7 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithZeroTimeIntoDateTargetIsClean) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, DatetimeoffsetIntoSsTime2Succeeds) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, DatetimeoffsetIntoSsTime2Succeeds) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_NO_FATAL_FAILURE(FetchOne(
         "SELECT CAST('2023-01-01 12:34:56.1234567 +05:30' AS DATETIMEOFFSET(7)) AS c1"));
@@ -248,7 +249,7 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeoffsetIntoSsTime2Succeeds) {
 // one byte short once the NUL is accounted for.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, ABufferOneByteShortTruncatesAndReportsFullLength) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, ABufferOneByteShortTruncatesAndReportsFullLength) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('abcdefghij' AS VARCHAR(10)) AS c1"));
 
     char buf[10] = {};  // 10 data bytes need 11 with the terminator
@@ -260,7 +261,7 @@ TEST_F(FetchErrorSemanticsLiveTest, ABufferOneByteShortTruncatesAndReportsFullLe
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, ABufferThatExactlyFitsSucceeds) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, ABufferThatExactlyFitsSucceeds) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('abcdefghij' AS VARCHAR(10)) AS c1"));
 
     char buf[11] = {};  // 10 data bytes + terminator
@@ -277,7 +278,7 @@ TEST_F(FetchErrorSemanticsLiveTest, ABufferThatExactlyFitsSucceeds) {
 // range error instead, with the rest of the rowset still delivering.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, ARangeErrorIsARowErrorInABlockFetch) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, ARangeErrorIsARowErrorInABlockFetch) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS INT) AS c1 UNION ALL SELECT CAST(300 AS INT) "
                             "ORDER BY c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -310,7 +311,7 @@ TEST_F(FetchErrorSemanticsLiveTest, ARangeErrorIsARowErrorInABlockFetch) {
 // rendering divergence, which no unit test could have reached.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDataChar) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDataChar) {
     ASSERT_NO_FATAL_FAILURE(
         FetchOne("SELECT CAST('0123ABCD-4567-89EF-0123-456789ABCDEF' AS UNIQUEIDENTIFIER) AS c1"));
 
@@ -323,7 +324,7 @@ TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDat
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDataWchar) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDataWchar) {
     ASSERT_NO_FATAL_FAILURE(
         FetchOne("SELECT CAST('0123ABCD-4567-89EF-0123-456789ABCDEF' AS UNIQUEIDENTIFIER) AS c1"));
 
@@ -338,7 +339,7 @@ TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDat
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaBoundFetchChar) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaBoundFetchChar) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('0123ABCD-4567-89EF-0123-456789ABCDEF' AS UNIQUEIDENTIFIER) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -358,7 +359,7 @@ TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaBoundF
 // reaches.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, DatetimeAtItsLowerBoundDecodes) {
+ODBC_TEST_F(FetchErrorSemanticsLiveTest, DatetimeAtItsLowerBoundDecodes) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('1753-01-01' AS DATETIME) AS c1"));
 
     SQL_TIMESTAMP_STRUCT ts{};

@@ -3,6 +3,7 @@
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <cstring>
@@ -52,7 +53,7 @@ protected:
 // (SQL_NO_ROWCOUNT_TOTAL) default only surfaces once a statement has executed;
 // that path is covered directly (bypassing the DM) by the unit test in
 // src/api/row_count.rs.
-TEST_F(RowCountLiveTest, FreshStatementReturnsSequenceError) {
+ODBC_TEST_F(RowCountLiveTest, FreshStatementReturnsSequenceError) {
     SQLLEN rows = 12345;
     SQLRETURN rc = SQLRowCount(stmt_, &rows);
     EXPECT_EQ(SQL_ERROR, rc);
@@ -60,14 +61,14 @@ TEST_F(RowCountLiveTest, FreshStatementReturnsSequenceError) {
 }
 
 // INSERT reports the number of rows inserted.
-TEST_F(RowCountLiveTest, InsertReportsAffectedRows) {
+ODBC_TEST_F(RowCountLiveTest, InsertReportsAffectedRows) {
     Exec("CREATE TABLE #rc(i int)");
     Exec("INSERT INTO #rc VALUES (1), (2), (3)");
     EXPECT_EQ(3, RowCount());
 }
 
 // UPDATE reports the number of rows matched/updated.
-TEST_F(RowCountLiveTest, UpdateReportsAffectedRows) {
+ODBC_TEST_F(RowCountLiveTest, UpdateReportsAffectedRows) {
     Exec("CREATE TABLE #rc(i int)");
     Exec("INSERT INTO #rc VALUES (1), (2), (3), (4)");
     Exec("UPDATE #rc SET i = i + 10 WHERE i >= 2");
@@ -75,7 +76,7 @@ TEST_F(RowCountLiveTest, UpdateReportsAffectedRows) {
 }
 
 // DELETE reports the number of rows removed.
-TEST_F(RowCountLiveTest, DeleteReportsAffectedRows) {
+ODBC_TEST_F(RowCountLiveTest, DeleteReportsAffectedRows) {
     Exec("CREATE TABLE #rc(i int)");
     Exec("INSERT INTO #rc VALUES (1), (2), (3), (4), (5)");
     Exec("DELETE FROM #rc WHERE i <= 2");
@@ -84,7 +85,7 @@ TEST_F(RowCountLiveTest, DeleteReportsAffectedRows) {
 
 // A result-returning SELECT reports -1 on a forward-only cursor — the row
 // count is unavailable until fully fetched (msodbcsql parity).
-TEST_F(RowCountLiveTest, SelectReportsNoRowCount) {
+ODBC_TEST_F(RowCountLiveTest, SelectReportsNoRowCount) {
     Exec("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
     EXPECT_EQ(-1, RowCount());
 
@@ -93,13 +94,13 @@ TEST_F(RowCountLiveTest, SelectReportsNoRowCount) {
 }
 
 // DDL carries no DONE_COUNT, so SQLRowCount reports -1.
-TEST_F(RowCountLiveTest, DdlReportsNoRowCount) {
+ODBC_TEST_F(RowCountLiveTest, DdlReportsNoRowCount) {
     Exec("CREATE TABLE #rc_ddl(i int)");
     EXPECT_EQ(-1, RowCount());
 }
 
 // SET NOCOUNT ON suppresses the row count, so a DML statement reports -1.
-TEST_F(RowCountLiveTest, NoCountSuppressesRowCount) {
+ODBC_TEST_F(RowCountLiveTest, NoCountSuppressesRowCount) {
     Exec("SET NOCOUNT ON; CREATE TABLE #rc_nc(i int); INSERT INTO #rc_nc VALUES (1), (2);");
     EXPECT_EQ(-1, RowCount());
 }
@@ -109,7 +110,7 @@ TEST_F(RowCountLiveTest, NoCountSuppressesRowCount) {
 // then advances to the forward-only SELECT, which must report -1 — not the
 // leaked DML count. Guards the fix that clears the count when positioning on
 // COLMETADATA.
-TEST_F(RowCountLiveTest, DmlThenSelectBatchReportsMinusOneForSelect) {
+ODBC_TEST_F(RowCountLiveTest, DmlThenSelectBatchReportsMinusOneForSelect) {
     Exec("CREATE TABLE #rc_mix(i int)");
     Exec("INSERT INTO #rc_mix VALUES (1), (2), (3)");
     Exec("UPDATE #rc_mix SET i = i + 1; SELECT * FROM #rc_mix;");
@@ -125,7 +126,7 @@ TEST_F(RowCountLiveTest, DmlThenSelectBatchReportsMinusOneForSelect) {
 
 // The count from one execute must not leak into the next statement that reports
 // none. A DDL after a counted INSERT reports -1, not the INSERT's count.
-TEST_F(RowCountLiveTest, RowCountResetsBetweenExecutes) {
+ODBC_TEST_F(RowCountLiveTest, RowCountResetsBetweenExecutes) {
     Exec("CREATE TABLE #rc_a(i int)");
     Exec("INSERT INTO #rc_a VALUES (1), (2), (3)");
     EXPECT_EQ(3, RowCount());
@@ -137,7 +138,7 @@ TEST_F(RowCountLiveTest, RowCountResetsBetweenExecutes) {
 // A pure-DML batch surfaces each statement as its own result set: SQLRowCount
 // reports UPDATE(3), then DELETE(2), then INSERT(1) as SQLMoreResults steps
 // through, then SQL_NO_DATA — matching msodbcsql.
-TEST_F(RowCountLiveTest, MultiDmlBatchReportsPerStatementCounts) {
+ODBC_TEST_F(RowCountLiveTest, MultiDmlBatchReportsPerStatementCounts) {
     Exec("CREATE TABLE #rc_multi(id int, age int)");
     Exec("INSERT INTO #rc_multi VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60)");
     Exec("UPDATE #rc_multi SET age = 99 WHERE id <= 3; "
@@ -162,7 +163,7 @@ TEST_F(RowCountLiveTest, MultiDmlBatchReportsPerStatementCounts) {
 // initial SQLExecute (sp_prepexec path) and a re-execution with a new parameter
 // value (sp_execute path) — matching msodbcsql. Uses a varchar parameter since
 // SQLBindParameter currently supports char/wchar C types.
-TEST_F(RowCountLiveTest, PreparedDmlReportsAffectedRows) {
+ODBC_TEST_F(RowCountLiveTest, PreparedDmlReportsAffectedRows) {
     Exec("CREATE TABLE #rc_prep(name varchar(10), touched int)");
     Exec("INSERT INTO #rc_prep VALUES ('a',0),('b',0),('c',0),('d',0)");
 
@@ -192,7 +193,7 @@ TEST_F(RowCountLiveTest, PreparedDmlReportsAffectedRows) {
 // SQLRowCount tracks the currently-positioned result set: after SQLMoreResults
 // advances to the next SELECT, the count reflects that result set (-1), not a
 // stale value from the previous one.
-TEST_F(RowCountLiveTest, RowCountRefreshedAcrossResultSets) {
+ODBC_TEST_F(RowCountLiveTest, RowCountRefreshedAcrossResultSets) {
     Exec("SELECT 1 AS a; SELECT 2 AS b;");
     EXPECT_EQ(-1, RowCount());
 
