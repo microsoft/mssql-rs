@@ -19,7 +19,8 @@ mod data_classification_live {
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::token::data_classification::{
-        DataClassificationMetadata, DataClassificationVersion, SensitivityRank,
+        DataClassificationMetadata, DataClassificationVersion, InformationTypeReference,
+        SensitivityLabelReference, SensitivityProperty, SensitivityRank,
     };
 
     struct Classification {
@@ -76,52 +77,27 @@ mod data_classification_live {
         client.close_query().await.unwrap();
     }
 
-    /// A classified table in tempdb, unique per test so runs sharing a server
-    /// do not collide. Dropped by [`drop`](Self::drop).
-    struct ClassifiedTable {
+    /// A table in tempdb, unique per test so runs sharing a server do not
+    /// collide. Dropped by [`drop`](Self::drop).
+    struct TempTable {
         name: String,
     }
 
-    impl ClassifiedTable {
-        async fn create() -> Self {
+    impl TempTable {
+        /// `setup` gets the bare table name and returns the batch that creates,
+        /// fills and classifies it. ADD SENSITIVITY CLASSIFICATION rejects a
+        /// database part (error 16110), so the batch runs in tempdb with
+        /// two-part names.
+        async fn create(setup: impl FnOnce(&str) -> String) -> Self {
             use rand::Rng;
             let table = format!("dc_live_{:016x}", rand::rng().random::<u64>());
-            let rows: Vec<String> = ROWS
-                .iter()
-                .map(|(id, ssn, email, note)| format!("({id}, N'{ssn}', N'{email}', N'{note}')"))
-                .collect();
-            // ADD SENSITIVITY CLASSIFICATION rejects a database part (error
-            // 16110), so the setup runs in tempdb with two-part names.
-            let classify = |column: &str, c: &Classification| {
-                format!(
-                    "ADD SENSITIVITY CLASSIFICATION TO dbo.{table}.{column} WITH (LABEL = '{}', \
-                     LABEL_ID = '{}', INFORMATION_TYPE = '{}', INFORMATION_TYPE_ID = '{}', \
-                     RANK = {});",
-                    c.label, c.label_id, c.information_type, c.information_type_id, c.rank_name
-                )
-            };
             let mut admin = connect(None).await;
             exec_and_drain(&mut admin, "USE tempdb").await;
-            exec_and_drain(
-                &mut admin,
-                &format!(
-                    "CREATE TABLE dbo.{table} (id INT NOT NULL, ssn NVARCHAR(11) NOT NULL, \
-                     email NVARCHAR(50) NOT NULL, note NVARCHAR(20) NOT NULL); \
-                     INSERT INTO dbo.{table} VALUES {}; {} {}",
-                    rows.join(", "),
-                    classify("ssn", &SSN),
-                    classify("email", &EMAIL)
-                ),
-            )
-            .await;
+            exec_and_drain(&mut admin, &setup(&table)).await;
             admin.close_connection().await.unwrap();
             Self {
                 name: format!("tempdb.dbo.{table}"),
             }
-        }
-
-        fn select(&self) -> String {
-            format!("SELECT id, ssn, email, note FROM {} ORDER BY id", self.name)
         }
 
         async fn drop(self) {
@@ -131,22 +107,59 @@ mod data_classification_live {
         }
     }
 
-    /// Runs `test` with the SELECT for a fresh classified table, dropping the
+    /// Runs `test` with the three-part name of a fresh table, dropping the
     /// table even when `test` panics so a failing run leaves nothing in tempdb.
-    async fn with_classified_table<F, Fut>(test: F)
+    async fn with_table<F, Fut>(setup: impl FnOnce(&str) -> String, test: F)
     where
         F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         use futures::FutureExt;
-        let table = ClassifiedTable::create().await;
-        let outcome = std::panic::AssertUnwindSafe(test(table.select()))
+        let table = TempTable::create(setup).await;
+        let outcome = std::panic::AssertUnwindSafe(test(table.name.clone()))
             .catch_unwind()
             .await;
         table.drop().await;
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// `id, ssn, email, note` with [`SSN`] and [`EMAIL`] classified; `test`
+    /// gets the SELECT for it.
+    async fn with_classified_table<F, Fut>(test: F)
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let setup = |table: &str| {
+            let rows: Vec<String> = ROWS
+                .iter()
+                .map(|(id, ssn, email, note)| format!("({id}, N'{ssn}', N'{email}', N'{note}')"))
+                .collect();
+            let classify = |column: &str, c: &Classification| {
+                format!(
+                    "ADD SENSITIVITY CLASSIFICATION TO dbo.{table}.{column} WITH (LABEL = '{}', \
+                     LABEL_ID = '{}', INFORMATION_TYPE = '{}', INFORMATION_TYPE_ID = '{}', \
+                     RANK = {});",
+                    c.label, c.label_id, c.information_type, c.information_type_id, c.rank_name
+                )
+            };
+            format!(
+                "CREATE TABLE dbo.{table} (id INT NOT NULL, ssn NVARCHAR(11) NOT NULL, \
+                 email NVARCHAR(50) NOT NULL, note NVARCHAR(20) NOT NULL); \
+                 INSERT INTO dbo.{table} VALUES {}; {} {}",
+                rows.join(", "),
+                classify("ssn", &SSN),
+                classify("email", &EMAIL)
+            )
+        };
+        with_table(setup, |table| {
+            test(format!(
+                "SELECT id, ssn, email, note FROM {table} ORDER BY id"
+            ))
+        })
+        .await;
     }
 
     fn assert_column(
@@ -271,6 +284,156 @@ mod data_classification_live {
     #[tokio::test]
     async fn live_v1_classification_matches_the_server() {
         assert_classification_matches(DataClassificationVersion::Version1).await;
+    }
+
+    /// `(label, information type, rank)` a property resolves to.
+    type Resolved<'a> = (Option<&'a str>, Option<&'a str>, Option<SensitivityRank>);
+
+    fn resolve<'a>(
+        metadata: &'a DataClassificationMetadata,
+        property: &SensitivityProperty,
+    ) -> Resolved<'a> {
+        (
+            metadata
+                .resolve_label(property.sensitivity_label())
+                .map(|label| label.name()),
+            metadata
+                .resolve_information_type(property.information_type())
+                .map(|information_type| information_type.name()),
+            property.rank(),
+        )
+    }
+
+    fn resolved_column<'a>(
+        metadata: &'a DataClassificationMetadata,
+        column: usize,
+    ) -> Vec<Resolved<'a>> {
+        metadata.columns()[column]
+            .properties()
+            .iter()
+            .map(|property| resolve(metadata, property))
+            .collect()
+    }
+
+    /// Shapes the main table does not produce: a classification with only a
+    /// label or only an information type, two columns sharing a label, and
+    /// derived columns combining classified sources.
+    async fn assert_classification_shapes(version: DataClassificationVersion) {
+        let setup = |table: &str| {
+            format!(
+                "CREATE TABLE dbo.{table} (label_only NVARCHAR(10), type_only NVARCHAR(10), \
+                 first NVARCHAR(10), second NVARCHAR(10)); \
+                 INSERT INTO dbo.{table} VALUES (N'a', N'b', N'c', N'd'); \
+                 ADD SENSITIVITY CLASSIFICATION TO dbo.{table}.label_only \
+                 WITH (LABEL = 'Confidential', LABEL_ID = 'L-conf'); \
+                 ADD SENSITIVITY CLASSIFICATION TO dbo.{table}.type_only \
+                 WITH (INFORMATION_TYPE = 'Contact Info', INFORMATION_TYPE_ID = 'T-contact'); \
+                 ADD SENSITIVITY CLASSIFICATION TO dbo.{table}.first \
+                 WITH (LABEL = 'Highly Confidential', LABEL_ID = 'L-high', \
+                 INFORMATION_TYPE = 'National ID', INFORMATION_TYPE_ID = 'T-nid', RANK = CRITICAL); \
+                 ADD SENSITIVITY CLASSIFICATION TO dbo.{table}.second \
+                 WITH (LABEL = 'Highly Confidential', LABEL_ID = 'L-high', \
+                 INFORMATION_TYPE = 'Financial', INFORMATION_TYPE_ID = 'T-fin', RANK = HIGH);"
+            )
+        };
+        with_table(setup, |table| async move {
+            let mut client = connect(Some(version)).await;
+            client
+                .execute(
+                    format!(
+                        "SELECT label_only, type_only, first, second, \
+                         first + second AS derived, label_only + type_only AS mixed FROM {table}"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+            let metadata = client
+                .data_classification()
+                .expect("SQL Server sent no classification")
+                .clone();
+            println!("DATACLASSIFICATION received: {metadata:#?}");
+            client.close_query().await.unwrap();
+            client.close_connection().await.unwrap();
+
+            let rank = |rank| (version == DataClassificationVersion::Version2).then_some(rank);
+            let label_only = (
+                Some("Confidential"),
+                None,
+                rank(SensitivityRank::NotDefined),
+            );
+            let type_only = (
+                None,
+                Some("Contact Info"),
+                rank(SensitivityRank::NotDefined),
+            );
+            let first = (
+                Some("Highly Confidential"),
+                Some("National ID"),
+                rank(SensitivityRank::Critical),
+            );
+            let second = (
+                Some("Highly Confidential"),
+                Some("Financial"),
+                rank(SensitivityRank::High),
+            );
+
+            assert_eq!(metadata.version(), version);
+            assert_eq!(metadata.rank(), rank(SensitivityRank::Critical));
+            assert_eq!(metadata.columns().len(), 6);
+
+            // The missing half of a partial classification is 0xFFFF on the wire.
+            let [label_only_property] = metadata.columns()[0].properties() else {
+                panic!("label_only: {:?}", metadata.columns()[0]);
+            };
+            assert_eq!(
+                label_only_property.information_type(),
+                InformationTypeReference::Unspecified
+            );
+            let [type_only_property] = metadata.columns()[1].properties() else {
+                panic!("type_only: {:?}", metadata.columns()[1]);
+            };
+            assert_eq!(
+                type_only_property.sensitivity_label(),
+                SensitivityLabelReference::Unspecified
+            );
+            assert_eq!(resolved_column(&metadata, 0), [label_only]);
+            assert_eq!(resolved_column(&metadata, 1), [type_only]);
+            assert_eq!(resolved_column(&metadata, 2), [first]);
+            assert_eq!(resolved_column(&metadata, 3), [second]);
+
+            // SQL Server sends each dictionary entry once per result set, so
+            // the two columns sharing a label refer to the same entry.
+            assert_eq!(metadata.sensitivity_labels().len(), 2);
+            assert_eq!(metadata.information_types().len(), 3);
+            assert_eq!(
+                metadata.columns()[2].properties()[0].sensitivity_label(),
+                metadata.columns()[3].properties()[0].sensitivity_label()
+            );
+
+            // A derived column carries one property per classified source.
+            for (column, sources) in [(4, [first, second]), (5, [label_only, type_only])] {
+                let properties = resolved_column(&metadata, column);
+                assert_eq!(properties.len(), 2, "column {column}: {properties:?}");
+                for source in sources {
+                    assert!(
+                        properties.contains(&source),
+                        "column {column}: {source:?} missing from {properties:?}"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn live_v2_partial_shared_and_derived_classifications_match_the_server() {
+        assert_classification_shapes(DataClassificationVersion::Version2).await;
+    }
+
+    #[tokio::test]
+    async fn live_v1_partial_shared_and_derived_classifications_match_the_server() {
+        assert_classification_shapes(DataClassificationVersion::Version1).await;
     }
 
     /// Without the feature SQL Server sends no `0xA3`, so the query reads as before.
