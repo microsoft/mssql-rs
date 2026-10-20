@@ -1210,6 +1210,7 @@ pub fn build_routing_envchange_token(redirect_host: &str, redirect_port: u16) ->
 ///
 /// This response is sent instead of a normal login response when the server
 /// wants to redirect the client to a different endpoint. The response contains:
+/// - LOGINACK token, which [MS-TDS] 2.2.7.9 requires before the route
 /// - Routing EnvChange token (tells client where to connect)
 /// - DONE token (indicates end of response)
 ///
@@ -1220,15 +1221,7 @@ pub fn build_routing_envchange_token(redirect_host: &str, redirect_port: u16) ->
 /// # Returns
 /// A BytesMut containing the complete TDS packet with routing response
 pub fn build_routing_response(redirect_host: &str, redirect_port: u16) -> BytesMut {
-    let mut response = BytesMut::new();
-
-    // Add routing EnvChange token
-    response.extend_from_slice(&build_routing_envchange_token(redirect_host, redirect_port));
-
-    // Add DONE token
-    response.extend_from_slice(&build_done_token(0));
-
-    wrap_in_packet(PacketType::TabularResult, response)
+    build_routing_login_response(redirect_host, redirect_port, &[None], true, None, false)
 }
 
 /// EnvChange subtype for Enhanced Routing
@@ -1269,28 +1262,39 @@ pub fn build_enhanced_routing_envchange_token(
     token_data
 }
 
-/// Build a login response that routes the client with Enhanced Routing.
+/// Build a login response that routes the client to `redirect_host:redirect_port`.
 ///
-/// Like a real server it sends LOGINACK first. `ack` is the FEATUREEXTACK
-/// `IsEnabled` byte for feature `0x0F` (`None` omits it); servers may send
-/// that acknowledgement before or after the routing token.
-pub fn build_enhanced_routing_response(
+/// Each entry of `routes` becomes a routing EnvChange: Enhanced Routing
+/// (type 21) to that database, or plain routing (type 20) for `None`.
+/// [MS-TDS] 2.2.7.9 allows exactly one, after LOGINACK; clearing `login_ack`
+/// or passing more routes models a server that breaks those rules. `ack` is
+/// the FEATUREEXTACK `IsEnabled` byte for feature `0x0F` (`None` omits it),
+/// which servers may send before or after the routing token.
+pub fn build_routing_login_response(
     redirect_host: &str,
     redirect_port: u16,
-    database: &str,
+    routes: &[Option<&str>],
+    login_ack: bool,
     ack: Option<u8>,
     ack_before_routing: bool,
 ) -> BytesMut {
     let ack_token = ack.map(build_feature_ext_ack_enhanced_routing);
-    let mut response = build_login_ack();
+    let mut response = if login_ack {
+        build_login_ack()
+    } else {
+        BytesMut::new()
+    };
     if ack_before_routing && let Some(ref token) = ack_token {
         response.extend_from_slice(token);
     }
-    response.extend_from_slice(&build_enhanced_routing_envchange_token(
-        redirect_host,
-        redirect_port,
-        database,
-    ));
+    for route in routes {
+        response.extend_from_slice(&match route {
+            Some(database) => {
+                build_enhanced_routing_envchange_token(redirect_host, redirect_port, database)
+            }
+            None => build_routing_envchange_token(redirect_host, redirect_port),
+        });
+    }
     if !ack_before_routing && let Some(ref token) = ack_token {
         response.extend_from_slice(token);
     }
@@ -1455,8 +1459,24 @@ mod tests {
         // First byte should be packet type (TabularResult = 0x04)
         assert_eq!(response[0], PacketType::TabularResult as u8);
 
-        // After header, should have EnvChange token (0xE3)
-        assert_eq!(response[PACKET_HEADER_SIZE], TokenType::EnvChange as u8);
+        // [MS-TDS] 2.2.7.9: LOGINACK, then the routing EnvChange.
+        assert_eq!(
+            response,
+            routing_packet(&[
+                &build_login_ack(),
+                &build_routing_envchange_token("sqlserver.database.windows.net", 1433),
+            ])
+        );
+    }
+
+    /// A login response packet carrying `tokens`, then DONE.
+    fn routing_packet(tokens: &[&BytesMut]) -> BytesMut {
+        let mut body = BytesMut::new();
+        for token in tokens {
+            body.extend_from_slice(token);
+        }
+        body.extend_from_slice(&build_done_token(0));
+        wrap_in_packet(PacketType::TabularResult, body)
     }
 
     #[test]
@@ -1488,13 +1508,29 @@ mod tests {
                 .position(|window| window == needle)
         };
 
-        let after = build_enhanced_routing_response("srv", 1433, "db", Some(1), false);
+        let after = build_routing_login_response("srv", 1433, &[Some("db")], true, Some(1), false);
         assert!(position(&after, &routing) < position(&after, &ack));
-        let before = build_enhanced_routing_response("srv", 1433, "db", Some(1), true);
+        let before = build_routing_login_response("srv", 1433, &[Some("db")], true, Some(1), true);
         assert!(position(&before, &ack) < position(&before, &routing));
-        let without = build_enhanced_routing_response("srv", 1433, "db", None, false);
+        let without = build_routing_login_response("srv", 1433, &[Some("db")], true, None, false);
         assert!(position(&without, &routing).is_some());
         assert_eq!(position(&without, &ack), None);
+    }
+
+    #[test]
+    fn test_routing_login_response_models_malformed_servers() {
+        let ack = build_feature_ext_ack_enhanced_routing(1);
+        let plain = build_routing_envchange_token("srv", 1433);
+        let enhanced = build_enhanced_routing_envchange_token("srv", 1433, "db");
+
+        assert_eq!(
+            build_routing_login_response("srv", 1433, &[Some("db")], false, Some(1), true),
+            routing_packet(&[&ack, &enhanced])
+        );
+        assert_eq!(
+            build_routing_login_response("srv", 1433, &[Some("db"), None], true, None, false),
+            routing_packet(&[&build_login_ack(), &enhanced, &plain])
+        );
     }
 
     #[test]

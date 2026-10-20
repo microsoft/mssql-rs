@@ -71,6 +71,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `mssql-tds`: `Error::Redirection` has a new `database` field, set when the
   server routes the connection with Enhanced Routing. Routing ENVCHANGEs are
   now acted on after the whole login response is read rather than mid-stream.
+  A routing ENVCHANGE (type 20 or 21) must follow LOGINACK and be the only one
+  in the login response ([MS-TDS] 2.2.7.9); otherwise the login fails with a
+  protocol error instead of following a route, matching msodbcsql.
 
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,
@@ -142,6 +145,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-tds`: a route received over shared memory, the first transport tried
+  for a local named instance, is now followed over TCP like a route received
+  over any other transport. The connection previously failed with
+  `Error::Redirection`.
 
 - `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
   zero payload length now decodes as empty instead of NULL (AB#49220). In the

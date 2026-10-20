@@ -403,6 +403,15 @@ mod redirection_tests {
     /// next one (the last to a destination that accepts the login) with the
     /// configuration its builder returns for the target port.
     async fn login_through(hops: Vec<Hop>) -> RoutedLogin {
+        login_through_with(hops, |port| format!("127.0.0.1,{port}")).await
+    }
+
+    /// [`login_through`], connecting to the data source that `datasource`
+    /// returns for the first gateway's port.
+    async fn login_through_with(
+        hops: Vec<Hop>,
+        datasource: impl FnOnce(u16) -> String,
+    ) -> RoutedLogin {
         use mssql_mock_tds::MockTdsServer;
 
         let destination = MockTdsServer::new("127.0.0.1:0").await.unwrap();
@@ -420,11 +429,7 @@ mod redirection_tests {
         }
 
         let result = TdsConnectionProvider {}
-            .create_client(
-                create_test_context(),
-                &format!("127.0.0.1,{target_port}"),
-                None,
-            )
+            .create_client(create_test_context(), &datasource(target_port), None)
             .await
             .map(drop)
             .map_err(|e| e.to_string());
@@ -533,5 +538,109 @@ mod redirection_tests {
         assert_eq!(routed.result, Ok(()));
         assert_eq!(only_database(&routed.logins[1]), Some("routed_db"));
         assert_eq!(only_database(&routed.logins[2]), Some("master"));
+    }
+
+    /// [MS-TDS] 2.2.7.9: a route follows LOGINACK, and a login response carries
+    /// at most one. Like msodbcsql, the client fails the login on either
+    /// violation instead of following whichever route came last.
+    #[tokio::test]
+    async fn test_malformed_routing_fails_the_login_without_following_a_route() {
+        use mssql_mock_tds::RedirectionConfig;
+
+        let cases: Vec<(&str, &str, Hop)> = vec![
+            (
+                "Enhanced Routing without LOGINACK",
+                "before LOGINACK",
+                Box::new(|port| RedirectionConfig {
+                    login_ack: false,
+                    ack_before_routing: true,
+                    ..RedirectionConfig::enhanced("127.0.0.1", port, "routed_db")
+                }),
+            ),
+            (
+                "plain routing without LOGINACK",
+                "before LOGINACK",
+                Box::new(|port| RedirectionConfig {
+                    login_ack: false,
+                    ..RedirectionConfig::new("127.0.0.1", port)
+                }),
+            ),
+            (
+                "two Enhanced Routing ENVCHANGEs",
+                "more than one routing ENVCHANGE",
+                Box::new(|port| RedirectionConfig {
+                    extra_routes: vec![Some("other_db".to_string())],
+                    ..RedirectionConfig::enhanced("127.0.0.1", port, "routed_db")
+                }),
+            ),
+            (
+                "Enhanced Routing, then plain routing",
+                "more than one routing ENVCHANGE",
+                Box::new(|port| RedirectionConfig {
+                    extra_routes: vec![None],
+                    ..RedirectionConfig::enhanced("127.0.0.1", port, "routed_db")
+                }),
+            ),
+            (
+                "plain routing, then Enhanced Routing",
+                "more than one routing ENVCHANGE",
+                Box::new(|port| RedirectionConfig {
+                    enhanced_routing_ack: Some(1),
+                    extra_routes: vec![Some("routed_db".to_string())],
+                    ..RedirectionConfig::new("127.0.0.1", port)
+                }),
+            ),
+        ];
+        for (case, violation, hop) in cases {
+            let routed = login_through(vec![hop]).await;
+            let error = routed.result.expect_err(case);
+            assert!(
+                error.starts_with("Protocol Error") && error.contains(violation),
+                "{case}: expected a protocol error naming the violation, got {error}"
+            );
+            assert!(
+                routed.logins[1].is_empty(),
+                "{case}: the client must not follow a route"
+            );
+        }
+    }
+
+    /// A route received over shared memory is followed over TCP. The gateway
+    /// is served on the `\\.\pipe\SQLLocal\<instance>` pipe that a local named
+    /// instance's shared-memory shortcut opens before SSRP.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_shared_memory_login_follows_the_route_over_tcp() {
+        let instance = format!("ROUTE{}", std::process::id());
+        let routed = login_through_with(vec![enhanced("routed_db")], |port| {
+            relay_shared_memory(&instance, port);
+            format!(r".\{instance}")
+        })
+        .await;
+        assert_eq!(routed.result, Ok(()));
+        assert_eq!(only_database(&routed.logins[0]), Some("master"));
+        assert_eq!(only_database(&routed.logins[1]), Some("routed_db"));
+    }
+
+    /// Relays the shared-memory pipe of local instance `instance` to the TDS
+    /// server on `port`.
+    #[cfg(windows)]
+    fn relay_shared_memory(instance: &str, port: u16) {
+        use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+
+        let mut pipe = ServerOptions::new()
+            .first_pipe_instance(true)
+            .pipe_mode(PipeMode::Message)
+            .create(format!(r"\\.\pipe\SQLLocal\{instance}"))
+            .expect("create the shared-memory pipe");
+        tokio::spawn(async move {
+            pipe.connect()
+                .await
+                .expect("accept the shared-memory client");
+            let mut server = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect to the gateway");
+            let _ = tokio::io::copy_bidirectional(&mut pipe, &mut server).await;
+        });
     }
 }

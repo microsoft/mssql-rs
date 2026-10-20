@@ -5,12 +5,13 @@
 
 use crate::protocol::{
     FEATURE_EXT_ENHANCED_ROUTING, PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError,
-    TM_BEGIN_XACT, build_attention_ack_packet, build_done_token, build_enhanced_routing_response,
-    build_error_response, build_feature_ext_ack_data_classification, build_feature_ext_ack_fedauth,
+    TM_BEGIN_XACT, build_attention_ack_packet, build_done_token, build_error_response,
+    build_feature_ext_ack_data_classification, build_feature_ext_ack_fedauth,
     build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
-    build_prelogin_response_with_fedauth, build_query_result_with_extras, build_routing_response,
-    build_transaction_manager_response, parse_fedauth_token, parse_login7_auth, parse_sql_batch,
-    parse_transaction_descriptor_header, parse_transaction_manager_request,
+    build_prelogin_response_with_fedauth, build_query_result_with_extras,
+    build_routing_login_response, build_transaction_manager_response, parse_fedauth_token,
+    parse_login7_auth, parse_sql_batch, parse_transaction_descriptor_header,
+    parse_transaction_manager_request,
 };
 use crate::query_response::{LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
@@ -65,6 +66,12 @@ pub struct RedirectionConfig {
     pub enhanced_routing_ack: Option<u8>,
     /// Send that acknowledgement before the routing ENVCHANGE instead of after it.
     pub ack_before_routing: bool,
+    /// Send LOGINACK before the route, as [MS-TDS] 2.2.7.9 requires. Cleared to
+    /// model a server that routes without one.
+    pub login_ack: bool,
+    /// Routing ENVCHANGEs sent after the first, which [MS-TDS] 2.2.7.9 forbids:
+    /// Enhanced Routing to each named database, plain routing for `None`.
+    pub extra_routes: Vec<Option<String>>,
 }
 
 impl RedirectionConfig {
@@ -76,6 +83,8 @@ impl RedirectionConfig {
             enhanced_database: None,
             enhanced_routing_ack: None,
             ack_before_routing: false,
+            login_ack: true,
+            extra_routes: Vec::new(),
         }
     }
 
@@ -382,28 +391,31 @@ impl ConnectionProcessor {
                 if let Some(ref redir) = self.redirection {
                     self.awaiting_fedauth_token = false;
                     self.is_authenticated = true;
-                    // Like a real server, route by database only for clients that
-                    // advertise Enhanced Routing.
-                    let enhanced_database = redir.enhanced_database.as_deref().filter(|_| {
-                        auth_info
-                            .feature_ids
-                            .contains(&FEATURE_EXT_ENHANCED_ROUTING)
-                    });
+                    // Like a real server, route by database and acknowledge
+                    // feature 0x0F only for clients that advertise Enhanced Routing.
+                    let enhanced_routing = auth_info
+                        .feature_ids
+                        .contains(&FEATURE_EXT_ENHANCED_ROUTING);
+                    let enhanced_database = redir
+                        .enhanced_database
+                        .as_deref()
+                        .filter(|_| enhanced_routing);
                     // Redirect the client to a different server
                     info!(
                         "Redirecting client {} to {}:{} (database {:?})",
                         self.addr, redir.redirect_host, redir.redirect_port, enhanced_database
                     );
-                    let response = match enhanced_database {
-                        Some(database) => build_enhanced_routing_response(
-                            &redir.redirect_host,
-                            redir.redirect_port,
-                            database,
-                            redir.enhanced_routing_ack,
-                            redir.ack_before_routing,
-                        ),
-                        None => build_routing_response(&redir.redirect_host, redir.redirect_port),
-                    };
+                    let routes: Vec<Option<&str>> = std::iter::once(enhanced_database)
+                        .chain(redir.extra_routes.iter().map(Option::as_deref))
+                        .collect();
+                    let response = build_routing_login_response(
+                        &redir.redirect_host,
+                        redir.redirect_port,
+                        &routes,
+                        redir.login_ack,
+                        redir.enhanced_routing_ack.filter(|_| enhanced_routing),
+                        redir.ack_before_routing,
+                    );
                     self.record_to_store().await;
                     Some(response)
                 } else if auth_info.has_fedauth && auth_info.access_token_bytes.is_none() {

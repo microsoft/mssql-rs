@@ -587,6 +587,19 @@ impl LoginResponseModel {
                         "Routing env change did not include a redirection target".to_string(),
                     ));
                 };
+                // [MS-TDS] 2.2.7.9: a route follows LOGINACK, and a login response
+                // carries at most one. msodbcsql (`Parse.cpp`) rejects both
+                // violations instead of letting the last route pick the endpoint.
+                if self.success_token.is_none() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Received a routing ENVCHANGE before LOGINACK".to_string(),
+                    ));
+                }
+                if self.change_properties.routing_information.is_some() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Received more than one routing ENVCHANGE in a login response".to_string(),
+                    ));
+                }
                 // Acted on by `redirect_if_routed` once the whole response is read.
                 self.change_properties.routing_information = Some(routing_info.clone());
                 Ok(())
@@ -2189,21 +2202,89 @@ mod tests {
         assert!(err.to_string().contains("Protocol Error"));
     }
 
+    /// A response model past LOGINACK, which a routing ENVCHANGE must follow.
+    fn logged_in_model() -> LoginResponseModel {
+        let mut model = make_response_model();
+        model.success_token = Some(LoginAckToken {
+            interface_type: SqlInterfaceType::TSql,
+            tds_version: TdsVersion::V7_4,
+            prog_name: "SQL".to_string(),
+            prog_version: Version {
+                major: 1,
+                minor: 0,
+                build: 0,
+                revision: 0,
+            },
+        });
+        model
+    }
+
+    fn routing_info(server: &str, database: Option<&str>) -> RoutingInfo {
+        RoutingInfo {
+            protocol: 0,
+            server: server.to_string(),
+            port: 11000,
+            database: database.map(str::to_string),
+        }
+    }
+
+    /// Type 21 when the route names a database, type 20 otherwise.
+    fn routing_token(routing: &RoutingInfo) -> EnvChangeToken {
+        let sub_type = match routing.database {
+            Some(_) => EnvChangeTokenSubType::EnhancedRouting,
+            None => EnvChangeTokenSubType::Routing,
+        };
+        env_token(sub_type, (None, Some(routing.clone())).into())
+    }
+
     #[test]
     fn capture_change_property_routing_is_recorded_not_raised() {
-        let mut model = make_response_model();
-        let routing = RoutingInfo {
-            protocol: 0,
-            server: "redirect.sql.net".to_string(),
-            port: 11000,
-            database: None,
-        };
-        let token = env_token(
-            EnvChangeTokenSubType::Routing,
-            (None, Some(routing.clone())).into(),
-        );
-        model.capture_change_property(token).unwrap();
+        let mut model = logged_in_model();
+        let routing = routing_info("redirect.sql.net", None);
+        model
+            .capture_change_property(routing_token(&routing))
+            .unwrap();
         assert_eq!(model.change_properties.routing_information, Some(routing));
+    }
+
+    #[test]
+    fn capture_change_property_routing_before_login_ack_errors() {
+        for database in [None, Some("sales")] {
+            let mut model = make_response_model();
+            let routing = routing_info("redirect.sql.net", database);
+            let err = model
+                .capture_change_property(routing_token(&routing))
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ProtocolError(ref message) if message.contains("before LOGINACK")),
+                "database {database:?}: got {err:?}"
+            );
+            assert_eq!(model.change_properties.routing_information, None);
+        }
+    }
+
+    #[test]
+    fn capture_change_property_second_route_errors() {
+        for (first, second) in [
+            (None, None),
+            (Some("sales"), Some("hr")),
+            (Some("sales"), None),
+            (None, Some("sales")),
+        ] {
+            let mut model = logged_in_model();
+            let routing = routing_info("first.sql.net", first);
+            model
+                .capture_change_property(routing_token(&routing))
+                .unwrap();
+            let err = model
+                .capture_change_property(routing_token(&routing_info("second.sql.net", second)))
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ProtocolError(ref message) if message.contains("more than one routing ENVCHANGE")),
+                "{first:?} then {second:?}: got {err:?}"
+            );
+            assert_eq!(model.change_properties.routing_information, Some(routing));
+        }
     }
 
     #[test]
