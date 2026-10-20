@@ -59,10 +59,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   DataFrame to a PyArrow table.
 
 - `mssql-tds`: DNS caching. LOGIN7 always advertises feature extension `0x0B`,
-  as msodbcsql does. When a server acknowledges it, the host's latest
-  successful resolution is kept in a process-wide cache and used only if a
-  later resolution of that host fails, so connections survive a DNS outage
-  (AB#49294).
+  as msodbcsql does. When a server acknowledges it, the addresses that
+  connection resolved are kept in a process-wide cache and used only if a
+  later resolution of that host fails, so connections survive a DNS outage.
+  A later login the server accepts without that acknowledgement removes the
+  host; a rejected login leaves it (AB#49294).
 
 - Initial public release of the mssql-rs workspace.
 

@@ -8,12 +8,19 @@
 //! connect resolves the host normally, and cached addresses are used only when
 //! that resolution fails, so connections keep working through a DNS outage.
 //!
-//! The server decides whether its host may be cached. Each FEATUREEXTACK
-//! settles it, as `SNI_QUERY_CONN_DNSCACHE` does in SNI: an acknowledgement
-//! with bit 0 set publishes the host's latest resolution, and anything else
-//! removes the host. Unlike SNI, addresses are never used before a server has
-//! allowed them, and a resolution waiting for that verdict is held in a
-//! bounded set, so hosts whose logins never get that far cannot grow the cache.
+//! The server decides whether its host may be cached, and every login it
+//! accepts settles that. A FEATUREEXTACK with bit 0 set publishes the addresses
+//! that login's connection resolved; any other FEATUREEXTACK removes the host,
+//! as `SNI_QUERY_CONN_DNSCACHE` does in SNI, and so does a login accepted with
+//! no FEATUREEXTACK at all. SNI needs no such rule because it re-caches every
+//! successful resolution, whereas addresses here are only ever published by a
+//! server's allowance. A login the server rejects settles nothing: MS-TDS sends
+//! FEATUREEXTACK only alongside LOGINACK, and a retry that fails during a DNS
+//! outage must not take away the fallback the next one needs.
+//!
+//! Each connection carries its own [`Resolution`] to its login, as SqlClient
+//! does with `pendingSQLDNSObject`, so the cache only ever holds allowed hosts
+//! and concurrent logins cannot lose each other's addresses.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,38 +30,34 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use tracing::{debug, warn};
 
-/// Most hosts whose latest resolution can wait for a verdict at once.
-const MAX_PENDING_HOSTS: usize = 256;
-
-/// Keys are lowercased host names, because DNS names are case-insensitive.
-/// Addresses keep their IPv6 scope; serving one only replaces the port.
-#[derive(Debug, Default)]
-struct Entries {
-    /// Hosts a server allowed caching for: the fallback addresses.
-    allowed: HashMap<String, Vec<SocketAddr>>,
-    /// Each host's latest resolution, or the cached addresses a login fell
-    /// back to, for an allowing verdict to publish. Verdicts leave it in
-    /// place, so the last verdict decides however logins interleave.
-    pending: HashMap<String, Vec<SocketAddr>>,
+/// The addresses one connection resolved its host to, or fell back to. Only
+/// that connection's login verdict can publish them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resolution {
+    /// Lowercased, because DNS names are case-insensitive.
+    host: String,
+    addresses: Vec<SocketAddr>,
 }
 
-impl Entries {
-    fn hold(&mut self, key: String, addresses: Vec<SocketAddr>) {
-        if self.pending.len() >= MAX_PENDING_HOSTS && !self.pending.contains_key(&key) {
-            // Any victim will do: losing one only defers caching its host to
-            // that host's next login.
-            if let Some(victim) = self.pending.keys().next().cloned() {
-                self.pending.remove(&victim);
-            }
+impl Resolution {
+    pub(crate) fn new(host: &str, addresses: Vec<SocketAddr>) -> Self {
+        Self {
+            host: host.to_ascii_lowercase(),
+            addresses,
         }
-        self.pending.insert(key, addresses);
+    }
+
+    pub(crate) fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
     }
 }
 
-/// Process-lifetime host name to address cache.
+/// Process-lifetime map from each host a server allowed caching for to the
+/// addresses to fall back to. Addresses keep their IPv6 scope; serving one only
+/// replaces the port.
 #[derive(Debug, Default)]
 pub(crate) struct DnsCache {
-    entries: Mutex<Entries>,
+    allowed: Mutex<HashMap<String, Vec<SocketAddr>>>,
 }
 
 static GLOBAL_CACHE: OnceLock<DnsCache> = OnceLock::new();
@@ -65,66 +68,49 @@ impl DnsCache {
         GLOBAL_CACHE.get_or_init(DnsCache::default)
     }
 
-    fn entries(&self) -> MutexGuard<'_, Entries> {
-        // Every critical section leaves the maps consistent, so a poisoned lock
+    fn allowed(&self) -> MutexGuard<'_, HashMap<String, Vec<SocketAddr>>> {
+        // Every critical section leaves the map consistent, so a poisoned lock
         // is safe to keep using; the cache is only a fallback.
-        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+        self.allowed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Resolves `host` with `lookup`. A successful resolution becomes the
-    /// host's pending entry; a failed one falls back to the addresses a server
-    /// allowed.
+    /// Resolves `host` with `lookup`, falling back to the addresses a server
+    /// allowed when that fails.
     pub(crate) async fn resolve<F, Fut>(
         &self,
         host: &str,
         port: u16,
         lookup: F,
-    ) -> io::Result<Vec<SocketAddr>>
+    ) -> io::Result<Resolution>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
     {
-        match lookup().await {
-            Ok(addresses) => {
-                self.record(host, &addresses);
-                Ok(addresses)
+        let addresses = match lookup().await {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                let Some(addresses) = self.cached(host, port) else {
+                    return Err(error);
+                };
+                warn!(
+                    host,
+                    %error,
+                    ?addresses,
+                    "DNS resolution failed; connecting with cached addresses"
+                );
+                addresses
             }
-            Err(error) => match self.cached(host, port) {
-                Some(addresses) => {
-                    warn!(
-                        host,
-                        %error,
-                        ?addresses,
-                        "DNS resolution failed; connecting with cached addresses"
-                    );
-                    Ok(addresses)
-                }
-                None => Err(error),
-            },
-        }
-    }
-
-    fn record(&self, host: &str, addresses: &[SocketAddr]) {
-        // An IP literal never needs a resolver to fall back from.
-        if addresses.is_empty() || host.parse::<IpAddr>().is_ok() {
-            return;
-        }
-        self.entries()
-            .hold(host.to_ascii_lowercase(), addresses.to_vec());
+        };
+        Ok(Resolution::new(host, addresses))
     }
 
     fn cached(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
-        let key = host.to_ascii_lowercase();
-        let mut entries = self.entries();
-        let addresses = entries.allowed.get(&key)?.clone();
-        // This login's verdict must still be able to publish what it connected
-        // with if another login's verdict removes the entry first.
-        if !entries.pending.contains_key(&key) {
-            entries.hold(key, addresses.clone());
-        }
+        let allowed = self.allowed();
+        let addresses = allowed.get(&host.to_ascii_lowercase())?;
         Some(
             addresses
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|mut address| {
                     address.set_port(port);
                     address
@@ -133,23 +119,26 @@ impl DnsCache {
         )
     }
 
-    /// Applies a server's DNS caching acknowledgement for `host`.
-    pub(crate) fn apply_verdict(&self, host: &str, allowed: bool) {
-        let key = host.to_ascii_lowercase();
-        let mut entries = self.entries();
-        if allowed {
-            if let Some(addresses) = entries.pending.get(&key).cloned() {
-                entries.allowed.insert(key, addresses);
-            }
-        } else {
-            entries.allowed.remove(&key);
+    /// Applies a server's DNS caching verdict to the host `resolution` came
+    /// from: allowing publishes its addresses, anything else removes the host.
+    pub(crate) fn apply_verdict(&self, resolution: &Resolution, allowed: bool) {
+        let Resolution { host, addresses } = resolution;
+        let mut entries = self.allowed();
+        if !allowed {
+            entries.remove(host);
+        } else if !addresses.is_empty() && host.parse::<IpAddr>().is_err() {
+            // An IP literal never needs a resolver to fall back from.
+            entries.insert(host.clone(), addresses.clone());
         }
-        debug!(host, allowed, "Applied DNS caching acknowledgement");
+        debug!(
+            host = host.as_str(),
+            allowed, "Applied DNS caching acknowledgement"
+        );
     }
 }
 
 /// Resolves `host` for a TCP connect through the process-wide DNS cache.
-pub(crate) async fn lookup_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+pub(crate) async fn lookup_host(host: &str, port: u16) -> io::Result<Resolution> {
     DnsCache::global()
         .resolve(host, port, || system_lookup(host, port))
         .await
@@ -179,17 +168,14 @@ mod tests {
         host: &str,
         port: u16,
         addresses: Vec<SocketAddr>,
-    ) -> io::Result<Vec<SocketAddr>> {
+    ) -> Resolution {
         cache
             .resolve(host, port, || async move { Ok(addresses) })
             .await
+            .unwrap()
     }
 
-    async fn fails_to_resolve(
-        cache: &DnsCache,
-        host: &str,
-        port: u16,
-    ) -> io::Result<Vec<SocketAddr>> {
+    async fn fails_to_resolve(cache: &DnsCache, host: &str, port: u16) -> io::Result<Resolution> {
         cache
             .resolve(host, port, || async {
                 Err(io::Error::new(io::ErrorKind::NotFound, "no such host"))
@@ -197,14 +183,20 @@ mod tests {
             .await
     }
 
+    /// The addresses a connect to `host` falls back to when resolution fails.
+    async fn fallback(cache: &DnsCache, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+        fails_to_resolve(cache, host, port)
+            .await
+            .ok()
+            .map(|resolution| resolution.addresses)
+    }
+
     #[tokio::test]
     async fn successful_resolution_is_returned_as_is() {
         let cache = DnsCache::default();
         let addresses = vec![address("10.0.0.1", 1433), address("10.0.0.2", 1433)];
-        let resolved = resolves_to(&cache, "db.example.com", 1433, addresses.clone())
-            .await
-            .unwrap();
-        assert_eq!(resolved, addresses);
+        let resolution = resolves_to(&cache, "DB.Example.com", 1433, addresses.clone()).await;
+        assert_eq!(resolution, Resolution::new("db.example.com", addresses));
     }
 
     #[tokio::test]
@@ -216,162 +208,194 @@ mod tests {
             1433,
             vec![address("10.0.0.1", 1433)],
         )
-        .await
-        .unwrap();
+        .await;
         let error = fails_to_resolve(&cache, "db.example.com", 1433)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            cache.allowed().is_empty(),
+            "nothing is held while a verdict is pending"
+        );
     }
 
     #[tokio::test]
-    async fn allowed_entry_is_used_when_resolution_fails() {
+    async fn allowed_resolution_is_used_when_resolution_fails() {
         let cache = DnsCache::default();
-        resolves_to(
+        let resolution = resolves_to(
             &cache,
             "db.example.com",
             1433,
             vec![address("10.0.0.1", 1433)],
         )
-        .await
-        .unwrap();
-        cache.apply_verdict("db.example.com", true);
+        .await;
+        cache.apply_verdict(&resolution, true);
 
         let resolved = fails_to_resolve(&cache, "DB.Example.com", 11000)
             .await
             .unwrap();
-        assert_eq!(resolved, [address("10.0.0.1", 11000)]);
+        assert_eq!(
+            resolved,
+            Resolution::new("db.example.com", vec![address("10.0.0.1", 11000)])
+        );
     }
 
     #[tokio::test]
-    async fn a_new_resolution_replaces_the_allowed_one_at_the_next_verdict() {
+    async fn a_new_resolution_replaces_the_allowed_one_only_once_allowed() {
         let cache = DnsCache::default();
-        resolves_to(
+        let first = resolves_to(
             &cache,
             "db.example.com",
             1433,
             vec![address("10.0.0.1", 1433)],
         )
-        .await
-        .unwrap();
-        cache.apply_verdict("db.example.com", true);
-        resolves_to(
+        .await;
+        cache.apply_verdict(&first, true);
+        let second = resolves_to(
             &cache,
             "db.example.com",
             1433,
             vec![address("10.0.0.9", 1433)],
         )
-        .await
-        .unwrap();
-
-        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
-            .await
-            .unwrap();
+        .await;
         assert_eq!(
-            resolved,
-            [address("10.0.0.1", 1433)],
+            fallback(&cache, "db.example.com", 1433).await,
+            Some(vec![address("10.0.0.1", 1433)]),
             "a resolution no server has allowed yet is not a fallback"
         );
 
-        cache.apply_verdict("db.example.com", true);
-        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
-            .await
-            .unwrap();
-        assert_eq!(resolved, [address("10.0.0.9", 1433)]);
+        cache.apply_verdict(&second, true);
+        assert_eq!(
+            fallback(&cache, "db.example.com", 1433).await,
+            Some(vec![address("10.0.0.9", 1433)])
+        );
     }
 
     #[tokio::test]
     async fn disallowing_removes_the_entry() {
         let cache = DnsCache::default();
-        resolves_to(
+        let resolution = resolves_to(
             &cache,
             "db.example.com",
             1433,
             vec![address("10.0.0.1", 1433)],
         )
-        .await
-        .unwrap();
-        cache.apply_verdict("db.example.com", true);
-        cache.apply_verdict("db.example.com", false);
+        .await;
+        cache.apply_verdict(&resolution, true);
+        cache.apply_verdict(&resolution, false);
 
-        assert!(
-            fails_to_resolve(&cache, "db.example.com", 1433)
-                .await
-                .is_err()
+        assert_eq!(fallback(&cache, "db.example.com", 1433).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_last_verdict_publishes_what_its_own_login_resolved() {
+        let cache = DnsCache::default();
+        // Three logins resolve the host differently, and their verdicts arrive
+        // in another order.
+        let mut logins = Vec::new();
+        for ip in ["10.0.0.1", "10.0.0.2", "10.0.0.3"] {
+            logins.push(resolves_to(&cache, "db.example.com", 1433, vec![address(ip, 1433)]).await);
+        }
+        cache.apply_verdict(&logins[2], true);
+        cache.apply_verdict(&logins[0], false);
+        cache.apply_verdict(&logins[1], true);
+
+        assert_eq!(
+            fallback(&cache, "db.example.com", 1433).await,
+            Some(vec![address("10.0.0.2", 1433)])
         );
     }
 
     #[tokio::test]
-    async fn the_last_of_interleaved_verdicts_decides() {
+    async fn a_disallowing_verdict_does_not_cancel_a_concurrent_allowing_one() {
         let cache = DnsCache::default();
-        // Three logins resolve the host before their verdicts arrive.
-        for _ in 0..3 {
-            resolves_to(
-                &cache,
-                "db.example.com",
-                1433,
-                vec![address("10.0.0.1", 1433)],
-            )
-            .await
-            .unwrap();
-        }
-        cache.apply_verdict("db.example.com", true);
-        cache.apply_verdict("db.example.com", false);
-        cache.apply_verdict("db.example.com", true);
+        // Two logins resolve the host before either gets its verdict.
+        let first = resolves_to(
+            &cache,
+            "db.example.com",
+            1433,
+            vec![address("10.0.0.1", 1433)],
+        )
+        .await;
+        let second = resolves_to(
+            &cache,
+            "db.example.com",
+            1433,
+            vec![address("10.0.0.1", 1433)],
+        )
+        .await;
+        cache.apply_verdict(&first, false);
+        cache.apply_verdict(&second, true);
 
-        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
-            .await
-            .unwrap();
-        assert_eq!(resolved, [address("10.0.0.1", 1433)]);
+        assert_eq!(
+            fallback(&cache, "db.example.com", 1433).await,
+            Some(vec![address("10.0.0.1", 1433)])
+        );
     }
 
     #[tokio::test]
     async fn logins_through_the_fallback_can_restore_it_after_a_denial() {
         let cache = DnsCache::default();
-        resolves_to(
+        let resolution = resolves_to(
             &cache,
             "db.example.com",
             1433,
             vec![address("10.0.0.1", 1433)],
         )
-        .await
-        .unwrap();
-        cache.apply_verdict("db.example.com", true);
-        // As if evicted, so only the fallback can tell the coming verdicts what
-        // their logins connected with.
-        cache.entries().pending.clear();
+        .await;
+        cache.apply_verdict(&resolution, true);
 
         // During a DNS outage two logins connect through the cache, and their
         // verdicts arrive deny, then allow.
-        for _ in 0..2 {
-            fails_to_resolve(&cache, "db.example.com", 1433)
-                .await
-                .unwrap();
-        }
-        cache.apply_verdict("db.example.com", false);
-        cache.apply_verdict("db.example.com", true);
-
-        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
+        let first = fails_to_resolve(&cache, "db.example.com", 1433)
             .await
             .unwrap();
-        assert_eq!(resolved, [address("10.0.0.1", 1433)]);
+        let second = fails_to_resolve(&cache, "db.example.com", 1433)
+            .await
+            .unwrap();
+        cache.apply_verdict(&first, false);
+        cache.apply_verdict(&second, true);
+
+        assert_eq!(
+            fallback(&cache, "db.example.com", 1433).await,
+            Some(vec![address("10.0.0.1", 1433)])
+        );
+    }
+
+    /// Regression: resolutions used to wait for their verdicts in a set capped
+    /// at 256 hosts, so the 257th evicted one, and that host's later allowing
+    /// verdict published nothing.
+    #[tokio::test]
+    async fn hosts_resolved_beyond_the_former_pending_cap_are_still_published() {
+        let cache = DnsCache::default();
+        let host = |i: usize| format!("host{i}.example.com");
+        let mut logins = Vec::new();
+        for i in 0..=256 {
+            logins.push(resolves_to(&cache, &host(i), 1433, vec![address("10.0.0.1", 1433)]).await);
+        }
+        for login in &logins {
+            cache.apply_verdict(login, true);
+        }
+
+        for i in 0..=256 {
+            assert_eq!(
+                fallback(&cache, &host(i), 1433).await,
+                Some(vec![address("10.0.0.1", 1433)]),
+                "{}",
+                host(i)
+            );
+        }
     }
 
     #[tokio::test]
     async fn ip_literals_and_empty_results_are_not_cached() {
         let cache = DnsCache::default();
-        resolves_to(&cache, "10.0.0.1", 1433, vec![address("10.0.0.1", 1433)])
-            .await
-            .unwrap();
-        resolves_to(&cache, "empty.example.com", 1433, Vec::new())
-            .await
-            .unwrap();
-        cache.apply_verdict("10.0.0.1", true);
-        cache.apply_verdict("empty.example.com", true);
+        let literal = resolves_to(&cache, "10.0.0.1", 1433, vec![address("10.0.0.1", 1433)]).await;
+        let empty = resolves_to(&cache, "empty.example.com", 1433, Vec::new()).await;
+        cache.apply_verdict(&literal, true);
+        cache.apply_verdict(&empty, true);
 
-        let entries = cache.entries();
-        assert!(entries.allowed.is_empty());
-        assert!(entries.pending.is_empty());
+        assert!(cache.allowed().is_empty());
     }
 
     #[tokio::test]
@@ -385,53 +409,63 @@ mod tests {
             ))
         };
         let cache = DnsCache::default();
-        resolves_to(&cache, "db.example.com", 1433, vec![scoped(1433)])
-            .await
-            .unwrap();
-        cache.apply_verdict("db.example.com", true);
+        let resolution = resolves_to(&cache, "db.example.com", 1433, vec![scoped(1433)]).await;
+        cache.apply_verdict(&resolution, true);
 
-        let resolved = fails_to_resolve(&cache, "db.example.com", 11000)
-            .await
-            .unwrap();
-        assert_eq!(resolved, [scoped(11000)]);
+        assert_eq!(
+            fallback(&cache, "db.example.com", 11000).await,
+            Some(vec![scoped(11000)])
+        );
     }
 
+    /// End to end: a connect that falls back to an allowed entry carries that
+    /// resolution to its login, and the mock server, which accepts the login
+    /// with LOGINACK and no FEATUREEXTACK, revokes it.
     #[tokio::test]
-    async fn a_disallowing_verdict_does_not_cancel_a_concurrent_allowing_one() {
-        let cache = DnsCache::default();
-        // Two logins resolve the host before either gets its verdict.
-        for _ in 0..2 {
-            resolves_to(
-                &cache,
-                "db.example.com",
-                1433,
-                vec![address("10.0.0.1", 1433)],
+    async fn a_login_accepted_without_feature_ext_ack_revokes_the_fallback() {
+        use crate::connection::client_context::{ClientContext, TransportContext};
+        use crate::connection_provider::tds_connection_provider::TdsConnectionProvider;
+        use crate::core::{EncryptionOptions, EncryptionSetting};
+
+        let server = mssql_mock_tds::MockTdsServer::new("127.0.0.1:0")
+            .await
+            .unwrap();
+        let server_address = server.local_addr();
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        let host = "accepted-without-ack.dns-cache.invalid";
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![server_address]), true);
+        let context = ClientContext {
+            encryption_options: EncryptionOptions {
+                mode: EncryptionSetting::PreferOff,
+                trust_server_certificate: true,
+                host_name_in_cert: None,
+                server_certificate: None,
+            },
+            ..ClientContext::default()
+        };
+        let transport_context = TransportContext::Tcp {
+            host: host.to_string(),
+            port: server_address.port(),
+            instance_name: None,
+        };
+
+        TdsConnectionProvider::connect_with_transport_context(&context, &transport_context, None)
+            .await
+            .expect("connects through the cached address");
+        assert!(
+            TdsConnectionProvider::connect_with_transport_context(
+                &context,
+                &transport_context,
+                None
             )
             .await
-            .unwrap();
-        }
-        cache.apply_verdict("db.example.com", false);
-        cache.apply_verdict("db.example.com", true);
+            .is_err(),
+            "the accepted login removed the fallback"
+        );
 
-        let resolved = fails_to_resolve(&cache, "db.example.com", 1433)
-            .await
-            .unwrap();
-        assert_eq!(resolved, [address("10.0.0.1", 1433)]);
-    }
-
-    #[tokio::test]
-    async fn resolutions_waiting_for_a_verdict_are_bounded() {
-        let cache = DnsCache::default();
-        let host = |i: usize| format!("host{i}.example.com");
-        for i in 0..MAX_PENDING_HOSTS + 10 {
-            resolves_to(&cache, &host(i), 1433, vec![address("10.0.0.1", 1433)])
-                .await
-                .unwrap();
-        }
-
-        let entries = cache.entries();
-        assert_eq!(entries.pending.len(), MAX_PENDING_HOSTS);
-        assert!(entries.pending.contains_key(&host(MAX_PENDING_HOSTS + 9)));
-        assert!(entries.allowed.is_empty());
+        let _ = shutdown.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
     }
 }

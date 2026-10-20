@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 
+use crate::connection::dns_cache::Resolution;
 use crate::core::TdsResult;
 use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::message::login::{Feature, FeatureExtension};
@@ -19,14 +20,14 @@ use crate::message::login::{Feature, FeatureExtension};
 pub(crate) struct DnsCachingFeature {
     acknowledged: bool,
     allowed: bool,
-    /// Host the login's transport resolved; the acknowledgement applies to it.
-    host: Option<String>,
+    /// What the login's connection resolved; the acknowledgement applies to it.
+    resolution: Option<Resolution>,
 }
 
 impl DnsCachingFeature {
-    pub(crate) fn for_host(host: &str) -> Self {
+    pub(crate) fn for_resolution(resolution: Resolution) -> Self {
         Self {
-            host: Some(host.to_string()),
+            resolution: Some(resolution),
             ..Self::default()
         }
     }
@@ -59,10 +60,10 @@ impl Feature for DnsCachingFeature {
         Ok(())
     }
 
-    fn dns_caching_verdict(&self) -> Option<(&str, bool)> {
-        self.host
-            .as_deref()
-            .map(|host| (host, self.acknowledged && self.allowed))
+    fn dns_caching_verdict(&self) -> Option<(&Resolution, bool)> {
+        self.resolution
+            .as_ref()
+            .map(|resolution| (resolution, self.acknowledged && self.allowed))
     }
 
     fn is_acknowledged(&self) -> bool {
@@ -88,8 +89,12 @@ mod tests {
     use crate::message::messages::PacketType;
     use futures::executor::block_on;
 
+    fn resolution() -> Resolution {
+        Resolution::new("db.example.com", vec!["10.0.0.7:1433".parse().unwrap()])
+    }
+
     fn acknowledged(payload: &[u8]) -> DnsCachingFeature {
-        let mut feature = DnsCachingFeature::for_host("db.example.com");
+        let mut feature = DnsCachingFeature::for_resolution(resolution());
         feature.set_acknowledged(true);
         feature.deserialize(payload).unwrap();
         feature
@@ -130,7 +135,7 @@ mod tests {
         ] {
             assert_eq!(
                 acknowledged(payload).dns_caching_verdict(),
-                Some(("db.example.com", allowed)),
+                Some((&resolution(), allowed)),
                 "payload {payload:?}"
             );
         }
@@ -138,11 +143,8 @@ mod tests {
 
     #[test]
     fn unacknowledged_feature_disallows_caching() {
-        let feature = DnsCachingFeature::for_host("db.example.com");
-        assert_eq!(
-            feature.dns_caching_verdict(),
-            Some(("db.example.com", false))
-        );
+        let feature = DnsCachingFeature::for_resolution(resolution());
+        assert_eq!(feature.dns_caching_verdict(), Some((&resolution(), false)));
     }
 
     #[test]
@@ -154,9 +156,9 @@ mod tests {
     }
 
     #[test]
-    fn clone_box_keeps_host_and_acknowledgement() {
+    fn clone_box_keeps_resolution_and_acknowledgement() {
         let cloned = acknowledged(&[0x01]).clone_box();
         assert_eq!(cloned.feature_identifier(), FeatureExtension::SqlDnsCaching);
-        assert_eq!(cloned.dns_caching_verdict(), Some(("db.example.com", true)));
+        assert_eq!(cloned.dns_caching_verdict(), Some((&resolution(), true)));
     }
 }
