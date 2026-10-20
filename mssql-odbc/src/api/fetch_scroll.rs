@@ -3724,6 +3724,133 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_codec_fetch_failures_preserve_diagnostics_and_following_columns() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let cases = [
+            (932, Call::Encode, 0, 8, false),
+            (932, Call::Prefix, 0, 8, false),
+            #[cfg(windows)]
+            (1252, Call::Encode, 1, 2, false),
+            #[cfg(unix)]
+            (12000, Call::Encode, 0, 8, true),
+        ];
+        for plp in [false, true] {
+            for (code_page, call, after, capacity, binary) in cases {
+                if binary && !plp {
+                    continue;
+                }
+                let text = "\u{3042}\u{3044}";
+                let encoding = client_output(code_page, true).encoding;
+                let h = TestHandles::with_env_dbc_stmt_encoding(encoding);
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                stmt.inner.lock().unwrap().text_output.warn_on_loss = true;
+                let response = QueryResponse::new(
+                    vec![
+                        ColumnDefinition::new(
+                            "value",
+                            if binary {
+                                SqlDataType::VarBinaryMax
+                            } else if plp {
+                                SqlDataType::NVarCharMax
+                            } else {
+                                SqlDataType::NVarChar
+                            },
+                        ),
+                        ColumnDefinition::new("following", SqlDataType::Int),
+                    ],
+                    vec![Row::new(vec![
+                        if binary {
+                            ColumnValue::VarBinaryMax(vec![vec![0xab]])
+                        } else if plp {
+                            ColumnValue::NVarCharMax(vec![text.encode_utf16().collect()])
+                        } else {
+                            ColumnValue::NVarChar(text.into())
+                        },
+                        ColumnValue::Int(42),
+                    ])],
+                );
+                let _server =
+                    crate::test_support::connect_mock_server(dbc, "SELECT codec_failure", response);
+                let sql: Vec<u16> = "SELECT codec_failure".encode_utf16().collect();
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLExecDirectW(
+                            h.stmt,
+                            sql.as_ptr(),
+                            sql.len().try_into().unwrap(),
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let mut output = [0xcc; 8];
+                let mut length = -99;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLBindCol(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            output.as_mut_ptr().cast(),
+                            capacity,
+                            &mut length,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let rc = with_failure(call, after, || unsafe {
+                    crate::api::exports::SQLFetch(h.stmt)
+                });
+                assert_eq!(rc, SQL_ERROR);
+                {
+                    let state = stmt.inner.lock().unwrap();
+                    let diagnostic = state.diag_records.last().unwrap();
+                    assert_eq!(diagnostic.sql_state, ERR_INTERNAL_CONVERSION.state);
+                    assert!(diagnostic.message.ends_with(ERR_INTERNAL_CONVERSION.text));
+                }
+                let mut following = 0_i32;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            h.stmt,
+                            2,
+                            SQL_C_SLONG,
+                            (&raw mut following).cast(),
+                            4,
+                            &mut length,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(following, 42);
+                assert_eq!(length, 4);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_codec_hex_width_failure_does_not_write_bound_output() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+
+        let mut output = [0xcc; 16];
+        let mut length = -99;
+        let binding = binding(1, SQL_C_CHAR, output.as_mut_ptr().cast(), 16, &mut length);
+        let outcome = with_failure(Call::Encode, 0, || unsafe {
+            deliver_bound_value(
+                &binding,
+                &ColumnValues::Bytes(vec![0xab]),
+                client_output(12000, false),
+            )
+        });
+        assert_eq!(outcome, RowOutcome::Error(RowIssue::Internal));
+        assert_eq!(output, [0xcc; 16]);
+        assert_eq!(length, -99);
+    }
+
     // The live BoundTruncationPreservesOnlyCompletePairs test covers SQL Server.
     // This mock additionally forces the pair across a PLP wire-chunk boundary.
     #[test]

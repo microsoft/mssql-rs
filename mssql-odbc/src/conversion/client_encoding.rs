@@ -227,6 +227,8 @@ impl ClientEncoding {
                 had_loss: false,
             });
         }
+        #[cfg(test)]
+        test_support::check(test_support::Call::Encode)?;
         let (bytes, had_loss) = platform::encode(self, text)?;
         Ok(ClientEncoded {
             bytes: Cow::Owned(bytes),
@@ -284,12 +286,61 @@ impl ClientEncoding {
         if self.is_ascii_compatible() && bytes.is_ascii() {
             return Ok(capacity);
         }
+        #[cfg(test)]
+        test_support::check(test_support::Call::Prefix)?;
         platform::prefix_len(self, bytes, capacity)
     }
 
     #[cfg(test)]
     pub(crate) fn for_code_page(code_page: u32) -> Option<Self> {
         platform::for_code_page(code_page)
+    }
+}
+
+#[cfg(test)]
+// Native-service failures must not depend on process-wide locale or resource exhaustion.
+pub(crate) mod test_support {
+    use super::ConvError;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Call {
+        Encode,
+        Prefix,
+    }
+
+    thread_local! {
+        static FAILURE: Cell<Option<(Call, usize)>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn with_failure<T>(call: Call, after: usize, run: impl FnOnce() -> T) -> T {
+        struct Restore(Option<(Call, usize)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAILURE.set(self.0);
+            }
+        }
+        let _restore = Restore(FAILURE.replace(Some((call, after))));
+        let result = run();
+        assert!(
+            FAILURE.get().is_none(),
+            "native codec failure was not reached"
+        );
+        result
+    }
+
+    pub(super) fn check(call: Call) -> Result<(), ConvError> {
+        match FAILURE.get() {
+            Some((target, remaining)) if target == call => {
+                if remaining == 0 {
+                    FAILURE.set(None);
+                    return Err(ConvError::Internal);
+                }
+                FAILURE.set(Some((target, remaining - 1)));
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -842,6 +893,17 @@ mod platform {
             let encoding = for_code_page(1258).unwrap();
             assert_eq!(encoding.decode(b"\xf4").unwrap(), "ô");
             assert_eq!(&*encoding.encode("ô").unwrap().bytes, b"\xf4");
+        }
+
+        #[test]
+        fn cp1258_flush_grows_a_full_output_buffer_without_losing_input() {
+            let encoding = for_code_page(1258).unwrap();
+            let mut input = vec![b'a'; 15];
+            input.push(0xf4);
+            assert_eq!(
+                encoding.decode(&input).unwrap(),
+                format!("{}\u{f4}", "a".repeat(15))
+            );
         }
 
         #[cfg(not(target_env = "musl"))]
