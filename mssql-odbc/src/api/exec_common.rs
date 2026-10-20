@@ -490,12 +490,6 @@ pub(super) fn try_claim_idle_client(
         .ok()
 }
 
-/// Returns `client` to the DBC but **keeps** the busy claim — used when a
-/// cursor is left open for `SQLFetch`.
-pub(super) fn return_client_busy(dbc: &DbcHandle, client: WireLease) {
-    dbc.return_lease(client, LeaseReturn::KeepReservation);
-}
-
 /// Peeks whether another row follows the one just fully consumed, and
 /// releases the DBC's busy claim once both the peek and
 /// `client.has_open_batch()` agree nothing remains for this statement to
@@ -1346,18 +1340,6 @@ pub(super) fn finish_execute(
     let metadata = client.get_metadata().clone();
     let has_result_set = !metadata.is_empty();
 
-    // Populated before `metadata` is moved into `stmt_state.begin_batch`
-    // below (each arm), while it's still owned locally — avoids a clone per
-    // arm purely to keep a copy alive across the STMT lock drop.
-    // `populate_ird` only ever touches the IRD's own DescHandle, with no
-    // dependency on `stmt_state`/`client`/`dbc`, so running it before the
-    // STMT-locked bookkeeping instead of after doesn't change what state ends
-    // up where — only whether an IRD failure is checked before or after that
-    // bookkeeping runs, and every arm already runs the bookkeeping
-    // unconditionally and reports the IRD failure (if any) in its return
-    // value regardless.
-    let ird_ok = populate_ird(stmt, &metadata).is_ok();
-
     if !has_result_set && client.has_open_batch() {
         // Statement-wise navigation: positioned on a no-row statement result
         // (PRINT / low-severity RAISERROR / DDL / DML) with more statements still
@@ -1367,16 +1349,19 @@ pub(super) fn finish_execute(
         // batch. Matches msodbcsql.
         let info_messages = client.take_info_messages();
         let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
+        let row_count = client.last_rows_affected();
+        if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+            return SQL_ERROR;
+        }
+        let ird_ok = populate_ird(stmt, &metadata).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned on no-row result");
-            return_client_busy(dbc, client);
             return SQL_ERROR;
         };
         stmt_state.begin_batch(metadata); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
-        let row_count = client.last_rows_affected();
         stmt_state.row_count = row_count;
         stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
@@ -1384,7 +1369,6 @@ pub(super) fn finish_execute(
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
             | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
-        return_client_busy(dbc, client);
         if !ird_ok {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_sql_error(
@@ -1416,17 +1400,20 @@ pub(super) fn finish_execute(
         let has_dml_counts = !dml_counts.is_empty();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
         let bound_params = snapshot_bound_params(stmt);
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("{op}: stmt mutex poisoned");
-            return_client_idle(dbc, statement_handle, client);
-            return SQL_ERROR;
-        };
-        stmt_state.clear_exhaustion_state();
         // Draining the wire does not consume application-visible DML counts.
         // Keep the return tokens until SQLMoreResults advances past the last
         // count, even when the first count is the only one.
         let return_values = client.get_return_values();
         let return_status = client.get_return_status();
+        if !dbc.return_lease(client, LeaseReturn::Release) {
+            return SQL_ERROR;
+        }
+        let ird_ok = populate_ird(stmt, &metadata).is_ok();
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("{op}: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        stmt_state.clear_exhaustion_state();
         let output_rc = if has_dml_counts {
             stmt_state.batch_exhausted = true;
             stmt_state.pending_output_params = Some((return_values, return_status));
@@ -1460,7 +1447,6 @@ pub(super) fn finish_execute(
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
             | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
-        return_client_idle(dbc, statement_handle, client);
         if !ird_ok {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_sql_error(
@@ -1508,13 +1494,19 @@ pub(super) fn finish_execute(
     // window, and taking the messages first would leave them for a later fetch.
     let info_messages = client.take_info_messages();
     let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
+    let pending_output_params =
+        batch_exhausted.then(|| (client.get_return_values(), client.get_return_status()));
+    let lease_return = if batch_exhausted {
+        LeaseReturn::Release
+    } else {
+        LeaseReturn::KeepReservation
+    };
+    if !dbc.return_lease(client, lease_return) {
+        return SQL_ERROR;
+    }
+    let ird_ok = populate_ird(stmt, &metadata).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
-        if batch_exhausted {
-            return_client_idle(dbc, statement_handle, client);
-        } else {
-            return_client_busy(dbc, client);
-        }
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
@@ -1523,20 +1515,12 @@ pub(super) fn finish_execute(
     stmt_state.clear_exhaustion_state();
     stmt_state.result_set_exhausted = !has_row;
     stmt_state.batch_exhausted = batch_exhausted;
-    if batch_exhausted {
-        stmt_state.pending_output_params =
-            Some((client.get_return_values(), client.get_return_status()));
-    }
+    stmt_state.pending_output_params = pending_output_params;
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
         | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     drop(stmt_state);
-    if batch_exhausted {
-        return_client_idle(dbc, statement_handle, client);
-    } else {
-        return_client_busy(dbc, client);
-    }
     if !ird_ok {
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
@@ -1847,6 +1831,34 @@ mod tests {
         assert!(stmt_state.result_set_exhausted);
         assert!(stmt_state.batch_exhausted);
         assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    #[test]
+    fn finish_execute_publishes_nothing_from_a_stale_lease() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_tokens(vec![col_metadata(int_columns(1)), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        let client = lease_for_test(dbc, handles.stmt, client);
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecDirectW"),
+            SQL_ERROR
+        );
+
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.has_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN));
+        assert!(!stmt_state.result_set_exhausted);
+        assert!(!stmt_state.batch_exhausted);
     }
 
     #[test]

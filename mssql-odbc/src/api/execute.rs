@@ -37,6 +37,7 @@ use crate::handles::stmt::{
     DaeParam, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED,
 };
+use crate::handles::wire::LeaseReturn;
 use crate::handles::wire::WireLease;
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
@@ -611,7 +612,6 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             finish_parameter_array(
                 dbc,
                 stmt,
-                statement_handle,
                 client,
                 result,
                 BatchClientResults {
@@ -651,14 +651,12 @@ unsafe fn write_params_processed(processed_ptr: *mut SqlULen, processed: SqlULen
 fn finish_parameter_array(
     dbc: &crate::handles::DbcHandle,
     stmt: &StmtHandle,
-    statement_handle: SqlHandle,
     mut client: WireLease,
     result: PreparedBatchResult,
     mut batch: BatchClientResults,
 ) -> SqlReturn {
     let has_more = client.has_open_batch();
     let metadata = client.get_metadata().clone();
-    let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
     let info_messages = client.take_info_messages();
     // Parameter arrays are serialized through the same `PacketWriter` as a
     // scalar execute (`execute_sp_execute_batch`), so an unmappable value in
@@ -669,18 +667,21 @@ fn finish_parameter_array(
     // next statement's verdict. Drained before the STMT lock for the DBC-then-
     // STMT ordering reason `take_code_page_conversion_loss` documents.
     let warn_cp_loss = super::exec_common::take_code_page_conversion_loss(dbc, &mut client);
+    let current_set = client.current_parameter_set();
+    let lease_return = if has_more {
+        LeaseReturn::KeepReservation
+    } else {
+        LeaseReturn::Release
+    };
+    if !dbc.return_lease(client, lease_return) {
+        return SQL_ERROR;
+    }
+    let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
-        super::exec_common::return_client_busy(dbc, client);
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
-    let mut rc = report_parameter_array(
-        &mut stmt_state,
-        result,
-        &mut batch,
-        client.current_parameter_set(),
-        has_more,
-    );
+    let mut rc = report_parameter_array(&mut stmt_state, result, &mut batch, current_set, has_more);
     let posted_info = post_tds_info_messages(&mut stmt_state, &info_messages)
         | super::exec_common::post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     if posted_info && rc == SQL_SUCCESS {
@@ -707,11 +708,6 @@ fn finish_parameter_array(
         rc = SQL_ERROR;
     }
     drop(stmt_state);
-    if has_more {
-        super::exec_common::return_client_busy(dbc, client);
-    } else {
-        return_client_idle(dbc, statement_handle, client);
-    }
     rc
 }
 
@@ -3698,6 +3694,55 @@ mod tests {
                 assert!(state.diag_records.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn finish_parameter_array_publishes_nothing_from_a_stale_lease() {
+        use crate::handles::DbcHandle;
+        use crate::test_support::lease_for_test;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new()));
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+        let mut status = 77;
+        let mut processed = 88;
+
+        assert_eq!(
+            finish_parameter_array(
+                dbc,
+                stmt,
+                client,
+                PreparedBatchResult {
+                    rows: vec![reported_row(0)],
+                    complete: true,
+                },
+                BatchClientResults {
+                    outputs: ParamArrayOutputs {
+                        paramset_size: 1,
+                        param_status_ptr: &mut status,
+                        params_processed_ptr: &mut processed,
+                    },
+                    client_side_failures: 0,
+                    truncated_rows: Vec::new(),
+                    rows_affected: None,
+                    processed: 0,
+                },
+            ),
+            SQL_ERROR
+        );
+
+        assert_eq!(status, 77);
+        assert_eq!(processed, 88);
+        let state = stmt.inner.lock().unwrap();
+        assert!(!state.has_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN));
     }
 
     /// A complete batch reports the whole array regardless of what the server
