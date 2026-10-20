@@ -471,12 +471,7 @@ def test_open_bump_pr_branches_before_editing_and_creates(tmp_path):
     with patch.object(bump.subprocess, "run", side_effect=run), patch.object(
         bump, "remote_branch_state", return_value=(False, None, None, True)
     ), patch.object(
-        bump,
-        "github_paged",
-        side_effect=[
-            [],
-            [{"merged_at": None, "head": {"sha": "theirsha"}}],
-        ],
+        bump, "github_paged", return_value=[]
     ), patch.object(
         bump, "github_api",
         return_value=(201, {"number": 700, "html_url": "https://example/700"}),
@@ -636,7 +631,12 @@ def test_closed_unmerged_maintainer_branch_requires_cleanup(tmp_path):
         "remote_branch_state",
         return_value=(True, "theirsha", "theirtree", False),
     ), patch.object(
-        bump, "github_paged", return_value=[]
+        bump,
+        "github_paged",
+        side_effect=[
+            [],
+            [{"merged_at": None, "head": {"sha": "theirsha"}}],
+        ],
     ), patch.object(
         bump, "branch_merged_into_base", return_value=False
     ), patch.object(
