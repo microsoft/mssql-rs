@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Async Rust implementation of the TDS (Tabular Data Stream) protocol for SQL Server
 //! and Azure SQL Database.
@@ -77,6 +76,7 @@
 //! - [`error`] — Error definitions.
 //! - [`message`] — TDS message types (prelogin, login7, etc.).
 //! - [`query`] — Query metadata and column descriptors.
+//! - [`security`] — Integrated authentication (SSPI/GSSAPI) and Always Encrypted.
 //! - [`token`] — TDS token stream parsing (COLMETADATA, ROW, DONE, etc.).
 
 pub mod connection;
@@ -89,6 +89,7 @@ pub mod core;
 // to name the type. Re-exported so they inherit ours instead of guessing a
 // matching version.
 pub use encoding_rs;
+/// Cursor types and response structures for TDS cursor RPCs.
 pub mod cursor;
 pub mod datatypes;
 /// Error definitions for TDS operations.
@@ -119,8 +120,7 @@ pub mod test_client_support;
 #[cfg(test)]
 pub(crate) mod test_packet_support;
 
-// Compiles the README's code blocks as doctests so the crates.io page cannot
-// drift from the API.
+// Compiles the README's code blocks under `cargo test --doc`.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

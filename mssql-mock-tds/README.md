@@ -157,7 +157,7 @@ async fn test_custom_query() -> Result<(), Box<dyn std::error::Error>> {
     let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
     let mut context = ClientContext::default();
     context.user_name = "sa".to_string();
-    context.password = "<password>".to_string();
+    context.password = "password".to_string();
     context.encryption_options = EncryptionOptions {
         mode: EncryptionSetting::PreferOff,
         trust_server_certificate: true,
@@ -170,7 +170,6 @@ async fn test_custom_query() -> Result<(), Box<dyn std::error::Error>> {
     
     client.execute("SELECT CAST(1 AS BIGINT), 2, 3".to_string(), ()).await?;
     // ... process results ...
-    client.close_query().await?;
     
     let _ = shutdown_tx.send(());
     Ok(())

@@ -7,6 +7,7 @@
 //! between TDS wire format and Rust values, and metadata structures for
 //! bulk copy operations.
 
+/// Metadata types for bulk copy column mappings.
 pub mod bulk_copy_metadata;
 /// Decoded column value types returned in result rows.
 pub mod column_values;
@@ -20,7 +21,9 @@ pub mod row_writer;
 pub mod sql_json;
 /// SQL Server character string type with encoding.
 pub mod sql_string;
+/// Table-valued parameter (TVP) types for RPC calls.
 pub mod sql_tvp;
+/// CLR user-defined type (UDT) parameter support.
 pub mod sql_udt;
 /// SQL Server `vector` column type.
 pub mod sql_vector;
