@@ -260,6 +260,13 @@ Measured 2026-10-08 on both drivers unless noted.
   a busy STMT, or on a descriptor associated with it, waits; only `SQLCancel`
   bypasses the lock. Calls on another STMT, the DBC, or an unassociated
   descriptor proceed.
+- **The Windows Driver Manager deadlocks on explicit descriptors.** With an
+  explicit descriptor associated with a STMT, `SQLSetStmtAttr` on that STMT
+  (`odbc32!LockDescStmt`, waiting for the STMT lock) and a concurrent
+  `SQLGetDiagField` on the STMT or its DBC (waiting in `EnterDbcCS`) hang
+  forever. Measured with both drivers, neither on the blocked stacks; every
+  `SharedStmt` run of the three explicit-descriptor tests in
+  `fetch_scroll_test.cpp` hung at 8 x 20, so they leave that mode out.
 - **Effect on the modes, on every platform** (Windows, and unixODBC at the
   `Threading=1` that `run_e2e.sh` sets, below): calls on one handle never
   reach the driver concurrently, except `SQLCancel`. `SharedDbc` reaches it
@@ -284,6 +291,12 @@ Measured 2026-10-08 on both drivers unless noted.
   build with the fix (AB#49575), the stress profiles skip `/SharedStmt` on
   unixODBC, and PR runs keep it at 2 x 1 except for the two GetData streaming
   tests that crashed most (unregistered on non-Windows by #758).
+  With the fetch and GetData suites converted (about 400 `/SharedStmt`
+  variants), every one of 8 PR-profile runs on WSL's 2.3.9 had an entry crash
+  in `libodbc` under `SQLGetDiagRec` or read a garbage SQLSTATE, with either
+  driver; with the PR's `--retries=3` all 4 runs measured still ended green.
+  Built from master (2.3.15pre, with `ea454e49`), 0 of 8 PR-profile runs
+  failed, and the nightly profile with `/SharedStmt` included passed.
 - Every non-diagnostic call clears the handle's diagnostics, including an idle
   `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`. Cross-thread
   `SQLCancel` preserves the interrupted call's diagnostics.
@@ -463,6 +476,11 @@ local SQL Server:
   on every run. For about 700 converted tests that extrapolates to roughly an
   hour per driver per platform, so it is weekly. 8 x 20 is a fifth of that and
   reproduced AB#49225.
+- With the fetch and GetData suites converted (AB#49260: 18 `<name>_mt`
+  entries, 1,188 concurrent variants in its 14 files), measured on Windows
+  against a local server with the Debug driver: the `_mt` entries take about
+  40 s per leg at 2 x 1, 7 minutes at 8 x 20, and 33 minutes at 16 x 50
+  (`get_data_test_mt` alone 23).
 
 ## Validation
 
@@ -513,9 +531,18 @@ Tracked under AB#49256:
 1. **AB#49257 (PR #709, merged):** the harness with all five modes; the
    `get_data_test.cpp` pilot (five converted tests, one worker-token test,
    fourteen chunk-fill tests); empty-value, NULL, and parameterized-`THROW` tests.
-2. **AB#49263 (this PR):** CTest split, PR filter, nightly (temporary) and
+2. **AB#49263 (PR #750):** CTest split, PR filter, nightly (temporary) and
    weekly profiles, crash and hang evidence, `msodbcsql.h` type check.
-3. **AB#49260:** fetch and GetData suites, plus worker-token tests.
+3. **AB#49260 (this PR):** every `TEST_F` in the fetch and GetData suites
+   (`get_data`, `binary_fetch`, `bin_to_char`, `datetime_types`,
+   `time_to_timestamp`, `numeric_types`, `text_money_types`, `fetch_scroll`,
+   `fetch_error_semantics`, `col_attribute`, `describe_col`,
+   `num_result_cols`, `more_results`, `row_count`) runs in the default modes,
+   except a fixture that sets the ENV's ODBC version (HY010 on a shared ENV)
+   and the three explicit-descriptor tests (Windows Driver Manager deadlock);
+   each file records why. Worker-token tests: a typed row of every scalar type,
+   interleaved results and row counts, and a 5000-row stream. `SharedDbc`
+   opt-ins wait for AB#49225.
 4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
    remaining cancel cases `cancel_test.cpp` does not cover, added to it
    (idle cursor cleanup is covered by `connection_busy_test.cpp`, AB#49386):

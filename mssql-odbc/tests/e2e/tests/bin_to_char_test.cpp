@@ -10,6 +10,7 @@
 // pair, so a 4-byte buffer takes "01" and not "010". That is why these tests check
 // several buffer sizes rather than one.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <array>
@@ -58,7 +59,7 @@ protected:
 // Non-PLP: binary(n), varbinary(n), image.
 // ---------------------------------------------------------------------------
 
-TEST_F(BinToCharLiveTest, FixedBinaryRendersUpperCaseHex) {
+ODBC_TEST_F(BinToCharLiveTest, FixedBinaryRendersUpperCaseHex) {
     FetchOne("SELECT CAST(0x0102AB AS BINARY(3))");
 
     SQLRETURN rc;
@@ -71,7 +72,7 @@ TEST_F(BinToCharLiveTest, FixedBinaryRendersUpperCaseHex) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, VarbinaryRendersUpperCaseHex) {
+ODBC_TEST_F(BinToCharLiveTest, VarbinaryRendersUpperCaseHex) {
     FetchOne("SELECT CAST(0xDEADBEEF AS VARBINARY(8))");
 
     SQLRETURN rc;
@@ -84,7 +85,7 @@ TEST_F(BinToCharLiveTest, VarbinaryRendersUpperCaseHex) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, EmptyBinaryRendersEmptyString) {
+ODBC_TEST_F(BinToCharLiveTest, EmptyBinaryRendersEmptyString) {
     FetchOne("SELECT CAST(0x AS VARBINARY(8))");
 
     SQLRETURN rc;
@@ -100,7 +101,7 @@ TEST_F(BinToCharLiveTest, EmptyBinaryRendersEmptyString) {
 // The pair-atomicity rule, across every interesting buffer size. A buffer of n
 // bytes holds floor((n-1)/2)*2 characters: one is reserved for the terminator and
 // the remainder rounds down to a whole number of bytes.
-TEST_F(BinToCharLiveTest, HexNeverSplitsAByteAcrossTheBufferEdge) {
+ODBC_TEST_F(BinToCharLiveTest, HexNeverSplitsAByteAcrossTheBufferEdge) {
     struct Case {
         SQLLEN bufLen;
         const char* expected;
@@ -123,7 +124,7 @@ TEST_F(BinToCharLiveTest, HexNeverSplitsAByteAcrossTheBufferEdge) {
     }
 }
 
-TEST_F(BinToCharLiveTest, ChunkedHexReportsADecreasingRemainder) {
+ODBC_TEST_F(BinToCharLiveTest, ChunkedHexReportsADecreasingRemainder) {
     FetchOne("SELECT CAST(0x0102AB40 AS BINARY(4))");
 
     const char* expected[] = {"01", "02", "AB", "40"};
@@ -145,7 +146,7 @@ TEST_F(BinToCharLiveTest, ChunkedHexReportsADecreasingRemainder) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, NonPlpZeroLengthHexProbePreservesBufferAndValue) {
+ODBC_TEST_F(BinToCharLiveTest, NonPlpZeroLengthHexProbePreservesBufferAndValue) {
     const auto check = [&](auto& buf, SQLSMALLINT target) {
         for (const char* source : {"BINARY(3)", "VARBINARY(8)"}) {
             SCOPED_TRACE(::testing::Message() << source << ", target " << target);
@@ -177,7 +178,7 @@ TEST_F(BinToCharLiveTest, NonPlpZeroLengthHexProbePreservesBufferAndValue) {
     ASSERT_NO_FATAL_FAILURE(check(wide, SQL_C_WCHAR));
 }
 
-TEST_F(BinToCharLiveTest, WideTargetRendersTheSameHex) {
+ODBC_TEST_F(BinToCharLiveTest, WideTargetRendersTheSameHex) {
     FetchOne("SELECT CAST(0x0102AB AS BINARY(3))");
 
     SQLWCHAR wbuf[64];
@@ -193,7 +194,7 @@ TEST_F(BinToCharLiveTest, WideTargetRendersTheSameHex) {
 }
 
 // Pair atomicity on the wide target, where the capacity is in code units.
-TEST_F(BinToCharLiveTest, WideTargetAlsoKeepsBytesWhole) {
+ODBC_TEST_F(BinToCharLiveTest, WideTargetAlsoKeepsBytesWhole) {
     struct Case {
         SQLLEN bufBytes;
         const char* expected;
@@ -220,7 +221,7 @@ TEST_F(BinToCharLiveTest, WideTargetAlsoKeepsBytesWhole) {
 // PLP: varbinary(max) and the UDT types, which stream rather than materialize.
 // ---------------------------------------------------------------------------
 
-TEST_F(BinToCharLiveTest, VarbinaryMaxRendersHex) {
+ODBC_TEST_F(BinToCharLiveTest, VarbinaryMaxRendersHex) {
     FetchOne("SELECT CAST(0x4142 AS VARBINARY(MAX))");
 
     SQLRETURN rc;
@@ -233,7 +234,7 @@ TEST_F(BinToCharLiveTest, VarbinaryMaxRendersHex) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, EmptyVarbinaryMaxRendersEmptyString) {
+ODBC_TEST_F(BinToCharLiveTest, EmptyVarbinaryMaxRendersEmptyString) {
     FetchOne("SELECT CAST(0x AS VARBINARY(MAX))");
 
     SQLRETURN rc;
@@ -246,7 +247,7 @@ TEST_F(BinToCharLiveTest, EmptyVarbinaryMaxRendersEmptyString) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, NullVarbinaryMaxReportsNull) {
+ODBC_TEST_F(BinToCharLiveTest, NullVarbinaryMaxReportsNull) {
     FetchOne("SELECT CAST(NULL AS VARBINARY(MAX))");
 
     char buf[16];
@@ -260,7 +261,7 @@ TEST_F(BinToCharLiveTest, NullVarbinaryMaxReportsNull) {
 
 // #555: msodbcsql18 18.6.2.1-1 (SQL_DRIVER_VER 18.06.0002), Linux/unixODBC,
 // leaves NULL destinations untouched, including bound columns and zero-length reads.
-TEST_F(BinToCharLiveTest, NullBinaryPreservesCharacterBuffers) {
+ODBC_TEST_F(BinToCharLiveTest, NullBinaryPreservesCharacterBuffers) {
     for (const char* type : {"BINARY(3)", "VARBINARY(8)", "VARBINARY(MAX)"}) {
         SCOPED_TRACE(type);
         for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
@@ -304,7 +305,7 @@ TEST_F(BinToCharLiveTest, NullBinaryPreservesCharacterBuffers) {
     }
 }
 
-TEST_F(BinToCharLiveTest, StreamedHexChunksWithADecreasingRemainder) {
+ODBC_TEST_F(BinToCharLiveTest, StreamedHexChunksWithADecreasingRemainder) {
     FetchOne("SELECT CAST(0x0102AB40 AS VARBINARY(MAX))");
 
     const char* expected[] = {"01", "02", "AB", "40"};
@@ -321,7 +322,7 @@ TEST_F(BinToCharLiveTest, StreamedHexChunksWithADecreasingRemainder) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, StreamedWideHexChunksWithADecreasingByteRemainder) {
+ODBC_TEST_F(BinToCharLiveTest, StreamedWideHexChunksWithADecreasingByteRemainder) {
     const char* expected[] = {"01", "02", "AB", "40"};
     for (const SQLLEN bufUnits : {3, 4}) {
         SCOPED_TRACE(bufUnits);
@@ -353,7 +354,7 @@ TEST_F(BinToCharLiveTest, StreamedWideHexChunksWithADecreasingByteRemainder) {
     }
 }
 
-TEST_F(BinToCharLiveTest, StreamedHexPairSizedProbesDoNotConsumeValue) {
+ODBC_TEST_F(BinToCharLiveTest, StreamedHexPairSizedProbesDoNotConsumeValue) {
     const auto check = [&](auto& buf, SQLSMALLINT target) {
         const SQLLEN unitBytes = sizeof(buf[0]);
         for (SQLLEN bufBytes = 0; bufBytes < 3 * unitBytes; ++bufBytes) {
@@ -391,7 +392,7 @@ TEST_F(BinToCharLiveTest, StreamedHexPairSizedProbesDoNotConsumeValue) {
 
 // A value far larger than any single wire chunk, so the remaining count comes
 // from the declared total rather than from what happens to be buffered.
-TEST_F(BinToCharLiveTest, LargeStreamedValueReportsTheFullCharacterCount) {
+ODBC_TEST_F(BinToCharLiveTest, LargeStreamedValueReportsTheFullCharacterCount) {
     FetchOne(
         "SELECT CAST(REPLICATE(CAST(0xAB AS VARBINARY(MAX)), 1100000) AS VARBINARY(MAX))");
 
@@ -405,7 +406,7 @@ TEST_F(BinToCharLiveTest, LargeStreamedValueReportsTheFullCharacterCount) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, LargeStreamedWideValueReportsTheFullByteCount) {
+ODBC_TEST_F(BinToCharLiveTest, LargeStreamedWideValueReportsTheFullByteCount) {
     FetchOne(
         "SELECT CAST(REPLICATE(CAST(0xAB AS VARBINARY(MAX)), 1100000) AS VARBINARY(MAX))");
 
@@ -425,7 +426,7 @@ TEST_F(BinToCharLiveTest, LargeStreamedWideValueReportsTheFullByteCount) {
 }
 
 // The UDT types arrive as PLP binary too, so they render the same way.
-TEST_F(BinToCharLiveTest, HierarchyidRendersItsWireBytesAsHex) {
+ODBC_TEST_F(BinToCharLiveTest, HierarchyidRendersItsWireBytesAsHex) {
     FetchOne("SELECT CAST('/1/' AS HIERARCHYID)");
 
     SQLRETURN rc;
@@ -438,7 +439,7 @@ TEST_F(BinToCharLiveTest, HierarchyidRendersItsWireBytesAsHex) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, GeometryRendersItsWireBytesAsHex) {
+ODBC_TEST_F(BinToCharLiveTest, GeometryRendersItsWireBytesAsHex) {
     FetchOne("SELECT geometry::Point(1, 2, 0)");
 
     SQLRETURN rc;
@@ -451,7 +452,7 @@ TEST_F(BinToCharLiveTest, GeometryRendersItsWireBytesAsHex) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinToCharLiveTest, GeographyRendersItsWireBytesAsHex) {
+ODBC_TEST_F(BinToCharLiveTest, GeographyRendersItsWireBytesAsHex) {
     FetchOne("SELECT geography::Point(47.651, -122.349, 4326)");
 
     SQLRETURN rc;
@@ -467,7 +468,7 @@ TEST_F(BinToCharLiveTest, GeographyRendersItsWireBytesAsHex) {
 // Bound delivery must not depend on how big the value happens to be. A small
 // varbinary(max) arrives buffered and goes through deliver_bound; a large one
 // streams through deliver_bound_plp. Both have to render hex.
-TEST_F(BinToCharLiveTest, BoundVarbinaryMaxRendersHexWhetherBufferedOrStreamed) {
+ODBC_TEST_F(BinToCharLiveTest, BoundVarbinaryMaxRendersHexWhetherBufferedOrStreamed) {
     struct Case {
         const char* repeat;
         SQLLEN expectedIndicator;
@@ -504,7 +505,7 @@ TEST_F(BinToCharLiveTest, BoundVarbinaryMaxRendersHexWhetherBufferedOrStreamed) 
     }
 }
 
-TEST_F(BinToCharLiveTest, BoundWideVarbinaryMaxRendersHexWhetherBufferedOrStreamed) {
+ODBC_TEST_F(BinToCharLiveTest, BoundWideVarbinaryMaxRendersHexWhetherBufferedOrStreamed) {
     struct Case {
         const char* repeat;
         SQLLEN expectedChars;
@@ -556,7 +557,7 @@ TEST_F(BinToCharLiveTest, BoundWideVarbinaryMaxRendersHexWhetherBufferedOrStream
     }
 }
 
-TEST_F(BinToCharLiveTest, BoundHexNeverSplitsAByteAcrossTheBufferEdge) {
+ODBC_TEST_F(BinToCharLiveTest, BoundHexNeverSplitsAByteAcrossTheBufferEdge) {
     const auto check = [&](auto& buf, SQLSMALLINT target) {
         for (const char* source : {"BINARY(3)", "VARBINARY(8)", "VARBINARY(MAX)"}) {
             for (const SQLLEN bufUnits : {0, 1, 2, 3, 4, 5, 6, 7}) {
@@ -593,7 +594,7 @@ TEST_F(BinToCharLiveTest, BoundHexNeverSplitsAByteAcrossTheBufferEdge) {
 
 // A uniqueidentifier is not hex-rendered: it has its own string form, which the
 // driver already produced before this change.
-TEST_F(BinToCharLiveTest, UniqueidentifierKeepsItsGuidRendering) {
+ODBC_TEST_F(BinToCharLiveTest, UniqueidentifierKeepsItsGuidRendering) {
     FetchOne("SELECT CAST('0BA9F6C6-7B1A-4A2C-9C31-1E2E1D5B0C55' AS UNIQUEIDENTIFIER)");
 
     SQLRETURN rc;

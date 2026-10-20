@@ -13,6 +13,7 @@
 //   9.  NVarCharColumnSizeIsCharCount       - NVARCHAR(100) → colSize=100 (chars, not bytes)
 //  10.  ClrUdtColumnsReportSqlSsUdt          - CLR UDT type, size, scale, and nullability
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
 
@@ -46,7 +47,7 @@ protected:
     }
 };
 
-TEST_F(DescribeColLiveTest, FreshStatementReturnsSequenceError) {
+ODBC_TEST_F(DescribeColLiveTest, FreshStatementReturnsSequenceError) {
     SQLSMALLINT dataType = 0;
     SQLULEN colSize = 0;
     SQLSMALLINT decDigits = 0;
@@ -61,7 +62,7 @@ TEST_F(DescribeColLiveTest, FreshStatementReturnsSequenceError) {
     }
 }
 
-TEST_F(DescribeColLiveTest, BasicMetadata) {
+ODBC_TEST_F(DescribeColLiveTest, BasicMetadata) {
     ExecDirect("SELECT CAST(1 AS INT) AS i, CAST('abc' AS VARCHAR(10)) AS v, CAST(N'xy' AS NVARCHAR(12)) AS n");
 
     SQLTCHAR name[32] = {};
@@ -97,7 +98,7 @@ TEST_F(DescribeColLiveTest, BasicMetadata) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DescribeColLiveTest, NameTruncationReturnsInfo) {
+ODBC_TEST_F(DescribeColLiveTest, NameTruncationReturnsInfo) {
     ExecDirect("SELECT 1 AS this_is_a_long_column_name");
 
     SQLTCHAR name[8] = {};
@@ -120,7 +121,7 @@ TEST_F(DescribeColLiveTest, NameTruncationReturnsInfo) {
 // Both column 0 (reserved as the bookmark column without bookmarks enabled)
 // and ordinals past the last column must be rejected with 07009
 // (invalid descriptor index).
-TEST_F(DescribeColLiveTest, InvalidColumnOrdinal) {
+ODBC_TEST_F(DescribeColLiveTest, InvalidColumnOrdinal) {
     ExecDirect("SELECT 1 AS i");
 
     SQLSMALLINT dataType = 0;
@@ -139,7 +140,7 @@ TEST_F(DescribeColLiveTest, InvalidColumnOrdinal) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
+ODBC_TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
     ExecDirect(
         "SELECT CAST(3.14 AS DECIMAL(10,2)) AS d, CAST(6.28 AS NUMERIC(12,3)) AS n, 1.5 AS "
         "literal");
@@ -173,7 +174,7 @@ TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DescribeColLiveTest, NullableFlag) {
+ODBC_TEST_F(DescribeColLiveTest, NullableFlag) {
     // Use sys.objects: `name` is NVARCHAR(128) NOT NULL, `principal_id` is INT NULL.
     // Stable across SQL Server versions, no DDL needed.
     ExecDirect("SELECT TOP 1 name, principal_id FROM sys.objects");
@@ -200,7 +201,7 @@ TEST_F(DescribeColLiveTest, NullableFlag) {
 
 // datetime2 has no ODBC core equivalent for sub-second precision, but maps to
 // SQL_TYPE_TIMESTAMP. datetimeoffset is SQL Server-specific → SQL_SS_TIMESTAMPOFFSET (-155).
-TEST_F(DescribeColLiveTest, DateTime2AndDateTimeOffset) {
+ODBC_TEST_F(DescribeColLiveTest, DateTime2AndDateTimeOffset) {
     ExecDirect("SELECT CAST(SYSDATETIME() AS DATETIME2) AS dt2, "
                "CAST(SYSDATETIMEOFFSET() AS DATETIMEOFFSET) AS dto");
 
@@ -224,7 +225,7 @@ TEST_F(DescribeColLiveTest, DateTime2AndDateTimeOffset) {
 
 // ColumnSize for character types is in characters, not bytes. NVARCHAR(100) on the wire
 // occupies 200 bytes but must be reported as 100.
-TEST_F(DescribeColLiveTest, NVarCharColumnSizeIsCharCount) {
+ODBC_TEST_F(DescribeColLiveTest, NVarCharColumnSizeIsCharCount) {
     ExecDirect("SELECT CAST(N'x' AS NVARCHAR(100)) AS n");
 
     SQLSMALLINT dataType = 0;
@@ -241,7 +242,7 @@ TEST_F(DescribeColLiveTest, NVarCharColumnSizeIsCharCount) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DescribeColLiveTest, ClrUdtColumnsReportSqlSsUdt) {
+ODBC_TEST_F(DescribeColLiveTest, ClrUdtColumnsReportSqlSsUdt) {
     ExecDirect("SELECT CAST(NULL AS geography) AS geography_col, "
                "CAST(NULL AS geometry) AS geometry_col, "
                "CAST(NULL AS hierarchyid) AS hierarchyid_col");
