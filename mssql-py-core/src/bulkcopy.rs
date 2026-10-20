@@ -5,8 +5,9 @@
 //!
 //! This module provides adapters that bridge Python data to the `BulkLoadRow`
 //! trait. Each row is materialized once into a temporary `Vec<ColumnValues>`
-//! while the GIL is held, then written to the TDS packet after the GIL is
-//! released; rows are not buffered at the batch level.
+//! inside a `Python::attach` scope and then written to the TDS packet; rows
+//! are not buffered at the batch level. The current caller,
+//! `Cursor::bulkcopy`, holds the GIL for the whole operation.
 
 use std::sync::Arc;
 
@@ -102,8 +103,8 @@ impl SourcePythonType {
 /// Adapter that wraps a Python tuple for bulk insert.
 ///
 /// This struct implements the `BulkLoadRow` trait. Each row's Python values
-/// are converted into one temporary `Vec<ColumnValues>` while the GIL is held,
-/// so the GIL can be released before the async packet writes.
+/// are converted into one temporary `Vec<ColumnValues>` inside the adapter's
+/// `Python::attach` scope, then written to the packet after that scope ends.
 ///
 /// When destination metadata is provided, the adapter will attempt to perform
 /// type conversions (e.g., string to int) to match the target column types.
@@ -1900,17 +1901,18 @@ impl PythonRowAdapter {
 impl BulkLoadRow for PythonRowAdapter {
     /// Write this row's column values directly to the TDS packet writer.
     ///
-    /// This method acquires the GIL to read each Python value, converts it
+    /// This method attaches to Python to read each Python value, converts it
     /// to a ColumnValues variant, and writes it directly to the packet.
     ///
     /// The implementation strategy:
-    /// 1. Acquire GIL and convert all Python values to Vec<ColumnValues>
-    /// 2. Release GIL
+    /// 1. Inside `Python::attach`, convert all Python values to Vec<ColumnValues>
+    /// 2. Leave the attach scope
     /// 3. Write each ColumnValues to packet asynchronously
     ///
-    /// The temporary Vec is one allocation per row, consumed immediately; it
-    /// lets the GIL be released before the async packet writes, and nothing is
-    /// buffered at the batch level.
+    /// The temporary Vec is one allocation per row, consumed immediately, and
+    /// nothing is buffered at the batch level. Leaving the attach scope does not
+    /// release the GIL if the caller already holds it, as `Cursor::bulkcopy`
+    /// does.
     ///
     /// # Arguments
     ///
@@ -2006,7 +2008,7 @@ impl BulkLoadRow for PythonRowAdapter {
             }
         })?;
 
-        // Step 2: GIL is now released, write values to packet asynchronously
+        // Step 2: outside the attach scope, write values to packet asynchronously
         for value in column_values.iter() {
             writer.write_column_value(*column_index, value).await?;
             *column_index += 1;
