@@ -23,8 +23,7 @@
 #   * Test -> SQL host:  one teardown-sentinel artifact per matrix entry,
 #                        published always() so the SQL host releases on
 #                        success, failure, and cancellation.
-#   * SA password is derived from build context by derive-sql-password.sh
-#     in both jobs so they agree without sharing a secret across jobs.
+#   * Both jobs import the secret output from InitializeValidation.
 
 parameters:
   - name: targets
@@ -80,6 +79,9 @@ jobs:
 
     - job: Test_Matrix_arm64
       displayName: Linux arm64
+      variables:
+        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
+        SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       # Intentionally no `dependsOn`: see sql-host-template.yml header.
       # The endpoint is resolved at runtime via the sql-ready-shared
       # pipeline artifact (poll-for-endpoint.sh).
@@ -97,12 +99,12 @@ jobs:
       steps:
         - bash: |
             set -euo pipefail
-            bash .pipeline/scripts/sql-host/derive-sql-password.sh
-          displayName: 'Derive shared SQL_PASSWORD from build context'
+            bash .pipeline/scripts/sql-host/import-sql-password.sh
+          displayName: 'Import shared SQL credential'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
-            BUILD_BUILDID: $(Build.BuildId)
-            SYSTEM_COLLECTIONID: $(System.CollectionId)
+            SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
+            SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
 
         - task: DockerInstaller@0
           inputs:
@@ -125,7 +127,8 @@ jobs:
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
             # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
-            ARTIFACT_NAME: 'sql-ready-shared-$(System.StageAttempt)'
+            ARTIFACT_NAME: 'sql-ready-shared-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+            SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
             BUILD_BUILDID: $(Build.BuildId)
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -151,7 +154,7 @@ jobs:
               -e "DB_USERNAME=sa" \
               -e "DB_HOST=$DB_HOST" \
               -e "DB_PORT=$DB_PORT" \
-              -e "SQL_PASSWORD=$(SQL_PASSWORD)" \
+              -e SQL_PASSWORD \
               -e "ARCHIVE_NAME=tdslib-nextest.tar.zst" \
               -e "TRUST_SERVER_CERTIFICATE=true" \
               --network testnet \
@@ -187,7 +190,7 @@ jobs:
           inputs:
             targetPath: '$(Agent.TempDirectory)/teardown'
             # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
-            artifact: '$(sentinelName)-$(System.StageAttempt)'
+            artifact: '$(sentinelName)-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
             publishLocation: 'pipeline'
 
   # ------------------------------------------------------------------
@@ -206,6 +209,9 @@ jobs:
 
       - job: Test_${{ target.name }}_arm64
         displayName: 'Linux arm64 ${{ target.name }}'
+        variables:
+          SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
+          SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
         # Intentionally no `dependsOn`: see sql-host-template.yml header.
         pool:
           name: ${{ parameters.poolName }}
@@ -214,12 +220,12 @@ jobs:
         steps:
           - bash: |
               set -euo pipefail
-              bash .pipeline/scripts/sql-host/derive-sql-password.sh
-            displayName: 'Derive shared SQL_PASSWORD from build context'
+              bash .pipeline/scripts/sql-host/import-sql-password.sh
+            displayName: 'Import shared SQL credential'
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
-              BUILD_BUILDID: $(Build.BuildId)
-              SYSTEM_COLLECTIONID: $(System.CollectionId)
+              SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
+              SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
 
           - task: DockerInstaller@0
             inputs:
@@ -242,7 +248,8 @@ jobs:
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
               # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
-              ARTIFACT_NAME: 'sql-ready-${{ target.name }}-$(System.StageAttempt)'
+              ARTIFACT_NAME: 'sql-ready-${{ target.name }}-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+              SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
               BUILD_BUILDID: $(Build.BuildId)
               BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
               SYSTEM_COLLECTIONURI: $(System.CollectionUri)
@@ -268,7 +275,7 @@ jobs:
                 -e "DB_USERNAME=sa" \
                 -e "DB_HOST=$DB_HOST" \
                 -e "DB_PORT=$DB_PORT" \
-                -e "SQL_PASSWORD=$(SQL_PASSWORD)" \
+                -e SQL_PASSWORD \
                 -e "ARCHIVE_NAME=tdslib-nextest.tar.zst" \
                 -e "TRUST_SERVER_CERTIFICATE=true" \
                 --network testnet \
@@ -304,5 +311,5 @@ jobs:
             inputs:
               targetPath: '$(Agent.TempDirectory)/teardown'
               # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
-              artifact: '${{ target.name }}-$(System.StageAttempt)'
+              artifact: '${{ target.name }}-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
               publishLocation: 'pipeline'

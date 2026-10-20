@@ -8,14 +8,15 @@
 # would deadlock — ADO won't start a dependent job until its upstream
 # completes, and the SQL host can only complete after tests finish). The two
 # jobs rendezvous via pipeline-artifact sentinels in both directions:
-#   * SQL host -> Test:  sql-ready-<instanceId>-<stageAttempt>  (endpoint)
-#   * Test    -> SQL host: <sentinelName>-<stageAttempt>        (one per entry)
+#   * SQL host -> Test:  sql-ready-<instanceId>-<generation>-<stageAttempt>
+#   * Test    -> SQL host: <sentinelName>-<generation>-<stageAttempt>
 # The -<stageAttempt> (System.StageAttempt) suffix namespaces the rendezvous
 # per stage attempt so a rerun forms a fresh handshake instead of colliding
 # with or reading a prior attempt's artifacts. Set ARTIFACT_NAME accordingly.
 #
 # Required env:
 #   ARTIFACT_NAME         Name of the sql-ready sentinel artifact.
+#   SQL_CREDENTIAL_GENERATION  Nonsecret initialization generation ID.
 #   BUILD_BUILDID
 #   SYSTEM_COLLECTIONURI
 #   SYSTEM_TEAMPROJECT
@@ -45,6 +46,11 @@ set -euo pipefail
 : "${SYSTEM_TEAMPROJECT:?SYSTEM_TEAMPROJECT is required}"
 : "${SYSTEM_ACCESSTOKEN:?SYSTEM_ACCESSTOKEN is required (expose via env: in YAML step)}"
 : "${AGENT_TEMPDIRECTORY:?AGENT_TEMPDIRECTORY is required}"
+
+if [[ ! "${SQL_CREDENTIAL_GENERATION:-}" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "ERROR: SQL credential generation is missing or invalid. Queue a fresh validation run." >&2
+    exit 1
+fi
 
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 # Generous default — the x64 SQL host job has its own queue + boot latency
@@ -171,13 +177,17 @@ if [ -z "${endpoint_file}" ]; then
     exit 1
 fi
 
-# endpoint.txt format: "HOST PORT DEADLINE_EPOCH" on a single line. The
+# endpoint.txt format: "HOST PORT DEADLINE_EPOCH GENERATION" on a single line. The
 # deadline is the UTC epoch second past which the SQL host will tear down.
 # Refuse to proceed if we are within MIN_HOST_LIFE_REMAINING_SECONDS of it
 # — connecting to a host that will disappear mid-test only buys us silent
 # timeouts.
 MIN_HOST_LIFE_REMAINING_SECONDS="${MIN_HOST_LIFE_REMAINING_SECONDS:-300}"
-read -r host port deadline < "${endpoint_file}"
+read -r host port deadline generation < "${endpoint_file}"
+if [ "${generation}" != "${SQL_CREDENTIAL_GENERATION}" ]; then
+    echo "ERROR: SQL endpoint belongs to a different initialization. Queue a fresh validation run." >&2
+    exit 1
+fi
 if [ -z "${host}" ] || [ -z "${port}" ]; then
     echo "ERROR: endpoint.txt is malformed: '$(cat "${endpoint_file}")'" >&2
     exit 1

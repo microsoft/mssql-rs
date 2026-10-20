@@ -333,13 +333,14 @@ def test_pin_validation_is_not_path_filtered_or_optional():
     assert "pr" not in pipeline
     stages = load_template("validation-stages.yml")["stages"]
     stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
-    assert stage["dependsOn"] == ["EvaluateDuplicate"]
+    assert stage["dependsOn"] == ["InitializeValidation"]
     assert stage["condition"] == (
         "and(not(canceled()), "
+        "eq(dependencies.InitializeValidation.result, 'Succeeded'), "
         "eq('${{ parameters.RunFuzz }}', 'false'), "
         "eq('${{ parameters.RunLongHaul }}', 'false'), "
         "or(ne(variables['Build.Reason'], 'PullRequest'), "
-        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))"
+        "ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true')))"
     )
     for job in stage["jobs"]:
         assert "condition" not in job
@@ -451,6 +452,48 @@ def test_odbc_runner_distinguishes_harness_errors(tmp_path, pytest_exit, runner_
     assert f"passed: {2 if pytest_exit == 0 else 1} |" in result.stdout
     assert f"harness errors: {int(runner_exit == 2)}" in result.stdout
     assert len(list((tmp_path / "test-results").glob("*.xml"))) == 2
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [("", None), ("PYTEST_MARK_EXPR='not slow'", "not slow"), ("PYTEST_MARK_EXPR=''", "")],
+)
+def test_odbc_runner_forwards_marker_expression(tmp_path, env, expected):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").touch()
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    (tmp_path / "runner.sh").write_text(runner.read_text(encoding="utf-8"), newline="\n")
+    script = f"""
+    python() {{ return 0; }}
+    timeout() {{ printf '%s\\n' "$@" > "$PWD/args"; }}
+    {env} MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
+    """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name, "./runner.sh", "."],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (tmp_path / "args").read_text(encoding="utf-8").splitlines()
+    pytest_args = args[args.index("tests/test_a.py"):]
+    if expected is None:
+        assert "-m" not in pytest_args
+    else:
+        assert pytest_args[pytest_args.index("-m") + 1] == expected
+
+
+def test_mssql_python_odbc_job_includes_non_slow_stress_tests():
+    template = load_template("test-mssql-python-odbc-template.yml")
+    params = {p["name"]: p["default"] for p in template["parameters"]}
+    assert params["pytestMarker"] == "not slow"
+    step = next(
+        step for step in template["steps"]
+        if step.get("displayName") == "Run mssql-python tests against mssql-odbc"
+    )
+    assert 'PYTEST_MARK_EXPR="${{ parameters.pytestMarker }}"' in step["script"]
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
