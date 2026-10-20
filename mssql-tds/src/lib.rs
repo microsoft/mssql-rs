@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Async Rust implementation of the TDS (Tabular Data Stream) protocol for SQL Server
 //! and Azure SQL Database.
@@ -20,11 +21,14 @@
 //! | `integrated-auth` | **yes** | Enables both `sspi` and `gssapi` |
 //! | `sspi` | via `integrated-auth` | Windows SSPI (Kerberos/NTLM) |
 //! | `gssapi` | via `integrated-auth` | Unix GSSAPI (Kerberos) via runtime `dlopen` |
+//! | `tls-schannel-direct-on-windows` | **yes** | Enables `tls-schannel-direct` |
+//! | `tls-schannel-direct` | via `tls-schannel-direct-on-windows` | Windows: TLS through the in-tree Schannel engine instead of `native-tls`. No effect on other targets. |
 //!
-//! Disable the default to drop platform-specific auth dependencies:
+//! Disable the defaults to drop platform-specific auth dependencies and use
+//! `native-tls` on every platform:
 //!
 //! ```toml
-//! mssql-tds = { version = "0.1", default-features = false }
+//! mssql-tds = { version = "0.3", default-features = false }
 //! ```
 //!
 //! # Quick start
@@ -85,7 +89,6 @@ pub mod core;
 // to name the type. Re-exported so they inherit ours instead of guessing a
 // matching version.
 pub use encoding_rs;
-/// Cursor types and response structures for TDS cursor RPCs.
 pub mod cursor;
 pub mod datatypes;
 /// Error definitions for TDS operations.
@@ -115,3 +118,9 @@ pub mod test_client_support;
 // neither.
 #[cfg(test)]
 pub(crate) mod test_packet_support;
+
+// Compiles the README's code blocks as doctests so the crates.io page cannot
+// drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

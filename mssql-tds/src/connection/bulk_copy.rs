@@ -1287,7 +1287,7 @@ impl<'a> BulkCopy<'a> {
 /// Zero-copy bulk copy trait for direct serialization to TDS packets.
 ///
 /// This trait enables true zero-copy bulk insert by allowing rows to write
-/// directly to the packet writer without allocating intermediate Vec<ColumnValues>.
+/// directly to the packet writer without allocating intermediate `Vec<ColumnValues>`.
 /// This eliminates the per-row allocation overhead present in the `BulkCopyRow` trait.
 ///
 /// # Performance Benefits

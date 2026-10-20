@@ -10,8 +10,8 @@ use crate::token::tokens::ReturnValueToken;
 /// `OUTPUT` parameter or a UDF return value.
 ///
 /// Collected automatically as the TDS token stream is read. Use
-/// [`TdsClient::get_return_values()`](crate::TdsClient::get_return_values) or
-/// [`TdsClient::retrieve_output_params()`](crate::TdsClient::retrieve_output_params)
+/// [`TdsClient::get_return_values()`](crate::connection::tds_client::TdsClient::get_return_values) or
+/// [`TdsClient::retrieve_output_params()`](crate::connection::tds_client::TdsClient::retrieve_output_params)
 /// to access them after the result set is consumed.
 #[derive(Debug, Clone)]
 pub struct ReturnValue {

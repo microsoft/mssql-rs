@@ -6178,7 +6178,7 @@ impl TdsClient {
     ///
     /// SQL Server RPC responses can end a row set with `DONE_MORE`, then emit
     /// RETURNVALUE/RETURNSTATUS tokens and a terminal DONEPROC. For a
-    /// `DONEINPROC`, [`settle_rpc_terminator`](Self::settle_rpc_terminator)
+    /// `DONEINPROC`, `settle_rpc_terminator`
     /// consumes only that control-token tail and parks the first non-tail token
     /// for [`advance`](Self::advance). Plain batch DONE tokens are never probed.
     ///
@@ -7067,7 +7067,7 @@ impl TdsClient {
     /// a row was written or `false` when the result set is exhausted.
     ///
     /// This is the **push** entry point used by bulk consumers (Arrow / N-API /
-    /// `next_row`). It always decodes a full row ([`ColumnPolicy::DecodeAll`]) and
+    /// `next_row`). It always decodes a full row (`ColumnPolicy::DecodeAll`) and
     /// never pauses. If the pull cursor
     /// ([`next_row_cursor`](Self::next_row_cursor)) left a row *partially* read,
     /// this returns a [`UsageError`] rather than silently draining and skipping
@@ -8889,9 +8889,9 @@ impl TdsClient {
     /// connection is retired: a drain that stops partway leaves the reader at an
     /// unknown offset in the response, and a TDS stream cannot be
     /// resynchronized from there. The error is returned to the caller and
-    /// pooled consumers discard the connection rather than reusing it. See
-    /// [`Self::retire_desynchronized_connection`] for what retirement does not
-    /// cover.
+    /// pooled consumers discard the connection rather than reusing it.
+    /// Retirement does not close the socket; a caller that keeps using this
+    /// `TdsClient` directly can still issue commands on it.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
         self.interrupted_read_settled = false;

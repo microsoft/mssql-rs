@@ -128,7 +128,7 @@ The driver must drive the async TDS work to completion *before returning*. That
 is a `block_on`:
 
 ```rust
-let rc = runtime.block_on(client.execute(sql, None, None));
+let rc = runtime.block_on(client.execute(sql, ()));
 ```
 
 The calling thread is parked inside `block_on` until the query finishes.
@@ -336,7 +336,7 @@ msodbcsql's model.)
 
 ```rust
 // SQLExecDirect (async path):
-let handle = runtime.spawn(async move { client.execute(sql, None, None).await });
+let handle = runtime.spawn(async move { client.execute(sql, ()).await });
 stmt.pending = Some(handle);
 return SQL_STILL_EXECUTING;
 
