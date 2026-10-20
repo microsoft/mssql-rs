@@ -5157,12 +5157,11 @@ impl TdsClient {
     ///
     /// See [`Self::drain_failure_lost_the_transport`] for the split.
     ///
-    /// What this does not do: it does not close the socket, and no execute path
-    /// consults `is_connection_dead`, so a caller reusing this `TdsClient`
-    /// directly can still issue another command. That command is not left
-    /// parked mid-value — entry points call `reset_reader`, which discards the
-    /// client-side buffer — but stale bytes may remain queued in the kernel
-    /// receive buffer. Closing the socket here is the wrong remedy:
+    /// What this does not do: it does not close the socket. A caller reusing
+    /// this `TdsClient` directly is still stopped by the known-dead gate in
+    /// [`Self::check_and_reconnect`]: after a desync it returns
+    /// `ConnectionClosed`, and after a transport loss it attempts session
+    /// recovery when it is available. Closing the socket here is the wrong remedy:
     /// `close_transport` writes a TLS close_notify on a socket we just failed to
     /// read from, and its `?` returns before `self.stream = None`, so a
     /// swallowed error would leave the stream alive in exactly the degraded case
@@ -8889,9 +8888,13 @@ impl TdsClient {
     /// connection is retired: a drain that stops partway leaves the reader at an
     /// unknown offset in the response, and a TDS stream cannot be
     /// resynchronized from there. The error is returned to the caller and
-    /// pooled consumers discard the connection rather than reusing it.
-    /// Retirement does not close the socket; a caller that keeps using this
-    /// `TdsClient` directly can still issue commands on it.
+    /// pooled consumers discard the connection rather than reusing it. On a
+    /// direct `TdsClient`, the next request after a stream desynchronization
+    /// fails with [`ConnectionClosed`](crate::error::Error::ConnectionClosed)
+    /// before anything is sent, because session recovery is disabled. After a
+    /// transport loss (I/O, TLS, or connection closed) recovery stays enabled,
+    /// so if session recovery is available the next request may reconnect
+    /// transparently.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
         self.interrupted_read_settled = false;
