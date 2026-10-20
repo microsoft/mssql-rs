@@ -62,8 +62,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   as msodbcsql does. When a server acknowledges it, the addresses that
   connection resolved are kept in a process-wide cache and used only if a
   later resolution of that host fails, so connections survive a DNS outage.
-  A later login the server accepts without that acknowledgement removes the
-  host; a rejected login leaves it (AB#49294).
+  Verdicts take effect only after LOGINACK and a successful terminal DONE.
+  A FEATUREEXTACK without a positive DNS acknowledgement removes the host;
+  a rejected or incomplete response, or one with no FEATUREEXTACK at all,
+  leaves the cache unchanged (AB#49294).
 
 - Initial public release of the mssql-rs workspace.
 

@@ -8,15 +8,13 @@
 //! connect resolves the host normally, and cached addresses are used only when
 //! that resolution fails, so connections keep working through a DNS outage.
 //!
-//! The server decides whether its host may be cached, and every login it
-//! accepts settles that. A FEATUREEXTACK with bit 0 set publishes the addresses
-//! that login's connection resolved; any other FEATUREEXTACK removes the host,
-//! as `SNI_QUERY_CONN_DNSCACHE` does in SNI, and so does a login accepted with
-//! no FEATUREEXTACK at all. SNI needs no such rule because it re-caches every
-//! successful resolution, whereas addresses here are only ever published by a
-//! server's allowance. A login the server rejects settles nothing: MS-TDS sends
-//! FEATUREEXTACK only alongside LOGINACK, and a retry that fails during a DNS
-//! outage must not take away the fallback the next one needs.
+//! The last FEATUREEXTACK in a completed, accepted login decides whether its
+//! host may be cached: bit 0 set publishes that connection's addresses; a
+//! missing or negative DNS acknowledgement removes the host. No FEATUREEXTACK
+//! means no new verdict, including on a gateway redirect. Rejected, incomplete,
+//! and authentication-continuation responses leave the fallback unchanged.
+//! Unlike SNI, resolutions are never shared before an accepted login allows
+//! them, and a malformed FEATUREEXTACK cannot retain a partial DNS allow.
 //!
 //! Each connection carries its own [`Resolution`] to its login, as SqlClient
 //! does with `pendingSQLDNSObject`, so the cache only ever holds allowed hosts
@@ -145,10 +143,10 @@ pub(crate) async fn lookup_host(host: &str, port: u16) -> io::Result<Resolution>
 }
 
 async fn system_lookup(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    // Names under `.invalid` never resolve (RFC 6761). Unit tests use them to
+    // Names under `.invalid` never resolve (RFC 6761). Tests use them to
     // reach the fallback through a real connect without depending on the
     // machine's resolver.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if host.ends_with(".invalid") {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no such host"));
     }
@@ -362,11 +360,8 @@ mod tests {
         );
     }
 
-    /// Regression: resolutions used to wait for their verdicts in a set capped
-    /// at 256 hosts, so the 257th evicted one, and that host's later allowing
-    /// verdict published nothing.
     #[tokio::test]
-    async fn hosts_resolved_beyond_the_former_pending_cap_are_still_published() {
+    async fn every_allowed_host_is_published() {
         let cache = DnsCache::default();
         let host = |i: usize| format!("host{i}.example.com");
         let mut logins = Vec::new();
@@ -418,54 +413,40 @@ mod tests {
         );
     }
 
-    /// End to end: a connect that falls back to an allowed entry carries that
-    /// resolution to its login, and the mock server, which accepts the login
-    /// with LOGINACK and no FEATUREEXTACK, revokes it.
     #[tokio::test]
-    async fn a_login_accepted_without_feature_ext_ack_revokes_the_fallback() {
-        use crate::connection::client_context::{ClientContext, TransportContext};
-        use crate::connection_provider::tds_connection_provider::TdsConnectionProvider;
-        use crate::core::{EncryptionOptions, EncryptionSetting};
-
-        let server = mssql_mock_tds::MockTdsServer::new("127.0.0.1:0")
+    async fn a_resolver_timeout_error_uses_the_allowed_fallback() {
+        let cache = DnsCache::default();
+        let resolution = Resolution::new("db.example.com", vec![address("10.0.0.1", 1433)]);
+        cache.apply_verdict(&resolution, true);
+        let resolved = cache
+            .resolve("db.example.com", 1433, || async {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "DNS timed out"))
+            })
             .await
             .unwrap();
-        let server_address = server.local_addr();
-        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+        assert_eq!(resolved, resolution);
+    }
 
-        let host = "accepted-without-ack.dns-cache.invalid";
-        DnsCache::global().apply_verdict(&Resolution::new(host, vec![server_address]), true);
-        let context = ClientContext {
-            encryption_options: EncryptionOptions {
-                mode: EncryptionSetting::PreferOff,
-                trust_server_certificate: true,
-                host_name_in_cert: None,
-                server_certificate: None,
-            },
-            ..ClientContext::default()
-        };
-        let transport_context = TransportContext::Tcp {
-            host: host.to_string(),
-            port: server_address.port(),
-            instance_name: None,
-        };
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_lookup_remains_bounded_by_the_callers_deadline() {
+        use std::time::Duration;
+        use tokio::time::{Instant, timeout};
 
-        TdsConnectionProvider::connect_with_transport_context(&context, &transport_context, None)
-            .await
-            .expect("connects through the cached address");
-        assert!(
-            TdsConnectionProvider::connect_with_transport_context(
-                &context,
-                &transport_context,
-                None
-            )
-            .await
-            .is_err(),
-            "the accepted login removed the fallback"
+        let cache = DnsCache::default();
+        let resolution = Resolution::new("db.example.com", vec![address("10.0.0.1", 1433)]);
+        cache.apply_verdict(&resolution, true);
+        let budget = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = timeout(
+            budget,
+            cache.resolve("db.example.com", 1433, std::future::pending),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), budget);
+        assert_eq!(
+            fallback(&cache, "db.example.com", 1433).await,
+            Some(resolution.addresses)
         );
-
-        let _ = shutdown.send(());
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
     }
 }
