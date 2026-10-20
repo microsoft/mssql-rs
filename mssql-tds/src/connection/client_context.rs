@@ -322,7 +322,9 @@ pub struct ClientContext {
     /// Transparent Network IP Resolution: when a host name resolves to several
     /// addresses, connect to the first one and, if that fails, to all of them
     /// in parallel. On by default, as in msodbcsql. Has no effect with
-    /// `multi_subnet_failover`, and a `failover_partner` turns it off.
+    /// `multi_subnet_failover`, and a `failover_partner` turns it off. Like
+    /// every TCP attempt, each step is bounded by [`Self::connect_timeout`],
+    /// within the login deadline.
     pub transparent_network_ip_resolution: bool,
     /// Timeout in milliseconds for SQL Browser (SSRP) instance resolution.
     /// Defaults to 1000ms.

@@ -13,7 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   and, if it fails, races every address, following msodbcsql.
   `ClientContext::transparent_network_ip_resolution` controls it and is on by
   default; MultiSubnetFailover takes precedence, and a failover partner turns
-  it off (AB#49293).
+  it off. Like every TCP attempt, each step is bounded by `connect_timeout`
+  within the login deadline, where msodbcsql gives the first attempt the whole
+  remaining login time; see parity deviation 34 (AB#49293).
 
 - `mssql-odbc`: the `TransparentNetworkIPResolution` keyword
   (`Enabled`/`Disabled`) and the `SQL_COPT_SS_TNIR` and

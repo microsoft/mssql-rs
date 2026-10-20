@@ -1133,3 +1133,35 @@ msodbcsql build is measured.
     answers, and whose third is live would close the first: the third answers
     at once only if TNIR is still on. Tracked in AB#49293. Human parity sign-off
     has not been recorded.
+
+34. **A Transparent Network IP Resolution connect moves past a silent first
+    address when the per-attempt connect timeout expires, not the login
+    timeout.** msodbcsql's login loop passes the remaining login timeout to
+    every connect outside database mirroring and MultiSubnetFailover
+    (`netconn.cpp`, the `GetConnection` call: "we always pass the remaining
+    login timeout value"), and with TNIR that becomes SNI's timeout for its
+    first attempt, which tries only the first resolved address (`tcp.cpp`,
+    `SequentialMode`). SNI's comment describes a 500 ms first attempt with the
+    full timeout passed separately as `totalTimeout`, but msodbcsql never sets
+    `totalTimeout`. A first address that never answers therefore keeps the
+    connect until the operating system abandons it, and the login fails if its
+    timeout ends first. This driver bounds every TCP connect attempt, TNIR's
+    first attempt and the race after it included, by mssql-tds's
+    `connect_timeout`, which mssql-odbc leaves at 15 seconds, all within the
+    `SQL_ATTR_LOGIN_TIMEOUT` deadline. At the default login timeout of 15
+    seconds, or any shorter one, the deadline ends first and the drivers behave
+    the same. With a longer login timeout this driver races every address after
+    15 seconds and can connect through a later one where msodbcsql is still
+    waiting on the first or has failed. The same bound already covers the
+    sequential walk and the MultiSubnetFailover race, so that one address that
+    drops packets cannot hold a long login; interactive sign-in raises the
+    default login timeout to 330 seconds (`interactive.rs`), and exempting
+    TNIR's first attempt would reopen that wait.
+    `first_then_parallel_escalates_after_the_connect_timeout_not_the_login_budget`
+    (`network_transport.rs`) pins the split with a first address that never
+    answers. **Evidence limit:** a source reading only. Connecting msodbcsql 18
+    with `SQL_ATTR_LOGIN_TIMEOUT` set to 30 through a name whose first address
+    drops the connection request and whose second is live would close it:
+    msodbcsql should connect only once the operating system abandons the first
+    address, or fail at 30 seconds, where this driver connects after 15.
+    Tracked in AB#49293. Human parity sign-off has not been recorded.

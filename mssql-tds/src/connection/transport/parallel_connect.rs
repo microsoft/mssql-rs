@@ -27,6 +27,7 @@
 //! and returns as soon as one succeeds. Failed connections are logged but don't
 //! prevent other connections from succeeding.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -256,6 +257,25 @@ pub async fn parallel_connect_to_addresses(
     addresses: Vec<SocketAddr>,
     config: &ParallelConnectConfig,
 ) -> TdsResult<ParallelConnectResult> {
+    let (keep_alive_in_ms, keep_alive_interval_in_ms) =
+        (config.keep_alive_in_ms, config.keep_alive_interval_in_ms);
+    parallel_connect_with(addresses, config.timeout_ms, move |addr| {
+        connect_with_keepalive(addr, keep_alive_in_ms, keep_alive_interval_in_ms)
+    })
+    .await
+}
+
+/// [`parallel_connect_to_addresses`] with the per-address connect supplied by
+/// the caller, so tests can stand in for an address that never answers.
+pub(crate) async fn parallel_connect_with<C, F>(
+    addresses: Vec<SocketAddr>,
+    timeout_ms: u64,
+    connect: C,
+) -> TdsResult<ParallelConnectResult>
+where
+    C: Fn(SocketAddr) -> F,
+    F: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
+{
     if addresses.is_empty() {
         return Err(Error::ConnectionError(
             "No addresses provided for parallel connection".to_string(),
@@ -285,13 +305,10 @@ pub async fn parallel_connect_to_addresses(
         .enumerate()
         .map(|(idx, addr)| {
             let addr = *addr;
-            let keep_alive_in_ms = config.keep_alive_in_ms;
-            let keep_alive_interval_in_ms = config.keep_alive_interval_in_ms;
+            let attempt = connect(addr);
             async move {
                 trace!("Attempting connection {} to {}", idx, addr);
-                match connect_with_keepalive(addr, keep_alive_in_ms, keep_alive_interval_in_ms)
-                    .await
-                {
+                match attempt.await {
                     Ok(stream) => {
                         info!("Connection {} to {} succeeded", idx, addr);
                         Ok((stream, addr, idx))
@@ -307,7 +324,7 @@ pub async fn parallel_connect_to_addresses(
 
     // Race all connections with an overall timeout
     let result = timeout(
-        Duration::from_millis(config.timeout_ms),
+        Duration::from_millis(timeout_ms),
         race_connections(connect_futures),
     )
     .await;
@@ -336,7 +353,7 @@ pub async fn parallel_connect_to_addresses(
             )))
         }
         Err(_) => {
-            warn!("Parallel connection timeout after {}ms", config.timeout_ms);
+            warn!("Parallel connection timeout after {}ms", timeout_ms);
             Err(Error::TimeoutError(crate::error::TimeoutErrorType::String(
                 "Connection timeout: Connection attempt timed out".to_string(),
             )))
@@ -349,7 +366,7 @@ pub async fn parallel_connect_to_addresses(
 /// On Windows, this function ensures a minimum wait time (MIN_PARALLEL_WAIT_TIME_MS)
 /// to increase the likelihood of getting useful error messages like WSAECONNREFUSED
 /// rather than generic timeout errors.
-async fn connect_with_keepalive(
+pub(crate) async fn connect_with_keepalive(
     addr: SocketAddr,
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,

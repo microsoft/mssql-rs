@@ -6,7 +6,8 @@ use crate::connection::client_context::{ClientContext, IPAddressPreference, Tran
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{
-    MAX_PARALLEL_IPS, ParallelConnectConfig, parallel_connect, parallel_connect_to_addresses,
+    MAX_PARALLEL_IPS, ParallelConnectConfig, connect_with_keepalive, parallel_connect,
+    parallel_connect_with,
 };
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
@@ -46,7 +47,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{self, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, error, event, info, trace, warn};
 
@@ -374,10 +375,13 @@ fn sort_by_ip_preference(
 /// Tries each resolved IP address one at a time until one succeeds.
 ///
 /// With `first_then_parallel` (Transparent Network IP Resolution) only the first
-/// address is tried this way; if it fails, every address is tried in parallel.
-/// msodbcsql's SNI (`tcp.cpp`) gives that first attempt the whole remaining
-/// timeout and walks a host with more than 64 addresses sequentially instead;
-/// its login retry (`netconn.cpp`, `fTnirRetry`) then switches to parallel.
+/// address is tried this way; if it fails, every address is tried in parallel,
+/// and a host with more than 64 addresses is walked sequentially instead, as in
+/// SNI (`tcp.cpp`). Like every TCP attempt, each step is bounded by
+/// `connect_timeout_ms`, and the caller's login deadline bounds the whole
+/// sequence. msodbcsql instead gives the first attempt the whole remaining login
+/// time (`netconn.cpp`), so a first address that never answers uses up its
+/// login; see parity-deviations entry 34.
 async fn create_base_stream_sequential(
     ipaddress_preference: IPAddressPreference,
     host: &str,
@@ -427,8 +431,35 @@ async fn connect_to_resolved_addresses(
     connect_timeout_ms: u64,
     first_then_parallel: bool,
 ) -> TdsResult<Box<dyn Stream>> {
+    // The keep-alive defaults for the SQL Server clients are at
+    // https://learn.microsoft.com/en-us/sql/tools/configuration-manager/client-protocols-tcp-ip-properties-protocol-tab?view=sql-server-ver16
+    let stream = connect_to_addresses_with(
+        host,
+        port,
+        socket_addresses,
+        connect_timeout_ms,
+        first_then_parallel,
+        move |address| connect_with_keepalive(address, keep_alive_in_ms, keep_alive_interval_in_ms),
+    )
+    .await?;
+    Ok(Box::new(stream))
+}
+
+/// [`connect_to_resolved_addresses`] with the per-address connect supplied by
+/// the caller, so tests can stand in for an address that never answers.
+async fn connect_to_addresses_with<C, F>(
+    host: &str,
+    port: u16,
+    socket_addresses: Vec<SocketAddr>,
+    connect_timeout_ms: u64,
+    first_then_parallel: bool,
+    connect: C,
+) -> TdsResult<TcpStream>
+where
+    C: Fn(SocketAddr) -> F,
+    F: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
+{
     let mut last_error = None;
-    let mut tcp_stream = None;
 
     let first_then_parallel =
         first_then_parallel && (2..=MAX_PARALLEL_IPS).contains(&socket_addresses.len());
@@ -439,34 +470,17 @@ async fn connect_to_resolved_addresses(
     };
 
     for &socket_address in sequential_addresses {
-        let socket = if socket_address.is_ipv6() {
-            net::TcpSocket::new_v6()?
-        } else {
-            net::TcpSocket::new_v4()?
-        };
-
-        // The defaults for the SQL Server clients are at
-        // https://learn.microsoft.com/en-us/sql/tools/configuration-manager/client-protocols-tcp-ip-properties-protocol-tab?view=sql-server-ver16
-        let keep_alive_settings = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_millis(keep_alive_in_ms as u64))
-            .with_interval(Duration::from_millis(keep_alive_interval_in_ms as u64));
-
-        let socket2_socket = socket2::SockRef::from(&socket);
-        socket2_socket.set_tcp_keepalive(&keep_alive_settings)?;
-        socket2_socket.set_nodelay(true)?;
-
-        // Apply connection timeout to each connection attempt
-        let connect_future = socket.connect(socket_address);
-        tcp_stream = match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await
+        match timeout(
+            Duration::from_millis(connect_timeout_ms),
+            connect(socket_address),
+        )
+        .await
         {
             Ok(Ok(stream)) => {
                 info!("Connected to TCP transport: {}:{}", host, port);
-                Some(stream)
+                return Ok(stream);
             }
-            Ok(Err(e)) => {
-                last_error = Some(e);
-                None
-            }
+            Ok(Err(e)) => last_error = Some(e),
             Err(_elapsed) => {
                 last_error = Some(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -475,30 +489,18 @@ async fn connect_to_resolved_addresses(
                         socket_address, connect_timeout_ms
                     ),
                 ));
-                None
             }
-        };
-        if tcp_stream.is_some() {
-            break;
         }
     }
 
-    if let Some(stream) = tcp_stream {
-        return Ok(Box::new(stream));
-    }
     if first_then_parallel {
         info!(
             error = ?last_error,
             "First address failed; connecting to all {} addresses in parallel",
             socket_addresses.len()
         );
-        let config = ParallelConnectConfig {
-            timeout_ms: connect_timeout_ms,
-            keep_alive_in_ms,
-            keep_alive_interval_in_ms,
-        };
-        let result = parallel_connect_to_addresses(socket_addresses, &config).await?;
-        return Ok(Box::new(result.stream));
+        let result = parallel_connect_with(socket_addresses, connect_timeout_ms, connect).await?;
+        return Ok(result.stream);
     }
     // We don't have a valid TCP stream, so we need to return the last error.
     Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
@@ -6007,6 +6009,55 @@ pub(crate) mod tests {
     async fn first_then_parallel_fails_when_every_address_fails() {
         let addresses = vec![closed_address().await, closed_address().await];
         assert!(connect_resolved(addresses, true).await.is_err());
+    }
+
+    /// TNIR's first attempt is bounded by the connect timeout, like every TCP
+    /// attempt, not by the login budget, so a first address that never answers
+    /// gives way to the race long before the login would fail (parity-deviations
+    /// entry 34).
+    #[tokio::test]
+    async fn first_then_parallel_escalates_after_the_connect_timeout_not_the_login_budget() {
+        const CONNECT_TIMEOUT_MS: u64 = 500;
+        const LOGIN_BUDGET: Duration = Duration::from_secs(5);
+        // TEST-NET-1 (RFC 5737); the connector below never completes it.
+        let silent: SocketAddr = "192.0.2.1:1433".parse().unwrap();
+        let live = listener().await;
+        let connect = move |address: SocketAddr| async move {
+            if address == silent {
+                std::future::pending().await
+            } else {
+                TcpStream::connect(address).await
+            }
+        };
+
+        let started = Instant::now();
+        let connected = timeout(
+            LOGIN_BUDGET,
+            connect_to_addresses_with(
+                "db.example.com",
+                1433,
+                vec![silent, live.local_addr().unwrap()],
+                CONNECT_TIMEOUT_MS,
+                true,
+                connect,
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(connected, Ok(Ok(_))),
+            "connects through the live address"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(CONNECT_TIMEOUT_MS),
+            "the first address keeps its whole connect timeout, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < LOGIN_BUDGET / 2,
+            "escalates long before the login budget runs out, took {elapsed:?}"
+        );
+        assert!(was_contacted(&live, 1_000).await);
     }
 
     /// `skip_bytes` spins the same way, and it runs on the discard path that
