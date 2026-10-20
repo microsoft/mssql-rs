@@ -10,8 +10,9 @@ plus small concurrent smoke runs; nightly and weekly runs hunt races.
   `ODBC_TEST_F` in its API-group file, such as `get_data_test.cpp`, and also
   runs across threads. No second copy to drift.
 - **Multithreaded-only scenarios** in `tests/e2e/tests/multithreaded_tests/`,
-  for what has no single-threaded form: handle churn, races on one STMT, a
-  shared APD, connect races, and cancel (`cancel_test.cpp`, from #703).
+  for what has no single-threaded form: handle churn and pooling, races on one
+  STMT, a shared APD, connect races, cancel (`cancel_test.cpp`, from #703),
+  faults under load, thread scale, and a mixed-workload soak.
 
 Separate copies drifted from the single-threaded suite (a fixed bug was
 re-filed from stale expectations); running three GetData test bodies under
@@ -429,12 +430,53 @@ Purpose-built workloads using the same settings, start gate, and watchdog.
     DBC give one success and one state error (`HY010` or Driver Manager); the
     DBC stays usable. Debug and release builds; Rust-driver robustness, not
     parity.
+11. **Pooled connection churn:** threads connect, run a short query, and
+    disconnect, with and without Driver Manager pooling, over TLS and with
+    each supported authentication (the Entra and MSQA token caches are
+    process-global). A borrower must not see the previous one's session state:
+    SET options, temp tables, an open transaction, the current database.
+    Extends 7.
+12. **Timeouts, cancel, and network faults under load:** query and connection
+    timeouts expire, threads cancel each other's calls, and a proxy (as in
+    `cancel_test.cpp`) delays, stalls, or resets one connection mid-stream while
+    other workers keep running. The faulted connection fails or recovers
+    cleanly; the others are unaffected.
+13. **Thread scale:** 64 to 512 application threads on one ENV, far more than
+    its shared tokio runtime has workers, and threads with small stacks
+    (musl's 128 KiB default overflowed in connect; CI found it, not this
+    harness). Checks for starvation and deadlock, not values.
+14. **Mixed-workload soak:** each thread repeatedly picks a random operation
+    (LOB stream, parameter array, catalog call, prepare and execute, cancel,
+    reconnect) against a server with injected latency, for hours. Every result
+    is token-checked; memory, handle, thread, and socket counts must plateau.
+15. **Process-wide changes under load:** tracing turned on and off, and the
+    driver loaded and unloaded, while other threads run queries.
 
 Scenarios 8 and 9 need same-handle calls to reach the driver concurrently. No
 Driver Manager provides that safely: Windows serializes them, and released
 unixODBC corrupts its own diagnostic list at any `Threading` level. So they call the driver
 library directly, without a Driver Manager, which is also the
 ThreadSanitizer target (AB#49259).
+
+### Priorities
+
+Converted suites are a cheap regression net, not a race hunt: the fetch and
+GetData suites passed at 16 x 50 on both platforms with nothing found. In
+`SharedEnv` each worker has its own DBC and STMT, and the only driver state
+they share is the ENV's tokio runtime, the live-handle registry, and a few
+one-time settings, so per-statement paths such as `SQLGetData` never run
+against shared state. `SharedStmt` reaches the driver only through DBC
+diagnostics, and `CrossThread` finds only thread affinity. A local server's
+sub-millisecond round trips also keep race windows small. The one driver race
+found so far, AB#49225, came from `SharedDbc`. Order of effort for finding
+races:
+
+1. `SharedDbc` opt-ins, as soon as AB#49225 is fixed (scenario 3).
+2. Churn, pooling, and authentication (scenarios 7, 10, 11).
+3. Same-STMT and shared-APD races under ThreadSanitizer (scenarios 8, 9).
+4. Faults under load (scenario 12), and disconnect or free during use (see
+   Deferred).
+5. Thread scale, soak, and process-wide changes (scenarios 13-15).
 
 ## Stress Profiles
 
@@ -457,7 +499,7 @@ ThreadSanitizer target (AB#49259).
   (fixed object names, process-wide settings) in the PR that adds them.
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
-- Scenarios 7-10 join the stress run as their suites land (AB#49261,
+- Scenarios 7-15 join the stress run as their suites land (AB#49261,
   AB#49259).
 - Nightly failures need a named triage owner.
 
@@ -557,9 +599,12 @@ Tracked under AB#49256:
    scenario 6.
 6. **AB#49261:** scenarios 7 and 10.
 7. **AB#49259:** scenarios 8a, 8b, 8c, and 9 under ThreadSanitizer.
+8. **Not yet tracked:** scenarios 11-15.
 
 ## Deferred
 
 - **Disconnect or free during use:** add to 8b once handle lifetimes are
-  reference-counted or generation-checked.
+  reference-counted or generation-checked. Applications reach it through
+  timeout cleanup and finalizers on other threads, so until then it is a known
+  crash class with no test.
 - **Async execution and MARS:** once the driver supports them.
