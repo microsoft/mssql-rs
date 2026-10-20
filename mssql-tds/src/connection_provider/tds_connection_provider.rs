@@ -34,7 +34,7 @@ use std::sync::LazyLock;
 pub(crate) static PARSER_REGISTRY: LazyLock<GenericTokenParserRegistry> =
     LazyLock::new(GenericTokenParserRegistry::default);
 
-/// Redirects one connection attempt may follow before it fails.
+/// Redirects one login may follow before it fails.
 const MAX_REDIRECTS: u32 = 10;
 
 /// What a completed login yields, ready to become a [`TdsClient`].
@@ -177,6 +177,7 @@ impl TdsConnectionProvider {
                 1.. => Some(Instant::now() + Duration::from_secs(login_timeout.into())),
                 _ => None,
             };
+            let mut redirect_count = 0;
 
             // Try Shared Memory before SSRP for local named instances (Windows only).
             // SM doesn't need instance resolution — it uses the name directly.
@@ -205,7 +206,6 @@ impl TdsConnectionProvider {
                 };
                 // A route received over shared memory is followed over TCP like
                 // any other, instead of surfacing as a permanent failure below.
-                let mut redirect_count = 0;
                 match Self::follow_redirects(context, sm_result, deadline, &mut redirect_count).await {
                     Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                         debug!("Shared Memory connection succeeded, skipping SSRP");
@@ -220,15 +220,15 @@ impl TdsConnectionProvider {
                         return Ok(client);
                     }
                     Err(err) => {
-                        // Only transient (transport-level) shared-memory failures
-                        // fall through to SSRP/TCP. A definitive failure — e.g. the
+                        // Only transient failures before routing fall through to
+                        // SSRP/TCP. A definitive failure — e.g. the
                         // user cancelled interactive sign-in (`AuthenticationDenied`)
                         // or the login was rejected — would recur on every transport,
                         // and falling through would relaunch the interactive browser.
                         // Surface it immediately.
-                        if !err.is_transient_connect_error() {
+                        if redirect_count > 0 || !err.is_transient_connect_error() {
                             debug!(
-                                "Shared Memory failed permanently ({}), not falling through",
+                                "Shared Memory login or routed connection failed ({}), not falling through",
                                 err
                             );
                             return Err(err);
@@ -366,8 +366,6 @@ impl TdsConnectionProvider {
                     break;
                 }
 
-                let mut redirect_count = 0;
-
                 // Try each transport context in order
                 for (transport_ctx, _action_timeout_ms) in &transport_contexts {
                     debug!("Attempt {}: connecting with {:?}", attempt, transport_ctx);
@@ -414,8 +412,9 @@ impl TdsConnectionProvider {
                         Err(err) => {
                             debug!("Connection attempt failed: {}", err);
 
-                            // Permanent errors should not be retried
-                            if !err.is_transient_connect_error() {
+                            // A routed failure is terminal, as in msodbcsql's
+                            // OpenOrRedirectConnection; do not restart the gateway.
+                            if redirect_count > 0 || !err.is_transient_connect_error() {
                                 return Err(err);
                             }
 
@@ -528,8 +527,8 @@ impl TdsConnectionProvider {
     /// Follows routing ENVCHANGEs until a login completes or fails for another
     /// reason. The shared-memory shortcut and the transport loop both hand
     /// their login here, so a route is honored whichever transport carried it
-    /// (msodbcsql `OpenOrRedirectConnection`). `redirect_count` spans one
-    /// connection attempt.
+    /// (msodbcsql `OpenOrRedirectConnection`). `redirect_count` spans the
+    /// entire login, including the shared-memory shortcut.
     async fn follow_redirects(
         context: &ClientContext,
         mut result: TdsResult<ConnectionParts>,

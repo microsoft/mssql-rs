@@ -595,6 +595,7 @@ mod tests {
             EnvChangeTokenSubType::TransactionEnded,
             EnvChangeTokenSubType::UserInstanceName,
             EnvChangeTokenSubType::Routing,
+            EnvChangeTokenSubType::EnhancedRouting,
         ];
         for sub_type in unimplemented_subtypes {
             let token = EnvChangeToken {
