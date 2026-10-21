@@ -23,6 +23,19 @@ components:
 `mssql-python-rs` is the native runtime that
 [`mssql-python`](https://github.com/microsoft/mssql-python) depends on.
 
+## Native connection options
+
+`PyCoreConnection` and `PyAsyncConnection.connect` accept
+`transparent_network_ip_resolution` in their connection-context dictionary.
+It defaults to enabled when omitted. Pass `False` or `"Disabled"` to disable
+Transparent Network IP Resolution (TNIR), or `True` or `"Enabled"` to enable it.
+String values are case-insensitive; other strings and non-boolean/non-string
+values are rejected. `MultiSubnetFailover` still takes precedence over TNIR.
+
+This is a native dictionary option, not an ODBC connection-string parser.
+Higher-level clients such as `mssql-python` must forward the option when
+constructing a py-core connection context.
+
 ## Platforms
 
 Prebuilt CPython 3.10+ wheels for:

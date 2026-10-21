@@ -26,6 +26,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   back as on rather than off on a fresh handle; see parity deviation 33
   (AB#49293).
 
+- `mssql-py-core`: synchronous and asynchronous connections accept
+  `transparent_network_ip_resolution` in their native context dictionaries.
+  Python booleans and case-insensitive `Enabled`/`Disabled` strings control
+  TNIR; omitting the key preserves the enabled default. Invalid values are
+  rejected instead of ignored (AB#49293).
+
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing
   bound-fetch 1 MiB source-data cap (AB#47238).

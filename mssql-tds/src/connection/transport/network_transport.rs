@@ -6011,6 +6011,40 @@ pub(crate) mod tests {
         assert!(connect_resolved(addresses, true).await.is_err());
     }
 
+    #[tokio::test]
+    async fn first_then_parallel_races_only_two_to_64_addresses() {
+        for (count, races) in [
+            (0, false),
+            (1, false),
+            (2, true),
+            (MAX_PARALLEL_IPS, true),
+            (MAX_PARALLEL_IPS + 1, false),
+        ] {
+            let addresses: Vec<_> = (0..count)
+                .map(|index| {
+                    SocketAddr::from(([192, 0, 2, 1], 1000 + u16::try_from(index).unwrap()))
+                })
+                .collect();
+            let mut expected = addresses.clone();
+            if races {
+                expected.insert(0, addresses[0]);
+            }
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&attempts);
+            let connect = move |address| {
+                recorded.lock().unwrap().push(address);
+                async { Err::<TcpStream, _>(std::io::Error::from(ErrorKind::ConnectionRefused)) }
+            };
+
+            let result =
+                connect_to_addresses_with("db.example.com", 1433, addresses, 500, true, connect)
+                    .await;
+
+            assert!(result.is_err(), "{count} addresses");
+            assert_eq!(*attempts.lock().unwrap(), expected, "{count} addresses");
+        }
+    }
+
     /// TNIR's first attempt is bounded by the connect timeout, like every TCP
     /// attempt, not by the login budget, so a first address that never answers
     /// gives way to the race long before the login would fail (parity-deviations
