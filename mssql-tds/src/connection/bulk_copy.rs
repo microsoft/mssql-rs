@@ -204,6 +204,10 @@ pub struct ColumnMapping {
 
 impl ColumnMapping {
     /// Create a mapping from source column name to destination column name.
+    ///
+    /// [`BulkCopy::write_to_server_zerocopy`] rejects name-based source
+    /// mappings, because [`BulkLoadRow`] rows have no column names; use
+    /// [`by_ordinal`](Self::by_ordinal) there.
     pub fn by_name(source: impl Into<String>, destination: impl Into<String>) -> Self {
         Self {
             source: ColumnMappingSource::Name(source.into()),
@@ -328,8 +332,8 @@ impl BulkCopyResult {
 ///     .batch_size(5000)
 ///     .timeout(Duration::from_secs(60))
 ///     .keep_identity(true)
-///     .add_column_mapping(ColumnMapping::by_name("SourceId", "Id"))
-///     .add_column_mapping(ColumnMapping::by_name("SourceName", "Name"));
+///     .add_column_mapping(ColumnMapping::by_ordinal(0, "Id"))
+///     .add_column_mapping(ColumnMapping::by_ordinal(1, "Name"));
 ///
 /// let rows = vec![/* values implementing BulkLoadRow */];
 /// let result = bulk_copy.write_to_server_zerocopy(rows).await?;
@@ -648,7 +652,7 @@ impl<'a> BulkCopy<'a> {
     /// use mssql_tds::connection::bulk_copy::ColumnMapping;
     ///
     /// let bulk_copy = bulk_copy
-    ///     .add_column_mapping(ColumnMapping::by_name("SourceId", "Id"))
+    ///     .add_column_mapping(ColumnMapping::by_ordinal(0, "Id"))
     ///     .add_column_mapping(ColumnMapping::by_ordinal(1, "Name"));
     /// ```
     pub fn add_column_mapping(mut self, mapping: ColumnMapping) -> Self {
