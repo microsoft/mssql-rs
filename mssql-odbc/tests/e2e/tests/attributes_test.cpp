@@ -2196,22 +2196,17 @@ ODBC_TEST_F(AttributesTest, TnirOffIsAcceptedAndOnIsUnsupported) {
 
     SQLHDBC dbc = SQL_NULL_HDBC;
     ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
-    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "TransparentNetworkIPResolution=Disabled;")))
-        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
-    ASSERT_TRUE(SQL_SUCCEEDED(SQLDisconnect(dbc)));
-    // The driver is now loaded; setters before the first connect are DM-cached.
+    // The DM can cache pre-connect setters even after SQLDisconnect.
+    // Exercise OFF through connect; direct exported-API tests pin ON's HYC00.
     EXPECT_TRUE(SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_TNIR, 0)));
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "MultiSubnetFailover=Yes;")))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
     SQLRETURN rc = SQL_ERROR;
     EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_TNIR, &rc));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
-
-    rc = SetVendorAttr(dbc, SQL_COPT_SS_TNIR, 1);
-    if (comparing_msodbcsql) {
-        EXPECT_TRUE(SQL_SUCCEEDED(rc));
-    } else {
-        EXPECT_EQ(SQL_ERROR, rc);
-        EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc, "HYC00");
-    }
+    EXPECT_EQ(1u, GetVendorAttr(dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(SQLDisconnect(dbc)));
     SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 
     ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));

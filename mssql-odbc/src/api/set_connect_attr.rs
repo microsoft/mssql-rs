@@ -1473,10 +1473,12 @@ mod tests {
 
     #[test]
     fn tnir_only_accepts_off_without_changing_msf() {
+        use crate::api::exports::SQLSetConnectAttrW;
+
         let h = TestHandles::with_env_dbc();
         assert_eq!(
             unsafe {
-                sql_set_connect_attr_w(
+                SQLSetConnectAttrW(
                     h.dbc,
                     SQL_COPT_SS_MULTISUBNET_FAILOVER,
                     1usize as SqlPointer,
@@ -1490,8 +1492,7 @@ mod tests {
             (1, Some(SQLSTATE_HYC00)),
             (2, Some(SQLSTATE_HY024)),
         ] {
-            let rc =
-                unsafe { sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_TNIR, raw as SqlPointer, 0) };
+            let rc = unsafe { SQLSetConnectAttrW(h.dbc, SQL_COPT_SS_TNIR, raw as SqlPointer, 0) };
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             let state = dbc.inner.lock().unwrap();
             assert_eq!(state.vendor_overrides.multi_subnet_failover, Some(1));

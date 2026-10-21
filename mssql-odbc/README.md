@@ -73,6 +73,8 @@ their existing paths when MSF is inherited. MSF-on connections reject hosts
 with more than 64 addresses rather than ignoring part of the address list.
 `TransparentNetworkIPResolution=Disabled` and `SQL_COPT_SS_TNIR=SQL_IS_OFF`
 are compatibility no-ops; enabling TNIR is unsupported (`HYC00`).
+Driver Managers can cache pre-connect attribute setters, deferring driver
+validation until connect; a successful cached set is not driver acceptance.
 **TNIR Disabled does not disable MSF.** See the
 [shared connection policy and migration guide](../mssql-tds/README.md#connection-policy-and-migration)
 for the full precedence and applicability rules.

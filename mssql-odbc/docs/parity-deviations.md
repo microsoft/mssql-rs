@@ -1179,9 +1179,13 @@ msodbcsql build is measured.
     with `HY024`, and reports 0 on a fresh DBC. This PR's debug DLL accepts 0,
     rejects 1 with `HYC00`, rejects 2 with `HY024`, and reports 0.
     The reference's initial getter is stored state, not proof that its
-    algorithm is disabled. `TnirOffIsAcceptedAndOnIsUnsupported` compares the
-    keyword and driver-loaded setter paths; its connected retail run remains
-    pending as described in entry 34.
+    algorithm is disabled. `TnirOffIsAcceptedAndOnIsUnsupported` compares
+    attribute OFF through connect and keyword ON at the connection boundary;
+    the exported-API unit test pins the attribute ON rejection. Build 184802's
+    Windows ARM leg demonstrated that the Windows Driver Manager also caches
+    pre-connect setters after `SQLDisconnect`, so a setter's success there
+    does not measure driver validation. Connected retail comparison remains
+    tracked as described in entry 34.
 
     This deliberate omission avoids maintaining TNIR's additional staged
     connection behavior after the senior review identified its support burden.
