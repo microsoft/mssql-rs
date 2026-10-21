@@ -48,6 +48,9 @@ Browser (SSRP). Those retain their existing transport/discovery paths.
 `tcp:host\instance,port` is eligible because discovery is unnecessary. Bare
 server names without instance discovery select TCP when MSF is on; explicitly
 select a non-TCP transport or disable MSF to retain the protocol waterfall.
+With certificate hostname validation enabled, connecting by IP requires a
+matching IP SAN or an explicit expected hostname (`host_name_in_cert` /
+ODBC `HostnameInCertificate`). MSF does not relax TLS validation.
 This does not implement database-mirroring failover.
 
 `TdsClient::multi_subnet_failover_policy()` reports the captured value, source,
