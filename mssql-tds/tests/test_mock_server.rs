@@ -129,6 +129,98 @@ mod mock_server_tests {
         Ok(())
     }
 
+    async fn connect_with_dns_fallback(
+        feature_ext_ack: bool,
+        multi_subnet_failover: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use mssql_tds::test_client_support::{dns_cache_fallback, set_dns_cache_entry};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        let host = format!("mock-{}.dns-cache.invalid", server_addr.port());
+        let addresses = if multi_subnet_failover {
+            vec![
+                SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), server_addr.port())),
+                server_addr,
+            ]
+        } else {
+            vec![server_addr]
+        };
+        set_dns_cache_entry(&host, addresses.clone(), true);
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.multi_subnet_failover = Some(multi_subnet_failover);
+        context.connect_timeout = 5;
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+        if feature_ext_ack {
+            // The mock acknowledges Data Classification, but not DNS caching.
+            context.request_data_classification_for_test(2)?;
+        }
+
+        let provider = TdsConnectionProvider {};
+        let datasource = format!("tcp:{host},{}", server_addr.port());
+        let client = provider
+            .create_client(context.clone(), &datasource, None)
+            .await?;
+        let policy = client.multi_subnet_failover_policy().unwrap();
+        assert_eq!(policy.enabled, multi_subnet_failover);
+        assert_eq!(
+            client
+                .secondary_client_context()
+                .unwrap()
+                .multi_subnet_failover_policy(),
+            Some(policy),
+        );
+        drop(client);
+
+        let cached = dns_cache_fallback(&host, server_addr.port()).await;
+        let retry = provider.create_client(context, &datasource, None).await;
+        if feature_ext_ack {
+            assert_eq!(cached.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            assert!(retry.is_err(), "the accepted verdict revoked the fallback");
+        } else {
+            assert_eq!(cached?, addresses);
+            drop(retry?);
+        }
+
+        set_dns_cache_entry(&host, Vec::new(), false);
+        shutdown_tx.send(()).expect("mock server is still running");
+        let server_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await?;
+        server_result??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_login_without_feature_ext_ack_preserves_dns_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        connect_with_dns_fallback(false, false).await
+    }
+
+    #[tokio::test]
+    async fn test_feature_ext_ack_without_dns_caching_revokes_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        connect_with_dns_fallback(true, false).await
+    }
+
+    #[tokio::test]
+    async fn test_multi_subnet_failover_uses_dns_fallback_after_an_unreachable_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        connect_with_dns_fallback(false, true).await
+    }
+
     /// Test executing "SELECT 1" against mock server
     #[tokio::test]
     async fn test_execute_select_one() -> Result<(), Box<dyn std::error::Error>> {

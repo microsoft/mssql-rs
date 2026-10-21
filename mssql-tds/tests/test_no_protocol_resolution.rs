@@ -538,7 +538,7 @@ mod no_protocol_resolution {
         let mut ctx = ClientContext::default();
         ctx.user_name = "sa".to_string();
         ctx.password = "pw".to_string();
-        ctx.multi_subnet_failover = true;
+        ctx.multi_subnet_failover = Some(true);
 
         let provider = TdsConnectionProvider {};
         let err = provider
@@ -561,7 +561,7 @@ mod no_protocol_resolution {
         let mut ctx = ClientContext::default();
         ctx.user_name = "sa".to_string();
         ctx.password = "pw".to_string();
-        ctx.multi_subnet_failover = true;
+        ctx.multi_subnet_failover = Some(true);
 
         let provider = TdsConnectionProvider {};
         // This should NOT produce a UsageError — the explicit port means no SSRP.

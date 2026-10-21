@@ -23,7 +23,7 @@
 //!
 //! ## Implementation Details
 //!
-//! The implementation uses Tokio's `select!` macro to race multiple connection futures
+//! The implementation uses a Tokio `JoinSet` to race multiple connection futures
 //! and returns as soon as one succeeds. Failed connections are logged but don't
 //! prevent other connections from succeeding.
 
@@ -35,6 +35,7 @@ use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
+use crate::connection::dns_cache::{self, Resolution};
 use crate::core::TdsResult;
 use crate::error::Error;
 
@@ -102,6 +103,7 @@ pub struct ParallelConnectResult {
 /// Returns an error if:
 /// - DNS resolution fails
 /// - No addresses were resolved
+/// - More than 64 addresses were resolved
 /// - All connection attempts failed
 /// - The overall timeout was exceeded
 ///
@@ -121,6 +123,18 @@ pub async fn parallel_connect(
     port: u16,
     config: &ParallelConnectConfig,
 ) -> TdsResult<ParallelConnectResult> {
+    parallel_connect_resolving(host, port, config)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// [`parallel_connect`], also returning what `host` resolved to, which the
+/// connection's login DNS caching verdict applies to.
+pub(crate) async fn parallel_connect_resolving(
+    host: &str,
+    port: u16,
+    config: &ParallelConnectConfig,
+) -> TdsResult<(ParallelConnectResult, Resolution)> {
     info!(
         "Starting parallel connection to {}:{} with timeout {}ms",
         host, port, config.timeout_ms
@@ -133,14 +147,14 @@ pub async fn parallel_connect(
     // Resolve DNS to get all IP addresses. `lookup_host` awaits the resolution
     // instead of blocking the calling thread (unlike `std::net::ToSocketAddrs`),
     // so a slow or stuck resolver stays subject to `deadline` instead of
-    // silently escaping it.
-    let addresses: Vec<SocketAddr> = match timeout(
+    // silently escaping it. A failed resolution falls back to the DNS cache.
+    let resolution = match timeout(
         deadline.saturating_duration_since(Instant::now()),
-        tokio::net::lookup_host((host, port)),
+        dns_cache::lookup_host(host, port),
     )
     .await
     {
-        Ok(Ok(resolved)) => resolved.take(MAX_PARALLEL_IPS).collect(),
+        Ok(Ok(resolution)) => resolution,
         Ok(Err(e)) => return Err(Error::from(e)),
         Err(_elapsed) => {
             warn!(
@@ -152,26 +166,14 @@ pub async fn parallel_connect(
             )));
         }
     };
-
-    if addresses.is_empty() {
-        return Err(Error::ConnectionError(format!(
-            "DNS resolution returned no addresses for {}:{}",
-            host, port
-        )));
-    }
+    validate_address_count(resolution.addresses().len())?;
+    let addresses = resolution.addresses();
 
     let total_addresses = addresses.len();
     info!(
         "Resolved {} addresses for {}:{}: {:?}",
         total_addresses, host, port, addresses
     );
-
-    if total_addresses > MAX_PARALLEL_IPS {
-        warn!(
-            "Resolved {} addresses, but only {} will be used",
-            total_addresses, MAX_PARALLEL_IPS
-        );
-    }
 
     // Create connection futures for all addresses
     let connect_futures: Vec<_> = addresses
@@ -213,12 +215,15 @@ pub async fn parallel_connect(
                 "Parallel connection succeeded to {} after {} failed attempts",
                 addr, failed_attempts
             );
-            Ok(ParallelConnectResult {
-                stream,
-                connected_address: addr,
-                total_addresses,
-                failed_attempts,
-            })
+            Ok((
+                ParallelConnectResult {
+                    stream,
+                    connected_address: addr,
+                    total_addresses,
+                    failed_attempts,
+                },
+                resolution,
+            ))
         }
         Ok(Err(last_error)) => {
             warn!(
@@ -267,7 +272,7 @@ pub async fn parallel_connect_to_addresses(
 
 /// [`parallel_connect_to_addresses`] with the per-address connect supplied by
 /// the caller, so tests can stand in for an address that never answers.
-pub(crate) async fn parallel_connect_with<C, F>(
+async fn parallel_connect_with<C, F>(
     addresses: Vec<SocketAddr>,
     timeout_ms: u64,
     connect: C,
@@ -276,28 +281,13 @@ where
     C: Fn(SocketAddr) -> F,
     F: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
 {
-    if addresses.is_empty() {
-        return Err(Error::ConnectionError(
-            "No addresses provided for parallel connection".to_string(),
-        ));
-    }
+    validate_address_count(addresses.len())?;
 
     let total_addresses = addresses.len();
     info!(
         "Starting parallel connection to {} addresses: {:?}",
         total_addresses, addresses
     );
-
-    if total_addresses > MAX_PARALLEL_IPS {
-        warn!(
-            "Provided {} addresses, but only {} will be used",
-            total_addresses, MAX_PARALLEL_IPS
-        );
-    }
-
-    // Take only up to MAX_PARALLEL_IPS addresses
-    let addresses: Vec<SocketAddr> = addresses.into_iter().take(MAX_PARALLEL_IPS).collect();
-    let total_addresses = addresses.len();
 
     // Create connection futures for all addresses
     let connect_futures: Vec<_> = addresses
@@ -361,12 +351,28 @@ where
     }
 }
 
+fn validate_address_count(count: usize) -> TdsResult<()> {
+    if count == 0 {
+        warn!("No addresses provided for parallel connection");
+        return Err(Error::ConnectionError(
+            "No addresses provided for parallel connection".to_string(),
+        ));
+    }
+    if count > MAX_PARALLEL_IPS {
+        warn!(
+            count,
+            maximum = MAX_PARALLEL_IPS,
+            "Too many addresses for MultiSubnetFailover"
+        );
+        return Err(Error::UsageError(format!(
+            "MultiSubnetFailover supports at most {MAX_PARALLEL_IPS} addresses; the host resolved to {count}. Disable MultiSubnetFailover to connect sequentially."
+        )));
+    }
+    Ok(())
+}
+
 /// Connects to a single address with TCP keep-alive settings.
-///
-/// On Windows, this function ensures a minimum wait time (MIN_PARALLEL_WAIT_TIME_MS)
-/// to increase the likelihood of getting useful error messages like WSAECONNREFUSED
-/// rather than generic timeout errors.
-pub(crate) async fn connect_with_keepalive(
+async fn connect_with_keepalive(
     addr: SocketAddr,
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
@@ -437,6 +443,54 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn parallel_address_limit_is_checked_before_any_attempt() {
+        for count in [0, 1, 2, 64, 65] {
+            let addresses: Vec<_> = (0..count)
+                .map(|i| SocketAddr::from(([192, 0, 2, 1], 1000 + u16::try_from(i).unwrap())))
+                .collect();
+            let attempted = std::sync::Arc::new(AtomicUsize::new(0));
+            let recorded = attempted.clone();
+            let result = parallel_connect_with(addresses, 1_000, move |_| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+                async { Err::<TcpStream, _>(std::io::ErrorKind::ConnectionRefused.into()) }
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                attempted.load(Ordering::SeqCst),
+                if (1..=64).contains(&count) { count } else { 0 }
+            );
+            if count == 65 {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::UsageError(_)));
+                assert!(!error.is_transient_connect_error());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_connect_does_not_wait_for_a_silent_first_address() {
+        let listener = net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let silent = SocketAddr::from(([192, 0, 2, 1], 1433));
+        let result = timeout(
+            Duration::from_secs(1),
+            parallel_connect_with(vec![silent, live], 5_000, move |address| async move {
+                if address == silent {
+                    std::future::pending().await
+                } else {
+                    TcpStream::connect(address).await
+                }
+            }),
+        )
+        .await
+        .expect("a silent first address must not delay the live one")
+        .unwrap();
+        assert_eq!(result.connected_address, live);
+        assert_eq!(result.total_addresses, 2);
+    }
 
     #[test]
     fn parallel_attempt_tasks_inherit_context_without_leaking_it() {

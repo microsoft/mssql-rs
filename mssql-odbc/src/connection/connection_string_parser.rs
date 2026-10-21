@@ -52,7 +52,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "network",
     "net",
     "mars_connection",
-    "failover_partner",
     "failoverpartnerspn",
     "autotranslate",
     "querylog_on",
@@ -139,6 +138,7 @@ enum ConnAttrKey {
     App,
     ApplicationIntent,
     MultiSubnetFailover,
+    FailoverPartner,
     TransparentNetworkIpResolution,
     ConnectRetryCount,
     ConnectRetryInterval,
@@ -210,6 +210,7 @@ pub(crate) struct ConnectionParams {
     pub(crate) application_name: Option<String>,
     pub(crate) application_intent: Option<String>,
     pub(crate) multi_subnet_failover: Option<bool>,
+    pub(crate) failover_partner: Option<String>,
     pub(crate) transparent_network_ip_resolution: Option<bool>,
     pub(crate) connect_retry_count: Option<u32>,
     pub(crate) connect_retry_interval: Option<u32>,
@@ -269,6 +270,9 @@ impl ConnectionParams {
                 "MultiSubnetFailover={}",
                 if multi_subnet_failover { "yes" } else { "no" }
             ));
+        }
+        if let Some(partner) = &self.failover_partner {
+            parts.push(format!("Failover_Partner={}", quote_odbc_value(partner)));
         }
         if let Some(tnir) = self.transparent_network_ip_resolution {
             parts.push(format!(
@@ -340,6 +344,7 @@ impl fmt::Debug for ConnectionParams {
             .field("application_name", &self.application_name)
             .field("application_intent", &self.application_intent)
             .field("multi_subnet_failover", &self.multi_subnet_failover)
+            .field("failover_partner", &self.failover_partner)
             .field(
                 "transparent_network_ip_resolution",
                 &self.transparent_network_ip_resolution,
@@ -401,6 +406,8 @@ const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
     ("app", ConnAttrKey::App),
     ("applicationintent", ConnAttrKey::ApplicationIntent),
     ("multisubnetfailover", ConnAttrKey::MultiSubnetFailover),
+    ("failover_partner", ConnAttrKey::FailoverPartner),
+    ("failoverpartner", ConnAttrKey::FailoverPartner),
     (
         "transparentnetworkipresolution",
         ConnAttrKey::TransparentNetworkIpResolution,
@@ -481,6 +488,7 @@ fn assign_value(
             validate_attr(lower, value, YES_NO)?;
             params.multi_subnet_failover = Some(is_yes(value));
         }
+        ConnAttrKey::FailoverPartner => params.failover_partner = Some(value.to_string()),
         ConnAttrKey::TransparentNetworkIpResolution => {
             validate_attr(lower, value, ENABLED_DISABLED)?;
             params.transparent_network_ip_resolution = Some(value.eq_ignore_ascii_case("enabled"));

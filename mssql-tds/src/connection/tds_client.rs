@@ -1384,6 +1384,16 @@ impl TdsClient {
         Some(context)
     }
 
+    /// Network policy captured before this connection's first transport attempt.
+    pub fn multi_subnet_failover_policy(
+        &self,
+    ) -> Option<super::multi_subnet_failover::MultiSubnetFailoverPolicy> {
+        self.recovery_context
+            .client_context
+            .as_deref()?
+            .multi_subnet_failover_policy()
+    }
+
     /// Returns the negotiated TDS packet size, in bytes.
     ///
     /// The packet size is fixed for the lifetime of the connection (the server

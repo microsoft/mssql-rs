@@ -396,6 +396,7 @@ mod redirection_tests {
     /// Outcome of logging in through a chain of redirecting gateways.
     struct RoutedLogin {
         result: Result<(), String>,
+        policy: Option<mssql_tds::connection::multi_subnet_failover::MultiSubnetFailoverPolicy>,
         /// LOGIN7s received by each gateway, then by the destination.
         logins: Vec<Vec<mssql_mock_tds::ConnectionInfo>>,
     }
@@ -433,10 +434,20 @@ mod redirection_tests {
             servers.push(start(gateway));
         }
 
+        let mut policy = None;
         let result = TdsConnectionProvider {}
             .create_client(context, &datasource(target_port), None)
             .await
-            .map(drop)
+            .map(|client| {
+                policy = client.multi_subnet_failover_policy();
+                assert_eq!(
+                    client
+                        .secondary_client_context()
+                        .unwrap()
+                        .multi_subnet_failover_policy(),
+                    policy,
+                );
+            })
             .map_err(|e| e.to_string());
         // Let the servers record connections the client has just closed.
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -449,7 +460,39 @@ mod redirection_tests {
             let _ = shutdown_tx.send(());
             let _ = handle.await;
         }
-        RoutedLogin { result, logins }
+        RoutedLogin {
+            result,
+            policy,
+            logins,
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_retains_the_captured_multi_subnet_failover_policy() {
+        use mssql_tds::connection::multi_subnet_failover::MultiSubnetFailoverSource;
+
+        for explicit in [None, Some(false), Some(true)] {
+            let mut context = create_test_context();
+            context.multi_subnet_failover = explicit;
+            let routed =
+                login_through_with(vec![plain(), enhanced("routed_db")], context, |port| {
+                    format!("tcp:127.0.0.1,{port}")
+                })
+                .await;
+            assert_eq!(routed.result, Ok(()));
+            let policy = routed.policy.unwrap();
+            assert_eq!(policy.enabled, explicit.unwrap_or(true));
+            assert_eq!(
+                policy.source,
+                if explicit.is_some() {
+                    MultiSubnetFailoverSource::Connection
+                } else {
+                    MultiSubnetFailoverSource::BuiltIn
+                },
+            );
+            assert_eq!(policy.inapplicable, None);
+            assert!(routed.logins.iter().all(|hop| hop.len() == 1));
+        }
     }
 
     fn enhanced(database: &'static str) -> Hop {
@@ -469,6 +512,43 @@ mod redirection_tests {
             "expected exactly one LOGIN7, got {logins:?}"
         );
         logins[0].received_database.as_deref()
+    }
+
+    #[tokio::test]
+    async fn test_routing_settles_dns_fallback_for_the_gateway() {
+        use mssql_tds::test_client_support::{dns_cache_fallback, set_dns_cache_entry};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        for (index, (hop, database, keep_fallback)) in [
+            (plain(), "master", true),
+            (enhanced("routed_db"), "routed_db", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let gateway = format!("routing-dns-{index}.invalid");
+            let mut gateway_address = None;
+            let routed = login_through_with(vec![hop], create_test_context(), |port| {
+                let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+                set_dns_cache_entry(&gateway, vec![address], true);
+                gateway_address = Some(address);
+                format!("tcp:{gateway},{port}")
+            })
+            .await;
+            assert_eq!(routed.result, Ok(()));
+            assert_eq!(only_database(&routed.logins[1]), Some(database));
+            let requested = &routed.logins[0][0].requested_feature_ids;
+            assert!(requested.contains(&0x0B) && requested.contains(&0x0F));
+
+            let address = gateway_address.unwrap();
+            let fallback = dns_cache_fallback(&gateway, address.port()).await;
+            if keep_fallback {
+                assert_eq!(fallback.unwrap(), vec![address]);
+            } else {
+                assert_eq!(fallback.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            }
+            set_dns_cache_entry(&gateway, Vec::new(), false);
+        }
     }
 
     /// Enhanced Routing (ENVCHANGE 21) redirects the login to the routed
@@ -570,6 +650,7 @@ mod redirection_tests {
 
     async fn failed_routed_login(
         hop: Hop,
+        multi_subnet_failover: Option<bool>,
         datasource: impl FnOnce(u16) -> String,
     ) -> (Error, usize) {
         // Reserve a port without listening so no other test can acquire it.
@@ -585,6 +666,7 @@ mod redirection_tests {
         let port = gateway.local_addr().port();
         let (shutdown, handle) = start(gateway);
         let mut context = create_test_context();
+        context.multi_subnet_failover = multi_subnet_failover;
         context.connect_timeout = 2;
         context.login_timeout = Some(10);
         context.connect_retry_count = 2;
@@ -604,20 +686,29 @@ mod redirection_tests {
 
     #[tokio::test]
     async fn test_failed_tcp_route_does_not_retry_the_gateway() {
-        for hop in [plain(), enhanced("routed_db")] {
-            let (error, logins) =
-                failed_routed_login(hop, |port| format!("tcp:127.0.0.1,{port}")).await;
-            assert_eq!(
-                logins, 1,
-                "a routed failure must not restart the gateway login"
-            );
-            assert!(
-                matches!(error, Error::Io(ref error) if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
-                )),
-                "must return the routed endpoint's error: {error:?}"
-            );
+        for multi_subnet_failover in [Some(false), Some(true), None] {
+            for hop in [plain(), enhanced("routed_db")] {
+                let (error, logins) = failed_routed_login(hop, multi_subnet_failover, |port| {
+                    format!("tcp:127.0.0.1,{port}")
+                })
+                .await;
+                assert_eq!(
+                    logins, 1,
+                    "a routed failure must not restart the gateway login"
+                );
+                let expected_error = if multi_subnet_failover == Some(false) {
+                    matches!(error, Error::Io(ref error) if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+                    ))
+                } else {
+                    matches!(error, Error::ConnectionError(_) | Error::TimeoutError(_))
+                };
+                assert!(
+                    expected_error,
+                    "must return the routed endpoint's error: {error:?}"
+                );
+            }
         }
     }
 
@@ -712,7 +803,7 @@ mod redirection_tests {
         let instance = format!("FAILEDROUTE{}", std::process::id());
         for hop in [plain(), enhanced("routed_db")] {
             let mut relay = None;
-            let (error, logins) = failed_routed_login(hop, |port| {
+            let (error, logins) = failed_routed_login(hop, None, |port| {
                 relay = Some(relay_shared_memory(&instance, port));
                 format!(r".\{instance}")
             })

@@ -160,8 +160,9 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `ServerSPN` | `ClientContext::server_spn` | verbatim |
 | `APP` | `ClientContext::application_name` | verbatim |
 | `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |
-| `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No` |
-| `TransparentNetworkIPResolution` | `ClientContext::transparent_network_ip_resolution` | `Enabled` / `Disabled` |
+| `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No`; omission inherits startup policy |
+| `TransparentNetworkIPResolution` | compatibility validation only | `Disabled` is a no-op; `Enabled` fails with `HYC00` |
+| `Failover_Partner` / `FailoverPartner` | `ClientContext::failover_partner` | suppresses inherited MSF; does not implement mirroring |
 | `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault`; unknown → `IPv4First` |
 | `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer 0–255 (rejected if out of range) |
 | `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer 1–60 seconds (rejected if out of range) |
@@ -181,8 +182,9 @@ Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
   `MultiSubnetFailover`): `Yes` | `No`.
 - **`Encrypt`**: `Yes` | `Mandatory` | `No` | `Optional` | `Strict`.
 - **`ApplicationIntent`**: `ReadOnly` | `ReadWrite`.
-- **`TransparentNetworkIPResolution`**: `Enabled` | `Disabled`, msodbcsql's only
-  Enabled/Disabled keyword.
+- **`TransparentNetworkIPResolution`**: `Enabled` | `Disabled` at parse time.
+  Connect rejects `Enabled` with `HYC00`; `Disabled` is a no-op independent of
+  MSF. Other spellings are `HY024`, not silently ignored.
 - **`IpAddressPreference`**: `IPv4First` | `IPv6First` | `UsePlatformDefault`. Unknown
   values are **not** rejected — they are accepted and fall back to `IPv4First` when
   mapped onto the `ClientContext`, matching msodbcsql.

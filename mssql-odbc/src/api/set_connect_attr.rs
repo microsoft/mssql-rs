@@ -302,8 +302,7 @@ unsafe fn sql_set_connect_attr_w_impl(
         // The attribute forms of MultiSubnetFailover and
         // TransparentNetworkIPResolution. msodbcsql handles both in one arm
         // (`sqlcmisc.cpp`): `HY011` once connected, `HY024` above `SQL_IS_ON`.
-        // Like the arm above they override the keyword (`ResolveFromPreconnAttrs`,
-        // `connecthelper.hpp`).
+        // MSF overrides its keyword; TNIR off is only a compatibility no-op.
         SQL_COPT_SS_MULTISUBNET_FAILOVER | SQL_COPT_SS_TNIR => {
             if state.connection_state != ConnectionState::Disconnected {
                 error!(
@@ -324,12 +323,16 @@ unsafe fn sql_set_connect_attr_w_impl(
                 post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
                 return SQL_ERROR;
             };
-            let overrides = &mut state.vendor_overrides;
-            if attribute == SQL_COPT_SS_MULTISUBNET_FAILOVER {
-                overrides.multi_subnet_failover = Some(value);
-            } else {
-                overrides.transparent_network_ip_resolution = Some(value);
+            if attribute == SQL_COPT_SS_TNIR {
+                if value != 0 {
+                    error!("SQLSetConnectAttrW: TNIR is not supported; use MultiSubnetFailover");
+                    post_diag(&mut state, ERR_TNIR_NOT_SUPPORTED);
+                    return SQL_ERROR;
+                }
+                return SQL_SUCCESS;
             }
+            let overrides = &mut state.vendor_overrides;
+            overrides.multi_subnet_failover = Some(value);
             debug!(
                 attribute,
                 value, "SQLSetConnectAttrW: vendor override stored"
@@ -1443,32 +1446,60 @@ mod tests {
         }
     }
 
-    /// msodbcsql rejects anything above `SQL_IS_ON` for these two with `HY024`
+    /// msodbcsql rejects anything above `SQL_IS_ON` for MSF with `HY024`
     /// (`sqlcmisc.cpp`), unlike the folding attributes above.
     #[test]
-    fn multi_subnet_failover_and_tnir_accept_only_on_and_off() {
-        for attribute in [SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_TNIR] {
-            for (raw, expected) in [(0usize, Some(0u32)), (1, Some(1)), (2, None), (7, None)] {
-                let h = TestHandles::with_env_dbc();
-                let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, raw as SqlPointer, 0) };
-                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-                let state = dbc.inner.lock().unwrap();
-                let stored = if attribute == SQL_COPT_SS_MULTISUBNET_FAILOVER {
-                    state.vendor_overrides.multi_subnet_failover
-                } else {
-                    state.vendor_overrides.transparent_network_ip_resolution
-                };
-                assert_eq!(stored, expected, "attribute {attribute} value {raw}");
-                if expected.is_some() {
-                    assert_eq!(ret, SQL_SUCCESS, "attribute {attribute} value {raw}");
-                } else {
-                    assert_eq!(ret, SQL_ERROR, "attribute {attribute} value {raw}");
-                    assert_eq!(
-                        state.diag_records()[0].sql_state,
-                        ERR_INVALID_ATTRIBUTE_VALUE.state,
-                        "attribute {attribute} value {raw}"
-                    );
-                }
+    fn multi_subnet_failover_accepts_only_on_and_off() {
+        let attribute = SQL_COPT_SS_MULTISUBNET_FAILOVER;
+        for (raw, expected) in [(0usize, Some(0u32)), (1, Some(1)), (2, None), (7, None)] {
+            let h = TestHandles::with_env_dbc();
+            let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, raw as SqlPointer, 0) };
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            let stored = state.vendor_overrides.multi_subnet_failover;
+            assert_eq!(stored, expected, "attribute {attribute} value {raw}");
+            if expected.is_some() {
+                assert_eq!(ret, SQL_SUCCESS, "attribute {attribute} value {raw}");
+            } else {
+                assert_eq!(ret, SQL_ERROR, "attribute {attribute} value {raw}");
+                assert_eq!(
+                    state.diag_records()[0].sql_state,
+                    ERR_INVALID_ATTRIBUTE_VALUE.state,
+                    "attribute {attribute} value {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tnir_only_accepts_off_without_changing_msf() {
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(
+            unsafe {
+                sql_set_connect_attr_w(
+                    h.dbc,
+                    SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                    1usize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        for (raw, expected) in [
+            (0usize, None),
+            (1, Some(SQLSTATE_HYC00)),
+            (2, Some(SQLSTATE_HY024)),
+        ] {
+            let rc =
+                unsafe { sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_TNIR, raw as SqlPointer, 0) };
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.vendor_overrides.multi_subnet_failover, Some(1));
+            if let Some(state_code) = expected {
+                assert_eq!(rc, SQL_ERROR);
+                assert_eq!(state.diag_records()[0].sql_state, state_code);
+            } else {
+                assert_eq!(rc, SQL_SUCCESS);
             }
         }
     }

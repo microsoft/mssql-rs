@@ -246,13 +246,9 @@ fn sql_get_connect_attr_w_safe(
         // from the attribute or the keyword -- measured for Encrypt: with no
         // attribute set, `Encrypt=no` reads back 0.
         //
-        // Before connect there is nothing to resolve, so an unset attribute falls
-        // back to the driver defaults (encryption on, no trust, no integrated
-        // auth, no multi-subnet failover, TNIR on). That pre-connect case is
-        // inferred from the defaults, not measured, unlike the post-connect
-        // behaviour above. msodbcsql reports TNIR off on a fresh handle although
-        // it connects with TNIR on; this driver reports the setting in use
-        // (parity-deviations entry 33).
+        // MSF reports the captured connection policy when connected and the
+        // explicit override or frozen startup default otherwise. TNIR is absent:
+        // its getter always reports off, and its setter accepts only off.
         SQL_COPT_SS_ENCRYPT
         | SQL_COPT_SS_TRUST_SERVER_CERTIFICATE
         | SQL_COPT_SS_INTEGRATED_SECURITY
@@ -274,8 +270,17 @@ fn sql_get_connect_attr_w_safe(
                 SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => {
                     settings.trust_server_certificate.unwrap_or(0)
                 }
-                SQL_COPT_SS_MULTISUBNET_FAILOVER => settings.multi_subnet_failover.unwrap_or(0),
-                SQL_COPT_SS_TNIR => settings.transparent_network_ip_resolution.unwrap_or(1),
+                SQL_COPT_SS_MULTISUBNET_FAILOVER => match settings.multi_subnet_failover {
+                    Some(value) => value,
+                    None => match mssql_tds::connection::multi_subnet_failover::default_multi_subnet_failover() {
+                        Ok(policy) => u32::from(policy.enabled),
+                        Err(error) => {
+                            post_tds_error(&mut state, &error, SQLSTATE_HY000);
+                            return SQL_ERROR;
+                        }
+                    },
+                },
+                SQL_COPT_SS_TNIR => 0,
                 _ => settings.integrated_security.unwrap_or(0),
             };
             unsafe { write_u32_attr(value_ptr, string_length_ptr, value) };
@@ -925,14 +930,13 @@ mod tests {
     #[test]
     fn vendor_attributes_report_driver_defaults_before_connect() {
         // Nothing has resolved yet, so these come from the driver defaults:
-        // encryption on, no trust, no integrated auth, no multi-subnet
-        // failover, TNIR on.
+        // Encryption and the built-in MSF default are on; TNIR is always off.
         let h = TestHandles::with_env_dbc();
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), SQL_EN_ON as u32);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE), 0);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_INTEGRATED_SECURITY), 0);
-        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER), 0);
-        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 1);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER), 1);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 0);
     }
 
     #[test]
@@ -946,7 +950,6 @@ mod tests {
                 trust_server_certificate: Some(1),
                 integrated_security: Some(1),
                 multi_subnet_failover: Some(1),
-                transparent_network_ip_resolution: Some(0),
             });
             state.connection_state = ConnectionState::Connected;
         }
@@ -960,7 +963,7 @@ mod tests {
             SQL_EN_ON as u32,
             "a disconnected reusable handle reports its explicit override or default"
         );
-        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 1);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 0);
     }
 
     #[test]

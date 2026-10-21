@@ -8,29 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
-- `mssql-tds`: Transparent Network IP Resolution (TNIR). When a server name
-  resolves to 2 to 64 addresses, the TCP connect tries the first address alone
-  and, if it fails, races every address, following msodbcsql.
-  `ClientContext::transparent_network_ip_resolution` controls it and is on by
-  default; MultiSubnetFailover takes precedence, and a failover partner turns
-  it off. Like every TCP attempt, each step is bounded by `connect_timeout`
-  within the login deadline, where msodbcsql gives the first attempt the whole
-  remaining login time; see parity deviation 34 (AB#49293).
-
-- `mssql-odbc`: the `TransparentNetworkIPResolution` keyword
-  (`Enabled`/`Disabled`) and the `SQL_COPT_SS_TNIR` and
-  `SQL_COPT_SS_MULTISUBNET_FAILOVER` connection attributes. The attributes
-  outrank their keywords, are set before connecting (`HY011` after, `HY024`
-  above `SQL_IS_ON`), and read back the effective setting. Unlike msodbcsql,
-  `SQL_COPT_SS_TNIR` set to `SQL_IS_OFF` turns TNIR off, and the default reads
-  back as on rather than off on a fresh handle; see parity deviation 33
+- Shared MultiSubnetFailover (MSF) startup configuration: explicit connection
+  setting > application default > `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT`
+  (`true`/`false`) > built-in on. Rust, native Python, and Node.js expose
+  startup setters; the CLI accepts `--multi-subnet-failover true|false`.
+  Defaults freeze on first use; late setters fail. Connection policy and its
+  source are traced and retained for recovery and secondary connections
   (AB#49293).
 
-- `mssql-py-core`: synchronous and asynchronous connections accept
-  `transparent_network_ip_resolution` in their native context dictionaries.
-  Python booleans and case-insensitive `Enabled`/`Disabled` strings control
-  TNIR; omitting the key preserves the enabled default. Invalid values are
-  rejected instead of ignored (AB#49293).
+- `mssql-odbc`: `SQL_COPT_SS_MULTISUBNET_FAILOVER` accepts off/on before
+  connecting, overrides the matching keyword, and reports the connection's
+  effective policy. Out-of-range values are `HY024`; changes while connected
+  are `HY011` (AB#49293).
 
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing
@@ -82,6 +71,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   columns, allowing Polars DataFrames to load without first converting the
   DataFrame to a PyArrow table.
 
+- `mssql-tds`: DNS caching. LOGIN7 always advertises feature extension `0x0B`,
+  as msodbcsql does. When a server acknowledges it, the addresses that
+  connection resolved are kept in a process-wide cache and used only if a
+  later resolution of that host fails, so connections survive a DNS outage.
+  Verdicts take effect only after LOGINACK and a successful terminal DONE.
+  A FEATUREEXTACK without a positive DNS acknowledgement removes the host;
+  a rejected or incomplete response, or one with no FEATUREEXTACK at all,
+  leaves the cache unchanged (AB#49294).
+
 - `mssql-tds`: Enhanced Routing. LOGIN7 always advertises feature extension
   `0x0F`, as msodbcsql does, and the client follows ENVCHANGE type 21 to the
   routed server and logs in to the routed database. A type 21 route without
@@ -92,14 +90,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
-- `mssql-tds`: a TCP connect to a name with 2 to 64 addresses now uses TNIR by
-  default, so once the first address fails the rest are raced rather than tried
-  one at a time. Set `ClientContext::transparent_network_ip_resolution` to
-  `false` for the previous sequence (AB#49293).
+- Eligible TCP connections now default to immediate parallel MSF attempts,
+  without TNIR's first-address phase. Explicit non-TCP transports, failover
+  partners, and named instances requiring SSRP suppress an inherited on
+  default; explicitly enabling incompatible MSF is an error. More than 64
+  resolved addresses is an error with MSF on, not a truncated race; MSF off
+  walks the full list sequentially. See parity decisions 34 and 35 (AB#49293).
 
-- `mssql-odbc`: `TransparentNetworkIPResolution` is no longer ignored. A value
-  other than `Enabled` or `Disabled` now fails the connection, as in msodbcsql
-  (AB#49293).
+- Rust API migration: `ClientContext::multi_subnet_failover` is now
+  `Option<bool>`: use `None` to inherit, or `Some(false)` to opt out.
+  Python dictionary and JS object options preserve omission and explicit false.
+
+- TNIR is deliberately unsupported. ODBC
+  `TransparentNetworkIPResolution=Disabled` / `SQL_COPT_SS_TNIR=OFF` and native
+  Python `False` / `"Disabled"` are compatibility no-ops, **not MSF opt-outs**.
+  Enabling TNIR returns `HYC00` in ODBC or an exception in native Python;
+  malformed values are rejected. Use `MultiSubnetFailover=No` or the equivalent
+  native option to select sequential connections (AB#49293).
 
 - `mssql-tds`: `Error::Redirection` has a new `database` field, set when the
   server routes the connection with Enhanced Routing. Routing ENVCHANGEs are
@@ -109,7 +116,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   protocol error instead of following a route, matching msodbcsql.
   Both routing types now validate the token and routing-data lengths, empty
   old value, TCP protocol, non-zero port, and bounded server name before
-  continuing to the next token.
+  continuing to the next token. A malformed or truncated response after the
+  routing token fails the login instead of being skipped (AB#49294).
 
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,
@@ -182,8 +190,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
-- `mssql-tds`: a parallel TCP connect (MultiSubnetFailover, and TNIR once the
-  first address fails) now aborts its remaining attempts when it is cancelled
+- `mssql-tds`: a parallel TCP connect now aborts its remaining attempts when it is cancelled
   or the login deadline expires. Before, those attempts kept their sockets
   open until the OS connect timeout (AB#49293).
 

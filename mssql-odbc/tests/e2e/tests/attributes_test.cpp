@@ -2138,25 +2138,27 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
 }
 
 // -------------------------------------------------------------------
-// Variation 63 - MultiSubnetFailover and TNIR read back the setting the
-// connection was made with: MultiSubnetFailover off by default, the
-// TransparentNetworkIPResolution keyword when it is the only source, and the
-// attribute over the keyword in either direction. Both drivers report a TNIR
-// attribute set off as off, though msodbcsql still connects with TNIR on
-// (parity-deviations entry 33); a single-address server cannot show that.
-// The default TNIR report differs and has its own test (variation 64).
+// Variation 63 - explicit MSF values and attribute precedence agree.
+// The inherited default differs (parity-deviations entry 34). TNIR Disabled
+// is not an MSF opt-out in either driver.
 // -------------------------------------------------------------------
-TEST_F(AttributesTest, MultiSubnetFailoverAndTnirReportTheEffectiveSetting) {
+ODBC_TEST_F(AttributesTest, MultiSubnetFailoverReportsTheEffectiveSetting) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
     constexpr SQLUINTEGER kUnset = 0xFFFFFFFFu;
     struct Case {
         const char* keyword;
         SQLUINTEGER attr;
-        SQLUINTEGER expected_tnir;
+        SQLUINTEGER expected_msf;
     };
     const Case cases[] = {
-        {"TransparentNetworkIPResolution=Disabled;", kUnset, 0},
-        {"TransparentNetworkIPResolution=Enabled;", 0, 0},
-        {"TransparentNetworkIPResolution=Disabled;", 1, 1},
+        {"", kUnset, comparing_msodbcsql ? 0u : 1u},
+        {"MultiSubnetFailover=No;", kUnset, 0},
+        {"MultiSubnetFailover=Yes;", kUnset, 1},
+        {"MultiSubnetFailover=Yes;", 0, 0},
+        {"MultiSubnetFailover=No;", 1, 1},
+        {"TransparentNetworkIPResolution=Disabled;", kUnset,
+         comparing_msodbcsql ? 0u : 1u},
     };
 
     for (const Case& c : cases) {
@@ -2168,15 +2170,14 @@ TEST_F(AttributesTest, MultiSubnetFailoverAndTnirReportTheEffectiveSetting) {
         ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
         if (c.attr != kUnset) {
             EXPECT_TRUE(
-                SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_TNIR, c.attr)));
+                SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                                           c.attr)));
         }
         ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, c.keyword)))
             << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
 
         SQLRETURN rc = SQL_ERROR;
-        EXPECT_EQ(c.expected_tnir, GetVendorAttr(dbc, SQL_COPT_SS_TNIR, &rc));
-        EXPECT_TRUE(SQL_SUCCEEDED(rc));
-        EXPECT_EQ(0u,
+        EXPECT_EQ(c.expected_msf,
                   GetVendorAttr(dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER, &rc));
         EXPECT_TRUE(SQL_SUCCEEDED(rc));
 
@@ -2186,27 +2187,43 @@ TEST_F(AttributesTest, MultiSubnetFailoverAndTnirReportTheEffectiveSetting) {
 }
 
 // -------------------------------------------------------------------
-// Variation 64 - with neither the keyword nor the attribute, both drivers
-// connect with TNIR on, but on a fresh handle msodbcsql reports SQL_IS_OFF:
-// its stored option is seeded on only by the reset SQLDisconnect runs. This
-// driver reports the setting in use. Pins parity-deviations entry 33, so each
-// leg asserts its own measured value.
+// Variation 64 - TNIR is deliberately omitted (parity-deviations entry 35).
+// OFF is accepted for compatibility; ON is HYC00 rather than silently ignored.
 // -------------------------------------------------------------------
-TEST_F(AttributesTest, TnirIsReportedOnByDefault) {
+ODBC_TEST_F(AttributesTest, TnirOffIsAcceptedAndOnIsUnsupported) {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
 
     SQLHDBC dbc = SQL_NULL_HDBC;
     ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
-    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "")))
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "TransparentNetworkIPResolution=Disabled;")))
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
-
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLDisconnect(dbc)));
+    // The driver is now loaded; setters before the first connect are DM-cached.
+    EXPECT_TRUE(SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_TNIR, 0)));
     SQLRETURN rc = SQL_ERROR;
-    EXPECT_EQ(comparing_msodbcsql ? 0u : 1u,
-              GetVendorAttr(dbc, SQL_COPT_SS_TNIR, &rc));
+    EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_TNIR, &rc));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
 
-    SQLDisconnect(dbc);
+    rc = SetVendorAttr(dbc, SQL_COPT_SS_TNIR, 1);
+    if (comparing_msodbcsql) {
+        EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    } else {
+        EXPECT_EQ(SQL_ERROR, rc);
+        EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc, "HYC00");
+    }
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+    rc = ConnectWith(dbc, "TransparentNetworkIPResolution=Enabled;");
+    if (comparing_msodbcsql) {
+        EXPECT_TRUE(SQL_SUCCEEDED(rc))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+        SQLDisconnect(dbc);
+    } else {
+        EXPECT_EQ(SQL_ERROR, rc);
+        EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc, "HYC00");
+    }
     SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 }
 

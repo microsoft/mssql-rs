@@ -1070,75 +1070,123 @@ msodbcsql build is measured.
     **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
     Tracked in AB#48044. Human parity sign-off has not been recorded.
 
-33. **`SQL_COPT_SS_TNIR` means what it reports: `SQL_IS_OFF` turns Transparent
-    Network IP Resolution off, and the default reads `SQL_IS_ON`.** MS Learn
-    documents `SQL_IS_OFF` as the attribute form of
-    `TransparentNetworkIPResolution=Disabled`, and in both drivers an attribute
-    set before connecting outranks the keyword. msodbcsql's
-    `ResolveFromPreconnAttrs` (`connecthelper.hpp`, the `ATTR_VALUE_TYPE_ON_OFF`
-    branch for an explicitly set attribute) writes it into the keyword slot as
-    `Disabled` but marks the slot defaulted (`fDefault = !isOn`), and
-    `sqlcconn.cpp` turns a defaulted slot into `fTnir = 1`. Setting the
-    attribute off therefore leaves TNIR on, and also cancels a
-    `TransparentNetworkIPResolution=Disabled` in the same connection string,
-    while `SQLGetConnectAttr` reports `SQL_IS_OFF`. This driver connects with
-    TNIR off and reports the same value. The connects differ when the server
-    name resolves to 2 to 64 addresses and the first refuses the connection:
-    msodbcsql then races every address, this driver tries the rest in order.
-    Matching would keep an attribute value that does nothing and silently
-    overrides the keyword the application also set.
-    `SQL_COPT_SS_MULTISUBNET_FAILOVER` takes the same path, but its default is
-    off, so `SQL_IS_OFF` disables it in both drivers.
-    The default is reported differently as well. With neither the keyword nor
-    the attribute, both drivers connect with TNIR on, but msodbcsql's stored
-    option starts at zero and only `ResetOptions` (`sqlcconn.cpp`, run by
-    `SQLDisconnect` and by a failed connect) seeds it with `SQL_IS_ON`, so a
-    fresh handle reports `SQL_IS_OFF`. This driver reports `SQL_IS_ON`, the
-    setting in use and the documented default, before and after connecting.
-    Measured by the `--compare-with-msodbcsql` legs on Windows and Linux (ADO
-    build 183601, 2026-10-16) against retail msodbcsql 18.6.2.1 /
-    `SQL_DRIVER_VER` 18.06.0002, the version pinned by `msodbcsqlVersion` in
-    `.pipeline/validation-pipeline.yml`; the harness does not read
-    `SQL_DRIVER_VER` back per leg. A fresh handle connected with neither
-    reports 0, and the keyword or an attribute set before connecting reads
-    back as given: `TnirIsReportedOnByDefault` asserts each driver's value,
-    and `MultiSubnetFailoverAndTnirReportTheEffectiveSetting`
-    (`attributes_test.cpp`) pins the values both report. **Evidence limit:**
-    the connect sequence and the reset on a disconnected handle are a source
-    reading only. Connecting with msodbcsql 18 and `SQL_COPT_SS_TNIR` set to
-    `SQL_IS_OFF` through a name whose first address refuses, whose second never
-    answers, and whose third is live would close the first: the third answers
-    at once only if TNIR is still on. Tracked in AB#49293. Human parity sign-off
-    has not been recorded.
+33. **DNS fallback is published only by a completed, accepted login.**
+    Source comparison: SNI's `GetCachedAddrInfo`
+    (`Sql/Common/DK/sni/src/dns_cache.cpp`) adds every successful resolution
+    before login and consults that cache when `GetAddressInfo` fails.
+    `BATCHCTX::ProcessFeatureExtAck`
+    (`Sql/Ntdbms/sqlncli/tds/Parse.cpp`, `FEACK_DNSCACHE` and `_EXIT`) passes its
+    local `useDNScache` verdict to `SNISetInfo`; the
+    `SNI_QUERY_CONN_DNSCACHE` arm in `Sql/Common/DK/sni/src/sni.cpp` deletes the
+    host on a false verdict. A DNS allow parsed before another malformed
+    feature remains true at that exit; no FEATUREEXTACK invokes no setter.
 
-34. **A Transparent Network IP Resolution connect moves past a silent first
-    address when the per-attempt connect timeout expires, not the login
-    timeout.** msodbcsql's login loop passes the remaining login timeout to
-    every connect outside database mirroring and MultiSubnetFailover
-    (`netconn.cpp`, the `GetConnection` call: "we always pass the remaining
-    login timeout value"), and with TNIR that becomes SNI's timeout for its
-    first attempt, which tries only the first resolved address (`tcp.cpp`,
-    `SequentialMode`). SNI's comment describes a 500 ms first attempt with the
-    full timeout passed separately as `totalTimeout`, but msodbcsql never sets
-    `totalTimeout`. A first address that never answers therefore keeps the
-    connect until the operating system abandons it, and the login fails if its
-    timeout ends first. This driver bounds every TCP connect attempt, TNIR's
-    first attempt and the race after it included, by mssql-tds's
-    `connect_timeout`, which mssql-odbc leaves at 15 seconds, all within the
-    `SQL_ATTR_LOGIN_TIMEOUT` deadline. At the default login timeout of 15
-    seconds, or any shorter one, the deadline ends first and the drivers behave
-    the same. With a longer login timeout this driver races every address after
-    15 seconds and can connect through a later one where msodbcsql is still
-    waiting on the first or has failed. The same bound already covers the
-    sequential walk and the MultiSubnetFailover race, so that one address that
-    drops packets cannot hold a long login; interactive sign-in raises the
-    default login timeout to 330 seconds (`interactive.rs`), and exempting
-    TNIR's first attempt would reopen that wait.
-    `first_then_parallel_escalates_after_the_connect_timeout_not_the_login_budget`
-    (`network_transport.rs`) pins the split with a first address that never
-    answers. **Evidence limit:** a source reading only. Connecting msodbcsql 18
-    with `SQL_ATTR_LOGIN_TIMEOUT` set to 30 through a name whose first address
-    drops the connection request and whose second is live would close it:
-    msodbcsql should connect only once the operating system abandons the first
-    address, or fail at 30 seconds, where this driver connects after 15.
-    Tracked in AB#49293. Human parity sign-off has not been recorded.
+    This driver's shared `mssql-tds` path instead retains each resolution on
+    its connection, publishing it only after LOGINACK, a successful terminal
+    DONE, and a positive DNS acknowledgement in the last FEATUREEXTACK.
+    A completed accepted response with a negative or missing DNS
+    acknowledgement removes the host. A malformed FEATUREEXTACK also
+    revokes it after that accepted response is drained, rather than keeping
+    a partial allow as SNI's source does. Rejected, incomplete, and
+    authentication-continuation responses cannot publish or remove an entry.
+    **No FEATUREEXTACK leaves the cache unchanged**, including a routing
+    response from an Azure gateway; it is not treated as a negative verdict.
+
+    The intent is to share only server-allowed addresses and keep a transient
+    rejected login from destroying the fallback needed by its next retry.
+    Consequently, a resolution followed by a failed or unacknowledged first
+    login cannot prime fallback as SNI's eager path can. Concurrent logins
+    publish their own addresses in completed-verdict order, rather than
+    keeping the most recent DNS lookup. The per-connection candidate follows
+    SqlClient's `pendingSQLDNSObject` model, not SNI's eager insertion.
+    Deterministic replay tests cover rejection after FEATUREEXTACK,
+    continuations, truncation, malformed acknowledgements, and routing with
+    no FEATUREEXTACK. Mock-server tests exercise the public connect path,
+    retained fallback, explicit revocation, and MultiSubnetFailover with an
+    unreachable first address.
+
+    **Evidence limit:** these msodbcsql comparisons are source readings, not
+    a retail-driver measurement. A controlled DNS-outage comparison against
+    a named retail build, with `SQL_DRIVER_VER` recorded, remains necessary;
+    Azure SQL Proxy/Redirect and session-recovery outage tests have not been
+    run. No human parity sign-off has been recorded. Tracked in AB#49294.
+
+34. **Eligible TCP connections default to MultiSubnetFailover (MSF) on.**
+    msodbcsql's login construction in `ConnectIt`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp`, `MultiSubnetFailover` branch)
+    defaults `conninfo.fMultiSubnetFailover` to zero. Its reset path also seeds
+    `SQL_COPT_SS_MULTISUBNET_FAILOVER` off. This driver instead resolves
+    explicit connection > application startup default > deployment environment
+    > built-in true. The ODBC attribute overrides the keyword; explicit off
+    remains off. Startup defaults freeze before connection creation and are
+    retained by recovery and secondary contexts. ODBC applications configure
+    the default with `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true|false` before
+    first use; native Rust, Python, and JS also expose a startup setter.
+    Separately loaded modules do not share that setter's state.
+
+    Inherited on is suppressed for explicit non-TCP transports, DAC, a
+    failover partner, and instances needing SSRP; explicitly requesting
+    incompatible MSF is an error. Bare server names without discovery select
+    TCP when enabled. MSF off restores the protocol waterfall and full
+    sequential address walk. More than 64 addresses fails before opening
+    sockets, not by racing a truncated list. The native reference's
+    `Tcp::ParallelOpen` -> `SocketOpenParallel` ->
+    `ParallelConnectWaitSet::Initialize` (`Sql/Common/DK/sni/src/tcp.cpp`,
+    `dwAddresses > 64`) also reports `SNIE_47`; that comparison is source evidence,
+    not a retail multi-address measurement.
+
+    **Measurement:** Windows x64 retail 18.7.1.1
+    (`SQL_DRIVER_VER=18.07.0001`), 2026-10-21, direct exported APIs:
+    a new DBC reports MSF 0; setters 0/1 succeed and 2 returns `HY024`.
+    This PR's debug DLL reports MSF 1, accepts 0/1, and returns `HY024` for 2.
+    Both report a four-byte numeric length. These are disconnected-handle
+    measurements: the Driver Manager caches pre-connect setters and does not
+    exercise the driver's validation on a never-connected DBC. A local
+    Driver Manager login to the mock did not complete, so connected keyword
+    precedence and network behavior are not claimed as retail measurements.
+    `MultiSubnetFailoverReportsTheEffectiveSetting` pins each driver's
+    expected connected values in the e2e comparison suite; running that suite
+    against the CI-pinned retail build and SQL Server closes this evidence gap.
+
+    The intent is one immediate parallel strategy rather than TNIR's staged
+    behavior, aligned with the planned next-major Microsoft.Data.SqlClient
+    direction, **not a claim about a shipped .NET default**. Existing SqlClient
+    releases expose `Switch.Microsoft.Data.SqlClient.EnableMultiSubnetFailoverByDefault`
+    in `LocalAppContextSwitches`; `DbConnectionStringDefaults` uses it only
+    when a connection does not explicitly specify MSF.
+    The author approved implementing this revised direction on 2026-10-21.
+    Maintainer product/parity approval remains pending on
+    [PR #746](https://github.com/microsoft/mssql-rs/pull/746). Tracked in AB#49293.
+
+35. **TNIR is omitted; only disabled compatibility inputs are accepted.**
+    msodbcsql's `ConnectIt` (`odbc/sqlcconn.cpp`, `Tnir` branch)
+    defaults `conninfo.fTnir` on and accepts `Enabled`/`Disabled`.
+    `ExportImp::SQLSetConnectAttrW` (`odbc/sqlcmisc.cpp`, `SQL_COPT_SS_TNIR`) accepts 0/1
+    before connect and rejects larger values with `HY024`.
+    `Tcp::Open` (`sni/src/tcp.cpp`) selects sequential-first or parallel
+    behavior from `transparentNetworkIPResolution`.
+
+    This driver has no TNIR algorithm or enabled state.
+    `TransparentNetworkIPResolution=Disabled` and `SQL_COPT_SS_TNIR=OFF`
+    succeed as no-ops; `Enabled`/`ON` returns `HYC00`, malformed keyword values
+    and numeric values above 1 return `HY024`. Its getter always returns off.
+    A connected setter remains `HY011`. Native Python mirrors this policy
+    with exceptions. TNIR off never changes MSF: use `MultiSubnetFailover=No`
+    to request sequential TCP.
+
+    **Measurement:** the same Windows x64 retail 18.7.1.1
+    (`SQL_DRIVER_VER=18.07.0001`) direct-API probe accepts TNIR 0/1, rejects 2
+    with `HY024`, and reports 0 on a fresh DBC. This PR's debug DLL accepts 0,
+    rejects 1 with `HYC00`, rejects 2 with `HY024`, and reports 0.
+    The reference's initial getter is stored state, not proof that its
+    algorithm is disabled. `TnirOffIsAcceptedAndOnIsUnsupported` compares the
+    keyword and driver-loaded setter paths; its connected retail run remains
+    pending as described in entry 34.
+
+    This deliberate omission avoids maintaining TNIR's additional staged
+    connection behavior after the senior review identified its support burden.
+    Modern .NET SqlClient likewise does not implement TNIR; .NET Framework
+    retains it for compatibility and deprecates it in 7.1. That is supporting
+    design context, not the ODBC parity authority. The implementation decision
+    was approved by the author on 2026-10-21; maintainer product/parity sign-off
+    remains pending. Tracked in AB#49293.

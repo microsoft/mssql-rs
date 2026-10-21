@@ -9,6 +9,94 @@ Low-level TDS client handling connection negotiation (prelogin, TLS, login7),
 query execution, result set streaming, bulk copy, RPC calls, and transaction
 management. Built on Tokio.
 
+## Connection policy and migration
+
+Eligible TCP connections default to MultiSubnetFailover (MSF): attempt all
+resolved addresses immediately and use the first successful connection. There
+is no Transparent Network IP Resolution (TNIR) first-address phase. One address
+is attempted once; zero addresses or more than 64 is an error with MSF on.
+MSF off attempts the complete address list sequentially, respecting
+`IPAddressPreference`. Parallel mode does not prioritize an address family.
+Parallel attempts share the TCP-connect budget, including DNS; sequential
+attempts retain their per-address budgets. Both remain inside the existing
+login deadline. Cancelling a parallel race aborts its remaining socket tasks.
+
+Precedence is **explicit connection > application startup default > deployment
+environment > built-in true**. Set `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT` to
+case-insensitive `true` or `false` before starting the application. Other values
+are errors unless a higher-priority setting overrides them; the variable is
+never reread after the first connection attempt or default lookup. Rust
+applications can instead call
+`connection::multi_subnet_failover::set_default_multi_subnet_failover(false)`
+before first use. Late calls fail. Set this before opening pools; separately
+loaded native modules have separate startup state, so use the environment to
+configure multiple bindings together. Changing the environment or a default
+does not change an established connection, a recovery, or a secondary login.
+
+The Rust `ClientContext::multi_subnet_failover` field changed from `bool` to
+`Option<bool>`:
+
+| Value | Meaning |
+|---|---|
+| `None` | Inherit startup defaults |
+| `Some(false)` | Explicit opt-out; sequential TCP |
+| `Some(true)` | Explicit MSF; incompatible options are errors |
+
+An inherited on default is suppressed for named pipes, shared memory, LocalDB,
+DAC (`admin:`), a nonempty failover partner, or a named instance requiring SQL
+Browser (SSRP). Those retain their existing transport/discovery paths.
+`tcp:host\instance,port` is eligible because discovery is unnecessary. Bare
+server names without instance discovery select TCP when MSF is on; explicitly
+select a non-TCP transport or disable MSF to retain the protocol waterfall.
+This does not implement database-mirroring failover.
+
+`TdsClient::multi_subnet_failover_policy()` reports the captured value, source,
+and any applicability suppression; the same fields appear in connection
+tracing. Cloned contexts preserve this policy. A caller can deliberately change
+the explicit override on a secondary context before opening a new connection;
+it cannot bypass the new endpoint's applicability checks.
+
+| Surface | Explicit opt-out | Application startup default |
+|---|---|---|
+| Rust | `context.multi_subnet_failover = Some(false)` | `set_default_multi_subnet_failover(false)?` |
+| ODBC | `MultiSubnetFailover=No` or `SQL_COPT_SS_MULTISUBNET_FAILOVER=OFF` | Set the process environment before driver use |
+| Native Python, sync/async | `{"multi_subnet_failover": False}` (also `"No"`) | `mssql_py_core.set_default_multi_subnet_failover(False)` |
+| Node.js | `multiSubnetFailover: false` | `setDefaultMultiSubnetFailover(false)` |
+| CLI | `--multi-subnet-failover false` | Environment |
+
+ODBC attributes outrank keywords. Omitted native options remain inherited.
+Legacy TNIR off/`Disabled` inputs in ODBC and native Python are accepted no-ops;
+on/`Enabled` is unsupported, and invalid values fail validation. **Disabling
+TNIR does not disable MSF.** See the
+[parity decisions](../mssql-odbc/docs/parity-deviations.md) for the intentional
+differences from msodbcsql and outstanding approval/evidence.
+
+## DNS fallback caching
+
+LOGIN7 advertises DNS caching (`0x0B`). Each TCP connection keeps its resolved
+addresses until login completes with LOGINACK and a successful DONE. The last
+FEATUREEXTACK then decides whether to publish those addresses in the process-wide
+fallback cache: DNS bit 0 allows them; a missing or negative DNS acknowledgement
+removes the host. A malformed FEATUREEXTACK revokes caching after that accepted
+response is drained, then returns its parsing error.
+
+Responses without FEATUREEXTACK leave an earlier allowance unchanged, including
+gateway redirects. Rejected, truncated, and authentication-continuation responses
+also leave it unchanged, so a failed retry cannot discard its own fallback.
+Pending resolutions belong to their connection, not a shared host-limited map.
+Concurrent accepted verdicts take effect in completion order and publish each
+connection's own addresses. Cached IPv6 addresses retain their scope IDs.
+
+Every connect still attempts DNS first. Fallback is used only if the resolver
+returns an error before the connection deadline, including a resolver-reported
+timeout. A resolver that remains pending until the caller's deadline expires
+does **not** get extra time for a cached TCP attempt. Reserving an earlier DNS
+sub-deadline for fallback is not implemented; caching does not guarantee that
+every form of DNS outage can be recovered within the login timeout.
+
+The deliberate differences from msodbcsql's eager cache are recorded in the
+[ODBC parity registry](../mssql-odbc/docs/parity-deviations.md).
+
 ## Execution stack usage
 
 Command execution keeps session-recovery state in a separately boxed future,

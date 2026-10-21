@@ -73,8 +73,9 @@ unsafe impl Sync for DbcHandle {}
 /// Values are normalized on the way in, matching msodbcsql: setting encrypt,
 /// trust, or integrated security to an out-of-range `7` and reading it back
 /// post-connect returns `1`, so the driver stores the effective value rather
-/// than the caller's input. Multi-subnet failover and TNIR instead reject
-/// anything above `SQL_IS_ON` with `HY024`, as msodbcsql does.
+/// than the caller's input. Multi-subnet failover instead rejects anything
+/// above `SQL_IS_ON` with `HY024`, as msodbcsql does. TNIR is not stored:
+/// off is a compatibility no-op, and on is unsupported.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct VendorConnOverrides {
     /// `SQL_COPT_SS_ENCRYPT` (1223): `0` no, `1` yes, `2` strict.
@@ -85,9 +86,6 @@ pub(crate) struct VendorConnOverrides {
     pub(crate) integrated_security: Option<u32>,
     /// `SQL_COPT_SS_MULTISUBNET_FAILOVER` (1248): `0` or `1`.
     pub(crate) multi_subnet_failover: Option<u32>,
-    /// `SQL_COPT_SS_TNIR` (1249): `0` or `1`. Unlike msodbcsql, `0` turns TNIR
-    /// off; see parity-deviations entry 33.
-    pub(crate) transparent_network_ip_resolution: Option<u32>,
 }
 
 /// Mutable state within a connection handle, protected by `inner`.

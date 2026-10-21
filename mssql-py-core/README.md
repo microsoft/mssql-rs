@@ -25,16 +25,34 @@ components:
 
 ## Native connection options
 
-`PyCoreConnection` and `PyAsyncConnection.connect` accept
-`transparent_network_ip_resolution` in their connection-context dictionary.
-It defaults to enabled when omitted. Pass `False` or `"Disabled"` to disable
-Transparent Network IP Resolution (TNIR), or `True` or `"Enabled"` to enable it.
-String values are case-insensitive; other strings and non-boolean/non-string
-values are rejected. `MultiSubnetFailover` still takes precedence over TNIR.
+Eligible TCP connections default to MultiSubnetFailover (MSF), racing resolved
+addresses without a first-address delay. For `PyCoreConnection` and
+`PyAsyncConnection.connect`, pass `multi_subnet_failover=False` in the native
+context dictionary to opt out, or `True` to opt in explicitly. Case-insensitive
+`"Yes"`/`"No"` strings are also accepted; other types and strings are errors.
+Omit the key to inherit startup defaults.
 
-This is a native dictionary option, not an ODBC connection-string parser.
-Higher-level clients such as `mssql-python` must forward the option when
-constructing a py-core connection context.
+Before opening any connections or pools, applications can call
+`mssql_py_core.set_default_multi_subnet_failover(False)`. Explicit connection
+settings outrank this default, which outranks the
+`MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true|false` environment variable, then the
+built-in enabled default. Defaults freeze on first use; late setters fail.
+The Python setter affects the py-core module, not a separately loaded ODBC
+driver. Use the environment before process startup to configure both.
+
+Transparent Network IP Resolution (TNIR) is not implemented.
+`transparent_network_ip_resolution=False` or `"Disabled"` is accepted as a
+compatibility no-op, **not an MSF opt-out**. `True` or `"Enabled"` raises an
+unsupported-feature exception; malformed values are rejected.
+
+These are native dictionary options, not an ODBC connection-string parser.
+Higher-level clients must forward them to py-core. The existing `mssql-python`
+MSF mapper preserves omitted and explicit `"No"` values in async and bulk-copy
+contexts; its TNIR keyword forwarding requires a separate consumer update.
+For ODBC connections, use `MultiSubnetFailover=No` or the corresponding
+connection attribute. See the
+[connection policy](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/README.md#connection-policy-and-migration)
+for applicability, address limits, and recovery behavior.
 
 ## Platforms
 
