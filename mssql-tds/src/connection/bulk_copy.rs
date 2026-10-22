@@ -70,6 +70,7 @@ use crate::error::bulk_copy_errors::{
     BulkCopyAttentionTimeoutError, BulkCopyError, BulkCopyTimeoutError,
 };
 use crate::message::transaction_management::TransactionIsolationLevel;
+use crate::sql_identifier::parse_bulk_copy_target_identifier;
 use async_trait::async_trait;
 use std::time::{Duration, Instant};
 
@@ -838,6 +839,8 @@ impl<'a> BulkCopy<'a> {
             return Ok(metadata.clone());
         }
 
+        parse_bulk_copy_target_identifier(&self.table_name, true)?;
+
         // Use the metadata retriever strategy
         let metadata = self
             .metadata_retriever
@@ -1391,6 +1394,36 @@ mod tests {
     use crate::datatypes::bulk_copy_metadata::SystemTypeId;
 
     use super::*;
+
+    struct UnreachableMetadataRetriever;
+
+    #[async_trait::async_trait]
+    impl MetadataRetriever for UnreachableMetadataRetriever {
+        async fn retrieve_metadata(
+            &mut self,
+            _client: &mut TdsClient,
+            _table_name: &str,
+            _timeout_sec: u32,
+        ) -> TdsResult<Vec<BulkCopyColumnMetadata>> {
+            panic!("invalid bulk-copy target reached metadata retriever")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bulk_copy_rejects_server_qualified_target_before_metadata_retrieval() {
+        let mut client = crate::test_client_support::tds_client_from_tokens(Vec::new());
+        let mut bulk_copy = BulkCopy::with_retriever(
+            &mut client,
+            "server.db.schema.table",
+            Box::new(UnreachableMetadataRetriever),
+        );
+
+        assert!(matches!(
+            bulk_copy.retrieve_destination_metadata().await,
+            Err(Error::UsageError(message))
+                if message == "Too many identifier parts: 4 (maximum is 3)"
+        ));
+    }
 
     #[test]
     fn test_bulk_copy_options_default() {

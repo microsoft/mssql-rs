@@ -330,11 +330,9 @@ mod tests {
             ("Target", "[Target]"),
             (" dbo . Target ", "[dbo].[Target]"),
             ("db.dbo.Target", "[db].[dbo].[Target]"),
-            ("server.db.dbo.Target", "[server].[db].[dbo].[Target]"),
             ("db..Target", "[db]..[Target]"),
             (".Target", ".[Target]"),
             ("..Target", "..[Target]"),
-            ("server...Target", "[server]...[Target]"),
             ("#Target", "[#Target]"),
             ("##Target", "[##Target]"),
             ("tempdb..#Target", "[tempdb]..[#Target]"),
@@ -355,6 +353,27 @@ mod tests {
             assert_eq!(
                 command,
                 format!("INSERT BULK {expected} ([id] int)"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_bulk_rejects_four_part_destination() {
+        use crate::connection::bulk_copy::BulkCopyOptions;
+        use crate::error::Error;
+        use crate::message::bulk_load::build_insert_bulk_command;
+
+        for name in ["server.db.dbo.Target", "a.b.c.d.e"] {
+            assert!(
+                matches!(
+                    build_insert_bulk_command(
+                        name,
+                        &[create_int_column("id")],
+                        &BulkCopyOptions::default()
+                    ),
+                    Err(Error::UsageError(message)) if message.ends_with("(maximum is 3)")
+                ),
                 "{name}"
             );
         }
