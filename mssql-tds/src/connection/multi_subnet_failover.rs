@@ -263,6 +263,22 @@ mod tests {
             let mut secondary = context.clone();
             secondary.prepare_datasource("tcp:secondary,1433").unwrap();
             assert_eq!(secondary.multi_subnet_failover_policy(), Some(policy));
+            for alias in ["localhost", ".", "(local)"] {
+                let mut local = ClientContext::with_data_source(alias);
+                local.multi_subnet_failover = explicit;
+                let parsed = local.prepare_datasource(alias).unwrap();
+                assert_eq!(parsed.parallel_connect, expected);
+                assert_eq!(local.multi_subnet_failover_policy(), Some(policy));
+                if expected {
+                    assert_eq!(parsed.protocol_name, "tcp");
+                    assert_eq!(parsed.server_name, "localhost");
+                    assert!(matches!(
+                        local.transport_context,
+                        crate::connection::client_context::TransportContext::Tcp { ref host, .. }
+                            if host == "localhost"
+                    ));
+                }
+            }
         }
         assert!(set_default_multi_subnet_failover(false).is_err());
         let default = default_multi_subnet_failover();

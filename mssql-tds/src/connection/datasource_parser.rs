@@ -444,12 +444,14 @@ impl ParsedDataSource {
             || Self::is_computer_name(normalized_server);
 
         if is_local {
-            // For TCP, admin, and SSRP-bound connections, keep "localhost" as-is.
+            // MSF selects TCP later in validate_protocol. Preserve loopback
+            // here just as for explicit TCP, admin, and SSRP-bound connections.
             // This preserves TLS certificate hostname validation and loopback
             // detection for SSPI (empty-SPN NTLM fallback).
             // Named Pipes and Shared Memory may need the actual computer name.
             if result.protocol_name == "admin"
                 || result.protocol_name == "tcp"
+                || result.parallel_connect
                 || !result.instance_name.is_empty()
             {
                 result.server_name = "localhost".to_string();
@@ -1553,7 +1555,19 @@ mod tests {
     #[test]
     fn parallel_connect_incompatible_protocols() {
         assert!(ParsedDataSource::parse("np:\\\\srv\\pipe\\sql\\query", true).is_err());
+        assert!(ParsedDataSource::parse("np:localhost", true).is_err());
+        assert!(ParsedDataSource::parse("lpc:localhost", true).is_err());
         assert!(ParsedDataSource::parse("admin:myserver", true).is_err());
+    }
+
+    #[test]
+    fn parallel_connect_preserves_local_aliases_as_loopback_tcp() {
+        for alias in ["localhost", "LOCALHOST", ".", "(local)"] {
+            let parsed = ParsedDataSource::parse(alias, true).unwrap();
+            assert_eq!(parsed.protocol_name, "tcp", "{alias}");
+            assert_eq!(parsed.server_name, "localhost", "{alias}");
+            assert_eq!(parsed.original_server_name, alias, "{alias}");
+        }
     }
 
     #[test]
