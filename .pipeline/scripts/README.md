@@ -207,6 +207,14 @@ blocking policy as the rest of the suite. Only the `slow` tests, including the
 fixed 5-minute sustained-load test, are left out; `pytestMarker: ''` selects
 every test. Leaving `PYTEST_MARK_EXPR` unset keeps upstream's default.
 
+Two timing-dependent stress tests are excluded through `PYTEST_DESELECT`
+(template parameter `pytestDeselect`, a list of pytest node IDs passed as
+`--deselect`): `test_arrow_reader_cancel_from_other_thread` races a cross-thread
+close against an in-flight fetch, and `test_concurrent_connection_gil_release`
+asserts a wall-clock speedup. Both fail under CI CPU contention without a driver
+defect ([#762](https://github.com/microsoft/mssql-rs/issues/762)). Remove them
+from the list once the pinned mssql-python revision includes the upstream fix.
+
 The macOS job owns the locally built Rust and source-matched ODBC wheels and
 installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
 third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a

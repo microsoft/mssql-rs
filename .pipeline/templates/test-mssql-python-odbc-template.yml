@@ -44,6 +44,15 @@ parameters:
   - name: pytestMarker
     type: string
     default: 'not slow'
+  # pytest node IDs excluded from the run. These stress tests race on timing and
+  # fail under CI CPU contention without a driver defect
+  # (https://github.com/microsoft/mssql-rs/issues/762). Remove them once the
+  # pinned mssql-python revision includes the upstream fix.
+  - name: pytestDeselect
+    type: object
+    default:
+      - tests/test_004_cursor_arrow.py::test_arrow_reader_cancel_from_other_thread
+      - tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release
 
 steps:
 - template: generate-sql-password-template.yml
@@ -224,6 +233,7 @@ steps:
     docker exec \
       -e DB_CONNECTION_STRING \
       -e PYTEST_MARK_EXPR="${{ parameters.pytestMarker }}" \
+      -e PYTEST_DESELECT="${{ join(' ', parameters.pytestDeselect) }}" \
       -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
       -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestTotalBudget }}" \
       -e TEST_RESULTS_DIR=/workspace/test-results \
