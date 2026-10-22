@@ -98,6 +98,42 @@ live `SQLGetConnectAttr` on every read (`connection.py`).
 
 ---
 
+### Connection-owned request timeouts
+
+`SQL_ATTR_CONNECTION_TIMEOUT` supplies the network request timeout for
+connection-owned batches and transaction-manager requests: catalog and isolation
+changes, autocommit transitions, `SQLEndTran`, post-login settings, and rollback
+performed during reset or disconnect. The value is read when each request starts,
+so it can be changed before or after login. Zero leaves the request unbounded.
+
+Application statements retain `SQL_ATTR_QUERY_TIMEOUT`, including an implicit
+transaction begin immediately before statement execution. Do not take the minimum
+of the two attributes or install a connection-wide socket idle timeout. The
+internal `SQL_USER_NAME` and alias-type lookups also retain their existing
+connection-timeout selection.
+
+Request expiry and protocol settlement are separate phases. The settlement budget
+is the nonzero connection timeout, or 120 seconds when the attribute is zero.
+A failed request reports `HYT00`; an unsafe partial write or failed settlement
+retires the connection rather than returning a desynchronized stream to the pool.
+Reset still marks a failed rollback's connection dead, and disconnect rollback
+remains best-effort. An isolation-change failure invalidates the isolation cache
+because the server may have applied the change before its response was lost.
+
+Source evidence: `sqlcprot.h`, `SetNetIOTimeout` and `GetCancelTimeoutValue`;
+`sqlcmisc.cpp`, the isolation setter; `sqlcconn.cpp`, `ChangeDatabase` and
+`SetCommitModeOption`; `sqlctran.cpp`, `CommitAbortTran`; and `sqlccmd.cpp`,
+`ExecImmediate`, `ExecTMRImmediate`, and `CheckOptions`. The immediate-execution
+helpers pass their selected timeout through recovery, sending, and response
+processing; `CheckOptions` selects the statement timeout for its implicit begin.
+This is not a promise that a whole ODBC call, including cursor cleanup and
+settlement, returns within exactly the configured number of seconds.
+
+Rust mock-server tests measure delayed batches, begin/commit/rollback responses,
+session reuse, zero timeout, and statement-timeout independence. The scope follows
+the reference source; exact retail timing and diagnostics have not yet been
+measured against CI's pinned msodbcsql 18.6.2.1 build.
+
 ## 2. Non-goals
 
 Capabilities present in `msodbcsql` that this work deliberately does **not**
