@@ -602,6 +602,28 @@ mod tests {
         assert!(std::mem::size_of::<SessionRecoveryData>() <= 512);
     }
 
+    // Catches a slot array being built on the stack and then boxed (e.g.
+    // `Box::new(std::array::from_fn(..))` or `Box::clone`), which
+    // `session_state_values_stay_small` cannot see. Unoptimized builds keep
+    // that temporary, so this is reliable in the default (debug) test profile.
+    #[test]
+    fn session_state_builds_on_small_stack() {
+        let mut table = SessionStateTable::new();
+        table.update_state(1, 1, true, vec![1]);
+        std::thread::Builder::new()
+            .stack_size(32 * 1024)
+            .spawn(move || {
+                let fresh = SessionStateTable::new();
+                let copy = (*table.snapshot(None, None, None)).clone();
+                table.reset();
+                assert!(fresh.delta.iter().all(Option::is_none));
+                assert!(copy.delta[1].is_some());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn snapshot_clone_preserves_every_slot() {
         let mut table = SessionStateTable::new();
