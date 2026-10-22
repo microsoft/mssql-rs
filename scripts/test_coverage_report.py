@@ -694,9 +694,17 @@ def test_github_head_rejects_invalid_sha(monkeypatch, sha):
 
 
 def duplicate_timeline(**changes):
-    stages = {"EvaluateDuplicate": "succeeded", "Build": "skipped", "Coverage": "skipped"}
+    stages = {"InitializeValidation": "succeeded", "Build": "skipped", "Coverage": "skipped"}
     stages.update(changes)
     return [{"type": "Stage", "identifier": name, "result": result} for name, result in stages.items()]
+
+
+def test_duplicate_timeline_matches_pipeline_stage_identifiers():
+    pipeline = yaml.safe_load(
+        (ROOT / ".pipeline" / "templates" / "validation-stages.yml").read_text(encoding="utf-8")
+    )
+    stages = {stage["stage"] for stage in pipeline["stages"] if "stage" in stage}
+    assert {record["identifier"] for record in duplicate_timeline()} <= stages
 
 
 def test_poll_reuses_original_coverage_after_duplicate_finishes(monkeypatch, poll_clock):
@@ -736,7 +744,8 @@ def test_duplicate_lookup_skips_chains_and_other_heads(monkeypatch, poll_clock):
 
 
 @pytest.mark.parametrize("changes", [
-    {"EvaluateDuplicate": "skipped"},
+    {"InitializeValidation": "skipped"},
+    {"InitializeValidation": "failed"},
     {"Build": "succeeded"},
     {"Coverage": "succeeded"},
     {"Coverage": None},

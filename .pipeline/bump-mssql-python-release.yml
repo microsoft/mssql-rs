@@ -1,0 +1,74 @@
+# Updates microsoft/mssql-python after pipeline 2332 publishes mssql-python-rs.
+#
+# This must be a GitHub-sourced Azure DevOps pipeline using the
+# github.com_microsoft service connection. The persisted checkout credential is
+# the short-lived GitHub App token used for the target-repository branch and API
+# calls.
+
+trigger: none
+
+pr: none
+
+parameters:
+- name: releasedVersion
+  displayName: Published mssql-python-rs version
+  type: string
+  default: ''
+
+- name: sourceBuildId
+  displayName: PyPI release build ID
+  type: string
+  default: ''
+
+variables:
+- name: Codeql.SkipTaskAutoInjection
+  value: true
+
+lockBehavior: sequential
+
+stages:
+- stage: UpdateMssqlPython
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: UpdateMssqlPython
+    environment: mssql-python-release-bump-writer
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            fetchDepth: 1
+            persistCredentials: true
+
+          - script: |
+              set -euo pipefail
+              KEY="$(git config --list | sed -n 's/^\(http\..*\.extraheader\)=.*/\1/p' | head -n1)"
+              if [ -z "$KEY" ]; then
+                echo "No persisted GitHub credential found; cannot update microsoft/mssql-python."
+                exit 1
+              fi
+              HEADER="$(git config --get "$KEY")"
+              DECODED="$(printf '%s' "${HEADER##* }" | base64 -d)"
+              TOKEN="${DECODED#*:}"
+              if [ -z "$TOKEN" ]; then
+                echo "Persisted credential at $KEY has no token component."
+                exit 1
+              fi
+              echo "##vso[task.setvariable variable=ghToken;issecret=true]$TOKEN"
+              echo "Extracted GitHub token from $KEY."
+            displayName: Read GitHub token from checkout credentials
+
+          - script: python3 scripts/bump-mssql-python-release.py
+            displayName: Open mssql-python dependency update pull request
+            env:
+              GH_TOKEN: $(ghToken)
+              RELEASED_VERSION: ${{ parameters.releasedVersion }}
+              SOURCE_BUILD_ID: ${{ parameters.sourceBuildId }}
+              MSSQL_PYTHON_REPOSITORY: microsoft/mssql-python
+              DEFAULT_BRANCH: main
+              GIT_AUTHOR_NAME: Azure Pipelines
+              GIT_AUTHOR_EMAIL: azuredevops@microsoft.com
+              GIT_COMMITTER_NAME: Azure Pipelines
+              GIT_COMMITTER_EMAIL: azuredevops@microsoft.com

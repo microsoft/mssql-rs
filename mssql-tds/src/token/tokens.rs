@@ -192,7 +192,10 @@ pub(crate) enum EnvChangeContainer {
     String(EnvChangeTokenValuePairs<String>),
     SqlCollation(EnvChangeTokenValuePairs<Option<SqlCollation>>),
     UInt32(EnvChangeTokenValuePairs<u32>),
-    RoutingType(EnvChangeTokenValuePairs<Option<RoutingInfo>>),
+    /// Boxed: routing arrives at most once per login, and inline it would be the
+    /// largest token, growing every future that holds one
+    /// (`row_fetch_futures_stay_small`).
+    RoutingType(EnvChangeTokenValuePairs<Option<Box<RoutingInfo>>>),
     BytesType(EnvChangeTokenValuePairs<Vec<u8>>),
     UInt64(EnvChangeTokenValuePairs<u64>),
 }
@@ -219,8 +222,9 @@ impl From<(u32, u32)> for EnvChangeContainer {
 
 impl From<(Option<RoutingInfo>, Option<RoutingInfo>)> for EnvChangeContainer {
     fn from(value: (Option<RoutingInfo>, Option<RoutingInfo>)) -> Self {
-        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::<Option<RoutingInfo>>::new(
-            value.0, value.1,
+        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::new(
+            value.0.map(Box::new),
+            value.1.map(Box::new),
         ))
     }
 }
@@ -1163,6 +1167,7 @@ pub(crate) enum EnvChangeTokenSubType {
     ResetConnection,
     UserInstanceName,
     Routing,
+    EnhancedRouting,
     Unknown(u8),
 }
 
@@ -1190,6 +1195,7 @@ impl TryFrom<u8> for EnvChangeTokenSubType {
             18 => EnvChangeTokenSubType::ResetConnection,
             19 => EnvChangeTokenSubType::UserInstanceName,
             20 => EnvChangeTokenSubType::Routing,
+            21 => EnvChangeTokenSubType::EnhancedRouting,
             unknown => EnvChangeTokenSubType::Unknown(unknown),
         })
     }
@@ -1218,6 +1224,7 @@ impl EnvChangeTokenSubType {
             EnvChangeTokenSubType::ResetConnection => 18,
             EnvChangeTokenSubType::UserInstanceName => 19,
             EnvChangeTokenSubType::Routing => 20,
+            EnvChangeTokenSubType::EnhancedRouting => 21,
             EnvChangeTokenSubType::Unknown(val) => *val,
         }
     }
@@ -1238,6 +1245,10 @@ mod env_change_tests {
             EnvChangeTokenSubType::try_from(20).unwrap(),
             EnvChangeTokenSubType::Routing
         ));
+        assert!(matches!(
+            EnvChangeTokenSubType::try_from(21).unwrap(),
+            EnvChangeTokenSubType::EnhancedRouting
+        ));
 
         // Test invalid values (should not panic, should return Unknown)
         assert!(matches!(
@@ -1254,6 +1265,7 @@ mod env_change_tests {
     fn test_env_change_token_subtype_as_u8() {
         assert_eq!(EnvChangeTokenSubType::Database.as_u8(), 1);
         assert_eq!(EnvChangeTokenSubType::Routing.as_u8(), 20);
+        assert_eq!(EnvChangeTokenSubType::EnhancedRouting.as_u8(), 21);
         assert_eq!(EnvChangeTokenSubType::Unknown(30).as_u8(), 30);
     }
 }
@@ -1418,6 +1430,7 @@ mod coverage_tests {
             protocol: 0,
             port: 1433,
             server: "host.example.com".into(),
+            database: None,
         };
         let container: EnvChangeContainer = (Some(routing), None).into();
         let dbg = format!("{container:?}");

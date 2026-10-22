@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::dns_cache::Resolution;
 use crate::connection::session_recovery::SessionRecoveryData;
 use crate::core::{EncryptionSetting, NegotiatedEncryptionSetting, TdsResult, Version};
 use crate::error::{Error, SqlInfoMessage, SqlServerDiagnostics};
@@ -30,6 +31,9 @@ pub(crate) struct HandlerFactory {
     /// Recovery data for session reconnection, passed separately from ClientContext
     /// since it is internal-only state not meant for library consumers.
     pub(crate) recovery_data: Option<Box<SessionRecoveryData>>,
+    /// What the transport resolved a TCP host to; the login's DNS caching
+    /// verdict publishes or removes it.
+    pub(crate) dns_resolution: Option<Resolution>,
 }
 
 impl HandlerFactory {
@@ -744,7 +748,7 @@ impl LoginHandler<'_> {
         };
 
         // Create the login request, optionally with SSPI token
-        let request = if let Some(token) = sspi_token {
+        let mut request = if let Some(token) = sspi_token {
             LoginRequest {
                 model: LoginRequestModel::from_context_with_sspi(
                     context,
@@ -758,6 +762,12 @@ impl LoginHandler<'_> {
             self.factory
                 .create_login_request(self.prelogin_fedauth_supported, transport_context)
         };
+        if let Some(resolution) = &self.factory.dns_resolution {
+            request
+                .model
+                .features_request
+                .bind_dns_caching(resolution.clone());
+        }
 
         // Note that the login process uses a timeout at a higher level than the request.
         let mut packet_writer = request.create_packet_writer(reader_writer, None, None);

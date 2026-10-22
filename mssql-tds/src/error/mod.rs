@@ -162,6 +162,8 @@ pub enum Error {
         host: String,
         /// Target port.
         port: u16,
+        /// Database to log in to on the target, set by Enhanced Routing.
+        database: Option<String>,
     },
 
     /// Failed to establish a connection.
@@ -474,6 +476,7 @@ mod tests {
         let error = Error::Redirection {
             host: "example.com".to_string(),
             port: 1433,
+            database: None,
         };
         assert!(error.to_string().contains("example.com"));
         assert!(error.to_string().contains("1433"));

@@ -240,7 +240,7 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// Write a single column value directly (for zero-copy bulk load).
     ///
     /// This is used by the `BulkLoadRow` trait to write columns one at a time
-    /// without allocating a Vec<ColumnValues>.
+    /// without allocating a `Vec<ColumnValues>`.
     ///
     /// # Arguments
     ///

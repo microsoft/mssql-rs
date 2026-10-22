@@ -56,6 +56,24 @@ class DuplicateValidation(unittest.TestCase):
             self.evaluate("a" * 40, "a" * 40),
         )
 
+    def test_lookup_failure_retains_full_validation_fallback(self):
+        env = {
+            "SYSTEM_ACCESSTOKEN": "test-token",
+            "SYSTEM_COLLECTIONURI": "https://example.invalid/",
+            "SYSTEM_TEAMPROJECT": "public",
+            "SYSTEM_DEFINITIONID": "1",
+            "BUILD_BUILDID": "101",
+            "SYSTEM_PULLREQUEST_SOURCECOMMITID": "a" * 40,
+        }
+        output = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            duplicate.urllib.request, "urlopen", side_effect=OSError("unavailable"),
+        ), contextlib.redirect_stdout(output):
+            duplicate.main()
+        self.assertIn("type=warning", output.getvalue())
+        self.assertIn("skipDuplicate;isOutput=true]false", output.getvalue())
+        self.assertNotIn("SQL_PASSWORD", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

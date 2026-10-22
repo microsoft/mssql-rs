@@ -344,7 +344,7 @@ pub struct ClientContext {
     pub access_token: Option<String>,
     /// Server Principal Name (SPN) for integrated authentication.
     /// If not provided, the SPN will be automatically generated from the server address.
-    /// Format: MSSQLSvc/<hostname>:<port> or MSSQLSvc/<hostname>:<instance>
+    /// Format: `MSSQLSvc/<hostname>:<port>` or `MSSQLSvc/<hostname>:<instance>`.
     pub server_spn: Option<String>,
     /// Overrides the server name written into the LOGIN7 packet, leaving the
     /// address actually dialled untouched.

@@ -302,6 +302,7 @@ def test_pypi_release_switch_graph(publish: bool) -> None:
     assert ("Require stable branch for publish" in names) == publish
     assert ("ESRP Release mssql-python-rs wheels to PyPI" in names) == publish
     assert ("Release summary" in names) == publish
+    assert ("Queue mssql-python dependency update" in names) == publish
     assert any(step.get("download") == "officialBuild" for step in steps)
     assert any(step.get("checkout") == "self" for step in steps)
     stage_step = next(
@@ -313,6 +314,9 @@ def test_pypi_release_switch_graph(publish: bool) -> None:
     else:
         esrp = next(step for step in steps if step.get("task", "").startswith("EsrpRelease@"))
         assert esrp["inputs"]["FolderLocation"] == "$(Agent.TempDirectory)/pypi-publish"
+        assert names.index("ESRP Release mssql-python-rs wheels to PyPI") < names.index(
+            "Queue mssql-python dependency update"
+        )
 
 
 @pytest.mark.parametrize(

@@ -84,8 +84,9 @@ steps:
       bash /workspace/.pipeline/scripts/containerized-odbc-swap-build.sh
   displayName: Build mssql-odbc driver
   env:
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+    ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
     set -euo pipefail
