@@ -26,6 +26,29 @@ pub use crate::sql_identifier::escape_identifier;
 
 pub use crate::message::parameters::rpc_parameters::rpc_parameter_status;
 
+/// Seeds or revokes an allowed DNS fallback for isolated connection tests.
+pub fn set_dns_cache_entry(host: &str, addresses: Vec<std::net::SocketAddr>, allowed: bool) {
+    use crate::connection::dns_cache::{DnsCache, Resolution};
+
+    DnsCache::global().apply_verdict(&Resolution::new(host, addresses), allowed);
+}
+
+/// Exercises DNS fallback without invoking the machine's resolver.
+pub async fn dns_cache_fallback(
+    host: &str,
+    port: u16,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    crate::connection::dns_cache::DnsCache::global()
+        .resolve(host, port, || async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "test DNS failure",
+            ))
+        })
+        .await
+        .map(|resolution| resolution.addresses().to_vec())
+}
+
 /// Uses the declaration generator used by prepared RPCs, without a server.
 pub fn rpc_parameter_declaration(
     parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
@@ -56,7 +79,7 @@ pub use crate::datatypes::tds_value_serializer::TdsTypeContext;
 ///
 /// Correct for a value of any size: `PacketWriter` flushes each full packet
 /// through `NetworkWriter::send` and copies the overflow back to the start of
-/// its buffer, so [`CapturingWriter`] keeps the flushed packets and only
+/// its buffer, so `CapturingWriter` keeps the flushed packets and only
 /// `..position()` of the final buffer is read.
 pub fn serialized_value_wire_bytes(
     value: &crate::datatypes::column_values::ColumnValues,
@@ -171,7 +194,7 @@ pub struct ScriptedToken(Tokens);
 /// written to the wire. Running out of queued tokens is reported as a closed
 /// connection.
 #[derive(Debug)]
-struct TokenReplayTransport {
+pub(crate) struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     pending_rows: VecDeque<VecDeque<i32>>,
     active_row: Option<VecDeque<i32>>,
@@ -182,7 +205,7 @@ struct TokenReplayTransport {
 }
 
 impl TokenReplayTransport {
-    fn new(tokens: Vec<Tokens>) -> Self {
+    pub(crate) fn new(tokens: Vec<Tokens>) -> Self {
         Self {
             pending_tokens: VecDeque::from(tokens),
             pending_rows: VecDeque::new(),
@@ -730,6 +753,16 @@ pub fn env_change_begin_transaction(descriptor: u64) -> ScriptedToken {
     }))
 }
 
+/// A `CommitTransaction` ENVCHANGE token — the acknowledgement the server
+/// emits for a Transaction Manager commit request, clearing the client's
+/// transaction descriptor.
+pub fn env_change_commit_transaction() -> ScriptedToken {
+    ScriptedToken(Tokens::EnvChange(EnvChangeToken {
+        sub_type: EnvChangeTokenSubType::CommitTransaction,
+        change_type: EnvChangeContainer::from((0u64, 0u64)),
+    }))
+}
+
 /// A `RollbackTransaction` ENVCHANGE token — the acknowledgement the server
 /// emits for a Transaction Manager rollback request, clearing the client's
 /// transaction descriptor.
@@ -742,8 +775,9 @@ pub fn env_change_rollback_transaction() -> ScriptedToken {
 
 /// A `ResetConnection` ENVCHANGE token — the acknowledgement the server emits
 /// when it processes a RESETCONNECTION request. Script it ahead of a terminal
-/// DONE to drive [`TdsClient::reset_connection`](crate::connection::tds_client::TdsClient::reset_connection)
-/// to completion in a consumer test.
+/// DONE to complete a reset requested with
+/// [`TdsClient::prepare_reset_connection`](crate::connection::tds_client::TdsClient::prepare_reset_connection)
+/// in a consumer test.
 pub fn env_change_reset_connection() -> ScriptedToken {
     ScriptedToken(Tokens::EnvChange(EnvChangeToken {
         sub_type: EnvChangeTokenSubType::ResetConnection,

@@ -9,6 +9,32 @@ Low-level TDS client handling connection negotiation (prelogin, TLS, login7),
 query execution, result set streaming, bulk copy, RPC calls, and transaction
 management. Built on Tokio.
 
+## DNS fallback caching
+
+LOGIN7 advertises DNS caching (`0x0B`). Each TCP connection keeps its resolved
+addresses until login completes with LOGINACK and a successful DONE. The last
+FEATUREEXTACK then decides whether to publish those addresses in the process-wide
+fallback cache: DNS bit 0 allows them; a missing or negative DNS acknowledgement
+removes the host. A malformed FEATUREEXTACK revokes caching after that accepted
+response is drained, then returns its parsing error.
+
+Responses without FEATUREEXTACK leave an earlier allowance unchanged, including
+gateway redirects. Rejected, truncated, and authentication-continuation responses
+also leave it unchanged, so a failed retry cannot discard its own fallback.
+Pending resolutions belong to their connection, not a shared host-limited map.
+Concurrent accepted verdicts take effect in completion order and publish each
+connection's own addresses. Cached IPv6 addresses retain their scope IDs.
+
+Every connect still attempts DNS first. Fallback is used only if the resolver
+returns an error before the connection deadline, including a resolver-reported
+timeout. A resolver that remains pending until the caller's deadline expires
+does **not** get extra time for a cached TCP attempt. Reserving an earlier DNS
+sub-deadline for fallback is not implemented; caching does not guarantee that
+every form of DNS outage can be recovered within the login timeout.
+
+The deliberate differences from msodbcsql's eager cache are recorded in the
+[ODBC parity registry](../mssql-odbc/docs/parity-deviations.md).
+
 ## Execution stack usage
 
 Command execution keeps session-recovery state in a separately boxed future,
@@ -44,18 +70,21 @@ raw unpaired UTF-16 units in ODBC `SQL_C_WCHAR` buffers is a separate behavior.
 | `integrated-auth` | **yes** | Enables both `sspi` and `gssapi` |
 | `sspi` | via `integrated-auth` | Windows SSPI (Kerberos/NTLM) |
 | `gssapi` | via `integrated-auth` | Unix GSSAPI (Kerberos) via runtime `dlopen` |
+| `tls-schannel-direct-on-windows` | **yes** | Enables `tls-schannel-direct` |
+| `tls-schannel-direct` | via `tls-schannel-direct-on-windows` | Windows: TLS through the in-tree Schannel engine instead of `native-tls`. No effect on other targets. |
 
-Disable the default to drop platform-specific auth dependencies:
+Disable the defaults to drop platform-specific auth dependencies and use
+`native-tls` on every platform:
 
 ```toml
-mssql-tds = { version = "0.1", default-features = false }
+mssql-tds = { version = "0.3", default-features = false }
 ```
 
 ## Quick start
 
 ```rust,no_run
 use mssql_tds::connection::client_context::ClientContext;
-use mssql_tds::connection::tds_client::ResultSetClient;
+use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::TdsResult;
 
@@ -71,12 +100,10 @@ async fn main() -> TdsResult<()> {
         .create_client(context, "tcp:localhost,1433", None)
         .await?;
 
-    client
-        .execute("SELECT 1 AS value".into(), None, None)
-        .await?;
+    client.execute("SELECT 1 AS value".into(), ()).await?;
 
-    if let Some(rs) = client.get_current_resultset() {
-        while let Some(row) = rs.next_row().await? {
+    if client.on_rows() {
+        while let Some(row) = client.next_row().await? {
             println!("{row:?}");
         }
     }
@@ -85,6 +112,11 @@ async fn main() -> TdsResult<()> {
     Ok(())
 }
 ```
+
+`execute` takes `()` for default options, or an `ExecuteOptions` to set a
+per-command timeout, cancellation handle, Always Encrypted override, or
+statement-error mode. It returns a `StatementResult` for the first result in
+the batch; use `advance()` to move through the rest of a multi-statement batch.
 
 ## Cancelling an outstanding response
 

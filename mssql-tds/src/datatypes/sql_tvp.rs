@@ -6,14 +6,15 @@
 //! A TVP (TDS type `0xF3`) sends tabular data as a single, input-only RPC
 //! parameter. This module defines the Rust-side representation of a TVP:
 //! its three-part type name, per-column metadata, optional sort/unique
-//! hints, and the row data. Serialization into TDS wire format is added in
-//! a later phase.
+//! hints, and the row data. A TVP is passed as
+//! [`SqlType::Table`](crate::datatypes::sqltypes::SqlType::Table) in an RPC
+//! parameter, which serializes it to TDS wire format.
 //!
-//! The column type template reuses [`SqlType`] with `None` values (e.g.
+//! The column type template reuses [`SqlType`](crate::datatypes::sqltypes::SqlType) with `None` values (e.g.
 //! `SqlType::Int(None)` describes an `int` column), avoiding a parallel type
 //! hierarchy. For types whose metadata lives inside the value `Option`
 //! (`Decimal`, `Numeric`, `Time`, `DateTime2`, `DateTimeOffset`),
-//! [`TvpColumnDef`] carries explicit `precision`/`scale` overrides.
+//! [`TvpColumnDef`](crate::datatypes::sql_tvp::TvpColumnDef) carries explicit `precision`/`scale` overrides.
 
 use bitflags::bitflags;
 

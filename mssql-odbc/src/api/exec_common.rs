@@ -10,6 +10,7 @@
 use tracing::{debug, error};
 
 use std::collections::VecDeque;
+use std::sync::MutexGuard;
 use std::time::Duration;
 
 use mssql_tds::connection::tds_client::{
@@ -33,12 +34,13 @@ use crate::conversion::param_convert::{
     dae_length_limit, dae_plan, dae_streamed_declaration,
 };
 use crate::error::{HasDiagnostics, post_sql_error};
-use crate::handles::dbc::ConnectionState;
+use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::desc::DescHeader;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED, StatementOperation, StmtState,
 };
+use crate::handles::wire::{ClaimError, ClaimPolicy, LeaseReturn, WireLease, WireOwner};
 use crate::handles::{
     DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
 };
@@ -111,7 +113,7 @@ fn unwind_dae_inner(
 pub(super) fn finish_dae_unwind(
     dbc: &DbcHandle,
     statement_handle: SqlHandle,
-    client: Option<TdsClient>,
+    client: Option<WireLease>,
     process_is_shutting_down: bool,
 ) {
     if let Some(mut client) = client {
@@ -197,7 +199,7 @@ fn settle_late_cancellation(
     // A released claim means the complete response was already read, so
     // nothing remains for the signal to abandon.
     let owns_wire = match stmt.parent_dbc().inner.lock() {
-        Ok(state) => state.active_stmt == Some(statement_handle),
+        Ok(state) => state.wire.statement_owner() == Some(statement_handle),
         Err(_) => {
             error!("settling cancellation: dbc mutex poisoned");
             return SQL_ERROR;
@@ -231,7 +233,7 @@ fn settle_late_cancellation(
 
 /// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
 /// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
-/// `active_stmt` set, so the connection stays busy for the duration.
+/// the wire reserved, so the connection stays busy for the duration.
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
@@ -240,7 +242,7 @@ fn settle_late_cancellation(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn park_dae_client(
     stmt: &StmtHandle,
-    client: TdsClient,
+    client: WireLease,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
@@ -276,7 +278,7 @@ pub(super) fn park_dae_client(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn park_deferred_dae(
     stmt: &StmtHandle,
-    client: TdsClient,
+    client: WireLease,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
@@ -334,13 +336,13 @@ pub(super) fn abort_dae_with_diag(
 }
 
 /// Acquires the connection's TDS client for an execution, enforcing the
-/// connection-busy / not-connected invariants and claiming `active_stmt`.
+/// connection-busy / not-connected invariants and reserving the wire.
 pub(super) fn claim_connection(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     op: &str,
-) -> Result<TdsClient, SqlReturn> {
+) -> Result<WireLease, SqlReturn> {
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned");
         clear_exec_started(stmt);
@@ -357,44 +359,31 @@ pub(super) fn claim_connection(
         return Err(SQL_ERROR);
     }
 
-    if let Some(busy_stmt) = dbc_state.active_stmt
-        && busy_stmt != statement_handle
-    {
-        error!("{op}: connection is busy with results for another statement");
-        drop(dbc_state);
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
-        }
-        clear_exec_started(stmt);
-        return Err(SQL_ERROR);
-    }
-
-    // Claim the connection before releasing the lock so concurrent threads see
-    // active_stmt and get HY000 rather than "no active TDS client".
-    dbc_state.active_stmt = Some(statement_handle);
     // Snapshot the collation before the client leaves the DBC: a
     // data-at-execution sequence parks it on the statement, so `SQLGetInfo`
     // needs this to answer `SQL_COLLATION_SEQ` until the client returns.
     let cache = dbc_state
-        .client
-        .as_ref()
+        .wire
+        .client()
         .map(super::get_info::collation_cache_inputs);
-    if let Some((code_page, char_set)) = cache {
-        dbc_state.last_collation_code_page = code_page;
-        dbc_state.last_char_set = char_set;
-    }
-    let Some(client) = dbc_state.client.take() else {
-        error!("{op}: no active TDS client");
-        dbc_state.active_stmt = None;
-        drop(dbc_state);
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            post_diag(&mut stmt_state, ERR_NO_ACTIVE_TDS_CLIENT);
+    match dbc_state.wire.claim(
+        WireOwner::Statement(statement_handle),
+        ClaimPolicy::IdleOrOwn,
+    ) {
+        Ok(lease) => {
+            if let Some((code_page, char_set)) = cache {
+                dbc_state.last_collation_code_page = code_page;
+                dbc_state.last_char_set = char_set;
+            }
+            Ok(lease)
         }
-        clear_exec_started(stmt);
-        return Err(SQL_ERROR);
-    };
-
-    Ok(client)
+        Err(claim_error) => {
+            error!(?claim_error, "{op}: connection is not available");
+            post_claim_error(dbc_state, stmt, claim_error);
+            clear_exec_started(stmt);
+            Err(SQL_ERROR)
+        }
+    }
 }
 
 /// Publishes the processed count for a scalar (single parameter set) execute.
@@ -415,23 +404,23 @@ pub(super) fn publish_scalar_processed(header: &ParamArrayHeader) {
     }
 }
 
+/// Takes the DBC guard so it is released before the statement lock is taken.
+pub(super) fn post_claim_error(
+    dbc_state: MutexGuard<'_, DbcState>,
+    stmt: &StmtHandle,
+    claim_error: ClaimError,
+) {
+    drop(dbc_state);
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        post_diag(&mut stmt_state, claim_error_diag(claim_error));
+    }
+}
+
 /// Returns `client` to the DBC and releases the busy claim. Used on the
 /// DDL/DML success path and on error recovery.
-pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, client: TdsClient) {
-    match dbc.inner.lock() {
-        Ok(mut dbc_state) => {
-            dbc_state.client = Some(client);
-            if dbc_state.active_stmt == Some(statement_handle) {
-                dbc_state.active_stmt = None;
-            }
-        }
-        // The client is dropped here, so the connection keeps recording this
-        // statement as busy and can never be used again.
-        Err(_) => error!(
-            ?statement_handle,
-            "return_client_idle: dbc mutex poisoned; client not returned"
-        ),
-    }
+pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, client: WireLease) {
+    debug_assert_eq!(client.owner(), WireOwner::Statement(statement_handle));
+    dbc.return_lease(client, LeaseReturn::Release);
 }
 
 /// Drains the connection's "a value reached the wire with a substituted
@@ -468,11 +457,10 @@ pub(super) fn post_code_page_conversion_loss(
     should_warn
 }
 
-/// Claims the TDS client only if the connection is live and **idle** (no
-/// statement currently holds it), marking `active_stmt` so the claim is visible
-/// to concurrent threads. Returns `None` — without side effects — when
-/// disconnected, busy, or the client is unavailable. Pairs with
-/// [`return_client_idle`].
+/// Claims the TDS client only if the connection is live and **idle**,
+/// reserving the wire so the claim is visible to concurrent threads. Returns
+/// `None` — without side effects — when disconnected, busy, or the client is
+/// unavailable. Pairs with [`return_client_idle`].
 ///
 /// Unlike [`claim_connection`], this posts no diagnostics and never sets
 /// `EXEC_STARTED`: it backs internal best-effort operations (e.g. releasing a
@@ -480,7 +468,7 @@ pub(super) fn post_code_page_conversion_loss(
 pub(super) fn try_claim_idle_client(
     dbc: &DbcHandle,
     statement_handle: SqlHandle,
-) -> Option<TdsClient> {
+) -> Option<WireLease> {
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         // Distinct from the ordinary `None` returns below: those are expected
         // (disconnected or busy), this one means the lock is unusable.
@@ -490,24 +478,20 @@ pub(super) fn try_claim_idle_client(
         );
         return None;
     };
-    if dbc_state.connection_state != ConnectionState::Connected || dbc_state.active_stmt.is_some() {
+    if dbc_state.connection_state != ConnectionState::Connected {
         return None;
     }
-    let client = dbc_state.client.take()?;
-    dbc_state.active_stmt = Some(statement_handle);
-    Some(client)
-}
-
-/// Returns `client` to the DBC but **keeps** the busy claim — used when a
-/// cursor is left open for `SQLFetch`.
-pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-    }
+    dbc_state
+        .wire
+        .claim(
+            WireOwner::Statement(statement_handle),
+            ClaimPolicy::IdleOnly,
+        )
+        .ok()
 }
 
 /// Peeks whether another row follows the one just fully consumed, and
-/// releases the DBC's busy claim (`active_stmt`) once both the peek and
+/// releases the DBC's busy claim once both the peek and
 /// `client.has_open_batch()` agree nothing remains for this statement to
 /// read — matching msodbcsql's wire-state busy gate rather than holding the
 /// connection for the statement's entire cursor lifetime (AB#47508). A row
@@ -554,9 +538,10 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// so it has to be recorded first; its return value reports whether it posted
 /// a server message. Callers with nothing pending pass `|_| false`.
 ///
-/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is `false` when
-/// the statement lock was poisoned and the closure therefore never ran, so a
-/// caller that relies on it having posted can fall back rather than assume.
+/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is
+/// `false` when the statement lock was poisoned and the closure therefore
+/// never ran, so a caller that relies on it having posted can fall back rather
+/// than assume. A stale lease returns `SQL_ERROR` without publishing state.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -566,9 +551,10 @@ pub(super) fn release_busy_if_row_exhausted(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: TdsClient,
+    mut client: WireLease,
     post_preceding: impl FnOnce(&mut StmtState) -> bool,
-) -> (bool, bool, bool) {
+) -> Result<(bool, bool, bool), SqlReturn> {
+    debug_assert_eq!(client.owner(), WireOwner::Statement(statement_handle));
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
@@ -618,13 +604,26 @@ pub(super) fn release_busy_if_row_exhausted(
     // the following result set, and would drop it outright if the application
     // never calls `SQLMoreResults` at all.
     let drained_info = client.take_info_messages();
+    let pending_output_params = if release && !cancelled {
+        Some((client.get_return_values(), client.get_return_status()))
+    } else {
+        None
+    };
+
+    let how = if release {
+        LeaseReturn::Release
+    } else {
+        LeaseReturn::KeepReservation
+    };
+    if !dbc.return_lease(client, how) {
+        return Err(SQL_ERROR);
+    }
 
     let mut has_server_info = false;
     let mut preceding_ran = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
-        if release && !cancelled {
-            stmt_state.pending_output_params =
-                Some((client.get_return_values(), client.get_return_status()));
+        if let Some(output_params) = pending_output_params {
+            stmt_state.pending_output_params = Some(output_params);
         }
         preceding_ran = true;
         has_server_info = post_preceding(&mut stmt_state);
@@ -645,17 +644,7 @@ pub(super) fn release_busy_if_row_exhausted(
             stmt_state.batch_exhausted = true;
         }
     }
-    // Capture outputs before publishing the idle client: another statement's
-    // execution clears the client's RETURNVALUE/RETURNSTATUS collections.
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        dbc_state.active_stmt = if release {
-            None
-        } else {
-            Some(statement_handle)
-        };
-    }
-    (has_server_info, preceding_ran, cancelled)
+    Ok((has_server_info, preceding_ran, cancelled))
 }
 
 /// The TDS read has settled or retired its transport and returned the client.
@@ -670,9 +659,7 @@ pub(super) fn finish_cancelled_cursor(
         error!("finishing cancelled cursor: dbc mutex poisoned");
         return SQL_ERROR;
     };
-    if dbc_state.active_stmt == Some(statement_handle) {
-        dbc_state.active_stmt = None;
-    }
+    dbc_state.wire.release_reservation(statement_handle);
     drop(dbc_state);
     let Ok(mut state) = stmt.inner.lock() else {
         error!("finishing cancelled cursor: stmt mutex poisoned");
@@ -690,7 +677,7 @@ pub(super) fn fail_with_tds(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: TdsClient,
+    mut client: WireLease,
     err: &TdsError,
 ) -> SqlReturn {
     let info_messages = client.take_info_messages();
@@ -1234,7 +1221,7 @@ pub(super) fn finish_execute_with_param_warning(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    client: TdsClient,
+    client: WireLease,
     op: &str,
     fractional_truncated: bool,
 ) -> SqlReturn {
@@ -1347,23 +1334,11 @@ pub(super) fn finish_execute(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: TdsClient,
+    mut client: WireLease,
     op: &str,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
     let has_result_set = !metadata.is_empty();
-
-    // Populated before `metadata` is moved into `stmt_state.begin_batch`
-    // below (each arm), while it's still owned locally — avoids a clone per
-    // arm purely to keep a copy alive across the STMT lock drop.
-    // `populate_ird` only ever touches the IRD's own DescHandle, with no
-    // dependency on `stmt_state`/`client`/`dbc`, so running it before the
-    // STMT-locked bookkeeping instead of after doesn't change what state ends
-    // up where — only whether an IRD failure is checked before or after that
-    // bookkeeping runs, and every arm already runs the bookkeeping
-    // unconditionally and reports the IRD failure (if any) in its return
-    // value regardless.
-    let ird_ok = populate_ird(stmt, &metadata).is_ok();
 
     if !has_result_set && client.has_open_batch() {
         // Statement-wise navigation: positioned on a no-row statement result
@@ -1374,16 +1349,19 @@ pub(super) fn finish_execute(
         // batch. Matches msodbcsql.
         let info_messages = client.take_info_messages();
         let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
+        let row_count = client.last_rows_affected();
+        if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+            return SQL_ERROR;
+        }
+        let ird_ok = populate_ird(stmt, &metadata).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned on no-row result");
-            return_client_busy(dbc, client);
             return SQL_ERROR;
         };
         stmt_state.begin_batch(metadata); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
-        let row_count = client.last_rows_affected();
         stmt_state.row_count = row_count;
         stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
@@ -1391,7 +1369,6 @@ pub(super) fn finish_execute(
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
             | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
-        return_client_busy(dbc, client);
         if !ird_ok {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_sql_error(
@@ -1423,17 +1400,20 @@ pub(super) fn finish_execute(
         let has_dml_counts = !dml_counts.is_empty();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
         let bound_params = snapshot_bound_params(stmt);
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("{op}: stmt mutex poisoned");
-            return_client_idle(dbc, statement_handle, client);
-            return SQL_ERROR;
-        };
-        stmt_state.clear_exhaustion_state();
         // Draining the wire does not consume application-visible DML counts.
         // Keep the return tokens until SQLMoreResults advances past the last
         // count, even when the first count is the only one.
         let return_values = client.get_return_values();
         let return_status = client.get_return_status();
+        if !dbc.return_lease(client, LeaseReturn::Release) {
+            return SQL_ERROR;
+        }
+        let ird_ok = populate_ird(stmt, &metadata).is_ok();
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("{op}: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        stmt_state.clear_exhaustion_state();
         let output_rc = if has_dml_counts {
             stmt_state.batch_exhausted = true;
             stmt_state.pending_output_params = Some((return_values, return_status));
@@ -1467,7 +1447,6 @@ pub(super) fn finish_execute(
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
             | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
-        return_client_idle(dbc, statement_handle, client);
         if !ird_ok {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_sql_error(
@@ -1515,13 +1494,19 @@ pub(super) fn finish_execute(
     // window, and taking the messages first would leave them for a later fetch.
     let info_messages = client.take_info_messages();
     let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
+    let pending_output_params =
+        batch_exhausted.then(|| (client.get_return_values(), client.get_return_status()));
+    let lease_return = if batch_exhausted {
+        LeaseReturn::Release
+    } else {
+        LeaseReturn::KeepReservation
+    };
+    if !dbc.return_lease(client, lease_return) {
+        return SQL_ERROR;
+    }
+    let ird_ok = populate_ird(stmt, &metadata).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
-        if batch_exhausted {
-            return_client_idle(dbc, statement_handle, client);
-        } else {
-            return_client_busy(dbc, client);
-        }
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
@@ -1530,20 +1515,12 @@ pub(super) fn finish_execute(
     stmt_state.clear_exhaustion_state();
     stmt_state.result_set_exhausted = !has_row;
     stmt_state.batch_exhausted = batch_exhausted;
-    if batch_exhausted {
-        stmt_state.pending_output_params =
-            Some((client.get_return_values(), client.get_return_status()));
-    }
+    stmt_state.pending_output_params = pending_output_params;
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
         | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     drop(stmt_state);
-    if batch_exhausted {
-        return_client_idle(dbc, statement_handle, client);
-    } else {
-        return_client_busy(dbc, client);
-    }
     if !ird_ok {
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
@@ -1572,6 +1549,7 @@ mod tests {
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
+    use crate::test_support::{assert_last_diag, lease_for_test};
     use mssql_tds::test_client_support::{
         ScriptedToken, col_metadata, col_metadata_empty, done_in_proc_more, done_more,
         done_no_more, done_proc_no_more, int_columns, sql_error, tds_client_from_tokens,
@@ -1808,7 +1786,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         // Default state is not connected.
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
     }
 
     #[test]
@@ -1818,10 +1796,17 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         // A different statement already holds the connection.
         let other = 0x1234 as SqlHandle;
-        dbc.inner.lock().unwrap().active_stmt = Some(other);
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(other));
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         // The existing claim must be left untouched.
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(other)
+        );
     }
 
     #[test]
@@ -1834,18 +1819,46 @@ mod tests {
         dbc.runtime
             .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
             .unwrap();
-        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+        let client = lease_for_test(dbc, handles.stmt, client);
 
         assert_eq!(
             finish_execute(dbc, stmt, handles.stmt, client, "SQLExecDirectW"),
             SQL_SUCCESS
         );
 
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let stmt_state = stmt.inner.lock().unwrap();
         assert!(stmt_state.result_set_exhausted);
         assert!(stmt_state.batch_exhausted);
         assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    #[test]
+    fn finish_execute_publishes_nothing_from_a_stale_lease() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_tokens(vec![col_metadata(int_columns(1)), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        let client = lease_for_test(dbc, handles.stmt, client);
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecDirectW"),
+            SQL_ERROR
+        );
+
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.has_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN));
+        assert!(!stmt_state.result_set_exhausted);
+        assert!(!stmt_state.batch_exhausted);
     }
 
     #[test]
@@ -1901,14 +1914,14 @@ mod tests {
         dbc.runtime
             .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
             .unwrap();
-        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+        let client = lease_for_test(dbc, handles.stmt, client);
 
         assert_eq!(
             finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
             SQL_SUCCESS_WITH_INFO
         );
 
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         {
             let stmt_state = stmt.inner.lock().unwrap();
             assert!(stmt_state.result_set_exhausted);
@@ -1951,7 +1964,7 @@ mod tests {
             dbc.runtime
                 .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_owned(), ()))
                 .unwrap();
-            dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+            let client = lease_for_test(dbc, handles.stmt, client);
             std::thread::scope(|scope| {
                 assert!(
                     scope
@@ -1969,11 +1982,16 @@ mod tests {
                 SQL_ERROR
             );
             assert_eq!(
-                dbc.inner.lock().unwrap().active_stmt,
+                dbc.inner.lock().unwrap().wire.statement_owner(),
                 if batch_done { None } else { Some(handles.stmt) }
             );
             stmt.inner.clear_poison();
-            let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+            let mut client = dbc
+                .inner
+                .lock()
+                .unwrap()
+                .wire
+                .take_lease_for_test(handles.stmt);
             dbc.runtime.block_on(client.close_query()).unwrap();
             return_client_idle(dbc, handles.stmt, client);
         }
@@ -1997,14 +2015,17 @@ mod tests {
             dbc.runtime
                 .block_on(client.execute("SELECT 1 WHERE 1 = 0; SELECT 2, 3".to_string(), ()))
                 .unwrap();
-            dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+            let client = lease_for_test(dbc, handles.stmt, client);
 
             assert_eq!(
                 finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
                 SQL_SUCCESS
             );
 
-            assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(handles.stmt));
+            assert_eq!(
+                dbc.inner.lock().unwrap().wire.statement_owner(),
+                Some(handles.stmt)
+            );
             {
                 let stmt_state = stmt.inner.lock().unwrap();
                 assert!(stmt_state.result_set_exhausted);
@@ -2029,20 +2050,28 @@ mod tests {
         dbc.runtime
             .block_on(client.execute("SELECT 42".to_string(), ()))
             .unwrap();
-        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+        let client = lease_for_test(dbc, handles.stmt, client);
 
         assert_eq!(
             finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
             SQL_SUCCESS
         );
 
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(handles.stmt));
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(handles.stmt)
+        );
         {
             let stmt_state = stmt.inner.lock().unwrap();
             assert!(!stmt_state.result_set_exhausted);
             assert!(!stmt_state.batch_exhausted);
         }
-        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let mut client = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .wire
+            .take_lease_for_test(handles.stmt);
         assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
         dbc.runtime.block_on(client.close_query()).unwrap();
         return_client_idle(dbc, handles.stmt, client);
@@ -2059,13 +2088,13 @@ mod tests {
         dbc.runtime
             .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
             .unwrap();
-        dbc.inner.lock().unwrap().active_stmt = Some(handles.stmt);
+        let client = lease_for_test(dbc, handles.stmt, client);
 
         assert_eq!(
             finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
             SQL_ERROR
         );
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let stmt_state = stmt.inner.lock().unwrap();
         assert!(!stmt_state.diag_records.is_empty());
         assert!(stmt_state.pending_fetch_error.is_none());
@@ -2087,6 +2116,7 @@ mod tests {
             .block_on(client.execute("SELECT blocked".to_string(), ()))
             .unwrap();
 
+        let client = lease_for_test(dbc, h.stmt, client);
         let rc = finish_execute(dbc, stmt, h.stmt, client, "SQLExecDirectW");
 
         assert_eq!(rc, SQL_ERROR);
@@ -2131,6 +2161,7 @@ mod tests {
             .block_on(client.execute("SELECT SUM(col) FROM t".to_string(), ()))
             .unwrap();
 
+        let client = lease_for_test(dbc, h.stmt, client);
         let rc = finish_execute(dbc, stmt, h.stmt, client, "SQLExecDirectW");
 
         assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
@@ -2162,6 +2193,7 @@ mod tests {
             // RPC execution can already have consumed the whole response before
             // handing the drained client and its collected counts to ODBC.
             dbc.runtime.block_on(client.close_query()).unwrap();
+            let client = lease_for_test(dbc, h.stmt, client);
             assert_eq!(
                 finish_execute(dbc, stmt, h.stmt, client, "SQLExecute"),
                 if counts.first() == Some(&0) {
@@ -2207,6 +2239,7 @@ mod tests {
             dbc.runtime
                 .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
                 .unwrap();
+            let client = lease_for_test(dbc, h.stmt, client);
             assert_eq!(
                 finish_execute_with_param_warning(
                     dbc,
@@ -2248,6 +2281,7 @@ mod tests {
             .block_on(client.execute("SELECT 1".to_string(), ()))
             .unwrap();
 
+        let client = lease_for_test(dbc, h.stmt, client);
         let rc = finish_execute_with_param_warning(dbc, stmt, h.stmt, client, "SQLExecute", true);
 
         assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
@@ -2267,7 +2301,7 @@ mod tests {
 
         let rc = park_dae_client(
             stmt,
-            tds_client_from_tokens(Vec::new()),
+            WireLease::detached_for_test(tds_client_from_tokens(Vec::new()), h.stmt),
             None,
             None,
             Vec::new(),
@@ -2293,8 +2327,8 @@ mod tests {
             .block_on(client.execute("SELECT 1;".to_string(), ()))
             .unwrap();
         let mut ds = dbc.inner.lock().unwrap();
-        ds.client = Some(client);
-        ds.active_stmt = Some(h.stmt);
+        ds.wire.put_client_for_test(client);
+        ds.wire.set_owner_for_test(Some(h.stmt));
     }
 
     #[test]
@@ -2309,12 +2343,16 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
+        assert!(
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
 
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
-        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
         let ss = stmt.inner.lock().unwrap();
         assert!(ss.result_set_exhausted);
         assert!(
@@ -2323,6 +2361,40 @@ mod tests {
              SQLMoreResults must also be able to fast-path without touching \
              the connection"
         );
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_publishes_nothing_from_a_stale_lease() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = {
+            let mut state = dbc.inner.lock().unwrap();
+            let client = state.wire.take_lease_for_test(h.stmt);
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+            client
+        };
+        let preceding_ran = std::cell::Cell::new(false);
+
+        assert_eq!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+                preceding_ran.set(true);
+                true
+            }),
+            Err(SQL_ERROR)
+        );
+
+        assert!(!preceding_ran.get());
+        let dbc_state = dbc.inner.lock().unwrap();
+        assert!(dbc_state.wire.client().is_some());
+        drop(dbc_state);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.result_set_exhausted);
+        assert!(!stmt_state.batch_exhausted);
+        assert!(stmt_state.diag_records.is_empty());
     }
 
     #[test]
@@ -2342,11 +2414,15 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        assert!(!release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
+        assert!(
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
 
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let ss = stmt.inner.lock().unwrap();
         assert!(ss.result_set_exhausted);
         assert!(ss.batch_exhausted);
@@ -2359,11 +2435,11 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let ss = stmt.inner.lock().unwrap();
         assert!(ss.result_set_exhausted);
         assert!(ss.batch_exhausted);
@@ -2398,16 +2474,16 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
         assert_eq!(
-            dbc.inner.lock().unwrap().active_stmt,
+            dbc.inner.lock().unwrap().wire.statement_owner(),
             Some(h.stmt),
             "a pending second result set must keep this statement's busy claim"
         );
-        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
         let ss = stmt.inner.lock().unwrap();
         assert!(
             ss.result_set_exhausted,
@@ -2440,10 +2516,12 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0,
             "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
         );
 
@@ -2482,12 +2560,12 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
         assert!(
-            dbc.inner.lock().unwrap().active_stmt.is_none(),
+            dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
             "the ERROR token ends the batch, so the busy claim must still be released"
         );
         let ss = stmt.inner.lock().unwrap();
@@ -2536,12 +2614,15 @@ mod tests {
         position_and_inject(&h, vec![col_metadata_empty()]);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false);
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
 
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
-        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt)
+        );
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
         let ss = stmt.inner.lock().unwrap();
         assert!(!ss.result_set_exhausted);
         assert!(!ss.batch_exhausted);
@@ -2582,15 +2663,17 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0,
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0,
             "the caller must be told a server message was posted"
         );
 
         assert_eq!(
-            dbc.inner.lock().unwrap().active_stmt,
+            dbc.inner.lock().unwrap().wire.statement_owner(),
             Some(h.stmt),
             "a pending second result set means the claim is not released"
         );
@@ -2605,12 +2688,7 @@ mod tests {
         );
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(
-            dbc_state
-                .client
-                .as_ref()
-                .unwrap()
-                .info_messages()
-                .is_empty(),
+            dbc_state.wire.client().unwrap().info_messages().is_empty(),
             "must not also stay on the client, where SQLMoreResults would \
              re-post it against the result set it advances to"
         );
@@ -2636,12 +2714,16 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
-
-        assert!(release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).0);
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            dbc.inner.lock().unwrap().active_stmt.is_none(),
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
+
+        assert!(
+            dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
             "the batch is genuinely done here, so the claim is still released"
         );
         let ss = stmt.inner.lock().unwrap();
@@ -2654,12 +2736,7 @@ mod tests {
         drop(ss);
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(
-            dbc_state
-                .client
-                .as_ref()
-                .unwrap()
-                .info_messages()
-                .is_empty(),
+            dbc_state.wire.client().unwrap().info_messages().is_empty(),
             "must not stay resident on the client, where a different statement \
              claiming the connection next could have it misattributed to its \
              own diagnostics"
@@ -2677,7 +2754,7 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         // Poison the statement lock the helper needs.
         assert!(
@@ -2697,7 +2774,8 @@ mod tests {
             release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
                 ran.set(true);
                 true
-            });
+            })
+            .unwrap();
 
         assert!(!ran.get(), "the poisoned lock must skip the closure");
         assert!(
@@ -2727,7 +2805,7 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
         let earlier = [SqlInfoMessage {
             message: "row loop message".to_string(),
             state: 1,
@@ -2742,6 +2820,7 @@ mod tests {
             release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
                 post_tds_info_messages(s, &earlier)
             })
+            .unwrap()
             .0
         );
 
@@ -3616,6 +3695,38 @@ mod tests {
         assert_eq!(unsafe { header.bind_offset() }, 24);
     }
 
+    #[test]
+    fn a_parked_data_at_execution_sequence_keeps_other_statements_busy() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_extra_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let lease = lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new()));
+        assert_eq!(
+            park_dae_client(stmt, lease, None, None, Vec::new(), false, "test"),
+            SQL_NEED_DATA
+        );
+
+        let other_stmt = unsafe { handle_from_raw::<StmtHandle>(other) };
+        assert!(matches!(
+            claim_connection(dbc, other_stmt, other, "SQLExecDirectW"),
+            Err(SQL_ERROR)
+        ));
+        assert_last_diag(
+            &other_stmt.inner.lock().unwrap().diag_records,
+            ERR_CONNECTION_BUSY,
+        );
+
+        unwind_dae_inner(dbc, stmt, h.stmt, None, true);
+        let lease = claim_connection(dbc, other_stmt, other, "SQLExecDirectW")
+            .expect("the wire is released when the sequence ends");
+        return_client_idle(dbc, other, lease);
+    }
+
     /// State consistency for the AB#47510 guard on the data-at-execution
     /// unwind. `SQLFreeHandle(SQL_HANDLE_STMT)` unwinds a parked DAE sequence
     /// before freeing, so a host freeing handles from an `onexit` handler
@@ -3643,15 +3754,10 @@ mod tests {
         // would have nothing to read and would fail rather than quietly pass.
         // Routed through `park_dae_client` rather than building `DaeState` by
         // hand, so the setup is the same one the execute path produces.
-        {
-            let mut ds = dbc.inner.lock().unwrap();
-            ds.client = None;
-            ds.active_stmt = Some(h.stmt);
-        }
         assert_eq!(
             park_dae_client(
                 stmt,
-                tds_client_from_tokens(Vec::new()),
+                lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new())),
                 None,
                 None,
                 Vec::new(),
@@ -3669,11 +3775,12 @@ mod tests {
         );
         let ds = dbc.inner.lock().unwrap();
         assert!(
-            ds.client.is_some(),
+            ds.wire.client().is_some(),
             "the client must be handed back even when the cancel is skipped"
         );
         assert_eq!(
-            ds.active_stmt, None,
+            ds.wire.statement_owner(),
+            None,
             "the connection must be released, or it stays busy forever"
         );
     }

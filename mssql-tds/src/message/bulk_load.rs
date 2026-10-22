@@ -16,7 +16,7 @@ use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer}
 use crate::error::Error;
 use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::sql_identifier::{
-    TABLE_INDEX, build_multipart_name, escape_identifier, parse_multipart_identifier,
+    TABLE_INDEX, build_multipart_name, escape_identifier, parse_bulk_copy_target_identifier,
 };
 use crate::token::tokens::SqlCollation;
 use tracing::{debug, trace};
@@ -240,7 +240,7 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// Write a single column value directly (for zero-copy bulk load).
     ///
     /// This is used by the `BulkLoadRow` trait to write columns one at a time
-    /// without allocating a Vec<ColumnValues>.
+    /// without allocating a `Vec<ColumnValues>`.
     ///
     /// # Arguments
     ///
@@ -1067,7 +1067,7 @@ pub(crate) fn build_insert_bulk_command(
     column_metadata: &[BulkCopyColumnMetadata],
     options: &BulkCopyOptions,
 ) -> crate::core::TdsResult<String> {
-    let parts = parse_multipart_identifier(table_name, true)?;
+    let parts = parse_bulk_copy_target_identifier(table_name, true)?;
     if parts[TABLE_INDEX]
         .as_ref()
         .is_none_or(|part| part.is_empty())

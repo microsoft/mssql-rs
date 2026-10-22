@@ -120,7 +120,9 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_INVALID_HANDLE;
     use crate::handles::stmt::{DaeParam, DaeState, STMT_STATE_EXEC_STARTED};
+    use crate::handles::wire::{LeaseReturn, WireOwner};
     use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::tds_client_from_tokens;
 
     fn dae_with_one_param(cursor: Option<usize>) -> DaeState {
         DaeState::for_test(
@@ -196,7 +198,10 @@ mod tests {
                 }
                 if fetched < 3 {
                     assert_eq!(SQL_ERROR, exec(other));
-                    assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+                    assert_eq!(
+                        dbc.inner.lock().unwrap().wire.statement_owner(),
+                        Some(h.stmt)
+                    );
                 } else {
                     assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
                 }
@@ -214,7 +219,7 @@ mod tests {
                         crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
                     });
                 }
-                assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+                assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
                 let mut columns = -1;
                 assert_eq!(SQL_ERROR, unsafe {
                     crate::api::SQLNumResultCols(h.stmt, &mut columns)
@@ -250,13 +255,15 @@ mod tests {
             h.mark_dbc_connected();
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let dbc = stmt.parent_dbc();
-            dbc.inner.lock().unwrap().client = Some(tds_client_from_int_rows_with_trailing_tokens(
-                vec![vec![1]],
-                vec![
-                    sql_error(50000, 16, "trailing close error"),
-                    done_select_no_more(),
-                ],
-            ));
+            dbc.inner.lock().unwrap().wire.put_client_for_test(
+                tds_client_from_int_rows_with_trailing_tokens(
+                    vec![vec![1]],
+                    vec![
+                        sql_error(50000, 16, "trailing close error"),
+                        done_select_no_more(),
+                    ],
+                ),
+            );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
                 crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
@@ -288,8 +295,12 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.parent_dbc().inner.lock().unwrap().client =
-            Some(tds_client_from_int_rows_with_trailing_tokens(
+        stmt.parent_dbc()
+            .inner
+            .lock()
+            .unwrap()
+            .wire
+            .put_client_for_test(tds_client_from_int_rows_with_trailing_tokens(
                 vec![vec![1]],
                 vec![info(50000, 10, "close info"), done_select_no_more()],
             ));
@@ -341,7 +352,10 @@ mod tests {
         assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
             crate::api::SQLCancel(h.stmt)
         });
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(other)
+        );
         for expected in 1..=3 {
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(other) });
             let mut value = 0i32;
@@ -391,8 +405,14 @@ mod tests {
                     crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
                 }
             };
-            assert!(dbc.inner.lock().unwrap().client.is_none());
-            release_dbc_client(dbc, client);
+            assert!(
+                dbc.inner
+                    .lock()
+                    .unwrap()
+                    .wire
+                    .is_leased_to(WireOwner::Connection)
+            );
+            assert!(release_dbc_client(dbc, client));
             assert_eq!(
                 rc,
                 if cancel {
@@ -443,11 +463,12 @@ mod tests {
             state.set_state(STMT_STATE_EXEC_STARTED);
             state.dae = Some(dae_with_one_param(None));
         }
-        {
+        let parked = {
             let mut dbc = stmt.parent_dbc().inner.lock().unwrap();
-            dbc.client = None;
-            dbc.active_stmt = Some(h.stmt);
-        }
+            dbc.wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            dbc.wire.take_lease_for_test(h.stmt)
+        };
         std::thread::scope(|scope| {
             let (locked_tx, locked_rx) = std::sync::mpsc::channel();
             scope.spawn(move || {
@@ -458,9 +479,12 @@ mod tests {
             locked_rx.recv().unwrap();
             assert_eq!(SQL_SUCCESS, unsafe { sql_cancel(h.stmt) });
         });
-        let state = stmt.inner.lock().unwrap();
-        assert!(!state.needs_data());
-        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(!state.needs_data());
+            assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        }
+        assert!(stmt.parent_dbc().return_lease(parked, LeaseReturn::Release));
     }
 
     #[test]
@@ -542,7 +566,7 @@ mod tests {
             assert_eq!(state.diag_records.len(), 1);
             assert_eq!(state.diag_records[0].sql_state, *b"01S05");
         }
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         assert_eq!(SQL_SUCCESS, exec(other));
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(other) });
     }
@@ -571,7 +595,7 @@ mod tests {
         let fresh = stmt.new_execution_cancel().unwrap();
         // A late signal through the previous execution must remain isolated.
         previous.cancel();
-        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let mut client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
         dbc.runtime.block_on(async {
             client
                 .execute("SELECT 1".to_string(), ExecuteOptions::new().cancel(&fresh))
@@ -579,7 +603,7 @@ mod tests {
                 .unwrap();
             client.close_query().await.unwrap();
         });
-        dbc.inner.lock().unwrap().client = Some(client);
+        assert!(dbc.return_lease(client, LeaseReturn::Release));
     }
 
     #[test]
@@ -844,7 +868,7 @@ mod tests {
             .unwrap();
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(client);
+            state.wire.install(client);
             state.connection_state = crate::handles::dbc::ConnectionState::Connected;
         }
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
@@ -955,7 +979,7 @@ mod tests {
                 }
             });
             let deadline = Instant::now() + Duration::from_secs(2);
-            while dbc.inner.lock().unwrap().client.is_some() {
+            while dbc.inner.lock().unwrap().wire.client().is_some() {
                 assert!(
                     Instant::now() < deadline,
                     "{phase:?} did not enter network I/O"
@@ -1012,9 +1036,9 @@ mod tests {
             }
             {
                 let state = dbc.inner.lock().unwrap();
-                assert!(state.active_stmt.is_none());
+                assert!(state.wire.owner().is_none());
                 assert_eq!(
-                    state.client.as_ref().unwrap().is_connection_dead(),
+                    state.wire.client().unwrap().is_connection_dead(),
                     !acknowledge
                 );
             }
@@ -1123,7 +1147,10 @@ mod tests {
         };
         assert_eq!(SQL_SUCCESS, exec());
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt)
+        );
 
         assert_eq!(
             SQL_ERROR,
@@ -1136,8 +1163,8 @@ mod tests {
         }
         {
             let state = dbc.inner.lock().unwrap();
-            assert!(state.active_stmt.is_none());
-            assert!(!state.client.as_ref().unwrap().is_connection_dead());
+            assert!(state.wire.owner().is_none());
+            assert!(!state.wire.client().unwrap().is_connection_dead());
         }
         // The settled signal must not reach the close or the next execution.
         assert_eq!(SQL_SUCCESS, unsafe {
@@ -1167,7 +1194,7 @@ mod tests {
             crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.owner().is_none());
 
         assert_eq!(
             SQL_SUCCESS,
@@ -1193,7 +1220,7 @@ mod tests {
             finish_after_late_cancel(stmt, h.stmt, SQL_SUCCESS)
         );
         let continued = stmt.execution_cancel().unwrap();
-        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let mut client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
         dbc.runtime.block_on(async {
             client
                 .execute(
@@ -1204,7 +1231,7 @@ mod tests {
                 .unwrap();
             client.close_query().await.unwrap();
         });
-        dbc.inner.lock().unwrap().client = Some(client);
+        assert!(dbc.return_lease(client, LeaseReturn::Release));
     }
 
     fn cancel_blocked(h: &TestHandles, execute: impl FnOnce(SqlHandle) -> SqlReturn + Send) {
@@ -1225,7 +1252,7 @@ mod tests {
                 tx.send(execute(raw as SqlHandle)).unwrap();
             });
             let started = Instant::now();
-            while dbc.inner.lock().unwrap().client.is_some()
+            while dbc.inner.lock().unwrap().wire.client().is_some()
                 && started.elapsed() < Duration::from_secs(2)
             {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1249,8 +1276,8 @@ mod tests {
         }
         {
             let state = dbc.inner.lock().unwrap();
-            assert!(state.active_stmt.is_none());
-            assert!(!state.client.as_ref().unwrap().is_connection_dead());
+            assert!(state.wire.owner().is_none());
+            assert!(!state.wire.client().unwrap().is_connection_dead());
         }
         assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
             crate::api::SQLCancel(h.stmt)

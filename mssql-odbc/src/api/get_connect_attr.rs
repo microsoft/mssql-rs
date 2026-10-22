@@ -285,8 +285,8 @@ fn sql_get_connect_attr_w_safe(
             // that is merely busy.
             let known_dead = match state.connection_state {
                 ConnectionState::Connected => state
-                    .client
-                    .as_ref()
+                    .wire
+                    .client()
                     .is_some_and(|client| client.is_connection_dead()),
                 _ => true,
             };
@@ -788,7 +788,11 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         // A replay-transport client has not been observed dead, so the cached
         // liveness read reports ALIVE.
-        dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .put_client_for_test(tds_client_from_tokens(vec![]));
 
         let mut out: u32 = 12345;
         let get = unsafe {
@@ -804,7 +808,7 @@ mod tests {
         assert_eq!(out, SQL_CD_FALSE);
 
         // Clear the client so TestHandles drop does not try to disconnect it.
-        dbc.inner.lock().unwrap().client = None;
+        dbc.inner.lock().unwrap().wire.clear_client_for_test();
     }
 
     #[test]
@@ -823,7 +827,7 @@ mod tests {
             let mut state = dbc.inner.lock().unwrap();
             let mut client = tds_client_from_tokens(vec![]);
             client.mark_connection_dead();
-            state.client = Some(client);
+            state.wire.put_client_for_test(client);
         }
 
         let mut out: u32 = 12345;
@@ -839,7 +843,7 @@ mod tests {
         assert_eq!(get, SQL_SUCCESS);
         assert_eq!(out, SQL_CD_TRUE);
 
-        dbc.inner.lock().unwrap().client = None;
+        dbc.inner.lock().unwrap().wire.clear_client_for_test();
     }
 
     #[test]

@@ -152,6 +152,7 @@ extends:
             if ($distributionName -ne 'mssql-python-rs') {
               throw "Selected build contains '$distributionName', expected 'mssql-python-rs'."
             }
+            Write-Host "##vso[task.setvariable variable=releaseVersion]$distributionVersion"
 
             $wheels = @(
               Get-ChildItem $artifactRoot -Filter '*.whl' -File -Recurse |
@@ -217,3 +218,42 @@ extends:
               Write-Host 'mssql-python-rs official wheels submitted to PyPI via ESRP.'
               Write-Host 'Yank the 0.0.0 reservation version after this release is verified on PyPI.'
             displayName: 'Release summary'
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $definitionName = 'Bump mssql-python Release Version'
+              $headers = @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }
+              $definitionsUri = (
+                "$env:SYSTEM_COLLECTIONURI$env:SYSTEM_TEAMPROJECTID/" +
+                "_apis/build/definitions?name=$([uri]::EscapeDataString($definitionName))" +
+                "&api-version=7.1"
+              )
+              $definitions = Invoke-RestMethod -Method Get -Uri $definitionsUri -Headers $headers
+              $matches = @($definitions.value | Where-Object name -CEQ $definitionName)
+              if ($matches.Count -ne 1) {
+                throw "Expected exactly one '$definitionName' pipeline, found $($matches.Count)."
+              }
+
+              $body = @{
+                resources = @{
+                  repositories = @{
+                    self = @{
+                      refName = 'refs/heads/main'
+                    }
+                  }
+                }
+                templateParameters = @{
+                  releasedVersion = "$(releaseVersion)"
+                  sourceBuildId = "$(Build.BuildId)"
+                }
+              } | ConvertTo-Json -Depth 4
+              $runUri = (
+                "$env:SYSTEM_COLLECTIONURI$env:SYSTEM_TEAMPROJECTID/" +
+                "_apis/pipelines/$($matches[0].id)/runs?api-version=7.1"
+              )
+              $run = Invoke-RestMethod -Method Post -Uri $runUri -Headers $headers `
+                -ContentType 'application/json' -Body $body
+              Write-Host "Queued $definitionName run $($run.id) for mssql-python-rs $(releaseVersion)."
+            displayName: 'Queue mssql-python dependency update'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)

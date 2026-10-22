@@ -33,7 +33,8 @@ def load_template(name):
 @pytest.mark.parametrize(
     "selector",
     [
-        "scripts/test_bump_released_crate_versions.py",
+        "scripts/test_bump_released_versions.py",
+        "scripts/test_bump_mssql_python_release.py",
         "scripts/test_validation_pipeline.py",
     ],
 )
@@ -48,6 +49,24 @@ def test_pipeline_tests_run_in_shared_validation(selector):
     command = next(line for line in step["pwsh"].splitlines() if "python -m pytest" in line)
     assert selector in command.split()
     assert step.get("condition", "succeeded()") == "succeeded()"
+    assert not step.get("continueOnError", False)
+
+
+def test_release_automation_bash_oracles_run_on_linux():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    linux = next(job for job in build["jobs"] if job.get("job") == "Build_Linux")
+    step = next(
+        step
+        for step in linux["steps"]
+        if step.get("displayName") == "Test release automation Bash oracles"
+    )
+    command = step["bash"]
+    assert "test_required_bash_oracles_have_usable_bash" in command
+    assert "test_pipeline_token_extraction_finds_the_repo_scoped_key" in command
+    assert "test_cadence_guard_selects_the_first_and_third_tuesday" in command
+    assert "test_worker_token_extraction_finds_the_repo_scoped_key" in command
+    assert step["env"]["REQUIRE_BASH_ORACLES"] == "1"
     assert not step.get("continueOnError", False)
 
 

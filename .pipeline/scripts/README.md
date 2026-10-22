@@ -48,6 +48,32 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
 
+### docker-cargo-run.sh
+
+Wraps `docker run` and forwards the `MSSQL_RS_PUBLIC` and `MSSQL_RS` Cargo feed
+tokens with `cargo:token` providers only for non-PR execution. Azure Pipelines
+automatically supplies `BUILD_REASON`; `PullRequest` removes both feeds' token
+and provider variables from the Docker process environment and adds no Cargo
+credential arguments. Other reasons (or an unset reason for local use) retain
+authenticated forwarding for each populated token. Absent, empty, or unresolved
+Azure `$(...)` token values are omitted, including their providers. No token
+values, lengths, or presence diagnostics are logged.
+
+PR-only callers must not map feed secrets into their step environments. Shared
+PR/CI callers gate those mappings with
+`${{ if ne(variables['Build.Reason'], 'PullRequest') }}`; Cargo authentication and
+CI feed configuration are already non-PR-only. This wrapper is not a sandbox
+against arbitrary PR code, caller-supplied Docker arguments, mounted credentials,
+or credentials inherited from an agent. Keeping live feed secrets out of PR jobs,
+isolating agents, and limiting service-token permissions remain deployment
+requirements. Actual PR secret availability and live permissions have not been
+verified by this hardening.
+
+Run the mocked-Docker and template-gating regression tests without Docker or feed
+access using `python -m pytest scripts/test_docker_cargo_run.py -q` (Bash required).
+The Linux validation job enforces these executable tests; Windows runs the
+template checks and skips executable cases only when Bash is not installed.
+
 ### stamp-crate-versions.ps1
 
 Stamps the selected crates (by default `mssql-tds` and `mssql-mock-tds`) from the

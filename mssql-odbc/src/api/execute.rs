@@ -37,6 +37,8 @@ use crate::handles::stmt::{
     DaeParam, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED,
 };
+use crate::handles::wire::LeaseReturn;
+use crate::handles::wire::WireLease;
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Executes the prepared statement on `statement_handle`.
@@ -610,7 +612,6 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             finish_parameter_array(
                 dbc,
                 stmt,
-                statement_handle,
                 client,
                 result,
                 BatchClientResults {
@@ -650,14 +651,12 @@ unsafe fn write_params_processed(processed_ptr: *mut SqlULen, processed: SqlULen
 fn finish_parameter_array(
     dbc: &crate::handles::DbcHandle,
     stmt: &StmtHandle,
-    statement_handle: SqlHandle,
-    mut client: mssql_tds::connection::tds_client::TdsClient,
+    mut client: WireLease,
     result: PreparedBatchResult,
     mut batch: BatchClientResults,
 ) -> SqlReturn {
     let has_more = client.has_open_batch();
     let metadata = client.get_metadata().clone();
-    let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
     let info_messages = client.take_info_messages();
     // Parameter arrays are serialized through the same `PacketWriter` as a
     // scalar execute (`execute_sp_execute_batch`), so an unmappable value in
@@ -668,18 +667,21 @@ fn finish_parameter_array(
     // next statement's verdict. Drained before the STMT lock for the DBC-then-
     // STMT ordering reason `take_code_page_conversion_loss` documents.
     let warn_cp_loss = super::exec_common::take_code_page_conversion_loss(dbc, &mut client);
+    let current_set = client.current_parameter_set();
+    let lease_return = if has_more {
+        LeaseReturn::KeepReservation
+    } else {
+        LeaseReturn::Release
+    };
+    if !dbc.return_lease(client, lease_return) {
+        return SQL_ERROR;
+    }
+    let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
-        super::exec_common::return_client_busy(dbc, client);
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
-    let mut rc = report_parameter_array(
-        &mut stmt_state,
-        result,
-        &mut batch,
-        client.current_parameter_set(),
-        has_more,
-    );
+    let mut rc = report_parameter_array(&mut stmt_state, result, &mut batch, current_set, has_more);
     let posted_info = post_tds_info_messages(&mut stmt_state, &info_messages)
         | super::exec_common::post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     if posted_info && rc == SQL_SUCCESS {
@@ -706,27 +708,42 @@ fn finish_parameter_array(
         rc = SQL_ERROR;
     }
     drop(stmt_state);
-    if has_more {
-        super::exec_common::return_client_busy(dbc, client);
-    } else {
-        return_client_idle(dbc, statement_handle, client);
-    }
     rc
 }
 
-pub(super) fn update_parameter_array(
+pub(super) struct ParameterArrayUpdate {
+    has_more: bool,
+    result: Option<PreparedBatchResult>,
+    current_set: Option<usize>,
+}
+
+pub(super) fn take_parameter_array_update(
     stmt: &StmtHandle,
     client: &mut mssql_tds::connection::tds_client::TdsClient,
-) -> SqlReturn {
+) -> Result<Option<ParameterArrayUpdate>, SqlReturn> {
     // The IPD pointers are read before the STMT lock (never nested), and only
     // when a batch is pending, so the common path takes no descriptor lock.
     let pending = match stmt.inner.lock() {
         Ok(stmt_state) => stmt_state.parameter_array.is_some(),
-        Err(_) => return SQL_ERROR,
+        Err(_) => return Err(SQL_ERROR),
     };
     if !pending {
-        return SQL_SUCCESS;
+        return Ok(None);
     }
+    Ok(Some(ParameterArrayUpdate {
+        has_more: client.has_open_batch(),
+        result: client.take_prepared_batch_results(),
+        current_set: client.current_parameter_set(),
+    }))
+}
+
+pub(super) fn apply_parameter_array_update(
+    stmt: &StmtHandle,
+    update: Option<ParameterArrayUpdate>,
+) -> SqlReturn {
+    let Some(update) = update else {
+        return SQL_SUCCESS;
+    };
     let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
     let (param_status_ptr, params_processed_ptr) = {
         let Ok(ipd_state) = ipd.inner.lock() else {
@@ -754,21 +771,31 @@ pub(super) fn update_parameter_array(
     };
     batch.outputs.param_status_ptr = param_status_ptr;
     batch.outputs.params_processed_ptr = params_processed_ptr;
-    let has_more = client.has_open_batch();
-    let rc = match client.take_prepared_batch_results() {
+    let rc = match update.result {
         Some(result) => report_parameter_array(
             &mut stmt_state,
             result,
             &mut batch,
-            client.current_parameter_set(),
-            has_more,
+            update.current_set,
+            update.has_more,
         ),
         None => SQL_SUCCESS,
     };
-    if has_more {
+    if update.has_more {
         stmt_state.parameter_array = Some(batch);
     }
     rc
+}
+
+#[cfg(test)]
+fn update_parameter_array(
+    stmt: &StmtHandle,
+    client: &mut mssql_tds::connection::tds_client::TdsClient,
+) -> SqlReturn {
+    match take_parameter_array_update(stmt, client) {
+        Ok(update) => apply_parameter_array_update(stmt, update),
+        Err(rc) => rc,
+    }
 }
 
 fn report_parameter_array(
@@ -2327,7 +2354,7 @@ mod tests {
                 execution.dae_params.iter().any(|param| param.is_buffered()),
                 deferred
             );
-            let client = tds_client_from_tokens(Vec::new());
+            let client = WireLease::detached_for_test(tds_client_from_tokens(Vec::new()), h.stmt);
             let rc = if deferred {
                 park_deferred_dae(
                     stmt,
@@ -2405,7 +2432,7 @@ mod tests {
         materialize_test_plan(h.stmt, id);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let dbc = stmt.parent_dbc();
-        dbc.inner.lock().unwrap().client = Some(client);
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
 
         for length in [16, 24, 32] {
             set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, length);
@@ -2423,8 +2450,8 @@ mod tests {
                 dbc.inner
                     .lock()
                     .unwrap()
-                    .client
-                    .as_ref()
+                    .wire
+                    .client()
                     .unwrap()
                     .prepared_handle_for_test(id),
                 Some(77)
@@ -2534,14 +2561,14 @@ mod tests {
         materialize_test_plan(h.stmt, id);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let dbc = stmt.parent_dbc();
-        dbc.inner.lock().unwrap().client = Some(client);
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
 
         // The application path: `sql_execute` parks the client on the statement,
         // which is the only moment `claim_connection` snapshots the collation.
         assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
         {
             let state = dbc.inner.lock().unwrap();
-            assert!(state.client.is_none(), "client is parked for DAE");
+            assert!(state.wire.client().is_none(), "client is parked for DAE");
             assert_eq!(state.last_collation_code_page, Some(1252));
         }
 
@@ -2717,12 +2744,16 @@ mod tests {
             );
             let dbc = unsafe { handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
-                done_more_with_count(2),
-                done_more_with_count(1),
-                col_metadata(int_columns(1)),
-                done_no_more(),
-            ]));
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![
+                    done_more_with_count(2),
+                    done_more_with_count(1),
+                    col_metadata(int_columns(1)),
+                    done_no_more(),
+                ]));
 
             let mut input = b'1';
             let mut indicator = SQL_DATA_AT_EXEC;
@@ -3665,6 +3696,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn finish_parameter_array_publishes_nothing_from_a_stale_lease() {
+        use crate::handles::DbcHandle;
+        use crate::test_support::lease_for_test;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new()));
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+        let mut status = 77;
+        let mut processed = 88;
+
+        assert_eq!(
+            finish_parameter_array(
+                dbc,
+                stmt,
+                client,
+                PreparedBatchResult {
+                    rows: vec![reported_row(0)],
+                    complete: true,
+                },
+                BatchClientResults {
+                    outputs: ParamArrayOutputs {
+                        paramset_size: 1,
+                        param_status_ptr: &mut status,
+                        params_processed_ptr: &mut processed,
+                    },
+                    client_side_failures: 0,
+                    truncated_rows: Vec::new(),
+                    rows_affected: None,
+                    processed: 0,
+                },
+            ),
+            SQL_ERROR
+        );
+
+        assert_eq!(status, 77);
+        assert_eq!(processed, 88);
+        let state = stmt.inner.lock().unwrap();
+        assert!(!state.has_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN));
+    }
+
     /// A complete batch reports the whole array regardless of what the server
     /// said per set, and a short one stops at the last set reported.
     #[test]
@@ -3802,7 +3882,13 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let _mock_server =
             crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
-        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        let mut client = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .wire
+            .clear_client_for_test()
+            .unwrap();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().parameter_array = Some(BatchClientResults {
             outputs: ParamArrayOutputs {
@@ -3826,7 +3912,7 @@ mod tests {
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             SQLSTATE_HY000
         );
-        dbc.inner.lock().unwrap().client = Some(client);
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
     }
 
     #[test]

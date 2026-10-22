@@ -36,6 +36,11 @@ tls-schannel-direct-on-windows = ["tls-schannel-direct"]
 # self dev-dependency below.
 test-util = []
 
+[package.metadata.docs.rs]
+# docs.rs builds only the default target unless told otherwise. Add Windows so
+# the SSPI and LocalDB surface is documented too.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
 
 [lints]
 workspace = true

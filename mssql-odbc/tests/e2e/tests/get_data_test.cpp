@@ -28,6 +28,17 @@
 
 namespace {
 
+#ifdef _WIN32
+constexpr unsigned kStreamingGetDataModes = odbc_concurrency::kDefaultModes;
+#else
+// These two SharedStmt cases hit the unixODBC diagnostic-list race fixed by
+// https://github.com/lurcher/unixODBC/pull/244. Re-enable SharedStmt once either
+// (1) a fixed release reaches all supported OS package channels (long-term), or
+// (2) the mssql-odbc pipelines build/use latest unixODBC code containing the fix.
+constexpr unsigned kStreamingGetDataModes =
+    odbc_concurrency::kDefaultModes & ~odbc_concurrency::kSharedStmt;
+#endif
+
 // Builds `token` repeated `count` times.
 std::string RepeatToken(const std::string& token, size_t count) {
     std::string out;
@@ -4534,7 +4545,8 @@ ODBC_TEST_F(GetDataLiveTest, DefaultTargetOnABinaryMaxColumnDeliversTheBytes) {
 // it at any size, which PlpColumnUnsupportedCTypeReturnsHyc00 above demonstrates
 // on a three-byte value: it answers HYC00 from the stream's target gate rather
 // than converting the text the way a captured value would.
-ODBC_TEST_F(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks,
+                  kStreamingGetDataModes) {
     const size_t kTotal = 9000;
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000)"),
                   SQL_HANDLE_STMT, stmt_);
@@ -4563,10 +4575,11 @@ ODBC_TEST_F(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks) {
 // delivered to another worker's connection or statement fails here instead of
 // matching an identical constant. Covers a fixed-width, narrow, wide, binary,
 // and multi-chunk PLP read on one row. Opts into SharedDbc once that mode runs
-// nightly only (AB#49263); AB#49225 fails it intermittently.
+// nightly only (AB#49263).
 // Benefits-from-mock-tds: delay one connection's response so concurrent reads
 // interleave by construction rather than by scheduling.
-ODBC_TEST_F(GetDataLiveTest, RunUniqueValuesSurviveEveryRetrievalPath) {
+ODBC_TEST_F_MODES(GetDataLiveTest, RunUniqueValuesSurviveEveryRetrievalPath,
+                  kStreamingGetDataModes) {
     const SQLINTEGER id = Worker() * 100000 + Iteration();
     const std::string token = WorkerToken("getdata");
     const size_t kMaxChars = 9000;
