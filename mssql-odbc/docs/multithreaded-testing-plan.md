@@ -280,8 +280,10 @@ Measured 2026-10-08 on both drivers unless noted.
   master in `ea454e49`, listed under 2.3.15pre, unreleased). At 0
   `/SharedStmt` crashed inside `libodbc` in 7 of 10 runs at 2 x 1 (WSL,
   unixODBC 2.3.9) and in none of 60 at 1; level 1 narrows the window but
-  Alpine CI still crashed there. The stress profiles therefore skip
-  `/SharedStmt` on unixODBC; PR runs keep it at 2 x 1.
+  Alpine CI still crashed there. Until the pipelines test against a unixODBC
+  build with the fix (AB#49575), the stress profiles skip `/SharedStmt` on
+  unixODBC, and PR runs keep it at 2 x 1 except for the two GetData streaming
+  tests that crashed most (unregistered on non-Windows by #758).
 - Every non-diagnostic call clears the handle's diagnostics, including an idle
   `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`. Cross-thread
   `SQLCancel` preserves the interrupted call's diagnostics.

@@ -24,8 +24,9 @@
 #
 # Plan: mssql-odbc/docs/multithreaded-testing-plan.md, "Stress Profiles". The
 # schedule targets GitHub main; this definition lives only in the mssql-rs
-# project, so the pool names below are that project's. Like the validation
-# definitions, it needs the secret variable SQL_PASSWORD set on the definition.
+# project, so the pool names below are that project's. Each job generates its
+# own SQL_PASSWORD (sql-setup-template.yml, test-matrix-odbc-template.yml), so
+# the definition needs no secret variable.
 # The Linux legs run mssql-odbc only; the msodbcsql parity leg is Windows-only.
 name: mssql-odbc multithreaded stress
 trigger: none
