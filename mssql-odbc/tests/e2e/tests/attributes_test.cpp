@@ -2143,6 +2143,20 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
 // is not an MSF opt-out in either driver.
 // -------------------------------------------------------------------
 ODBC_TEST_F(AttributesTest, MultiSubnetFailoverReportsTheEffectiveSetting) {
+    const auto& cfg = ODBCTestConfig::Instance();
+    if (cfg.HasConnStr() || cfg.HasDSN() || cfg.Server().empty()) {
+        GTEST_SKIP() << "Requires ODBC_TEST_SERVER to select an explicit TCP endpoint";
+    }
+    std::string server = cfg.Server();
+    if (server.find(',') == std::string::npos) {
+        if (server.find('\\') != std::string::npos) {
+            GTEST_SKIP() << "MSF requires an explicit TCP port for a named instance";
+        }
+        server += ",1433";
+    }
+    // Address outranks Server; an explicit port avoids the local Windows
+    // shared-memory exemption without changing the inherited MSF value.
+    const std::string tcp_address = "Address=" + server + ";";
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
     constexpr SQLUINTEGER kUnset = 0xFFFFFFFFu;
@@ -2173,7 +2187,7 @@ ODBC_TEST_F(AttributesTest, MultiSubnetFailoverReportsTheEffectiveSetting) {
                 SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER,
                                            c.attr)));
         }
-        ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, c.keyword)))
+        ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, tcp_address + c.keyword)))
             << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
 
         SQLRETURN rc = SQL_ERROR;

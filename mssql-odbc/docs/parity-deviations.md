@@ -1148,7 +1148,10 @@ msodbcsql build is measured.
     Driver Manager login to the mock did not complete, so connected keyword
     precedence and network behavior are not claimed as retail measurements.
     `MultiSubnetFailoverReportsTheEffectiveSetting` pins each driver's
-    expected connected values in the e2e comparison suite; running that suite
+    expected connected values for explicitly addressed TCP endpoints, not the
+    implicit local Windows waterfall. Its connection-string/attribute matrix
+    requires `ODBC_TEST_SERVER` (and an explicit port for a named instance).
+    Running that suite
     against the CI-pinned retail build and SQL Server closes this evidence gap.
 
     The intent is one immediate parallel strategy rather than TNIR's staged

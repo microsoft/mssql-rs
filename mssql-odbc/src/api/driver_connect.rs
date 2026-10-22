@@ -901,6 +901,12 @@ mod tests {
             let task = tokio::spawn(async move { server.run_with_shutdown(receiver).await });
             (address, shutdown, task)
         });
+        let server = format!("Server=tcp:{},{};", address.ip(), address.port());
+        let address_override = format!(
+            "Server=localhost;Address={},{};",
+            address.ip(),
+            address.port(),
+        );
         for (keyword, attribute, effective) in [
             ("", None, 1),
             ("MultiSubnetFailover=No;", None, 0),
@@ -924,11 +930,16 @@ mod tests {
                     SQL_SUCCESS,
                 );
             }
-            for (options, expected) in [(keyword, effective), ("", attribute.unwrap_or(1))] {
+            for (endpoint, options, expected) in [
+                (&server, keyword, effective),
+                (&address_override, "", attribute.unwrap_or(1)),
+            ] {
                 let input: Vec<u16> = cs(&format!(
-                    "Server=tcp:{},{};UID=sa;<PW>=unused;Encrypt=no;TrustServerCertificate=yes;{options}",
-                    address.ip(), address.port(),
-                )).encode_utf16().chain(std::iter::once(0)).collect();
+                    "{endpoint}UID=sa;<PW>=unused;Encrypt=no;TrustServerCertificate=yes;{options}",
+                ))
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
                 let result = unsafe {
                     SQLDriverConnectW(
                         handles.dbc,
