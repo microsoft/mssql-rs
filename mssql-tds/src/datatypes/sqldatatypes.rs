@@ -330,7 +330,7 @@ impl VectorBaseType {
 
     /// Returns the maximum number of dimensions a single vector value of this
     /// base type can hold. Based on the TDS protocol, the maximum payload size
-    /// is constrained by [`VECTOR_MAX_SIZE`] (8000 bytes) which allows up to
+    /// is constrained by `VECTOR_MAX_SIZE` (8000 bytes) which allows up to
     /// 1998 elements for Float32 and 3996 elements for Float16 vectors.
     pub const fn max_dimensions(self) -> u16 {
         // (VECTOR_MAX_SIZE - VECTOR_HEADER_SIZE) / element_size_bytes

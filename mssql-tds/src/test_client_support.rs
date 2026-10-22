@@ -79,7 +79,7 @@ pub use crate::datatypes::tds_value_serializer::TdsTypeContext;
 ///
 /// Correct for a value of any size: `PacketWriter` flushes each full packet
 /// through `NetworkWriter::send` and copies the overflow back to the start of
-/// its buffer, so [`CapturingWriter`] keeps the flushed packets and only
+/// its buffer, so `CapturingWriter` keeps the flushed packets and only
 /// `..position()` of the final buffer is read.
 pub fn serialized_value_wire_bytes(
     value: &crate::datatypes::column_values::ColumnValues,
@@ -765,8 +765,9 @@ pub fn env_change_rollback_transaction() -> ScriptedToken {
 
 /// A `ResetConnection` ENVCHANGE token — the acknowledgement the server emits
 /// when it processes a RESETCONNECTION request. Script it ahead of a terminal
-/// DONE to drive [`TdsClient::reset_connection`](crate::connection::tds_client::TdsClient::reset_connection)
-/// to completion in a consumer test.
+/// DONE to complete a reset requested with
+/// [`TdsClient::prepare_reset_connection`](crate::connection::tds_client::TdsClient::prepare_reset_connection)
+/// in a consumer test.
 pub fn env_change_reset_connection() -> ScriptedToken {
     ScriptedToken(Tokens::EnvChange(EnvChangeToken {
         sub_type: EnvChangeTokenSubType::ResetConnection,

@@ -70,18 +70,21 @@ raw unpaired UTF-16 units in ODBC `SQL_C_WCHAR` buffers is a separate behavior.
 | `integrated-auth` | **yes** | Enables both `sspi` and `gssapi` |
 | `sspi` | via `integrated-auth` | Windows SSPI (Kerberos/NTLM) |
 | `gssapi` | via `integrated-auth` | Unix GSSAPI (Kerberos) via runtime `dlopen` |
+| `tls-schannel-direct-on-windows` | **yes** | Enables `tls-schannel-direct` |
+| `tls-schannel-direct` | via `tls-schannel-direct-on-windows` | Windows: TLS through the in-tree Schannel engine instead of `native-tls`. No effect on other targets. |
 
-Disable the default to drop platform-specific auth dependencies:
+Disable the defaults to drop platform-specific auth dependencies and use
+`native-tls` on every platform:
 
 ```toml
-mssql-tds = { version = "0.1", default-features = false }
+mssql-tds = { version = "0.3", default-features = false }
 ```
 
 ## Quick start
 
 ```rust,no_run
 use mssql_tds::connection::client_context::ClientContext;
-use mssql_tds::connection::tds_client::ResultSetClient;
+use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::TdsResult;
 
@@ -97,12 +100,10 @@ async fn main() -> TdsResult<()> {
         .create_client(context, "tcp:localhost,1433", None)
         .await?;
 
-    client
-        .execute("SELECT 1 AS value".into(), None, None)
-        .await?;
+    client.execute("SELECT 1 AS value".into(), ()).await?;
 
-    if let Some(rs) = client.get_current_resultset() {
-        while let Some(row) = rs.next_row().await? {
+    if client.on_rows() {
+        while let Some(row) = client.next_row().await? {
             println!("{row:?}");
         }
     }
@@ -111,6 +112,11 @@ async fn main() -> TdsResult<()> {
     Ok(())
 }
 ```
+
+`execute` takes `()` for default options, or an `ExecuteOptions` to set a
+per-command timeout, cancellation handle, Always Encrypted override, or
+statement-error mode. It returns a `StatementResult` for the first result in
+the batch; use `advance()` to move through the rest of a multi-statement batch.
 
 ## Cancelling an outstanding response
 

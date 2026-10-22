@@ -35,7 +35,7 @@ use crate::{
 ///
 /// Each variant wraps an `Option` to support SQL `NULL`. The inner types
 /// carry the Rust-side value; serialization into TDS wire format is handled
-/// by [`TdsValueSerializer`].
+/// by the crate-internal `TdsValueSerializer`.
 #[derive(Debug, PartialEq, Clone)]
 pub enum SqlType {
     /// Boolean value (`bit`).
