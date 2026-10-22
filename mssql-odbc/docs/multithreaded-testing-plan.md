@@ -370,10 +370,9 @@ Measured 2026-10-08 on both drivers unless noted.
    parameters, and parameterized errors that stay on their STMT. TVPs, `vector`
    and UDT parameters, and output or data-at-execution parameters in arrays wait
    for driver support.
-3. **Shared DBC** (`SharedDbc`): opt in the eligible tests from 1 and 2 once
-   AB#49225 is fixed (PR runs skip the mode; the stress profiles run it).
-   Array DML stays out until a busy retry
-   cannot duplicate rows.
+3. **Shared DBC** (`SharedDbc`): opt in the eligible tests from 1 and 2; PR and
+   stress runs both run the mode (AB#49225 was fixed by #710). Array DML stays
+   out until a busy retry cannot duplicate rows.
 4. **Shared STMT diagnostics** (`SharedStmt`): every converted test, especially
    those that post warnings and errors. Concurrent in the driver on the DBC
    only (see Driver Manager facts); same-STMT races are scenario 8.
@@ -428,7 +427,7 @@ ThreadSanitizer target (AB#49259).
 
 | Profile | Where | Driver | Threads x iterations | Modes run | Retries |
 |---|---|---|---|---|---|
-| PR | validation pipeline, every PR | both | 2 x 1 | all but `SharedDbc` | 3 |
+| PR | validation pipeline, every PR | both | 2 x 1 | all | 3 |
 | Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
 | Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
 | Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
@@ -441,9 +440,8 @@ ThreadSanitizer target (AB#49259).
 - The nightly run exists to flush out obvious races while suites convert.
   Remove its schedule two to three weeks after it starts, once its findings
   are fixed; PR and weekly remain.
-- PR skips `SharedDbc` until AB#49225 is fixed; no test opts into it yet. PRs
-  do not hunt races: the 2 x 1 run catches tests unfit for concurrency (fixed
-  object names, process-wide settings) in the PR that adds them.
+- PRs do not hunt races: the 2 x 1 run catches tests unfit for concurrency
+  (fixed object names, process-wide settings) in the PR that adds them.
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
 - Scenarios 7-10 join the stress run as their suites land (AB#49261,

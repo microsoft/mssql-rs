@@ -21,8 +21,8 @@
 # -MtProfile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable), as in
 # run_e2e.sh --mt-profile:
-#   pr       (default) every ctest entry; concurrent variants at the harness
-#            default of 2 threads x 1 iteration, without /SharedDbc.
+#   pr       (default) every ctest entry; concurrent variants, every mode, at the
+#            harness default of 2 threads x 1 iteration.
 #   nightly  only the <name>_mt entries, 8 x 20, every mode.
 #   weekly   only the <name>_mt entries, 16 x 50, every mode.
 # nightly and weekly ignore -Retries (an intermittent failure is what they look
@@ -331,9 +331,7 @@ function Set-MtProfile {
     foreach ($name in $script:MtEnvNames) {
         $script:MtSavedEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
-    if (-not $script:MtStress) {
-        if (-not $env:MSSQL_ODBC_MT_SKIP_MODES) { $env:MSSQL_ODBC_MT_SKIP_MODES = 'SharedDbc' }
-    } else {
+    if ($script:MtStress) {
         $threads, $iters = if ($MtProfile -eq 'nightly') { 8, 20 } else { 16, 50 }
         if (-not $env:MSSQL_ODBC_MT_THREADS) { $env:MSSQL_ODBC_MT_THREADS = "$threads" }
         if (-not $env:MSSQL_ODBC_MT_ITERS) { $env:MSSQL_ODBC_MT_ITERS = "$iters" }

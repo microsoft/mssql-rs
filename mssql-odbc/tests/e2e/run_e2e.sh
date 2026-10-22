@@ -18,8 +18,8 @@
 #
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
-#   pr       (default) every ctest entry; concurrent variants at the harness
-#            default of 2 threads x 1 iteration, without /SharedDbc.
+#   pr       (default) every ctest entry; concurrent variants, every mode, at the
+#            harness default of 2 threads x 1 iteration.
 #   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
 #   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
 # nightly and weekly ignore --retries (an intermittent failure is what they
@@ -208,7 +208,6 @@ apply_mt_profile() {
     local threads iters
     case "$MT_PROFILE" in
         pr)
-            export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedDbc}"
             ;;
         nightly|weekly)
             if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
