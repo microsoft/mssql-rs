@@ -140,9 +140,20 @@ client's. The report adds:
   skipped as `canceled`;
 - findings marked `confirmed`, `suspected` or `informational`, and no
   remediation advice beyond the request for a named instance's port above;
-- the ordered error chain with its identifiers (SQL Server error, state and
-  class, operating-system error, symbolic code), noting where a classification
-  relied on message text;
+- the ordered error chain, with SQL Server's errors most severe first, as the
+  ODBC driver lists them. In text, an error the driver has a wording for is
+  printed as sqlcmd prints it (`Sqlcmd: Error: mssql-tds : ...`), once when
+  several addresses give the same line; any other error is printed with its
+  identifiers (SQL Server error, state and class, operating-system error,
+  symbolic code). The JSON report keeps every error with its identifiers, the
+  driver's wording as `errors[].text`, and `fromMessageText` where a
+  classification relied on message text. After a failed connection the chain
+  ends with the driver's summaries, as `client` errors:
+  `networkRelatedError`, or `clientUnableToEstablishConnection` after a failed
+  TLS handshake, and `loginTimeoutExpired` only when a time limit ran out
+  (outside Windows it comes before the errors it sums up, where the driver
+  prints it). When the client's own time limit runs out, its error has the
+  code `timedOut`;
 - the specialist domain for a support handoff (`connectivity.network`,
   `security.tlsCertificate`, `security.authentication.sql`, ..., or
   `undetermined` with candidates), never presented as a root cause; unless a
@@ -166,10 +177,10 @@ user names are replaced with labels (`database-1`, `user-1`) that are stable
 within one run only, in the text and JSON report alike, and in error text
 where they appear as whole words. `--local-detail` shows them as they are
 (JSON `localDetail: true`). Text sqlcmd cannot classify, such as error
-messages, is flagged for review before sharing (JSON `reviewBeforeSharing`),
-with or without local detail. No check reports certificate subject or SAN
-names or file paths; they would be labelled the same way. The password is
-never part of the report.
+messages, is flagged for review before sharing (`errors[].message` and
+`errors[].text` in `reviewBeforeSharing`), with or without local detail. No
+check reports certificate subject or SAN names or file paths; they would be
+labelled the same way. The password is never part of the report.
 
 The checks observe the client's real connection: sqlcmd makes no network call
 of its own. `mssql-tds` makes one connection attempt, as a normal run does,
