@@ -75,42 +75,49 @@ protected:
 };
 
 // A character literal holding only a time.
-ODBC_TEST_F(TimeToTimestampLiveTest, CharacterTimeWidensToTodaysDate) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, CharacterTimeWidensToTodaysDate,
+                  odbc_concurrency::kAllModes) {
     ExpectWidenedToToday("SELECT CAST('12:34:56' AS VARCHAR(32))", SQL_C_TYPE_TIMESTAMP, 12, 34,
                          56, 0);
 }
 
-ODBC_TEST_F(TimeToTimestampLiveTest, CharacterTimeKeepsItsFraction) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, CharacterTimeKeepsItsFraction,
+                  odbc_concurrency::kAllModes) {
     ExpectWidenedToToday("SELECT CAST('12:34:56.789' AS VARCHAR(32))", SQL_C_TYPE_TIMESTAMP, 12,
                          34, 56, 789000000);
 }
 
 // A real time column, which reaches the conversion as decoded parts rather than
 // as text, so it is a separate path into the same rule.
-ODBC_TEST_F(TimeToTimestampLiveTest, TimeColumnWidensToTodaysDate) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, TimeColumnWidensToTodaysDate,
+                  odbc_concurrency::kAllModes) {
     ExpectWidenedToToday("SELECT CAST('12:34:56.789' AS TIME(3))", SQL_C_TYPE_TIMESTAMP, 12, 34,
                          56, 789000000);
 }
 
-ODBC_TEST_F(TimeToTimestampLiveTest, ZeroScaleTimeColumnWidensToTodaysDate) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, ZeroScaleTimeColumnWidensToTodaysDate,
+                  odbc_concurrency::kAllModes) {
     ExpectWidenedToToday("SELECT CAST('12:34:56' AS TIME(0))", SQL_C_TYPE_TIMESTAMP, 12, 34, 56, 0);
 }
 
 // time(7) carries 100ns resolution, which the timestamp struct keeps.
-ODBC_TEST_F(TimeToTimestampLiveTest, TimeColumnKeepsHundredNanosecondResolution) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, TimeColumnKeepsHundredNanosecondResolution,
+                  odbc_concurrency::kAllModes) {
     ExpectWidenedToToday("SELECT CAST('12:34:56.1234567' AS TIME(7))", SQL_C_TYPE_TIMESTAMP, 12,
                          34, 56, 123456700);
 }
 
 // The ODBC 2.x spelling resolves to the same conversion.
-ODBC_TEST_F(TimeToTimestampLiveTest, LegacyTimestampSpellingWidensToo) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, LegacyTimestampSpellingWidensToo,
+                  odbc_concurrency::kAllModes) {
     ExpectWidenedToToday("SELECT CAST('12:34:56' AS TIME(0))", SQL_C_TIMESTAMP, 12, 34, 56, 0);
 }
 
 // The date-only targets still have nothing to build a date from. The SQLSTATE
 // differs by where the mismatch is: bad text for the target is 22018, while a
 // column whose type cannot feed the target at all is 07006.
-ODBC_TEST_F(TimeToTimestampLiveTest, CharacterTimeIntoDateIsStillInvalidCharacterValue) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, CharacterTimeIntoDateIsStillInvalidCharacterValue,
+                  odbc_concurrency::kAllModes) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('12:34:56' AS VARCHAR(32))"));
 
     SQL_DATE_STRUCT date;
@@ -121,7 +128,8 @@ ODBC_TEST_F(TimeToTimestampLiveTest, CharacterTimeIntoDateIsStillInvalidCharacte
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(TimeToTimestampLiveTest, TimeColumnIntoDateIsStillRestrictedDataType) {
+ODBC_TEST_F_MODES(TimeToTimestampLiveTest, TimeColumnIntoDateIsStillRestrictedDataType,
+                  odbc_concurrency::kAllModes) {
     ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('12:34:56' AS TIME(0))"));
 
     SQL_DATE_STRUCT date;

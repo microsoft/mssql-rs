@@ -46,7 +46,8 @@ protected:
 // -- applies to SQL_C_STINYINT and to any other source. See fetch_convert.rs.
 // ---------------------------------------------------------------------------
 
-ODBC_TEST_F(NumericTypesLiveTest, TinyintToTinyintTargetViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, TinyintToTinyintTargetViaBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(200 AS TINYINT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLCHAR v = 0;
@@ -58,7 +59,8 @@ ODBC_TEST_F(NumericTypesLiveTest, TinyintToTinyintTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, SmallintToSshortTargetViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, SmallintToSshortTargetViaBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(-32768 AS SMALLINT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLSMALLINT v = 0;
@@ -71,7 +73,7 @@ ODBC_TEST_F(NumericTypesLiveTest, SmallintToSshortTargetViaBoundFetch) {
 
 // BIGINT at its lower bound: the one value that cannot be negated, so a
 // sign-handling bug in the decode cannot round-trip it by accident.
-ODBC_TEST_F(NumericTypesLiveTest, BigintMinViaGetData) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, BigintMinViaGetData, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(-9223372036854775808 AS BIGINT) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -84,7 +86,7 @@ ODBC_TEST_F(NumericTypesLiveTest, BigintMinViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, BigintMaxViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, BigintMaxViaBoundFetch, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(9223372036854775807 AS BIGINT) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -100,7 +102,7 @@ ODBC_TEST_F(NumericTypesLiveTest, BigintMaxViaBoundFetch) {
 // BIT — both values, because a truthiness bug only shows on one of them
 // ---------------------------------------------------------------------------
 
-ODBC_TEST_F(NumericTypesLiveTest, BitBothValuesViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, BitBothValuesViaBoundFetch, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS BIT) AS t, CAST(0 AS BIT) AS f"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -114,7 +116,7 @@ ODBC_TEST_F(NumericTypesLiveTest, BitBothValuesViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, BitViaGetData) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, BitViaGetData, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS BIT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -130,7 +132,8 @@ ODBC_TEST_F(NumericTypesLiveTest, BitViaGetData) {
 // mistake (reading a REAL as a double or vice versa) cannot round-trip it.
 // ---------------------------------------------------------------------------
 
-ODBC_TEST_F(NumericTypesLiveTest, RealToFloatTargetViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, RealToFloatTargetViaBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS REAL) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLREAL v = 0.0f;
@@ -142,7 +145,7 @@ ODBC_TEST_F(NumericTypesLiveTest, RealToFloatTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, RealToFloatTargetViaGetData) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, RealToFloatTargetViaGetData, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS REAL) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -153,7 +156,8 @@ ODBC_TEST_F(NumericTypesLiveTest, RealToFloatTargetViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, FloatToDoubleTargetViaBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS FLOAT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLDOUBLE v = 0.0;
@@ -165,7 +169,8 @@ ODBC_TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaGetData) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, FloatToDoubleTargetViaGetData,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.1 AS FLOAT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -181,7 +186,8 @@ ODBC_TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaGetData) {
 // kept: msodbcsql's DoubleToChar writes it, while its decimal and money paths
 // strip it. Asserted here so the asymmetry is verified rather than only
 // described in a comment.
-ODBC_TEST_F(NumericTypesLiveTest, FloatToCharKeepsItsLeadingZero) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, FloatToCharKeepsItsLeadingZero,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.5 AS FLOAT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -192,7 +198,8 @@ ODBC_TEST_F(NumericTypesLiveTest, FloatToCharKeepsItsLeadingZero) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, RealToCharKeepsItsLeadingZero) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, RealToCharKeepsItsLeadingZero,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.5 AS REAL) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -210,7 +217,8 @@ ODBC_TEST_F(NumericTypesLiveTest, RealToCharKeepsItsLeadingZero) {
 // that mistake cannot survive.
 // ---------------------------------------------------------------------------
 
-ODBC_TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -229,7 +237,8 @@ ODBC_TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaGetData) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaGetData,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -254,7 +263,8 @@ ODBC_TEST_F(NumericTypesLiveTest, UniqueidentifierToGuidTargetViaGetData) {
 // normalising it away.
 // ---------------------------------------------------------------------------
 
-ODBC_TEST_F(NumericTypesLiveTest, DecimalToCharKeepsScaleViaBoundFetch) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, DecimalToCharKeepsScaleViaBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(123.4500 AS DECIMAL(10,4)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -268,7 +278,8 @@ ODBC_TEST_F(NumericTypesLiveTest, DecimalToCharKeepsScaleViaBoundFetch) {
 
 // A negative decimal, since the sign is carried separately from the digits on
 // the wire.
-ODBC_TEST_F(NumericTypesLiveTest, NegativeDecimalToCharViaGetData) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, NegativeDecimalToCharViaGetData,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(-0.0001 AS DECIMAL(10,4)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -288,7 +299,8 @@ ODBC_TEST_F(NumericTypesLiveTest, NegativeDecimalToCharViaGetData) {
 // SQLGetData did not.
 // ---------------------------------------------------------------------------
 
-ODBC_TEST_F(NumericTypesLiveTest, NullWithNoIndicatorViaBoundFetchIs22002) {
+ODBC_TEST_F_MODES(NumericTypesLiveTest, NullWithNoIndicatorViaBoundFetchIs22002,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLINTEGER v = 7;
