@@ -357,6 +357,9 @@ impl QueryResponse {
 /// ignored, since `Begin` always acknowledges with an `EnvChange` + `DONE`.
 pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
 
+/// Delays BEGIN's DONE after sending its transaction ENVCHANGE.
+pub const TM_BEGIN_COMPLETION_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_COMPLETION_DELAY__";
+
 /// Delays a transaction commit response, using only [`QueryResponse::delay`].
 pub const TM_COMMIT_DELAY_KEY: &str = "__MOCK_TDS_TM_COMMIT_DELAY__";
 

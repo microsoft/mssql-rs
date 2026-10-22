@@ -758,6 +758,16 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     } else {
         begin_dbc_transaction(dbc, &mut client)
     };
+    // BEGIN's ENVCHANGE can precede a timeout. Do not hand an autocommit
+    // connection back with that transaction still open.
+    if result.is_err()
+        && client.has_active_transaction()
+        && !client.is_connection_dead()
+        && let Err(e) = end_dbc_transaction(dbc, &mut client, false)
+    {
+        error!(%e, "{op}: rollback after failed transaction begin failed");
+        client.mark_connection_dead();
+    }
     release_dbc_client(dbc, client);
 
     let Ok(mut state) = dbc.inner.lock() else {
@@ -1201,6 +1211,58 @@ mod tests {
         );
         assert_connection_timeout(dbc, rc, started.elapsed());
         assert!(dbc.inner.lock().unwrap().autocommit);
+    }
+
+    #[test]
+    fn connection_timeout_after_begin_envchange_restores_autocommit() {
+        for rollback_stalls in [false, true] {
+            let h = TestHandles::with_env_dbc();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let server = connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+            server.register_query(
+                mssql_mock_tds::TM_BEGIN_COMPLETION_DELAY_KEY,
+                QueryResponse::select_one().with_delay(SLOW_RESPONSE),
+            );
+            if rollback_stalls {
+                server.set_tm_end_delay(false, SLOW_RESPONSE);
+            }
+            assert_eq!(
+                set_connection_attr(&h, odbc_types::SQL_ATTR_CONNECTION_TIMEOUT, 1),
+                SQL_SUCCESS
+            );
+
+            let started = Instant::now();
+            let rc = set_connection_attr(
+                &h,
+                odbc_types::SQL_ATTR_AUTOCOMMIT,
+                SQL_AUTOCOMMIT_OFF as usize,
+            );
+            assert_connection_timeout(dbc, rc, started.elapsed());
+            {
+                let state = dbc.inner.lock().unwrap();
+                assert!(state.autocommit);
+                let client = state.client.as_ref().unwrap();
+                assert_eq!(client.is_connection_dead(), rollback_stalls);
+                if !rollback_stalls {
+                    assert!(!client.has_active_transaction());
+                }
+            }
+            if !rollback_stalls {
+                server.register_query(
+                    mssql_mock_tds::TM_BEGIN_COMPLETION_DELAY_KEY,
+                    QueryResponse::select_one().with_delay(Duration::from_millis(10)),
+                );
+                assert_eq!(
+                    set_connection_attr(
+                        &h,
+                        odbc_types::SQL_ATTR_AUTOCOMMIT,
+                        SQL_AUTOCOMMIT_OFF as usize,
+                    ),
+                    SQL_SUCCESS
+                );
+                assert!(!dbc.inner.lock().unwrap().autocommit);
+            }
+        }
     }
 
     #[test]

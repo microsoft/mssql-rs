@@ -327,23 +327,31 @@ impl<'a> PacketWriter<'a> {
     /// itself: [`resume`](Self::resume) always takes a fresh timestamp instead
     /// of restoring the suspended one (see its doc comment), so it is not
     /// carried in [`SuspendedMessage`].
-    pub(crate) fn suspend(self) -> SuspendedMessage {
-        SuspendedMessage {
+    pub(crate) fn suspend(mut self) -> SuspendedMessage {
+        self.take_message()
+    }
+
+    /// Detaches a message through a borrowed writer. The original writer must
+    /// not be used again; resuming the returned message is the only safe write.
+    pub(crate) fn take_message(&mut self) -> SuspendedMessage {
+        let message = SuspendedMessage {
             packet_type: self.packet_type,
             max_payload_size: self.max_payload_size,
             packet_id: self.packet_id,
-            payload_cursor: self.payload_cursor,
+            payload_cursor: std::mem::take(&mut self.payload_cursor),
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
             send_incomplete: self.send_incomplete,
             send_attempted: self.send_attempted,
             message_complete: self.message_complete,
             max_timeout_sec: self.max_timeout_sec,
-            cancel_handle: self.cancel_handle,
+            cancel_handle: self.cancel_handle.take(),
             reset_mode: self.reset_mode,
             eom_pending: self.eom_pending,
             code_page_conversion_loss: self.code_page_conversion_loss,
-        }
+        };
+        self.send_incomplete = true;
+        message
     }
 
     /// Reattaches a previously [`suspend`](Self::suspend)ed message to a network
@@ -974,6 +982,26 @@ pub(crate) mod tests {
         drop(writer);
         assert_eq!(mock.send_calls, 1);
         assert_eq!(mock.data.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn take_message_preserves_buffer_and_blocks_the_original_writer() {
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::BulkLoad, &mut mock, None, None);
+        writer.write_byte_async(0xAB).await.unwrap();
+        let message = writer.take_message();
+        assert!(message.nothing_sent());
+        assert!(!message.send_incomplete());
+        assert!(writer.finalize().await.is_err());
+        assert!(writer.cancel_current_message().await.is_err());
+        drop(writer);
+        assert_eq!(mock.send_calls, 0);
+
+        let mut writer = PacketWriter::resume(message, &mut mock);
+        writer.finalize().await.unwrap();
+        drop(writer);
+        assert_eq!(mock.send_calls, 1);
+        assert_eq!(mock.data[PacketWriter::PACKET_HEADER_SIZE], 0xAB);
     }
 
     #[tokio::test(start_paused = true)]

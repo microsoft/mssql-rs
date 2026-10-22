@@ -119,6 +119,10 @@ retires the connection rather than returning a desynchronized stream to the pool
 Reset still marks a failed rollback's connection dead, and disconnect rollback
 remains best-effort. An isolation-change failure invalidates the isolation cache
 because the server may have applied the change before its response was lost.
+If switching to manual commit fails after BEGIN's ENVCHANGE, the driver rolls
+back the surviving transaction before returning the original error. If rollback
+fails, it marks the connection dead rather than leaving a usable autocommit
+connection inside a transaction.
 
 Source evidence: `sqlcprot.h`, `SetNetIOTimeout` and `GetCancelTimeoutValue`;
 `sqlcmisc.cpp`, the isolation setter; `sqlcconn.cpp`, `ChangeDatabase` and
