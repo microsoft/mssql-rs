@@ -44,14 +44,13 @@ parameters:
   - name: pytestMarker
     type: string
     default: 'not slow'
-  # pytest node IDs excluded from the run. These stress tests race on timing and
-  # fail under CI CPU contention without a driver defect
-  # (https://github.com/microsoft/mssql-rs/issues/762). Remove them once the
-  # pinned mssql-python revision includes the upstream fix.
+  # pytest node IDs excluded from the run. The GIL-release test asserts a >2x
+  # wall-clock speedup for 10 concurrent connects, which measured 1.88x-2.82x on
+  # CI agents and fails without a GIL or driver regression
+  # (https://github.com/microsoft/mssql-rs/issues/762).
   - name: pytestDeselect
     type: object
     default:
-      - tests/test_004_cursor_arrow.py::test_arrow_reader_cancel_from_other_thread
       - tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release
 
 steps:

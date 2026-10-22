@@ -545,7 +545,6 @@ def test_mssql_python_odbc_job_deselects_only_timing_flaky_tests():
     template = load_template("test-mssql-python-odbc-template.yml")
     params = {p["name"]: p["default"] for p in template["parameters"]}
     assert params["pytestDeselect"] == [
-        "tests/test_004_cursor_arrow.py::test_arrow_reader_cancel_from_other_thread",
         "tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release",
     ]
     step = next(
