@@ -582,9 +582,10 @@ Tracked under AB#49256:
    `num_result_cols`, `more_results`, `row_count`) runs in the default modes,
    except a fixture that sets the ENV's ODBC version (HY010 on a shared ENV)
    and the three explicit-descriptor tests (Windows Driver Manager deadlock);
-   each file records why. Worker-token tests: a typed row of every scalar type,
-   interleaved results and row counts, and a 5000-row stream. `SharedDbc`
-   opt-ins wait for AB#49225.
+   each file records why. On non-Windows, #758 also leaves `/SharedStmt` out of
+   two GetData streaming tests until AB#49575. Worker-token tests: a typed row
+   of every scalar type, interleaved results and row counts, and a 5000-row
+   stream. `SharedDbc` opt-ins wait for AB#49225.
 4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
    remaining cancel cases `cancel_test.cpp` does not cover, added to it
    (idle cursor cleanup is covered by `connection_busy_test.cpp`, AB#49386):
