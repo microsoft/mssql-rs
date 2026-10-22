@@ -637,7 +637,7 @@ fn install_fuzz_client(dbc: SqlHandle, server_bytes: &[u8]) {
     let Ok(mut state) = dbc_ref.inner.lock() else {
         return;
     };
-    state.client = Some(client);
+    state.wire.install(client);
     state.connection_state = ConnectionState::Connected;
 }
 

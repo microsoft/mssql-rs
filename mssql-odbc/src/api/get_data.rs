@@ -17,6 +17,7 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
+use crate::api::exec_common::post_claim_error;
 use crate::api::exec_common::{finish_cancelled_cursor, release_busy_if_row_exhausted};
 use crate::api::fetch_scroll::{element_stride, typed_plp_chunk_fits};
 use crate::api::odbc_types::SqlWChar;
@@ -27,6 +28,7 @@ use crate::api::util::{
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, CapturedPlpWire, STMT_STATE_CURSOR_OPEN, StmtState};
+use crate::handles::wire::{ClaimPolicy, LeaseReturn, WireOwner};
 use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
 use mssql_tds::core::TdsResult;
@@ -917,22 +919,20 @@ fn try_deliver_complete_buffered_unicode_plp(
     let out_len = payload_capacity.min(payload.len()) & !1;
     let dbc = stmt.parent_dbc();
     let mut dbc_state = dbc.inner.lock().ok()?;
-    if dbc_state
-        .active_stmt
-        .is_some_and(|busy_stmt| busy_stmt != statement_handle)
-    {
-        return None;
-    }
     let poll = dbc_state
-        .client
-        .as_mut()?
+        .wire
+        .parked_client_mut(
+            WireOwner::Statement(statement_handle),
+            ClaimPolicy::IdleOrOwn,
+        )
+        .ok()?
         .try_read_row_plp_complete(col_index - 1, &mut payload[..out_len])
         .ok()?;
     let value = match poll {
         CursorPoll::Pending => return None,
         CursorPoll::Ready(value) => value,
     };
-    dbc_state.active_stmt = Some(statement_handle);
+    dbc_state.wire.reserve(statement_handle);
     drop(dbc_state);
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -1027,18 +1027,24 @@ fn finish_get_data(
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         return rc;
     };
-    if dbc_state.active_stmt != Some(statement_handle) {
+    if dbc_state.wire.statement_owner() != Some(statement_handle) {
         return rc;
     }
-    let Some(client) = dbc_state.client.take() else {
+    let Ok(client) = dbc_state.wire.claim(
+        WireOwner::Statement(statement_handle),
+        ClaimPolicy::IdleOrOwn,
+    ) else {
         return rc;
     };
     drop(dbc_state);
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    let (has_server_info, _, cancelled) =
-        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false);
+    let Ok((has_server_info, _, cancelled)) =
+        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false)
+    else {
+        return SQL_ERROR;
+    };
     if cancelled {
         SQL_ERROR
     } else if rc == SQL_SUCCESS && has_server_info {
@@ -1716,28 +1722,19 @@ fn resume_row_to_column(
         return SQL_ERROR;
     };
 
-    if let Some(busy_stmt) = dbc_state.active_stmt
-        && busy_stmt != statement_handle
+    let owner = WireOwner::Statement(statement_handle);
+    let cursor_poll = match dbc_state
+        .wire
+        .parked_client_mut(owner, ClaimPolicy::IdleOrOwn)
     {
-        drop(dbc_state);
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
-        }
-        return SQL_ERROR;
-    }
-
-    let cursor_poll = {
-        let Some(client) = dbc_state.client.as_mut() else {
-            drop(dbc_state);
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
-                post_diag(&mut stmt_state, ERR_NO_ACTIVE_TDS_CLIENT);
-            }
+        Ok(client) => client.try_read_row_column(target),
+        Err(claim_error) => {
+            post_claim_error(dbc_state, stmt, claim_error);
             return SQL_ERROR;
-        };
-        client.try_read_row_column(target)
+        }
     };
 
-    dbc_state.active_stmt = Some(statement_handle);
+    dbc_state.wire.reserve(statement_handle);
     let cursor_result = match cursor_poll {
         Ok(CursorPoll::Ready(column)) => {
             drop(dbc_state);
@@ -1748,24 +1745,20 @@ fn resume_row_to_column(
             Err(error)
         }
         Ok(CursorPoll::Pending) => {
-            let Some(mut client) = dbc_state.client.take() else {
-                drop(dbc_state);
-                if let Ok(mut stmt_state) = stmt.inner.lock() {
-                    post_diag(&mut stmt_state, ERR_NO_ACTIVE_TDS_CLIENT);
+            let mut client = match dbc_state.wire.claim(owner, ClaimPolicy::IdleOrOwn) {
+                Ok(lease) => lease,
+                Err(claim_error) => {
+                    post_claim_error(dbc_state, stmt, claim_error);
+                    return SQL_ERROR;
                 }
-                return SQL_ERROR;
             };
             drop(dbc_state);
 
             let result = dbc.runtime.block_on(client.read_row_column(target));
 
-            let Ok(mut dbc_state) = dbc.inner.lock() else {
-                error!("SQLGetData: dbc mutex poisoned after row resume");
+            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
                 return SQL_ERROR;
-            };
-            dbc_state.client = Some(client);
-            dbc_state.active_stmt = Some(statement_handle);
-            drop(dbc_state);
+            }
             result
         }
     };
@@ -3168,26 +3161,18 @@ fn read_plp_wire(
             return Err(SQL_ERROR);
         }
     };
-    if let Some(busy_stmt) = dbc_state.active_stmt
-        && busy_stmt != statement_handle
+    let owner = WireOwner::Statement(statement_handle);
+    let buffered_read = match dbc_state
+        .wire
+        .parked_client_mut(owner, ClaimPolicy::IdleOrOwn)
     {
-        drop(dbc_state);
-        if let Ok(mut s) = stmt.inner.lock() {
-            post_diag(&mut s, ERR_CONNECTION_BUSY);
-        }
-        return Err(SQL_ERROR);
-    }
-    let buffered_read = {
-        let Some(client) = dbc_state.client.as_mut() else {
-            drop(dbc_state);
-            if let Ok(mut s) = stmt.inner.lock() {
-                post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
-            }
+        Ok(client) => client.try_read_active_plp_chunk(payload),
+        Err(claim_error) => {
+            post_claim_error(dbc_state, stmt, claim_error);
             return Err(SQL_ERROR);
-        };
-        client.try_read_active_plp_chunk(payload)
+        }
     };
-    dbc_state.active_stmt = Some(statement_handle);
+    dbc_state.wire.reserve(statement_handle);
     Ok(match buffered_read {
         Ok(CursorPoll::Ready(chunk)) => {
             drop(dbc_state);
@@ -3198,12 +3183,12 @@ fn read_plp_wire(
             Err(error)
         }
         Ok(CursorPoll::Pending) => {
-            let Some(mut client) = dbc_state.client.take() else {
-                drop(dbc_state);
-                if let Ok(mut s) = stmt.inner.lock() {
-                    post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
+            let mut client = match dbc_state.wire.claim(owner, ClaimPolicy::IdleOrOwn) {
+                Ok(lease) => lease,
+                Err(claim_error) => {
+                    post_claim_error(dbc_state, stmt, claim_error);
+                    return Err(SQL_ERROR);
                 }
-                return Err(SQL_ERROR);
             };
             drop(dbc_state);
             let mut prefetch_scratch = {
@@ -3239,13 +3224,9 @@ fn read_plp_wire(
                     Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
                 }
             });
-            let Ok(mut dbc_state) = dbc.inner.lock() else {
-                error!("SQLGetData: dbc mutex poisoned after PLP read");
+            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
                 return Err(SQL_ERROR);
-            };
-            dbc_state.client = Some(client);
-            dbc_state.active_stmt = Some(statement_handle);
-            drop(dbc_state);
+            }
             match result {
                 Ok((chunk, carry, unused_scratch, prefetch_error)) => {
                     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -4250,10 +4231,10 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP, SqlSsTime2Struct};
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NTS, SQL_NULL_HANDLE};
-    use crate::error::diag::DiagRecord;
     use crate::handles::stmt::BufferedGetDataRow;
     use crate::handles::{DbcHandle, EnvHandle};
     use crate::test_support::TestHandles;
+    use crate::test_support::assert_last_diag;
     use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::test_client_support::{
@@ -4288,20 +4269,6 @@ mod tests {
             }
             None => additional,
         })
-    }
-
-    /// Assert the most recent diagnostic matches the expected canonical
-    /// SQLSTATE and message text (the message is prefixed by the driver, so we
-    /// match on a substring).
-    fn assert_last_diag(records: &[DiagRecord], expected: DiagMsg) {
-        let d = records.last().expect("expected a diagnostic record");
-        assert_eq!(d.sql_state, expected.state, "SQLSTATE mismatch");
-        assert!(
-            d.message.contains(expected.text),
-            "message {:?} did not contain {:?}",
-            d.message,
-            expected.text
-        );
     }
 
     #[test]
@@ -4730,6 +4697,61 @@ mod tests {
             "SQL_NO_DATA must not post a diagnostic, got: {:?}",
             s.diag_records
         );
+    }
+
+    /// AB#49225: reading a column while another owner holds the wire is busy,
+    /// not a missing client.
+    #[test]
+    fn get_data_while_another_owner_holds_the_wire_is_busy() {
+        use crate::handles::wire::LeaseReturn;
+        use crate::test_support::connection_lease_for_test;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        for connection_operation in [false, true] {
+            let mut h = TestHandles::with_env_dbc_stmt();
+            let other = h.alloc_extra_stmt();
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            {
+                let mut s = stmt_handle.inner.lock().unwrap();
+                s.set_state(STMT_STATE_CURSOR_OPEN);
+                s.column_metadata = int_columns(1);
+                s.row_positioned = true;
+            }
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let lease = if connection_operation {
+                Some(connection_lease_for_test(
+                    dbc,
+                    tds_client_from_tokens(Vec::new()),
+                ))
+            } else {
+                let mut ds = dbc.inner.lock().unwrap();
+                ds.wire
+                    .put_client_for_test(tds_client_from_tokens(Vec::new()));
+                ds.wire.set_owner_for_test(Some(other));
+                None
+            };
+
+            let mut value: i32 = 0;
+            let mut ind: SqlLen = 0;
+            let ret = unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR);
+            assert_last_diag(
+                &stmt_handle.inner.lock().unwrap().diag_records,
+                ERR_CONNECTION_BUSY,
+            );
+            if let Some(lease) = lease {
+                dbc.return_lease(lease, LeaseReturn::Release);
+            }
+        }
     }
 
     /// Helper: transcode a full UTF-16LE buffer delivered in one chunk with no
@@ -5997,8 +6019,8 @@ mod tests {
             .unwrap();
         assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
         let mut state = dbc.inner.lock().unwrap();
-        state.client = Some(client);
-        state.active_stmt = Some(h.stmt);
+        state.wire.put_client_for_test(client);
+        state.wire.set_owner_for_test(Some(h.stmt));
     }
 
     fn stmt_with_buffered_values(h: &TestHandles, values: Vec<ColumnValues>) {
@@ -6062,8 +6084,8 @@ mod tests {
             })
         ));
         let mut state = dbc.inner.lock().unwrap();
-        state.client = Some(client);
-        state.active_stmt = Some(h.stmt);
+        state.wire.put_client_for_test(client);
+        state.wire.set_owner_for_test(Some(h.stmt));
     }
 
     #[test]
@@ -6091,8 +6113,8 @@ mod tests {
         assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(client);
-            state.active_stmt = Some(h.stmt);
+            state.wire.put_client_for_test(client);
+            state.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let mut value = 0_i32;
@@ -6141,8 +6163,8 @@ mod tests {
             assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
             {
                 let mut state = dbc.inner.lock().unwrap();
-                state.client = Some(client);
-                state.active_stmt = Some(h.stmt);
+                state.wire.put_client_for_test(client);
+                state.wire.set_owner_for_test(Some(h.stmt));
             }
 
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -6281,8 +6303,8 @@ mod tests {
         assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(client);
-            state.active_stmt = Some(h.stmt);
+            state.wire.put_client_for_test(client);
+            state.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let mut value = 0_i32;
@@ -7267,8 +7289,8 @@ mod tests {
 
         {
             let state = dbc.inner.lock().unwrap();
-            assert!(state.client.is_some());
-            assert_eq!(state.active_stmt, Some(h.stmt));
+            assert!(state.wire.client().is_some());
+            assert_eq!(state.wire.statement_owner(), Some(h.stmt));
         }
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.last_captured, Some((1, ColumnValues::Int(42))));
@@ -7300,7 +7322,7 @@ mod tests {
         );
         assert_eq!(value, 42);
         assert_eq!(indicator, 4);
-        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
     }
 
     #[test]
@@ -7313,8 +7335,8 @@ mod tests {
         assert_eq!(resume_row_to_column(stmt, h.stmt, 1), SQL_SUCCESS);
 
         let dbc_state = dbc.inner.lock().unwrap();
-        assert!(dbc_state.client.is_some());
-        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+        assert!(dbc_state.wire.client().is_some());
+        assert_eq!(dbc_state.wire.statement_owner(), Some(h.stmt));
         drop(dbc_state);
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.last_captured, Some((1, ColumnValues::Int(10))));
@@ -9250,8 +9272,8 @@ mod tests {
             .unwrap();
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
-            ds.active_stmt = Some(h.stmt);
+            ds.wire.put_client_for_test(client);
+            ds.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let mut buf = [0u8; 8];
@@ -9268,7 +9290,7 @@ mod tests {
         };
 
         assert_eq!(rc, SQL_SUCCESS);
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
@@ -9288,8 +9310,8 @@ mod tests {
             .unwrap();
         {
             let mut dbc_state = dbc.inner.lock().unwrap();
-            dbc_state.client = Some(client);
-            dbc_state.active_stmt = Some(h.stmt);
+            dbc_state.wire.put_client_for_test(client);
+            dbc_state.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let mut value = 0_i32;
@@ -9307,7 +9329,7 @@ mod tests {
 
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(value, 42);
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
@@ -9323,7 +9345,11 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_captured(&h, ColumnValues::Null); // int_columns(2) by default
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(h.stmt));
 
         let mut buf = [0u8; 8];
         let mut ind: SqlLen = 0;
@@ -9339,7 +9365,10 @@ mod tests {
         };
 
         assert_eq!(rc, SQL_SUCCESS);
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt)
+        );
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
@@ -9366,8 +9395,8 @@ mod tests {
             .unwrap();
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
-            ds.active_stmt = Some(h.stmt);
+            ds.wire.put_client_for_test(client);
+            ds.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -9375,7 +9404,7 @@ mod tests {
         let rc = finish_get_data(stmt_handle, h.stmt, stmt_state, 1, SQL_ERROR);
 
         assert_eq!(rc, SQL_ERROR);
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 
@@ -9411,8 +9440,8 @@ mod tests {
             .unwrap();
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
-            ds.active_stmt = Some(h.stmt);
+            ds.wire.put_client_for_test(client);
+            ds.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -9421,11 +9450,11 @@ mod tests {
 
         assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(
-            dbc.inner.lock().unwrap().active_stmt,
+            dbc.inner.lock().unwrap().wire.statement_owner(),
             Some(h.stmt),
             "an active PLP stream must retain the busy claim, not release it"
         );
-        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 
@@ -10858,7 +10887,7 @@ mod tests {
                 unsafe { crate::api::fetch::sql_fetch(handles.stmt) },
                 SQL_NO_DATA
             );
-            assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+            assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
             let next_stmt = handles.alloc_extra_stmt();
             assert_eq!(
                 unsafe {
@@ -10991,7 +11020,7 @@ mod tests {
                 assert!(state.active_plp.is_none());
                 assert!(state.result_set_exhausted);
             }
-            assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+            assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
             assert_eq!(
                 unsafe {
                     crate::api::exports::SQLGetData(

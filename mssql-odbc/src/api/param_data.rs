@@ -1043,7 +1043,10 @@ mod tests {
         let mut next_parameter = DaeParam::unbounded(1, std::ptr::null_mut(), None);
         next_parameter.set_buffered(true);
         let dae = DaeState::new(
-            tds_client_from_tokens(Vec::new()),
+            crate::handles::wire::WireLease::detached_for_test(
+                tds_client_from_tokens(Vec::new()),
+                h.stmt,
+            ),
             None,
             None,
             vec![

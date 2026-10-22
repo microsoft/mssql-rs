@@ -20,49 +20,10 @@
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
-#include "odbc_test_fixture.h"
+#include "connection_busy_fixture.h"
 #include "odbc_concurrent_test.h"
 
 #include <string>
-
-class ConnectionBusyLiveTest : public ODBCTest {
-protected:
-    void SetUp() override {
-        ODBCTest::SetUp();
-        if (!ODBCTestConfig::Instance().HasConnection()) {
-            GTEST_SKIP() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
-        }
-        Connect();
-    }
-
-    static SQLRETURN Run(SQLHSTMT hstmt, const std::string& sql) {
-        SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
-        return SQLExecDirect(hstmt, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
-    }
-
-    static SQLRETURN Prepare(SQLHSTMT hstmt, const std::string& sql) {
-        SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
-        return SQLPrepare(hstmt, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
-    }
-
-    static SQLRETURN BindInt(SQLHSTMT hstmt, SQLUSMALLINT ordinal,
-                             SQLINTEGER* value, SQLLEN* indicator) {
-        return SQLBindParameter(hstmt, ordinal, SQL_PARAM_INPUT, SQL_C_SLONG,
-                                SQL_INTEGER, 0, 0, value, 0, indicator);
-    }
-
-    SQLRETURN CancelIdleStatement() {
-        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
-        const auto rc = SQLCancel(stmt_);
-        EXPECT_EQ(SQL_SUCCESS, rc);
-        SQLTCHAR state[6] = {};
-        SQLTCHAR message[256] = {};
-        EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRec(
-            SQL_HANDLE_STMT, stmt_, 1, state, nullptr, message,
-            static_cast<SQLSMALLINT>(sizeof(message) / sizeof(message[0])), nullptr));
-        return rc;
-    }
-};
 
 // Benefits-from-mock-tds: cancel.rs pins cursor reset and drain errors; this
 // checks connection reuse and the Driver Manager's suppression of 01S05.
@@ -837,4 +798,33 @@ TEST_F(ConnectionBusyLiveTest, TrailingPrintMessageSurfacesOnMoreResults) {
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
     std::string msg = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
     EXPECT_NE(std::string::npos, msg.find("row9 trailing print"));
+}
+
+// A statement suspended in SQL_NEED_DATA holds the connection between calls, so
+// another statement is busy until the data-at-execution sequence completes.
+// Benefits-from-mock-tds: assert B's batch never reaches the wire while A's
+// streamed RPC is open, rather than only that B is told the connection is busy.
+ODBC_TEST_F(ConnectionBusyLiveTest, DataAtExecutionSequenceKeepsConnectionBusy) {
+    SQLHSTMT b = AllocStmt();
+    SQLCHAR token = 0;
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 0, 0,
+                                   &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, Run(stmt_, "SELECT ?"));
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 1"));
+    EXPECT_TRUE(IsBusy(SQL_HANDLE_STMT, b)) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, b);
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>("x"), 1), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 1"));
+    EXPECT_TRUE(IsBusy(SQL_HANDLE_STMT, b)) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, b);
+
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(Run(b, "SELECT 1"), SQL_HANDLE_STMT, b);
 }

@@ -1325,10 +1325,14 @@ mod tests {
                 )
             };
             for execution in 1..=2 {
-                dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
-                    sql_error(11529, 16, "no metadata could be determined"),
-                    done_no_more(),
-                ]));
+                dbc.inner
+                    .lock()
+                    .unwrap()
+                    .wire
+                    .put_client_for_test(tds_client_from_tokens(vec![
+                        sql_error(11529, 16, "no metadata could be determined"),
+                        done_no_more(),
+                    ]));
                 assert_eq!(describe(1), SQL_ERROR);
                 let _scope = unsafe { context_for(h.stmt, "SQLRowCount") }.enter();
                 assert_eq!(mssql_tds::trace_context::snapshot().exec, Some(execution));
@@ -1408,10 +1412,11 @@ mod tests {
                     })
                 });
                 let deadline = Instant::now() + Duration::from_secs(2);
-                while dbc.inner.lock().unwrap().client.is_some() && Instant::now() < deadline {
+                while dbc.inner.lock().unwrap().wire.client().is_some() && Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                assert!(dbc.inner.lock().unwrap().client.is_none());
+                assert!(dbc.inner.lock().unwrap().wire.client().is_none());
                 assert_eq!(unsafe { SQLCancel(h.stmt) }, SQL_SUCCESS);
                 assert_eq!(worker.join().unwrap(), SQL_ERROR);
             });
@@ -1603,7 +1608,11 @@ mod tests {
             } else {
                 [done_no_more(), done_no_more()]
             });
-            dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(responses));
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(tds_client_from_tokens(responses));
             for execution in 1..=2 {
                 assert_eq!(
                     unsafe {

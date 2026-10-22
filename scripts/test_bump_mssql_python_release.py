@@ -128,6 +128,16 @@ def test_release_state_does_not_treat_prerelease_nuget_as_clean_release():
         assert bump.release_state("0.4.0") is False
 
 
+def test_release_state_treats_missing_nuget_package_as_unavailable():
+    missing_nuget = HTTPError("https://pkgs.dev.azure.com", 404, "missing", {}, io.BytesIO())
+    with patch.object(
+        bump,
+        "urlopen",
+        side_effect=[response({"info": {"version": "0.4.0"}}), missing_nuget],
+    ):
+        assert bump.release_state("0.4.0") is False
+
+
 def test_missing_pypi_release_fails_before_writing():
     error = HTTPError("https://pypi.org", 404, "missing", {}, io.BytesIO())
     with patch.object(bump, "urlopen", side_effect=error):

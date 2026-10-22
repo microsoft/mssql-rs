@@ -4575,7 +4575,7 @@ ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks,
 // delivered to another worker's connection or statement fails here instead of
 // matching an identical constant. Covers a fixed-width, narrow, wide, binary,
 // and multi-chunk PLP read on one row. Opts into SharedDbc once that mode runs
-// nightly only (AB#49263); AB#49225 fails it intermittently.
+// nightly only (AB#49263).
 // Benefits-from-mock-tds: delay one connection's response so concurrent reads
 // interleave by construction rather than by scheduling.
 ODBC_TEST_F_MODES(GetDataLiveTest, RunUniqueValuesSurviveEveryRetrievalPath,

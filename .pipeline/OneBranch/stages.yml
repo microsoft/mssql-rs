@@ -3,8 +3,9 @@
 # Builds 44 Python wheels from PyO3 bindings (mssql-py-core) across 9 tags:    #
 #   Windows x64/ARM64; Linux x64/ARM64 for manylinux 2.28, manylinux 2.34,    #
 #   and musllinux 1.2; macOS universal2.                                      #
-# Then packages all wheels into a NuGet archive and publishes to Azure         #
-# Artifacts via OneBranch native nugetPublishing mechanism.                    #
+# A ComputeWheelVersion job resolves the PEP 440 version once and every build  #
+# job stamps it into the wheel, then the Publish job twine-uploads the wheels  #
+# to the Azure Artifacts PyPI feed (pip-installable dev/nightly/release).     #
 #                                                                               #
 # When buildOdbcNative is true, the Windows/Linux x64+ARM64 and macOS jobs      #
 # also build the mssql-odbc native driver (glibc 2.28 + 2.34 and musl on       #
@@ -14,8 +15,9 @@
 # macOS job builds both arch slices as SEPARATE binaries (no lipo fusion),      #
 # matching mssql-python's libs/macos/{arm64,x86_64} layout for this driver.     #
 #                                                                               #
-# Build jobs use custom 1ES pools (Rust, Docker, Python pre-installed).        #
-# Publish job uses managed OneBranch pool with ob_nugetPublishing_enabled.     #
+# Build jobs and the wheel Publish job use custom 1ES pools (Rust, Docker,     #
+# Python pre-installed). The mssql-sqlcmd NuGet Publish job uses the managed   #
+# OneBranch pool with ob_nugetPublishing_enabled.                              #
 # Artifact publishing on custom pools requires explicit                        #
 # PublishPipelineArtifact@1 (governed template rewrites to                     #
 # 1ES.PublishPipelineArtifact@1).                                              #
@@ -65,7 +67,7 @@ parameters:
 - name: publishToFeed
   type: boolean
   default: false
-  displayName: 'Publish NuGet package to Azure Artifacts feed'
+  displayName: 'Publish wheels to the Azure Artifacts PyPI feed'
 
 - name: buildMssqlSqlcmd
   type: boolean
@@ -78,6 +80,25 @@ stages:
 #############################################################################
 - stage: Build
   jobs:
+  #########################################################################
+  # Compute wheel version once so every parallel build job stamps the
+  # identical PEP 440 version (no cross-job UTC-midnight skew).
+  #########################################################################
+  - job: ComputeWheelVersion
+    displayName: 'Compute wheel version'
+    pool:
+      type: windows
+    variables:
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+    - pwsh: >
+        .pipeline/scripts/compute-python-wheel-version.ps1
+        -BuildReason '$(Build.Reason)'
+        -BuildId '$(Build.BuildId)'
+        -IsOfficial '${{ parameters.isOfficial }}'
+      name: compute
+      displayName: 'Resolve wheel version (shared by all build jobs)'
+
   #########################################################################
   # Publishable Rust crates
   #########################################################################
@@ -126,6 +147,7 @@ stages:
   #########################################################################
   - job: Windows_x64
     displayName: 'Windows x64'
+    dependsOn: ComputeWheelVersion
     pool:
       type: windows
       isCustom: true
@@ -147,6 +169,8 @@ stages:
       value: '_windows_x64'
     - name: CARGO_TARGET_DIR
       value: C:\cargo_target_dir
+    - name: pyCoreWheelVersion
+      value: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
     steps:
     - template: /.pipeline/templates/cargo-authenticate-template.yml
       parameters:
@@ -184,6 +208,7 @@ stages:
           architecture: x64
           publishArtifacts: false
           signWindowsWheels: ${{ parameters.isOfficial }}
+          wheelVersion: $(pyCoreWheelVersion)
     - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
       - template: /.pipeline/templates/build-odbc-windows-template.yml
         parameters:
@@ -217,6 +242,7 @@ stages:
   - ${{ if eq(parameters.buildAllTargets, true) }}:
     - job: Windows_ARM64
       displayName: 'Windows ARM64'
+      dependsOn: ComputeWheelVersion
       pool:
         type: windows
         isCustom: true
@@ -232,6 +258,8 @@ stages:
         value: '_windows_arm64'
       - name: CARGO_TARGET_DIR
         value: C:\cargo_target_dir
+      - name: pyCoreWheelVersion
+        value: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       # Node.js workaround for ARM64 ADO tasks
       - pwsh: ./scripts/setup-nodejs-path.ps1
@@ -254,6 +282,7 @@ stages:
             architecture: arm64
             publishArtifacts: false
             signWindowsWheels: ${{ parameters.isOfficial }}
+            wheelVersion: $(pyCoreWheelVersion)
             # Python 3.10 excluded - limited ARM64 support
             pythonVersions:
             - '3.11'
@@ -297,6 +326,7 @@ stages:
   #########################################################################
   - job: Linux_x64
     displayName: 'Linux x64'
+    dependsOn: ComputeWheelVersion
     pool:
       type: linux
       isCustom: true
@@ -307,6 +337,7 @@ stages:
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
       ob_artifactSuffix: '_linux_x64'
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      pyCoreWheelVersion: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
     steps:
     - template: /.pipeline/templates/cargo-authenticate-template.yml
       parameters:
@@ -326,11 +357,13 @@ stages:
           osType: Linux
           architecture: x64
           publishArtifacts: false
+          wheelVersion: $(pyCoreWheelVersion)
       - template: /.pipeline/templates/build-python-wheels-template.yml
         parameters:
           osType: Alpine
           architecture: x64
           publishArtifacts: false
+          wheelVersion: $(pyCoreWheelVersion)
       # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
       - script: |
           set -e
@@ -446,6 +479,7 @@ stages:
   - ${{ if eq(parameters.buildAllTargets, true) }}:
     - job: Linux_ARM64
       displayName: 'Linux ARM64'
+      dependsOn: ComputeWheelVersion
       pool:
         type: linux
         isCustom: true
@@ -456,6 +490,7 @@ stages:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         ob_artifactSuffix: '_linux_arm64'
         CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        pyCoreWheelVersion: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       - template: /.pipeline/templates/cargo-authenticate-template.yml
         parameters:
@@ -475,11 +510,13 @@ stages:
             osType: Linux
             architecture: arm64
             publishArtifacts: false
+            wheelVersion: $(pyCoreWheelVersion)
         - template: /.pipeline/templates/build-python-wheels-template.yml
           parameters:
             osType: Alpine
             architecture: arm64
             publishArtifacts: false
+            wheelVersion: $(pyCoreWheelVersion)
         # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
         - script: |
             set -e
@@ -594,6 +631,7 @@ stages:
   - ${{ if eq(parameters.buildAllTargets, true) }}:
     - job: MacOS_universal2
       displayName: 'macOS universal2'
+      dependsOn: ComputeWheelVersion
       pool:
         type: linux
         isCustom: true
@@ -603,6 +641,7 @@ stages:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         ob_artifactSuffix: '_macos_universal2'
         CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        pyCoreWheelVersion: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       - template: /.pipeline/templates/cargo-authenticate-template.yml
         parameters:
@@ -616,6 +655,7 @@ stages:
             osType: MacOS
             architecture: universal2
             publishArtifacts: false
+            wheelVersion: $(pyCoreWheelVersion)
       - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
         - template: /.pipeline/templates/build-odbc-macos-template.yml
           parameters:
@@ -671,7 +711,9 @@ stages:
         isOfficial: ${{ parameters.isOfficial }}
 
 #############################################################################
-# Publish Stage - Collect wheels, create NuGet package, publish to feed
+# Publish Stage - Collect wheels and twine-upload to the Azure Artifacts
+# PyPI feed (ODBC driver binaries, when built, are already injected into the
+# wheels by the Build stage — there is no separate native artifact here)
 #############################################################################
 - ${{ if eq(parameters.publishToFeed, true) }}:
   - stage: Publish
@@ -680,12 +722,16 @@ stages:
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
     - job: PackageAndPublish
-      displayName: 'Package wheels into NuGet and publish'
+      displayName: 'Publish wheels to PyPI feed'
       pool:
         type: windows
+        isCustom: true
+        name: RUST-X64-WUS3
+        demands:
+          - imageOverride -equals RUST-W22-SQL25
       variables:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-        ob_nugetPublishing_enabled: true
+        pyCoreWheelVersion: $[ stageDependencies.Build.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       - download: current
         displayName: 'Download all build artifacts'
@@ -713,124 +759,66 @@ stages:
 
       - pwsh: |
           $requireOdbc = "${{ parameters.buildOdbcNative }}" -eq "True"
-          $pyprojectToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/pyproject.toml" -Raw
-          $projectMatch = [regex]::Match($pyprojectToml, '(?ms)^\[project\]\s*$(?<body>.*?)(?=^\[|\z)')
-          $versionMatch = [regex]::Match($projectMatch.Groups['body'].Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
-          if (-not $versionMatch.Success) {
-            throw "Could not extract [project].version from mssql-py-core/pyproject.toml"
+
+          # Every build job stamped this version into the wheel (see
+          # ComputeWheelVersion); official builds stamp the committed version.
+          # Passed through env so pwsh never parses the macro as a subexpression.
+          $pythonVersion = $env:PY_CORE_WHEEL_VERSION
+          if ([string]::IsNullOrWhiteSpace($pythonVersion) -or $pythonVersion.StartsWith('$(')) {
+            throw "pyCoreWheelVersion was not resolved (got '$pythonVersion'); check the ComputeWheelVersion job."
           }
-          $pythonVersion = $versionMatch.Groups[1].Value
+
           & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
             -WheelsDir "$(Build.StagingDirectory)/wheels" `
             -ExpectedName "mssql-python-rs" `
             -ExpectedVersion $pythonVersion `
             -RequireOdbc:$requireOdbc
         displayName: 'Validate wheel metadata and ODBC payloads'
+        env:
+          PY_CORE_WHEEL_VERSION: $(pyCoreWheelVersion)
 
-      - pwsh: |
-          $ErrorActionPreference = 'Stop'
-
-          # The NuGet package transports the Python distribution, so it follows
-          # the wheel version rather than the independently-versioned Rust crate.
-          $pyprojectToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/pyproject.toml" -Raw
-          $projectMatch = [regex]::Match($pyprojectToml, '(?ms)^\[project\]\s*$(?<body>.*?)(?=^\[|\z)')
-          $versionMatch = [regex]::Match($projectMatch.Groups['body'].Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
-          if (-not $versionMatch.Success) {
-            Write-Error "Could not extract [project].version from mssql-py-core/pyproject.toml"
-            exit 1
-          }
-          $version = $versionMatch.Groups[1].Value
-
-          # Determine prerelease suffix based on Build.Reason and pipeline type
-          $buildReason = "$(Build.Reason)"
-          # Template expansion produces bare True/False which aren't valid PowerShell;
-          # string comparison converts to a proper $true/$false boolean.
-          $isOfficial = "${{ parameters.isOfficial }}" -eq "True"
-          $dateStamp = Get-Date -Format "yyyyMMdd"
-          $buildId = "$(Build.BuildId)"
-          $commitSha = "$(Build.SourceVersion)"
-          $shortSha = $commitSha.Substring(0, 8)
-
-          switch ($buildReason) {
-            'Schedule' {
-              # Nightly build: 0.1.0-nightly.20260217
-              $packageVersion = "$version-nightly.$dateStamp"
-              Write-Host "Nightly build detected"
-            }
-            'Manual' {
-              if ($isOfficial) {
-                # Official release: clean semver 0.1.0
-                $packageVersion = $version
-                Write-Host "Official release build detected"
-              } else {
-                # Non-official manual trigger: dev build
-                $packageVersion = "$version-dev.$dateStamp.$buildId"
-                Write-Host "Non-official manual build detected"
-              }
-            }
-            default {
-              # CI push (IndividualCI, BatchedCI, etc.): 0.1.0-dev.20260217.12345
-              $packageVersion = "$version-dev.$dateStamp.$buildId"
-              Write-Host "CI build detected (reason: $buildReason)"
-            }
-          }
-
-          Write-Host "Package version: $packageVersion"
-          Write-Host "Build reason: $buildReason | Official: $isOfficial"
-          Write-Host "##vso[task.setvariable variable=nugetVersion]$packageVersion"
-
-          $packageContents = if ("${{ parameters.buildOdbcNative }}" -eq "True") {
-            "the mssql-python-rs TDS core and ODBC driver"
-          } else {
-            "the mssql-python-rs TDS core"
-          }
-
-          # Create .nuspec
-          $nuspecContent = @"
-          <?xml version="1.0"?>
-          <package>
-            <metadata>
-              <id>mssql-python-rs-wheels</id>
-              <version>$packageVersion</version>
-              <description>Python wheels containing $packageContents. Commit: $shortSha. Build: $(Build.BuildNumber)</description>
-              <authors>SqlClientDrivers</authors>
-            </metadata>
-            <files>
-              <file src="wheels\**\*.whl" target="wheels" />
-            </files>
-          </package>
-          "@
-
-          $nuspecPath = "$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec"
-          $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
-          Write-Host "Created nuspec at $nuspecPath"
-        displayName: 'Generate NuGet package metadata'
-
-      - task: NuGetCommand@2
-        displayName: 'Create NuGet package'
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.12'
         inputs:
-          command: pack
-          packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
-          packDestination: '$(ob_outputDirectory)/packages'
-          basePath: '$(Build.StagingDirectory)'
+          versionSpec: '3.12'
+          architecture: 'x64'
+          addToPath: true
 
-      # The mssql-sqlcmd package was packed by its Build job; OneBranch publishes
-      # it from the same folder as the wheels package.
-      - ${{ if eq(parameters.buildMssqlSqlcmd, true) }}:
+      - pwsh: .pipeline/scripts/collect-wheels.ps1 -StagingDir '$(Build.StagingDirectory)' -SourceRoot '$(Build.StagingDirectory)/wheels'
+        displayName: 'Collect wheels for upload'
+
+      - task: TwineAuthenticate@1
+        displayName: 'Authenticate twine to feed'
+        inputs:
+          artifactFeed: '$(pythonArtifactFeed)'
+
+      - pwsh: .pipeline/scripts/twine-upload.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)' -SimpleIndexUrl '$(pythonSimpleIndex)'
+        displayName: 'twine upload to feed'
+
+    # The mssql-sqlcmd package was packed by its Build job and is still a NuGet
+    # package, so it publishes through OneBranch's nugetPublishing, which only
+    # runs on the managed pool.
+    - ${{ if eq(parameters.buildMssqlSqlcmd, true) }}:
+      - job: PublishMssqlSqlcmd
+        displayName: 'Publish mssql-sqlcmd NuGet package'
+        pool:
+          type: windows
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_nugetPublishing_enabled: true
+        steps:
+        - download: current
+          artifact: drop_Build_MssqlSqlcmd_Package
+          displayName: 'Download the mssql-sqlcmd package'
+
         - pwsh: |
             $ErrorActionPreference = 'Stop'
             $packages = @(Get-ChildItem "$(Pipeline.Workspace)/drop_Build_MssqlSqlcmd_Package" -Filter 'mssql-sqlcmd.*.nupkg')
             if ($packages.Count -ne 1) {
               throw "Expected one mssql-sqlcmd package, found $($packages.Count)"
             }
-            Copy-Item $packages[0].FullName "$(ob_outputDirectory)/packages"
-            Write-Host "Publishing $($packages[0].Name)"
+            $destination = "$(ob_outputDirectory)/packages"
+            New-Item -ItemType Directory -Force -Path $destination | Out-Null
+            Copy-Item $packages[0].FullName $destination
+            Write-Host "Publishing $($packages[0].Name); OneBranch publishes from $destination"
           displayName: 'Stage the mssql-sqlcmd package'
-
-      - pwsh: |
-          Write-Host "=== NuGet package created ==="
-          Get-ChildItem "$(ob_outputDirectory)/packages" -Filter *.nupkg | ForEach-Object {
-            Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
-          }
-          Write-Host "OneBranch will auto-publish from $(ob_outputDirectory)/packages"
-        displayName: 'Verify NuGet package'
