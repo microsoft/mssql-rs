@@ -968,11 +968,10 @@ fn settle_isolation_invalidation(state: &mut DbcState, captured_generation: u64)
 /// Applies transaction attributes that were set before `SQLDriverConnect` and so
 /// could not reach the server. Called once the login completes.
 ///
-/// A failure does not fail the connection — the session is usable — but it must
-/// not pass unnoticed either: an unapplied isolation level would leave
-/// `SQLGetConnectAttr` reporting a level the server is not actually running at.
-/// Returns `SQL_SUCCESS_WITH_INFO` with a diagnostic posted in that case, which
-/// the caller promotes into the `SQLDriverConnect` result.
+/// A settings failure leaves the session usable, so it returns
+/// `SQL_SUCCESS_WITH_INFO` with a diagnostic. A stale lease means the session
+/// was torn down while the settings ran; that returns `SQL_ERROR` / `08003`
+/// because the successful login no longer represents a usable connection.
 #[must_use]
 pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
     const OP: &str = "SQLDriverConnectW(transaction settings)";

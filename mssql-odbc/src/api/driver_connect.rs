@@ -201,10 +201,10 @@ pub(crate) fn sql_driver_connect_w_safe(
 
     // Autocommit and isolation level set before connecting had no session to
     // apply to; push them now. Needs the DBC lock and network I/O, so it runs
-    // only once the connect path has released the lock. A failure downgrades the
-    // connect to SQL_SUCCESS_WITH_INFO rather than failing it: the session is
-    // usable, but the application must be able to see that its requested
-    // settings did not take effect.
+    // only once the connect path has released the lock. A settings failure
+    // downgrades the connect to SQL_SUCCESS_WITH_INFO because the session is
+    // still usable. A session torn down while the settings run fails the
+    // connect with 08003 because nothing usable remains.
     drop(state);
     combine_connect_results(result, apply_post_connect_txn_settings(dbc))
 }
