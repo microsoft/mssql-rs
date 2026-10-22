@@ -40,7 +40,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlPointer, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::STMT_STATE_EXEC_STARTED;
+use crate::handles::stmt::{DaeTarget, STMT_STATE_EXEC_STARTED};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// Advances the data-at-execution parameter protocol.
 ///
@@ -200,7 +200,10 @@ fn sql_param_data_safe(
                 error!("SQLParamData: DAE sequence vanished closing a buffered parameter");
                 return SQL_ERROR;
             };
-            let Some(bound_index) = dae.current_param().map(|param| param.bound_index) else {
+            let Some((bound_index, target)) = dae
+                .current_param()
+                .map(|param| (param.bound_index, param.target))
+            else {
                 error!("SQLParamData: no open parameter to close");
                 dae.return_client(client);
                 return SQL_ERROR;
@@ -210,8 +213,36 @@ fn sql_param_data_safe(
             // materialized path.
             let bytes = std::mem::take(&mut dae.progress.buffer);
             let is_null = dae.progress.is_null;
-            dae.buffered.push((bound_index, bytes, is_null));
-            dae.advance();
+            match target {
+                DaeTarget::Parameter => dae.buffered.push((bound_index, bytes, is_null)),
+                DaeTarget::TvpCell {
+                    tvp_index,
+                    row_index,
+                    column_index,
+                } => dae.tvp_cells.push(crate::handles::stmt::BufferedTvpCell {
+                    tvp_index,
+                    row_index,
+                    column_index,
+                    bytes,
+                    is_null,
+                }),
+                DaeTarget::TvpRowControl { tvp_index, .. } => {
+                    let Some(row_present) = dae.progress.tvp_row_present else {
+                        error!("SQLParamData: TVP row-control value was not captured");
+                        dae.return_client(client);
+                        return SQL_ERROR;
+                    };
+                    if row_present {
+                        *dae.tvp_row_counts.entry(tvp_index).or_default() += 1;
+                        dae.advance();
+                    } else {
+                        dae.advance_past_tvp(tvp_index);
+                    }
+                }
+            }
+            if !matches!(target, DaeTarget::TvpRowControl { .. }) {
+                dae.advance();
+            }
             let has_more = dae.current_param().is_some();
             let buffered_done = dae.buffered_phase_complete();
             dae.return_client(client);
@@ -471,6 +502,8 @@ fn open_deferred_rpc(
             return Some(SQL_ERROR);
         };
         let collected = std::mem::take(&mut dae.buffered);
+        let tvp_cells = std::mem::take(&mut dae.tvp_cells);
+        let tvp_row_counts = std::mem::take(&mut dae.tvp_row_counts);
         let dae_params = dae.params().to_vec();
         let prebuilt = std::mem::take(&mut dae.prebuilt);
         let sql = dae.sql.take();
@@ -488,6 +521,8 @@ fn open_deferred_rpc(
             prebuilt,
             &collected,
             &dae_params,
+            &tvp_cells,
+            &tvp_row_counts,
             "SQLParamData",
         ) {
             Ok(params) => params,
@@ -643,6 +678,8 @@ fn run_deferred_execute(
             return SQL_ERROR;
         };
         let collected = std::mem::take(&mut dae.buffered);
+        let tvp_cells = std::mem::take(&mut dae.tvp_cells);
+        let tvp_row_counts = std::mem::take(&mut dae.tvp_row_counts);
         let dae_params = dae.params().to_vec();
         let prebuilt = std::mem::take(&mut dae.prebuilt);
         let sql = dae.sql.take();
@@ -655,6 +692,8 @@ fn run_deferred_execute(
             prebuilt,
             &collected,
             &dae_params,
+            &tvp_cells,
+            &tvp_row_counts,
             "SQLParamData",
         ) {
             Ok(params) => params,

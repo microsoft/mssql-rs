@@ -6,6 +6,8 @@
 
 use tracing::{debug, error};
 
+use std::mem::size_of;
+
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT,
@@ -416,10 +418,31 @@ fn sql_bind_parameter_safe(
     // reads it there). Record it on the IPD so execute can name the table type
     // even without a prior SQLDescribeParam. Done after the bind, when the IPD
     // record exists; a `None` here leaves any describe-supplied name in place.
-    if parameter_type == crate::api::odbc_types::SQL_SS_TABLE
-        && let Some(name) = unsafe { read_tvp_type_name(parameter_value_ptr, buffer_length) }
-    {
-        store_tvp_type_name(stmt.ipd, parameter_number, name);
+    if parameter_type == crate::api::odbc_types::SQL_SS_TABLE {
+        match unsafe { read_tvp_type_name(parameter_value_ptr, buffer_length) } {
+            Ok(Some(name)) => {
+                if store_tvp_type_name(stmt.ipd, parameter_number, name).is_err() {
+                    error!("SQLBindParameter: failed storing TVP type name");
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        post_sql_error(
+                            &mut stmt_state,
+                            SQLSTATE_HY000,
+                            0,
+                            "Internal error storing table-valued parameter type name",
+                        );
+                    }
+                    return SQL_ERROR;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => {
+                error!("SQLBindParameter: failed reading TVP type name");
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_diag(&mut stmt_state, ERR_MEMORY_ALLOCATION);
+                }
+                return SQL_ERROR;
+            }
+        }
     }
 
     debug!(parameter_number, "SQLBindParameter: parameter bound");
@@ -434,53 +457,68 @@ fn sql_bind_parameter_safe(
 /// # Safety
 /// `ptr` must be null or address a readable UTF-16 buffer of the indicated
 /// length (or NUL-terminated for `SQL_NTS`).
-unsafe fn read_tvp_type_name(ptr: SqlPointer, buffer_length: SqlLen) -> Option<String> {
+unsafe fn read_tvp_type_name(ptr: SqlPointer, buffer_length: SqlLen) -> Result<Option<String>, ()> {
     if ptr.is_null() {
-        return None;
+        return Ok(None);
     }
-    let ptr = ptr as *const u16;
+    let ptr = ptr.cast::<u8>();
     let units: Vec<u16> = if buffer_length > 0 {
-        let count = buffer_length as usize / size_of::<u16>();
-        unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec()
+        let count = usize::try_from(buffer_length).map_err(|_| ())? / size_of::<u16>();
+        let mut units = Vec::new();
+        units.try_reserve(count).map_err(|_| ())?;
+        for i in 0..count {
+            // ODBC does not require the application buffer to be aligned for
+            // SQLWCHAR, so read each code unit without creating a u16 slice.
+            units.push(unsafe { ptr.add(i * size_of::<u16>()).cast::<u16>().read_unaligned() });
+        }
+        units
     } else if SqlLen::from(SQL_NTS) == buffer_length {
         let mut units = Vec::new();
-        let mut i = 0isize;
+        let mut i = 0usize;
         loop {
-            let unit = unsafe { *ptr.offset(i) };
+            let unit = unsafe {
+                ptr.wrapping_add(i * size_of::<u16>())
+                    .cast::<u16>()
+                    .read_unaligned()
+            };
             if unit == 0 {
                 break;
             }
+            if units.len() == units.capacity() {
+                units.try_reserve(1).map_err(|_| ())?;
+            }
             units.push(unit);
-            i += 1;
+            i = i.checked_add(1).ok_or(())?;
         }
         units
     } else {
-        return None;
+        return Ok(None);
     };
     let name = String::from_utf16_lossy(&units);
     let name = name.trim_end_matches('\0');
-    (!name.is_empty()).then(|| name.to_string())
+    Ok((!name.is_empty()).then(|| name.to_string()))
 }
 
 /// Records `name` as the table type name on `ipd`'s record, claiming it so a
 /// later `SQLDescribeParam` does not overwrite the application's choice (the
-/// same provenance the `SQL_CA_SS_*` descriptor-field writes use). Best-effort:
-/// a poisoned IPD mutex is logged rather than failing the bind, since the
-/// describe path can still supply the name.
-fn store_tvp_type_name(ipd: SqlHandle, record_number: SqlUSmallInt, name: String) {
-    let Ok(record_number) = SqlSmallInt::try_from(record_number) else {
-        return;
-    };
+/// same provenance the `SQL_CA_SS_*` descriptor-field writes use).
+fn store_tvp_type_name(
+    ipd: SqlHandle,
+    record_number: SqlUSmallInt,
+    name: String,
+) -> Result<(), ()> {
+    let record_number = SqlSmallInt::try_from(record_number).map_err(|_| ())?;
     let desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
-    let Ok(mut state) = desc.inner.lock() else {
-        error!("SQLBindParameter: ipd mutex poisoned storing TVP type name");
-        return;
+    let mut state = desc.inner.lock().map_err(|_| ())?;
+    let Some(record) = state.record_mut(record_number) else {
+        return Err(());
     };
-    if let Some(record) = state.record_mut(record_number) {
+    {
         let names = std::sync::Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
         names.type_name = name;
         record.udt_name_claimed.type_name = true;
     }
+    Ok(())
 }
 
 /// Writes `bound` into `apd`'s and `ipd`'s records at `parameter_number`,
@@ -1119,6 +1157,23 @@ mod tests {
         let names = record.udt_names.as_ref().expect("type name recorded");
         assert_eq!(names.type_name, "OrderList");
         assert!(record.udt_name_claimed.type_name, "name is claimed");
+    }
+
+    #[test]
+    fn tvp_type_name_buffer_may_be_unaligned() {
+        let units: Vec<u16> = "OrderList".encode_utf16().collect();
+        let mut bytes = vec![0u8; units.len() * size_of::<u16>() + 1];
+        for (index, unit) in units.iter().enumerate() {
+            let offset = 1 + index * size_of::<u16>();
+            bytes[offset..offset + 2].copy_from_slice(&unit.to_ne_bytes());
+        }
+        let name = unsafe {
+            read_tvp_type_name(
+                bytes.as_mut_ptr().add(1).cast(),
+                (units.len() * size_of::<u16>()) as SqlLen,
+            )
+        };
+        assert_eq!(name, Ok(Some("OrderList".to_string())));
     }
 
     /// Helper: bind a scalar `SQL_C_SLONG` -> `SQL_INTEGER` column at

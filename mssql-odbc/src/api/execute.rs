@@ -1068,6 +1068,15 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
                 post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                 return Err(SQL_ERROR);
             };
+            if bound.param.sql_type == crate::api::odbc_types::SQL_SS_TABLE {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Table-valued parameters are not supported in parameter arrays",
+                );
+                return Err(SQL_ERROR);
+            }
             if bound.param.input_output_type != SQL_PARAM_INPUT {
                 post_sql_error(
                     &mut stmt_state,
@@ -3552,6 +3561,37 @@ mod tests {
         assert!(stage_execution(stmt).is_err());
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    #[test]
+    fn stage_parameter_array_rejects_tvp_before_batch_construction() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "EXEC dbo.p ?");
+        set_array_size(h.apd(), 2);
+        let mut indicator: SqlLen = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::bind_param::sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    crate::api::odbc_types::SQL_C_BINARY,
+                    crate::api::odbc_types::SQL_SS_TABLE,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stage_execution(stmt).is_err());
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 

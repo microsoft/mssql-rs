@@ -820,6 +820,8 @@ pub(crate) struct DaeParam {
     /// 0-based index into [`StmtState::bound_params`], and equally the
     /// parameter's position in the RPC list, which is built in the same order.
     pub(crate) bound_index: usize,
+    /// The role this token plays in the DAE protocol.
+    pub(crate) target: DaeTarget,
     /// `ParameterValuePtr` with the execution's bind offset already applied.
     pub(crate) value_ptr: SqlPointer,
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
@@ -856,6 +858,7 @@ impl DaeParam {
     ) -> Self {
         Self {
             bound_index,
+            target: DaeTarget::Parameter,
             value_ptr: binding.parameter_value_ptr,
             expected_len,
             plan,
@@ -864,6 +867,11 @@ impl DaeParam {
             udt_names,
             transcode: None,
         }
+    }
+
+    pub(crate) fn with_target(mut self, target: DaeTarget) -> Self {
+        self.target = target;
+        self
     }
 
     /// A streamed parameter with no `ColumnSize` bound, for the tests that only
@@ -917,6 +925,29 @@ impl DaeParam {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaeTarget {
+    Parameter,
+    TvpRowControl {
+        tvp_index: usize,
+        row_index: usize,
+    },
+    TvpCell {
+        tvp_index: usize,
+        row_index: usize,
+        column_index: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BufferedTvpCell {
+    pub(crate) tvp_index: usize,
+    pub(crate) row_index: usize,
+    pub(crate) column_index: usize,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) is_null: bool,
+}
+
 /// How much of the open data-at-execution parameter the application has
 /// supplied. Reset as a unit whenever the cursor advances.
 #[derive(Debug, Default)]
@@ -941,6 +972,8 @@ pub(crate) struct DaeProgress {
     /// The parameter was supplied as SQL NULL, so the declared-length check is
     /// skipped, as in msodbcsql.
     pub(crate) is_null: bool,
+    /// The row-presence value supplied for a TVP row-control token.
+    pub(crate) tvp_row_present: Option<bool>,
     /// Chunks collected for a [`DaePlan::Buffer`] parameter, converted when it
     /// closes. Empty for a streamed one.
     pub(crate) buffer: Vec<u8>,
@@ -992,6 +1025,11 @@ pub(crate) struct DaeState {
     /// Collected values for buffered parameters as `(bound index, bytes,
     /// is_null)`, in close order.
     pub(crate) buffered: Vec<(usize, Vec<u8>, bool)>,
+    /// Buffered TVP cell payloads, kept separate from top-level parameter
+    /// buffers because several cells contribute to one RPC parameter.
+    pub(crate) tvp_cells: Vec<BufferedTvpCell>,
+    /// Number of rows whose TVP row-control marker was true, by parameter.
+    pub(crate) tvp_row_counts: BTreeMap<usize, usize>,
     /// The RPC parameters as `build_named_params` materialized them at execute
     /// time, data-at-execution slots included as placeholders. The deferred
     /// execute replaces only those slots and keeps the rest verbatim.
@@ -1028,6 +1066,8 @@ impl DaeState {
             progress: DaeProgress::default(),
             deferred: false,
             buffered: Vec::new(),
+            tvp_cells: Vec::new(),
+            tvp_row_counts: BTreeMap::new(),
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
@@ -1156,6 +1196,32 @@ impl DaeState {
         self.progress = DaeProgress::default();
     }
 
+    /// A false TVP row-control marker terminates that table. Its remaining
+    /// pre-staged cell and row tokens must not be presented to the application.
+    pub(crate) fn advance_past_tvp(&mut self, tvp_index: usize) {
+        let next = self.cursor.map_or(0, |current| current + 1);
+        let end = self
+            .params
+            .get(next..)
+            .and_then(|rest| {
+                rest.iter().position(|param| {
+                    !matches!(
+                        param.target,
+                        DaeTarget::TvpRowControl {
+                            tvp_index: target,
+                            ..
+                        } | DaeTarget::TvpCell {
+                            tvp_index: target,
+                            ..
+                        } if target == tvp_index
+                    )
+                })
+            })
+            .map_or(self.params.len(), |offset| next + offset);
+        self.cursor = Some(end);
+        self.progress = DaeProgress::default();
+    }
+
     /// Builds a sequence with no parked client, for tests that exercise the
     /// validation paths reached before any network write.
     #[cfg(test)]
@@ -1170,6 +1236,8 @@ impl DaeState {
             progress: DaeProgress::default(),
             deferred: false,
             buffered: Vec::new(),
+            tvp_cells: Vec::new(),
+            tvp_row_counts: BTreeMap::new(),
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
@@ -1862,6 +1930,53 @@ mod tests {
         assert!(dae.buffered_phase_complete());
         dae.cursor = Some(2);
         assert!(!dae.buffered_phase_complete());
+    }
+
+    #[test]
+    fn false_tvp_row_marker_skips_the_rest_of_its_tokens() {
+        let mut row_control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        row_control.plan = DaePlan::Buffer;
+        let mut cell =
+            DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(DaeTarget::TvpCell {
+                tvp_index: 0,
+                row_index: 0,
+                column_index: 0,
+            });
+        cell.plan = DaePlan::Buffer;
+        let next_param = DaeParam::unbounded(1, std::ptr::null_mut(), None);
+        let mut dae = DaeState::for_test(
+            vec![
+                row_control.clone(),
+                cell,
+                row_control.clone().with_target(DaeTarget::TvpRowControl {
+                    tvp_index: 0,
+                    row_index: 1,
+                }),
+                row_control.with_target(DaeTarget::TvpCell {
+                    tvp_index: 0,
+                    row_index: 1,
+                    column_index: 0,
+                }),
+                DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+                    DaeTarget::TvpRowControl {
+                        tvp_index: 0,
+                        row_index: 2,
+                    },
+                ),
+                next_param,
+            ],
+            Some(0),
+        );
+
+        dae.advance_past_tvp(0);
+
+        assert_eq!(dae.cursor, Some(5));
+        assert_eq!(dae.current_param().unwrap().bound_index, 1);
     }
 
     #[test]

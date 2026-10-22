@@ -15,10 +15,11 @@ the `mssql-odbc` Rust driver, so that mssql-python can offer TVPs through its sy
 It is written for two audiences: the **mssql-python team**, to state what the driver will
 expose and guarantee; and the **mssql-odbc team**, to record the scope of the work.
 
-The design goal is **behavioral parity with msodbcsql18 at the ODBC surface**. mssql-python
-drives TVPs through standard ODBC calls, and those calls must produce identical observable
-results whether the active provider is msodbcsql18 or mssql-odbc — with no provider-specific
-code path.
+The design goal is **behavioral parity with msodbcsql18 for the supported TVP flow at the
+ODBC surface**. mssql-python drives TVPs through standard ODBC calls, and those calls must
+produce identical observable results whether the active provider is msodbcsql18 or
+mssql-odbc — with no provider-specific code path. The unsupported cases are listed in
+[Section 6](#6-out-of-scope).
 
 ---
 
@@ -78,8 +79,11 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   name and the number of rows (or an empty-table marker).
 - **Bind the columns under focus** — parameter focus is set to the TVP, each column's values
   are bound, and focus is then restored.
-- **Execute** — the statement runs; procedure result sets are returned through the normal
-  fetch path. TVPs are input-only and are never fetched back.
+- **Supply TVP content with data-at-execution** — the driver returns the table token, then
+  row-control and cell tokens in the order expected by the ODBC TVP protocol. Cell bytes are
+  buffered and converted into the table value before execution.
+- **Execute** — the statement runs; procedure result sets are returned through the normal fetch
+  path. TVPs are input-only and are never fetched back.
 
 ---
 
@@ -90,18 +94,21 @@ mssql-odbc will add the following capabilities:
 - **Expose the table type identity** from describe — report `SQL_SS_TABLE` and the table
   type's three-part name, extending the driver's existing SQL Server user-type-name handling
   to table types.
-- **Support the SQL Server TVP descriptor fields** — the type / schema / catalog name and the
-  per-column default-value marker.
+- **Support the SQL Server TVP type identity fields** — catalog, schema, and type name.
 - **Accept a table parameter** bound as `SQL_SS_TABLE`, validated as input-only and
   non-nullable, with msodbcsql18-compatible diagnostics.
 - **Implement parameter focus** so a TVP's constituent columns can be bound and then
   restored to top-level binding.
 - **Assemble the bound columns into rows** for transmission, applying the same per-cell
   conversion and null semantics as top-level scalar parameters.
+- **Support data-at-execution for TVP content** — consume row-control markers and per-cell
+  payloads, preserving row order and NULL values while assembling the table parameter.
 - **Handle empty TVPs and all-NULL columns** correctly.
-- **Preserve clean lifecycle and diagnostics** — reset TVP state on cursor close or
-  re-prepare; on a bad value, report the offending row and column and keep the connection
-  usable.
+- **Preserve binding lifetime and diagnostics** — retain TVP column bindings across cursor
+  close and re-prepare, as with scalar parameter bindings; clear them on
+  `SQLFreeStmt(SQL_RESET_PARAMS)`. Parameter focus remains a statement attribute, so the
+  application must restore it to 0 before execute. On a bad value, report the offending row
+  and column and keep the connection usable.
 
 ---
 
@@ -111,6 +118,8 @@ mssql-odbc will add the following capabilities:
 - **Asynchronous / Rust-TDS adapter** — delivered separately.
 - **Output or input/output TVPs; fetching TVPs back** — TVPs are input-only by definition.
 - **TVPs inside parameter arrays / `executemany`** — a TVP is one logical value, not a batch.
+- **The per-column default-value marker** (`SQL_CA_SS_COLUMN_HAS_DEFAULT_VALUE`) — applying a
+  server default to every row of a TVP column is deferred.
 - **`sql_variant` columns within a TVP** — deferred.
 
 ---
@@ -140,9 +149,9 @@ provider-specific skips.
 
 ## 9. Summary for the mssql-python team
 
-- mssql-odbc will implement the **SQL Server ODBC TVP contract to msodbcsql18 parity**:
-  describe reports the table type and its name, the table parameter and its columns bind
-  under parameter focus, and the statement executes with the TVP.
-- Your ODBC TVP code path will run **unchanged** on mssql-odbc — no provider-specific branch
-  or rejection is required once this work lands.
+- mssql-odbc implements the supported SQL Server ODBC TVP flow: describe reports the table
+  type and its name, the table parameter and its columns bind under parameter focus, and the
+  statement executes with the TVP.
+- Your ODBC TVP code path can run unchanged for the supported cases listed in this document.
+  The exclusions in Section 6 remain unsupported.
 - The asynchronous / Rust-TDS path is owned separately and is not affected by this work.

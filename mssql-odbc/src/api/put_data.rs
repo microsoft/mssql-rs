@@ -22,6 +22,7 @@ use crate::api::odbc_types::{
 };
 use crate::conversion::param_convert::reserve_dae_buffer;
 use crate::error::free_errors;
+use crate::handles::stmt::DaeTarget;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Supplies a data chunk for the current data-at-execution parameter.
@@ -132,6 +133,53 @@ unsafe fn sql_put_data_safe(
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
         }
+    }
+
+    let tvp_row_control = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLPutData: stmt mutex poisoned checking TVP row control");
+            return SQL_ERROR;
+        };
+        let Some(dae) = stmt_state.dae.as_ref() else {
+            error!("SQLPutData: DAE sequence ended before TVP row control");
+            return SQL_ERROR;
+        };
+        if !matches!(
+            dae.current_param().map(|param| param.target),
+            Some(DaeTarget::TvpRowControl { .. })
+        ) {
+            false
+        } else {
+            if dae.call_in_flight() {
+                error!("SQLPutData: DAE sequence is in use by another call");
+                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            }
+            let row_present = if data_ptr as usize == 1 && strlen_or_ind == 1 {
+                Some(true)
+            } else if data_ptr.is_null() && strlen_or_ind == 0 {
+                Some(false)
+            } else {
+                error!("SQLPutData: invalid TVP row-control marker");
+                post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                return SQL_ERROR;
+            };
+            if dae.progress.put_data_called {
+                drop(stmt_state);
+                error!("SQLPutData: multiple writes to a TVP row-control token");
+                return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_FUNCTION_SEQUENCE);
+            }
+            let Some(dae) = stmt_state.dae.as_mut() else {
+                error!("SQLPutData: DAE sequence vanished capturing TVP row control");
+                return SQL_ERROR;
+            };
+            dae.progress.put_data_called = true;
+            dae.progress.tvp_row_present = row_present;
+            true
+        }
+    };
+    if tvp_row_control {
+        return SQL_SUCCESS;
     }
 
     let is_null_put = strlen_or_ind == SQL_NULL_DATA || (data_ptr.is_null() && strlen_or_ind == 0);
@@ -631,7 +679,7 @@ unsafe fn sql_put_data_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
-    use crate::handles::stmt::{DaeParam, DaeState};
+    use crate::handles::stmt::{DaeParam, DaeState, DaeTarget};
     use crate::test_support::TestHandles;
 
     /// A sequence with one parameter, already opened by `SQLParamData`.
@@ -679,6 +727,57 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+    }
+
+    #[test]
+    fn tvp_row_control_sentinel_is_captured_without_dereferencing_it() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        control.plan = crate::conversion::param_convert::DaePlan::Buffer;
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(vec![control], Some(0)));
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, 1usize as SqlPointer, 1) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let state = stmt.inner.lock().unwrap();
+        let progress = &state.dae.as_ref().unwrap().progress;
+        assert!(progress.put_data_called);
+        assert_eq!(progress.tvp_row_present, Some(true));
+        assert!(progress.buffer.is_empty());
+    }
+
+    #[test]
+    fn null_zero_tvp_row_control_marker_stops_the_table() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(vec![control], Some(0)));
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.dae.as_ref().unwrap().progress.tvp_row_present,
+            Some(false)
+        );
     }
 
     /// The hazard the missing-binding guard exists to prevent: a defaulted C

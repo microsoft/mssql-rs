@@ -38,20 +38,21 @@ use uuid::Uuid;
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIND_BY_COLUMN, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_NUMERIC,
-    SQL_C_WCHAR, SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID,
-    SQL_INTEGER, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NULL_DATA,
-    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT,
-    SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT,
+    SQL_C_WCHAR, SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT,
+    SQL_GUID, SQL_INTEGER, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR,
+    SQL_NULL_DATA, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT,
     SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR,
     SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt,
     SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INTERNAL_CONVERSION,
-    ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_DATETIME_FORMAT, ERR_INVALID_NULL_POINTER,
-    ERR_INVALID_PARAM_PRECISION_OR_SCALE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
-    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION, ERR_MISSING_UDT_TYPE_NAME,
-    ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+    ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_DATETIME_FORMAT,
+    ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
+    ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION,
+    ERR_MISSING_TVP_TYPE_NAME, ERR_MISSING_UDT_TYPE_NAME, ERR_NUMERIC_OUT_OF_RANGE,
+    ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_CONVERSION_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE, ERR_UNBOUND_PARAMETER,
 };
@@ -126,6 +127,18 @@ pub(crate) enum ParamBuildError {
     /// A `SQL_SS_TABLE` parameter with no table type name on its IPD record.
     /// The server cannot resolve the table type without it.
     MissingTableTypeName,
+    /// A TVP row count is negative (other than SQL_DEFAULT_PARAM) or exceeds
+    /// the bound row capacity.
+    InvalidTvpRowCount,
+    /// A TVP constituent column uses data-at-execution, which this path does
+    /// not support.
+    TvpColumnDataAtExec(usize),
+    /// A TVP cell could not be converted. The coordinates are zero-based.
+    TvpCellConversion {
+        row: usize,
+        column: usize,
+        diagnostic: DiagMsg,
+    },
     /// A table-valued parameter has rows but one of its constituent columns
     /// (0-based index) was never bound under `SQL_SOPT_SS_PARAM_FOCUS`.
     TvpColumnUnbound(usize),
@@ -152,7 +165,10 @@ impl ParamBuildError {
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
             Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
             Self::MissingUdtTypeName => ERR_MISSING_UDT_TYPE_NAME,
-            Self::MissingTableTypeName => ERR_MISSING_UDT_TYPE_NAME,
+            Self::MissingTableTypeName => ERR_MISSING_TVP_TYPE_NAME,
+            Self::InvalidTvpRowCount => ERR_INVALID_ATTRIBUTE_VALUE,
+            Self::TvpColumnDataAtExec(_) => ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED,
+            Self::TvpCellConversion { diagnostic, .. } => diagnostic,
             Self::TvpColumnUnbound(_) => ERR_UNBOUND_PARAMETER,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
             // Exhaustiveness backstop; parameters use Self::DateTimeFieldOverflow.
@@ -763,6 +779,21 @@ pub(crate) fn buffered_dae_to_rpc(
     };
     let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
     unsafe { bound_param_to_rpc(name, &synthetic, udt_names) }
+}
+
+pub(crate) fn buffered_dae_to_value(
+    binding: &BoundParam,
+    buffer: &[u8],
+    is_null: bool,
+) -> Result<(SqlType, ConvOk), ParamBuildError> {
+    let mut indicator: SqlLen = if is_null {
+        SQL_NULL_DATA
+    } else {
+        SqlLen::try_from(buffer.len()).map_err(|_| ParamBuildError::StringTruncation)?
+    };
+    let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
+    let ((value, _), outcome) = unsafe { bound_param_to_value_with_outcome(&synthetic, None) }?;
+    Ok((value, outcome))
 }
 
 fn buffered_dae_binding(binding: &BoundParam, buffer: &[u8], indicator: &mut SqlLen) -> BoundParam {
@@ -2138,10 +2169,10 @@ pub(crate) unsafe fn build_tvp_param(
 ) -> Result<RpcParameter, ParamBuildError> {
     let type_name = tvp_type_name(udt_names)?;
 
-    // The indicator carries the row count; a negative value (SQL_DEFAULT_PARAM)
-    // or a null pointer means an empty table, which the wire encodes as a
-    // no-metadata TVP.
-    let row_count = unsafe { tvp_row_count(tvp, bind_offset) };
+    // A null indicator or SQL_DEFAULT_PARAM means an empty table. Other
+    // negative indicators are not row counts and must not silently become an
+    // empty/default TVP.
+    let row_count = unsafe { tvp_row_count(tvp, bind_offset) }?;
     let Some(row_count) = row_count.filter(|&n| n > 0) else {
         return Ok(RpcParameter::new(
             name,
@@ -2150,9 +2181,16 @@ pub(crate) unsafe fn build_tvp_param(
         ));
     };
 
+    if row_count > tvp.column_size {
+        return Err(ParamBuildError::InvalidTvpRowCount);
+    }
+
     // Column templates (type only), with precision/scale for the types whose
     // metadata lives inside the value.
-    let mut column_defs = Vec::with_capacity(columns.len());
+    let mut column_defs = Vec::new();
+    column_defs
+        .try_reserve(columns.len())
+        .map_err(|_| ParamBuildError::MemoryAllocation)?;
     for (index, column) in columns.iter().enumerate() {
         let column = column
             .as_ref()
@@ -2161,22 +2199,115 @@ pub(crate) unsafe fn build_tvp_param(
     }
 
     // Rows, built column-major from the captured column arrays and transposed.
-    let mut rows = Vec::with_capacity(row_count);
+    let mut rows = Vec::new();
+    rows.try_reserve(row_count)
+        .map_err(|_| ParamBuildError::MemoryAllocation)?;
     for row in 0..row_count {
-        let mut cells = Vec::with_capacity(columns.len());
+        let mut cells = Vec::new();
+        cells
+            .try_reserve(columns.len())
+            .map_err(|_| ParamBuildError::MemoryAllocation)?;
         for (index, column) in columns.iter().enumerate() {
             let column = column
                 .as_ref()
                 .ok_or(ParamBuildError::TvpColumnUnbound(index))?;
-            let positioned = column.for_row(row, 0, SQL_BIND_BY_COLUMN).map_err(
-                |ParamArrayLayoutError::InvalidValueStride { .. }| {
+            let positioned = column
+                .for_row(row, bind_offset, SQL_BIND_BY_COLUMN)
+                .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                     ParamBuildError::InvalidBufferLength
-                },
-            )?;
-            let ((value, _), _) = unsafe { bound_param_to_value_with_outcome(&positioned, None) }?;
+                })?;
+            if unsafe { data_at_exec_indicator(&positioned) }.is_some() {
+                return Err(ParamBuildError::TvpColumnDataAtExec(index));
+            }
+            let ((value, _), _) = unsafe { bound_param_to_value_with_outcome(&positioned, None) }
+                .map_err(|error| ParamBuildError::TvpCellConversion {
+                row,
+                column: index,
+                diagnostic: error.diag(),
+            })?;
             cells.push(value);
         }
         rows.push(cells);
+    }
+
+    Ok(RpcParameter::new(
+        name,
+        StatusFlags::NONE,
+        SqlType::Table(type_name, Some(TvpTableData::new(column_defs, rows))),
+    ))
+}
+
+pub(crate) fn build_tvp_param_from_dae(
+    name: Option<String>,
+    udt_names: Option<&UdtNames>,
+    columns: &[Option<BoundParam>],
+    tvp_index: usize,
+    row_count: usize,
+    buffered_cells: &[crate::handles::stmt::BufferedTvpCell],
+) -> Result<RpcParameter, ParamBuildError> {
+    let type_name = tvp_type_name(udt_names)?;
+    if row_count == 0 {
+        return Ok(RpcParameter::new(
+            name,
+            StatusFlags::NONE,
+            SqlType::Table(type_name, None),
+        ));
+    }
+
+    let mut column_defs = Vec::new();
+    column_defs
+        .try_reserve(columns.len())
+        .map_err(|_| ParamBuildError::MemoryAllocation)?;
+    for (index, column) in columns.iter().enumerate() {
+        let column = column
+            .as_ref()
+            .ok_or(ParamBuildError::TvpColumnUnbound(index))?;
+        column_defs.push(tvp_column_def(column)?);
+    }
+
+    let expected_cells = row_count
+        .checked_mul(columns.len())
+        .ok_or(ParamBuildError::MemoryAllocation)?;
+    let mut cells = Vec::new();
+    cells
+        .try_reserve_exact(expected_cells)
+        .map_err(|_| ParamBuildError::MemoryAllocation)?;
+    for cell in buffered_cells
+        .iter()
+        .filter(|cell| cell.tvp_index == tvp_index)
+    {
+        cells.push(cell);
+    }
+    if cells.len() != expected_cells {
+        return Err(ParamBuildError::InvalidBufferLength);
+    }
+
+    let mut rows = Vec::new();
+    rows.try_reserve(row_count)
+        .map_err(|_| ParamBuildError::MemoryAllocation)?;
+    for row_index in 0..row_count {
+        let mut row = Vec::new();
+        row.try_reserve(columns.len())
+            .map_err(|_| ParamBuildError::MemoryAllocation)?;
+        for (column_index, column) in columns.iter().enumerate() {
+            let cell = cells[row_index * columns.len() + column_index];
+            if cell.row_index != row_index || cell.column_index != column_index {
+                return Err(ParamBuildError::InvalidBufferLength);
+            }
+            let column = column
+                .as_ref()
+                .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
+            let (value, _) =
+                buffered_dae_to_value(column, &cell.bytes, cell.is_null).map_err(|error| {
+                    ParamBuildError::TvpCellConversion {
+                        row: row_index,
+                        column: column_index,
+                        diagnostic: error.diag(),
+                    }
+                })?;
+            row.push(value);
+        }
+        rows.push(row);
     }
 
     Ok(RpcParameter::new(
@@ -2221,18 +2352,26 @@ fn tvp_column_def(column: &BoundParam) -> Result<TvpColumnDef, ParamBuildError> 
 }
 
 /// The row count a TVP's indicator declares, or `None` for an empty table
-/// (`SQL_DEFAULT_PARAM`, a negative value, or a null indicator pointer).
+/// (`SQL_DEFAULT_PARAM` or a null indicator pointer).
 ///
 /// # Safety
 /// `tvp`'s indicator pointer, after `bind_offset`, must be null or address a
 /// readable `SqlLen`.
-unsafe fn tvp_row_count(tvp: &BoundParam, bind_offset: isize) -> Option<usize> {
+unsafe fn tvp_row_count(
+    tvp: &BoundParam,
+    bind_offset: isize,
+) -> Result<Option<usize>, ParamBuildError> {
     let positioned = tvp.with_bind_offset(bind_offset);
     if positioned.strlen_or_ind_ptr.is_null() {
-        return None;
+        return Ok(None);
     }
     let indicator = unsafe { positioned.strlen_or_ind_ptr.read_unaligned() };
-    usize::try_from(indicator).ok()
+    if indicator == SQL_DEFAULT_PARAM {
+        return Ok(None);
+    }
+    usize::try_from(indicator)
+        .map(Some)
+        .map_err(|_| ParamBuildError::InvalidTvpRowCount)
 }
 
 /// Recovers a vector's dimension count and base type from the `ColumnSize` and
@@ -4183,20 +4322,27 @@ mod tests {
         ));
     }
 
-    /// The TVP indicator carries the row count; `SQL_DEFAULT_PARAM`, a negative
-    /// value, or a null pointer all mean an empty table.
+    /// The TVP indicator carries the row count; `SQL_DEFAULT_PARAM` or a null
+    /// pointer means an empty table. Other negative values are rejected.
     #[test]
     fn tvp_row_count_reads_the_indicator() {
         let mut count: SqlLen = 3;
         let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
-        assert_eq!(unsafe { tvp_row_count(&p, 0) }, Some(3));
+        assert_eq!(unsafe { tvp_row_count(&p, 0) }, Ok(Some(3)));
 
         let mut default: SqlLen = SQL_DEFAULT_PARAM;
         let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut default);
-        assert_eq!(unsafe { tvp_row_count(&p, 0) }, None);
+        assert_eq!(unsafe { tvp_row_count(&p, 0) }, Ok(None));
+
+        let mut null: SqlLen = SQL_NULL_DATA;
+        let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut null);
+        assert_eq!(
+            unsafe { tvp_row_count(&p, 0) },
+            Err(ParamBuildError::InvalidTvpRowCount)
+        );
 
         let p = param(SQL_C_BINARY, std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(unsafe { tvp_row_count(&p, 0) }, None);
+        assert_eq!(unsafe { tvp_row_count(&p, 0) }, Ok(None));
     }
 
     /// An empty TVP builds without reading any column, carries no rows, and
@@ -4237,12 +4383,151 @@ mod tests {
         let columns = vec![Some(column)];
 
         let mut count: SqlLen = 2;
-        let tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        tvp.column_size = 2;
         assert!(unsafe { build_tvp_param(None, &tvp, Some(&names), &columns, 0) }.is_ok());
 
         let unbound = vec![None];
         let err = unsafe { build_tvp_param(None, &tvp, Some(&names), &unbound, 0) }.unwrap_err();
         assert!(matches!(err, ParamBuildError::TvpColumnUnbound(0)));
+    }
+
+    #[test]
+    fn build_tvp_param_from_dae_assembles_buffered_cells() {
+        use crate::handles::desc::UdtNames;
+        use crate::handles::stmt::BufferedTvpCell;
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let column = int_param(
+            SQL_C_SLONG,
+            SQL_INTEGER,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let cells = [BufferedTvpCell {
+            tvp_index: 0,
+            row_index: 0,
+            column_index: 0,
+            bytes: 42_i32.to_ne_bytes().to_vec(),
+            is_null: false,
+        }];
+
+        let rpc =
+            build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &cells).unwrap();
+        match mssql_tds::test_client_support::rpc_parameter_value(&rpc).unwrap() {
+            SqlType::Table(_, Some(data)) => {
+                assert_eq!(data.rows, vec![vec![SqlType::Int(Some(42))]]);
+            }
+            other => panic!("expected a materialized TVP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tvp_row_count_cannot_exceed_bound_capacity() {
+        use crate::handles::desc::UdtNames;
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let mut count: SqlLen = 2;
+        let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        tvp.column_size = 1;
+        assert!(matches!(
+            unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0) },
+            Err(ParamBuildError::InvalidTvpRowCount)
+        ));
+    }
+
+    #[test]
+    fn tvp_column_data_at_exec_is_reported_as_unsupported() {
+        use crate::handles::desc::UdtNames;
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let mut count: SqlLen = 1;
+        let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        tvp.column_size = 1;
+
+        let mut value = 42_i32;
+        let mut indicator = SQL_DATA_AT_EXEC;
+        let column = int_param(
+            SQL_C_SLONG,
+            SQL_INTEGER,
+            (&mut value as *mut i32).cast(),
+            &mut indicator,
+        );
+        assert!(matches!(
+            unsafe { build_tvp_param(None, &tvp, Some(&names), &[Some(column)], 0) },
+            Err(ParamBuildError::TvpColumnDataAtExec(0))
+        ));
+    }
+
+    #[test]
+    fn tvp_row_reservation_fails_without_aborting_for_extreme_counts() {
+        use crate::handles::desc::UdtNames;
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let mut count = SqlLen::MAX;
+        let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        tvp.column_size = SqlULen::MAX;
+        assert!(matches!(
+            unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0) },
+            Err(ParamBuildError::MemoryAllocation)
+        ));
+    }
+
+    #[test]
+    fn tvp_bind_offset_applies_to_top_level_and_column_indicators_and_values() {
+        use crate::handles::desc::UdtNames;
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+
+        let mut row_count_buffer = [0u8; 16];
+        unsafe {
+            row_count_buffer
+                .as_mut_ptr()
+                .add(4)
+                .cast::<SqlLen>()
+                .write_unaligned(1);
+        }
+        let mut tvp = param(
+            SQL_C_BINARY,
+            std::ptr::null_mut(),
+            row_count_buffer.as_mut_ptr().cast(),
+        );
+        tvp.column_size = 1;
+
+        let mut values = [10i32, 42];
+        let mut indicator_buffer = [0u8; 16];
+        unsafe {
+            indicator_buffer
+                .as_mut_ptr()
+                .add(4)
+                .cast::<SqlLen>()
+                .write_unaligned(0);
+        }
+        let mut column = int_param(
+            SQL_C_SLONG,
+            SQL_INTEGER,
+            values.as_mut_ptr().cast(),
+            indicator_buffer.as_mut_ptr().cast(),
+        );
+        column.buffer_length = size_of::<i32>() as SqlLen;
+
+        let rpc = unsafe { build_tvp_param(None, &tvp, Some(&names), &[Some(column)], 4) }.unwrap();
+        match mssql_tds::test_client_support::rpc_parameter_value(&rpc).unwrap() {
+            SqlType::Table(_, Some(data)) => {
+                assert_eq!(data.rows, vec![vec![SqlType::Int(Some(42))]]);
+            }
+            other => panic!("expected a materialized TVP, got {other:?}"),
+        }
     }
 
     /// One buffer, four declarations: the wire type follows `ParameterType`, so

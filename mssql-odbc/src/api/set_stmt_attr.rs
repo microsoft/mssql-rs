@@ -183,23 +183,20 @@ unsafe fn sql_set_stmt_attr_w_impl(
 /// Mirrors msodbcsql's `IsValidTvpOrdinal` (`sqlcdesc.cpp`): a zero ordinal is
 /// never valid (it is the non-specific focus), and the record must exist and
 /// carry the table type. Reads the IPD without holding the STMT lock, per the
-/// crate's locking rule; a poisoned IPD mutex reads as "not valid" rather than
-/// panicking. `stmt.ipd` is never reassociated or independently freed
+/// crate's locking rule. `stmt.ipd` is never reassociated or independently freed
 /// (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so no liveness recheck is needed.
-fn is_valid_tvp_ordinal(stmt: &StmtHandle, ordinal: SqlULen) -> bool {
+fn is_valid_tvp_ordinal(stmt: &StmtHandle, ordinal: SqlULen) -> Result<bool, ()> {
     if ordinal == 0 {
-        return false;
+        return Ok(false);
     }
     let Ok(record_number) = SqlSmallInt::try_from(ordinal) else {
-        return false;
+        return Ok(false);
     };
     let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
-    let Ok(ipd_state) = ipd.inner.lock() else {
-        return false;
-    };
-    ipd_state
+    let ipd_state = ipd.inner.lock().map_err(|_| ())?;
+    Ok(ipd_state
         .record(record_number)
-        .is_some_and(|record| record.concise_type == SQL_SS_TABLE)
+        .is_some_and(|record| record.concise_type == SQL_SS_TABLE))
 }
 
 /// # Safety
@@ -561,7 +558,21 @@ unsafe fn sql_set_stmt_attr_w_safe(
             if focus != 0 {
                 // Read the IPD after releasing the STMT lock (locking rule).
                 drop(state);
-                let valid = is_valid_tvp_ordinal(stmt, focus);
+                let valid = match is_valid_tvp_ordinal(stmt, focus) {
+                    Ok(valid) => valid,
+                    Err(()) => {
+                        error!("SQLSetStmtAttrW: ipd mutex poisoned validating PARAM_FOCUS");
+                        if let Ok(mut state) = stmt.inner.lock() {
+                            post_sql_error(
+                                &mut state,
+                                SQLSTATE_HY000,
+                                0,
+                                "Internal error reading table-valued parameter metadata",
+                            );
+                        }
+                        return SQL_ERROR;
+                    }
+                };
                 let Ok(mut state) = stmt.inner.lock() else {
                     error!("SQLSetStmtAttrW: stmt mutex poisoned validating PARAM_FOCUS");
                     return SQL_ERROR;
@@ -2990,6 +3001,17 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
         assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_PARAM_FOCUS), 0);
+    }
+
+    #[test]
+    fn param_focus_reports_a_poisoned_ipd_as_an_internal_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        poison_desc(h.ipd());
+
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY000);
     }
 
     /// Once a parameter is bound as `SQL_SS_TABLE`, focusing on its ordinal is
