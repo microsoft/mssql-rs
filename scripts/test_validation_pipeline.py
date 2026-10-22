@@ -333,13 +333,14 @@ def test_pin_validation_is_not_path_filtered_or_optional():
     assert "pr" not in pipeline
     stages = load_template("validation-stages.yml")["stages"]
     stage = next(stage for stage in stages if stage["stage"] == "Build_mssql_python")
-    assert stage["dependsOn"] == ["EvaluateDuplicate"]
+    assert stage["dependsOn"] == ["InitializeValidation"]
     assert stage["condition"] == (
         "and(not(canceled()), "
+        "eq(dependencies.InitializeValidation.result, 'Succeeded'), "
         "eq('${{ parameters.RunFuzz }}', 'false'), "
         "eq('${{ parameters.RunLongHaul }}', 'false'), "
         "or(ne(variables['Build.Reason'], 'PullRequest'), "
-        "ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')))"
+        "ne(dependencies.InitializeValidation.outputs['Initialize.SetDuplicateState.skipDuplicate'], 'true')))"
     )
     for job in stage["jobs"]:
         assert "condition" not in job

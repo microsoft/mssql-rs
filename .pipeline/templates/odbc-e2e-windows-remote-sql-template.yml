@@ -5,7 +5,7 @@
 #
 # The Windows ARM agent image ships no SQL Server (unlike RUST-W22-SQL25 used
 # by Build_Windows), so the ARM job joins the same artifact-sentinel rendezvous the
-# Linux ARM jobs use: derive the shared SA password, poll for the sql-ready
+# Linux ARM jobs use: import the initialization secret, poll for the sql-ready
 # endpoint sentinel, run the suite, then publish a teardown sentinel to release
 # the host. See sql-host-template.yml for the full contract.
 #
@@ -96,18 +96,19 @@ steps:
     displayName: 'Preflight: CMake and C++ toolchain'
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
-  - pwsh: ./.pipeline/scripts/sql-host/New-SqlPassword.ps1
-    displayName: 'Derive shared SQL_PASSWORD from build context'
+  - pwsh: ./.pipeline/scripts/sql-host/Import-SqlPassword.ps1
+    displayName: 'Import shared SQL credential'
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
-      BUILD_BUILDID: $(Build.BuildId)
-      SYSTEM_COLLECTIONID: $(System.CollectionId)
+      SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
+      SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
 
   - pwsh: ./.pipeline/scripts/sql-host/Wait-ForSqlEndpoint.ps1
     displayName: 'Wait for SQL host endpoint sentinel'
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
-      ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(System.StageAttempt)'
+      ARTIFACT_NAME: 'sql-ready-${{ parameters.sqlReadyInstanceId }}-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+      SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
       BUILD_BUILDID: $(Build.BuildId)
       SYSTEM_COLLECTIONURI: $(System.CollectionUri)
       SYSTEM_TEAMPROJECT: $(System.TeamProject)
@@ -158,5 +159,5 @@ steps:
     condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
     inputs:
       targetPath: '$(Agent.TempDirectory)/teardown-${{ parameters.sentinelName }}'
-      artifact: '${{ parameters.sentinelName }}-$(System.StageAttempt)'
+      artifact: '${{ parameters.sentinelName }}-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
       publishLocation: 'pipeline'

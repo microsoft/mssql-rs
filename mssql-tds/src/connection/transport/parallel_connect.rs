@@ -34,6 +34,7 @@ use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
+use crate::connection::dns_cache::{self, Resolution};
 use crate::core::TdsResult;
 use crate::error::Error;
 
@@ -120,6 +121,18 @@ pub async fn parallel_connect(
     port: u16,
     config: &ParallelConnectConfig,
 ) -> TdsResult<ParallelConnectResult> {
+    parallel_connect_resolving(host, port, config)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// [`parallel_connect`], also returning what `host` resolved to, which the
+/// connection's login DNS caching verdict applies to.
+pub(crate) async fn parallel_connect_resolving(
+    host: &str,
+    port: u16,
+    config: &ParallelConnectConfig,
+) -> TdsResult<(ParallelConnectResult, Resolution)> {
     info!(
         "Starting parallel connection to {}:{} with timeout {}ms",
         host, port, config.timeout_ms
@@ -132,14 +145,14 @@ pub async fn parallel_connect(
     // Resolve DNS to get all IP addresses. `lookup_host` awaits the resolution
     // instead of blocking the calling thread (unlike `std::net::ToSocketAddrs`),
     // so a slow or stuck resolver stays subject to `deadline` instead of
-    // silently escaping it.
-    let addresses: Vec<SocketAddr> = match timeout(
+    // silently escaping it. A failed resolution falls back to the DNS cache.
+    let resolution = match timeout(
         deadline.saturating_duration_since(Instant::now()),
-        tokio::net::lookup_host((host, port)),
+        dns_cache::lookup_host(host, port),
     )
     .await
     {
-        Ok(Ok(resolved)) => resolved.take(MAX_PARALLEL_IPS).collect(),
+        Ok(Ok(resolution)) => resolution,
         Ok(Err(e)) => return Err(Error::from(e)),
         Err(_elapsed) => {
             warn!(
@@ -151,6 +164,12 @@ pub async fn parallel_connect(
             )));
         }
     };
+    let addresses: Vec<SocketAddr> = resolution
+        .addresses()
+        .iter()
+        .take(MAX_PARALLEL_IPS)
+        .copied()
+        .collect();
 
     if addresses.is_empty() {
         return Err(Error::ConnectionError(format!(
@@ -212,12 +231,15 @@ pub async fn parallel_connect(
                 "Parallel connection succeeded to {} after {} failed attempts",
                 addr, failed_attempts
             );
-            Ok(ParallelConnectResult {
-                stream,
-                connected_address: addr,
-                total_addresses,
-                failed_attempts,
-            })
+            Ok((
+                ParallelConnectResult {
+                    stream,
+                    connected_address: addr,
+                    total_addresses,
+                    failed_attempts,
+                },
+                resolution,
+            ))
         }
         Ok(Err(last_error)) => {
             warn!(

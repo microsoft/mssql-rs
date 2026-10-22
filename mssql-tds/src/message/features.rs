@@ -3,6 +3,8 @@
 
 pub mod always_encrypted;
 pub mod data_classification;
+pub mod dns_caching;
+pub mod enhanced_routing;
 pub mod fedauth;
 pub mod jsonfeature;
 pub mod session_recovery;

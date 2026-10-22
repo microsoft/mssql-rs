@@ -1069,3 +1069,44 @@ msodbcsql build is measured.
     session's uncommitted `CREATE TYPE` until its 3-second command timeout.
     **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
     Tracked in AB#48044. Human parity sign-off has not been recorded.
+
+33. **DNS fallback is published only by a completed, accepted login.**
+    Source comparison: SNI's `GetCachedAddrInfo`
+    (`Sql/Common/DK/sni/src/dns_cache.cpp`) adds every successful resolution
+    before login and consults that cache when `GetAddressInfo` fails.
+    `BATCHCTX::ProcessFeatureExtAck`
+    (`Sql/Ntdbms/sqlncli/tds/Parse.cpp`, `FEACK_DNSCACHE` and `_EXIT`) passes its
+    local `useDNScache` verdict to `SNISetInfo`; the
+    `SNI_QUERY_CONN_DNSCACHE` arm in `Sql/Common/DK/sni/src/sni.cpp` deletes the
+    host on a false verdict. A DNS allow parsed before another malformed
+    feature remains true at that exit; no FEATUREEXTACK invokes no setter.
+
+    This driver's shared `mssql-tds` path instead retains each resolution on
+    its connection, publishing it only after LOGINACK, a successful terminal
+    DONE, and a positive DNS acknowledgement in the last FEATUREEXTACK.
+    A completed accepted response with a negative or missing DNS
+    acknowledgement removes the host. A malformed FEATUREEXTACK also
+    revokes it after that accepted response is drained, rather than keeping
+    a partial allow as SNI's source does. Rejected, incomplete, and
+    authentication-continuation responses cannot publish or remove an entry.
+    **No FEATUREEXTACK leaves the cache unchanged**, including a routing
+    response from an Azure gateway; it is not treated as a negative verdict.
+
+    The intent is to share only server-allowed addresses and keep a transient
+    rejected login from destroying the fallback needed by its next retry.
+    Consequently, a resolution followed by a failed or unacknowledged first
+    login cannot prime fallback as SNI's eager path can. Concurrent logins
+    publish their own addresses in completed-verdict order, rather than
+    keeping the most recent DNS lookup. The per-connection candidate follows
+    SqlClient's `pendingSQLDNSObject` model, not SNI's eager insertion.
+    Deterministic replay tests cover rejection after FEATUREEXTACK,
+    continuations, truncation, malformed acknowledgements, and routing with
+    no FEATUREEXTACK. Mock-server tests exercise the public connect path,
+    retained fallback, explicit revocation, and MultiSubnetFailover with an
+    unreachable first address.
+
+    **Evidence limit:** these msodbcsql comparisons are source readings, not
+    a retail-driver measurement. A controlled DNS-outage comparison against
+    a named retail build, with `SQL_DRIVER_VER` recorded, remains necessary;
+    Azure SQL Proxy/Redirect and session-recovery outage tests have not been
+    run. No human parity sign-off has been recorded. Tracked in AB#49294.
