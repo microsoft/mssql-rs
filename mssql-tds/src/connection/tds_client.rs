@@ -3503,58 +3503,36 @@ impl TdsClient {
             writer.set_plaintext_ceks(plaintext_ceks);
         }
 
-        // Begin streaming (write metadata)
-        writer.begin().await?;
-
-        // STEP 3: Stream rows using zero-copy path
-        // If an error occurs during row writing, we need to send an attention packet
-        // to gracefully cancel the bulk load operation and leave the connection usable.
-        let mut row_write_error: Option<crate::error::Error> = None;
-        for row in rows {
-            // Write the row directly using the streaming writer
-            if let Err(e) = writer.write_row_zerocopy(&row).await {
-                row_write_error = Some(e);
-                break;
+        let serialize_result = async {
+            writer.begin().await?;
+            for row in rows {
+                writer.write_row_zerocopy(&row).await?;
             }
+
+            Ok(())
         }
+        .await;
+        let (serialize_result, message) = writer.end_with_message(serialize_result).await;
 
-        // A bulk row goes through the same `TdsValueSerializer` as an RPC
-        // parameter, so a narrow value can be substituted here too. This path
-        // builds its own `PacketWriter` and never reaches `finish_send`, so the
-        // verdict is published by hand.
-        //
-        // Published *here*, before the error branch, rather than after `end`:
-        // every exit below then carries it. Rows streamed before a mid-batch
-        // failure can already have been applied — a bulk copy with no internal
-        // transaction commits as it streams — so a substitution among them is
-        // real, and `BulkCopy::write_to_server_zerocopy` drains this in its
-        // `Err` arm to fold into the operation's verdict. Reading it now also
-        // ends the
-        // writer's borrow of the transport before either exit needs `&mut self`,
-        // and `end` writes only the DONE token, so nothing can be substituted
-        // between here and the return.
-        self.code_page_conversion_loss = writer.code_page_conversion_loss();
-
-        // Handle error during row streaming
-        if let Some(original_error) = row_write_error {
-            // Send attention packet to cancel the bulk load operation gracefully.
-            // This tells SQL Server to abort the current operation and resets the
-            // TDS protocol state so the connection can be reused.
-            // The stream is always in a clean state here because writes are never
-            // dropped mid-flight (issue #513).
-            // If the attention is never acknowledged the transport marks itself
-            // dead, so clearing the batch flag below cannot hand out a connection
-            // with an ATTENTION still outstanding.
-            let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
-            let _ = self.send_attention_with_timeout(attention_timeout).await;
-            return Err(original_error);
-        }
-
-        // STEP 4: End streaming (write DONE token and finalize)
-        //
-        // The substitution verdict was published above so that the error exits
-        // carry it too; `end` cannot change it.
-        let rows_written = writer.end().await?;
+        // Rows preceding a failure may already be committed. Preserve their
+        // substitution verdict even when metadata, a row, or finalization fails.
+        self.code_page_conversion_loss = message.code_page_conversion_loss();
+        let rows_written = match serialize_result {
+            Ok(rows_written) => rows_written,
+            Err(error) => {
+                // A timeout can interrupt a packet/TLS record in any phase.
+                // Neither ATTENTION nor TLS shutdown is safe on that stream.
+                if message.send_incomplete() {
+                    self.retire_without_writing();
+                } else {
+                    // INSERT BULK already put the server in bulk-load mode,
+                    // even if all BulkLoad bytes are still buffered locally.
+                    let timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+                    let _ = self.send_attention_with_timeout(timeout).await;
+                }
+                return Err(error);
+            }
+        };
 
         // STEP 5: Drain the server response for error handling and INFO capture.
         // Its returned count is informational only; callers receive the client-side
@@ -9116,12 +9094,27 @@ impl TdsClient {
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
         }
+        self.execute_transaction_request(
+            TransactionManagementType::Begin(CreateTxnParams {
+                level: isolation_level,
+                name,
+            }),
+            options.into(),
+        )
+        .await
+    }
+
+    async fn execute_transaction_request(
+        &mut self,
+        transaction_params: TransactionManagementType,
+        options: ExecuteOptions<'_>,
+    ) -> TdsResult<()> {
         let ExecuteOptions {
             timeout,
             cancel,
             on_error,
             ..
-        } = options.into();
+        } = options;
         Self::note_on_error_ignored(on_error);
 
         self.begin_command();
@@ -9132,10 +9125,6 @@ impl TdsClient {
         self.remaining_request_timeout = resolved.duration();
         self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
-        let transaction_params = TransactionManagementType::Begin(CreateTxnParams {
-            level: isolation_level,
-            name,
-        });
         let transaction =
             TransactionManagementRequest::new(transaction_params, &self.execution_context);
         let mut packet_writer =
@@ -9185,26 +9174,33 @@ impl TdsClient {
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
+        self.commit_transaction_with_options(name, create_txn_params, ())
+            .await
+    }
+
+    /// Like [`commit_transaction`](Self::commit_transaction), but with a request
+    /// timeout and cancellation handle. Recovery is checked only before sending;
+    /// an unknown commit outcome is never retried.
+    #[instrument(skip(self, options), level = "info")]
+    pub async fn commit_transaction_with_options<'a>(
+        &mut self,
+        name: Option<String>,
+        create_txn_params: Option<CreateTxnParams>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
         if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot commit transaction while another batch is executing.".to_string(),
             ));
         }
-        self.begin_command();
-        let transaction = TransactionManagementRequest::new(
+        self.execute_transaction_request(
             TransactionManagementType::Commit {
                 name,
                 create_txn_params,
             },
-            &self.execution_context,
-        );
-        let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), None, None);
-        transaction.serialize(&mut packet_writer).await?;
-
-        self.consume_transaction_response().await?;
-
-        Ok(())
+            options.into(),
+        )
+        .await
     }
 
     /// Roll back the current transaction, or roll back to a named savepoint.
@@ -9217,26 +9213,33 @@ impl TdsClient {
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
+        self.rollback_transaction_with_options(name, create_txn_params, ())
+            .await
+    }
+
+    /// Like [`rollback_transaction`](Self::rollback_transaction), but with a
+    /// request timeout and cancellation handle, including for named savepoints
+    /// and atomic rollback-and-begin.
+    #[instrument(skip(self, options), level = "info")]
+    pub async fn rollback_transaction_with_options<'a>(
+        &mut self,
+        name: Option<String>,
+        create_txn_params: Option<CreateTxnParams>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
         if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot rollback transaction while another batch is executing.".to_string(),
             ));
         }
-        self.begin_command();
-        let transaction = TransactionManagementRequest::new(
+        self.execute_transaction_request(
             TransactionManagementType::Rollback {
                 name,
                 create_txn_params,
             },
-            &self.execution_context,
-        );
-        let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), None, None);
-        transaction.serialize(&mut packet_writer).await?;
-
-        self.consume_transaction_response().await?;
-
-        Ok(())
+            options.into(),
+        )
+        .await
     }
 
     /// Retrieve the DTC (Distributed Transaction Coordinator) network address from the server.
@@ -9742,6 +9745,10 @@ mod tests {
         cancel_during_send: Option<tokio_util::sync::CancellationToken>,
         sends_before_cancel: usize,
         send_delay: Option<Duration>,
+        /// Simulates a send completing in one poll after a stalled runtime,
+        /// so only the post-send budget check can observe the timeout.
+        send_completion_delay: Option<Duration>,
+        partial_bulk_send: bool,
         /// Attentions requested, so a test can tell the cancel-a-sent-request
         /// path from the withdraw-a-partial-one path.
         attentions: Arc<std::sync::atomic::AtomicUsize>,
@@ -9781,6 +9788,8 @@ mod tests {
                 cancel_during_send: None,
                 sends_before_cancel: 0,
                 send_delay: None,
+                send_completion_delay: None,
+                partial_bulk_send: false,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
                 receive_error: None,
@@ -9987,6 +9996,11 @@ mod tests {
             {
                 std::future::pending::<()>().await;
             }
+            if self.partial_bulk_send && data[0] == PacketType::BulkLoad as u8 {
+                self.partial_bulk_send = false;
+                self.sent.lock().unwrap().extend_from_slice(&data[..8]);
+                std::future::pending::<()>().await;
+            }
             if self.sends_before_cancel == 0
                 && let Some(cancel) = self.cancel_during_send.take()
             {
@@ -9995,6 +10009,9 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             self.sends_before_cancel = self.sends_before_cancel.saturating_sub(1);
+            if let Some(delay) = self.send_completion_delay.take() {
+                std::thread::sleep(delay);
+            }
             self.sent.lock().unwrap().extend_from_slice(data);
             if let Some(cancel) = self.cancel_after_send.take() {
                 cancel.cancel();
@@ -14722,6 +14739,143 @@ mod tests {
             *column_index += 1;
             Ok(())
         }
+    }
+
+    async fn assert_bulk_partial_send_timeout(column_count: usize, row_count: usize) {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport.partial_bulk_send = true;
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        client.execution_context.set_transaction_descriptor(42);
+        let columns = (0..column_count)
+            .map(|index| {
+                BulkCopyColumnMetadata::new(
+                    format!("column_{index}"),
+                    SqlDbType::Int,
+                    TdsDataType::Int4 as u8,
+                )
+                .with_length(4, TypeLength::Fixed(4))
+            })
+            .collect();
+        let rows_visited = std::cell::Cell::new(0);
+        let rows = (0..row_count).map(|_| {
+            rows_visited.set(rows_visited.get() + 1);
+            IntRow(10)
+        });
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.execute_bulk_load_streaming_zerocopy(
+                "#t".to_string(),
+                columns,
+                BulkCopyOptions::default(),
+                Some(1),
+                None,
+                rows,
+                &[],
+            ),
+        )
+        .await
+        .expect("bulk timeout cleanup must not hang");
+
+        assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+        assert!(start.elapsed() <= Duration::from_secs(1));
+        if column_count > 1 {
+            assert_eq!(rows_visited.get(), 0, "metadata must fail before rows");
+        } else if row_count > 1 {
+            assert!(rows_visited.get() > 0 && rows_visited.get() < row_count);
+        } else {
+            assert_eq!(
+                rows_visited.get(),
+                row_count,
+                "finalization must follow rows"
+            );
+        }
+        assert!(client.transport.connection_known_dead());
+        assert!(!client.execution_context.has_open_batch());
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let wire = sent.lock().unwrap().clone();
+        let mut offset = 0;
+        while wire[offset] == PacketType::SqlBatch as u8 {
+            offset += u16::from_be_bytes([wire[offset + 2], wire[offset + 3]]) as usize;
+        }
+        assert_eq!(wire[offset], PacketType::BulkLoad as u8);
+        assert_eq!(wire.len() - offset, 8, "no writes after the partial packet");
+        assert!(matches!(
+            client.rollback_transaction(None, None).await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert_eq!(
+            *sent.lock().unwrap(),
+            wire,
+            "rollback must not write either"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_metadata_timeout_retires_partial_send_without_writing() {
+        assert_bulk_partial_send_timeout(300, 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_row_timeout_retires_partial_send_without_writing() {
+        assert_bulk_partial_send_timeout(1, 2000).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_end_timeout_retires_partial_send_without_writing() {
+        assert_bulk_partial_send_timeout(1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_buffered_row_failure_still_cancels_the_insert_bulk_preamble() {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        struct FailingRow;
+
+        #[async_trait]
+        impl BulkLoadRow for FailingRow {
+            async fn write_to_packet(
+                &self,
+                _writer: &mut StreamingBulkLoadWriter<'_>,
+                _column_index: &mut usize,
+            ) -> TdsResult<()> {
+                Err(UsageError("injected bulk row error".to_string()))
+            }
+        }
+
+        let transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let attentions = Arc::clone(&transport.attentions);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let result = client
+            .execute_bulk_load_streaming_zerocopy(
+                "#t".to_string(),
+                vec![
+                    BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                        .with_length(4, TypeLength::Fixed(4)),
+                ],
+                BulkCopyOptions::default(),
+                None,
+                None,
+                std::iter::once(FailingRow),
+                &[],
+            )
+            .await;
+
+        assert!(matches!(result, Err(UsageError(message)) if message == "injected bulk row error"));
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!client.transport.connection_known_dead());
+        assert!(!client.execution_context.has_open_batch());
     }
 
     #[tokio::test]
@@ -19984,7 +20138,7 @@ mod tests {
         for delayed_send in [false, true] {
             let mut transport = TestTransport::new();
             if delayed_send {
-                transport.send_delay = Some(Duration::from_millis(2100));
+                transport.send_completion_delay = Some(Duration::from_millis(2100));
             }
             let sent = Arc::clone(&transport.sent);
             let attentions = Arc::clone(&transport.attentions);
@@ -20020,6 +20174,48 @@ mod tests {
             let wire = sent.lock().unwrap();
             assert_eq!(wire[1] & 1, 1, "the final EOM packet must have been sent");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepared_stream_interrupted_send_preserves_orphan_on_timeout() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let mut transport = TestTransport::new();
+        transport.send_delay = Some(Duration::from_secs(60));
+        let sent = Arc::clone(&transport.sent);
+        let attentions = Arc::clone(&transport.attentions);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        client
+            .prepared_param_encryption
+            .insert(id, Arc::new(DescribeParameterEncryptionResult::new()));
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(1),
+            )
+            .await
+            .unwrap();
+        let error = client
+            .end_execute_prepared_param(&mut statement, &mut orphaned)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::TimeoutError(_)));
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        assert!(client.prepared_param_encryption.contains_key(&id));
+        assert!(client.transport.connection_known_dead());
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -20144,6 +20340,153 @@ mod tests {
         assert!(!client.prepared_handles.contains_key(&id));
         assert_eq!(sent.lock().unwrap().len(), 8);
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_completion_timeout_retires_a_stalled_write_without_retry() {
+        for commit in [true, false] {
+            let mut transport = TestTransport::new();
+            transport.send_delay = Some(Duration::from_secs(60));
+            let closes = Arc::clone(&transport.close_calls);
+            let attentions = Arc::clone(&transport.attentions);
+            let sent = Arc::clone(&transport.sent);
+            let mut client = create_test_client_with_transport(transport);
+            client.execution_context.set_transaction_descriptor(42);
+            let options = ExecuteOptions::new().timeout_secs(1);
+            let start = tokio::time::Instant::now();
+            let result = if commit {
+                client
+                    .commit_transaction_with_options(None, None, options)
+                    .await
+            } else {
+                client
+                    .rollback_transaction_with_options(None, None, options)
+                    .await
+            };
+            assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+            assert_eq!(start.elapsed(), Duration::from_secs(1));
+            assert!(client.is_connection_dead());
+            assert!(client.has_active_transaction());
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(sent.lock().unwrap().is_empty());
+            let result = if commit {
+                client.commit_transaction(None, None).await
+            } else {
+                client.rollback_transaction(None, None).await
+            };
+            assert!(matches!(
+                result,
+                Err(crate::error::Error::ConnectionClosed(_))
+            ));
+            assert!(sent.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_completion_deducts_reconnect_budget_before_send_and_read() {
+        for commit in [true, false] {
+            for reconnect_seconds in [2, 5] {
+                let transport = TestTransport::with_tokens(vec![done_no_more()]);
+                let timeouts = Arc::clone(&transport.receive_timeouts);
+                let sent = Arc::clone(&transport.sent);
+                let mut client = create_test_client_with_transport(transport);
+                client.reconnect_elapsed_for_test = Some(Duration::from_secs(reconnect_seconds));
+                let options = ExecuteOptions::new().timeout_secs(5);
+                let result = if commit {
+                    client
+                        .commit_transaction_with_options(None, None, options)
+                        .await
+                } else {
+                    client
+                        .rollback_transaction_with_options(None, None, options)
+                        .await
+                };
+                if reconnect_seconds == 5 {
+                    assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+                    assert!(sent.lock().unwrap().is_empty());
+                    assert!(timeouts.lock().unwrap().is_empty());
+                } else {
+                    result.unwrap();
+                    assert!(!sent.lock().unwrap().is_empty());
+                    assert_eq!(
+                        *timeouts.lock().unwrap(),
+                        vec![Some(Duration::from_secs(3))]
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_completion_cancellation_uses_its_own_settlement_budget() {
+        for commit in [true, false] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut transport = TestTransport::new();
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            let sent = Arc::clone(&transport.sent);
+            let closes = Arc::clone(&transport.close_calls);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            client.execution_context.set_transaction_descriptor(42);
+            let options = ExecuteOptions::new().timeout_secs(1).cancel(&cancel);
+            let start = tokio::time::Instant::now();
+            let result = if commit {
+                client
+                    .commit_transaction_with_options(None, None, options)
+                    .await
+            } else {
+                client
+                    .rollback_transaction_with_options(None, None, options)
+                    .await
+            };
+            assert!(matches!(
+                result,
+                Err(crate::error::Error::OperationCancelledError(_))
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(3));
+            assert!(client.is_connection_dead());
+            assert!(client.has_active_transaction());
+            assert_eq!(sent.lock().unwrap().len(), 8);
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_completion_zero_and_legacy_timeouts_are_unlimited() {
+        for commit in [true, false] {
+            for legacy in [true, false] {
+                let transport = TestTransport::with_tokens(vec![done_no_more()]);
+                let timeouts = Arc::clone(&transport.receive_timeouts);
+                let mut client = create_test_client_with_transport(transport);
+                let result = match (commit, legacy) {
+                    (true, true) => client.commit_transaction(None, None).await,
+                    (false, true) => client.rollback_transaction(None, None).await,
+                    (true, false) => {
+                        client
+                            .commit_transaction_with_options(
+                                None,
+                                None,
+                                ExecuteOptions::new().timeout_secs(0),
+                            )
+                            .await
+                    }
+                    (false, false) => {
+                        client
+                            .rollback_transaction_with_options(
+                                None,
+                                None,
+                                ExecuteOptions::new().timeout_secs(0),
+                            )
+                            .await
+                    }
+                };
+                result.unwrap();
+                assert_eq!(*timeouts.lock().unwrap(), vec![None]);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

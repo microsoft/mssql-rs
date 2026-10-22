@@ -333,6 +333,18 @@ impl MockServer {
         });
     }
 
+    pub(crate) fn set_tm_end_delay(&self, commit: bool, delay: std::time::Duration) {
+        let key = if commit {
+            mssql_mock_tds::TM_COMMIT_DELAY_KEY
+        } else {
+            mssql_mock_tds::TM_ROLLBACK_DELAY_KEY
+        };
+        self.register_query(
+            key,
+            mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+        );
+    }
+
     /// Registers a delay for the server's answer to any RPC request that
     /// matched no specific registration.
     ///
