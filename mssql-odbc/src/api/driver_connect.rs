@@ -908,6 +908,7 @@ mod tests {
             ("MultiSubnetFailover=No;", Some(1), 1),
             ("TransparentNetworkIPResolution=Disabled;", None, 1),
             ("Failover_Partner=mirror;", None, 0),
+            ("FailoverPartner=mirror;", None, 0),
         ] {
             let handles = TestHandles::with_env_dbc();
             if let Some(value) = attribute {

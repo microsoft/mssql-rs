@@ -93,13 +93,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Eligible TCP connections now default to immediate parallel MSF attempts,
   without TNIR's first-address phase. Explicit non-TCP transports, failover
   partners, and named instances requiring SSRP suppress an inherited on
-  default; explicitly enabling incompatible MSF is an error. More than 64
+  default; Windows local targets without a protocol or port retain their
+  shared-memory-first path unless MSF is explicitly enabled for the connection.
+  Explicitly enabling incompatible MSF is an error. More than 64
   resolved addresses is an error with MSF on, not a truncated race; MSF off
   walks the full list sequentially. See parity decisions 34 and 35 (AB#49293).
 
 - Rust API migration: `ClientContext::multi_subnet_failover` is now
   `Option<bool>`: use `None` to inherit, or `Some(false)` to opt out.
   Python dictionary and JS object options preserve omission and explicit false.
+  Native Python `multi_subnet_failover=None` also inherits the default.
 
 - TNIR is deliberately unsupported. ODBC
   `TransparentNetworkIPResolution=Disabled` / `SQL_COPT_SS_TNIR=OFF` and native

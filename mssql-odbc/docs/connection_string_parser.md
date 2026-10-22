@@ -162,7 +162,7 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |
 | `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No`; omission inherits startup policy |
 | `TransparentNetworkIPResolution` | compatibility validation only | `Disabled` is a no-op; `Enabled` fails with `HYC00` |
-| `Failover_Partner` / `FailoverPartner` | `ClientContext::failover_partner` | suppresses inherited MSF; does not implement mirroring |
+| `Failover_Partner` / `FailoverPartner` | `ClientContext::failover_partner` | suppresses inherited MSF on every platform; no mirroring (parity entry 36) |
 | `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault`; unknown → `IPv4First` |
 | `ConnectRetryCount` | `ClientContext::connect_retry_count` | integer 0–255 (rejected if out of range) |
 | `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer 1–60 seconds (rejected if out of range) |

@@ -29,8 +29,9 @@ Eligible TCP connections default to MultiSubnetFailover (MSF), racing resolved
 addresses without a first-address delay. For `PyCoreConnection` and
 `PyAsyncConnection.connect`, pass `multi_subnet_failover=False` in the native
 context dictionary to opt out, or `True` to opt in explicitly. Case-insensitive
-`"Yes"`/`"No"` strings are also accepted; other types and strings are errors.
-Omit the key to inherit startup defaults.
+`"Yes"`/`"No"` strings are also accepted. Omit the key or pass `None` to inherit
+startup defaults; `False` remains an explicit opt-out. Other types and strings
+are errors.
 
 Before opening any connections or pools, applications can call
 `mssql_py_core.set_default_multi_subnet_failover(False)`. Explicit connection

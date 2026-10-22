@@ -219,15 +219,14 @@ impl PyCoreConnection {
             .unwrap_or(false);
 
         let multi_subnet_failover = Self::extract_optional_bool(
-            dict,
-            "multi_subnet_failover",
+            dict.get_item("multi_subnet_failover")?
+                .filter(|value| !value.is_none()),
             "MultiSubnetFailover",
             "Yes",
             "No",
         )?;
         if Self::extract_optional_bool(
-            dict,
-            "transparent_network_ip_resolution",
+            dict.get_item("transparent_network_ip_resolution")?,
             "TransparentNetworkIPResolution",
             "Enabled",
             "Disabled",
@@ -521,13 +520,12 @@ impl PyCoreConnection {
     }
 
     fn extract_optional_bool(
-        dict: &Bound<'_, PyDict>,
-        key: &str,
+        value: Option<Bound<'_, PyAny>>,
         display_name: &str,
         on: &str,
         off: &str,
     ) -> PyResult<Option<bool>> {
-        let Some(value) = dict.get_item(key)? else {
+        let Some(value) = value else {
             return Ok(None);
         };
         if let Ok(value) = value.extract::<bool>() {
@@ -578,6 +576,16 @@ mod tests {
     fn missing_msf_preserves_inheritance() {
         Python::attach(|py| {
             let dict = PyDict::new(py);
+            let context = PyCoreConnection::dict_to_client_context(&dict).unwrap();
+            assert_eq!(context.multi_subnet_failover, None);
+        });
+    }
+
+    #[test]
+    fn none_msf_preserves_inheritance() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("multi_subnet_failover", py.None()).unwrap();
             let context = PyCoreConnection::dict_to_client_context(&dict).unwrap();
             assert_eq!(context.multi_subnet_failover, None);
         });

@@ -1126,9 +1126,12 @@ msodbcsql build is measured.
 
     Inherited on is suppressed for explicit non-TCP transports, DAC, a
     failover partner, and instances needing SSRP; explicitly requesting
-    incompatible MSF is an error. Bare server names without discovery select
-    TCP when enabled. MSF off restores the protocol waterfall and full
-    sequential address walk. More than 64 addresses fails before opening
+    incompatible MSF is an error. On Windows, local targets without a protocol
+    or port also suppress inherited on, preserving the shared-memory-first
+    waterfall for local instances with TCP/IP disabled. Explicit MSF on,
+    `tcp:`, or a port still selects TCP. Bare non-local names, and bare names
+    on other platforms, select TCP when enabled. MSF off restores the waterfall
+    and full sequential address walk. More than 64 addresses fails before opening
     sockets, not by racing a truncated list. The native reference's
     `Tcp::ParallelOpen` -> `SocketOpenParallel` ->
     `ParallelConnectWaitSet::Initialize` (`Sql/Common/DK/sni/src/tcp.cpp`,
@@ -1194,3 +1197,31 @@ msodbcsql build is measured.
     design context, not the ODBC parity authority. The implementation decision
     was approved by the author on 2026-10-21; maintainer product/parity sign-off
     remains pending. Tracked in AB#49293.
+
+36. **Failover-partner keywords constrain MSF on every platform, without
+    implementing database mirroring.** This driver accepts `Failover_Partner`
+    and `FailoverPartner` on Windows, Linux, and macOS without an unknown-keyword
+    warning. A nonempty partner suppresses inherited MSF; explicit MSF on is an
+    error. It does not connect to the partner, and `FailoverPartnerSPN` remains
+    recognized but ignored. Database-mirroring failover is still an implementation
+    gap, not a feature supplied by this keyword mapping.
+
+    **Source-level comparison:** msodbcsql's `SQLDriverConnectW` passes
+    `x_ullBitMapDriverConnectKeys` to `ParseAttrStr`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp`). That bitmap includes
+    `KEY_FAILOVERPARTNER` and `KEY_FAILOVERPARTNERSPN` only outside
+    `MPLAT_UNIX` (the VSTS 831337 branch). `ParseAttrStr` requires both a lookup
+    match and the bitmap bit; otherwise it ignores the value and returns
+    `S_FALSE`, and the caller reports invalid-attribute information. Thus the
+    Unix source does not treat a supplied partner as an MSF constraint.
+
+    This driver deliberately retains the input as a cross-platform applicability
+    constraint rather than letting default-on MSF override an application's
+    declared partner configuration. `msf_getter_tracks_connected_policy_without_leaking_keywords_to_reconnects`
+    exercises both spellings through a mock login and confirms MSF off for the
+    connected session, without letting the keyword leak into the next login.
+    **Evidence limit:** the native Unix behavior is a source reading, not a
+    retail-driver measurement. A connected Linux/macOS comparison with the retail
+    build and `SQL_DRIVER_VER` recorded must confirm the warning and effective
+    MSF value. This does not change the separate mirroring implementation gap.
+    Maintainer parity sign-off remains pending. Tracked in AB#49293.

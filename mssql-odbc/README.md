@@ -69,7 +69,10 @@ win. The default freezes on first use, including an inherited MSF attribute
 read, so configure it before loading pools or opening connections.
 
 Explicit non-TCP transports and named instances requiring SQL Browser retain
-their existing paths when MSF is inherited. MSF-on connections reject hosts
+their existing paths when MSF is inherited. On Windows, local targets without a
+protocol or port also retain the shared-memory-first path, including instances
+with TCP/IP disabled. `MultiSubnetFailover=Yes`, `tcp:`, or a port explicitly
+selects TCP instead. MSF-on connections reject hosts
 with more than 64 addresses rather than ignoring part of the address list.
 `TransparentNetworkIPResolution=Disabled` and `SQL_COPT_SS_TNIR=SQL_IS_OFF`
 are compatibility no-ops; enabling TNIR is unsupported (`HYC00`).

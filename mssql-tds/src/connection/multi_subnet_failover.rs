@@ -31,7 +31,7 @@ pub enum MultiSubnetFailoverSource {
     BuiltIn,
 }
 
-/// Why an inherited MSF default cannot apply to a connection.
+/// Why an inherited MSF default was suppressed for a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MultiSubnetFailoverInapplicable {
     /// The selected transport is not a normal TCP connection.
@@ -40,6 +40,8 @@ pub enum MultiSubnetFailoverInapplicable {
     FailoverPartner,
     /// This endpoint needs SQL Browser discovery before a TCP port is known.
     InstanceDiscovery,
+    /// An implicit local Windows connection retains its shared-memory-first path.
+    LocalServer,
 }
 
 /// Effective policy retained for redirects, recovery, and secondary connections.
@@ -168,32 +170,36 @@ pub(crate) fn resolve_policy(
     if !policy.enabled {
         return Ok(policy);
     }
-    let reason = if !matches!(parsed.protocol_name.as_str(), "" | "tcp") {
-        Some(MultiSubnetFailoverInapplicable::Transport)
+    let restriction = if !matches!(parsed.protocol_name.as_str(), "" | "tcp") {
+        Some((
+            MultiSubnetFailoverInapplicable::Transport,
+            "MultiSubnetFailover is only supported with TCP connections",
+        ))
     } else if !failover_partner.is_empty() {
-        Some(MultiSubnetFailoverInapplicable::FailoverPartner)
+        Some((
+            MultiSubnetFailoverInapplicable::FailoverPartner,
+            "MultiSubnetFailover cannot be used with FailoverPartner",
+        ))
     } else if parsed.needs_ssrp() {
-        Some(MultiSubnetFailoverInapplicable::InstanceDiscovery)
+        Some((
+            MultiSubnetFailoverInapplicable::InstanceDiscovery,
+            "MultiSubnetFailover requires an explicit TCP port for a named instance",
+        ))
     } else {
         None
     };
-    if let Some(reason) = reason {
+    if let Some((reason, message)) = restriction {
         if explicit == Some(true) {
-            let message = match reason {
-                MultiSubnetFailoverInapplicable::Transport => {
-                    "MultiSubnetFailover is only supported with TCP connections"
-                }
-                MultiSubnetFailoverInapplicable::FailoverPartner => {
-                    "MultiSubnetFailover cannot be used with FailoverPartner"
-                }
-                MultiSubnetFailoverInapplicable::InstanceDiscovery => {
-                    "MultiSubnetFailover requires an explicit TCP port for a named instance"
-                }
-            };
             return Err(configuration_error(message));
         }
         policy.enabled = false;
         policy.inapplicable = Some(reason);
+    }
+    #[cfg(windows)]
+    if policy.enabled && explicit.is_none() && parsed.protocol_name.is_empty() && parsed.is_local()
+    {
+        policy.enabled = false;
+        policy.inapplicable = Some(MultiSubnetFailoverInapplicable::LocalServer);
     }
     Ok(policy)
 }
@@ -245,9 +251,9 @@ mod tests {
         if let Some(value) = application {
             set_default_multi_subnet_failover(value).unwrap();
         }
-        let mut context = ClientContext::with_data_source("tcp:host,1433");
+        let mut context = ClientContext::with_data_source("db.example.invalid");
         context.multi_subnet_failover = explicit;
-        let result = context.prepare_datasource("tcp:host,1433");
+        let result = context.prepare_datasource("db.example.invalid");
         if parts[1] == "invalid" && application.is_none() && explicit.is_none() {
             assert!(
                 result
@@ -263,21 +269,69 @@ mod tests {
             let mut secondary = context.clone();
             secondary.prepare_datasource("tcp:secondary,1433").unwrap();
             assert_eq!(secondary.multi_subnet_failover_policy(), Some(policy));
-            for alias in ["localhost", ".", "(local)"] {
+            let machine = hostname::get().unwrap().into_string().unwrap();
+            for (alias, tcp_host) in [
+                ("localhost", "localhost"),
+                ("LOCALHOST", "localhost"),
+                (".", "localhost"),
+                ("(local)", "localhost"),
+                ("127.0.0.1", "127.0.0.1"),
+                ("::1", "::1"),
+                (machine.as_str(), "localhost"),
+            ] {
                 let mut local = ClientContext::with_data_source(alias);
                 local.multi_subnet_failover = explicit;
                 let parsed = local.prepare_datasource(alias).unwrap();
-                assert_eq!(parsed.parallel_connect, expected);
-                assert_eq!(local.multi_subnet_failover_policy(), Some(policy));
-                if expected {
+                let local_policy = if cfg!(windows) && explicit.is_none() && expected {
+                    MultiSubnetFailoverPolicy {
+                        enabled: false,
+                        source: policy.source,
+                        inapplicable: Some(MultiSubnetFailoverInapplicable::LocalServer),
+                    }
+                } else {
+                    policy
+                };
+                assert_eq!(parsed.parallel_connect, local_policy.enabled, "{alias}");
+                assert_eq!(local.multi_subnet_failover_policy(), Some(local_policy));
+                if local_policy.enabled {
                     assert_eq!(parsed.protocol_name, "tcp");
-                    assert_eq!(parsed.server_name, "localhost");
+                    assert_eq!(parsed.server_name, tcp_host);
                     assert!(matches!(
                         local.transport_context,
                         crate::connection::client_context::TransportContext::Tcp { ref host, .. }
-                            if host == "localhost"
+                            if host == tcp_host
                     ));
                 }
+                #[cfg(windows)]
+                if !local_policy.enabled {
+                    use crate::connection::connection_actions::ConnectionAction;
+                    let chain = parsed.to_connection_actions(15_000);
+                    assert!(
+                        chain.actions().iter().any(|action| matches!(
+                            action,
+                            ConnectionAction::TrySequence { actions, .. } if matches!(
+                                actions.as_slice(),
+                                [
+                                    ConnectionAction::ConnectSharedMemory { .. },
+                                    ConnectionAction::ConnectTcp { .. },
+                                    ConnectionAction::ConnectNamedPipe { .. }
+                                ]
+                            )
+                        )),
+                        "{alias}: {}",
+                        chain.describe()
+                    );
+                }
+                let mut secondary = local.clone();
+                secondary.prepare_datasource(alias).unwrap();
+                assert_eq!(secondary.multi_subnet_failover_policy(), Some(local_policy));
+            }
+            for target in ["tcp:localhost", "localhost,1433", "127.0.0.1,1433"] {
+                let mut local = ClientContext::with_data_source(target);
+                local.multi_subnet_failover = explicit;
+                let parsed = local.prepare_datasource(target).unwrap();
+                assert_eq!(parsed.parallel_connect, expected);
+                assert_eq!(local.multi_subnet_failover_policy(), Some(policy));
             }
         }
         assert!(set_default_multi_subnet_failover(false).is_err());

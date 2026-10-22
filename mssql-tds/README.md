@@ -45,11 +45,16 @@ The Rust `ClientContext::multi_subnet_failover` field changed from `bool` to
 An inherited on default is suppressed for named pipes, shared memory, LocalDB,
 DAC (`admin:`), a nonempty failover partner, or a named instance requiring SQL
 Browser (SSRP). Those retain their existing transport/discovery paths.
-`tcp:host\instance,port` is eligible because discovery is unnecessary. Bare
-server names without instance discovery select TCP when MSF is on; explicitly
-select a non-TCP transport or disable MSF to retain the protocol waterfall.
-Local aliases (`localhost`, `.`, `(local)`) remain `localhost` for TCP resolution
-and certificate hostname validation rather than becoming the machine hostname.
+`tcp:host\instance,port` is eligible because discovery is unnecessary. On Windows,
+a local target without a protocol or port (`localhost`, `.`, `(local)`, loopback
+IP, or the machine name) also suppresses inherited MSF. It retains the
+shared-memory-first waterfall, so a local instance with TCP/IP disabled remains
+reachable. An explicit per-connection MSF-on value, `tcp:`, or a port still selects
+TCP; application and environment defaults do not force local connections onto it.
+On other platforms, or for non-local targets, bare names without discovery select
+TCP when MSF is on. When TCP is selected, local aliases (`localhost`, `.`, `(local)`)
+remain `localhost` for resolution and certificate hostname validation rather than
+becoming the machine hostname.
 With certificate hostname validation enabled, connecting by IP requires a
 matching IP SAN or an explicit expected hostname (`host_name_in_cert` /
 ODBC `HostnameInCertificate`). MSF does not relax TLS validation.
@@ -69,7 +74,8 @@ it cannot bypass the new endpoint's applicability checks.
 | Node.js | `multiSubnetFailover: false` | `setDefaultMultiSubnetFailover(false)` |
 | CLI | `--multi-subnet-failover false` | Environment |
 
-ODBC attributes outrank keywords. Omitted native options remain inherited.
+ODBC attributes outrank keywords. Omitted native options remain inherited;
+native Python also treats `multi_subnet_failover=None` as omission, not false.
 Legacy TNIR off/`Disabled` inputs in ODBC and native Python are accepted no-ops;
 on/`Enabled` is unsupported, and invalid values fail validation. **Disabling
 TNIR does not disable MSF.** See the
