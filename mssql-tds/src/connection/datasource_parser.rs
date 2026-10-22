@@ -495,7 +495,7 @@ impl ParsedDataSource {
         #[cfg(windows)]
         if result.protocol_name == "lpc" {
             let is_local = result.original_server_name == "."
-                || result.original_server_name == "(local)"
+                || result.original_server_name.eq_ignore_ascii_case("(local)")
                 || result
                     .original_server_name
                     .eq_ignore_ascii_case("localhost")
@@ -636,7 +636,7 @@ impl ParsedDataSource {
     /// Check if this represents a local connection
     pub fn is_local(&self) -> bool {
         self.original_server_name == "."
-            || self.original_server_name == "(local)"
+            || self.original_server_name.eq_ignore_ascii_case("(local)")
             || self.original_server_name.eq_ignore_ascii_case("localhost")
             || self.original_server_name == "127.0.0.1"
             || self.original_server_name == "::1"
@@ -1562,12 +1562,42 @@ mod tests {
 
     #[test]
     fn parallel_connect_preserves_local_aliases_as_loopback_tcp() {
-        for alias in ["localhost", "LOCALHOST", ".", "(local)"] {
+        for alias in [
+            "localhost",
+            "LOCALHOST",
+            ".",
+            "(local)",
+            "(Local)",
+            "(LOCAL)",
+        ] {
             let parsed = ParsedDataSource::parse(alias, true).unwrap();
             assert_eq!(parsed.protocol_name, "tcp", "{alias}");
             assert_eq!(parsed.server_name, "localhost", "{alias}");
             assert_eq!(parsed.original_server_name, alias, "{alias}");
         }
+    }
+
+    #[test]
+    fn local_alias_detection_is_case_insensitive() {
+        for alias in ["(local)", "(Local)", "(LOCAL)", "(lOcAl)"] {
+            for parallel in [false, true] {
+                let parsed = ParsedDataSource::parse(alias, parallel).unwrap();
+                assert!(parsed.is_local(), "{alias}, parallel={parallel}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_case_local_transports_stay_local() {
+        for alias in ["(local)", "(Local)", "(LOCAL)", "(lOcAl)"] {
+            let pipe = ParsedDataSource::parse(&format!("np:{alias}"), false).unwrap();
+            assert_eq!(pipe.default_pipe_path(), r"\\.\pipe\sql\query");
+            let shared = ParsedDataSource::parse(&format!("lpc:{alias}"), false).unwrap();
+            assert!(shared.is_local());
+            assert_eq!(shared.get_protocol_type(), ProtocolType::SharedMemory);
+        }
+        assert!(ParsedDataSource::parse("lpc:remote.invalid", false).is_err());
     }
 
     #[test]

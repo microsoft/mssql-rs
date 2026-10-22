@@ -257,8 +257,8 @@ mod no_protocol_resolution {
         if !context.encryption_options.trust_server_certificate {
             context.encryption_options.mode = EncryptionSetting::Strict;
         }
-        // The CI certificate has a localhost DNS SAN, not a loopback IP SAN.
-        // Default MSF selects TCP rather than the previous shared-memory path.
+        // If shared memory is unavailable, validate the TCP fallback against
+        // the CI certificate's localhost DNS SAN, not a loopback IP SAN.
         context
             .encryption_options
             .host_name_in_cert

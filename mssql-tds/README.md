@@ -47,7 +47,8 @@ DAC (`admin:`), a nonempty failover partner, or a named instance requiring SQL
 Browser (SSRP). Those retain their existing transport/discovery paths.
 `tcp:host\instance,port` is eligible because discovery is unnecessary. On Windows,
 a local target without a protocol or port (`localhost`, `.`, `(local)`, loopback
-IP, or the machine name) also suppresses inherited MSF. It retains the
+IP, or the machine name) also suppresses inherited MSF. Local aliases are
+case-insensitive, including `(Local)` and `(LOCAL)`. This retains the
 shared-memory-first waterfall, so a local instance with TCP/IP disabled remains
 reachable. An explicit per-connection MSF-on value, `tcp:`, or a port still selects
 TCP; application and environment defaults do not force local connections onto it.

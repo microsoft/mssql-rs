@@ -275,6 +275,8 @@ mod tests {
                 ("LOCALHOST", "localhost"),
                 (".", "localhost"),
                 ("(local)", "localhost"),
+                ("(Local)", "localhost"),
+                ("(LOCAL)", "localhost"),
                 ("127.0.0.1", "127.0.0.1"),
                 ("::1", "::1"),
                 (machine.as_str(), "localhost"),
@@ -326,7 +328,12 @@ mod tests {
                 secondary.prepare_datasource(alias).unwrap();
                 assert_eq!(secondary.multi_subnet_failover_policy(), Some(local_policy));
             }
-            for target in ["tcp:localhost", "localhost,1433", "127.0.0.1,1433"] {
+            for target in [
+                "tcp:localhost",
+                "tcp:(LOCAL)",
+                "localhost,1433",
+                "127.0.0.1,1433",
+            ] {
                 let mut local = ClientContext::with_data_source(target);
                 local.multi_subnet_failover = explicit;
                 let parsed = local.prepare_datasource(target).unwrap();
