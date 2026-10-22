@@ -89,11 +89,8 @@ covers cold driver/TLS initialization. The native stack size of the existing
 matching musl's default application-thread budget. Debug/coverage drivers use
 512 KiB for unoptimized frames. When configuring CMake directly, pass
 `-DODBC_E2E_RELEASE_DRIVER=ON` for a release driver; the default is OFF.
-PR validation builds a debug/coverage driver, so it runs only the 512 KiB
-variant. The 128 KiB budget runs in the non-PR CI pipeline, whose
-`--release` builds feed the Linux legs, including RHEL 8 (glibc 2.28,
-unixODBC 2.3.7) and Alpine. To validate a stack-sensitive change before merge,
-queue that pipeline manually on the branch.
+The regression runs in the normal POSIX suite, including PR validation, rather
+than relying solely on the post-merge Alpine matrix.
 
 ### Comparing against msodbcsql 18
 
