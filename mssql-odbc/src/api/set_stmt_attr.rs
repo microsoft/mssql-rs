@@ -219,6 +219,26 @@ unsafe fn sql_set_stmt_attr_w_safe(
     };
     free_errors(&mut state);
 
+    let focus = state.vendor_attrs.get(SQL_SOPT_SS_PARAM_FOCUS).unwrap_or(0);
+    if focus != 0
+        && let Some(field) = tvp_layout_field(attribute)
+    {
+        if state.has_state(STMT_STATE_EXEC_STARTED) {
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
+        if attribute == SQL_ATTR_PARAMSET_SIZE && value_ptr.is_null() {
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+            return SQL_ERROR;
+        }
+        field.write(
+            state.tvp_column_layouts.entry(focus).or_default(),
+            value_ptr,
+            value_ptr as SqlULen,
+        );
+        return SQL_SUCCESS;
+    }
+
     match attribute {
         SQL_ATTR_PARAMSET_SIZE
         | SQL_ATTR_PARAM_BIND_OFFSET_PTR
@@ -765,13 +785,18 @@ impl HeaderField {
     }
 }
 
-/// Statement attributes stored on a descriptor header: the alias table in
-/// `handles::desc`, plus `SQL_ROWSET_SIZE`. Mirrors where msodbcsql's
-/// `SQLSetStmtAttr`/`SQLGetStmtAttr` keep each one. msodbcsql routes
-/// `PARAMSET_SIZE`/`PARAM_BIND_TYPE`/`PARAM_BIND_OFFSET_PTR` to the TVP child
-/// APD under `SQL_SOPT_SS_PARAM_FOCUS` (`pAPDActual`) but
-/// `PARAM_OPERATION_PTR` to the statement's APD; the same here today only
-/// because param focus is rejected.
+/// Layout attributes that follow the focused TVP's child APD (`pAPDActual`).
+fn tvp_layout_field(attribute: SqlInteger) -> Option<HeaderField> {
+    match attribute {
+        SQL_ATTR_PARAMSET_SIZE => Some(HeaderField::ArraySize),
+        SQL_ATTR_PARAM_BIND_TYPE => Some(HeaderField::BindType),
+        SQL_ATTR_PARAM_BIND_OFFSET_PTR => Some(HeaderField::BindOffsetPtr),
+        _ => None,
+    }
+}
+
+/// Statement descriptor-header aliases. `PARAM_OPERATION_PTR` remains on the
+/// outer APD even while the layout attributes follow TVP focus.
 fn header_alias(attribute: SqlInteger) -> Option<(HeaderOwner, HeaderField)> {
     let alias = match attribute {
         SQL_ATTR_ROW_ARRAY_SIZE => (HeaderOwner::Ard, HeaderField::ArraySize),
@@ -1030,6 +1055,27 @@ unsafe fn sql_get_stmt_attr_w_safe(
         return SQL_ERROR;
     };
     free_errors(&mut state);
+
+    let focus = state.vendor_attrs.get(SQL_SOPT_SS_PARAM_FOCUS).unwrap_or(0);
+    if focus != 0
+        && let Some(field) = tvp_layout_field(attribute)
+    {
+        let value = field.read(
+            state
+                .tvp_column_layouts
+                .get(&focus)
+                .unwrap_or(&DescHeader::default()),
+        );
+        drop(state);
+        unsafe {
+            write_if_some(value_ptr.cast::<SqlULen>(), value);
+            write_if_some(
+                string_length_ptr,
+                SqlInteger::try_from(size_of::<SqlULen>()).unwrap_or(SqlInteger::MAX),
+            );
+        }
+        return SQL_SUCCESS;
+    }
 
     // Header aliases are read from the owning descriptor, after dropping this
     // lock.
@@ -3022,6 +3068,167 @@ mod tests {
 
     /// Once a parameter is bound as `SQL_SS_TABLE`, focusing on its ordinal is
     /// accepted and reads back.
+    #[test]
+    fn focused_tvp_layout_is_independent_and_used_for_column_positioning() {
+        use crate::api::exports::{
+            SQLBindParameter, SQLGetStmtAttrW, SQLSetDescFieldW, SQLSetStmtAttrW,
+        };
+        use crate::api::odbc_types::{
+            SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH_PTR,
+            SQL_INTEGER, SQL_PARAM_INPUT, SQL_SS_TABLE, SqlLen,
+        };
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        #[repr(C)]
+        struct Row {
+            value: i32,
+            indicator: SqlLen,
+        }
+        let mut rows = [
+            Row {
+                value: -1,
+                indicator: 0,
+            },
+            Row {
+                value: 11,
+                indicator: 0,
+            },
+            Row {
+                value: 22,
+                indicator: 0,
+            },
+        ];
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut name: Vec<u16> = "Orders".encode_utf16().chain(Some(0)).collect();
+        let mut indicator: SqlLen = 0;
+        let mut count: SqlLen = 2;
+        assert_eq!(
+            unsafe {
+                SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_BINARY,
+                    SQL_SS_TABLE,
+                    2,
+                    0,
+                    name.as_mut_ptr().cast(),
+                    SqlLen::from(SQL_NTS),
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    h.apd(),
+                    1,
+                    SQL_DESC_OCTET_LENGTH_PTR.try_into().unwrap(),
+                    (&raw mut count).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { SQLSetStmtAttrW(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1usize as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        let mut offset = SqlLen::try_from(size_of::<Row>()).unwrap();
+        for (attribute, value) in [
+            (SQL_ATTR_PARAMSET_SIZE, 2usize),
+            (SQL_ATTR_PARAM_BIND_TYPE, size_of::<Row>()),
+            (SQL_ATTR_PARAM_BIND_OFFSET_PTR, (&raw mut offset).addr()),
+        ] {
+            assert_eq!(
+                unsafe { SQLSetStmtAttrW(h.stmt, attribute, value as SqlPointer, 0) },
+                SQL_SUCCESS
+            );
+            let mut actual: SqlULen = 0;
+            assert_eq!(
+                unsafe {
+                    SQLGetStmtAttrW(
+                        h.stmt,
+                        attribute,
+                        (&raw mut actual).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(actual, value);
+        }
+        assert_eq!(
+            unsafe {
+                SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    (&raw mut rows[0].value).cast(),
+                    0,
+                    &raw mut rows[0].indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { SQLSetStmtAttrW(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, std::ptr::null_mut(), 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE), 1);
+        assert_eq!(
+            get_attr(h.stmt, SQL_ATTR_PARAM_BIND_TYPE),
+            SQL_BIND_BY_COLUMN
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAM_BIND_OFFSET_PTR), 0);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        for null_indicator in [false, true] {
+            if null_indicator {
+                assert_eq!(
+                    unsafe {
+                        SQLSetDescFieldW(
+                            h.apd(),
+                            1,
+                            SQL_DESC_INDICATOR_PTR.try_into().unwrap(),
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+            }
+            let snapshot = crate::api::exec_common::snapshot_bound_params(stmt).unwrap();
+            assert_eq!(snapshot.header.array_size, 1);
+            let mut state = stmt.inner.lock().unwrap();
+            state.bound_params = snapshot.params;
+            let built =
+                unsafe { crate::api::exec_common::build_named_params(&mut state, 1, 0, "test") }
+                    .unwrap();
+            let SqlType::Table(_, Some(table)) =
+                mssql_tds::test_client_support::rpc_parameter_value(&built.params[0]).unwrap()
+            else {
+                panic!("expected a populated table");
+            };
+            assert_eq!(
+                table.rows,
+                vec![vec![SqlType::Int(Some(11))], vec![SqlType::Int(Some(22))]]
+            );
+        }
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_RESET_PARAMS)
+            },
+            SQL_SUCCESS
+        );
+        assert!(stmt.inner.lock().unwrap().tvp_column_layouts.is_empty());
+    }
+
     #[test]
     fn param_focus_accepts_a_bound_tvp_ordinal() {
         use crate::api::odbc_types::{SQL_C_BINARY, SQL_PARAM_INPUT, SQL_SS_TABLE, SqlLen};

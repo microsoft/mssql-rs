@@ -177,6 +177,7 @@ impl Iterator for PreparedRows<'_> {
                 // array (a TVP is one logical value, not a batch row), so no
                 // captured columns are threaded through this path.
                 &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
                 1,
                 self.marker_count,
                 self.bind_offset,

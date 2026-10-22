@@ -88,6 +88,8 @@ protected:
 
     void TearDown() override {
         if (stmt_ != SQL_NULL_HSTMT) {
+            if (impersonating_) Direct("REVERT");
+            for (const auto& sql : cleanup_sql_) Direct(sql);
             Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc_name_ + "]");
             Direct("DROP TYPE IF EXISTS dbo.[" + type_name_ + "]");
         }
@@ -158,6 +160,8 @@ protected:
     std::deque<std::vector<SQLWCHAR>> type_bufs_;
     std::deque<std::vector<SQLWCHAR>> schema_bufs_;
     std::deque<SQLLEN> row_counts_;
+    std::vector<std::string> cleanup_sql_;
+    bool impersonating_ = false;
 };
 
 // SQLDescribeParam reports the TVP as SQL_SS_TABLE and the IPD exposes the
@@ -204,6 +208,9 @@ TEST_F(TvpTest, PopulatedTableRoundTrips) {
     // Focus on the TVP and bind its two columns as arrays of row_count rows.
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_SOPT_SS_PARAM_FOCUS,
                                  reinterpret_cast<SQLPOINTER>(1), SQL_IS_INTEGER),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
                   SQL_HANDLE_STMT, stmt_);
 
     std::array<SQLINTEGER, 2> ids = {1, 2};
@@ -374,6 +381,52 @@ TEST_F(TvpTest, FocusMustBeZeroAtExecute) {
     EXPECT_EQ(SQLExecute(stmt_), SQL_ERROR);
     EXPECT_EQ(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_), "HY024");
     RestoreFocus();
+}
+
+// Benefits-from-mock-tds: pins default-schema resolution; a mock could also
+// assert that the prepared declaration leaves the type name unqualified.
+TEST_F(TvpTest, UnqualifiedTypeUsesTheCallersDefaultSchemaWithoutDescribe) {
+    const std::string schema = "pytvp_default_" + suffix_;
+    const std::string user = "pytvp_user_" + suffix_;
+    const std::string type = "DefaultOrders";
+    const std::string proc = "ReadOrders";
+    cleanup_sql_ = {
+        "DROP PROCEDURE IF EXISTS [" + schema + "].[" + proc + "]",
+        "DROP TYPE IF EXISTS [" + schema + "].[" + type + "]",
+        "DROP USER IF EXISTS [" + user + "]",
+        "DROP SCHEMA IF EXISTS [" + schema + "]",
+    };
+    ASSERT_SQL_OK(DirectRc("CREATE SCHEMA [" + schema + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE [" + schema + "].[" + type + "] AS TABLE (id INT)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE [" + schema + "].[" + proc + "] @t [" +
+                           schema + "].[" + type + "] READONLY AS SELECT id FROM @t"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE USER [" + user + "] WITHOUT LOGIN WITH DEFAULT_SCHEMA = [" +
+                           schema + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("GRANT EXECUTE, REFERENCES ON SCHEMA::[" + schema + "] TO [" + user + "]"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("EXECUTE AS USER = '" + user + "'"), SQL_HANDLE_STMT, stmt_);
+    impersonating_ = true;
+    ASSERT_SQL_OK(Prepare("EXEC [" + schema + "].[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    auto type_w = ToSqlW(type);
+    SQLLEN count = 1;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                                   1, 0, type_w.data(),
+                                   static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)), &count),
+                  SQL_HANDLE_STMT, stmt_);
+    Focus(1);
+    SQLINTEGER value = 42;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &value, 0, &indicator), SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER actual = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual, 0, &indicator), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual, value);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
 }
 
 // A table type in a non-dbo schema round-trips when the schema is set through

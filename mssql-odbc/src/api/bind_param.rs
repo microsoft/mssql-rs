@@ -660,6 +660,7 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
         // The TVP column captures are part of the parameter bindings this
         // option resets.
         stmt_state.tvp_column_bindings.clear();
+        stmt_state.tvp_column_layouts.clear();
         stmt_state.effective_apd(stmt)
     };
 

@@ -878,7 +878,7 @@ pub(super) fn post_param_row_build_error(
 /// total the same as `NO_PARAM_LENGTH` (`sqlccmd.cpp:4160`). Folding it into
 /// `None` here keeps that behaviour instead of rejecting the first byte with
 /// `22026`.
-fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
+pub(super) fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
     if indicator == SQL_DATA_AT_EXEC {
         return None;
     }
@@ -1041,6 +1041,7 @@ pub(super) unsafe fn build_positional_params(
         build_named_params_for_row(
             bound,
             &stmt_state.tvp_column_bindings,
+            &stmt_state.tvp_column_layouts,
             skip + 1,
             marker_count.saturating_sub(skip),
             bind_offset,
@@ -1092,6 +1093,7 @@ pub(super) unsafe fn build_named_params(
         build_named_params_for_row(
             &stmt_state.bound_params,
             &stmt_state.tvp_column_bindings,
+            &stmt_state.tvp_column_layouts,
             1,
             marker_count,
             bind_offset,
@@ -1122,6 +1124,7 @@ pub(super) unsafe fn build_named_params(
 pub(super) unsafe fn build_named_params_for_row(
     bound_params: &[Option<ParamSnapshot>],
     tvp_columns: &std::collections::BTreeMap<usize, Vec<Option<crate::params::BoundParam>>>,
+    tvp_layouts: &std::collections::BTreeMap<usize, crate::handles::desc::DescHeader>,
     first_ordinal: usize,
     marker_count: usize,
     bind_offset: isize,
@@ -1147,6 +1150,12 @@ pub(super) unsafe fn build_named_params_for_row(
         if snapshot.param.sql_type == crate::api::odbc_types::SQL_SS_TABLE {
             let ordinal = first_ordinal + i;
             let columns = tvp_columns.get(&ordinal).map_or(&[][..], Vec::as_slice);
+            let layout = tvp_layouts.get(&ordinal).copied().unwrap_or_default();
+            let column_offset = if layout.bind_offset_ptr.is_null() {
+                0
+            } else {
+                unsafe { layout.bind_offset_ptr.cast::<SqlLen>().read_unaligned() }
+            };
             let tvp_binding = snapshot
                 .param
                 .for_row(row, bind_offset, param_bind_type)
@@ -1161,7 +1170,8 @@ pub(super) unsafe fn build_named_params_for_row(
                     &tvp_binding,
                     snapshot.udt_names.clone(),
                     columns,
-                    bind_offset,
+                    column_offset,
+                    layout.bind_type,
                 )
                 .map_err(|source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
@@ -1188,6 +1198,8 @@ pub(super) unsafe fn build_named_params_for_row(
                         snapshot.udt_names.as_deref(),
                         columns,
                         bind_offset,
+                        column_offset,
+                        layout.bind_type,
                     )
                 }
                 .map_err(|source| ParamRowBuildError::Conversion {
@@ -1335,6 +1347,7 @@ fn build_tvp_dae_params(
     udt_names: Option<std::sync::Arc<crate::handles::desc::UdtNames>>,
     columns: &[Option<BoundParam>],
     bind_offset: isize,
+    bind_type: SqlULen,
 ) -> Result<Vec<DaeParam>, ParamBuildError> {
     let row_capacity = tvp.column_size;
     let per_row = columns
@@ -1370,11 +1383,7 @@ fn build_tvp_dae_params(
                 column
             } else {
                 binding
-                    .for_row(
-                        row_index,
-                        bind_offset,
-                        crate::api::odbc_types::SQL_BIND_BY_COLUMN,
-                    )
+                    .for_row(row_index, bind_offset, bind_type)
                     .map_err(|_| ParamBuildError::InvalidBufferLength)?
             };
             let expected_len = indicator.and_then(dae_expected_length);
@@ -3141,6 +3150,7 @@ mod tests {
             build_named_params_for_row(
                 &bound,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 1,
                 1,
                 0,
@@ -3159,6 +3169,7 @@ mod tests {
         let Err(error) = (unsafe {
             build_named_params_for_row(
                 &bound,
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 1,
                 1,
@@ -3683,7 +3694,15 @@ mod tests {
             sql_type: SQL_VARCHAR,
             ..tvp
         };
-        let staged = build_tvp_dae_params(0, &tvp, None, &[Some(bound), Some(dae)], 0).unwrap();
+        let staged = build_tvp_dae_params(
+            0,
+            &tvp,
+            None,
+            &[Some(bound), Some(dae)],
+            0,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+        )
+        .unwrap();
         assert_eq!(staged.len(), 7);
         assert_eq!(
             staged[1].binding.parameter_value_ptr,
@@ -3740,6 +3759,7 @@ mod tests {
             build_named_params_for_row(
                 &bound,
                 &tvp_columns,
+                &BTreeMap::new(),
                 1,
                 1,
                 0,

@@ -78,13 +78,17 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
 - **Bind the TVP** — the parameter is bound as `SQL_SS_TABLE`, input-only, carrying the type
   name and the number of rows (or an empty-table marker).
 - **Bind the columns under focus** — parameter focus is set to the TVP, each column's values
-  are bound, and focus is then restored.
+  are bound, and focus is then restored. `SQL_ATTR_PARAMSET_SIZE`,
+  `SQL_ATTR_PARAM_BIND_TYPE`, and `SQL_ATTR_PARAM_BIND_OFFSET_PTR` under focus belong to
+  that TVP's independent column layout, not the statement's outer parameter array.
 - **Supply TVP content with data-at-execution** — the driver returns the table token, then
   row-control and cell tokens in the order expected by the ODBC TVP protocol. Cell bytes are
   buffered and converted into the table value before execution. Only columns marked
   data-at-execution produce cell tokens; ordinary bound values and NULLs are captured from
   their positioned row buffers when the application supplies that row. A false first
-  row-control marker supplies an empty table.
+  row-control marker supplies an empty table. A row's DAE length is read when its cell
+  token is offered, so mixed ordinary/DAE rows retain their declared lengths without
+  reading unused future rows.
 - **Execute** — the statement runs; procedure result sets are returned through the normal fetch
   path. TVPs are input-only and are never fetched back.
 
@@ -110,6 +114,9 @@ mssql-odbc will add the following capabilities:
 - **Support data-at-execution for TVP content** — consume row-control markers and per-cell
   payloads, preserving row order and NULL values while assembling the table parameter.
 - **Handle empty TVPs and all-NULL columns** correctly.
+- **Preserve deferred descriptor fields** — row counts/default markers use the top-level
+  octet-length pointer independently of its NULL indicator. An omitted schema remains
+  unqualified in the SQL declaration and resolves against the caller's default schema.
 - **Preserve binding lifetime and diagnostics** — retain TVP column bindings across cursor
   close and re-prepare, as with scalar parameter bindings; clear them on
   `SQLFreeStmt(SQL_RESET_PARAMS)`. Parameter focus remains a statement attribute, so the

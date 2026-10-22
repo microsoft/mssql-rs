@@ -307,11 +307,12 @@ fn sql_param_data_operation(
                 else {
                     break;
                 };
-                if unsafe {
+                if let Some(indicator) = unsafe {
                     crate::conversion::param_convert::data_at_exec_indicator(&param.binding)
-                }
-                .is_some()
-                {
+                } {
+                    if let Some(param) = dae.current_param_mut() {
+                        param.expected_len = super::exec_common::dae_expected_length(indicator);
+                    }
                     break;
                 }
                 // Ordinary buffers remain application-owned throughout Need Data.
@@ -972,6 +973,108 @@ mod tests {
         let ret = unsafe { sql_param_data(h.stmt, &mut returned) };
         assert_eq!(ret, SQL_NEED_DATA);
         assert_eq!(returned, token_ptr);
+    }
+
+    #[test]
+    fn mixed_tvp_rows_enforce_each_cells_declared_dae_length() {
+        use crate::api::exports::{SQLParamData, SQLPutData};
+        use crate::api::odbc_types::{SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_SUCCESS};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        for supplied in [0usize, 2, 3, 4] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc = stmt.parent_dbc();
+            let client = {
+                let mut state = dbc.inner.lock().unwrap();
+                state.wire.install(tds_client_from_tokens(Vec::new()));
+                state.wire.take_lease_for_test(h.stmt)
+            };
+            let mut indicators = [1, SQL_LEN_DATA_AT_EXEC_OFFSET - 3];
+            let mut first_value = b'a';
+            let row = |index| {
+                DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+                    DaeTarget::TvpRowControl {
+                        tvp_index: 0,
+                        row_index: index,
+                    },
+                )
+            };
+            let mut bound = DaeParam::unbounded(0, (&raw mut first_value).cast(), None)
+                .with_binding_types(SQL_C_CHAR, crate::api::odbc_types::SQL_VARCHAR)
+                .with_target(DaeTarget::TvpCell {
+                    tvp_index: 0,
+                    row_index: 0,
+                    column_index: 0,
+                });
+            bound.binding.column_size = 10;
+            bound.binding.strlen_or_ind_ptr = &raw mut indicators[0];
+            bound.binding.octet_length_ptr = &raw mut indicators[0];
+            let mut deferred = bound.clone().with_target(DaeTarget::TvpCell {
+                tvp_index: 0,
+                row_index: 1,
+                column_index: 0,
+            });
+            deferred.binding.strlen_or_ind_ptr = &raw mut indicators[1];
+            deferred.binding.octet_length_ptr = &raw mut indicators[1];
+            let mut params = vec![row(0), bound, row(1), deferred, row(2)];
+            for param in &mut params {
+                param.set_buffered(true);
+            }
+            stmt.inner.lock().unwrap().dae =
+                Some(DaeState::new(client, None, None, params).deferred(Vec::new(), None, 0));
+            let mut token = std::ptr::null_mut();
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+            assert_eq!(
+                unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 1) },
+                SQL_SUCCESS
+            );
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+            assert_eq!(
+                unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 1) },
+                SQL_SUCCESS
+            );
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+            assert_eq!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .dae
+                    .as_ref()
+                    .unwrap()
+                    .current_param()
+                    .unwrap()
+                    .expected_len,
+                Some(3)
+            );
+            let bytes = [b'x'; 4];
+            let rc = unsafe {
+                SQLPutData(
+                    h.stmt,
+                    bytes.as_ptr().cast_mut().cast(),
+                    SqlLen::try_from(supplied).unwrap(),
+                )
+            };
+            if supplied > 3 {
+                assert_eq!(rc, SQL_ERROR);
+            } else {
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(
+                    unsafe { SQLParamData(h.stmt, &mut token) },
+                    if supplied == 3 {
+                        SQL_NEED_DATA
+                    } else {
+                        SQL_ERROR
+                    }
+                );
+            }
+            if supplied != 3 {
+                assert_eq!(
+                    stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                    ERR_DAE_LENGTH_MISMATCH.state
+                );
+            }
+        }
     }
 
     #[test]

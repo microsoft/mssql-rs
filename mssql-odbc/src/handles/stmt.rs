@@ -13,7 +13,7 @@ use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 use mssql_tds::core::CancelHandle;
 use mssql_tds::error::Error as TdsError;
 
-use super::desc::{DescHandle, DescKind, DescRecord, DescState};
+use super::desc::{DescHandle, DescHeader, DescKind, DescRecord, DescState};
 use super::wire::WireLease;
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::api::odbc_types::{
@@ -555,6 +555,7 @@ pub(crate) struct StmtState {
     /// the TVP's child descriptor. Read at execute to assemble the table's rows,
     /// and cleared whenever the parameter bindings are reset.
     pub(crate) tvp_column_bindings: BTreeMap<usize, Vec<Option<BoundParam>>>,
+    pub(crate) tvp_column_layouts: BTreeMap<usize, DescHeader>,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
     /// The drop is deferred to the next point that already holds the TDS client
@@ -1150,6 +1151,10 @@ impl DaeState {
     /// The parameters, for the deferred execute's rebuild.
     pub(crate) fn params(&self) -> &[DaeParam] {
         &self.params
+    }
+
+    pub(crate) fn current_param_mut(&mut self) -> Option<&mut DaeParam> {
+        self.params.get_mut(self.cursor?)
     }
 
     /// Takes the prepared plan back out when the deferred execute runs.
@@ -1935,6 +1940,7 @@ impl StmtHandle {
                 parameter_udt_names: Vec::new(),
                 bound_params: Vec::new(),
                 tvp_column_bindings: BTreeMap::new(),
+                tvp_column_layouts: BTreeMap::new(),
                 pending_unprepare: None,
                 parameter_array: None,
                 row_positioned: false,
