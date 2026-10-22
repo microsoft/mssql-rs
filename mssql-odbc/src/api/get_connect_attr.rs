@@ -118,6 +118,9 @@ fn sql_get_connect_attr_w_safe(
     if attribute == SQL_ATTR_CURRENT_CATALOG {
         return unsafe { get_current_catalog(dbc, value_ptr, buffer_length, string_length_ptr) };
     }
+    if attribute == SQL_ATTR_ACCESS_MODE {
+        return super::database_read_only::get_access_mode(dbc, value_ptr, string_length_ptr);
+    }
 
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLGetConnectAttrW: dbc mutex poisoned");
@@ -185,8 +188,7 @@ fn sql_get_connect_attr_w_safe(
         // The remaining attributes the set-side accepts. Returning HYC00 here
         // would make a set/get round-trip fail for a value the driver had just
         // reported as accepted.
-        SQL_ATTR_ACCESS_MODE
-        | SQL_ATTR_CONNECTION_TIMEOUT
+        SQL_ATTR_CONNECTION_TIMEOUT
         | SQL_ATTR_PACKET_SIZE
         | SQL_ATTR_AUTOCOMMIT
         | SQL_ATTR_TXN_ISOLATION
@@ -198,7 +200,6 @@ fn sql_get_connect_attr_w_safe(
                 return SQL_ERROR;
             }
             let value = match attribute {
-                SQL_ATTR_ACCESS_MODE => state.access_mode,
                 SQL_ATTR_CONNECTION_TIMEOUT => state.connection_timeout,
                 SQL_COPT_SS_WARN_ON_CP_ERROR => {
                     if state.warn_on_cp_error {
