@@ -655,6 +655,12 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         Ok(())
     };
     release_dbc_client_and_publish(dbc, client, op, |state| {
+        if had_user_txn {
+            // A failed commit has an unknown server outcome, but retaining this
+            // flag would make SQLDisconnect reject the connection with 25000.
+            // Match end_transaction and msodbcsql's unconditional Return cleanup.
+            state.local_tran_started = false;
+        }
         if let Err(e) = result {
             if had_user_txn {
                 error!(%e, "{op}: transaction-manager request failed");
@@ -1917,6 +1923,39 @@ mod tests {
         );
         assert_eq!(state.diag_records().len(), 1);
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_01000);
+    }
+
+    #[test]
+    fn failed_autocommit_commit_does_not_strand_the_local_transaction_flag() {
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens_in_transaction;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(
+                    Vec::new(),
+                    0xDEAD_BEEF,
+                ));
+            state.autocommit = false;
+            state.local_tran_started = true;
+        }
+
+        assert_eq!(set_autocommit(dbc, u64::from(SQL_AUTOCOMMIT_ON)), SQL_ERROR);
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.autocommit);
+        assert!(
+            !state.local_tran_started,
+            "a failed commit must not leave SQLDisconnect blocked by stale bookkeeping"
+        );
+        assert_eq!(state.diag_records().len(), 1);
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08007);
     }
 
     /// The AB#47510 guard on the `SQLDisconnect` rollback. A host that
