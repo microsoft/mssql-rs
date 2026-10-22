@@ -8,40 +8,55 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use mssql_tds::connection::bulk_copy::{BulkCopy, BulkCopyRow};
+//! ```rust,no_run
+//! use async_trait::async_trait;
+//! use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
+//! use mssql_tds::connection::tds_client::TdsClient;
+//! use mssql_tds::core::TdsResult;
 //! use mssql_tds::datatypes::column_values::ColumnValues;
+//! use mssql_tds::datatypes::sql_string::SqlString;
+//! use mssql_tds::message::bulk_load::StreamingBulkLoadWriter;
+//! use std::time::Duration;
 //!
-//! // Define a struct to represent your data
 //! struct User {
 //!     id: i32,
 //!     name: String,
-//!     email: String,
 //! }
 //!
-//! // Implement BulkCopyRow for your struct
-//! impl BulkCopyRow for User {
-//!     fn to_column_values(&self) -> Vec<ColumnValues> {
-//!         vec![
-//!             ColumnValues::Int(self.id),
-//!             ColumnValues::String(self.name.clone().into()),
-//!             ColumnValues::String(self.email.clone().into()),
-//!         ]
+//! // Columns are written in destination-table order.
+//! #[async_trait]
+//! impl BulkLoadRow for User {
+//!     async fn write_to_packet(
+//!         &self,
+//!         writer: &mut StreamingBulkLoadWriter<'_>,
+//!         column_index: &mut usize,
+//!     ) -> TdsResult<()> {
+//!         writer.write_column_value(*column_index, &ColumnValues::Int(self.id)).await?;
+//!         *column_index += 1;
+//!         writer
+//!             .write_column_value(
+//!                 *column_index,
+//!                 &ColumnValues::String(SqlString::from_utf8_string(self.name.clone())),
+//!             )
+//!             .await?;
+//!         *column_index += 1;
+//!         Ok(())
 //!     }
 //! }
 //!
-//! // Use bulk copy - metadata is automatically retrieved from SQL Server
-//! let users = vec![
-//!     User { id: 1, name: "Alice".to_string(), email: "alice@example.com".to_string() },
-//!     User { id: 2, name: "Bob".to_string(), email: "bob@example.com".to_string() },
-//! ];
-//! let mut bulk_copy = BulkCopy::new(&mut client, "Users");
-//! bulk_copy
-//!     .batch_size(5000)
-//!     .timeout(30);
-//!
-//! let result = bulk_copy.write_to_server(users.into_iter()).await?;
-//! println!("Copied {} rows", result.rows_affected);
+//! async fn copy_users(client: &mut TdsClient) -> TdsResult<()> {
+//!     let users = vec![
+//!         User { id: 1, name: "Alice".to_string() },
+//!         User { id: 2, name: "Bob".to_string() },
+//!     ];
+//!     // Destination metadata is retrieved from SQL Server automatically.
+//!     let mut bulk_copy = BulkCopy::new(client, "Users")
+//!         .batch_size(5000)
+//!         .timeout(Duration::from_secs(30));
+//!     let result = bulk_copy.write_to_server_zerocopy(users).await?;
+//!     println!("Copied {} rows", result.rows_affected);
+//!     Ok(())
+//! }
 //! ```
 
 use crate::connection::bulk_copy_state::{ATTENTION_TIMEOUT_SECONDS, BulkCopyTimeoutState};
@@ -189,6 +204,10 @@ pub struct ColumnMapping {
 
 impl ColumnMapping {
     /// Create a mapping from source column name to destination column name.
+    ///
+    /// [`BulkCopy::write_to_server_zerocopy`] rejects name-based source
+    /// mappings, because [`BulkLoadRow`] rows have no column names; use
+    /// [`by_ordinal`](Self::by_ordinal) there.
     pub fn by_name(source: impl Into<String>, destination: impl Into<String>) -> Self {
         Self {
             source: ColumnMappingSource::Name(source.into()),
@@ -306,18 +325,18 @@ impl BulkCopyResult {
 /// # Example
 ///
 /// ```rust,ignore
-/// use mssql_tds::connection::bulk_copy::{BulkCopy, BulkCopyRow, ColumnMapping};
+/// use mssql_tds::connection::bulk_copy::{BulkCopy, ColumnMapping};
 /// use std::time::Duration;
 ///
 /// let mut bulk_copy = BulkCopy::new(&mut client, "Users")
 ///     .batch_size(5000)
 ///     .timeout(Duration::from_secs(60))
 ///     .keep_identity(true)
-///     .add_column_mapping(ColumnMapping::by_name("SourceId", "Id"))
-///     .add_column_mapping(ColumnMapping::by_name("SourceName", "Name"));
+///     .add_column_mapping(ColumnMapping::by_ordinal(0, "Id"))
+///     .add_column_mapping(ColumnMapping::by_ordinal(1, "Name"));
 ///
-/// let rows = vec![/* your data */];
-/// let result = bulk_copy.write_to_server(rows.into_iter()).await?;
+/// let rows = vec![/* values implementing BulkLoadRow */];
+/// let result = bulk_copy.write_to_server_zerocopy(rows).await?;
 /// println!("Copied {} rows in {:?}", result.rows_affected, result.elapsed);
 /// ```
 pub struct BulkCopy<'a> {
@@ -418,7 +437,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.batch_size(5000); // Process 5000 rows at a time
+    /// let bulk_copy = bulk_copy.batch_size(5000); // Process 5000 rows at a time
     /// ```
     pub fn batch_size(mut self, size: usize) -> Self {
         self.options.batch_size = size;
@@ -455,7 +474,7 @@ impl<'a> BulkCopy<'a> {
     ///
     /// ```rust,ignore
     /// use std::time::Duration;
-    /// bulk_copy.timeout(Duration::from_secs(120)); // 2 minute timeout
+    /// let bulk_copy = bulk_copy.timeout(Duration::from_secs(120)); // 2 minute timeout
     /// ```
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.options.timeout_sec = Self::duration_to_timeout_seconds(timeout);
@@ -473,7 +492,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.check_constraints(true);
+    /// let bulk_copy = bulk_copy.check_constraints(true);
     /// ```
     pub fn check_constraints(mut self, enabled: bool) -> Self {
         self.options.check_constraints = enabled;
@@ -491,7 +510,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.fire_triggers(true);
+    /// let bulk_copy = bulk_copy.fire_triggers(true);
     /// ```
     pub fn fire_triggers(mut self, enabled: bool) -> Self {
         self.options.fire_triggers = enabled;
@@ -509,7 +528,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.keep_identity(true); // Preserve source identity values
+    /// let bulk_copy = bulk_copy.keep_identity(true); // Preserve source identity values
     /// ```
     pub fn keep_identity(mut self, enabled: bool) -> Self {
         self.options.keep_identity = enabled;
@@ -527,7 +546,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.keep_nulls(true);
+    /// let bulk_copy = bulk_copy.keep_nulls(true);
     /// ```
     pub fn keep_nulls(mut self, enabled: bool) -> Self {
         self.options.keep_nulls = enabled;
@@ -547,7 +566,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.allow_encrypted_value_modifications(true);
+    /// let bulk_copy = bulk_copy.allow_encrypted_value_modifications(true);
     /// ```
     pub fn allow_encrypted_value_modifications(mut self, enabled: bool) -> Self {
         self.options.allow_encrypted_value_modifications = enabled;
@@ -565,7 +584,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.table_lock(true); // Lock the table during bulk copy
+    /// let bulk_copy = bulk_copy.table_lock(true); // Lock the table during bulk copy
     /// ```
     pub fn table_lock(mut self, enabled: bool) -> Self {
         self.options.table_lock = enabled;
@@ -594,7 +613,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.use_internal_transaction(true); // Use internal transaction per batch
+    /// let bulk_copy = bulk_copy.use_internal_transaction(true); // Use internal transaction per batch
     /// ```
     pub fn use_internal_transaction(mut self, enabled: bool) -> Self {
         self.options.use_internal_transaction = enabled;
@@ -612,7 +631,7 @@ impl<'a> BulkCopy<'a> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// bulk_copy.notification_interval(1000); // Report progress every 1000 rows
+    /// let bulk_copy = bulk_copy.notification_interval(1000); // Report progress every 1000 rows
     /// ```
     pub fn notification_interval(mut self, interval: usize) -> Self {
         self.options.notification_interval = interval;
@@ -632,8 +651,8 @@ impl<'a> BulkCopy<'a> {
     /// ```rust,ignore
     /// use mssql_tds::connection::bulk_copy::ColumnMapping;
     ///
-    /// bulk_copy
-    ///     .add_column_mapping(ColumnMapping::by_name("SourceId", "Id"))
+    /// let bulk_copy = bulk_copy
+    ///     .add_column_mapping(ColumnMapping::by_ordinal(0, "Id"))
     ///     .add_column_mapping(ColumnMapping::by_ordinal(1, "Name"));
     /// ```
     pub fn add_column_mapping(mut self, mapping: ColumnMapping) -> Self {
@@ -838,8 +857,8 @@ impl<'a> BulkCopy<'a> {
     ///
     /// # Performance
     ///
-    /// This method provides superior performance compared to `write_to_server` by:
-    /// - Eliminating the `dest_buffer.clone()` allocation per row (0 allocations vs 1)
+    /// This method avoids per-row allocation by:
+    /// - Not building a per-row `Vec<ColumnValues>`
     /// - Writing columns directly to the TDS packet without intermediate buffering
     /// - Reusing column contexts across all rows (created once during metadata phase)
     ///
@@ -1287,8 +1306,7 @@ impl<'a> BulkCopy<'a> {
 /// Zero-copy bulk copy trait for direct serialization to TDS packets.
 ///
 /// This trait enables true zero-copy bulk insert by allowing rows to write
-/// directly to the packet writer without allocating intermediate Vec<ColumnValues>.
-/// This eliminates the per-row allocation overhead present in the `BulkCopyRow` trait.
+/// directly to the packet writer without allocating intermediate `Vec<ColumnValues>`.
 ///
 /// # Performance Benefits
 ///

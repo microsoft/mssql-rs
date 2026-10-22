@@ -166,6 +166,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   error without retrying the gateway or falling back to SSRP, matching
   msodbcsql. Retries before receiving a route are unchanged.
 
+- `mssql-tds`: the crates.io README quick start now uses the current
+  `execute(sql, ())` / `on_rows()` / `next_row()` API, both feature tables list
+  the `tls-schannel-direct` features, and the dependency snippet points at
+  `0.3`. The bulk copy docs now show `BulkLoadRow` and
+  `write_to_server_zerocopy` instead of the removed `BulkCopyRow` and
+  `write_to_server`. docs.rs now also builds the Windows target, and broken or
+  private intra-doc links no longer render as dead text. The `mssql-mock-tds`
+  README examples use the current `create_client` and `execute` signatures.
+
 - `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
   zero payload length now decodes as empty instead of NULL (AB#49220). In the
   legacy LOB wire format NULL is a zero *text-pointer* length; the decoder

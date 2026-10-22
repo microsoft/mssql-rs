@@ -117,6 +117,9 @@ The mock server allows you to register custom query responses with specific colu
 use mssql_mock_tds::{
     MockTdsServer, QueryResponse, ColumnDefinition, Row, ColumnValue, SqlDataType
 };
+use mssql_tds::connection::client_context::ClientContext;
+use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 
 #[tokio::test]
 async fn test_custom_query() -> Result<(), Box<dyn std::error::Error>> {
@@ -151,10 +154,21 @@ async fn test_custom_query() -> Result<(), Box<dyn std::error::Error>> {
     });
     
     // Connect and execute the custom query
+    let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+    let mut context = ClientContext::default();
+    context.user_name = "sa".to_string();
+    context.password = "password".to_string();
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
     let provider = TdsConnectionProvider {};
-    let mut client = provider.create_client(context, None).await?;
+    let mut client = provider.create_client(context, &datasource, None).await?;
     
-    client.execute("SELECT CAST(1 AS BIGINT), 2, 3".to_string(), None, None).await?;
+    client.execute("SELECT CAST(1 AS BIGINT), 2, 3".to_string(), ()).await?;
     // ... process results ...
     
     let _ = shutdown_tx.send(());
@@ -177,7 +191,7 @@ You can also use `ColumnValue::Null` to represent NULL values in result sets.
 
 ```rust
 use mssql_mock_tds::MockTdsServer;
-use mssql_tds::connection::client_context::{ClientContext, TransportContext};
+use mssql_tds::connection::client_context::ClientContext;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 
@@ -193,28 +207,24 @@ async fn test_connectivity() -> Result<(), Box<dyn std::error::Error>> {
     });
     
     // Create client context
-    let context = ClientContext {
-        transport_context: TransportContext::Tcp {
-            host: server_addr.ip().to_string(),
-            port: server_addr.port(),
-        },
-        user_name: "sa".to_string(),
-        password: "password".to_string(),
-        database: "master".to_string(),
-        encryption_options: EncryptionOptions {
-            mode: EncryptionSetting::PreferOff,
-            trust_server_certificate: true,
-            host_name_in_cert: None,
-        },
-        ..Default::default()
+    let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+    let mut context = ClientContext::default();
+    context.user_name = "sa".to_string();
+    context.password = "password".to_string();
+    context.database = "master".to_string();
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
     };
     
     // Connect to mock server
     let provider = TdsConnectionProvider {};
-    let mut client = provider.create_client(context, None).await?;
+    let mut client = provider.create_client(context, &datasource, None).await?;
     
     // Execute query
-    client.execute("SELECT 1".to_string(), None, None).await?;
+    client.execute("SELECT 1".to_string(), ()).await?;
     client.close_query().await?;
     
     // Cleanup

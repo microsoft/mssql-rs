@@ -17,9 +17,9 @@ pub mod parallel_connect;
 pub mod ssl_handler;
 /// High-level TDS transport abstraction.
 pub mod tds_transport;
-/// TLS engine abstraction (native-tls today, Schannel-direct in a later PR).
+/// TLS engine abstraction (native-tls, or Schannel-direct on Windows).
 pub(crate) mod tls;
-/// Direct Schannel TLS implementation (Windows-only). Not wired into the
-/// dispatcher until the final PR in the Schannel-direct stack.
+/// Direct Schannel TLS implementation (Windows-only), the default Windows TLS
+/// engine.
 #[cfg(windows)]
 pub(crate) mod win_tls;

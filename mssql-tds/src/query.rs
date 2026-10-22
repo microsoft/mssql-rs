@@ -10,8 +10,9 @@
 //! - [`result::ReturnValue`] — output parameters and return-status values
 //!   from stored procedures.
 //!
-//! Row-level iteration is driven by the [`ResultSet`](crate::ResultSet) trait
-//! implemented on [`TdsClient`](crate::TdsClient).
+//! Row-level iteration is driven by the
+//! [`ResultSet`](crate::connection::tds_client::ResultSet) trait implemented on
+//! [`TdsClient`](crate::connection::tds_client::TdsClient).
 
 /// Per-column type and flag metadata from COLMETADATA tokens.
 pub mod metadata;

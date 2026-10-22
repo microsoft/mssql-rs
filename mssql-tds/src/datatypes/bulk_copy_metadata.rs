@@ -424,21 +424,10 @@ impl TypeLength {
 /// ```rust,ignore
 /// use mssql_tds::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType, TypeLength};
 ///
-/// let metadata = BulkCopyColumnMetadata {
-///     column_name: "id".to_string(),
-///     sql_type: SqlDbType::Int,
-///     tds_type: 0x38, // SQLINT4
-///     length: 4,
-///     length_type: TypeLength::Fixed(4),
-///     precision: 0,
-///     scale: 0,
-///     collation: None,
-///     encoding: None,
-///     is_nullable: false,
-///     is_identity: true,
-///     is_encrypted: false,
-///     table_name: None,
-/// };
+/// let metadata = BulkCopyColumnMetadata::new("id", SqlDbType::Int, 0x38) // SQLINT4
+///     .with_length(4, TypeLength::Fixed(4))
+///     .with_nullable(false)
+///     .with_identity(true);
 /// ```
 #[derive(Debug, Clone)]
 pub struct BulkCopyColumnMetadata {
