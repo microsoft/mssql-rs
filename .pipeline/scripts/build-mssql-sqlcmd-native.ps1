@@ -81,6 +81,24 @@ try {
         Copy-Item (Join-Path $targetDir "$target\release\mssql_sqlcmd.lib") (Join-Path $dest 'mssql_sqlcmd.lib') -Force
         Set-Content -Path (Join-Path $dest 'native-static-libs.txt') -Value $nativeLibs -Encoding ascii
 
+        # The windows crates link their own import libraries (windows.0.52.0.lib and
+        # the like), which ship inside the windows_<arch>_msvc crates rather than the
+        # Windows SDK. Ship them next to the archive so a native linker finds them.
+        $bundled = @([regex]::Matches($nativeLibs, '\bwindows\.[\d.]+\.lib\b') | ForEach-Object Value | Sort-Object -Unique)
+        if ($bundled.Count -gt 0) {
+            $arch = $target.Split('-')[0]
+            $crateName = "windows_$($arch)_msvc"
+            $metadata = & cargo metadata --format-version 1 --filter-platform $target | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed for $target" }
+            $libDirs = $metadata.packages | Where-Object name -eq $crateName |
+                ForEach-Object { Join-Path (Split-Path $_.manifest_path) 'lib' }
+            foreach ($lib in $bundled) {
+                $source = $libDirs | ForEach-Object { Join-Path $_ $lib } | Where-Object { Test-Path $_ } | Select-Object -First 1
+                if (-not $source) { throw "$lib, which $target links, was not found in any $crateName crate" }
+                Copy-Item $source (Join-Path $dest $lib) -Force
+            }
+        }
+
         $size = (Get-Item (Join-Path $dest 'mssql_sqlcmd.lib')).Length
         Write-Host "Staged $rid ($target): $size bytes; native libs: $nativeLibs"
     }
