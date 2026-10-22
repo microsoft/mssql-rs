@@ -3,9 +3,12 @@
 
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::dns_cache::{self, Resolution};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
-use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
+use crate::connection::transport::parallel_connect::{
+    ParallelConnectConfig, parallel_connect_resolving,
+};
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
@@ -178,7 +181,8 @@ pub(crate) const PRE_NEGOTIATED_PACKET_SIZE: u32 = 4096;
 
 /// Creates a base stream for the specified transport context.
 /// This function handles the transport-specific connection logic (TCP, Named Pipe, Shared Memory)
-/// and returns a boxed Stream that can be used with any TDS version.
+/// and returns a boxed Stream that can be used with any TDS version, along with
+/// what a TCP host resolved to for the login's DNS caching verdict.
 ///
 /// # Arguments
 ///
@@ -195,10 +199,10 @@ async fn create_base_stream(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Option<Resolution>)> {
     match transport_context {
         TransportContext::Tcp { host, port, .. } => {
-            if multi_subnet_failover {
+            let (stream, resolution) = if multi_subnet_failover {
                 // Use parallel connection mode for MultiSubnetFailover
                 create_base_stream_parallel(
                     host,
@@ -207,7 +211,7 @@ async fn create_base_stream(
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
                 )
-                .await
+                .await?
             } else {
                 // Use sequential connection mode (original behavior)
                 create_base_stream_sequential(
@@ -218,8 +222,9 @@ async fn create_base_stream(
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
                 )
-                .await
-            }
+                .await?
+            };
+            Ok((stream, Some(resolution)))
         }
         #[cfg(windows)]
         TransportContext::NamedPipe { pipe_name } => {
@@ -236,7 +241,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(pipe_name).await?;
 
             info!("Connected to Named Pipe: {}", pipe_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
         #[cfg(not(windows))]
         TransportContext::NamedPipe { .. } => Err(crate::error::Error::from(std::io::Error::new(
@@ -279,7 +284,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
 
             info!("Connected to Shared Memory (LPC-over-NP): {}", pipe_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
         #[cfg(not(windows))]
         TransportContext::SharedMemory { .. } => {
@@ -312,7 +317,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
 
             info!("Connected to LocalDB instance: {}", instance_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
     }
 }
@@ -350,7 +355,7 @@ async fn create_base_stream_sequential(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Resolution)> {
     info!(
         "Connecting to TCP transport (sequential): {}:{}",
         host, port
@@ -360,9 +365,10 @@ async fn create_base_stream_sequential(
     // `std::net::ToSocketAddrs::to_socket_addrs`) awaits the resolution instead of
     // blocking the calling thread, so a slow or stuck resolver stays subject to the
     // `timeout()`/deadline machinery in the retry loop above this call instead of
-    // silently escaping it.
-    let mut socket_addresses: Vec<SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
+    // silently escaping it. A failed resolution falls back to the DNS cache.
+    let resolution = dns_cache::lookup_host(host, port).await?;
+    // Sorted as a copy, so the cache keeps the resolver's order.
+    let mut socket_addresses = resolution.addresses().to_vec();
 
     let mut last_error = None;
     let mut tcp_stream = None;
@@ -418,7 +424,7 @@ async fn create_base_stream_sequential(
 
     // We don't have a valid TCP stream, so we need to return the last error.
     if let Some(stream) = tcp_stream {
-        Ok(Box::new(stream))
+        Ok((Box::new(stream), resolution))
     } else {
         Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
             std::io::Error::new(
@@ -438,7 +444,7 @@ async fn create_base_stream_parallel(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Resolution)> {
     info!(
         "Connecting to TCP transport (parallel/MultiSubnetFailover): {}:{}",
         host, port
@@ -450,14 +456,14 @@ async fn create_base_stream_parallel(
         keep_alive_interval_in_ms,
     };
 
-    let result = parallel_connect(host, port, &config).await?;
+    let (result, resolution) = parallel_connect_resolving(host, port, &config).await?;
 
     info!(
         "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
         result.connected_address, result.total_addresses, result.failed_attempts
     );
 
-    Ok(Box::new(result.stream))
+    Ok((Box::new(result.stream), resolution))
 }
 
 /// Creates a NetworkTransport configured for the specified TDS version.
@@ -510,7 +516,8 @@ async fn create_transport_for_version(
     }
 }
 
-/// Creates a network transport for the specified parameters.
+/// Creates a network transport for the specified parameters, along with what a
+/// TCP host resolved to, which the login's DNS caching verdict applies to.
 ///
 /// # Arguments
 ///
@@ -532,11 +539,11 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<NetworkTransport> {
+) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
     let encryption_mode = encryption_options.mode;
 
     // Step 1: Create the base stream (transport-specific)
-    let stream = create_base_stream(
+    let (stream, resolution) = create_base_stream(
         ipaddress_preference,
         transport_context,
         keep_alive_in_ms,
@@ -547,14 +554,15 @@ pub(crate) async fn create_transport(
     .await?;
 
     // Step 2: Apply TDS version-specific wrapping (uniform for all transports)
-    create_transport_for_version(
+    let transport = create_transport_for_version(
         stream,
         tds_version,
         transport_context,
         encryption_options,
         encryption_mode,
     )
-    .await
+    .await?;
+    Ok((transport, resolution))
 }
 
 /// SSL/TLS lifecycle callbacks for a transport.
@@ -5816,6 +5824,49 @@ pub(crate) mod tests {
             "the heartbeat task never ran while resolving 'localhost' — \
              resolution is blocking the executor instead of awaiting it"
         );
+    }
+
+    /// Connects to `host`, a name the resolver fails (`.invalid`), after a
+    /// login allowed DNS caching for it with a local listener's address, and
+    /// checks the connect hands that resolution on to its own login.
+    async fn connects_through_the_dns_cache(host: &str, multi_subnet_failover: bool) {
+        use crate::connection::dns_cache::{DnsCache, Resolution};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![address]), true);
+
+        let transport_context = TransportContext::Tcp {
+            host: host.to_string(),
+            port: address.port(),
+            instance_name: None,
+        };
+        let (_stream, resolution) = create_base_stream(
+            IPAddressPreference::IPv4First,
+            &transport_context,
+            30_000,
+            1_000,
+            multi_subnet_failover,
+            5_000,
+        )
+        .await
+        .expect("connects with the cached address");
+        assert!(
+            timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .is_ok()
+        );
+        assert_eq!(resolution, Some(Resolution::new(host, vec![address])));
+    }
+
+    #[tokio::test]
+    async fn sequential_connect_falls_back_to_the_dns_cache() {
+        connects_through_the_dns_cache("sequential.dns-cache.invalid", false).await;
+    }
+
+    #[tokio::test]
+    async fn multi_subnet_failover_connect_falls_back_to_the_dns_cache() {
+        connects_through_the_dns_cache("parallel.dns-cache.invalid", true).await;
     }
 
     /// `skip_bytes` spins the same way, and it runs on the discard path that

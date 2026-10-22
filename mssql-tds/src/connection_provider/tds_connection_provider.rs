@@ -597,7 +597,7 @@ impl TdsConnectionProvider {
         // Create network transport directly
         // Convert connect_timeout from seconds to milliseconds
         let connect_timeout_ms = (context.connect_timeout as u64) * 1000;
-        let mut transport = network_transport::create_transport(
+        let (mut transport, dns_resolution) = network_transport::create_transport(
             context.ipaddress_preference,
             context.tds_version(),
             transport_context,
@@ -612,6 +612,7 @@ impl TdsConnectionProvider {
         let factory = HandlerFactory {
             context: context.clone(),
             recovery_data,
+            dns_resolution,
         };
         let session_result = factory
             .session_handler(transport_context)
@@ -665,6 +666,7 @@ impl TdsConnectionProvider {
         let factory = HandlerFactory {
             context: context.clone(),
             recovery_data: None,
+            dns_resolution: None,
         };
         let session_result = factory
             .session_handler(transport_context)

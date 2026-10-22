@@ -471,6 +471,43 @@ mod redirection_tests {
         logins[0].received_database.as_deref()
     }
 
+    #[tokio::test]
+    async fn test_routing_settles_dns_fallback_for_the_gateway() {
+        use mssql_tds::test_client_support::{dns_cache_fallback, set_dns_cache_entry};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        for (index, (hop, database, keep_fallback)) in [
+            (plain(), "master", true),
+            (enhanced("routed_db"), "routed_db", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let gateway = format!("routing-dns-{index}.invalid");
+            let mut gateway_address = None;
+            let routed = login_through_with(vec![hop], create_test_context(), |port| {
+                let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+                set_dns_cache_entry(&gateway, vec![address], true);
+                gateway_address = Some(address);
+                format!("tcp:{gateway},{port}")
+            })
+            .await;
+            assert_eq!(routed.result, Ok(()));
+            assert_eq!(only_database(&routed.logins[1]), Some(database));
+            let requested = &routed.logins[0][0].requested_feature_ids;
+            assert!(requested.contains(&0x0B) && requested.contains(&0x0F));
+
+            let address = gateway_address.unwrap();
+            let fallback = dns_cache_fallback(&gateway, address.port()).await;
+            if keep_fallback {
+                assert_eq!(fallback.unwrap(), vec![address]);
+            } else {
+                assert_eq!(fallback.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            }
+            set_dns_cache_entry(&gateway, Vec::new(), false);
+        }
+    }
+
     /// Enhanced Routing (ENVCHANGE 21) redirects the login to the routed
     /// database; the client advertises feature 0x0F so the route is offered.
     #[tokio::test]

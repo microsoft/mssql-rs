@@ -5,6 +5,7 @@ use crate::connection::client_context::{
     ClientContext, ColumnEncryptionSetting, MAX_LOGIN7_NAME_UNITS, TdsAuthenticationMethod,
     TransportContext, VectorVersion,
 };
+use crate::connection::dns_cache::{DnsCache, Resolution};
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
     OptionFlags1, OptionFlags2, OptionFlags3, OptionsValue, TdsVersion, TypeFlags,
@@ -16,8 +17,8 @@ use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::token::fed_auth_info::{FedAuthInfoToken, SspiToken};
 use crate::token::login_ack::LoginAckToken;
 use crate::token::tokens::{
-    EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SessionStateToken, SqlCollation,
-    Token, Tokens,
+    DoneStatus, EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SessionStateToken,
+    SqlCollation, Token, Tokens,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -26,6 +27,7 @@ use std::fmt::Debug;
 
 use super::features::always_encrypted::AlwaysEncryptedFeature;
 use super::features::data_classification::DataClassificationFeature;
+use super::features::dns_caching::DnsCachingFeature;
 use super::features::enhanced_routing::EnhancedRoutingFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
@@ -134,6 +136,12 @@ pub(crate) trait Feature: Send + Sync + Debug {
         None
     }
 
+    /// What this login's connection resolved and whether the server let the
+    /// client cache it, once bound. Only SqlDnsCaching does.
+    fn dns_caching_verdict(&self) -> Option<(&Resolution, bool)> {
+        None
+    }
+
     /// Data Classification version the server enabled in FEATUREEXTACK, if this
     /// feature negotiated one. Only DataClassification does.
     fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
@@ -187,6 +195,11 @@ impl FeaturesRequest {
         features.insert(
             FeatureExtension::Utf8Support,
             Box::new(Utf8Feature::default()),
+        );
+        // msodbcsql always advertises DNS caching (`TdsSend.cpp`).
+        features.insert(
+            FeatureExtension::SqlDnsCaching,
+            Box::new(DnsCachingFeature::default()),
         );
 
         features.insert(FeatureExtension::Json, Box::new(JsonFeature::default()));
@@ -282,6 +295,35 @@ impl FeaturesRequest {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// Ties the DNS caching acknowledgement to what this login's connection
+    /// resolved, so an allowing verdict publishes exactly those addresses.
+    pub(crate) fn bind_dns_caching(&mut self, resolution: Resolution) {
+        self.features.insert(
+            FeatureExtension::SqlDnsCaching,
+            Box::new(DnsCachingFeature::for_resolution(resolution)),
+        );
+    }
+
+    /// Forgets an earlier token's DNS caching acknowledgement, so each
+    /// FEATUREEXTACK is judged on its own. Other features keep theirs.
+    pub(crate) fn reset_dns_caching_acknowledgement(&mut self) {
+        if let Some(feature) = self.features.get_mut(&FeatureExtension::SqlDnsCaching) {
+            feature.set_acknowledged(false);
+        }
+    }
+
+    /// Settles whether the login's host may stay in the DNS cache, allowing it
+    /// only if the latest FEATUREEXTACK acknowledged DNS caching.
+    pub(crate) fn apply_dns_caching_verdict(&self) {
+        if let Some((resolution, allowed)) = self
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .and_then(|feature| feature.dns_caching_verdict())
+        {
+            DnsCache::global().apply_verdict(resolution, allowed);
         }
     }
 
@@ -753,7 +795,9 @@ impl LoginResponse {
     ) -> TdsResult<LoginResponseModel> {
         let mut response_model = LoginResponseModel::new(requested_features);
         let parser_context = ParserContext::default();
-        loop {
+        let mut feature_ext_ack_received = false;
+        let mut feature_ext_ack_error = None;
+        let completed = loop {
             match token_stream_reader
                 .receive_token(&parser_context, None, None)
                 .await
@@ -780,9 +824,13 @@ impl LoginResponse {
                         Tokens::LoginAck(login_ack_token) => {
                             response_model.success_token = Some(login_ack_token);
                         }
-                        Tokens::Done(_t) => {
-                            // Once we receive a Done token, exit the loop.
-                            break;
+                        Tokens::Done(done) => {
+                            break !done.status.intersects(
+                                DoneStatus::ERROR
+                                    | DoneStatus::SERVER_ERROR
+                                    | DoneStatus::MORE
+                                    | DoneStatus::ATTN,
+                            );
                         }
                         Tokens::DoneProc(_t) => {
                             // ...
@@ -800,15 +848,23 @@ impl LoginResponse {
                             // response is captured, not just the first.
                         }
                         Tokens::FeatureExtAck(_t) => {
-                            for f in _t.acknowledged_features().iter() {
-                                response_model
-                                    .features
-                                    .set_acknowledged(f.0, f.1.as_slice())?;
+                            feature_ext_ack_received = true;
+                            response_model.features.reset_dns_caching_acknowledgement();
+                            let acknowledged =
+                                _t.acknowledged_features().iter().try_for_each(|f| {
+                                    response_model
+                                        .features
+                                        .set_acknowledged(f.0, f.1.as_slice())
+                                });
+                            if let Err(error) = acknowledged {
+                                // Token framing is intact; retain the first error
+                                // while draining the response through DONE.
+                                feature_ext_ack_error.get_or_insert_with(|| Box::new(error));
                             }
                         }
                         Tokens::FedAuthInfo(fed_auth_info_token) => {
                             response_model.fed_auth_info = Some(fed_auth_info_token);
-                            break;
+                            break false;
                         }
                         Tokens::Info(t) => {
                             event!(
@@ -832,7 +888,7 @@ impl LoginResponse {
                             );
                             response_model.sspi_token = Some(sspi_token);
                             // Break to allow caller to process the SSPI challenge
-                            break;
+                            break false;
                         }
                         _ => {
                             event!(
@@ -849,12 +905,31 @@ impl LoginResponse {
                         "Failed to receive token during login response parsing. Error: {:?}",
                         e
                     );
+                    if let Some(error) = feature_ext_ack_error {
+                        return Err(*error);
+                    }
                     // if Io error then create the Io error
                     return Err(crate::error::Error::ProtocolError(
                         "Failed to receive token during login response parsing.".to_string(),
                     ));
                 }
             }
+        };
+        // A rejected or incomplete login must not change the fallback a retry
+        // needs. With no FEATUREEXTACK, there is no new verdict, even on a redirect.
+        if completed
+            && response_model.success_token.is_some()
+            && response_model.errors.is_empty()
+            && feature_ext_ack_received
+        {
+            if feature_ext_ack_error.is_some() {
+                // Unlike SNI, a malformed token cannot retain a partial DNS allow.
+                response_model.features.reset_dns_caching_acknowledgement();
+            }
+            response_model.features.apply_dns_caching_verdict();
+        }
+        if let Some(error) = feature_ext_ack_error {
+            return Err(*error);
         }
         response_model.redirect_if_routed()?;
         Ok(response_model)
@@ -2121,6 +2196,480 @@ mod tests {
         let mut req = make_features_request();
         req.set_acknowledged(FeatureExtension::Json, &[1]).unwrap();
         assert_eq!(req.get_acknowledged_features().len(), 1);
+    }
+
+    // ── DNS caching (feature 0x0B) ──
+
+    fn dns_caching_verdict(request: &FeaturesRequest) -> Option<(&Resolution, bool)> {
+        request
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .and_then(|feature| feature.dns_caching_verdict())
+    }
+
+    #[test]
+    fn features_request_always_requests_dns_caching() {
+        let request = FeaturesRequest::from((&ClientContext::default(), false));
+        let feature = request
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .expect("DNS caching is always advertised");
+        assert!(feature.is_requested());
+        assert_eq!(dns_caching_verdict(&request), None);
+    }
+
+    /// What the replayed logins' connections resolved.
+    fn login_resolution(host: &str) -> Resolution {
+        Resolution::new(host, vec!["10.0.0.7:1433".parse().unwrap()])
+    }
+
+    async fn login_replaying(host: &str, mut tokens: Vec<Tokens>) -> TdsResult<LoginResponseModel> {
+        use crate::token::tokens::{CurrentCommand, DoneStatus, DoneToken};
+
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        }));
+        replay_login_response(host, tokens).await
+    }
+
+    async fn replay_login_response(
+        host: &str,
+        tokens: Vec<Tokens>,
+    ) -> TdsResult<LoginResponseModel> {
+        use crate::test_client_support::TokenReplayTransport;
+
+        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+        request.bind_dns_caching(login_resolution(host));
+        let mut transport = TokenReplayTransport::new(tokens);
+        LoginResponse::new()
+            .deserialize(&mut transport, request)
+            .await
+    }
+
+    fn login_ack() -> Tokens {
+        Tokens::LoginAck(LoginAckToken {
+            interface_type: SqlInterfaceType::TSql,
+            tds_version: TdsVersion::V7_4,
+            prog_name: "SQL".to_string(),
+            prog_version: Version {
+                major: 16,
+                minor: 0,
+                build: 0,
+                revision: 0,
+            },
+        })
+    }
+
+    fn feature_ext_ack(acknowledged: Vec<(FeatureExtension, Vec<u8>)>) -> Tokens {
+        Tokens::FeatureExtAck(crate::token::tokens::FeatureExtAckToken::new(acknowledged))
+    }
+
+    fn allowing_dns_caching() -> Tokens {
+        feature_ext_ack(vec![(FeatureExtension::SqlDnsCaching, vec![0x01])])
+    }
+
+    fn login_error() -> Tokens {
+        Tokens::Error(ErrorToken {
+            number: 40613,
+            state: 1,
+            severity: 20,
+            message: "Database is not currently available.".to_string(),
+            server_name: "server".to_string(),
+            proc_name: String::new(),
+            line_number: 1,
+        })
+    }
+
+    fn routing_envchange() -> Tokens {
+        Tokens::EnvChange(routing_token(&routing_info("replica.sql.net", None)))
+    }
+
+    async fn login_with_feature_ext_ack(
+        host: &str,
+        acknowledged: Vec<(FeatureExtension, Vec<u8>)>,
+    ) -> TdsResult<LoginResponseModel> {
+        login_replaying(host, vec![login_ack(), feature_ext_ack(acknowledged)]).await
+    }
+
+    /// The resolution a connect to `host` falls back to when DNS fails.
+    async fn cached(host: &str) -> Option<Resolution> {
+        DnsCache::global()
+            .resolve(host, 1433, || async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                ))
+            })
+            .await
+            .ok()
+    }
+
+    async fn resolves_from_cache(host: &str) -> bool {
+        cached(host).await.is_some()
+    }
+
+    #[tokio::test]
+    async fn feature_ext_ack_settles_dns_caching_for_the_login_host() {
+        let host = "dns-caching-verdict.login.example";
+        assert!(
+            !resolves_from_cache(host).await,
+            "not allowed before a login acknowledges"
+        );
+
+        login_with_feature_ext_ack(host, vec![(FeatureExtension::SqlDnsCaching, vec![0x01])])
+            .await
+            .unwrap();
+        assert_eq!(
+            cached(host).await,
+            Some(login_resolution(host)),
+            "the acknowledgement publishes what this login resolved"
+        );
+
+        // A FEATUREEXTACK without the DNS caching bit removes the entry, as in SNI.
+        login_with_feature_ext_ack(host, vec![(FeatureExtension::Utf8Support, vec![0x01])])
+            .await
+            .unwrap();
+        assert!(
+            !resolves_from_cache(host).await,
+            "removed without an acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_without_feature_ext_ack_preserves_dns_caching() {
+        let host = "dns-caching-no-ack.login.example";
+        login_replaying(host, vec![login_ack()]).await.unwrap();
+        assert!(!resolves_from_cache(host).await);
+
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+        assert!(resolves_from_cache(host).await);
+
+        login_replaying(host, vec![login_ack()]).await.unwrap();
+        assert_eq!(
+            cached(host).await,
+            Some(login_resolution(host)),
+            "no FEATUREEXTACK leaves an earlier allowance unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_login_leaves_dns_caching_as_it_was() {
+        let host = "dns-caching-rejected.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let rejected = login_replaying(host, vec![login_error()]).await.unwrap();
+        assert_eq!(rejected.get_status(), LoginResponseStatus::Error);
+        assert!(
+            resolves_from_cache(host).await,
+            "a rejected login carries no verdict, and its retry still needs the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_feature_ext_ack_before_a_rejected_login_preserves_dns_caching() {
+        let host = "dns-caching-rejected-after-ack.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let rejected = login_replaying(
+            host,
+            vec![
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                login_error(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected.get_status(), LoginResponseStatus::Error);
+        assert_eq!(
+            cached(host).await,
+            Some(login_resolution(host)),
+            "FEATUREEXTACK before a rejected login must not remove the retry's fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_login_ack_or_server_error_prevents_dns_cache_publication() {
+        for (index, tokens) in [
+            vec![allowing_dns_caching()],
+            vec![allowing_dns_caching(), login_error()],
+            vec![login_ack(), allowing_dns_caching(), login_error()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let host = format!("dns-caching-unaccepted-{index}.login.example");
+            let response = login_replaying(&host, tokens).await.unwrap();
+            assert!(response.success_token.is_none() || !response.errors.is_empty());
+            assert!(!resolves_from_cache(&host).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_continuations_cannot_change_dns_caching() {
+        let host = "dns-caching-continuation.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        for challenge in [
+            Tokens::Sspi(SspiToken { data: vec![0x01] }),
+            Tokens::FedAuthInfo(FedAuthInfoToken {
+                spn: "spn".to_string(),
+                sts_url: "https://sts".to_string(),
+            }),
+        ] {
+            replay_login_response(
+                host,
+                vec![
+                    login_ack(),
+                    feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                    challenge,
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(cached(host).await, Some(login_resolution(host)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_feature_ext_ack_before_login_ack_is_applied_at_done() {
+        let host = "dns-caching-before-loginack.login.example";
+        let response = login_replaying(host, vec![allowing_dns_caching(), login_ack()])
+            .await
+            .unwrap();
+        assert_eq!(response.get_status(), LoginResponseStatus::Success);
+        assert_eq!(cached(host).await, Some(login_resolution(host)));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_login_cannot_apply_a_dns_caching_verdict() {
+        let host = "dns-caching-truncated.login.example";
+        let result = replay_login_response(host, vec![login_ack(), allowing_dns_caching()]).await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert!(!resolves_from_cache(host).await);
+
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+        for acknowledgement in [
+            feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+            feature_ext_ack(vec![(FeatureExtension::Utf8Support, Vec::new())]),
+        ] {
+            let result = replay_login_response(host, vec![login_ack(), acknowledgement]).await;
+            assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+            assert_eq!(cached(host).await, Some(login_resolution(host)));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsuccessful_done_cannot_apply_a_dns_caching_verdict() {
+        use crate::token::tokens::{CurrentCommand, DoneToken};
+
+        let host = "dns-caching-unsuccessful-done.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+        for status in [
+            DoneStatus::ERROR,
+            DoneStatus::SERVER_ERROR,
+            DoneStatus::MORE,
+            DoneStatus::ATTN,
+        ] {
+            replay_login_response(
+                host,
+                vec![
+                    login_ack(),
+                    feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                    Tokens::Done(DoneToken {
+                        status,
+                        cur_cmd: CurrentCommand::None,
+                        row_count: 0,
+                    }),
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                cached(host).await,
+                Some(login_resolution(host)),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_feature_ext_ack_revokes_dns_caching() {
+        let host = "dns-caching-malformed.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        // The UTF-8 acknowledgement must carry exactly one byte.
+        let result = login_replaying(
+            host,
+            vec![
+                login_ack(),
+                feature_ext_ack(vec![
+                    (FeatureExtension::SqlDnsCaching, vec![0x01]),
+                    (FeatureExtension::Utf8Support, Vec::new()),
+                ]),
+            ],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert!(
+            !resolves_from_cache(host).await,
+            "a malformed FEATUREEXTACK allows nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_feature_ext_ack_without_login_ack_preserves_dns_caching() {
+        let host = "dns-caching-malformed-rejected.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let result = login_replaying(
+            host,
+            vec![
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, Vec::new())]),
+                login_error(),
+            ],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert_eq!(cached(host).await, Some(login_resolution(host)));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_feature_ext_ack_cannot_be_overridden_by_a_later_allow() {
+        let host = "dns-caching-malformed-then-allow.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let result = login_replaying(
+            host,
+            vec![
+                login_ack(),
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, Vec::new())]),
+                allowing_dns_caching(),
+            ],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert!(!resolves_from_cache(host).await);
+    }
+
+    #[tokio::test]
+    async fn the_last_feature_ext_ack_decides_dns_caching_at_login_completion() {
+        let host = "dns-caching-per-token.login.example";
+
+        login_replaying(
+            host,
+            vec![
+                login_ack(),
+                allowing_dns_caching(),
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !resolves_from_cache(host).await,
+            "a later token without the acknowledgement revokes an earlier one"
+        );
+
+        login_replaying(
+            host,
+            vec![
+                login_ack(),
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                allowing_dns_caching(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(resolves_from_cache(host).await);
+    }
+
+    #[tokio::test]
+    async fn a_routed_login_settles_dns_caching_before_redirecting() {
+        let gateway = "dns-caching-gateway.login.example";
+
+        for (database, ack_before_route) in [
+            (None, false),
+            (None, true),
+            (Some("sales"), false),
+            (Some("sales"), true),
+        ] {
+            for (flags, allowed) in [(0x01u8, true), (0x00, false)] {
+                let mut features = vec![(FeatureExtension::SqlDnsCaching, vec![flags])];
+                if database.is_some() {
+                    features.push((FeatureExtension::EnhancedRouting, vec![1]));
+                }
+                let acknowledgement = feature_ext_ack(features);
+                let route =
+                    Tokens::EnvChange(routing_token(&routing_info("replica.sql.net", database)));
+                let tokens = if ack_before_route {
+                    vec![login_ack(), acknowledgement, route]
+                } else {
+                    vec![login_ack(), route, acknowledgement]
+                };
+                let Err(error) = login_replaying(gateway, tokens).await else {
+                    panic!("a routed login must redirect");
+                };
+                assert!(
+                    matches!(
+                        &error,
+                        Error::Redirection { host, port: 11000, database: routed_database }
+                            if host == "replica.sql.net" && routed_database.as_deref() == database
+                    ),
+                    "{error:?}"
+                );
+                assert_eq!(
+                    resolves_from_cache(gateway).await,
+                    allowed,
+                    "database {database:?}, ack_before_route {ack_before_route}, flags {flags:#04x}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routed_login_without_feature_ext_ack_keeps_the_gateway_fallback() {
+        let gateway = "dns-caching-gateway-no-ack.login.example";
+        login_replaying(gateway, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let result = login_replaying(gateway, vec![login_ack(), routing_envchange()]).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::Redirection { host, port: 11000, .. })
+                if host == "replica.sql.net"
+        ));
+        assert_eq!(cached(gateway).await, Some(login_resolution(gateway)));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_routed_login_fails_instead_of_redirecting() {
+        let result = replay_login_response(
+            "dns-caching-truncated-route.login.example",
+            vec![login_ack(), routing_envchange()],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
     }
 
     // ── LoginResponseModel::capture_change_property ──

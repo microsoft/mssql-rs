@@ -26,6 +26,29 @@ pub use crate::sql_identifier::escape_identifier;
 
 pub use crate::message::parameters::rpc_parameters::rpc_parameter_status;
 
+/// Seeds or revokes an allowed DNS fallback for isolated connection tests.
+pub fn set_dns_cache_entry(host: &str, addresses: Vec<std::net::SocketAddr>, allowed: bool) {
+    use crate::connection::dns_cache::{DnsCache, Resolution};
+
+    DnsCache::global().apply_verdict(&Resolution::new(host, addresses), allowed);
+}
+
+/// Exercises DNS fallback without invoking the machine's resolver.
+pub async fn dns_cache_fallback(
+    host: &str,
+    port: u16,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    crate::connection::dns_cache::DnsCache::global()
+        .resolve(host, port, || async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "test DNS failure",
+            ))
+        })
+        .await
+        .map(|resolution| resolution.addresses().to_vec())
+}
+
 /// Uses the declaration generator used by prepared RPCs, without a server.
 pub fn rpc_parameter_declaration(
     parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
@@ -171,7 +194,7 @@ pub struct ScriptedToken(Tokens);
 /// written to the wire. Running out of queued tokens is reported as a closed
 /// connection.
 #[derive(Debug)]
-struct TokenReplayTransport {
+pub(crate) struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     pending_rows: VecDeque<VecDeque<i32>>,
     active_row: Option<VecDeque<i32>>,
@@ -182,7 +205,7 @@ struct TokenReplayTransport {
 }
 
 impl TokenReplayTransport {
-    fn new(tokens: Vec<Tokens>) -> Self {
+    pub(crate) fn new(tokens: Vec<Tokens>) -> Self {
         Self {
             pending_tokens: VecDeque::from(tokens),
             pending_rows: VecDeque::new(),

@@ -58,6 +58,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   columns, allowing Polars DataFrames to load without first converting the
   DataFrame to a PyArrow table.
 
+- `mssql-tds`: DNS caching. LOGIN7 always advertises feature extension `0x0B`,
+  as msodbcsql does. When a server acknowledges it, the addresses that
+  connection resolved are kept in a process-wide cache and used only if a
+  later resolution of that host fails, so connections survive a DNS outage.
+  Verdicts take effect only after LOGINACK and a successful terminal DONE.
+  A FEATUREEXTACK without a positive DNS acknowledgement removes the host;
+  a rejected or incomplete response, or one with no FEATUREEXTACK at all,
+  leaves the cache unchanged (AB#49294).
+
 - `mssql-tds`: Enhanced Routing. LOGIN7 always advertises feature extension
   `0x0F`, as msodbcsql does, and the client follows ENVCHANGE type 21 to the
   routed server and logs in to the routed database. A type 21 route without
@@ -76,7 +85,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   protocol error instead of following a route, matching msodbcsql.
   Both routing types now validate the token and routing-data lengths, empty
   old value, TCP protocol, non-zero port, and bounded server name before
-  continuing to the next token.
+  continuing to the next token. A malformed or truncated response after the
+  routing token fails the login instead of being skipped (AB#49294).
 
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,

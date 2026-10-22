@@ -53,65 +53,192 @@ its platform. Free-threaded CPython is not supported by `abi3`.
 
 ## Version Scheme
 
-### Scheduled Rust crate version bumps
+### Scheduled version bumps
 
-The **Bump Released Crate Versions** GitHub workflow checks the default branch
-against crates.io every three UTC days. A daily trigger at 08:23 UTC runs the
-check on days whose Unix day number is divisible by three; unlike `*/3` in the
-day-of-month field, this does not reset at month boundaries. GitHub may delay or
-skip scheduled runs. **Run workflow** bypasses the date check and still targets
-the default branch.
+The **Bump Released Versions** Azure DevOps pipeline
+(`.pipeline/bump-released-versions.yml`) opens version bump pull requests against
+GitHub `microsoft/mssql-rs` on the first and third Tuesday of each month at
+07:30 UTC (13:00 IST). The cron trigger (`30 7 * * 2`) fires every Tuesday and
+the job then checks the UTC day of month: days 1-7 hold exactly one Tuesday, as
+do days 15-21. The ordinal guard lives in the job rather than in the cron
+day-of-month field because cron implementations disagree on whether a restricted
+day of month and day of week combine with AND or OR. Azure Pipelines may delay or
+skip scheduled runs. Running the pipeline manually bypasses the date check.
 
-`mssql-tds` and `mssql-mock-tds` are checked independently. If a crate's exact
-`[package].version` exists among its published versions (including older or
-yanked releases), the workflow suggests the next minor version: `0.1.7` becomes
-`0.2.0`. Unpublished source versions and crates that return HTTP 404 are left
-alone. Other registry errors fail the run rather than assuming a crate is
-unpublished. If the proposed next minor version is also published, the run fails
-and a maintainer must choose a new version. Before any bump is planned, the
-workflow also fails when the current `mssql-tds` and `mssql-mock-tds` source
-versions differ in either direction (`mssql-tds` and `mssql-mock-tds` must stay
-aligned for a release), because silently tolerating a drifted state can leave the
-repo in a release-invalid configuration. If the mock source version is ahead of
-the core target, the run also fails so a maintainer can choose the versions
-manually. A mock-only bump is deferred until the current `mssql-tds` version is
-published, because the mock crate's exact versioned dependency must resolve from
-the registry when it is packaged. When `mssql-tds` is bumped, the mock source
-version is kept aligned with the core target because the release pipeline stamps
-the mock crate from the core version.
+A scheduled trigger defined in the pipeline settings UI silently overrides the
+YAML schedule, so do not add one.
 
-Local versions come from `cargo metadata`. The workflow does not edit files,
-push branches, create PRs, publish crates, merge anything, or change the release
-pipeline's existing version-stamping policy. If a matching open version-bump PR
-targets the default branch, the workflow skips issue creation.
+The pipeline runs two independent tracks. A failure in one does not stop the
+other; the run fails at the end if either track failed.
 
-When a bump is needed, the workflow creates or updates one tracking issue labeled
-`automation:crate-version-bump`. The issue includes:
+#### Released Rust crates
 
-1. the affected crates and suggested next minor versions;
-2. TOML snippets for the manifest edits, including the mock crate's versioned
-   `mssql-tds` dependency when the core crate is bumped;
-3. crisp maintainer instructions to apply the snippets, run `cargo fetch` (or
-   `cargo update --workspace --offline`) to refresh `Cargo.lock`, then run
-   `cargo bfmt`, `cargo bclippy`, and `cargo btest`, and finally open a PR with
-   `Fixes #<issue-number>` and the version summary in the PR description.
+`mssql-tds` and `mssql-mock-tds` are checked against crates.io independently. If
+a crate's exact `[package].version` exists among its published versions
+(including older or yanked releases), the pipeline bumps it to the next minor
+version: `0.1.7` becomes `0.2.0`. Unpublished source versions and crates that
+return HTTP 404 are left alone. Other registry errors fail the track rather than
+assuming a crate is unpublished. If the proposed next minor version is also
+published, the track fails and a maintainer must choose a new version. Before any
+bump is planned, the track also fails when the current `mssql-tds` and
+`mssql-mock-tds` source versions differ in either direction (`mssql-tds` and
+`mssql-mock-tds` must stay aligned for a release), because silently tolerating a
+drifted state can leave the repo in a release-invalid configuration. If the mock
+source version is ahead of the core target, the track also fails so a maintainer
+can choose the versions manually. A mock-only bump is deferred until the current
+`mssql-tds` version is published, because the mock crate's exact versioned
+dependency must resolve from the registry when it is packaged. When `mssql-tds`
+is bumped, the mock source version and the mock crate's versioned `mssql-tds`
+requirement are kept aligned with the core target because the release pipeline
+stamps the mock crate from the core version.
 
-The workflow queries only open issues labeled `automation:crate-version-bump`,
-then checks the hidden marker in their bodies before reusing or updating one.
-It regenerates the issue body while the bump is pending; put maintainer notes
-in issue comments. The label is created automatically when needed; multiple
-matching open issues fail the run for manual cleanup.
-When no bump is needed, no issue is changed. If a bump becomes unnecessary, close
-its issue manually.
+Local versions come from `cargo metadata`. `Cargo.lock` is not tracked, and
+`--no-deps` means no lockfile is resolved or committed.
 
-The shared validation pipeline runs `scripts/test_bump_released_crate_versions.py`
-in its Windows Python test step for both PR validation and main-branch CI.
-Cargo metadata, registry, pull request, and issue requests are mocked. No
-cargo-edit installation or live issue/PR writes are needed.
+#### `mssql-python-rs`
 
-The workflow uses the built-in `GITHUB_TOKEN` with contents read, issues write,
-and pull request read permissions. No custom secret or permission to create PRs
-is needed. Normal validation and review are still required before merging.
+The `[project].version` in `mssql-py-core/pyproject.toml` is checked against
+PyPI on the same schedule and with the same rule: if the current version is
+already published, bump to the next minor version. The independently versioned
+`mssql-py-core` Rust crate is never touched.
+
+#### Issues, branches, and pull requests
+
+Each track creates or updates one tracking issue, then pushes a branch from the
+default branch tip and opens a pull request that closes it:
+
+| Track | Issue label | Branch |
+| --- | --- | --- |
+| Crates | `automation:crate-version-bump` | `automation/bump-released-crates` |
+| `mssql-python-rs` | `automation:python-version-bump` | `automation/bump-mssql-python-rs` |
+
+The issue exists because **PR Linked Issue Check** requires every pull request to
+reference a GitHub issue or an ADO work item; the generated PR body carries
+`Fixes #<issue-number>`. The pipeline queries only open issues with the track's
+label, ignores pull requests returned by the same endpoint, then checks the
+hidden marker in their bodies before reusing or updating one. It regenerates the
+issue body while the bump is pending; put maintainer notes in issue comments. The
+label is created automatically when needed; multiple matching open issues fail
+the track for manual cleanup.
+
+To release a different version, push to the open pull request. The pipeline
+force-updates its branch only while the planned versions change, and it skips a
+track entirely when a pull request on some *other* branch already proposes the
+same transitions. When no bump is needed, nothing is written. If a bump becomes
+unnecessary, close the pull request and its issue manually.
+
+Branch replacement uses `--force-with-lease` against the exact commit inspected
+by the job. A missing branch is confirmed with `git ls-remote`; network and
+server failures abort rather than being treated as an absent automation branch.
+This prevents a maintainer or overlapping run from being overwritten between
+inspection and push.
+
+Normal validation and review are still required before merging. The pipeline
+does not publish crates, merge anything, or change the release pipeline's
+existing version-stamping policy.
+
+#### Credentials
+
+No PAT, secret, or variable group is involved. The pipeline's source repository
+is GitHub `microsoft/mssql-rs` through the `github.com_microsoft` service
+connection, so `checkout: self` with `persistCredentials: true` leaves the Azure
+Pipelines GitHub App installation token in the local git config under a
+repo-scoped key such as
+`http.https://github.com/microsoft/mssql-rs.extraheader`. The job discovers that
+key, decodes the basic-auth header, and registers the token as a secret variable
+so it is masked in every downstream log. The same token authenticates both the
+branch push and the GitHub REST calls.
+
+That installation token is scoped to the whole `microsoft` organization, not to
+this repository alone. It is short-lived and the pipeline only ever writes to
+this repo, but any step in this job briefly holds a broadly scoped credential.
+A dedicated GitHub App scoped to `mssql-rs` would narrow that, at the cost of
+org-admin setup and two new secrets.
+
+GitHub is reached over the REST API with `urllib` rather than the `gh` CLI, so
+the job does not depend on `gh` being present on the agent image.
+
+If the credential cannot be found or decoded, the step fails before any branch is
+pushed.
+
+#### Creating the pipeline
+
+The YAML alone does nothing until a pipeline definition points at it:
+
+1. Create a new pipeline in the `mssql-rs` Azure DevOps project from the GitHub
+   `microsoft/mssql-rs` repository using the `github.com_microsoft` service
+   connection, with YAML path `.pipeline/bump-released-versions.yml`.
+2. Add an **Exclusive lock** check to the
+   `mssql-rs-version-bump-writer` environment. The YAML's sequential lock
+   behavior then queues overlapping manual and scheduled runs.
+3. Add an ADO **Branch control** check to the environment allowing only
+   `refs/heads/main`. The YAML also rejects the deployment stage on any other
+   source ref.
+4. Do not add a schedule in the pipeline settings UI.
+5. Run it manually once from `main` to confirm the credential extraction works.
+
+The pipeline runs on a Microsoft-hosted `ubuntu-latest` agent. It only runs git
+and Python, so it does not need the private Rust pools, which require a separate
+pool authorization for any new pipeline.
+
+The shared validation pipeline runs `scripts/test_bump_released_versions.py` in
+its Windows Python test step for both PR validation and main-branch CI. Cargo
+metadata, registry, git, pull request, and issue calls are mocked. The cadence
+guard and the credential-key extraction are executed as real `bash`, so the
+shipped shell is covered rather than a Python restatement of it.
+
+### Updating `microsoft/mssql-python` after a PyPI release
+
+Pipeline 2332 (`PyPI-Release`) queues the **Bump mssql-python Release Version**
+pipeline only after ESRP successfully publishes the selected official wheels to
+PyPI. The release pipeline passes the published distribution version and its
+build ID to the worker; dry runs do not queue it.
+
+The worker is GitHub-sourced so it can reuse the same short-lived
+`github.com_microsoft` installation token described above. It verifies the exact
+version on PyPI, clones `microsoft/mssql-python`, and opens a draft pull request
+against `main`. The pull request always advances
+`eng/versions/mssql-python-rs.version` when the repository is behind the
+published release.
+
+The clean `mssql-python-rs-wheels` NuGet package is released independently and
+is not guaranteed to exist when PyPI publishing finishes. The worker therefore
+queries the public `mssql-rs_Public` feed for the exact clean version:
+
+- when it exists, `eng/versions/mssql-python-rs-nuget.version` is advanced too;
+- when it does not exist, the NuGet pin is left unchanged;
+- prerelease `-dev` and `-nightly` packages never satisfy the check.
+
+Rerunning the worker for the same version after the clean NuGet package is
+published updates the existing automation pull request. Older release events
+never downgrade either pin on `main` or on the pending automation branch. An
+unrelated `main` change does not rebase a pending PR when its two managed pins
+already have the requested values. A branch containing maintainer commits is
+left untouched, and all automation-owned replacements use an exact
+`--force-with-lease`.
+
+If a newer PyPI release arrives while the pending automation PR already carries
+a clean NuGet upgrade from an earlier run, the worker advances the PyPI pin and
+retains that higher pending NuGet pin. The regenerated issue and PR summaries
+show both transitions relative to `main`; a PyPI-only event never rolls back an
+already verified clean NuGet package.
+
+This YAML also requires a permanent pipeline definition after the change reaches
+`main`:
+
+1. Create a GitHub-backed pipeline named **Bump mssql-python Release Version**
+   from `microsoft/mssql-rs` with the `github.com_microsoft` service connection.
+2. Set its YAML path to `.pipeline/bump-mssql-python-release.yml`.
+3. Add an **Exclusive lock** check to the
+   `mssql-python-release-bump-writer` environment.
+4. Add an ADO **Branch control** check to the environment allowing only
+   `refs/heads/main`. Pipeline 2332 explicitly queues the worker from that ref,
+   and the worker YAML rejects any other source ref.
+5. Run it manually from `main` with a published version to verify access to
+   `microsoft/mssql-python`.
+
+The exact pipeline name is part of the release contract: pipeline 2332 resolves
+that name through the Azure DevOps API before queueing the worker.
 
 ### Python and NuGet versions
 

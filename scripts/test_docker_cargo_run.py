@@ -243,7 +243,8 @@ def test_regressions_are_wired_without_removing_existing_selectors():
         "scripts/test_release_pipeline.py",
         "scripts/test_validation_pipeline.py",
         "scripts/test_repair_glibc_wheels.py",
-        "scripts/test_bump_released_crate_versions.py",
+        "scripts/test_bump_released_versions.py",
+        "scripts/test_bump_mssql_python_release.py",
         "scripts/test_python_wheel_install.py",
         "scripts/test_docker_cargo_run.py",
     }
