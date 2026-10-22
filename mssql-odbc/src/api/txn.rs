@@ -1024,11 +1024,7 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
              applied to the session: {e}"
         ));
     }
-    if failure.is_none() {
-        // Either the cached level reached the server or the session was already
-        // at it, so the cache is evidence again.
-        mark_server_isolation_known(dbc);
-    }
+    let isolation_applied = failure.is_none();
 
     if !autocommit
         && !client.has_active_transaction()
@@ -1042,18 +1038,32 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
         });
     }
 
-    // Only a warning is posted after this; the connect has already succeeded.
-    let _ = release_dbc_client(dbc, client);
+    finish_post_connect_txn_settings(dbc, client, isolation_applied, failure, OP)
+}
 
-    let Some(message) = failure else {
-        return SQL_SUCCESS;
+fn finish_post_connect_txn_settings(
+    dbc: &DbcHandle,
+    client: WireLease,
+    isolation_applied: bool,
+    failure: Option<String>,
+    op: &str,
+) -> SqlReturn {
+    let Some(generation) = release_dbc_client_generation(dbc, client) else {
+        return fail_lost_session(dbc, op);
     };
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{OP}: dbc mutex poisoned");
-        return SQL_SUCCESS;
-    };
-    post_sql_error(&mut state, SQLSTATE_01000, 0, &message);
-    SQL_SUCCESS_WITH_INFO
+    match publish_dbc_result(dbc, generation, op, |state| {
+        if isolation_applied {
+            state.server_isolation_unknown = false;
+        }
+        if let Some(message) = failure {
+            post_sql_error(state, SQLSTATE_01000, 0, &message);
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        }
+    }) {
+        Ok(rc) | Err(rc) => rc,
+    }
 }
 
 #[cfg(test)]
@@ -1139,6 +1149,7 @@ mod tests {
             state.session_generation = state.session_generation.wrapping_add(1);
             state.wire.install(tds_client_from_tokens(Vec::new()));
         }
+
         let published = Cell::new(false);
 
         assert_eq!(
@@ -1153,6 +1164,51 @@ mod tests {
         let state = dbc.inner.lock().unwrap();
         assert!(state.autocommit);
         assert!(state.wire.client().is_some());
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08003);
+    }
+
+    #[test]
+    fn post_connect_settings_publish_nothing_from_a_stale_lease() {
+        use crate::api::sqlstate::SQLSTATE_08003;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = {
+            let mut state = dbc.inner.lock().unwrap();
+            state.server_isolation_unknown = true;
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.session_generation = state.session_generation.wrapping_add(1);
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+
+        assert_eq!(
+            finish_post_connect_txn_settings(
+                dbc,
+                client,
+                true,
+                Some("old session warning".to_string()),
+                "test",
+            ),
+            SQL_ERROR
+        );
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.server_isolation_unknown);
+        assert_eq!(state.diag_records().len(), 1);
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08003);
     }
 

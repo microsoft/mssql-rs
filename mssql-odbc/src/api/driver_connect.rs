@@ -206,11 +206,15 @@ pub(crate) fn sql_driver_connect_w_safe(
     // usable, but the application must be able to see that its requested
     // settings did not take effect.
     drop(state);
-    if apply_post_connect_txn_settings(dbc) == SQL_SUCCESS_WITH_INFO {
-        return SQL_SUCCESS_WITH_INFO;
-    }
+    combine_connect_results(result, apply_post_connect_txn_settings(dbc))
+}
 
-    result
+fn combine_connect_results(connect_result: SqlReturn, settings_result: SqlReturn) -> SqlReturn {
+    match settings_result {
+        SQL_ERROR => SQL_ERROR,
+        SQL_SUCCESS_WITH_INFO => SQL_SUCCESS_WITH_INFO,
+        _ => connect_result,
+    }
 }
 
 /// Lets the `SQL_COPT_SS_*` attribute forms win over the connection-string
@@ -654,6 +658,19 @@ mod tests {
         SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE,
     };
     use crate::test_support::{TestHandles, cs};
+
+    #[test]
+    fn stale_post_connect_session_overrides_login_success() {
+        assert_eq!(combine_connect_results(SQL_SUCCESS, SQL_ERROR), SQL_ERROR);
+        assert_eq!(
+            combine_connect_results(SQL_SUCCESS, SQL_SUCCESS_WITH_INFO),
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(
+            combine_connect_results(SQL_SUCCESS_WITH_INFO, SQL_SUCCESS),
+            SQL_SUCCESS_WITH_INFO
+        );
+    }
 
     #[test]
     fn initial_database_uses_keyword_then_attribute_then_login_default() {
