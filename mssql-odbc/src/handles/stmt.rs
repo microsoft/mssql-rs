@@ -959,6 +959,7 @@ pub(crate) struct BufferedTvpCell {
     pub(crate) column_index: usize,
     pub(crate) bytes: Vec<u8>,
     pub(crate) is_null: bool,
+    pub(crate) value: Option<mssql_tds::datatypes::sqltypes::SqlType>,
 }
 
 /// How much of the open data-at-execution parameter the application has

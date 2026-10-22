@@ -2248,11 +2248,12 @@ pub(crate) unsafe fn build_tvp_param(
             if unsafe { data_at_exec_indicator(&positioned) }.is_some() {
                 return Err(ParamBuildError::TvpColumnDataAtExec(index));
             }
-            let ((value, _), _) = unsafe { bound_param_to_value_with_outcome(&positioned, None) }
-                .map_err(|error| ParamBuildError::TvpCellConversion {
-                row,
-                column: index,
-                diagnostic: error.diag(),
+            let value = unsafe { bound_tvp_cell_to_value(&positioned) }.map_err(|error| {
+                ParamBuildError::TvpCellConversion {
+                    row,
+                    column: index,
+                    diagnostic: error.diag(),
+                }
             })?;
             cells.push(value);
         }
@@ -2272,13 +2273,13 @@ pub(crate) fn build_tvp_param_from_dae(
     columns: &[Option<BoundParam>],
     tvp_index: usize,
     row_count: usize,
-    buffered_cells: &[crate::handles::stmt::BufferedTvpCell],
+    buffered_cells: &mut [crate::handles::stmt::BufferedTvpCell],
 ) -> Result<RpcParameter, ParamBuildError> {
     let type_name = tvp_type_name(udt_names)?;
     if row_count == 0 {
         return Ok(RpcParameter::new(
             name,
-            StatusFlags::NONE,
+            StatusFlags::DEFAULT_VALUE,
             SqlType::Table(type_name, None),
         ));
     }
@@ -2302,7 +2303,7 @@ pub(crate) fn build_tvp_param_from_dae(
         .try_reserve_exact(expected_cells)
         .map_err(|_| ParamBuildError::MemoryAllocation)?;
     for cell in buffered_cells
-        .iter()
+        .iter_mut()
         .filter(|cell| cell.tvp_index == tvp_index)
     {
         cells.push(cell);
@@ -2314,26 +2315,33 @@ pub(crate) fn build_tvp_param_from_dae(
     let mut rows = Vec::new();
     rows.try_reserve(row_count)
         .map_err(|_| ParamBuildError::MemoryAllocation)?;
+    let mut cells = cells.into_iter();
     for row_index in 0..row_count {
         let mut row = Vec::new();
         row.try_reserve(columns.len())
             .map_err(|_| ParamBuildError::MemoryAllocation)?;
         for (column_index, column) in columns.iter().enumerate() {
-            let cell = cells[row_index * columns.len() + column_index];
+            let cell = cells.next().ok_or(ParamBuildError::InvalidBufferLength)?;
             if cell.row_index != row_index || cell.column_index != column_index {
                 return Err(ParamBuildError::InvalidBufferLength);
             }
             let column = column
                 .as_ref()
                 .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
-            let (value, _) =
-                buffered_dae_to_value(column, &cell.bytes, cell.is_null).map_err(|error| {
-                    ParamBuildError::TvpCellConversion {
-                        row: row_index,
-                        column: column_index,
-                        diagnostic: error.diag(),
-                    }
-                })?;
+            let value = (|| {
+                let value = match cell.value.take() {
+                    Some(value) => value,
+                    None => buffered_dae_to_value(column, &cell.bytes, cell.is_null)?.0,
+                };
+                normalize_tvp_cell(column, value)
+            })()
+            .map_err(|error: ParamBuildError| {
+                ParamBuildError::TvpCellConversion {
+                    row: row_index,
+                    column: column_index,
+                    diagnostic: error.diag(),
+                }
+            })?;
             row.push(value);
         }
         rows.push(row);
@@ -2343,6 +2351,46 @@ pub(crate) fn build_tvp_param_from_dae(
         name,
         StatusFlags::NONE,
         SqlType::Table(type_name, Some(TvpTableData::new(column_defs, rows))),
+    ))
+}
+
+/// # Safety
+/// The binding's buffers must remain valid through this row's collection.
+pub(crate) unsafe fn bound_tvp_cell_to_value(
+    column: &BoundParam,
+) -> Result<SqlType, ParamBuildError> {
+    unsafe { stamp_numeric_apd(column) };
+    let ((value, _), _) = unsafe { bound_param_to_value_with_outcome(column, None) }?;
+    normalize_tvp_cell(column, value)
+}
+
+fn normalize_tvp_cell(column: &BoundParam, value: SqlType) -> Result<SqlType, ParamBuildError> {
+    let parts = match &value {
+        SqlType::Decimal(Some(parts)) | SqlType::Numeric(Some(parts)) => parts,
+        _ => return Ok(value),
+    };
+    let metadata = decimal_metadata(column.column_size, column.decimal_digits)?;
+    let precision = metadata.precision.unwrap_or(0);
+    let scale = metadata.scale.unwrap_or(0);
+    let magnitude = i128::try_from(parts.magnitude())
+        .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+    let mantissa = if parts.is_positive {
+        magnitude
+    } else {
+        -magnitude
+    };
+    let (mut scaled, _) = rescale_mantissa(mantissa, i64::from(parts.scale), scale)?;
+    if parts.scale > scale {
+        let divisor = 10i128
+            .checked_pow(u32::from(parts.scale - scale))
+            .ok_or(ParamBuildError::Value(ConvError::OutOfRange))?;
+        if (mantissa % divisor).abs() >= divisor / 2 {
+            scaled += mantissa.signum();
+        }
+    }
+    Ok(decimal_of(
+        column.sql_type,
+        decimal_from_magnitude(scaled, precision, scale)?,
     ))
 }
 
@@ -4421,6 +4469,59 @@ mod tests {
     }
 
     #[test]
+    fn tvp_numeric_normalization_rounds_and_checks_column_precision() {
+        let mut column = param(SQL_C_NUMERIC, std::ptr::null_mut(), std::ptr::null_mut());
+        column.sql_type = SQL_NUMERIC;
+        column.column_size = 2;
+        column.decimal_digits = 0;
+        for (mantissa, expected) in [(120, 12), (124, 12), (125, 13), (-125, -13)] {
+            let value = SqlType::Numeric(Some(decimal_from_magnitude(mantissa, 3, 1).unwrap()));
+            let actual = normalize_tvp_cell(&column, value).unwrap();
+            assert_eq!(
+                actual,
+                SqlType::Numeric(Some(decimal_from_magnitude(expected, 2, 0).unwrap()))
+            );
+        }
+        let overflow = SqlType::Numeric(Some(decimal_from_magnitude(995, 3, 1).unwrap()));
+        assert!(matches!(
+            normalize_tvp_cell(&column, overflow),
+            Err(ParamBuildError::Value(ConvError::OutOfRange))
+        ));
+        column.column_size = 5;
+        column.decimal_digits = 2;
+        let value = SqlType::Numeric(Some(decimal_from_magnitude(12, 2, 0).unwrap()));
+        assert_eq!(
+            normalize_tvp_cell(&column, value).unwrap(),
+            SqlType::Numeric(Some(decimal_from_magnitude(1200, 5, 2).unwrap()))
+        );
+    }
+
+    #[test]
+    fn empty_dae_tvp_has_the_same_default_status_as_a_bound_empty_table() {
+        let names = crate::handles::desc::UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let mut count: SqlLen = 0;
+        let tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        let bound = unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0) }.unwrap();
+        let dae = build_tvp_param_from_dae(None, Some(&names), &[], 0, 0, &mut []).unwrap();
+        use mssql_tds::test_client_support::{rpc_parameter_status, rpc_parameter_value};
+        assert_eq!(
+            rpc_parameter_status(&dae).bits(),
+            StatusFlags::DEFAULT_VALUE.bits()
+        );
+        assert_eq!(
+            rpc_parameter_status(&bound).bits(),
+            rpc_parameter_status(&dae).bits()
+        );
+        assert_eq!(
+            rpc_parameter_value(&bound).unwrap(),
+            rpc_parameter_value(&dae).unwrap()
+        );
+    }
+
+    #[test]
     fn build_tvp_param_from_dae_assembles_buffered_cells() {
         use crate::handles::desc::UdtNames;
         use crate::handles::stmt::BufferedTvpCell;
@@ -4434,16 +4535,17 @@ mod tests {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         );
-        let cells = [BufferedTvpCell {
+        let mut cells = [BufferedTvpCell {
             tvp_index: 0,
             row_index: 0,
             column_index: 0,
             bytes: 42_i32.to_ne_bytes().to_vec(),
             is_null: false,
+            value: None,
         }];
 
-        let rpc =
-            build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &cells).unwrap();
+        let rpc = build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &mut cells)
+            .unwrap();
         match mssql_tds::test_client_support::rpc_parameter_value(&rpc).unwrap() {
             SqlType::Table(_, Some(data)) => {
                 assert_eq!(data.rows, vec![vec![SqlType::Int(Some(42))]]);

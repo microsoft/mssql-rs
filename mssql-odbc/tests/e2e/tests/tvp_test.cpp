@@ -95,10 +95,14 @@ protected:
     }
 
     SQLRETURN DirectRc(const std::string& sql) {
+        SQLRETURN close_rc = SQLFreeStmt(stmt_, SQL_CLOSE);
+        if (!SQL_SUCCEEDED(close_rc)) return close_rc;
         auto text = ODBCTestUtils::ToSqlTStr(sql);
         return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
     }
-    void Direct(const std::string& sql) { DirectRc(sql); }
+    void Direct(const std::string& sql) {
+        EXPECT_SQL_OK(DirectRc(sql), SQL_HANDLE_STMT, stmt_);
+    }
 
     SQLRETURN Prepare(const std::string& sql) {
         auto text = ODBCTestUtils::ToSqlTStr(sql);

@@ -27,8 +27,8 @@ use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SQL_PARAM_ERROR, SQL_PARAM_IGNORE,
     SQL_PARAM_INPUT, SQL_PARAM_PROCEED, SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO,
-    SQL_PARAM_UNUSED, SQL_SOPT_SS_PARAM_FOCUS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
-    SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_PARAM_UNUSED, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn, SqlULen,
+    SqlUSmallInt,
 };
 use crate::conversion::param_convert::{is_data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
@@ -955,27 +955,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<(ExecutionStaging, CancelHandle)
             return Err(SQL_ERROR);
         }
 
-        // A table-valued parameter's constituent columns are bound while
-        // SQL_SOPT_SS_PARAM_FOCUS points at the TVP, but the statement itself
-        // executes at top level, so the focus must be reset to 0 first.
-        // msodbcsql rejects a non-zero focus at execute with HY024
-        // ("must be zero at execution time", IDS_HY_024_02), checking both the
-        // IPD and APD focus; this driver keeps a single synchronized value.
-        if stmt_state
-            .vendor_attrs
-            .get(SQL_SOPT_SS_PARAM_FOCUS)
-            .unwrap_or(0)
-            != 0
-        {
-            error!("SQLExecute: SQL_SOPT_SS_PARAM_FOCUS must be 0 at execute time");
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_HY024,
-                0,
-                "Parameter focus (SQL_SOPT_SS_PARAM_FOCUS) must be zero at execution time",
-            );
-            return Err(SQL_ERROR);
-        }
+        super::exec_common::validate_parameter_focus(&mut stmt_state, "SQLExecute")?;
 
         let cancel_handle = stmt.new_execution_cancel()?;
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);

@@ -356,7 +356,7 @@ fn sql_bind_parameter_safe(
         (stmt_state.effective_apd(stmt), c_type, param_focus)
     };
 
-    let bound = BoundParam {
+    let mut bound = BoundParam {
         input_output_type,
         c_type,
         sql_type: parameter_type,
@@ -381,6 +381,11 @@ fn sql_bind_parameter_safe(
     // APD/IPD, mirroring msodbcsql routing the bind to the TVP's child
     // descriptor. The column's own type was validated above like any scalar.
     if param_focus != 0 {
+        let mut defaults =
+            crate::handles::desc::DescRecord::default_for(crate::handles::desc::DescKind::AppParam);
+        defaults.reset_app_type_defaults(c_type);
+        bound.app_precision = defaults.precision;
+        bound.app_scale = defaults.scale;
         let tvp_ordinal = param_focus;
         let column_index = usize::from(parameter_number) - 1;
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -433,8 +438,17 @@ fn sql_bind_parameter_safe(
     // record exists; a `None` here leaves any describe-supplied name in place.
     if parameter_type == crate::api::odbc_types::SQL_SS_TABLE {
         match unsafe { read_tvp_type_name(parameter_value_ptr, buffer_length) } {
-            Ok(Some(name)) => {
-                if store_tvp_type_name(stmt.ipd, parameter_number, name).is_err() {
+            Ok(Some(name)) => match store_tvp_type_name(stmt.ipd, parameter_number, name) {
+                Ok(changed) => {
+                    if changed
+                        && stmt
+                            .invalidate_parameter_definition(usize::from(parameter_number))
+                            .is_err()
+                    {
+                        return SQL_ERROR;
+                    }
+                }
+                Err(()) => {
                     error!("SQLBindParameter: failed storing TVP type name");
                     if let Ok(mut stmt_state) = stmt.inner.lock() {
                         post_sql_error(
@@ -446,7 +460,7 @@ fn sql_bind_parameter_safe(
                     }
                     return SQL_ERROR;
                 }
-            }
+            },
             Ok(None) => {}
             Err(()) => {
                 error!("SQLBindParameter: failed reading TVP type name");
@@ -519,19 +533,20 @@ fn store_tvp_type_name(
     ipd: SqlHandle,
     record_number: SqlUSmallInt,
     name: String,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     let record_number = SqlSmallInt::try_from(record_number).map_err(|_| ())?;
     let desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
     let mut state = desc.inner.lock().map_err(|_| ())?;
     let Some(record) = state.record_mut(record_number) else {
         return Err(());
     };
+    let previous = record.parameter_definition();
     {
         let names = std::sync::Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
         names.type_name = name;
         record.udt_name_claimed.type_name = true;
     }
-    Ok(())
+    Ok(previous != record.parameter_definition())
 }
 
 /// Writes `bound` into `apd`'s and `ipd`'s records at `parameter_number`,
@@ -1267,6 +1282,153 @@ mod tests {
         drop(state);
         let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
         assert_eq!(ipd.inner.lock().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn focused_numeric_bind_uses_apd_defaults_and_preserves_decimal_value() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        for (magnitude, positive, expected) in [(120u128, 1, 12u128), (125, 1, 13), (125, 0, 13)] {
+            let h = TestHandles::with_env_dbc_stmt();
+            bind_and_focus_tvp(&h, 1);
+            let mut value = SqlNumericStruct {
+                precision: 38,
+                scale: 1,
+                sign: positive,
+                val: magnitude.to_le_bytes(),
+            };
+            let mut indicator: SqlLen = 0;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLBindParameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_NUMERIC,
+                        SQL_DECIMAL,
+                        38,
+                        0,
+                        (&raw mut value).cast(),
+                        0,
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let column = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
+            assert_eq!((column.app_precision, column.app_scale), (38, 0));
+            let result =
+                unsafe { crate::conversion::param_convert::bound_tvp_cell_to_value(&column) }
+                    .unwrap();
+            let SqlType::Decimal(Some(parts)) = result else {
+                panic!("expected decimal cell");
+            };
+            assert_eq!(parts.magnitude(), expected);
+            assert_eq!(parts.scale, 0);
+            assert_eq!(parts.is_positive, positive != 0);
+        }
+    }
+
+    #[test]
+    fn tvp_type_name_rebind_and_descriptor_changes_invalidate_prepared_definition() {
+        use crate::api::odbc_types::{SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME, SQL_SS_TABLE};
+        use crate::handles::stmt::PreparedPlan;
+        use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut indicator: SqlLen = 0;
+        let mut bind_name = |name: &str| {
+            let mut name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLBindParameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_BINARY,
+                        SQL_SS_TABLE,
+                        0,
+                        0,
+                        name.as_mut_ptr().cast(),
+                        SqlLen::from(SQL_NTS),
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        };
+        let install_plan = || {
+            let mut state = stmt.inner.lock().unwrap();
+            // A new prepare would first drain the previous unprepare.
+            state.pending_unprepare = None;
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test(
+                    "SELECT @P1",
+                    StatementId::from_raw_for_test(42),
+                ),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+        };
+        bind_name("TypeA");
+        install_plan();
+        bind_name("TypeA");
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .prepared
+                .as_ref()
+                .unwrap()
+                .stmt
+                .id()
+                .is_some()
+        );
+        bind_name("TypeB");
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .prepared
+                .as_ref()
+                .unwrap()
+                .stmt
+                .id()
+                .is_none()
+        );
+        for (field, value) in [
+            (SQL_CA_SS_SCHEMA_NAME, "other"),
+            (SQL_CA_SS_TYPE_NAME, "TypeC"),
+        ] {
+            install_plan();
+            let mut value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLSetDescFieldW(
+                        h.ipd(),
+                        1,
+                        SqlSmallInt::try_from(field).unwrap(),
+                        value.as_mut_ptr().cast(),
+                        crate::api::odbc_types::SqlInteger::from(SQL_NTS),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .stmt
+                    .id()
+                    .is_none()
+            );
+        }
     }
 
     /// A TVP cannot be a column of another TVP: binding SQL_SS_TABLE while focus

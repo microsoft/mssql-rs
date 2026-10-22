@@ -862,7 +862,7 @@ impl ParamRowBuildError {
     }
 }
 
-fn post_param_row_build_error(
+pub(super) fn post_param_row_build_error(
     stmt_state: &mut StmtState,
     error: &ParamRowBuildError,
     parameter_offset: usize,
@@ -1323,6 +1323,25 @@ pub(super) unsafe fn build_named_params_for_row(
     })
 }
 
+pub(super) fn validate_parameter_focus(state: &mut StmtState, op: &str) -> Result<(), SqlReturn> {
+    if state
+        .vendor_attrs
+        .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+        .unwrap_or(0)
+        != 0
+    {
+        error!("{op}: SQL_SOPT_SS_PARAM_FOCUS must be zero at execution time");
+        post_sql_error(
+            state,
+            SQLSTATE_HY024,
+            0,
+            "Parameter focus (SQL_SOPT_SS_PARAM_FOCUS) must be zero at execution time",
+        );
+        return Err(SQL_ERROR);
+    }
+    Ok(())
+}
+
 fn build_tvp_dae_params(
     tvp_index: usize,
     tvp: &BoundParam,
@@ -1354,13 +1373,24 @@ fn build_tvp_dae_params(
             ),
         );
         for (column_index, column) in columns.iter().enumerate() {
-            let column = column
+            let binding = column
                 .as_ref()
-                .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?
-                .with_bind_offset(bind_offset);
-            let expected_len =
-                unsafe { crate::conversion::param_convert::data_at_exec_indicator(&column) }
-                    .and_then(dae_expected_length);
+                .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
+            let column = binding.with_bind_offset(bind_offset);
+            let indicator =
+                unsafe { crate::conversion::param_convert::data_at_exec_indicator(&column) };
+            let column = if indicator.is_some() {
+                column
+            } else {
+                binding
+                    .for_row(
+                        row_index,
+                        bind_offset,
+                        crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                    )
+                    .map_err(|_| ParamBuildError::InvalidBufferLength)?
+            };
+            let expected_len = indicator.and_then(dae_expected_length);
             staged.push(
                 DaeParam::new(tvp_index, expected_len, true, None, column, None).with_target(
                     DaeTarget::TvpCell {
@@ -1428,7 +1458,7 @@ pub(super) fn rebuild_deferred_params(
     prebuilt: Vec<RpcParameter>,
     collected: &[(usize, Vec<u8>, bool)],
     dae_params: &[DaeParam],
-    tvp_cells: &[BufferedTvpCell],
+    tvp_cells: &mut [BufferedTvpCell],
     tvp_row_counts: &std::collections::BTreeMap<usize, usize>,
     op: &str,
 ) -> Result<(Vec<RpcParameter>, bool), SqlReturn> {
@@ -3184,7 +3214,7 @@ mod tests {
                         built.params,
                         &[(0, b"42".to_vec(), false)],
                         &built.dae_params,
-                        &[],
+                        &mut [],
                         &BTreeMap::new(),
                         "test",
                     )
@@ -3416,7 +3446,7 @@ mod tests {
             vec![deferred_slot()],
             &collected,
             &dae_params,
-            &[],
+            &mut [],
             &BTreeMap::new(),
             "test",
         )
@@ -3438,7 +3468,7 @@ mod tests {
             vec![deferred_slot()],
             &[(0, Vec::new(), false)],
             &[],
-            &[],
+            &mut [],
             &BTreeMap::new(),
             "test",
         );
@@ -3454,7 +3484,7 @@ mod tests {
             Vec::new(),
             &[(0, Vec::new(), false)],
             &[buffered_decimal_param(0)],
-            &[],
+            &mut [],
             &BTreeMap::new(),
             "test",
         );
@@ -3476,7 +3506,7 @@ mod tests {
             vec![deferred_slot()],
             &[(0, b"not-a-number".to_vec(), false)],
             &[buffered_decimal_param(0)],
-            &[],
+            &mut [],
             &BTreeMap::new(),
             "test",
         );
@@ -3501,7 +3531,7 @@ mod tests {
                 vec![deferred_slot()],
                 &[(0, bytes, is_null)],
                 &dae_params,
-                &[],
+                &mut [],
                 &BTreeMap::new(),
                 "test",
             );
@@ -3541,6 +3571,57 @@ mod tests {
         assert_eq!(dae.dae_params.len(), 1);
         assert_eq!(dae.dae_params[0].bound_index, 0);
         assert_eq!(dae.dae_params[0].expected_len, Some(7));
+    }
+
+    #[test]
+    fn tvp_dae_staging_positions_bound_columns_but_reuses_dae_tokens() {
+        let mut indicator = SQL_DATA_AT_EXEC;
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 2,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut indicator,
+        };
+        let mut values = [7i32, 9];
+        let mut indicators = [0, crate::api::odbc_types::SQL_NULL_DATA];
+        let bound = BoundParam {
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: crate::api::odbc_types::SQL_INTEGER,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+            ..tvp
+        };
+        let dae = BoundParam {
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            ..tvp
+        };
+        let staged = build_tvp_dae_params(0, &tvp, None, &[Some(bound), Some(dae)], 0).unwrap();
+        assert_eq!(staged.len(), 7);
+        assert_eq!(
+            staged[1].binding.parameter_value_ptr,
+            values.as_mut_ptr().cast()
+        );
+        assert_eq!(
+            staged[4].binding.parameter_value_ptr,
+            unsafe { values.as_mut_ptr().add(1) }.cast()
+        );
+        assert_eq!(staged[4].binding.strlen_or_ind_ptr, unsafe {
+            indicators.as_mut_ptr().add(1)
+        });
+        assert_eq!(
+            staged[2].binding.strlen_or_ind_ptr,
+            staged[5].binding.strlen_or_ind_ptr
+        );
+        assert_eq!(staged[2].value_ptr, staged[5].value_ptr);
     }
 
     #[test]

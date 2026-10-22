@@ -333,7 +333,7 @@ pub(crate) struct ParameterDefinition {
     length: SqlULen,
     precision: SqlSmallInt,
     scale: SqlSmallInt,
-    /// Catalog/schema/type of a UDT, which `sp_executesql` spells out in the
+    /// Catalog/schema/type of a UDT or TVP, which `sp_executesql` spells out in the
     /// declaration and so must invalidate a materialized handle when it
     /// changes. The assembly-qualified name is excluded: it never reaches the
     /// wire, so rewriting it cannot change the prepared text.
@@ -410,7 +410,7 @@ impl DescRecord {
             precision,
             scale,
             // Only the three wire parts, and only on a record that actually
-            // declares a UDT: the concise type says so, and a type name is
+            // declares a UDT or TVP: the concise type says so, and a type name is
             // present. The `SQL_CA_SS_UDT_*` fields are writable on any IPD
             // record (`classify_field` gates on kind, not type), so without
             // the first test a UDT name on an `int` marker would orphan a
@@ -425,13 +425,15 @@ impl DescRecord {
             // a catalog or schema declares nothing. Once a type name is
             // present the catalog and schema travel with it, so changing
             // either still invalidates, and a later switch away from
-            // `SQL_SS_UDT` invalidates through `sql_type`.
+            // either structured type invalidates through `sql_type`.
             udt: self
                 .udt_names
                 .as_ref()
                 .filter(|names| {
-                    self.concise_type == crate::api::odbc_types::SQL_SS_UDT
-                        && !names.type_name.is_empty()
+                    matches!(
+                        self.concise_type,
+                        crate::api::odbc_types::SQL_SS_UDT | crate::api::odbc_types::SQL_SS_TABLE
+                    ) && !names.type_name.is_empty()
                 })
                 .map(Arc::clone),
         }

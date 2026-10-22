@@ -81,7 +81,10 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   are bound, and focus is then restored.
 - **Supply TVP content with data-at-execution** — the driver returns the table token, then
   row-control and cell tokens in the order expected by the ODBC TVP protocol. Cell bytes are
-  buffered and converted into the table value before execution.
+  buffered and converted into the table value before execution. Only columns marked
+  data-at-execution produce cell tokens; ordinary bound values and NULLs are captured from
+  their positioned row buffers when the application supplies that row. A false first
+  row-control marker supplies an empty table.
 - **Execute** — the statement runs; procedure result sets are returned through the normal fetch
   path. TVPs are input-only and are never fetched back.
 
@@ -100,15 +103,20 @@ mssql-odbc will add the following capabilities:
 - **Implement parameter focus** so a TVP's constituent columns can be bound and then
   restored to top-level binding.
 - **Assemble the bound columns into rows** for transmission, applying the same per-cell
-  conversion and null semantics as top-level scalar parameters.
+  conversion and null semantics as top-level scalar parameters. Numeric bindings use the
+  scalar application-descriptor defaults; decimal values are rescaled to the fixed TVP
+  column metadata, rounding half away from zero when reducing scale and rejecting
+  precision overflow before transmission.
 - **Support data-at-execution for TVP content** — consume row-control markers and per-cell
   payloads, preserving row order and NULL values while assembling the table parameter.
 - **Handle empty TVPs and all-NULL columns** correctly.
 - **Preserve binding lifetime and diagnostics** — retain TVP column bindings across cursor
   close and re-prepare, as with scalar parameter bindings; clear them on
   `SQLFreeStmt(SQL_RESET_PARAMS)`. Parameter focus remains a statement attribute, so the
-  application must restore it to 0 before execute. On a bad value, report the offending row
-  and column and keep the connection usable.
+  application must restore it to 0 before `SQLExecute` or `SQLExecDirectW`. Rebinding a
+  different table type or changing its descriptor identity invalidates the prepared
+  declaration. On a bad value, report the offending row and column and keep the connection
+  usable.
 
 ---
 
