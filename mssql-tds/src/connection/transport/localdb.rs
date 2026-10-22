@@ -9,6 +9,7 @@
 //! LocalDB API Reference:
 //! https://learn.microsoft.com/en-us/sql/relational-databases/express-localdb-instance-apis/sql-server-express-localdb-reference-instance-apis
 
+use crate::connection::blocking::off_runtime_thread;
 use crate::core::TdsResult;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -441,13 +442,14 @@ fn from_wide_string(buffer: &[u16]) -> String {
 pub async fn resolve_localdb_instance(instance_name: &str) -> TdsResult<String> {
     info!("Resolving LocalDB instance: {}", instance_name);
 
-    // Load the LocalDB API
-    let api = LocalDBApi::load()?;
-
-    // Resolve the instance to a named pipe path
-    let pipe_name = api.resolve_instance(instance_name)?;
-
-    Ok(pipe_name)
+    // LocalDBStartInstance can take a while, or stall, so it runs off the
+    // runtime thread.
+    let instance_name = instance_name.to_string();
+    off_runtime_thread(move || {
+        let api = LocalDBApi::load()?;
+        api.resolve_instance(&instance_name)
+    })
+    .await
 }
 
 #[cfg(test)]

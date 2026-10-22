@@ -211,6 +211,13 @@ pub trait SecurityContext: Send + Sync {
 
     /// Returns the SPN (Service Principal Name) being used.
     fn spn(&self) -> &str;
+
+    /// The service name as the platform's security library receives it. Differs
+    /// from [`spn`](Self::spn) where the library takes another form, such as
+    /// GSSAPI's `service@host`.
+    fn imported_name(&self) -> &str {
+        self.spn()
+    }
 }
 
 #[cfg(test)]
