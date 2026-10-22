@@ -61,7 +61,10 @@ if [ -n "${PYTEST_MARK_EXPR+set}" ]; then
 fi
 
 declare -a DESELECT_ARGS=()
-read -r -a DESELECT_IDS <<< "${PYTEST_DESELECT:-}"
+declare -a DESELECT_IDS=()
+# -d '' reads past newlines, so IDs may be separated by any whitespace. read
+# returns 1 at end of input, which is expected here.
+read -r -d '' -a DESELECT_IDS <<< "${PYTEST_DESELECT:-}" || true
 for node_id in "${DESELECT_IDS[@]}"; do
     DESELECT_ARGS+=(--deselect "$node_id")
 done

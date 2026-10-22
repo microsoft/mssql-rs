@@ -515,6 +515,10 @@ def test_odbc_runner_forwards_marker_expression(tmp_path, env, expected):
             "PYTEST_DESELECT='tests/test_a.py::test_x  tests/test_b.py::test_y[1]'",
             ["tests/test_a.py::test_x", "tests/test_b.py::test_y[1]"],
         ),
+        (
+            "PYTEST_DESELECT=$'tests/test_a.py::test_x\\n\\ttests/test_b.py::test_y\\n'",
+            ["tests/test_a.py::test_x", "tests/test_b.py::test_y"],
+        ),
     ],
 )
 def test_odbc_runner_forwards_deselected_tests(tmp_path, env, expected):
