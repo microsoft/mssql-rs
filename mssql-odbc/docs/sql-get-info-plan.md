@@ -87,6 +87,41 @@ stay `0` through `SQLGetConnectAttr`/`SQLGetInfo` while disconnected, and only
 `ClientContext` (which cannot hold a literal `0`) resolves to its own default
 at connect time.
 
+## Database read-only state
+
+`SQL_DATA_SOURCE_READ_ONLY` is database-scoped, not a constant capability:
+it returns `"Y"` for an actually read-only current database and `"N"` for
+a writable one, independently of `SQL_ATTR_ACCESS_MODE`. A read-only access
+hint on a writable database still reports `"N"` and does not prohibit DML.
+Conversely, requesting read/write before login does not reject a read-only
+database: its connected access-mode getter reports read-only and its
+information value is `"Y"`.
+
+Source reference: `sqlcinfo.cpp`, `SQLGetInfoW` / `ExecOption`'s database
+read-only branch, together with `sqlcmisc.cpp`'s `IsDataBaseReadOnly`
+path in the connection-attribute setter/getter. Runtime evidence for this
+contract is retail **18.7.1.1**, `SQL_DRIVER_VER=18.07.0001`, against SQL
+Server **16.0.4305.5**, separately from the 18.6.2.1 information-type sweep
+above.
+
+The implementation uses a scalar `CASE` over
+`DATABASEPROPERTYEX(DB_NAME(), 'Updateability')`, returning `N'Y'` or `N'N'`.
+This matches the measured API results, not a claim of byte-for-byte query
+parity with msodbcsql. Lookup failures propagate; missing, NULL, or invalid
+scalar answers explicitly return `SQL_ERROR` / `HY000`, not a writable default.
+
+The shared database-state cache is keyed by catalog and
+`database_change_count`, invalidated on catalog switches including raw `USE`,
+and cleared on connect, disconnect, and reset. Idle lookups use the original
+session. Cold lookups during a streaming cursor use a secondary context
+without consuming or closing the original result. The access-mode regression
+cases in `tests/e2e/tests/attributes_test.cpp` cover both getter orders with
+an active large result, independence from the hint, and actual read-only state
+across catalog switches. See the [access-mode contract](attributes_plan.md#access-mode-hint-versus-database-state)
+for test names, parity invocation, and safe private-database provisioning
+requirements. The existing fixed `"N"` row in `get_info_test.cpp` assumes
+the suite's usual writable database; it is not the read-only-database contract.
+
 ## Capability ledger
 
 Capability masks describe this driver rather than copying features that only

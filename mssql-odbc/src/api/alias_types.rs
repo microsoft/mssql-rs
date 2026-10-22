@@ -254,7 +254,7 @@ fn publish(
 /// msodbcsql's `SpawnConnection` (`sqlcinfo.cpp`) does not copy the session's
 /// `Authentication` keyword, so its secondary login raises no sign-in prompt
 /// mid-call. Methods that may prompt are not replayed.
-fn prompts_for_sign_in(context: &ClientContext) -> bool {
+pub(super) fn prompts_for_sign_in(context: &ClientContext) -> bool {
     matches!(
         context.tds_authentication_method,
         TdsAuthenticationMethod::ActiveDirectoryInteractive
