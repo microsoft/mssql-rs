@@ -87,6 +87,12 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
   and `HasFatalFailure()` in the body does not see them. They are re-reported
   with their original file and line. `SharedStmt` observers hand their first
   error to the main thread, which reports it after joining.
+- A `SharedDbc` attempt ends at its first busy or fatal failure, even inside a
+  fixture helper such as `ODBCTest::ExecDirect`, whose `ASSERT` would otherwise
+  return only from the helper and let the body fail on a statement that never
+  ran (`HY010`). The retried attempt runs the body from the start. Long,
+  many-statement bodies can starve under heavy contention: the Debug driver
+  could not finish three of them at 8 x 20, so they leave the mode out.
 - `SharedStmt` observers call only `SQLGetDiagRec` and `SQLGetDiagField`. Every
   other call clears the owner's diagnostics, and an idle `SQLCancel` also
   closes the open cursor on both drivers. Cross-thread cancel has its own test,
@@ -461,7 +467,10 @@ ThreadSanitizer target (AB#49259).
 ### Priorities
 
 Converted suites are a cheap regression net, not a race hunt: the fetch and
-GetData suites passed at 16 x 50 on both platforms with nothing found. In
+GetData suites passed at 16 x 50 on both platforms with nothing found, and in
+`SharedDbc` at 8 x 20 (Windows) showed only a slowdown: under heavy
+contention the release driver needed about 4.5 times msodbcsql's busy retries
+on the invalid-temporal conversion tests. In
 `SharedEnv` each worker has its own DBC and STMT, and the only driver state
 they share is the ENV's tokio runtime, the live-handle registry, and a few
 one-time settings, so per-statement paths such as `SQLGetData` never run
@@ -471,7 +480,8 @@ sub-millisecond round trips also keep race windows small. The one driver race
 found so far, AB#49225, came from `SharedDbc`. Order of effort for finding
 races:
 
-1. `SharedDbc` opt-ins, as soon as AB#49225 is fixed (scenario 3).
+1. `SharedDbc` opt-ins (scenario 3; the fetch and GetData suites opted in with
+   AB#49260).
 2. Churn, pooling, and authentication (scenarios 7, 10, 11).
 3. Same-STMT and shared-APD races under ThreadSanitizer (scenarios 8, 9).
 4. Faults under load (scenario 12), and disconnect or free during use (see
@@ -585,7 +595,9 @@ Tracked under AB#49256:
    each file records why. On non-Windows, #758 also leaves `/SharedStmt` out of
    two GetData streaming tests until AB#49575. Worker-token tests: a typed row
    of every scalar type, interleaved results and row counts, and a 5000-row
-   stream. `SharedDbc` opt-ins wait for AB#49225.
+   stream. 350 of the 399 tests also run in `SharedDbc`; the rest use `#temp`
+   objects or session settings, change connection state, or (eight, each
+   recorded) starve or fail on msodbcsql in that mode at 8 x 20.
 4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
    remaining cancel cases `cancel_test.cpp` does not cover, added to it
    (idle cursor cleanup is covered by `connection_busy_test.cpp`, AB#49386):

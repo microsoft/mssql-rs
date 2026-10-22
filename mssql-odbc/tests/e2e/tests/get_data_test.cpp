@@ -550,8 +550,10 @@ ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedDiagnosticsAndFollowingRows,
     }
 }
 
-ODBC_TEST_F_MODES(GetDataLiveTest, EmptyTextTypedConversionsLeaveOutputUntouched,
-                  odbc_concurrency::kAllModes) {
+// Not /SharedDbc: every busy error restarts this long, many-statement body, so with
+// eight workers on one connection the Debug driver starved at 8 x 20 (the release
+// driver and msodbcsql finish it).
+ODBC_TEST_F(GetDataLiveTest, EmptyTextTypedConversionsLeaveOutputUntouched) {
     for (const char* type : {"varchar(max)", "nvarchar(max)", "varchar(32)", "nvarchar(32)"}) {
         for (SQLSMALLINT target : {SQL_C_SLONG, SQL_C_SBIGINT, SQL_C_UBIGINT, SQL_C_SSHORT,
                                   SQL_C_USHORT, SQL_C_STINYINT, SQL_C_UTINYINT, SQL_C_BIT,

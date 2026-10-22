@@ -101,8 +101,9 @@ class FetchScrollUtf16Test : public FetchScrollLiveTest {};
 constexpr unsigned kExplicitDescriptorModes =
     odbc_concurrency::kSingle | odbc_concurrency::kCrossThread | odbc_concurrency::kSharedEnv;
 
-ODBC_TEST_F_MODES(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding,
-                  odbc_concurrency::kAllModes) {
+// Not /SharedDbc: msodbcsql, the parity reference, fails it at 8 x 20 when threads
+// share the connection, so the mode cannot be judged against it.
+ODBC_TEST_F(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding) {
     constexpr size_t row_count = 2;
     unsigned char output[row_count][32] = {};
     SQLLEN lengths[row_count] = {};
@@ -188,7 +189,9 @@ ODBC_TEST_F(FetchScrollLiveTest, BoundClientCodePageLossHonorsWarningAttribute) 
     ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR, nullptr, 0), SQL_HANDLE_DBC, dbc_);
 }
 
-ODBC_TEST_F_MODES(FetchScrollUtf16Test, RawUnitsInBoundRowArrays, odbc_concurrency::kAllModes) {
+// Not /SharedDbc: msodbcsql, the parity reference, fails it at 8 x 20 when threads
+// share the connection, so the mode cannot be judged against it.
+ODBC_TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
     constexpr size_t row_count = 4;
     struct Column {
         SQLWCHAR before;
@@ -267,8 +270,9 @@ ODBC_TEST_F_MODES(FetchScrollUtf16Test, RawUnitsInBoundRowArrays, odbc_concurren
 // was still unread when the rowset budget was reached and that the release
 // peek is what consumed it. `row_fetch_with_terminal_info_returns_success_with_info`
 // pins that split in Rust meanwhile.
-ODBC_TEST_F_MODES(FetchScrollLiveTest, TerminalAggregateWarningIsReportedExactlyOnce,
-                  odbc_concurrency::kAllModes) {
+// Not /SharedDbc: msodbcsql, the parity reference, fails it at 8 x 20 when threads
+// share the connection, so the mode cannot be judged against it.
+ODBC_TEST_F(FetchScrollLiveTest, TerminalAggregateWarningIsReportedExactlyOnce) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -500,8 +504,9 @@ ODBC_TEST_F(FetchScrollUtf16Test, NullDataPointersStayUnboundWithOffsetAndLiveIn
     }
 }
 
-ODBC_TEST_F_MODES(FetchScrollUtf16Test, BoundedRawUnitsTruncateBoundRows,
-                  odbc_concurrency::kAllModes) {
+// Not /SharedDbc: msodbcsql, the parity reference, fails it at 8 x 20 when threads
+// share the connection, so the mode cannot be judged against it.
+ODBC_TEST_F(FetchScrollUtf16Test, BoundedRawUnitsTruncateBoundRows) {
     constexpr size_t row_count = 3;
     struct Column {
         SQLWCHAR before;
@@ -928,8 +933,9 @@ ODBC_TEST_F_MODES(FetchScrollLiveTest, RowsFetchedCountsAnErrorRowInTheRowset,
 // A truncated row: msodbcsql reports SQL_ROW_ERROR through SQLFetch and
 // SQL_ROW_SUCCESS_WITH_INFO through SQLFetchScroll; mssql-odbc reports the
 // latter through both (see `RowOutcome::status`). Each leg asserts its own.
-ODBC_TEST_F_MODES(FetchScrollLiveTest, TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll,
-                  odbc_concurrency::kAllModes) {
+// Not /SharedDbc: msodbcsql, the parity reference, fails it at 8 x 20 when threads
+// share the connection, so the mode cannot be judged against it.
+ODBC_TEST_F(FetchScrollLiveTest, TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll) {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool reference = target && std::string(target) == "msodbcsql";
     for (bool scroll : {false, true}) {

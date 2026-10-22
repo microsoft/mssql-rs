@@ -133,13 +133,17 @@ protected:
     }
 };
 
-ODBC_TEST_F_MODES(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaGetData,
-                  odbc_concurrency::kAllModes) {
+// Not /SharedDbc: every busy error restarts this long, many-statement body, so with
+// eight workers on one connection the Debug driver starved at 8 x 20 (the release
+// driver and msodbcsql finish it).
+ODBC_TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaGetData) {
     CheckInvalidCharacterTemporalValues(false);
 }
 
-ODBC_TEST_F_MODES(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaBoundFetch,
-                  odbc_concurrency::kAllModes) {
+// Not /SharedDbc: every busy error restarts this long, many-statement body, so with
+// eight workers on one connection the Debug driver starved at 8 x 20 (the release
+// driver and msodbcsql finish it).
+ODBC_TEST_F(DateTimeTypesLiveTest, InvalidCharacterTemporalValuesViaBoundFetch) {
     CheckInvalidCharacterTemporalValues(true);
 }
 
