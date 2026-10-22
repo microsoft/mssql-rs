@@ -75,6 +75,10 @@ fn apply_for(
 ) {
     order_server_errors(errors);
     for record in errors.iter_mut() {
+        // sqlcmd's own driver records are already its words.
+        if record.source == "driver" {
+            continue;
+        }
         // A transport the client moved past is not in a normal run's errors.
         record.text = if record.superseded {
             None
@@ -198,6 +202,10 @@ fn tls_text(message: &str, windows: bool) -> Option<String> {
 /// the network error before `Login timeout expired` (added only when a time
 /// limit ran out); Linux and macOS after.
 fn add_summaries(errors: &mut Vec<ErrorRecord>, checks: &[Check], server: &str, windows: bool) {
+    // sqlcmd's own driver gave its records, summaries included.
+    if errors.iter().any(|e| e.source == "driver" && !e.superseded) {
+        return;
+    }
     // The failure a normal run reports: the first failed check with errors
     // still current (after the protocol order moved past TCP, the pipe's).
     let failed_checks = || checks.iter().filter(|c| c.coverage.failed());
@@ -632,6 +640,33 @@ mod tests {
                 .skip(2)
                 .all(|e| e.check == CheckId::ConnectionAttempt)
         );
+    }
+
+    #[test]
+    fn sqlcmds_own_driver_records_are_left_as_they_are() {
+        let mut driver = record(
+            "driver",
+            CheckId::ConnectionAttempt,
+            "Login timeout expired",
+        );
+        driver.text = Some("Login timeout expired".to_string());
+        driver.printed = Some(
+            "Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login timeout expired."
+                .to_string(),
+        );
+        let mut errors = vec![
+            os(CheckId::TcpConnect, "refused", Some(10061), "refused"),
+            driver,
+        ];
+        // TCP failed and stays current (the driver then tried other transports):
+        // without the driver's records it would get the summaries.
+        let checks = [
+            failed(CheckId::TcpConnect),
+            failed(CheckId::ConnectionAttempt),
+        ];
+        apply_for(&mut errors, &checks, Some(Protocol::Tcp), "db01", true);
+        assert_eq!(errors.len(), 2, "no summaries: the driver gave its own");
+        assert_eq!(errors[1].text.as_deref(), Some("Login timeout expired"));
     }
 
     #[test]
