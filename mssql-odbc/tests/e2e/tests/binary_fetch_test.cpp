@@ -9,6 +9,7 @@
 // Binary carries no terminator, so the whole buffer is payload -- which is why
 // these do not reuse the character-target helpers.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <cstring>
@@ -49,7 +50,7 @@ protected:
 // Fixed-length binary, whole and chunked.
 // ---------------------------------------------------------------------------
 
-TEST_F(BinaryFetchLiveTest, FixedBinaryDeliversWholeValue) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, FixedBinaryDeliversWholeValue, odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(0x010203040506070809 AS BINARY(9))");
 
     unsigned char buf[16] = {};
@@ -62,7 +63,8 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryDeliversWholeValue) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, FixedBinaryPreservesEmbeddedZero) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, FixedBinaryPreservesEmbeddedZero,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(0x01000203 AS BINARY(4))");
 
     unsigned char buf[4] = {};
@@ -77,7 +79,8 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryPreservesEmbeddedZero) {
 
 // The indicator counts down because it reports what was left before each call,
 // not what the call delivered.
-TEST_F(BinaryFetchLiveTest, FixedBinaryChunksWithARemainingCount) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, FixedBinaryChunksWithARemainingCount,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(0x010203040506070809 AS BINARY(9))");
 
     unsigned char buf[4] = {};
@@ -101,7 +104,8 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryChunksWithARemainingCount) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, FixedBinaryProbeReportsRemainingBytesWithoutConsumingThem) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, FixedBinaryProbeReportsRemainingBytesWithoutConsumingThem,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(0x010203040506070809 AS BINARY(9))");
 
     unsigned char buf[4] = {};
@@ -130,7 +134,8 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryProbeReportsRemainingBytesWithoutConsumin
 
 // The PLP half of the same rule. This path computes its remainder from the
 // stream rather than from `remaining_binary_length`, so it needs its own case.
-TEST_F(BinaryFetchLiveTest, StreamedBinaryProbeReportsRemainingBytesWithoutConsumingThem) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, StreamedBinaryProbeReportsRemainingBytesWithoutConsumingThem,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))");
     AssertColumnSqlType(SQL_VARBINARY);
 
@@ -150,7 +155,8 @@ TEST_F(BinaryFetchLiveTest, StreamedBinaryProbeReportsRemainingBytesWithoutConsu
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, EmptyVarbinaryReportsZeroLength) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, EmptyVarbinaryReportsZeroLength,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(0x AS VARBINARY(20))");
 
     unsigned char buf[8];
@@ -163,7 +169,7 @@ TEST_F(BinaryFetchLiveTest, EmptyVarbinaryReportsZeroLength) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, NullVarbinaryReportsNull) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, NullVarbinaryReportsNull, odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(NULL AS VARBINARY(8))");
 
     unsigned char buf[8];
@@ -179,7 +185,8 @@ TEST_F(BinaryFetchLiveTest, NullVarbinaryReportsNull) {
 // AB#49220: a zero-length IMAGE is a present, empty value, not NULL. The legacy
 // LOB wire format marks NULL with a zero text-pointer length; a present pointer
 // with zero data bytes is empty. The non-empty trailing column pins alignment.
-TEST_F(BinaryFetchLiveTest, EmptyImageReportsZeroLengthAndNullImageReportsNull) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, EmptyImageReportsZeroLengthAndNullImageReportsNull,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(0x AS IMAGE), CAST(NULL AS IMAGE), CAST(0x0102 AS IMAGE)");
 
     unsigned char buf[8];
@@ -215,7 +222,8 @@ TEST_F(BinaryFetchLiveTest, EmptyImageReportsZeroLengthAndNullImageReportsNull) 
 // than a materialized value.
 // ---------------------------------------------------------------------------
 
-TEST_F(BinaryFetchLiveTest, VarbinaryMaxDeliversWholeValue) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, VarbinaryMaxDeliversWholeValue,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))");
     AssertColumnSqlType(SQL_VARBINARY);
 
@@ -228,7 +236,8 @@ TEST_F(BinaryFetchLiveTest, VarbinaryMaxDeliversWholeValue) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, EmptyVarbinaryMaxReportsZeroLength) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, EmptyVarbinaryMaxReportsZeroLength,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(0x AS VARBINARY(MAX))");
     AssertColumnSqlType(SQL_VARBINARY);
 
@@ -245,7 +254,7 @@ TEST_F(BinaryFetchLiveTest, EmptyVarbinaryMaxReportsZeroLength) {
 // The chunked stream is the case that regressed twice while this was built:
 // the first chunk and the resumed chunk are admitted by two separate gates, so
 // a read could start and then be refused half way through.
-TEST_F(BinaryFetchLiveTest, VarbinaryMaxChunksAcrossCalls) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, VarbinaryMaxChunksAcrossCalls, odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))");
     AssertColumnSqlType(SQL_VARBINARY);
 
@@ -268,7 +277,8 @@ TEST_F(BinaryFetchLiveTest, VarbinaryMaxChunksAcrossCalls) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, HierarchyidDeliversItsWireBytes) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, HierarchyidDeliversItsWireBytes,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST(hierarchyid::Parse('/1/2/') AS hierarchyid)");
 
     unsigned char buf[16] = {};
@@ -281,7 +291,7 @@ TEST_F(BinaryFetchLiveTest, HierarchyidDeliversItsWireBytes) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, GeometryDeliversItsWireBytes) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, GeometryDeliversItsWireBytes, odbc_concurrency::kAllModes) {
     FetchOne("SELECT geometry::Point(1, 2, 0)");
 
     unsigned char buf[64] = {};
@@ -297,7 +307,8 @@ TEST_F(BinaryFetchLiveTest, GeometryDeliversItsWireBytes) {
 // column size is 0, unknown, or over 8000 - so the chunked read below is the
 // common case there, not an edge case. The two UDT tests above only cover a
 // value small enough for one call.
-TEST_F(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls,
+                  odbc_concurrency::kAllModes) {
     // Built here rather than in T-SQL so the test does not depend on a server
     // version for string aggregation. ~1000 points puts the serialized value
     // well past a single buffer.
@@ -367,7 +378,8 @@ TEST_F(BinaryFetchLiveTest, LargeGeometryChunksAcrossCalls) {
 }
 
 // A character column read as binary yields its wire bytes, not its text.
-TEST_F(BinaryFetchLiveTest, NvarcharAsBinaryYieldsUtf16WireBytes) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, NvarcharAsBinaryYieldsUtf16WireBytes,
+                  odbc_concurrency::kAllModes) {
     FetchOne("SELECT CAST('hi' AS NVARCHAR(10))");
 
     unsigned char buf[16] = {};
@@ -385,7 +397,7 @@ TEST_F(BinaryFetchLiveTest, NvarcharAsBinaryYieldsUtf16WireBytes) {
 // the path its arrow reader drives.
 // ---------------------------------------------------------------------------
 
-TEST_F(BinaryFetchLiveTest, BoundBinaryDeliversWholeValue) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, BoundBinaryDeliversWholeValue, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x010203040506070809 AS BINARY(9))"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -401,7 +413,8 @@ TEST_F(BinaryFetchLiveTest, BoundBinaryDeliversWholeValue) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, BoundBinaryTruncatesWithTheFullLength) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, BoundBinaryTruncatesWithTheFullLength,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x010203040506070809 AS BINARY(9))"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -416,7 +429,8 @@ TEST_F(BinaryFetchLiveTest, BoundBinaryTruncatesWithTheFullLength) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, BoundVarbinaryMaxDeliversWholeValue) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, BoundVarbinaryMaxDeliversWholeValue,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))"),
         SQL_HANDLE_STMT, stmt_);
@@ -433,7 +447,8 @@ TEST_F(BinaryFetchLiveTest, BoundVarbinaryMaxDeliversWholeValue) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, BoundBinaryNullsReportNullWithoutDisturbingBuffers) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, BoundBinaryNullsReportNullWithoutDisturbingBuffers,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(NULL AS VARBINARY(8)), CAST(NULL AS VARBINARY(MAX))"),
         SQL_HANDLE_STMT, stmt_);
@@ -458,7 +473,8 @@ TEST_F(BinaryFetchLiveTest, BoundBinaryNullsReportNullWithoutDisturbingBuffers) 
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, BoundEmptyImageReportsZeroLengthAndNullImageReportsNull) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, BoundEmptyImageReportsZeroLengthAndNullImageReportsNull,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(0x AS IMAGE), CAST(NULL AS IMAGE), CAST(0x0102 AS IMAGE)"),
         SQL_HANDLE_STMT, stmt_);
@@ -492,7 +508,8 @@ TEST_F(BinaryFetchLiveTest, BoundEmptyImageReportsZeroLengthAndNullImageReportsN
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, AdjacentBoundBinaryColumnsStayWithinTheirBuffers) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, AdjacentBoundBinaryColumnsStayWithinTheirBuffers,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(0x01020304 AS BINARY(4)), CAST(0x05060708 AS BINARY(4))"),
         SQL_HANDLE_STMT, stmt_);
@@ -518,7 +535,8 @@ TEST_F(BinaryFetchLiveTest, AdjacentBoundBinaryColumnsStayWithinTheirBuffers) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(BinaryFetchLiveTest, BoundBinaryRowArrayUsesTheBinaryStride) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, BoundBinaryRowArrayUsesTheBinaryStride,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT b FROM (VALUES (1, CAST(0x01020304 AS BINARY(4))),"
                    " (2, CAST(0x05060708 AS BINARY(4)))) AS t(n, b) ORDER BY n"),
@@ -552,7 +570,8 @@ TEST_F(BinaryFetchLiveTest, BoundBinaryRowArrayUsesTheBinaryStride) {
 // pins the boundary so the gap is visible rather than assumed closed.
 // ---------------------------------------------------------------------------
 
-TEST_F(BinaryFetchLiveTest, FixedWidthKindsAreStillRefused) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, FixedWidthKindsAreStillRefused,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     FetchOne("SELECT CAST(258 AS INT)");
 
@@ -570,7 +589,8 @@ TEST_F(BinaryFetchLiveTest, FixedWidthKindsAreStillRefused) {
 // to a binary caller silently drops bytes it asked for verbatim.
 // ---------------------------------------------------------------------------
 
-TEST_F(BinaryFetchLiveTest, ABoundBinaryReadOfAUtf8ColumnKeepsTheTruncatedTail) {
+ODBC_TEST_F_MODES(BinaryFetchLiveTest, ABoundBinaryReadOfAUtf8ColumnKeepsTheTruncatedTail,
+                  odbc_concurrency::kAllModes) {
     // Every character is 2 bytes, so an odd-sized buffer must split one. The
     // whole slot is payload: character trimming would give back 8, not 9.
     ASSERT_SQL_OK(
