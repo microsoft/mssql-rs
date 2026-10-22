@@ -56,10 +56,12 @@ pub(crate) unsafe fn sql_param_data(
     statement_handle: SqlHandle,
     value_ptr_ptr: *mut SqlPointer,
 ) -> SqlReturn {
-    debug!(?statement_handle, ?value_ptr_ptr, "SQLParamData called");
-    crate::ffi_entry!("SQLParamData", unsafe {
-        sql_param_data_impl(statement_handle, value_ptr_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLParamData",
+        statement_handle,
+        debug!(?statement_handle, ?value_ptr_ptr, "SQLParamData called"),
+        unsafe { sql_param_data_impl(statement_handle, value_ptr_ptr) }
+    )
 }
 
 /// # Safety
@@ -85,6 +87,19 @@ unsafe fn sql_param_data_impl(
 }
 
 fn sql_param_data_safe(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    value_ptr_ptr: *mut SqlPointer,
+) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_param_data_operation(statement_handle, stmt, value_ptr_ptr);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_param_data_operation(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
     value_ptr_ptr: *mut SqlPointer,
@@ -157,6 +172,44 @@ fn sql_param_data_safe(
 
     if let Some(diag) = close_error {
         error!("SQLParamData: current DAE parameter failed close-time validation");
+        return abort_dae_with_diag(dbc, stmt, statement_handle, diag);
+    }
+
+    let deferred_tail_error = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned validating buffered transcoder tail");
+            return SQL_ERROR;
+        };
+        let Some(dae) = stmt_state.dae.as_mut() else {
+            error!("SQLParamData: DAE sequence vanished validating buffered transcoder tail");
+            return SQL_ERROR;
+        };
+        if !dae.deferred {
+            None
+        } else if let Some(limit) = dae
+            .current_param()
+            .and_then(|param| param.length_limit)
+            .filter(|limit| limit.requires_encoded_input())
+        {
+            let trailing = match dae.current_param().and_then(|param| param.transcode) {
+                Some(transcode) => transcode.finish(&mut dae.progress.carry).bytes,
+                None => Vec::new(),
+            };
+            let mut no_carry = Vec::new();
+            match limit.fit_chunk(&mut no_carry, &trailing, dae.progress.retained_units) {
+                Ok((_, consumed)) => {
+                    dae.progress.retained_units =
+                        dae.progress.retained_units.saturating_add(consumed);
+                    None
+                }
+                Err(error) => Some(error.diag()),
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(diag) = deferred_tail_error {
+        error!("SQLParamData: buffered transcoder tail exceeds the parameter length");
         return abort_dae_with_diag(dbc, stmt, statement_handle, diag);
     }
 
@@ -272,10 +325,6 @@ fn sql_param_data_safe(
             error!("SQLParamData: stmt mutex poisoned taking dae_client");
             return SQL_ERROR;
         };
-        // Checked out before the carry is drained: if this fails (a concurrent
-        // call already holds the client), the sequence stays open for a retry
-        // with the partial character still intact rather than silently
-        // discarded.
         let client = match stmt_state
             .dae
             .as_mut()
@@ -288,7 +337,6 @@ fn sql_param_data_safe(
                 return SQL_ERROR;
             }
         };
-
         // A value that ended part-way through a character leaves bytes in the
         // carry that no further chunk will complete. Flush them before the
         // terminator so they reach the wire lossily rather than vanishing.
@@ -297,7 +345,7 @@ fn sql_param_data_safe(
         // chunk ended mid-code-unit has that half unit held there, and it has to
         // rejoin the value before the transcoder sees it, or the tail character
         // is silently lost.
-        let trailing = stmt_state
+        let mut trailing = stmt_state
             .dae
             .as_mut()
             .map(|dae| {
@@ -318,6 +366,30 @@ fn sql_param_data_safe(
                 }
             })
             .unwrap_or_default();
+
+        if let Some(dae) = stmt_state.dae.as_mut()
+            && let Some(limit) = dae
+                .current_param()
+                .and_then(|param| param.length_limit)
+                .filter(|limit| limit.requires_encoded_input())
+        {
+            let mut no_carry = Vec::new();
+            match limit.fit_chunk(&mut no_carry, &trailing.0, dae.progress.retained_units) {
+                Ok((kept, consumed)) => {
+                    trailing.0 = kept;
+                    dae.progress.retained_units =
+                        dae.progress.retained_units.saturating_add(consumed);
+                }
+                Err(error) => {
+                    if let Some(dae) = stmt_state.dae.as_mut() {
+                        dae.return_client(client);
+                    }
+                    drop(stmt_state);
+                    return abort_dae_with_diag(dbc, stmt, statement_handle, error.diag());
+                }
+            }
+        }
+
         (client, trailing)
     };
     let (trailing, tail_had_loss) = trailing;
@@ -492,6 +564,10 @@ fn open_deferred_rpc(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
 ) -> Option<SqlReturn> {
+    let cancel_handle = match stmt.execution_cancel() {
+        Ok(handle) => handle,
+        Err(rc) => return Some(rc),
+    };
     let taken = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned opening the deferred RPC");
@@ -559,7 +635,9 @@ fn open_deferred_rpc(
     let (mut client, params, mut prepared, mut orphaned, sql, timeout_secs, fractional_truncated) =
         taken;
     let collation = client.get_collation();
-    let options = ExecuteOptions::new().timeout_secs(timeout_secs);
+    let options = ExecuteOptions::new()
+        .timeout_secs(timeout_secs)
+        .cancel(&cancel_handle);
 
     let begin_result = match (prepared.as_mut(), sql) {
         (Some(plan), _) => dbc.runtime.block_on(client.begin_execute_prepared(
@@ -668,6 +746,10 @@ fn run_deferred_execute(
     // Take everything the execute needs, and end the sequence, in one critical
     // section: a statement observed between the two would look idle but
     // unprepared.
+    let cancel_handle = match stmt.execution_cancel() {
+        Ok(handle) => handle,
+        Err(rc) => return rc,
+    };
     let taken = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned starting the deferred execute");
@@ -738,7 +820,9 @@ fn run_deferred_execute(
         return SQL_ERROR;
     };
 
-    let options = ExecuteOptions::new().timeout_secs(timeout_secs);
+    let options = ExecuteOptions::new()
+        .timeout_secs(timeout_secs)
+        .cancel(&cancel_handle);
     let exec_result = match (prepared.as_mut(), sql) {
         (Some(plan), _) => dbc
             .runtime
@@ -781,8 +865,8 @@ fn run_deferred_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE};
-    use crate::handles::stmt::{DaeParam, DaeState};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR, SqlLen};
+    use crate::handles::stmt::{DaeParam, DaeState, DaeTarget};
     use crate::test_support::TestHandles;
 
     fn open_dae(expected_len: Option<usize>) -> DaeState {
@@ -828,6 +912,100 @@ mod tests {
         let ret = unsafe { sql_param_data(h.stmt, &mut returned) };
         assert_eq!(ret, SQL_NEED_DATA);
         assert_eq!(returned, token_ptr);
+    }
+
+    #[test]
+    fn tvp_dae_sequence_collects_rows_and_stops_at_false_row_marker() {
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut row0 = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        row0.set_buffered(true);
+        let mut cell0 =
+            DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(DaeTarget::TvpCell {
+                tvp_index: 0,
+                row_index: 0,
+                column_index: 0,
+            });
+        cell0.set_buffered(true);
+        let mut row1 = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 1,
+            },
+        );
+        row1.set_buffered(true);
+        let mut cell1 =
+            DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(DaeTarget::TvpCell {
+                tvp_index: 0,
+                row_index: 1,
+                column_index: 0,
+            });
+        cell1.set_buffered(true);
+        let mut end = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 2,
+            },
+        );
+        end.set_buffered(true);
+        let mut next_parameter = DaeParam::unbounded(1, std::ptr::null_mut(), None);
+        next_parameter.set_buffered(true);
+        let dae = DaeState::new(
+            tds_client_from_tokens(Vec::new()),
+            None,
+            None,
+            vec![row0, cell0, row1, cell1, end, next_parameter],
+        )
+        .deferred(Vec::new(), Some("SELECT ?".into()), 0);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(dae);
+        }
+
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut token) }, SQL_NEED_DATA);
+        assert_eq!(
+            unsafe { crate::api::put_data::sql_put_data(h.stmt, 1usize as SqlPointer, 1) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
+
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut token) }, SQL_NEED_DATA);
+        let cell_bytes = [42u8];
+        assert_eq!(
+            unsafe {
+                crate::api::put_data::sql_put_data(
+                    h.stmt,
+                    cell_bytes.as_ptr().cast_mut().cast(),
+                    SqlLen::try_from(cell_bytes.len()).unwrap(),
+                )
+            },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
+
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut token) }, SQL_NEED_DATA);
+        assert_eq!(
+            unsafe { crate::api::put_data::sql_put_data(h.stmt, std::ptr::null_mut(), 0) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut token) }, SQL_NEED_DATA);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().unwrap();
+        assert!(matches!(
+            dae.current_param().unwrap().target,
+            DaeTarget::Parameter
+        ));
+        assert_eq!(dae.tvp_row_counts.get(&0), Some(&1));
+        assert_eq!(dae.tvp_cells.len(), 1);
+        assert_eq!(dae.tvp_cells[0].bytes, cell_bytes);
+        assert_eq!(dae.tvp_cells[0].row_index, 0);
     }
 
     #[test]
@@ -885,6 +1063,49 @@ mod tests {
             state.dae.as_ref().unwrap().progress.carry,
             vec![0xC3],
             "the pending partial character must survive a failed checkout"
+        );
+    }
+
+    #[test]
+    fn buffered_partial_utf8_overflow_is_reported_at_close() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let limit =
+                crate::conversion::param_convert::dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+                    .unwrap()
+                    .unwrap();
+            let collation = mssql_tds::token::tokens::SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags: 0x40,
+                sort_id: 0,
+            };
+            let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit);
+            param.transcode = Some(crate::conversion::param_convert::DaeTranscode::new(
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                collation,
+            ));
+            let mut dae = DaeState::for_test(vec![param], Some(0));
+            dae.deferred = true;
+            dae.progress.put_data_called = true;
+            dae.progress.bytes_sent = 1;
+            dae.progress.buffer = vec![0xC3];
+            dae.progress.carry = vec![0xC3];
+            state.dae = Some(dae);
+        }
+
+        let mut p: SqlPointer = std::ptr::null_mut();
+        assert_eq!(unsafe { sql_param_data(h.stmt, &mut p) }, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_STRING_TRUNCATION.state
         );
     }
 

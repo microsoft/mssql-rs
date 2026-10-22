@@ -815,24 +815,27 @@ pub(crate) unsafe fn sql_get_info_w(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        info_type,
-        ?info_value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetInfoW called",
-    );
-
-    crate::ffi_entry!("SQLGetInfoW", unsafe {
-        sql_get_info_w_impl(
-            connection_handle,
+    crate::ffi_entry!(
+        "SQLGetInfoW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
             info_type,
-            info_value_ptr,
+            ?info_value_ptr,
             buffer_length,
-            string_length_ptr,
-        )
-    })
+            ?string_length_ptr,
+            "SQLGetInfoW called",
+        ),
+        unsafe {
+            sql_get_info_w_impl(
+                connection_handle,
+                info_type,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -1477,11 +1480,12 @@ struct LookupFailure {
 /// alias-type query in one `sp_executesql` (`sqlcstr.cpp:46`). The
 /// `set implicit_transactions off` is there because msodbcsql implements
 /// manual-commit with `SET IMPLICIT_TRANSACTIONS` and must keep this internal
-/// query from opening a transaction (`sqlccmd.cpp` bug #656241); this driver
-/// drives transactions with TDS transaction-manager requests and never enables
-/// implicit transactions, so a bare batch already carries that guarantee. The
-/// alias-type half has no counterpart here — there is no UDT cache to refresh —
-/// which leaves just the `SELECT`.
+/// query from opening a transaction (`sqlccmd.cpp` bug #656241). A bare
+/// `SELECT USER_NAME()` cannot open one: a `SELECT` that reads no table never
+/// begins an implicit transaction, even when the application has enabled them
+/// itself. The alias-type half reads `systypes`, so `alias_types` keeps the
+/// scoped batch, and reads it separately because it may log in separately
+/// while a cursor is open and this lookup does not (AB#48044).
 /// `timeout_secs` is `SQL_ATTR_CONNECTION_TIMEOUT`, with `0` meaning no
 /// deadline; see the call site for why that is the attribute msodbcsql bounds
 /// this query with.
@@ -2533,6 +2537,7 @@ mod tests {
             let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             let mut state = dbc_ref.inner.lock().unwrap();
             state.identity = crate::handles::dbc::ConnectionIdentity {
+                client_connection_id: None,
                 data_source_name: "ReportingDsn".to_string(),
                 server_name: "SQLPROD01\\INST".to_string(),
             };

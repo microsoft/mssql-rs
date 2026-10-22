@@ -10,6 +10,7 @@
 #
 # Required env:
 #   ARTIFACT_NAME         Name of the sql-ready sentinel artifact.
+#   SQL_CREDENTIAL_GENERATION  Nonsecret initialization generation ID.
 #   BUILD_BUILDID
 #   SYSTEM_COLLECTIONURI
 #   SYSTEM_TEAMPROJECT
@@ -24,6 +25,10 @@
 #   MIN_HOST_LIFE_REMAINING_SECONDS  default 300
 
 $ErrorActionPreference = 'Stop'
+
+if ($env:SQL_CREDENTIAL_GENERATION -cnotmatch '\A[0-9a-f]{32}\z') {
+    throw 'SQL credential generation is missing or invalid. Queue a fresh validation run.'
+}
 
 foreach ($required in 'ARTIFACT_NAME', 'BUILD_BUILDID', 'SYSTEM_COLLECTIONURI', 'SYSTEM_TEAMPROJECT', 'SYSTEM_ACCESSTOKEN', 'AGENT_TEMPDIRECTORY') {
     if (-not [Environment]::GetEnvironmentVariable($required)) {
@@ -125,22 +130,23 @@ if (-not $endpointFile) {
     throw "endpoint.txt not found inside $artifactName artifact."
 }
 
-# endpoint.txt format: "HOST PORT DEADLINE_EPOCH" on a single line.
+# endpoint.txt format: "HOST PORT DEADLINE_EPOCH GENERATION" on a single line.
 $fields = (Get-Content -Path $endpointFile.FullName -TotalCount 1) -split '\s+' | Where-Object { $_ }
-if ($fields.Count -lt 2) {
-    throw "endpoint.txt is malformed: '$(Get-Content -Path $endpointFile.FullName -Raw)'"
+if ($fields.Count -ne 4) {
+    throw 'endpoint.txt must contain host, port, deadline, and credential generation.'
+}
+if ($fields[3] -cne $env:SQL_CREDENTIAL_GENERATION) {
+    throw 'SQL endpoint belongs to a different initialization. Queue a fresh validation run.'
 }
 $dbHost = $fields[0]
 $dbPort = $fields[1]
 
-if ($fields.Count -ge 3) {
-    $remaining = [int]$fields[2] - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ($remaining -lt $minHostLife) {
-        Write-Host "  This usually means the SQL host hit MAX_LIFETIME_MINUTES while this test job was queued."
-        throw "SQL host endpoint expires in ${remaining}s (need >= ${minHostLife}s)."
-    }
-    Write-Host "SQL host has ${remaining}s of life remaining (over the ${minHostLife}s threshold)."
+$remaining = [int]$fields[2] - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+if ($remaining -lt $minHostLife) {
+    Write-Host "  This usually means the SQL host hit MAX_LIFETIME_MINUTES while this test job was queued."
+    throw "SQL host endpoint expires in ${remaining}s (need >= ${minHostLife}s)."
 }
+Write-Host "SQL host has ${remaining}s of life remaining (over the ${minHostLife}s threshold)."
 
 Write-Host "Resolved SQL endpoint: host=$dbHost port=$dbPort"
 Write-Host "##vso[task.setvariable variable=DB_HOST]$dbHost"

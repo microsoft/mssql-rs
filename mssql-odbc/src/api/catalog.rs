@@ -514,9 +514,39 @@ fn run_catalog(
     not_null_cols: &[usize],
     renames: &[(usize, &'static str)],
 ) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = run_catalog_operation(
+        statement_handle,
+        name,
+        stmt,
+        proc,
+        catalog,
+        retry_on_error,
+        build_params,
+        not_null_cols,
+        renames,
+    );
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_catalog_operation(
+    statement_handle: SqlHandle,
+    name: &'static str,
+    stmt: &StmtHandle,
+    proc: &str,
+    catalog: &Arg,
+    retry_on_error: bool,
+    build_params: impl Fn(bool) -> (Vec<RpcParameter>, Option<Vec<RpcParameter>>),
+    not_null_cols: &[usize],
+    renames: &[(usize, &'static str)],
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    let query_timeout = {
+    let (query_timeout, cancel_handle) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{name}: stmt mutex poisoned");
             return SQL_ERROR;
@@ -527,6 +557,10 @@ fn run_catalog(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        let cancel_handle = match stmt.new_execution_cancel() {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
         // A new query invalidates prior metadata/context immediately, matching
         // SQLGetTypeInfo/SQLExecDirect: a later failure cannot expose stale
         // SQLNumResultCols/DescribeCol state.
@@ -537,7 +571,8 @@ fn run_catalog(
         stmt_state.prepared = None;
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        stmt_state.query_timeout
+        mssql_tds::trace_context::activate_execution();
+        (stmt_state.query_timeout, cancel_handle)
     };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, name) {
@@ -555,7 +590,11 @@ fn run_catalog(
     // unlimited. Steps are charged against the *fixed* original budget using
     // *cumulative* elapsed time, so no step is double-charged and sub-second
     // remainders accumulate rather than being floored away independently.
-    flush_pending_unprepare(dbc, stmt, &mut client, name, query_timeout);
+    if let Err(e) =
+        flush_pending_unprepare(dbc, stmt, &mut client, name, query_timeout, &cancel_handle)
+    {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
         Ok(remaining) => remaining,
@@ -570,7 +609,9 @@ fn run_catalog(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, name, query_timeout) {
+    if let Err(e) =
+        begin_transaction_if_manual(dbc, &mut client, name, query_timeout, &cancel_handle)
+    {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
@@ -588,12 +629,16 @@ fn run_catalog(
     };
 
     let (positional, named) = build_params(false);
-    let mut exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
-        qualified_proc_name(catalog, proc),
-        Some(positional),
-        named,
-        ExecuteOptions::new().timeout_secs(query_timeout),
-    ));
+    let mut exec_result = dbc.runtime.block_on(
+        client.execute_stored_procedure(
+            qualified_proc_name(catalog, proc),
+            Some(positional),
+            named,
+            ExecuteOptions::new()
+                .timeout_secs(query_timeout)
+                .cancel(&cancel_handle),
+        ),
+    );
 
     if retry_on_error && matches!(exec_result, Err(TdsError::SqlServerError { .. })) {
         debug!(%proc, "{name}: qualified catalog call failed, retrying unqualified");
@@ -639,12 +684,16 @@ fn run_catalog(
             }
         };
         let (retry_positional, retry_named) = build_params(true);
-        exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
-            qualified_proc_name(&None, proc),
-            Some(retry_positional),
-            retry_named,
-            ExecuteOptions::new().timeout_secs(retry_timeout),
-        ));
+        exec_result = dbc.runtime.block_on(
+            client.execute_stored_procedure(
+                qualified_proc_name(&None, proc),
+                Some(retry_positional),
+                retry_named,
+                ExecuteOptions::new()
+                    .timeout_secs(retry_timeout)
+                    .cancel(&cancel_handle),
+            ),
+        );
     }
 
     if let Err(e) = exec_result {
@@ -732,31 +781,35 @@ pub(crate) unsafe fn sql_tables_w(
     table_type: *const SqlWChar,
     name_length_4: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?catalog_name,
-        name_length_1,
-        ?schema_name,
-        name_length_2,
-        ?table_name,
-        name_length_3,
-        ?table_type,
-        name_length_4,
-        "SQLTablesW called"
-    );
-    crate::ffi_entry!("SQLTablesW", unsafe {
-        sql_tables_w_impl(
-            statement_handle,
-            catalog_name,
+    crate::ffi_entry!(
+        "SQLTablesW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?catalog_name,
             name_length_1,
-            schema_name,
+            ?schema_name,
             name_length_2,
-            table_name,
+            ?table_name,
             name_length_3,
-            table_type,
+            ?table_type,
             name_length_4,
-        )
-    })
+            "SQLTablesW called"
+        ),
+        unsafe {
+            sql_tables_w_impl(
+                statement_handle,
+                catalog_name,
+                name_length_1,
+                schema_name,
+                name_length_2,
+                table_name,
+                name_length_3,
+                table_type,
+                name_length_4,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -881,31 +934,35 @@ pub(crate) unsafe fn sql_columns_w(
     column_name: *const SqlWChar,
     name_length_4: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?catalog_name,
-        name_length_1,
-        ?schema_name,
-        name_length_2,
-        ?table_name,
-        name_length_3,
-        ?column_name,
-        name_length_4,
-        "SQLColumnsW called"
-    );
-    crate::ffi_entry!("SQLColumnsW", unsafe {
-        sql_columns_w_impl(
-            statement_handle,
-            catalog_name,
+    crate::ffi_entry!(
+        "SQLColumnsW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?catalog_name,
             name_length_1,
-            schema_name,
+            ?schema_name,
             name_length_2,
-            table_name,
+            ?table_name,
             name_length_3,
-            column_name,
+            ?column_name,
             name_length_4,
-        )
-    })
+            "SQLColumnsW called"
+        ),
+        unsafe {
+            sql_columns_w_impl(
+                statement_handle,
+                catalog_name,
+                name_length_1,
+                schema_name,
+                name_length_2,
+                table_name,
+                name_length_3,
+                column_name,
+                name_length_4,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -1026,27 +1083,31 @@ pub(crate) unsafe fn sql_primary_keys_w(
     table_name: *const SqlWChar,
     name_length_3: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?catalog_name,
-        name_length_1,
-        ?schema_name,
-        name_length_2,
-        ?table_name,
-        name_length_3,
-        "SQLPrimaryKeysW called"
-    );
-    crate::ffi_entry!("SQLPrimaryKeysW", unsafe {
-        sql_primary_keys_w_impl(
-            statement_handle,
-            catalog_name,
+    crate::ffi_entry!(
+        "SQLPrimaryKeysW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?catalog_name,
             name_length_1,
-            schema_name,
+            ?schema_name,
             name_length_2,
-            table_name,
+            ?table_name,
             name_length_3,
-        )
-    })
+            "SQLPrimaryKeysW called"
+        ),
+        unsafe {
+            sql_primary_keys_w_impl(
+                statement_handle,
+                catalog_name,
+                name_length_1,
+                schema_name,
+                name_length_2,
+                table_name,
+                name_length_3,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -1155,39 +1216,43 @@ pub(crate) unsafe fn sql_foreign_keys_w(
     fk_table_name: *const SqlWChar,
     name_length_6: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?pk_catalog_name,
-        name_length_1,
-        ?pk_schema_name,
-        name_length_2,
-        ?pk_table_name,
-        name_length_3,
-        ?fk_catalog_name,
-        name_length_4,
-        ?fk_schema_name,
-        name_length_5,
-        ?fk_table_name,
-        name_length_6,
-        "SQLForeignKeysW called"
-    );
-    crate::ffi_entry!("SQLForeignKeysW", unsafe {
-        sql_foreign_keys_w_impl(
-            statement_handle,
-            pk_catalog_name,
+    crate::ffi_entry!(
+        "SQLForeignKeysW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?pk_catalog_name,
             name_length_1,
-            pk_schema_name,
+            ?pk_schema_name,
             name_length_2,
-            pk_table_name,
+            ?pk_table_name,
             name_length_3,
-            fk_catalog_name,
+            ?fk_catalog_name,
             name_length_4,
-            fk_schema_name,
+            ?fk_schema_name,
             name_length_5,
-            fk_table_name,
+            ?fk_table_name,
             name_length_6,
-        )
-    })
+            "SQLForeignKeysW called"
+        ),
+        unsafe {
+            sql_foreign_keys_w_impl(
+                statement_handle,
+                pk_catalog_name,
+                name_length_1,
+                pk_schema_name,
+                name_length_2,
+                pk_table_name,
+                name_length_3,
+                fk_catalog_name,
+                name_length_4,
+                fk_schema_name,
+                name_length_5,
+                fk_table_name,
+                name_length_6,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -1363,31 +1428,35 @@ pub(crate) unsafe fn sql_statistics_w(
     unique: SqlUSmallInt,
     reserved: SqlUSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?catalog_name,
-        name_length_1,
-        ?schema_name,
-        name_length_2,
-        ?table_name,
-        name_length_3,
-        unique,
-        reserved,
-        "SQLStatisticsW called"
-    );
-    crate::ffi_entry!("SQLStatisticsW", unsafe {
-        sql_statistics_w_impl(
-            statement_handle,
-            catalog_name,
+    crate::ffi_entry!(
+        "SQLStatisticsW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?catalog_name,
             name_length_1,
-            schema_name,
+            ?schema_name,
             name_length_2,
-            table_name,
+            ?table_name,
             name_length_3,
             unique,
             reserved,
-        )
-    })
+            "SQLStatisticsW called"
+        ),
+        unsafe {
+            sql_statistics_w_impl(
+                statement_handle,
+                catalog_name,
+                name_length_1,
+                schema_name,
+                name_length_2,
+                table_name,
+                name_length_3,
+                unique,
+                reserved,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -1531,33 +1600,37 @@ pub(crate) unsafe fn sql_special_columns_w(
     scope: SqlUSmallInt,
     nullable: SqlUSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        identifier_type,
-        ?catalog_name,
-        name_length_1,
-        ?schema_name,
-        name_length_2,
-        ?table_name,
-        name_length_3,
-        scope,
-        nullable,
-        "SQLSpecialColumnsW called"
-    );
-    crate::ffi_entry!("SQLSpecialColumnsW", unsafe {
-        sql_special_columns_w_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLSpecialColumnsW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             identifier_type,
-            catalog_name,
+            ?catalog_name,
             name_length_1,
-            schema_name,
+            ?schema_name,
             name_length_2,
-            table_name,
+            ?table_name,
             name_length_3,
             scope,
             nullable,
-        )
-    })
+            "SQLSpecialColumnsW called"
+        ),
+        unsafe {
+            sql_special_columns_w_impl(
+                statement_handle,
+                identifier_type,
+                catalog_name,
+                name_length_1,
+                schema_name,
+                name_length_2,
+                table_name,
+                name_length_3,
+                scope,
+                nullable,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -1719,27 +1792,31 @@ pub(crate) unsafe fn sql_procedures_w(
     proc_name: *const SqlWChar,
     name_length_3: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?catalog_name,
-        name_length_1,
-        ?schema_name,
-        name_length_2,
-        ?proc_name,
-        name_length_3,
-        "SQLProceduresW called"
-    );
-    crate::ffi_entry!("SQLProceduresW", unsafe {
-        sql_procedures_w_impl(
-            statement_handle,
-            catalog_name,
+    crate::ffi_entry!(
+        "SQLProceduresW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?catalog_name,
             name_length_1,
-            schema_name,
+            ?schema_name,
             name_length_2,
-            proc_name,
+            ?proc_name,
             name_length_3,
-        )
-    })
+            "SQLProceduresW called"
+        ),
+        unsafe {
+            sql_procedures_w_impl(
+                statement_handle,
+                catalog_name,
+                name_length_1,
+                schema_name,
+                name_length_2,
+                proc_name,
+                name_length_3,
+            )
+        }
+    )
 }
 
 /// # Safety

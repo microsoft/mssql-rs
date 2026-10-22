@@ -273,13 +273,15 @@ pub(crate) unsafe fn sql_fetch_scroll(
     fetch_orientation: SqlSmallInt,
     fetch_offset: SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        fetch_orientation, fetch_offset, "SQLFetchScroll called"
-    );
-    crate::ffi_entry!("SQLFetchScroll", unsafe {
-        sql_fetch_scroll_impl(statement_handle, fetch_orientation, fetch_offset)
-    })
+    crate::ffi_entry!(
+        "SQLFetchScroll",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            fetch_orientation, fetch_offset, "SQLFetchScroll called"
+        ),
+        unsafe { sql_fetch_scroll_impl(statement_handle, fetch_orientation, fetch_offset) }
+    )
 }
 
 /// # Safety
@@ -886,6 +888,19 @@ fn fetch_scroll_safe(
     stmt: &StmtHandle,
     fetch_orientation: SqlSmallInt,
     _fetch_offset: SqlLen,
+) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = fetch_scroll_operation(statement_handle, stmt, fetch_orientation);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn fetch_scroll_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    fetch_orientation: SqlSmallInt,
 ) -> SqlReturn {
     // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
     // the stmt lock to preserve parent-before-child lock ordering (the same
@@ -1495,7 +1510,7 @@ fn fill_rowset(
     // re-derive which branch was taken or assume the helper's closure ran:
     // desyncing the two would either double-post the row diagnostics or drop
     // them, and nothing would catch it.
-    let (release_has_server_info, row_diags_posted) = if fetch_error.is_some() {
+    let (release_has_server_info, row_diags_posted, cancelled) = if fetch_error.is_some() {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
             return SQL_ERROR;
@@ -1504,17 +1519,17 @@ fn fill_rowset(
         if dbc_state.active_stmt == Some(statement_handle) {
             dbc_state.active_stmt = None;
         }
-        (false, false)
+        (false, false, false)
     } else if peek_is_safe {
         // Everything the rows produced goes in through the closure rather than
         // being posted below: it all left the wire before anything the release
         // peek finds, and posting it afterward would invert the order
         // SQLGetDiagRec reports it in.
-        let (posted, preceding_ran) =
+        let (posted, preceding_ran, cancelled) =
             release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
                 post_row_diagnostics(s, &info_messages, worst)
             });
-        (posted, preceding_ran)
+        (posted, preceding_ran, cancelled)
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -1522,7 +1537,7 @@ fn fill_rowset(
         };
         dbc_state.client = Some(client);
         dbc_state.active_stmt = Some(statement_handle);
-        (false, false)
+        (false, false, false)
     };
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -1537,12 +1552,14 @@ fn fill_rowset(
     unsafe { write_if_some(rows_fetched_ptr, rows_filled) };
     mark_no_rows(row_status_ptr, rows_filled, row_array_size);
 
+    if cancelled {
+        return SQL_ERROR;
+    }
     if let Some(e) = fetch_error {
         error!(%e, "SQLFetchScroll: row fetch failed");
         // The cursor cannot be resumed after a protocol failure, so tear the
         // row stream down rather than leaving it addressable.
-        stmt_state.reset_row_stream();
-        stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+        super::close_cursor::reset_cursor_state(&mut stmt_state);
         // Fans a server error out into one diagnostic per record, keeping each
         // SQLSTATE and native error rather than flattening them into HY000.
         post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
@@ -2125,6 +2142,7 @@ unsafe fn deliver_bound_plp(
     } else {
         None
     };
+    let mut narrow_decoder_finalized = false;
     let compatible = matches!(
         (target, encoding),
         (SQL_C_WCHAR, PlpEncoding::Utf16Text)
@@ -2284,6 +2302,7 @@ unsafe fn deliver_bound_plp(
             decoded_units.clear();
             widen_into_pending(
                 decoder,
+                &mut narrow_decoder_finalized,
                 &mut decoded_units,
                 &scratch[..chunk.read],
                 chunk.reached_end,
@@ -3905,6 +3924,78 @@ mod tests {
                 assert!(!dbc.runtime.block_on(client.next_row_cursor()).unwrap());
             }
         }
+    }
+
+    #[test]
+    fn bound_wchar_replaces_dangling_gbk_lead_at_end_of_stream() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use mssql_tds::token::tokens::SqlCollation;
+
+        let response = QueryResponse::new(
+            vec![
+                ColumnDefinition::new("", SqlDataType::VarCharMax),
+                ColumnDefinition::new("", SqlDataType::Int),
+            ],
+            vec![Row::new(vec![
+                ColumnValue::VarCharMax(vec![vec![0xD0]]),
+                ColumnValue::Int(42),
+            ])],
+        );
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(dbc, "SELECT dbcs", response);
+        let mut state = dbc.inner.lock().unwrap();
+        let client = state.client.as_mut().unwrap();
+        dbc.runtime
+            .block_on(client.execute("SELECT dbcs".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        assert!(matches!(
+            dbc.runtime.block_on(client.read_row_column(0)).unwrap(),
+            CursorColumn::PlpStreaming { .. }
+        ));
+
+        let mut output = [0xCCCC_u16; 2];
+        let mut indicator = -99;
+        let binding = binding(
+            1,
+            SQL_C_WCHAR,
+            output.as_mut_ptr().cast(),
+            std::mem::size_of_val(&output) as SqlLen,
+            &mut indicator,
+        );
+        let outcome = unsafe {
+            deliver_bound_plp(
+                client,
+                &dbc.runtime,
+                &binding,
+                0,
+                0,
+                Some(PlpColumnInfo {
+                    wire_encoding: PlpEncoding::SingleByteText,
+                    text_encoding: Some(EncodingType::LcidBased(SqlCollation {
+                        info: 0x0804,
+                        lcid_language_id: 0x0804,
+                        col_flags: 0,
+                        sort_id: 0,
+                    })),
+                }),
+                &mut [0; 1],
+                TextOutput::UTF8,
+            )
+        }
+        .unwrap();
+
+        assert_eq!(outcome, RowOutcome::Success);
+        assert_eq!(indicator, 2);
+        assert_eq!(output, [0xFFFD, 0]);
+        assert!(matches!(
+            dbc.runtime.block_on(client.read_row_column(1)).unwrap(),
+            CursorColumn::Value {
+                value: ColumnValues::Int(42),
+                ..
+            }
+        ));
     }
 
     #[test]

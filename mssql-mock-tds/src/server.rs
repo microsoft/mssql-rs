@@ -4,15 +4,16 @@
 //! Mock TDS Server implementation
 
 use crate::protocol::{
-    PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT,
-    build_attention_ack_packet, build_done_token, build_error_response,
-    build_feature_ext_ack_fedauth, build_fedauth_challenge_response, build_login_ack,
-    build_prelogin_response, build_prelogin_response_with_fedauth,
-    build_query_result_with_trailing_info, build_routing_response,
-    build_transaction_manager_response, parse_fedauth_token, parse_login7_auth, parse_sql_batch,
-    parse_transaction_descriptor_header, parse_transaction_manager_request,
+    FEATURE_EXT_ENHANCED_ROUTING, PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError,
+    TM_BEGIN_XACT, build_attention_ack_packet, build_done_token, build_error_response,
+    build_feature_ext_ack_data_classification, build_feature_ext_ack_fedauth,
+    build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
+    build_prelogin_response_with_fedauth, build_query_result_with_extras,
+    build_routing_login_response, build_transaction_manager_response, parse_fedauth_token,
+    parse_login7_auth, parse_sql_batch, parse_transaction_descriptor_header,
+    parse_transaction_manager_request,
 };
-use crate::query_response::{QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
+use crate::query_response::{LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
 use native_tls::Identity;
 use std::collections::BTreeMap;
@@ -56,6 +57,21 @@ pub struct RedirectionConfig {
     pub redirect_host: String,
     /// The port to redirect clients to
     pub redirect_port: u16,
+    /// Route with Enhanced Routing (ENVCHANGE type 21) to this database, as a
+    /// server does when the client advertises feature `0x0F`; clients that do
+    /// not advertise it get plain routing.
+    pub enhanced_database: Option<String>,
+    /// `IsEnabled` byte acknowledging feature `0x0F` with an enhanced route;
+    /// `None` omits the acknowledgement.
+    pub enhanced_routing_ack: Option<u8>,
+    /// Send that acknowledgement before the routing ENVCHANGE instead of after it.
+    pub ack_before_routing: bool,
+    /// Send LOGINACK before the route, as [MS-TDS] 2.2.7.9 requires. Cleared to
+    /// model a server that routes without one.
+    pub login_ack: bool,
+    /// Routing ENVCHANGEs sent after the first, which [MS-TDS] 2.2.7.9 forbids:
+    /// Enhanced Routing to each named database, plain routing for `None`.
+    pub extra_routes: Vec<Option<String>>,
 }
 
 impl RedirectionConfig {
@@ -64,6 +80,21 @@ impl RedirectionConfig {
         Self {
             redirect_host: host.into(),
             redirect_port: port,
+            enhanced_database: None,
+            enhanced_routing_ack: None,
+            ack_before_routing: false,
+            login_ack: true,
+            extra_routes: Vec::new(),
+        }
+    }
+
+    /// Route clients to `database` on `host:port` with Enhanced Routing,
+    /// acknowledging feature `0x0F` after the routing ENVCHANGE.
+    pub fn enhanced(host: impl Into<String>, port: u16, database: impl Into<String>) -> Self {
+        Self {
+            enhanced_database: Some(database.into()),
+            enhanced_routing_ack: Some(1),
+            ..Self::new(host, port)
         }
     }
 }
@@ -84,6 +115,10 @@ pub struct ConnectionProcessor {
     pub user_agent: Option<String>,
     /// ServerName received in the Login7 packet
     received_server_name: Option<String>,
+    /// Database received in the Login7 packet
+    received_database: Option<String>,
+    /// FeatureExt ids the Login7 packet carried
+    requested_feature_ids: Vec<u8>,
     /// MSAL FedAuth workflow byte received in the Login7 packet (if any)
     fedauth_workflow: Option<u8>,
     /// Whether the server is waiting for a follow-up FedAuthToken packet
@@ -111,21 +146,7 @@ impl ConnectionProcessor {
         query_registry: Arc<Mutex<QueryRegistry>>,
         connection_store: Option<Arc<Mutex<ConnectionStore>>>,
     ) -> Self {
-        Self {
-            conn_id,
-            addr,
-            is_authenticated: false,
-            received_token: None,
-            user_agent: None,
-            received_server_name: None,
-            fedauth_workflow: None,
-            awaiting_fedauth_token: false,
-            query_registry,
-            buffer: BytesMut::with_capacity(4096),
-            redirection: None,
-            connection_store,
-            transaction_descriptor_headers: Vec::new(),
-        }
+        Self::new_with_redirection(conn_id, addr, query_registry, connection_store, None)
     }
 
     /// Create a new connection processor with redirection configuration
@@ -143,6 +164,8 @@ impl ConnectionProcessor {
             received_token: None,
             user_agent: None,
             received_server_name: None,
+            received_database: None,
+            requested_feature_ids: Vec::new(),
             fedauth_workflow: None,
             awaiting_fedauth_token: false,
             query_registry,
@@ -176,6 +199,16 @@ impl ConnectionProcessor {
     /// Get the ServerName received in the Login7 packet
     pub fn received_server_name(&self) -> Option<&str> {
         self.received_server_name.as_deref()
+    }
+
+    /// Get the database received in the Login7 packet
+    pub fn received_database(&self) -> Option<&str> {
+        self.received_database.as_deref()
+    }
+
+    /// Get the FeatureExt ids the Login7 packet carried
+    pub fn requested_feature_ids(&self) -> &[u8] {
+        &self.requested_feature_ids
     }
 
     /// Get the MSAL FedAuth workflow byte received in the Login7 packet
@@ -321,6 +354,18 @@ impl ConnectionProcessor {
             PacketType::Login7 => {
                 debug!("Handling Login7 from {}", self.addr);
 
+                let delay = self
+                    .query_registry
+                    .lock()
+                    .await
+                    .get(LOGIN_DELAY_KEY)
+                    .and_then(|r| r.delay);
+                match self.wait_out_delay_or_attention(socket, delay).await? {
+                    DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                    DelayOutcome::Closed => return Ok(None),
+                    DelayOutcome::Elapsed => {}
+                }
+
                 // Parse Login7 packet body (skip header) for authentication info
                 let packet_body = &packet_data[PACKET_HEADER_SIZE..];
                 let auth_info = parse_login7_auth(packet_body);
@@ -338,21 +383,41 @@ impl ConnectionProcessor {
 
                 // Store the server name for test verification
                 self.received_server_name = auth_info.server_name.clone();
+                self.received_database = auth_info.database.clone();
+                self.requested_feature_ids = auth_info.feature_ids.clone();
                 self.fedauth_workflow = auth_info.fedauth_workflow;
 
                 // Check if redirection is configured
                 if let Some(ref redir) = self.redirection {
                     self.awaiting_fedauth_token = false;
                     self.is_authenticated = true;
+                    // Like a real server, route by database and acknowledge
+                    // feature 0x0F only for clients that advertise Enhanced Routing.
+                    let enhanced_routing = auth_info
+                        .feature_ids
+                        .contains(&FEATURE_EXT_ENHANCED_ROUTING);
+                    let enhanced_database = redir
+                        .enhanced_database
+                        .as_deref()
+                        .filter(|_| enhanced_routing);
                     // Redirect the client to a different server
                     info!(
-                        "Redirecting client {} to {}:{}",
-                        self.addr, redir.redirect_host, redir.redirect_port
+                        "Redirecting client {} to {}:{} (database {:?})",
+                        self.addr, redir.redirect_host, redir.redirect_port, enhanced_database
                     );
-                    Some(build_routing_response(
+                    let routes: Vec<Option<&str>> = std::iter::once(enhanced_database)
+                        .chain(redir.extra_routes.iter().map(Option::as_deref))
+                        .collect();
+                    let response = build_routing_login_response(
                         &redir.redirect_host,
                         redir.redirect_port,
-                    ))
+                        &routes,
+                        redir.login_ack,
+                        redir.enhanced_routing_ack.filter(|_| enhanced_routing),
+                        redir.ack_before_routing,
+                    );
+                    self.record_to_store().await;
+                    Some(response)
                 } else if auth_info.has_fedauth && auth_info.access_token_bytes.is_none() {
                     self.awaiting_fedauth_token = true;
                     self.is_authenticated = false;
@@ -396,6 +461,12 @@ impl ConnectionProcessor {
                     if auth_info.has_fedauth {
                         debug!("Including FeatureExtAck for FedAuth");
                         response.extend_from_slice(&build_feature_ext_ack_fedauth());
+                    }
+
+                    if let Some(version) = auth_info.data_classification_version {
+                        debug!("Including FeatureExtAck for Data Classification v{version}");
+                        response
+                            .extend_from_slice(&build_feature_ext_ack_data_classification(version));
                     }
 
                     response.extend_from_slice(&build_done_token(0));
@@ -480,12 +551,17 @@ impl ConnectionProcessor {
                             // released before any artificial delay below.
                             let registered = {
                                 let registry = self.query_registry.lock().await;
-                                registry
-                                    .get(&sql)
-                                    .cloned()
-                                    .map(|r| (r, registry.trailing_info(&sql).to_vec()))
+                                registry.get(&sql).cloned().map(|r| {
+                                    (
+                                        r,
+                                        registry.data_classification(&sql).to_vec(),
+                                        registry.trailing_info(&sql).to_vec(),
+                                    )
+                                })
                             };
-                            if let Some((response_data, trailing_info)) = registered {
+                            if let Some((response_data, data_classification, trailing_info)) =
+                                registered
+                            {
                                 info!("Found registered response for query");
                                 match self
                                     .wait_out_delay_or_attention(socket, response_data.delay)
@@ -496,8 +572,9 @@ impl ConnectionProcessor {
                                     DelayOutcome::Elapsed => {}
                                 }
                                 // build_query_result already wraps in a packet, so return directly
-                                let packet = build_query_result_with_trailing_info(
+                                let packet = build_query_result_with_extras(
                                     &response_data,
+                                    &data_classification,
                                     &trailing_info,
                                 );
                                 Some(packet)
@@ -545,10 +622,16 @@ impl ConnectionProcessor {
                     let registered = {
                         let registry = self.query_registry.lock().await;
                         registry
-                            .get_by_contained_utf16_text_with_trailing_info(packet_body)
-                            .map(|(response, trailing)| (response.clone(), trailing.to_vec()))
+                            .get_by_contained_utf16_text_with_extras(packet_body)
+                            .map(|(response, data_classification, trailing)| {
+                                (
+                                    response.clone(),
+                                    data_classification.to_vec(),
+                                    trailing.to_vec(),
+                                )
+                            })
                     };
-                    if let Some((response_data, trailing_info)) = registered {
+                    if let Some((response_data, data_classification, trailing_info)) = registered {
                         info!("Found registered response for RPC request");
                         match self
                             .wait_out_delay_or_attention(socket, response_data.delay)
@@ -558,8 +641,9 @@ impl ConnectionProcessor {
                             DelayOutcome::Closed => return Ok(None),
                             DelayOutcome::Elapsed => {}
                         }
-                        Some(build_query_result_with_trailing_info(
+                        Some(build_query_result_with_extras(
                             &response_data,
+                            &data_classification,
                             &trailing_info,
                         ))
                     } else {
@@ -703,6 +787,10 @@ pub struct ConnectionInfo {
     pub user_agent: Option<String>,
     /// ServerName received in the Login7 packet
     pub received_server_name: Option<String>,
+    /// Database received in the Login7 packet
+    pub received_database: Option<String>,
+    /// FeatureExt ids the Login7 packet carried, in order
+    pub requested_feature_ids: Vec<u8>,
     /// MSAL FedAuth workflow byte received in the Login7 packet (if any)
     pub fedauth_workflow: Option<u8>,
     /// The ALL_HEADERS TransactionDescriptor header — `(TransactionDescriptor,
@@ -752,6 +840,8 @@ impl ConnectionStore {
             authenticated: processor.is_authenticated(),
             user_agent: processor.user_agent.clone(),
             received_server_name: processor.received_server_name().map(|s| s.to_string()),
+            received_database: processor.received_database().map(|s| s.to_string()),
+            requested_feature_ids: processor.requested_feature_ids().to_vec(),
             fedauth_workflow: processor.fedauth_workflow(),
             transaction_descriptor_headers: processor.transaction_descriptor_headers().to_vec(),
         };
@@ -818,13 +908,20 @@ impl MockTdsServer {
         redirect_host: impl Into<String>,
         redirect_port: u16,
     ) -> Result<Self, std::io::Error> {
-        Self::new_internal(
+        Self::new_with_redirection_config(
             addr,
-            None,
-            false,
-            Some(RedirectionConfig::new(redirect_host, redirect_port)),
+            RedirectionConfig::new(redirect_host, redirect_port),
         )
         .await
+    }
+
+    /// Create a new mock TDS server that redirects clients as `config`
+    /// describes, including Enhanced Routing.
+    pub async fn new_with_redirection_config(
+        addr: &str,
+        config: RedirectionConfig,
+    ) -> Result<Self, std::io::Error> {
+        Self::new_internal(addr, None, false, Some(config)).await
     }
 
     /// Create a new mock TDS server with optional TLS support (TDS 7.4 style).
@@ -1175,9 +1272,7 @@ async fn handle_strict_encrypted_connection(
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
 ) -> Result<(), ProtocolError> {
-    let redir_config = redirection
-        .as_ref()
-        .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
+    let redir_config = redirection.as_deref().cloned();
     let mut processor = ConnectionProcessor::new_with_redirection(
         conn_id,
         addr,
@@ -1300,9 +1395,7 @@ async fn handle_encrypted_tds_wrapped_connection(
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
 ) -> Result<(), ProtocolError> {
-    let redir_config = redirection
-        .as_ref()
-        .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
+    let redir_config = redirection.as_deref().cloned();
     let mut processor = ConnectionProcessor::new_with_redirection(
         conn_id,
         addr,
@@ -1349,9 +1442,7 @@ async fn handle_unencrypted_connection(
     connection_store: Arc<Mutex<ConnectionStore>>,
     redirection: Option<Arc<RedirectionConfig>>,
 ) -> Result<(), ProtocolError> {
-    let redir_config = redirection
-        .as_ref()
-        .map(|r| RedirectionConfig::new(r.redirect_host.clone(), r.redirect_port));
+    let redir_config = redirection.as_deref().cloned();
     let mut processor = ConnectionProcessor::new_with_redirection(
         conn_id,
         addr,
@@ -1478,8 +1569,9 @@ async fn handle_connection(
                                 // Look up query in registry
                                 let registry = query_registry.lock().await;
                                 if let Some(response) = registry.get(&sql) {
-                                    Some(build_query_result_with_trailing_info(
+                                    Some(build_query_result_with_extras(
                                         response,
+                                        registry.data_classification(&sql),
                                         registry.trailing_info(&sql),
                                     ))
                                 } else if sql.to_uppercase().starts_with("SELECT") {

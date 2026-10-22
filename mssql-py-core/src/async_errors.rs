@@ -48,6 +48,7 @@ pub(crate) fn map_tds_error(
         }
         TdsError::UsageError(_) => ProgrammingError::new_err(message),
         TdsError::TypeConversionError(_)
+        | TdsError::EncodedValueTooLong { .. }
         | TdsError::UnsupportedEncoding { .. }
         | TdsError::ColumnEncryptionError(_) => DataError::new_err(message),
         TdsError::UnimplementedFeature { .. } => NotSupportedError::new_err(message),
@@ -191,6 +192,16 @@ mod tests {
                 Vec::new(),
             );
             assert!(conversion.is_instance_of::<DataError>(py));
+
+            let encoded_overflow = map_tds_error(
+                "operation failed",
+                TdsError::EncodedValueTooLong {
+                    actual: 2,
+                    maximum: 1,
+                },
+                Vec::new(),
+            );
+            assert!(encoded_overflow.is_instance_of::<DataError>(py));
 
             let unsupported = map_tds_error(
                 "operation failed",

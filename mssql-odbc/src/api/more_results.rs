@@ -35,10 +35,12 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_more_results(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLMoreResults called");
-    crate::ffi_entry!("SQLMoreResults", unsafe {
-        sql_more_results_impl(statement_handle)
-    })
+    crate::ffi_entry!(
+        "SQLMoreResults",
+        statement_handle,
+        debug!(?statement_handle, "SQLMoreResults called"),
+        unsafe { sql_more_results_impl(statement_handle) }
+    )
 }
 
 /// # Safety
@@ -54,6 +56,15 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_more_results_operation(statement_handle, stmt);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
     let snapshot = snapshot_bound_params(stmt);
     // Free any stale diagnostics and observe cursor state.

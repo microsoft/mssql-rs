@@ -52,16 +52,17 @@ pub(crate) unsafe fn sql_exec_direct_w(
     statement_text: *const SqlWChar,
     text_length: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?statement_text,
-        text_length,
-        "SQLExecDirectW called",
-    );
-
-    crate::ffi_entry!("SQLExecDirectW", unsafe {
-        sql_exec_direct_w_impl(statement_handle, statement_text, text_length)
-    })
+    crate::ffi_entry!(
+        "SQLExecDirectW",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?statement_text,
+            text_length,
+            "SQLExecDirectW called",
+        ),
+        unsafe { sql_exec_direct_w_impl(statement_handle, statement_text, text_length) }
+    )
 }
 
 /// # Safety
@@ -109,6 +110,19 @@ fn sql_exec_direct_w_safe(
 ) -> SqlReturn {
     debug!(sql = %sql, "SQLExecDirectW: executing");
 
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_exec_direct_w_operation(statement_handle, stmt, sql);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_exec_direct_w_operation(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    sql: String,
+) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
     // The `EXEC_STARTED` claim must be taken before the APD is read and held
@@ -119,7 +133,7 @@ fn sql_exec_direct_w_safe(
     // between the reads would let the stale size of 1 skip the `HYC00` refusal
     // below while the new offset shifts the one set that does run. Same
     // two-phase shape as `execute.rs`'s `stage_execution`.
-    {
+    let cancel_handle = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -139,8 +153,14 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        let cancel_handle = match stmt.new_execution_cancel() {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-    }
+        mssql_tds::trace_context::activate_execution();
+        cancel_handle
+    };
 
     // Check STMT state, gather parameter values, and reset prior context.
     let staged =
@@ -317,7 +337,16 @@ fn sql_exec_direct_w_safe(
 
     // Release any handle orphaned by the reset above before running the batch.
     // Bounded by the full budget: nothing has run yet to charge against it.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW", query_timeout);
+    if let Err(e) = flush_pending_unprepare(
+        dbc,
+        stmt,
+        &mut client,
+        "SQLExecDirectW",
+        query_timeout,
+        &cancel_handle,
+    ) {
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
 
     // `query_timeout` (SQL_ATTR_QUERY_TIMEOUT) bounds every wire operation this
     // call makes, not just the final execute — matching msodbcsql's
@@ -344,7 +373,13 @@ fn sql_exec_direct_w_safe(
         }
     };
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW", query_timeout) {
+    if let Err(e) = begin_transaction_if_manual(
+        dbc,
+        &mut client,
+        "SQLExecDirectW",
+        query_timeout,
+        &cancel_handle,
+    ) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
@@ -368,7 +403,7 @@ fn sql_exec_direct_w_safe(
         // A buffered parameter cannot be declared until its bytes are all in,
         // so no RPC is opened: the sequence collects its values and runs
         // `sp_executesql` from the last `SQLParamData` (AB#47590).
-        if dae_params.iter().any(|param| param.plan.is_buffered()) {
+        if dae_params.iter().any(|param| param.is_buffered()) {
             return park_deferred_dae(
                 stmt,
                 client,
@@ -382,11 +417,15 @@ fn sql_exec_direct_w_safe(
                 "SQLExecDirectW",
             );
         }
-        let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
-            rewritten_sql,
-            params,
-            ExecuteOptions::new().timeout_secs(query_timeout),
-        ));
+        let begin_result = dbc.runtime.block_on(
+            client.begin_sp_executesql(
+                rewritten_sql,
+                params,
+                ExecuteOptions::new()
+                    .timeout_secs(query_timeout)
+                    .cancel(&cancel_handle),
+            ),
+        );
         return match begin_result {
             // Defensive: staging only reports DAE parameters when at least one
             // placeholder is present, so the TDS layer should not complete here.
@@ -431,20 +470,28 @@ fn sql_exec_direct_w_safe(
         // batch, or with a literal argument — took the EXEC text form during
         // translation and runs through sp_executesql below.
         dbc.runtime
-            .block_on(client.execute_stored_procedure(
-                call.proc_name.clone(),
-                Some(params),
-                None,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ))
+            .block_on(
+                client.execute_stored_procedure(
+                    call.proc_name.clone(),
+                    Some(params),
+                    None,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            )
             .map(|_| ())
     } else if marker_count > 0 {
         dbc.runtime
-            .block_on(client.execute_sp_executesql(
-                rewritten_sql,
-                params,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ))
+            .block_on(
+                client.execute_sp_executesql(
+                    rewritten_sql,
+                    params,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            )
             .map(|_| ())
     } else {
         // Statement-wise navigation: position on the batch's first statement
@@ -453,10 +500,14 @@ fn sql_exec_direct_w_safe(
         // resulting client state. The *translated* text is sent: a statement
         // with no parameter markers can still carry escapes.
         dbc.runtime
-            .block_on(client.execute(
-                rewritten_sql,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ))
+            .block_on(
+                client.execute(
+                    rewritten_sql,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            )
             .map(|_| ())
     };
     if let Err(e) = exec_result {
@@ -812,6 +863,69 @@ mod tests {
             !state.has_state(STMT_STATE_EXEC_STARTED),
             "a failed snapshot must release the claim"
         );
+    }
+
+    #[test]
+    fn exec_direct_on_small_stack() {
+        use crate::api::exports::{SQLExecDirectW, SQLFetch, SQLFreeStmt, SQLGetData};
+        use crate::api::odbc_types::{SQL_C_LONG, SQL_CLOSE, SQL_NO_DATA, SQL_SUCCESS, SqlLen};
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::Duration;
+
+        // Debug/coverage builds need room for unoptimized frames; only release
+        // builds enforce musl's 128 KiB application-thread stack budget.
+        const STACK_BYTES: usize = if cfg!(debug_assertions) {
+            512 * 1024
+        } else {
+            128 * 1024
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            "SELECT 1",
+            QueryResponse::select_one().with_delay(Duration::from_millis(10)),
+        );
+        let stmt_addr = h.stmt as usize;
+
+        // The owner retains the handle chain until the application thread joins.
+        std::thread::Builder::new()
+            .stack_size(STACK_BYTES)
+            .spawn(move || {
+                let stmt = stmt_addr as SqlHandle;
+                let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
+                for _ in 0..3 {
+                    assert_eq!(
+                        unsafe { SQLExecDirectW(stmt, sql.as_ptr(), SQL_NTS) },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!(unsafe { SQLFetch(stmt) }, SQL_SUCCESS);
+                    let mut value = 0i32;
+                    let mut length: SqlLen = 0;
+                    assert_eq!(
+                        unsafe {
+                            SQLGetData(
+                                stmt,
+                                1,
+                                SQL_C_LONG,
+                                std::ptr::from_mut(&mut value).cast(),
+                                SqlLen::try_from(size_of::<i32>()).unwrap(),
+                                &mut length,
+                            )
+                        },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!(value, 1);
+                    assert_eq!(length, SqlLen::try_from(size_of::<i32>()).unwrap());
+                    assert_eq!(unsafe { SQLFetch(stmt) }, SQL_NO_DATA);
+                    assert_eq!(unsafe { SQLFreeStmt(stmt, SQL_CLOSE) }, SQL_SUCCESS);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// A plain batch whose first statement is a no-row result (DML row count)

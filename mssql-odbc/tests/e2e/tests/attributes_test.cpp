@@ -295,6 +295,54 @@ protected:
     }
 };
 
+TEST_F(AttributesTest, ClientConnectionIdIsAStringAndStableWithinTheConnection) {
+    constexpr SQLINTEGER clientConnectionId = 1233;
+    SQLWCHAR first[37] = {};
+    SQLINTEGER bytes = 0;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetConnectAttrW(dbc_, clientConnectionId, first,
+                                             sizeof(first), &bytes));
+    ASSERT_EQ(72, bytes);
+    EXPECT_EQ(0, first[36]);
+    for (size_t i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            EXPECT_EQ('-', first[i]);
+        } else {
+            EXPECT_TRUE((first[i] >= '0' && first[i] <= '9') ||
+                        (first[i] >= 'A' && first[i] <= 'F'));
+        }
+    }
+    SQLWCHAR second[37] = {};
+    ASSERT_EQ(SQL_SUCCESS, SQLGetConnectAttrW(dbc_, clientConnectionId, second,
+                                             sizeof(second), &bytes));
+    EXPECT_EQ(0, std::memcmp(first, second, sizeof(first)));
+}
+
+TEST_F(AttributesTest, ClientConnectionIdSupportsLengthAndTruncationAndRejectsSet) {
+    constexpr SQLINTEGER clientConnectionId = 1233;
+    SQLINTEGER bytes = 0;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetConnectAttrW(dbc_, clientConnectionId, nullptr, 0, &bytes));
+    EXPECT_EQ(72, bytes);
+    SQLWCHAR shortBuffer[4] = {};
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetConnectAttrW(dbc_, clientConnectionId, shortBuffer,
+                                 sizeof(shortBuffer), &bytes));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "01004");
+    EXPECT_EQ(72, bytes);
+    EXPECT_EQ(0, shortBuffer[3]);
+    EXPECT_EQ(SQL_ERROR, SQLSetConnectAttrW(dbc_, clientConnectionId, nullptr, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY092");
+}
+
+TEST_F(AttributesTest, ClientConnectionIdNegativeLengthReportsTruncation) {
+    constexpr SQLINTEGER clientConnectionId = 1233;
+    SQLWCHAR buffer[37] = {};
+    SQLINTEGER bytes = -1;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetConnectAttrW(dbc_, clientConnectionId, buffer, -2, &bytes));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "01004");
+    EXPECT_EQ(72, bytes);
+}
+
 // ===========================================================================
 // SQL_ATTR_QUERY_TIMEOUT
 // ===========================================================================

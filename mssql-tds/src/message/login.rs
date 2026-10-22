@@ -5,6 +5,7 @@ use crate::connection::client_context::{
     ClientContext, ColumnEncryptionSetting, MAX_LOGIN7_NAME_UNITS, TdsAuthenticationMethod,
     TransportContext, VectorVersion,
 };
+use crate::connection::dns_cache::{DnsCache, Resolution};
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
     OptionFlags1, OptionFlags2, OptionFlags3, OptionsValue, TdsVersion, TypeFlags,
@@ -16,8 +17,8 @@ use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::token::fed_auth_info::{FedAuthInfoToken, SspiToken};
 use crate::token::login_ack::LoginAckToken;
 use crate::token::tokens::{
-    EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SessionStateToken, SqlCollation,
-    Token, Tokens,
+    DoneStatus, EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, SessionStateToken,
+    SqlCollation, Token, Tokens,
 };
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -25,6 +26,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use super::features::always_encrypted::AlwaysEncryptedFeature;
+use super::features::data_classification::DataClassificationFeature;
+use super::features::dns_caching::DnsCachingFeature;
+use super::features::enhanced_routing::EnhancedRoutingFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
@@ -32,6 +36,7 @@ use super::features::utf8::Utf8Feature;
 use super::features::vectorfeature::VectorFeature;
 use crate::core::TdsResult;
 use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
+use crate::token::data_classification::DataClassificationVersion;
 use tracing::{Level, debug, event, trace};
 
 pub(crate) const FIXED_LOGIN_RECORD_LENGTH: i32 = 94;
@@ -42,6 +47,9 @@ pub(crate) struct RoutingInfo {
     pub protocol: u8,
     pub port: u16,
     pub server: String,
+    /// Database named by an Enhanced Routing ENVCHANGE (type 21); `None` for
+    /// plain routing (type 20), which keeps the login's own database.
+    pub database: Option<String>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -66,6 +74,7 @@ pub(crate) enum FeatureExtension {
     SqlDnsCaching,
     Json,
     Vector,
+    EnhancedRouting,
     UserAgent,
     Terminator,
     Unknown(u8),
@@ -84,6 +93,7 @@ impl FeatureExtension {
             FeatureExtension::SqlDnsCaching => 0x0B,
             FeatureExtension::Json => 0x0D,
             FeatureExtension::Vector => 0x0E,
+            FeatureExtension::EnhancedRouting => 0x0F,
             FeatureExtension::UserAgent => 0x10,
             FeatureExtension::Terminator => 0xFF,
             FeatureExtension::Unknown(value) => value,
@@ -104,6 +114,7 @@ impl From<u8> for FeatureExtension {
             0x0B => FeatureExtension::SqlDnsCaching,
             0x0D => FeatureExtension::Json,
             0x0E => FeatureExtension::Vector,
+            0x0F => FeatureExtension::EnhancedRouting,
             0x10 => FeatureExtension::UserAgent,
             0xFF => FeatureExtension::Terminator,
             _ => FeatureExtension::Unknown(value),
@@ -123,6 +134,24 @@ pub(crate) trait Feature: Send + Sync + Debug {
     /// one. Only SessionRecovery does; it must be echoed in the reconnect LOGIN7.
     fn session_recovery_initial_state(&self) -> Option<&[u8]> {
         None
+    }
+
+    /// What this login's connection resolved and whether the server let the
+    /// client cache it, once bound. Only SqlDnsCaching does.
+    fn dns_caching_verdict(&self) -> Option<(&Resolution, bool)> {
+        None
+    }
+
+    /// Data Classification version the server enabled in FEATUREEXTACK, if this
+    /// feature negotiated one. Only DataClassification does.
+    fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
+        None
+    }
+
+    /// Whether the server acknowledged Enhanced Routing with `IsEnabled = 1`.
+    /// Only EnhancedRouting does.
+    fn enhanced_routing_enabled(&self) -> bool {
+        false
     }
 
     #[allow(dead_code)]
@@ -160,16 +189,27 @@ impl FeaturesRequest {
         vector_version: VectorVersion,
         column_encryption_setting: ColumnEncryptionSetting,
         user_agent_feature: UserAgentFeature,
+        requested_data_classification_version: Option<DataClassificationVersion>,
     ) -> Self {
         let mut features: HashMap<FeatureExtension, Box<dyn Feature>> = HashMap::new();
         features.insert(
             FeatureExtension::Utf8Support,
             Box::new(Utf8Feature::default()),
         );
+        // msodbcsql always advertises DNS caching (`TdsSend.cpp`).
+        features.insert(
+            FeatureExtension::SqlDnsCaching,
+            Box::new(DnsCachingFeature::default()),
+        );
 
         features.insert(FeatureExtension::Json, Box::new(JsonFeature::default()));
 
         features.insert(FeatureExtension::UserAgent, Box::new(user_agent_feature));
+        // msodbcsql always advertises Enhanced Routing (`TdsSend.cpp`, "always sent").
+        features.insert(
+            FeatureExtension::EnhancedRouting,
+            Box::new(EnhancedRoutingFeature::default()),
+        );
         if let Some(vector_feature) = Option::<VectorFeature>::from(vector_version) {
             features.insert(FeatureExtension::Vector, Box::new(vector_feature));
         }
@@ -178,6 +218,13 @@ impl FeaturesRequest {
             features.insert(
                 FeatureExtension::AlwaysEncrypted,
                 Box::new(AlwaysEncryptedFeature::default()),
+            );
+        }
+
+        if let Some(version) = requested_data_classification_version {
+            features.insert(
+                FeatureExtension::DataClassification,
+                Box::new(DataClassificationFeature::new(version)),
             );
         }
 
@@ -251,12 +298,47 @@ impl FeaturesRequest {
         }
     }
 
+    /// Ties the DNS caching acknowledgement to what this login's connection
+    /// resolved, so an allowing verdict publishes exactly those addresses.
+    pub(crate) fn bind_dns_caching(&mut self, resolution: Resolution) {
+        self.features.insert(
+            FeatureExtension::SqlDnsCaching,
+            Box::new(DnsCachingFeature::for_resolution(resolution)),
+        );
+    }
+
+    /// Forgets an earlier token's DNS caching acknowledgement, so each
+    /// FEATUREEXTACK is judged on its own. Other features keep theirs.
+    pub(crate) fn reset_dns_caching_acknowledgement(&mut self) {
+        if let Some(feature) = self.features.get_mut(&FeatureExtension::SqlDnsCaching) {
+            feature.set_acknowledged(false);
+        }
+    }
+
+    /// Settles whether the login's host may stay in the DNS cache, allowing it
+    /// only if the latest FEATUREEXTACK acknowledged DNS caching.
+    pub(crate) fn apply_dns_caching_verdict(&self) {
+        if let Some((resolution, allowed)) = self
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .and_then(|feature| feature.dns_caching_verdict())
+        {
+            DnsCache::global().apply_verdict(resolution, allowed);
+        }
+    }
+
     pub fn get_requested_features(&self) -> Vec<&dyn Feature> {
         self.features
             .values()
             .filter(|f| f.is_requested())
             .map(|f| f.as_ref())
             .collect()
+    }
+
+    pub fn enhanced_routing_enabled(&self) -> bool {
+        self.features
+            .get(&FeatureExtension::EnhancedRouting)
+            .is_some_and(|f| f.enhanced_routing_enabled())
     }
 
     #[allow(dead_code)]
@@ -298,6 +380,7 @@ impl From<(&ClientContext, bool)> for FeaturesRequest {
             context.vector_version,
             context.column_encryption_setting,
             UserAgentFeature::new(context),
+            context.requested_data_classification_version,
         );
 
         warn_if_always_encrypted_has_no_providers(context);
@@ -329,6 +412,7 @@ impl FeaturesRequest {
             context.vector_version,
             context.column_encryption_setting,
             UserAgentFeature::new(context),
+            context.requested_data_classification_version,
         );
 
         warn_if_always_encrypted_has_no_providers(context);
@@ -540,16 +624,27 @@ impl LoginResponseModel {
                 }
             },
             EnvChangeContainer::RoutingType(routing_change) => {
-                self.change_properties.routing_information = routing_change.new_value().clone();
-                let routing_info = routing_change.new_value().as_ref().ok_or_else(|| {
-                    crate::error::Error::ProtocolError(
+                let Some(routing_info) = routing_change.new_value().as_deref() else {
+                    return Err(crate::error::Error::ProtocolError(
                         "Routing env change did not include a redirection target".to_string(),
-                    )
-                })?;
-                Err(crate::error::Error::Redirection {
-                    host: routing_info.server.clone(),
-                    port: routing_info.port,
-                })
+                    ));
+                };
+                // [MS-TDS] 2.2.7.9: a route follows LOGINACK, and a login response
+                // carries at most one. msodbcsql (`Parse.cpp`) rejects both
+                // violations instead of letting the last route pick the endpoint.
+                if self.success_token.is_none() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Received a routing ENVCHANGE before LOGINACK".to_string(),
+                    ));
+                }
+                if self.change_properties.routing_information.is_some() {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Received more than one routing ENVCHANGE in a login response".to_string(),
+                    ));
+                }
+                // Acted on by `redirect_if_routed` once the whole response is read.
+                self.change_properties.routing_information = Some(routing_info.clone());
+                Ok(())
             }
             _ => {
                 event!(
@@ -586,6 +681,30 @@ impl LoginResponseModel {
         }
 
         LoginResponseStatus::Error
+    }
+
+    /// Turns a routing ENVCHANGE captured during login into `Error::Redirection`.
+    ///
+    /// Deferred to the end of the login response because an Enhanced Routing
+    /// ENVCHANGE can precede the FEATUREEXTACK that enables it (msodbcsql
+    /// `netconn.cpp`). Without an acknowledgement of 1 the login fails, as in
+    /// msodbcsql; [MS-TDS] 2.2.7.11 would have the client ignore the token.
+    fn redirect_if_routed(&self) -> TdsResult<()> {
+        let Some(routing) = &self.change_properties.routing_information else {
+            return Ok(());
+        };
+        if routing.database.is_some() && !self.features.enhanced_routing_enabled() {
+            return Err(crate::error::Error::ProtocolError(
+                "Received an Enhanced Routing ENVCHANGE without an Enhanced Routing \
+                 feature acknowledgement"
+                    .to_string(),
+            ));
+        }
+        Err(crate::error::Error::Redirection {
+            host: routing.server.clone(),
+            port: routing.port,
+            database: routing.database.clone(),
+        })
     }
 }
 
@@ -676,7 +795,9 @@ impl LoginResponse {
     ) -> TdsResult<LoginResponseModel> {
         let mut response_model = LoginResponseModel::new(requested_features);
         let parser_context = ParserContext::default();
-        loop {
+        let mut feature_ext_ack_received = false;
+        let mut feature_ext_ack_error = None;
+        let completed = loop {
             match token_stream_reader
                 .receive_token(&parser_context, None, None)
                 .await
@@ -696,16 +817,20 @@ impl LoginResponse {
                                 "Received {:?} during login response parsing.",
                                 token_type
                             );
-                            // If the redirection is received, then the error will be unwrapped and surfaced
-                            // to the caller.
+                            // A routing change is recorded here and surfaced as
+                            // `Error::Redirection` after the response is read.
                             response_model.capture_change_property(env_change_token)?;
                         }
                         Tokens::LoginAck(login_ack_token) => {
                             response_model.success_token = Some(login_ack_token);
                         }
-                        Tokens::Done(_t) => {
-                            // Once we receive a Done token, exit the loop.
-                            break;
+                        Tokens::Done(done) => {
+                            break !done.status.intersects(
+                                DoneStatus::ERROR
+                                    | DoneStatus::SERVER_ERROR
+                                    | DoneStatus::MORE
+                                    | DoneStatus::ATTN,
+                            );
                         }
                         Tokens::DoneProc(_t) => {
                             // ...
@@ -723,15 +848,23 @@ impl LoginResponse {
                             // response is captured, not just the first.
                         }
                         Tokens::FeatureExtAck(_t) => {
-                            for f in _t.acknowledged_features().iter() {
-                                response_model
-                                    .features
-                                    .set_acknowledged(f.0, f.1.as_slice())?;
+                            feature_ext_ack_received = true;
+                            response_model.features.reset_dns_caching_acknowledgement();
+                            let acknowledged =
+                                _t.acknowledged_features().iter().try_for_each(|f| {
+                                    response_model
+                                        .features
+                                        .set_acknowledged(f.0, f.1.as_slice())
+                                });
+                            if let Err(error) = acknowledged {
+                                // Token framing is intact; retain the first error
+                                // while draining the response through DONE.
+                                feature_ext_ack_error.get_or_insert_with(|| Box::new(error));
                             }
                         }
                         Tokens::FedAuthInfo(fed_auth_info_token) => {
                             response_model.fed_auth_info = Some(fed_auth_info_token);
-                            break;
+                            break false;
                         }
                         Tokens::Info(t) => {
                             event!(
@@ -755,7 +888,7 @@ impl LoginResponse {
                             );
                             response_model.sspi_token = Some(sspi_token);
                             // Break to allow caller to process the SSPI challenge
-                            break;
+                            break false;
                         }
                         _ => {
                             event!(
@@ -772,13 +905,33 @@ impl LoginResponse {
                         "Failed to receive token during login response parsing. Error: {:?}",
                         e
                     );
+                    if let Some(error) = feature_ext_ack_error {
+                        return Err(*error);
+                    }
                     // if Io error then create the Io error
                     return Err(crate::error::Error::ProtocolError(
                         "Failed to receive token during login response parsing.".to_string(),
                     ));
                 }
             }
+        };
+        // A rejected or incomplete login must not change the fallback a retry
+        // needs. With no FEATUREEXTACK, there is no new verdict, even on a redirect.
+        if completed
+            && response_model.success_token.is_some()
+            && response_model.errors.is_empty()
+            && feature_ext_ack_received
+        {
+            if feature_ext_ack_error.is_some() {
+                // Unlike SNI, a malformed token cannot retain a partial DNS allow.
+                response_model.features.reset_dns_caching_acknowledgement();
+            }
+            response_model.features.apply_dns_caching_verdict();
         }
+        if let Some(error) = feature_ext_ack_error {
+            return Err(*error);
+        }
+        response_model.redirect_if_routed()?;
         Ok(response_model)
     }
 }
@@ -1421,7 +1574,9 @@ impl ClientContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::session_recovery::SessionStateTable;
     use crate::core::Version;
+    use crate::error::Error;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::features::jsonfeature::JsonFeature;
     use crate::message::features::vectorfeature::VectorFeature;
@@ -1432,6 +1587,7 @@ mod tests {
     };
     use byteorder::{LittleEndian, ReadBytesExt};
     use futures::executor::block_on;
+    use std::collections::BTreeMap;
 
     // ── FeatureExtension::as_u8 ──
 
@@ -1447,6 +1603,7 @@ mod tests {
         assert_eq!(FeatureExtension::SqlDnsCaching.as_u8(), 0x0B);
         assert_eq!(FeatureExtension::Json.as_u8(), 0x0D);
         assert_eq!(FeatureExtension::Vector.as_u8(), 0x0E);
+        assert_eq!(FeatureExtension::EnhancedRouting.as_u8(), 0x0F);
         assert_eq!(FeatureExtension::Terminator.as_u8(), 0xFF);
         assert_eq!(FeatureExtension::Unknown(0xAB).as_u8(), 0xAB);
     }
@@ -1480,6 +1637,10 @@ mod tests {
         );
         assert_eq!(FeatureExtension::from(0x0D), FeatureExtension::Json);
         assert_eq!(FeatureExtension::from(0x0E), FeatureExtension::Vector);
+        assert_eq!(
+            FeatureExtension::from(0x0F),
+            FeatureExtension::EnhancedRouting
+        );
         assert_eq!(FeatureExtension::from(0xFF), FeatureExtension::Terminator);
     }
 
@@ -1494,7 +1655,7 @@ mod tests {
     #[test]
     fn feature_extension_roundtrip() {
         for val in [
-            0x01u8, 0x02, 0x04, 0x05, 0x08, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0xFF, 0x42,
+            0x01u8, 0x02, 0x04, 0x05, 0x08, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F, 0xFF, 0x42,
         ] {
             assert_eq!(FeatureExtension::from(val).as_u8(), val);
         }
@@ -1759,7 +1920,223 @@ mod tests {
         );
     }
 
+    // ── Data Classification LOGIN7 advertisement (feature 0x09) ──
+
+    const DATA_CLASSIFICATION_ID: u8 = 0x09;
+    const USER_AGENT_ID: u8 = 0x10;
+
+    /// Serializes the LOGIN7 feature-extension block and splits it into
+    /// `(feature id, feature data)` entries in wire order. Asserts the block is
+    /// well framed, ends in a single terminator, and matches `len_bytes()`.
+    fn login7_feature_blocks(
+        context: &ClientContext,
+        recovery_data: Option<&SessionRecoveryData>,
+    ) -> Vec<(u8, Vec<u8>)> {
+        let transport_context = context.transport_context.clone();
+        let model =
+            LoginRequestModel::from_context(context, false, &transport_context, recovery_data);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        block_on(Serializer::new(&model, &mut packet_writer).write_feature_extension_data())
+            .unwrap();
+        let payload = packet_writer.get_payload();
+        let bytes = &payload.get_ref()[PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(bytes.len(), model.features_request.len_bytes());
+
+        let mut blocks = Vec::new();
+        let mut offset = 0;
+        loop {
+            let id = bytes[offset];
+            if id == 0xFF {
+                assert_eq!(offset + 1, bytes.len(), "terminator must be the last byte");
+                return blocks;
+            }
+            let length = u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap());
+            let start = offset + 5;
+            let end = start + length as usize;
+            blocks.push((id, bytes[start..end].to_vec()));
+            offset = end;
+        }
+    }
+
+    fn data_classification_blocks(blocks: &[(u8, Vec<u8>)]) -> Vec<&[u8]> {
+        blocks
+            .iter()
+            .filter(|(id, _)| *id == DATA_CLASSIFICATION_ID)
+            .map(|(_, data)| data.as_slice())
+            .collect()
+    }
+
+    fn by_feature_id(blocks: Vec<(u8, Vec<u8>)>) -> BTreeMap<u8, Vec<u8>> {
+        let count = blocks.len();
+        let map: BTreeMap<_, _> = blocks.into_iter().collect();
+        assert_eq!(map.len(), count, "a feature id was serialized twice");
+        map
+    }
+
+    #[test]
+    fn data_classification_is_not_requested_by_default() {
+        #[allow(deprecated)]
+        let contexts = [
+            ClientContext::default(),
+            ClientContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+        ];
+        for context in contexts {
+            assert_eq!(context.requested_data_classification_version, None);
+            assert!(
+                !FeaturesRequest::from((&context, false))
+                    .features
+                    .contains_key(&FeatureExtension::DataClassification)
+            );
+            assert!(
+                !FeaturesRequest::from_context_with_recovery(&context, false, None)
+                    .features
+                    .contains_key(&FeatureExtension::DataClassification)
+            );
+            assert!(data_classification_blocks(&login7_feature_blocks(&context, None)).is_empty());
+        }
+    }
+
+    #[test]
+    fn login7_requests_data_classification_version1() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version1),
+            ..ClientContext::default()
+        };
+        let blocks = login7_feature_blocks(&context, None);
+        assert_eq!(data_classification_blocks(&blocks), [[0x01].as_slice()]);
+    }
+
+    #[test]
+    fn login7_requests_data_classification_version2() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version2),
+            ..ClientContext::default()
+        };
+        let blocks = login7_feature_blocks(&context, None);
+        assert_eq!(data_classification_blocks(&blocks), [[0x02].as_slice()]);
+    }
+
+    #[test]
+    fn data_classification_adds_only_its_own_block_to_existing_features() {
+        let baselines = [
+            ClientContext::default(),
+            ClientContext {
+                connect_retry_count: 0,
+                ..ClientContext::default()
+            },
+            ClientContext {
+                column_encryption_setting: ColumnEncryptionSetting::Enabled,
+                vector_version: VectorVersion::V2,
+                tds_authentication_method: TdsAuthenticationMethod::AccessToken,
+                access_token: Some("token".to_string()),
+                ..ClientContext::default()
+            },
+        ];
+        for baseline in baselines {
+            let without = login7_feature_blocks(&baseline, None);
+            for version in [
+                DataClassificationVersion::Version1,
+                DataClassificationVersion::Version2,
+            ] {
+                let with_context = ClientContext {
+                    requested_data_classification_version: Some(version),
+                    ..baseline.clone()
+                };
+                let with = login7_feature_blocks(&with_context, None);
+                assert_eq!(with.first().map(|(id, _)| *id), Some(USER_AGENT_ID));
+
+                let mut expected = by_feature_id(without.clone());
+                expected.insert(DATA_CLASSIFICATION_ID, vec![version as u8]);
+                assert_eq!(by_feature_id(with), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rebuild_preserves_requested_data_classification() {
+        let recovery_data = SessionStateTable::new().snapshot(Some("other_db"), None, None);
+        for requested in [
+            None,
+            Some(DataClassificationVersion::Version1),
+            Some(DataClassificationVersion::Version2),
+        ] {
+            let context = ClientContext {
+                requested_data_classification_version: requested,
+                ..ClientContext::default()
+            };
+            let reconnect_context = context.clone();
+            assert_eq!(
+                reconnect_context.requested_data_classification_version,
+                requested
+            );
+
+            let blocks = login7_feature_blocks(&reconnect_context, Some(&recovery_data));
+            assert!(blocks.iter().any(|(id, _)| *id == 0x01));
+            let expected: Vec<Vec<u8>> = requested.map(|v| vec![v as u8]).into_iter().collect();
+            let actual: Vec<Vec<u8>> = data_classification_blocks(&blocks)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
     // ── FeaturesRequest::features() ──
+
+    fn negotiated_data_classification(
+        request: &FeaturesRequest,
+    ) -> Option<DataClassificationVersion> {
+        request
+            .get_acknowledged_features()
+            .iter()
+            .find_map(|f| f.negotiated_data_classification_version())
+    }
+
+    #[test]
+    fn featureextack_negotiates_the_server_version_not_the_requested_one() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version2),
+            ..ClientContext::default()
+        };
+        let mut request = FeaturesRequest::from((&context, false));
+        assert_eq!(negotiated_data_classification(&request), None);
+
+        request
+            .set_acknowledged(FeatureExtension::DataClassification, &[0x01, 0x01])
+            .unwrap();
+
+        assert_eq!(
+            negotiated_data_classification(&request),
+            Some(DataClassificationVersion::Version1)
+        );
+    }
+
+    #[test]
+    fn invalid_data_classification_featureextack_fails_login_response_parsing() {
+        let context = ClientContext {
+            requested_data_classification_version: Some(DataClassificationVersion::Version2),
+            ..ClientContext::default()
+        };
+        let mut request = FeaturesRequest::from((&context, false));
+        let error = request
+            .set_acknowledged(FeatureExtension::DataClassification, &[0x03, 0x01])
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::error::Error::ProtocolError(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unrequested_data_classification_featureextack_negotiates_nothing() {
+        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+        request
+            .set_acknowledged(FeatureExtension::DataClassification, &[0x02, 0x01])
+            .unwrap();
+        assert_eq!(negotiated_data_classification(&request), None);
+    }
 
     #[test]
     fn features_request_features_returns_all() {
@@ -1819,6 +2196,480 @@ mod tests {
         let mut req = make_features_request();
         req.set_acknowledged(FeatureExtension::Json, &[1]).unwrap();
         assert_eq!(req.get_acknowledged_features().len(), 1);
+    }
+
+    // ── DNS caching (feature 0x0B) ──
+
+    fn dns_caching_verdict(request: &FeaturesRequest) -> Option<(&Resolution, bool)> {
+        request
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .and_then(|feature| feature.dns_caching_verdict())
+    }
+
+    #[test]
+    fn features_request_always_requests_dns_caching() {
+        let request = FeaturesRequest::from((&ClientContext::default(), false));
+        let feature = request
+            .features
+            .get(&FeatureExtension::SqlDnsCaching)
+            .expect("DNS caching is always advertised");
+        assert!(feature.is_requested());
+        assert_eq!(dns_caching_verdict(&request), None);
+    }
+
+    /// What the replayed logins' connections resolved.
+    fn login_resolution(host: &str) -> Resolution {
+        Resolution::new(host, vec!["10.0.0.7:1433".parse().unwrap()])
+    }
+
+    async fn login_replaying(host: &str, mut tokens: Vec<Tokens>) -> TdsResult<LoginResponseModel> {
+        use crate::token::tokens::{CurrentCommand, DoneStatus, DoneToken};
+
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        }));
+        replay_login_response(host, tokens).await
+    }
+
+    async fn replay_login_response(
+        host: &str,
+        tokens: Vec<Tokens>,
+    ) -> TdsResult<LoginResponseModel> {
+        use crate::test_client_support::TokenReplayTransport;
+
+        let mut request = FeaturesRequest::from((&ClientContext::default(), false));
+        request.bind_dns_caching(login_resolution(host));
+        let mut transport = TokenReplayTransport::new(tokens);
+        LoginResponse::new()
+            .deserialize(&mut transport, request)
+            .await
+    }
+
+    fn login_ack() -> Tokens {
+        Tokens::LoginAck(LoginAckToken {
+            interface_type: SqlInterfaceType::TSql,
+            tds_version: TdsVersion::V7_4,
+            prog_name: "SQL".to_string(),
+            prog_version: Version {
+                major: 16,
+                minor: 0,
+                build: 0,
+                revision: 0,
+            },
+        })
+    }
+
+    fn feature_ext_ack(acknowledged: Vec<(FeatureExtension, Vec<u8>)>) -> Tokens {
+        Tokens::FeatureExtAck(crate::token::tokens::FeatureExtAckToken::new(acknowledged))
+    }
+
+    fn allowing_dns_caching() -> Tokens {
+        feature_ext_ack(vec![(FeatureExtension::SqlDnsCaching, vec![0x01])])
+    }
+
+    fn login_error() -> Tokens {
+        Tokens::Error(ErrorToken {
+            number: 40613,
+            state: 1,
+            severity: 20,
+            message: "Database is not currently available.".to_string(),
+            server_name: "server".to_string(),
+            proc_name: String::new(),
+            line_number: 1,
+        })
+    }
+
+    fn routing_envchange() -> Tokens {
+        Tokens::EnvChange(routing_token(&routing_info("replica.sql.net", None)))
+    }
+
+    async fn login_with_feature_ext_ack(
+        host: &str,
+        acknowledged: Vec<(FeatureExtension, Vec<u8>)>,
+    ) -> TdsResult<LoginResponseModel> {
+        login_replaying(host, vec![login_ack(), feature_ext_ack(acknowledged)]).await
+    }
+
+    /// The resolution a connect to `host` falls back to when DNS fails.
+    async fn cached(host: &str) -> Option<Resolution> {
+        DnsCache::global()
+            .resolve(host, 1433, || async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such host",
+                ))
+            })
+            .await
+            .ok()
+    }
+
+    async fn resolves_from_cache(host: &str) -> bool {
+        cached(host).await.is_some()
+    }
+
+    #[tokio::test]
+    async fn feature_ext_ack_settles_dns_caching_for_the_login_host() {
+        let host = "dns-caching-verdict.login.example";
+        assert!(
+            !resolves_from_cache(host).await,
+            "not allowed before a login acknowledges"
+        );
+
+        login_with_feature_ext_ack(host, vec![(FeatureExtension::SqlDnsCaching, vec![0x01])])
+            .await
+            .unwrap();
+        assert_eq!(
+            cached(host).await,
+            Some(login_resolution(host)),
+            "the acknowledgement publishes what this login resolved"
+        );
+
+        // A FEATUREEXTACK without the DNS caching bit removes the entry, as in SNI.
+        login_with_feature_ext_ack(host, vec![(FeatureExtension::Utf8Support, vec![0x01])])
+            .await
+            .unwrap();
+        assert!(
+            !resolves_from_cache(host).await,
+            "removed without an acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_without_feature_ext_ack_preserves_dns_caching() {
+        let host = "dns-caching-no-ack.login.example";
+        login_replaying(host, vec![login_ack()]).await.unwrap();
+        assert!(!resolves_from_cache(host).await);
+
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+        assert!(resolves_from_cache(host).await);
+
+        login_replaying(host, vec![login_ack()]).await.unwrap();
+        assert_eq!(
+            cached(host).await,
+            Some(login_resolution(host)),
+            "no FEATUREEXTACK leaves an earlier allowance unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_login_leaves_dns_caching_as_it_was() {
+        let host = "dns-caching-rejected.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let rejected = login_replaying(host, vec![login_error()]).await.unwrap();
+        assert_eq!(rejected.get_status(), LoginResponseStatus::Error);
+        assert!(
+            resolves_from_cache(host).await,
+            "a rejected login carries no verdict, and its retry still needs the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_feature_ext_ack_before_a_rejected_login_preserves_dns_caching() {
+        let host = "dns-caching-rejected-after-ack.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let rejected = login_replaying(
+            host,
+            vec![
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                login_error(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected.get_status(), LoginResponseStatus::Error);
+        assert_eq!(
+            cached(host).await,
+            Some(login_resolution(host)),
+            "FEATUREEXTACK before a rejected login must not remove the retry's fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_login_ack_or_server_error_prevents_dns_cache_publication() {
+        for (index, tokens) in [
+            vec![allowing_dns_caching()],
+            vec![allowing_dns_caching(), login_error()],
+            vec![login_ack(), allowing_dns_caching(), login_error()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let host = format!("dns-caching-unaccepted-{index}.login.example");
+            let response = login_replaying(&host, tokens).await.unwrap();
+            assert!(response.success_token.is_none() || !response.errors.is_empty());
+            assert!(!resolves_from_cache(&host).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_continuations_cannot_change_dns_caching() {
+        let host = "dns-caching-continuation.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        for challenge in [
+            Tokens::Sspi(SspiToken { data: vec![0x01] }),
+            Tokens::FedAuthInfo(FedAuthInfoToken {
+                spn: "spn".to_string(),
+                sts_url: "https://sts".to_string(),
+            }),
+        ] {
+            replay_login_response(
+                host,
+                vec![
+                    login_ack(),
+                    feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                    challenge,
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(cached(host).await, Some(login_resolution(host)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_feature_ext_ack_before_login_ack_is_applied_at_done() {
+        let host = "dns-caching-before-loginack.login.example";
+        let response = login_replaying(host, vec![allowing_dns_caching(), login_ack()])
+            .await
+            .unwrap();
+        assert_eq!(response.get_status(), LoginResponseStatus::Success);
+        assert_eq!(cached(host).await, Some(login_resolution(host)));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_login_cannot_apply_a_dns_caching_verdict() {
+        let host = "dns-caching-truncated.login.example";
+        let result = replay_login_response(host, vec![login_ack(), allowing_dns_caching()]).await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert!(!resolves_from_cache(host).await);
+
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+        for acknowledgement in [
+            feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+            feature_ext_ack(vec![(FeatureExtension::Utf8Support, Vec::new())]),
+        ] {
+            let result = replay_login_response(host, vec![login_ack(), acknowledgement]).await;
+            assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+            assert_eq!(cached(host).await, Some(login_resolution(host)));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsuccessful_done_cannot_apply_a_dns_caching_verdict() {
+        use crate::token::tokens::{CurrentCommand, DoneToken};
+
+        let host = "dns-caching-unsuccessful-done.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+        for status in [
+            DoneStatus::ERROR,
+            DoneStatus::SERVER_ERROR,
+            DoneStatus::MORE,
+            DoneStatus::ATTN,
+        ] {
+            replay_login_response(
+                host,
+                vec![
+                    login_ack(),
+                    feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                    Tokens::Done(DoneToken {
+                        status,
+                        cur_cmd: CurrentCommand::None,
+                        row_count: 0,
+                    }),
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                cached(host).await,
+                Some(login_resolution(host)),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_feature_ext_ack_revokes_dns_caching() {
+        let host = "dns-caching-malformed.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        // The UTF-8 acknowledgement must carry exactly one byte.
+        let result = login_replaying(
+            host,
+            vec![
+                login_ack(),
+                feature_ext_ack(vec![
+                    (FeatureExtension::SqlDnsCaching, vec![0x01]),
+                    (FeatureExtension::Utf8Support, Vec::new()),
+                ]),
+            ],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert!(
+            !resolves_from_cache(host).await,
+            "a malformed FEATUREEXTACK allows nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_feature_ext_ack_without_login_ack_preserves_dns_caching() {
+        let host = "dns-caching-malformed-rejected.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let result = login_replaying(
+            host,
+            vec![
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, Vec::new())]),
+                login_error(),
+            ],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert_eq!(cached(host).await, Some(login_resolution(host)));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_feature_ext_ack_cannot_be_overridden_by_a_later_allow() {
+        let host = "dns-caching-malformed-then-allow.login.example";
+        login_replaying(host, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let result = login_replaying(
+            host,
+            vec![
+                login_ack(),
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, Vec::new())]),
+                allowing_dns_caching(),
+            ],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+        assert!(!resolves_from_cache(host).await);
+    }
+
+    #[tokio::test]
+    async fn the_last_feature_ext_ack_decides_dns_caching_at_login_completion() {
+        let host = "dns-caching-per-token.login.example";
+
+        login_replaying(
+            host,
+            vec![
+                login_ack(),
+                allowing_dns_caching(),
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !resolves_from_cache(host).await,
+            "a later token without the acknowledgement revokes an earlier one"
+        );
+
+        login_replaying(
+            host,
+            vec![
+                login_ack(),
+                feature_ext_ack(vec![(FeatureExtension::Utf8Support, vec![0x01])]),
+                allowing_dns_caching(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(resolves_from_cache(host).await);
+    }
+
+    #[tokio::test]
+    async fn a_routed_login_settles_dns_caching_before_redirecting() {
+        let gateway = "dns-caching-gateway.login.example";
+
+        for (database, ack_before_route) in [
+            (None, false),
+            (None, true),
+            (Some("sales"), false),
+            (Some("sales"), true),
+        ] {
+            for (flags, allowed) in [(0x01u8, true), (0x00, false)] {
+                let mut features = vec![(FeatureExtension::SqlDnsCaching, vec![flags])];
+                if database.is_some() {
+                    features.push((FeatureExtension::EnhancedRouting, vec![1]));
+                }
+                let acknowledgement = feature_ext_ack(features);
+                let route =
+                    Tokens::EnvChange(routing_token(&routing_info("replica.sql.net", database)));
+                let tokens = if ack_before_route {
+                    vec![login_ack(), acknowledgement, route]
+                } else {
+                    vec![login_ack(), route, acknowledgement]
+                };
+                let Err(error) = login_replaying(gateway, tokens).await else {
+                    panic!("a routed login must redirect");
+                };
+                assert!(
+                    matches!(
+                        &error,
+                        Error::Redirection { host, port: 11000, database: routed_database }
+                            if host == "replica.sql.net" && routed_database.as_deref() == database
+                    ),
+                    "{error:?}"
+                );
+                assert_eq!(
+                    resolves_from_cache(gateway).await,
+                    allowed,
+                    "database {database:?}, ack_before_route {ack_before_route}, flags {flags:#04x}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routed_login_without_feature_ext_ack_keeps_the_gateway_fallback() {
+        let gateway = "dns-caching-gateway-no-ack.login.example";
+        login_replaying(gateway, vec![login_ack(), allowing_dns_caching()])
+            .await
+            .unwrap();
+
+        let result = login_replaying(gateway, vec![login_ack(), routing_envchange()]).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::Redirection { host, port: 11000, .. })
+                if host == "replica.sql.net"
+        ));
+        assert_eq!(cached(gateway).await, Some(login_resolution(gateway)));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_routed_login_fails_instead_of_redirecting() {
+        let result = replay_login_response(
+            "dns-caching-truncated-route.login.example",
+            vec![login_ack(), routing_envchange()],
+        )
+        .await;
+        assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
     }
 
     // ── LoginResponseModel::capture_change_property ──
@@ -1900,18 +2751,172 @@ mod tests {
         assert!(err.to_string().contains("Protocol Error"));
     }
 
-    #[test]
-    fn capture_change_property_routing_returns_redirection() {
+    /// A response model past LOGINACK, which a routing ENVCHANGE must follow.
+    fn logged_in_model() -> LoginResponseModel {
         let mut model = make_response_model();
-        let routing = RoutingInfo {
+        model.success_token = Some(LoginAckToken {
+            interface_type: SqlInterfaceType::TSql,
+            tds_version: TdsVersion::V7_4,
+            prog_name: "SQL".to_string(),
+            prog_version: Version {
+                major: 1,
+                minor: 0,
+                build: 0,
+                revision: 0,
+            },
+        });
+        model
+    }
+
+    fn routing_info(server: &str, database: Option<&str>) -> RoutingInfo {
+        RoutingInfo {
             protocol: 0,
-            server: "redirect.sql.net".to_string(),
+            server: server.to_string(),
             port: 11000,
+            database: database.map(str::to_string),
+        }
+    }
+
+    /// Type 21 when the route names a database, type 20 otherwise.
+    fn routing_token(routing: &RoutingInfo) -> EnvChangeToken {
+        let sub_type = match routing.database {
+            Some(_) => EnvChangeTokenSubType::EnhancedRouting,
+            None => EnvChangeTokenSubType::Routing,
         };
-        let token = env_token(EnvChangeTokenSubType::Routing, (None, Some(routing)).into());
+        env_token(sub_type, (None, Some(routing.clone())).into())
+    }
+
+    #[test]
+    fn capture_change_property_routing_is_recorded_not_raised() {
+        let mut model = logged_in_model();
+        let routing = routing_info("redirect.sql.net", None);
+        model
+            .capture_change_property(routing_token(&routing))
+            .unwrap();
+        assert_eq!(model.change_properties.routing_information, Some(routing));
+    }
+
+    #[test]
+    fn capture_change_property_routing_before_login_ack_errors() {
+        for database in [None, Some("sales")] {
+            let mut model = make_response_model();
+            let routing = routing_info("redirect.sql.net", database);
+            let err = model
+                .capture_change_property(routing_token(&routing))
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ProtocolError(ref message) if message.contains("before LOGINACK")),
+                "database {database:?}: got {err:?}"
+            );
+            assert_eq!(model.change_properties.routing_information, None);
+        }
+    }
+
+    #[test]
+    fn capture_change_property_second_route_errors() {
+        for (first, second) in [
+            (None, None),
+            (Some("sales"), Some("hr")),
+            (Some("sales"), None),
+            (None, Some("sales")),
+        ] {
+            let mut model = logged_in_model();
+            let routing = routing_info("first.sql.net", first);
+            model
+                .capture_change_property(routing_token(&routing))
+                .unwrap();
+            let err = model
+                .capture_change_property(routing_token(&routing_info("second.sql.net", second)))
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ProtocolError(ref message) if message.contains("more than one routing ENVCHANGE")),
+                "{first:?} then {second:?}: got {err:?}"
+            );
+            assert_eq!(model.change_properties.routing_information, Some(routing));
+        }
+    }
+
+    #[test]
+    fn capture_change_property_routing_without_target_errors() {
+        let mut model = make_response_model();
+        let token = env_token(
+            EnvChangeTokenSubType::Routing,
+            (None::<RoutingInfo>, None::<RoutingInfo>).into(),
+        );
         let err = model.capture_change_property(token).unwrap_err();
-        assert!(err.to_string().contains("redirect.sql.net"));
-        assert!(model.change_properties.routing_information.is_some());
+        assert!(err.to_string().contains("redirection target"));
+    }
+
+    // ── LoginResponseModel::redirect_if_routed ──
+
+    fn routed_model(database: Option<&str>, acknowledgement: Option<u8>) -> LoginResponseModel {
+        let mut model =
+            LoginResponseModel::new(FeaturesRequest::from((&ClientContext::default(), false)));
+        model.change_properties.routing_information = Some(RoutingInfo {
+            protocol: 0,
+            port: 11000,
+            server: "replica.sql.net".to_string(),
+            database: database.map(str::to_string),
+        });
+        if let Some(value) = acknowledgement {
+            model
+                .features
+                .set_acknowledged(FeatureExtension::EnhancedRouting, &[value])
+                .unwrap();
+        }
+        model
+    }
+
+    #[test]
+    fn features_request_always_requests_enhanced_routing() {
+        let request = FeaturesRequest::from((&ClientContext::default(), false));
+        let feature = request
+            .features
+            .get(&FeatureExtension::EnhancedRouting)
+            .expect("Enhanced Routing is always advertised");
+        assert!(feature.is_requested());
+        assert!(!request.enhanced_routing_enabled());
+    }
+
+    #[test]
+    fn no_routing_does_not_redirect() {
+        let model =
+            LoginResponseModel::new(FeaturesRequest::from((&ClientContext::default(), false)));
+        assert!(model.redirect_if_routed().is_ok());
+    }
+
+    #[test]
+    fn plain_routing_redirects_without_a_database() {
+        let error = routed_model(None, None).redirect_if_routed().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Redirection { ref host, port: 11000, database: None } if host == "replica.sql.net"
+        ));
+    }
+
+    #[test]
+    fn enhanced_routing_redirects_to_its_database_once_acknowledged() {
+        let error = routed_model(Some("sales"), Some(1))
+            .redirect_if_routed()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Redirection { ref host, port: 11000, database: Some(ref database) }
+                if host == "replica.sql.net" && database == "sales"
+        ));
+    }
+
+    #[test]
+    fn enhanced_routing_without_acknowledgement_fails_the_login() {
+        for acknowledgement in [None, Some(0)] {
+            let error = routed_model(Some("sales"), acknowledgement)
+                .redirect_if_routed()
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::ProtocolError(ref message) if message.contains("Enhanced Routing")),
+                "acknowledgement {acknowledgement:?} should fail the login, got {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -1945,6 +2950,7 @@ mod tests {
             protocol: 0,
             server: "s".to_string(),
             port: 1433,
+            database: None,
         });
         assert_eq!(model.get_status(), LoginResponseStatus::Rerouting);
     }
@@ -2027,6 +3033,7 @@ mod tests {
             protocol: 0,
             server: "s".to_string(),
             port: 1433,
+            database: None,
         });
         model.success_token = Some(LoginAckToken {
             interface_type: SqlInterfaceType::TSql,

@@ -17,7 +17,7 @@ use super::odbc_types::{
 };
 use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
-use crate::api::exec_common::release_busy_if_row_exhausted;
+use crate::api::exec_common::{finish_cancelled_cursor, release_busy_if_row_exhausted};
 use crate::api::fetch_scroll::{element_stride, typed_plp_chunk_fits};
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
@@ -78,26 +78,29 @@ pub(crate) unsafe fn sql_get_data(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        column_number,
-        target_type,
-        ?target_value_ptr,
-        buffer_length,
-        ?strlen_or_ind_ptr,
-        "SQLGetData called",
-    );
-
-    crate::ffi_entry!("SQLGetData", unsafe {
-        sql_get_data_impl(
-            statement_handle,
+    crate::ffi_entry!(
+        "SQLGetData",
+        statement_handle,
+        debug!(
+            ?statement_handle,
             column_number,
             target_type,
-            target_value_ptr,
+            ?target_value_ptr,
             buffer_length,
-            strlen_or_ind_ptr,
-        )
-    })
+            ?strlen_or_ind_ptr,
+            "SQLGetData called",
+        ),
+        unsafe {
+            sql_get_data_impl(
+                statement_handle,
+                column_number,
+                target_type,
+                target_value_ptr,
+                buffer_length,
+                strlen_or_ind_ptr,
+            )
+        }
+    )
 }
 
 /// # Safety
@@ -139,6 +142,31 @@ unsafe fn sql_get_data_impl(
 }
 
 fn sql_get_data_safe(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_get_data_operation(
+        statement_handle,
+        stmt,
+        column_number,
+        target_type,
+        target_value_ptr,
+        buffer_length,
+        strlen_or_ind_ptr,
+    );
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_get_data_operation(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
     column_number: SqlUSmallInt,
@@ -1009,9 +1037,11 @@ fn finish_get_data(
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    let (has_server_info, _) =
+    let (has_server_info, _, cancelled) =
         release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false);
-    if rc == SQL_SUCCESS && has_server_info {
+    if cancelled {
+        SQL_ERROR
+    } else if rc == SQL_SUCCESS && has_server_info {
         SQL_SUCCESS_WITH_INFO
     } else {
         rc
@@ -1740,7 +1770,7 @@ fn resume_row_to_column(
         }
     };
 
-    apply_cursor_result(stmt, column_number, cursor_result)
+    apply_cursor_result(stmt, statement_handle, column_number, cursor_result)
 }
 
 /// Applies one TDS cursor result to the statement's `SQLGetData` state.
@@ -1750,6 +1780,7 @@ fn resume_row_to_column(
 /// row-exhaustion bookkeeping.
 fn apply_cursor_result(
     stmt: &StmtHandle,
+    statement_handle: SqlHandle,
     column_number: usize,
     cursor_result: TdsResult<CursorColumn>,
 ) -> SqlReturn {
@@ -1801,6 +1832,9 @@ fn apply_cursor_result(
             SQL_ERROR
         }
         Err(e) => {
+            if matches!(e, mssql_tds::error::Error::OperationCancelledError(_)) {
+                return finish_cancelled_cursor(stmt, statement_handle, &e);
+            }
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.reset_row_stream();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
@@ -2471,6 +2505,10 @@ fn stream_active_plp_chunk_once<'a>(
     } = match read_result {
         Ok(chunk) => chunk,
         Err(e) => {
+            if matches!(e, mssql_tds::error::Error::OperationCancelledError(_)) {
+                drop(retained_stmt_state.take());
+                return finish_cancelled_cursor(stmt, statement_handle, &e);
+            }
             if let Some(mut s) = retained_stmt_state.take() {
                 s.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut s, &e, SQLSTATE_HY000);
@@ -2589,14 +2627,12 @@ fn stream_active_plp_chunk_once<'a>(
             let pending_before = pending_units.len();
             let emit = widen_into_pending(
                 decoder,
+                narrow_decoder_finished,
                 pending_units,
                 &payload[..read],
                 reached_end,
                 widen_out_units,
             );
-            // The helper skips empty final input; `read` counts wire bytes,
-            // not decoded output. Only an actual final decode sets this flag.
-            *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_units.len() > pending_before;
             unsafe {
                 copy_with_nul(
@@ -2830,14 +2866,12 @@ fn stream_active_plp_chunk_once<'a>(
             };
             let emit = transcode_narrow_into_pending(
                 decoder,
+                narrow_decoder_finished,
                 pending_utf8,
                 &payload[..read],
                 reached_end,
                 payload_capacity,
             );
-            // Like widening, this helper skips empty final input. Preserve any
-            // earlier finalization while draining already-decoded carry.
-            *narrow_decoder_finished |= reached_end && read != 0;
             decoded_output = pending_utf8.len() > pending_before;
             let emit = if text_output.encoding.is_utf8() {
                 emit
@@ -3201,6 +3235,7 @@ fn read_plp_wire(
                         let carry = (prefetch_scratch, tail, chunk.total_read);
                         Ok((chunk, Some(carry), None, None))
                     }
+                    Err(error @ mssql_tds::error::Error::OperationCancelledError(_)) => Err(error),
                     Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
                 }
             });
@@ -3504,8 +3539,11 @@ fn append_typed_utf16(
 /// carries code units the caller's buffer had no room for. Both are needed:
 /// the wire and the caller advance at rates that are unrelated when the
 /// encoding is variable-width.
+/// `decoder_finalized` is caller-owned state that must live with `decoder`; it
+/// is set once when `reached_end` first arrives and must not be reset.
 pub(crate) fn widen_into_pending(
     decoder: &mut ResolvedDecoder,
+    decoder_finalized: &mut bool,
     pending: &mut Vec<u16>,
     payload: &[u8],
     reached_end: bool,
@@ -3526,10 +3564,11 @@ pub(crate) fn widen_into_pending(
     // with one unit of room), and the caller's buffer may legitimately be that
     // small.
     //
-    // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
-    // must not be used afterwards. Once the wire is exhausted there is nothing
-    // left to feed it, so later calls only drain what is already decoded.
-    if !(payload.is_empty() && reached_end) {
+    // `reached_end` flushes any half-formed sequence to U+FFFD. It can arrive
+    // with no payload, so finalization is tracked separately from pending
+    // output: later calls may still need to drain decoded units without using
+    // the decoder again.
+    if !*decoder_finalized && (!payload.is_empty() || reached_end) {
         let base = pending.len();
         let headroom = decoder
             .max_utf16_buffer_length(payload.len())
@@ -3543,6 +3582,12 @@ pub(crate) fn widen_into_pending(
             "widening output slice was too short, so input bytes were dropped"
         );
         pending.truncate(base + written);
+        *decoder_finalized = reached_end;
+    } else if *decoder_finalized {
+        debug_assert!(
+            payload.is_empty() && reached_end,
+            "widening decoder used after finalization: expected a drain-only call"
+        );
     }
     out_units.min(pending.len())
 }
@@ -3598,24 +3643,27 @@ fn narrow_source_fit(source: &[u8], room: usize, held_partial: bool) -> usize {
 /// carries bytes the caller's buffer had no room for. Both are needed: the wire
 /// and the caller advance at unrelated rates once the encoding is
 /// variable-width on either side.
+/// `decoder_finalized` is caller-owned state that must live with `decoder`; it
+/// is set once when `reached_end` first arrives and must not be reset.
 pub(crate) fn transcode_narrow_into_pending(
     decoder: &mut ResolvedDecoder,
+    decoder_finalized: &mut bool,
     pending: &mut Vec<u8>,
     payload: &[u8],
     reached_end: bool,
     out_bytes: usize,
 ) -> usize {
-    // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
-    // must not be used afterwards. Once the wire is exhausted there is nothing
-    // left to feed it, so later calls only drain what is already decoded.
-    //
-    // The flush therefore only happens when the final wire bytes and
-    // `reached_end` arrive together. If `reached_end` first arrives on a call
-    // with no payload, a sequence the decoder is still holding is dropped rather
-    // than replaced. Same shape as `widen_into_pending` above, which has carried
-    // this guard since before this path existed; tracked in AB#48073.
-    if !(payload.is_empty() && reached_end) {
+    // `reached_end` can arrive with no payload. Finalize exactly once so an
+    // incomplete source character becomes U+FFFD, then let later calls drain
+    // pending output without reusing the decoder.
+    if !*decoder_finalized && (!payload.is_empty() || reached_end) {
         decode_narrow_into_pending(decoder, pending, payload, reached_end);
+        *decoder_finalized = reached_end;
+    } else if *decoder_finalized {
+        debug_assert!(
+            payload.is_empty() && reached_end,
+            "narrow decoder used after finalization: expected a drain-only call"
+        );
     }
     // A character may be split across two SQLGetData calls at the byte level,
     // exactly as the UTF-16 transcode does it: the application concatenates the
@@ -4889,6 +4937,7 @@ mod tests {
         out_units: usize,
     ) -> (String, Vec<usize>) {
         let mut decoder = ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
         let mut pending: Vec<u16> = Vec::new();
         let mut delivered: Vec<u16> = Vec::new();
         let mut per_call = Vec::new();
@@ -4900,8 +4949,14 @@ mod tests {
             let reached_end = end == wire.len();
             offset = end;
 
-            let emit =
-                widen_into_pending(&mut decoder, &mut pending, payload, reached_end, out_units);
+            let emit = widen_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                payload,
+                reached_end,
+                out_units,
+            );
             delivered.extend_from_slice(&pending[..emit]);
             pending.drain(..emit);
             per_call.push(emit);
@@ -4923,6 +4978,55 @@ mod tests {
         let wire = encoding_rs::GBK.encode("你好世界abc").0.into_owned();
         let (got, _) = drain_widening(encoding_rs::GBK, &wire, 3, 64);
         assert_eq!(got, "你好世界abc");
+    }
+
+    #[test]
+    fn widening_flushes_partial_character_on_empty_final_payload() {
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::GBK).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
+        let mut pending = Vec::new();
+
+        assert_eq!(
+            widen_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                b"\xD0",
+                false,
+                usize::MAX,
+            ),
+            0
+        );
+        assert!(narrow_decoder_has_partial_character(&decoder));
+
+        assert_eq!(
+            widen_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                &[],
+                true,
+                usize::MAX,
+            ),
+            1
+        );
+        assert_eq!(pending, vec![0xFFFD]);
+        assert!(decoder_finalized);
+
+        pending.clear();
+        assert_eq!(
+            widen_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                &[],
+                true,
+                usize::MAX,
+            ),
+            0
+        );
+        assert!(pending.is_empty());
     }
 
     /// The caller's buffer does not bound the decode. `encoding_rs::GBK`
@@ -4948,20 +5052,42 @@ mod tests {
         let wire = b"abcdef";
         let mut decoder =
             ResolvedEncoding::from(encoding_rs::UTF_8).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
         let mut pending = Vec::new();
 
         // Whole value arrives at once, but the caller can only take two units.
-        let emit = widen_into_pending(&mut decoder, &mut pending, wire, true, 2);
+        let emit = widen_into_pending(
+            &mut decoder,
+            &mut decoder_finalized,
+            &mut pending,
+            wire,
+            true,
+            2,
+        );
         assert_eq!(emit, 2);
         assert_eq!(pending.len(), 6, "the surplus must be held, not dropped");
         pending.drain(..emit);
 
         // No wire left: the decoder must not be flushed twice, and the rest is
         // still delivered.
-        let emit = widen_into_pending(&mut decoder, &mut pending, &[], true, 2);
+        let emit = widen_into_pending(
+            &mut decoder,
+            &mut decoder_finalized,
+            &mut pending,
+            &[],
+            true,
+            2,
+        );
         assert_eq!(emit, 2);
         pending.drain(..emit);
-        let emit = widen_into_pending(&mut decoder, &mut pending, &[], true, 2);
+        let emit = widen_into_pending(
+            &mut decoder,
+            &mut decoder_finalized,
+            &mut pending,
+            &[],
+            true,
+            2,
+        );
         assert_eq!(emit, 2);
         pending.drain(..emit);
         assert!(pending.is_empty());
@@ -4984,8 +5110,16 @@ mod tests {
     fn widening_emits_nothing_for_a_zero_capacity_buffer() {
         let mut decoder =
             ResolvedEncoding::from(encoding_rs::UTF_8).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
         let mut pending = Vec::new();
-        let emit = widen_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
+        let emit = widen_into_pending(
+            &mut decoder,
+            &mut decoder_finalized,
+            &mut pending,
+            b"abc",
+            false,
+            0,
+        );
         assert_eq!(emit, 0);
         assert_eq!(pending, vec![b'a' as u16, b'b' as u16, b'c' as u16]);
     }
@@ -5046,6 +5180,7 @@ mod tests {
         out_bytes: usize,
     ) -> (String, Vec<usize>) {
         let mut decoder = ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
         let mut pending: Vec<u8> = Vec::new();
         let mut delivered: Vec<u8> = Vec::new();
         let mut per_call = Vec::new();
@@ -5059,6 +5194,7 @@ mod tests {
 
             let emit = transcode_narrow_into_pending(
                 &mut decoder,
+                &mut decoder_finalized,
                 &mut pending,
                 payload,
                 reached_end,
@@ -5084,20 +5220,21 @@ mod tests {
     /// `utf16_chunk_trailing_odd_byte_at_end_is_replacement`. A GBK lead byte
     /// with no trail byte is reachable from SQL: `CAST(0xD0 AS VARCHAR(MAX))`
     /// under a DBCS collation puts exactly that on the wire.
-    ///
-    /// Only covers the flush landing in the same call as the dangling bytes,
-    /// which is the shape the decode guard admits. When `reached_end` first
-    /// arrives on a call with no payload the decoder is never flushed and the
-    /// carry is dropped instead — pre-existing behaviour shared with
-    /// `widen_into_pending`, tracked in AB#48073.
     #[test]
     fn narrow_transcode_malformed_sequence_at_end_is_replacement() {
         let mut decoder =
             ResolvedEncoding::from(encoding_rs::GBK).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
         let mut pending: Vec<u8> = Vec::new();
 
-        let emit =
-            transcode_narrow_into_pending(&mut decoder, &mut pending, b"abc\xD0", true, usize::MAX);
+        let emit = transcode_narrow_into_pending(
+            &mut decoder,
+            &mut decoder_finalized,
+            &mut pending,
+            b"abc\xD0",
+            true,
+            usize::MAX,
+        );
 
         assert_eq!(emit, pending.len());
         assert_eq!(
@@ -5105,6 +5242,55 @@ mod tests {
             "abc\u{FFFD}",
             "a dangling DBCS lead byte must become U+FFFD, not vanish"
         );
+    }
+
+    #[test]
+    fn narrow_transcode_flushes_partial_character_on_empty_final_payload() {
+        let mut decoder =
+            ResolvedEncoding::from(encoding_rs::GBK).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
+        let mut pending = Vec::new();
+
+        assert_eq!(
+            transcode_narrow_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                b"\xD0",
+                false,
+                usize::MAX,
+            ),
+            0
+        );
+        assert!(narrow_decoder_has_partial_character(&decoder));
+
+        assert_eq!(
+            transcode_narrow_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                &[],
+                true,
+                usize::MAX,
+            ),
+            "\u{FFFD}".len()
+        );
+        assert_eq!(pending, "\u{FFFD}".as_bytes());
+        assert!(decoder_finalized);
+
+        pending.clear();
+        assert_eq!(
+            transcode_narrow_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                &[],
+                true,
+                usize::MAX,
+            ),
+            0
+        );
+        assert!(pending.is_empty());
     }
 
     /// The regression this path exists for (AB#47566 / AB#47875): a CP1252
@@ -5181,15 +5367,30 @@ mod tests {
         let wire = encoding_rs::WINDOWS_1252.encode("abcdef").0.into_owned();
         let mut decoder =
             ResolvedEncoding::from(encoding_rs::WINDOWS_1252).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
         let mut pending = Vec::new();
 
-        let emit = transcode_narrow_into_pending(&mut decoder, &mut pending, &wire, true, 2);
+        let emit = transcode_narrow_into_pending(
+            &mut decoder,
+            &mut decoder_finalized,
+            &mut pending,
+            &wire,
+            true,
+            2,
+        );
         assert_eq!(emit, 2);
         assert_eq!(pending.len(), 6, "the surplus must be held, not dropped");
         pending.drain(..emit);
 
         for _ in 0..2 {
-            let emit = transcode_narrow_into_pending(&mut decoder, &mut pending, &[], true, 2);
+            let emit = transcode_narrow_into_pending(
+                &mut decoder,
+                &mut decoder_finalized,
+                &mut pending,
+                &[],
+                true,
+                2,
+            );
             assert_eq!(emit, 2);
             pending.drain(..emit);
         }
@@ -5202,8 +5403,16 @@ mod tests {
     fn narrow_transcode_emits_nothing_for_a_zero_capacity_buffer() {
         let mut decoder =
             ResolvedEncoding::from(encoding_rs::WINDOWS_1252).new_decoder_without_bom_handling();
+        let mut decoder_finalized = false;
         let mut pending = Vec::new();
-        let emit = transcode_narrow_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
+        let emit = transcode_narrow_into_pending(
+            &mut decoder,
+            &mut decoder_finalized,
+            &mut pending,
+            b"abc",
+            false,
+            0,
+        );
         assert_eq!(emit, 0);
         assert_eq!(pending, b"abc");
     }
@@ -12148,6 +12357,42 @@ mod tests {
         (rc, indicator)
     }
 
+    #[test]
+    fn sql_get_data_drains_replacement_for_dangling_gbk_lead_at_end_of_stream() {
+        let (h, _server) = open_mock_gbk_plp(vec![vec![0xD0]]);
+        let mut delivered = Vec::new();
+
+        loop {
+            let mut output = [0xCC; 2];
+            let (rc, _) = read_plp_test_chunk(&h, SQL_C_CHAR, &mut output);
+            assert!(matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO));
+            if output[0] != 0 {
+                delivered.push(output[0]);
+            }
+            if rc == SQL_SUCCESS {
+                break;
+            }
+        }
+
+        assert_eq!(delivered, "\u{FFFD}".as_bytes());
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_CHAR, &mut [0xCC; 2]),
+            (SQL_NO_DATA, -999)
+        );
+
+        let (h, _server) = open_mock_gbk_plp(vec![vec![0xD0]]);
+        let mut output = [0xCC; 4];
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut output),
+            (SQL_SUCCESS, 2)
+        );
+        assert_eq!(output, [0xFD, 0xFF, 0, 0]);
+        assert_eq!(
+            read_plp_test_chunk(&h, SQL_C_WCHAR, &mut output),
+            (SQL_NO_DATA, -999)
+        );
+    }
+
     thread_local! {
         pub(super) static PLP_WIRE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -12852,6 +13097,7 @@ mod tests {
             for wide in [false, true] {
                 let mut decoder =
                     ResolvedEncoding::from(encoding).new_decoder_without_bom_handling();
+                let mut decoder_finalized = false;
                 assert!(!narrow_decoder_has_partial_character(&decoder));
                 let mut utf8 = Vec::new();
                 let mut utf16 = Vec::new();
@@ -12859,13 +13105,21 @@ mod tests {
                 first.extend_from_slice(&bytes[..bytes.len() - 1]);
                 if wide {
                     assert_eq!(
-                        widen_into_pending(&mut decoder, &mut utf16, &first, false, usize::MAX),
+                        widen_into_pending(
+                            &mut decoder,
+                            &mut decoder_finalized,
+                            &mut utf16,
+                            &first,
+                            false,
+                            usize::MAX,
+                        ),
                         1
                     );
                 } else {
                     assert_eq!(
                         transcode_narrow_into_pending(
                             &mut decoder,
+                            &mut decoder_finalized,
                             &mut utf8,
                             &first,
                             false,
@@ -12877,9 +13131,23 @@ mod tests {
                 assert!(narrow_decoder_has_partial_character(&decoder));
                 let last = &bytes[bytes.len() - 1..];
                 if wide {
-                    widen_into_pending(&mut decoder, &mut utf16, last, false, usize::MAX);
+                    widen_into_pending(
+                        &mut decoder,
+                        &mut decoder_finalized,
+                        &mut utf16,
+                        last,
+                        false,
+                        usize::MAX,
+                    );
                 } else {
-                    transcode_narrow_into_pending(&mut decoder, &mut utf8, last, false, usize::MAX);
+                    transcode_narrow_into_pending(
+                        &mut decoder,
+                        &mut decoder_finalized,
+                        &mut utf8,
+                        last,
+                        false,
+                        usize::MAX,
+                    );
                 }
                 assert!(!narrow_decoder_has_partial_character(&decoder));
             }

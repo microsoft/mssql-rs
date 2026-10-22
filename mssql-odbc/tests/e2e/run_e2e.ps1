@@ -15,6 +15,7 @@
 # Requires: Administrator privileges (writes to HKLM).
 # Usage: .\run_e2e.ps1 [-Release] [-Retries N] [-Coverage] [-CoverageOutput PATH]
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
+#                      [-FilterTests REGEX]
 #
 # -Retries N reruns each failing test up to N extra times (ctest
 # --repeat until-pass:N+1). A test that passes on any attempt counts as a
@@ -57,6 +58,7 @@ param(
     [string]$CoverageOutput = "",
     [switch]$CompareWithMsodbcsql,
     [string]$MsodbcsqlDll = "",
+    [string]$FilterTests = "",
     # Optional ctest name-exclusion regex (ctest -E). Empty by default: the Windows
     # driver gaps tracked in AB#46973 (get_type_info_test, driver_connect_test) are
     # fixed, so the full suite runs on Windows. Pass -ExcludeTests '<regex>' to skip.
@@ -305,6 +307,9 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
     $prevDll = $env:MSSQL_ODBC_DLL
     try {
         $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
+        if ($FilterTests) {
+            $ctestArgs += @('-R', $FilterTests)
+        }
         if ($Retries -gt 0) {
             $ctestArgs += @('--repeat', "until-pass:$($Retries + 1)")
         }
@@ -538,7 +543,6 @@ function Initialize-DevSqlEnv {
     if (-not $reachable) { return }
 
     $env:ODBC_TEST_SERVER = 'localhost'
-    if (-not $env:ODBC_TEST_UID) { $env:ODBC_TEST_UID = 'sa' }
     if (-not $env:ODBC_TEST_TRUST_CERT) { $env:ODBC_TEST_TRUST_CERT = 'Yes' }
 
     if (-not $env:ODBC_TEST_PWD) {
@@ -557,7 +561,13 @@ function Initialize-DevSqlEnv {
     }
 
     if ($env:ODBC_TEST_PWD) {
+        # Default the SQL login only once a password exists; a UID without one
+        # makes the fixture attempt SQL auth with an empty password.
+        if (-not $env:ODBC_TEST_UID) { $env:ODBC_TEST_UID = 'sa' }
         Write-Host "Auto-detected dev SQL Server at localhost:1433 ($($env:ODBC_TEST_UID) login)"
+    } elseif ($env:ODBC_TEST_UID) {
+        Write-Host "Warning: SQL Server detected on localhost:1433 but no password found for ODBC_TEST_UID=$($env:ODBC_TEST_UID)."
+        Write-Host "  Set SQL_PASSWORD or ODBC_TEST_PWD, or unset ODBC_TEST_UID to use integrated auth."
     } else {
         # Without a password the fixture falls back to Trusted_Connection, which
         # is a valid local setup — warn rather than fail.

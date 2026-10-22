@@ -15,6 +15,7 @@ use std::time::Duration;
 use mssql_tds::connection::tds_client::{
     CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
 };
+use mssql_tds::core::CancelHandle;
 use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
 
@@ -22,8 +23,10 @@ use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_NO_DATA,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_SS_XML, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen,
+    SqlUSmallInt,
 };
+use crate::api::type_rules::parameter_column_size_is_valid;
 use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
     DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
@@ -34,7 +37,7 @@ use crate::handles::dbc::ConnectionState;
 use crate::handles::desc::DescHeader;
 use crate::handles::stmt::{
     BufferedTvpCell, DaeParam, DaeState, DaeTarget, PreparedPlan, STMT_STATE_CURSOR_OPEN,
-    STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
+    STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StatementOperation, StmtState,
 };
 use crate::handles::{
     DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
@@ -101,6 +104,16 @@ fn unwind_dae_inner(
         client
     };
 
+    finish_dae_unwind(dbc, statement_handle, client, process_is_shutting_down);
+}
+
+/// Completes an unwind whose DAE state was already taken under the STMT lock.
+pub(super) fn finish_dae_unwind(
+    dbc: &DbcHandle,
+    statement_handle: SqlHandle,
+    client: Option<TdsClient>,
+    process_is_shutting_down: bool,
+) {
     if let Some(mut client) = client {
         // `cancel_streamed_write` writes the request's cancel and drains the
         // response, so it needs the scheduler's worker to drive the socket.
@@ -117,6 +130,103 @@ fn unwind_dae_inner(
         }
         return_client_idle(dbc, statement_handle, client);
     }
+}
+
+fn finish_cancelled_dae_call(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cancelled_success = matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NEED_DATA);
+    let needs_data = match stmt.inner.lock() {
+        Ok(state) => state.needs_data(),
+        Err(_) => {
+            error!("finishing cancelled DAE call: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !needs_data {
+        return rc;
+    }
+    unwind_dae(
+        stmt.parent_dbc(),
+        stmt,
+        statement_handle,
+        cancelled_success.then_some(ERR_OPERATION_CANCELED),
+    );
+    if cancelled_success { SQL_ERROR } else { rc }
+}
+
+/// Ends a call registered with [`StmtHandle::begin_operation`].
+///
+/// SQLCancel can signal after the call's last cancellable read but before it
+/// returns. The signal latches the token the client still holds, so leaving it
+/// unsettled would cancel a later, unrelated call on this statement and fail
+/// the drain of SQLFreeStmt(SQL_CLOSE) or SQLEndTran. msodbcsql sends ATTN in
+/// that window too (`sqlcmisc.cpp`, `pBatchCtx->Cancel` while `csStmt` is
+/// held), so the pending response is abandoned here, before SQLCancel returns.
+pub(super) fn finish_operation(
+    mut operation: StatementOperation<'_>,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    match operation.finish_unless_cancelled() {
+        Ok(true) => rc,
+        Ok(false) => settle_late_cancellation(stmt, statement_handle, rc),
+        Err(rc) => rc,
+    }
+}
+
+fn settle_late_cancellation(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cursor_open = match stmt.inner.lock() {
+        Ok(state) if state.needs_data() => {
+            drop(state);
+            return finish_cancelled_dae_call(stmt, statement_handle, rc);
+        }
+        Ok(state) => state.has_state(STMT_STATE_CURSOR_OPEN),
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    // A released claim means the complete response was already read, so
+    // nothing remains for the signal to abandon.
+    let owns_wire = match stmt.parent_dbc().inner.lock() {
+        Ok(state) => state.active_stmt == Some(statement_handle),
+        Err(_) => {
+            error!("settling cancellation: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !cursor_open || !owns_wire {
+        return rc;
+    }
+    match stmt.inner.lock() {
+        Ok(mut state) => {
+            state.pending_fetch_error = None;
+            super::close_cursor::reset_cursor_state(&mut state);
+        }
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    }
+    let drained = !matches!(
+        super::close_cursor::drain_and_release(stmt, statement_handle),
+        super::close_cursor::DrainOutcome::Failed
+    );
+    if drained
+        && matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA)
+        && let Ok(mut state) = stmt.inner.lock()
+    {
+        post_diag(&mut state, ERR_OPERATION_CANCELED);
+    }
+    SQL_ERROR
 }
 
 /// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
@@ -142,21 +252,7 @@ pub(super) fn park_dae_client(
     // writes bytes verbatim, so the re-encoding has to happen before them
     // (AB#47590).
     let collation = client.get_collation();
-    for param in &mut dae_params {
-        if !param.plan.is_buffered() {
-            let transcode =
-                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
-            // A pairing whose buffer bytes already are the wire's bytes keeps
-            // `None`, so `SQLPutData` forwards its chunks borrowed instead of
-            // copying each one through a conversion that would return them
-            // unchanged. Skipping the transcode also skips the close-time
-            // flush, which is right: a passthrough parameter never holds back a
-            // partial character to carry.
-            if !transcode.is_passthrough() {
-                param.transcode = Some(transcode);
-            }
-        }
-    }
+    set_dae_transcodes(&mut dae_params, collation, true);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         // The client has nowhere to go: the statement that owns it is
         // unreachable and the DBC still records it as busy.
@@ -183,13 +279,14 @@ pub(super) fn park_deferred_dae(
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
-    dae_params: Vec<DaeParam>,
+    mut dae_params: Vec<DaeParam>,
     prebuilt: Vec<RpcParameter>,
     sql: Option<String>,
     timeout_secs: u32,
     fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
+    set_dae_transcodes(&mut dae_params, client.get_collation(), false);
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned while parking deferred DAE state");
         return SQL_ERROR;
@@ -201,6 +298,28 @@ pub(super) fn park_deferred_dae(
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
     }
     SQL_NEED_DATA
+}
+
+fn set_dae_transcodes(
+    dae_params: &mut [DaeParam],
+    collation: mssql_tds::token::tokens::SqlCollation,
+    include_streamed: bool,
+) {
+    for param in dae_params {
+        let validates_encoded_input = param
+            .length_limit
+            .is_some_and(|limit| limit.requires_encoded_input());
+        if (include_streamed && !param.is_buffered()) || validates_encoded_input {
+            let mut transcode =
+                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+            if validates_encoded_input {
+                transcode = transcode.with_passthrough_validation();
+            }
+            if validates_encoded_input || !transcode.is_passthrough() {
+                param.transcode = Some(transcode);
+            }
+        }
+    }
 }
 
 /// Aborts a data-at-execution sequence with a diagnostic. Always `SQL_ERROR`.
@@ -435,7 +554,7 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// so it has to be recorded first; its return value reports whether it posted
 /// a server message. Callers with nothing pending pass `|_| false`.
 ///
-/// Returns `(has_server_info, preceding_ran)`. `preceding_ran` is `false` when
+/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is `false` when
 /// the statement lock was poisoned and the closure therefore never ran, so a
 /// caller that relies on it having posted can fall back rather than assume.
 ///
@@ -449,7 +568,7 @@ pub(super) fn release_busy_if_row_exhausted(
     statement_handle: SqlHandle,
     mut client: TdsClient,
     post_preceding: impl FnOnce(&mut StmtState) -> bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
@@ -482,12 +601,12 @@ pub(super) fn release_busy_if_row_exhausted(
         Some(Ok(done)) => *done,
         _ => !client.has_open_batch(),
     };
-    let release = result_set_exhausted && batch_done;
-
     let mut read_error = peek_result.err();
     if let Some(Err(error)) = completion_result {
         read_error = Some(error);
     }
+    let cancelled = matches!(read_error, Some(TdsError::OperationCancelledError(_)));
+    let release = cancelled || (result_set_exhausted && batch_done);
 
     // Drained whether or not the claim is released. Everything the peek
     // consumed came before this result set's DONE, so it belongs to the call
@@ -503,7 +622,7 @@ pub(super) fn release_busy_if_row_exhausted(
     let mut has_server_info = false;
     let mut preceding_ran = false;
     if let Ok(mut stmt_state) = stmt.inner.lock() {
-        if release {
+        if release && !cancelled {
             stmt_state.pending_output_params =
                 Some((client.get_return_values(), client.get_return_status()));
         }
@@ -512,14 +631,17 @@ pub(super) fn release_busy_if_row_exhausted(
         has_server_info |= post_tds_info_messages(&mut stmt_state, &drained_info);
         if let Some(e) = read_error {
             error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
-            if batch_done {
+            if cancelled {
+                super::close_cursor::reset_cursor_state(&mut stmt_state);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            } else if batch_done {
                 stmt_state.pending_fetch_error = Some(e);
             }
         }
-        if result_set_exhausted {
+        if result_set_exhausted && !cancelled {
             stmt_state.result_set_exhausted = true;
         }
-        if release {
+        if release && !cancelled {
             stmt_state.batch_exhausted = true;
         }
     }
@@ -533,7 +655,32 @@ pub(super) fn release_busy_if_row_exhausted(
             Some(statement_handle)
         };
     }
-    (has_server_info, preceding_ran)
+    (has_server_info, preceding_ran, cancelled)
+}
+
+/// The TDS read has settled or retired its transport and returned the client.
+/// Release the ODBC claim without deferring cancellation to a later call.
+pub(super) fn finish_cancelled_cursor(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    err: &TdsError,
+) -> SqlReturn {
+    let dbc = stmt.parent_dbc();
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("finishing cancelled cursor: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    if dbc_state.active_stmt == Some(statement_handle) {
+        dbc_state.active_stmt = None;
+    }
+    drop(dbc_state);
+    let Ok(mut state) = stmt.inner.lock() else {
+        error!("finishing cancelled cursor: stmt mutex poisoned");
+        return SQL_ERROR;
+    };
+    super::close_cursor::reset_cursor_state(&mut state);
+    post_tds_error(&mut state, err, SQLSTATE_HY000);
+    SQL_ERROR
 }
 
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
@@ -560,7 +707,7 @@ pub(super) fn fail_with_tds(
 
 /// Releases a statement's pending orphaned prepared handle (from a re-prepare,
 /// rebind, or `SQLExecDirect` supersede) via `sp_unprepare`, using the already
-/// claimed `client`. Best-effort: any failure is logged and swallowed — a
+/// claimed `client`. Best-effort except for cancellation: other failures are logged — a
 /// leaked handle is freed when the connection closes, and must not fail the
 /// caller's execution.
 ///
@@ -581,26 +728,44 @@ pub(super) fn flush_pending_unprepare(
     client: &mut TdsClient,
     op: &str,
     timeout_secs: u32,
-) {
+    cancel: &CancelHandle,
+) -> Result<(), TdsError> {
     let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
         Err(_) => {
             error!("{op}: stmt mutex poisoned taking pending unprepare");
-            return;
+            return Err(TdsError::ImplementationError(
+                "statement state is poisoned during orphan cleanup".to_string(),
+            ));
         }
     };
     let Some(handle) = pending else {
-        return;
+        return Ok(());
     };
     // `unprepare` recovers a dead connection first, then drops the handle only
     // if it still belongs to the (recovered) session — a superseded handle is
     // already gone server-side and is skipped without an RPC.
-    if let Err(e) = dbc
-        .runtime
-        .block_on(client.unprepare(handle, ExecuteOptions::new().timeout_secs(timeout_secs)))
-    {
+    if let Err(e) = dbc.runtime.block_on(
+        client.unprepare(
+            handle,
+            ExecuteOptions::new()
+                .timeout_secs(timeout_secs)
+                .cancel(cancel),
+        ),
+    ) {
+        if matches!(e, TdsError::OperationCancelledError(_)) {
+            // Unprepare retains an unsent handle, but forgets one whose send
+            // was attempted. Retrying this id is safe: absent handles are skipped.
+            if let Ok(mut state) = stmt.inner.lock() {
+                state.pending_unprepare = Some(handle);
+            } else {
+                error!("{op}: stmt mutex poisoned restoring cancelled orphan cleanup");
+            }
+            return Err(e);
+        }
         error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
+    Ok(())
 }
 
 /// Deducts elapsed wall-clock time from a `SQL_ATTR_QUERY_TIMEOUT` budget
@@ -1058,12 +1223,12 @@ pub(super) unsafe fn build_named_params_for_row(
             unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
 
         if let Some(indicator) = dae_indicator {
-            let plan = dae_plan(bound_param.c_type, bound_param.sql_type).map_err(|source| {
-                ParamRowBuildError::Conversion {
+            let plan = dae_plan(bound_param.c_type, bound_param.sql_type, udt_names).map_err(
+                |source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
                     source,
-                }
-            })?;
+                },
+            )?;
             let length_limit = dae_length_limit(
                 bound_param.c_type,
                 bound_param.sql_type,
@@ -1073,14 +1238,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 parameter: i + 1,
                 source,
             })?;
-            dae_params.push(DaeParam::new(
-                i,
-                dae_expected_length(indicator),
-                plan,
-                length_limit,
-                bound_param,
-                snapshot.udt_names.clone(),
-            ));
+            let buffered = plan.is_buffered();
             // Nothing to declare for a buffered parameter yet: its bytes are
             // not in, so its type and length are not known. The slot is filled
             // to keep parameter positions lined up and is rebuilt by
@@ -1128,7 +1286,23 @@ pub(super) unsafe fn build_named_params_for_row(
                 }
             };
             params.push(rpc);
+            dae_params.push(DaeParam::new(
+                i,
+                dae_expected_length(indicator),
+                buffered,
+                length_limit,
+                bound_param,
+                snapshot.udt_names.clone(),
+            ));
         } else {
+            if bound_param.sql_type == SQL_SS_XML
+                && !parameter_column_size_is_valid(bound_param.sql_type, bound_param.column_size)
+            {
+                return Err(ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source: ParamBuildError::InvalidParameterSize(bound_param.column_size),
+                });
+            }
             unsafe { crate::conversion::param_convert::stamp_numeric_apd(&bound_param) };
             let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
                 .map_err(|source| ParamRowBuildError::Conversion {
@@ -1172,18 +1346,12 @@ fn build_tvp_dae_params(
 
     for row_index in 0..row_capacity {
         staged.push(
-            DaeParam::new(
-                tvp_index,
-                None,
-                DaePlan::Buffer,
-                None,
-                *tvp,
-                udt_names.clone(),
-            )
-            .with_target(DaeTarget::TvpRowControl {
-                tvp_index,
-                row_index,
-            }),
+            DaeParam::new(tvp_index, None, true, None, *tvp, udt_names.clone()).with_target(
+                DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index,
+                },
+            ),
         );
         for (column_index, column) in columns.iter().enumerate() {
             let column = column
@@ -1194,17 +1362,18 @@ fn build_tvp_dae_params(
                 unsafe { crate::conversion::param_convert::data_at_exec_indicator(&column) }
                     .and_then(dae_expected_length);
             staged.push(
-                DaeParam::new(tvp_index, expected_len, DaePlan::Buffer, None, column, None)
-                    .with_target(DaeTarget::TvpCell {
+                DaeParam::new(tvp_index, expected_len, true, None, column, None).with_target(
+                    DaeTarget::TvpCell {
                         tvp_index,
                         row_index,
                         column_index,
-                    }),
+                    },
+                ),
             );
         }
     }
     staged.push(
-        DaeParam::new(tvp_index, None, DaePlan::Buffer, None, *tvp, udt_names).with_target(
+        DaeParam::new(tvp_index, None, true, None, *tvp, udt_names).with_target(
             DaeTarget::TvpRowControl {
                 tvp_index,
                 row_index: row_capacity,
@@ -1626,8 +1795,8 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT,
-        SQL_VARCHAR, sql_len_data_at_exec,
+        SQL_C_CHAR, SQL_C_LONG, SQL_C_WCHAR, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS,
+        SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -1652,6 +1821,64 @@ mod tests {
         assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
         assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
         assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
+
+    #[test]
+    fn deferred_dae_configures_transcoding_for_encoded_length_limits() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        for (c_type, input) in [
+            (SQL_C_CHAR, &[0xC3, 0xA9][..]),
+            (SQL_C_WCHAR, &[0xE9, 0x00][..]),
+        ] {
+            let limit = dae_length_limit(c_type, SQL_VARCHAR, 1).unwrap().unwrap();
+            let mut params = vec![
+                DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                    .with_binding_types(c_type, SQL_VARCHAR)
+                    .with_length_limit(limit),
+            ];
+
+            set_dae_transcodes(&mut params, collation, false);
+
+            let transcode = params[0]
+                .transcode
+                .expect("deferred encoded-byte validation needs a transcoder");
+            let mut carry = Vec::new();
+            assert_eq!(transcode.push(&mut carry, input).bytes, [0xE9]);
+        }
+    }
+
+    #[test]
+    fn encoded_length_validation_repairs_malformed_utf8_before_measuring() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+            .unwrap()
+            .unwrap();
+        let mut params = vec![
+            DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit),
+        ];
+
+        set_dae_transcodes(&mut params, collation, false);
+
+        let transcode = params[0]
+            .transcode
+            .expect("encoded-byte validation needs a validating transcoder");
+        let mut carry = Vec::new();
+        assert_eq!(
+            transcode.push(&mut carry, &[0xFF]).bytes,
+            "\u{FFFD}".as_bytes()
+        );
     }
 
     #[test]
@@ -2696,10 +2923,11 @@ mod tests {
         );
 
         let ran = std::cell::Cell::new(false);
-        let (_, preceding_ran) = release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
-            ran.set(true);
-            true
-        });
+        let (_, preceding_ran, _) =
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+                ran.set(true);
+                true
+            });
 
         assert!(!ran.get(), "the poisoned lock must skip the closure");
         assert!(
@@ -2789,6 +3017,57 @@ mod tests {
             strlen_or_ind_ptr: ind as *mut SqlLen,
             octet_length_ptr: ind as *mut SqlLen,
         }
+    }
+
+    #[test]
+    fn oversized_xml_is_revalidated_when_the_indicator_stops_being_dae() {
+        let mut value = b"<x/>".to_vec();
+        let mut indicator = sql_len_data_at_exec(SqlLen::try_from(value.len()).unwrap());
+        let mut param = char_param(&mut value, &mut indicator);
+        param.sql_type = SQL_SS_XML;
+        param.column_size = 4001;
+        let bound = [snap(param)];
+
+        let Ok(streamed) = (unsafe {
+            build_named_params_for_row(
+                &bound,
+                &BTreeMap::new(),
+                1,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }) else {
+            panic!("oversized XML should stream while the indicator is DAE");
+        };
+        assert_eq!(streamed.dae_params.len(), 1);
+
+        unsafe {
+            (&raw mut indicator).write(SqlLen::try_from(value.len()).unwrap());
+        }
+        let Err(error) = (unsafe {
+            build_named_params_for_row(
+                &bound,
+                &BTreeMap::new(),
+                1,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }) else {
+            panic!("materialized oversized XML should fail");
+        };
+        assert!(matches!(
+            error,
+            ParamRowBuildError::Conversion {
+                source: ParamBuildError::InvalidParameterSize(4001),
+                ..
+            }
+        ));
     }
 
     /// The narrow race `snapshot_bound_params`'s liveness check guards
@@ -2893,7 +3172,7 @@ mod tests {
                 state.bound_params = vec![snap(param)];
                 let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
                 assert_eq!(built.dae_params.len(), 1);
-                assert_eq!(built.dae_params[0].plan, plan);
+                assert_eq!(built.dae_params[0].is_buffered(), plan.is_buffered());
                 assert_eq!(
                     rpc_parameter_status(&built.params[0]).bits(),
                     expected.bits(),
@@ -3078,7 +3357,7 @@ mod tests {
         use crate::api::odbc_types::SQL_DECIMAL;
 
         let mut param = DaeParam::unbounded(bound_index, std::ptr::null_mut(), None);
-        param.plan = DaePlan::Buffer;
+        param.set_buffered(true);
         param.binding.c_type = SQL_C_CHAR;
         param.binding.sql_type = SQL_DECIMAL;
         param.binding.column_size = 5;
@@ -3101,7 +3380,7 @@ mod tests {
         use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
 
         assert!(matches!(
-            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL),
+            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL, None),
             Err(ParamBuildError::UnsupportedCType(SQL_C_NUMERIC))
         ));
 
@@ -3204,6 +3483,34 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), SQL_ERROR);
         assert!(!state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_keeps_oversized_dae_xml_unlimited() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+            .with_binding_types(SQL_C_CHAR, SQL_SS_XML);
+        param.binding.column_size = 4001;
+        let dae_params = [param];
+
+        for (bytes, is_null) in [(b"<x/>".to_vec(), false), (Vec::new(), true)] {
+            let result = rebuild_deferred_params(
+                &mut state,
+                vec![deferred_slot()],
+                &[(0, bytes, is_null)],
+                &dae_params,
+                &[],
+                &BTreeMap::new(),
+                "test",
+            );
+            assert!(
+                result.is_ok(),
+                "internal deferral must not change DAE XML validity"
+            );
+            assert!(state.diag_records.is_empty());
+        }
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing

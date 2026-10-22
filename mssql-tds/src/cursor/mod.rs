@@ -11,21 +11,21 @@
 //! # Types
 //!
 //! **Bitflags** (combinable via `|`):
-//! - [`CursorScrollOption`] — cursor type + modifiers + acceptability flags
-//! - [`CursorConcurrency`] — locking/optimistic modes + negotiation
-//! - [`FetchDirection`] — scroll direction for `sp_cursorfetch`
-//! - [`CursorOperation`] — positioned UPDATE/DELETE/INSERT via `sp_cursor`
-//! - [`FetchStatus`] — per-row status from `sp_cursorfetch`
+//! - [`CursorScrollOption`](crate::cursor::CursorScrollOption) — cursor type + modifiers + acceptability flags
+//! - [`CursorConcurrency`](crate::cursor::CursorConcurrency) — locking/optimistic modes + negotiation
+//! - [`FetchDirection`](crate::cursor::FetchDirection) — scroll direction for `sp_cursorfetch`
+//! - [`CursorOperation`](crate::cursor::CursorOperation) — positioned UPDATE/DELETE/INSERT via `sp_cursor`
+//! - [`FetchStatus`](crate::cursor::FetchStatus) — per-row status from `sp_cursorfetch`
 //!
 //! **Enums:**
-//! - [`CursorStatus`] — return status from cursor RPCs
-//! - [`CursorOptionCode`] — option codes for `sp_cursoroption`
-//! - [`CursorOptionValue`] — typed value for `sp_cursoroption`
+//! - [`CursorStatus`](crate::cursor::CursorStatus) — return status from cursor RPCs
+//! - [`CursorOptionCode`](crate::cursor::CursorOptionCode) — option codes for `sp_cursoroption`
+//! - [`CursorOptionValue`](crate::cursor::CursorOptionValue) — typed value for `sp_cursoroption`
 //!
 //! **Responses:**
-//! - [`CursorOpenResponse`] — from `sp_cursoropen` / `sp_cursorexecute`
-//! - [`CursorPrepExecResponse`] — from `sp_cursorprepexec`
-//! - [`CursorPrepareResponse`] — from `sp_cursorprepare`
+//! - [`CursorOpenResponse`](crate::cursor::CursorOpenResponse) — from `sp_cursoropen` / `sp_cursorexecute`
+//! - [`CursorPrepExecResponse`](crate::cursor::CursorPrepExecResponse) — from `sp_cursorprepexec`
+//! - [`CursorPrepareResponse`](crate::cursor::CursorPrepareResponse) — from `sp_cursorprepare`
 
 mod cursor_response;
 mod cursor_types;

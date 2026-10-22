@@ -12,6 +12,7 @@ use mssql_tds::connection::tds_client::{
     ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, PreparedStatement, ResultSet,
     StatementId, StreamedParamStatus,
 };
+use mssql_tds::core::CancelHandle;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
@@ -50,8 +51,12 @@ use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 /// displaced range. The offset pointer itself must remain readable for one
 /// `SqlLen`.
 pub(crate) unsafe fn sql_execute(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLExecute called");
-    crate::ffi_entry!("SQLExecute", unsafe { sql_execute_impl(statement_handle) })
+    crate::ffi_entry!(
+        "SQLExecute",
+        statement_handle,
+        debug!(?statement_handle, "SQLExecute called"),
+        unsafe { sql_execute_impl(statement_handle) }
+    )
 }
 
 /// # Safety
@@ -208,9 +213,18 @@ impl Iterator for PreparedRows<'_> {
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_execute_operation(statement_handle, stmt);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let dbc = stmt.parent_dbc();
 
-    let staging = match stage_execution(stmt) {
+    let (staging, cancel_handle) = match stage_execution(stmt) {
         Ok(s) => s,
         Err(rc) => return rc,
     };
@@ -239,9 +253,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             };
             let started = Instant::now();
 
-            if let Err(e) =
-                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
-            {
+            if let Err(e) = begin_transaction_if_manual(
+                dbc,
+                &mut client,
+                "SQLExecute",
+                query_timeout,
+                &cancel_handle,
+            ) {
                 // Nothing ran, so put the staged statement (and any pending orphan)
                 // back before reporting, exactly as the failed-claim path does.
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -284,12 +302,16 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // `query_timeout` (already deducted above) bounds the whole call,
             // including any reconnect charged above; `0` means unlimited, matching
             // the ODBC default.
-            let exec_result = dbc.runtime.block_on(client.execute_prepared(
-                &mut prepared.stmt,
-                named_params,
-                &mut orphaned,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ));
+            let exec_result = dbc.runtime.block_on(
+                client.execute_prepared(
+                    &mut prepared.stmt,
+                    named_params,
+                    &mut orphaned,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            );
 
             // Write the statement back along with any orphan that was not consumed
             // because execution failed before the prepexec send boundary. The fresh
@@ -339,9 +361,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             };
             let started = Instant::now();
 
-            if let Err(e) =
-                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
-            {
+            if let Err(e) = begin_transaction_if_manual(
+                dbc,
+                &mut client,
+                "SQLExecute",
+                query_timeout,
+                &cancel_handle,
+            ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.prepared = Some(prepared);
                     stmt_state.pending_unprepare = orphaned;
@@ -373,7 +399,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // are all in, so the RPC cannot be opened yet: park the sequence
             // with no request in flight and run the execute from the last
             // `SQLParamData`, once every value can be built (AB#47590).
-            if dae_params.iter().any(|param| param.plan.is_buffered()) {
+            if dae_params.iter().any(|param| param.is_buffered()) {
                 return park_deferred_dae(
                     stmt,
                     client,
@@ -394,12 +420,16 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // prepared and reuses its handle across executes (msodbcsql parity).
             // The orphan stays owned by DAE until SQLParamData completes the
             // send; cancellation restores it without creating another id.
-            let begin_result = dbc.runtime.block_on(client.begin_execute_prepared(
-                &mut prepared.stmt,
-                params,
-                &mut orphaned,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ));
+            let begin_result = dbc.runtime.block_on(
+                client.begin_execute_prepared(
+                    &mut prepared.stmt,
+                    params,
+                    &mut orphaned,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            );
 
             match begin_result {
                 Ok(StreamedParamStatus::Complete(result)) => {
@@ -482,9 +512,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 }
             };
             let started = Instant::now();
-            if let Err(e) =
-                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
-            {
+            if let Err(e) = begin_transaction_if_manual(
+                dbc,
+                &mut client,
+                "SQLExecute",
+                query_timeout,
+                &cancel_handle,
+            ) {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.prepared = Some(prepared);
                     stmt_state.pending_unprepare = orphaned;
@@ -517,12 +551,16 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 failures: Vec::new(),
                 truncated_rows: Vec::new(),
             };
-            let batch_result = dbc.runtime.block_on(client.begin_execute_prepared_batch(
-                &mut prepared.stmt,
-                &mut rows,
-                &mut orphaned,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ));
+            let batch_result = dbc.runtime.block_on(
+                client.begin_execute_prepared_batch(
+                    &mut prepared.stmt,
+                    &mut rows,
+                    &mut orphaned,
+                    ExecuteOptions::new()
+                        .timeout_secs(query_timeout)
+                        .cancel(&cancel_handle),
+                ),
+            );
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.prepared = Some(prepared);
                 stmt_state.pending_unprepare = orphaned;
@@ -875,8 +913,8 @@ fn parameter_array_return_code(
 /// Before AB#48943 the size lived on `StmtState` and was read in the same lock
 /// acquisition as the controls, so the pair could not drift and no claim was
 /// needed this early.
-fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
-    {
+fn stage_execution(stmt: &StmtHandle) -> Result<(ExecutionStaging, CancelHandle), SqlReturn> {
+    let cancel_handle = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecute: stmt mutex poisoned");
             return Err(SQL_ERROR);
@@ -939,8 +977,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             return Err(SQL_ERROR);
         }
 
+        let cancel_handle = stmt.new_execution_cancel()?;
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-    }
+        mssql_tds::trace_context::activate_execution();
+        cancel_handle
+    };
 
     let staged = stage_execution_claimed(stmt);
     if staged.is_err() {
@@ -951,7 +992,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         }
     }
-    staged
+    staged.map(|staging| (staging, cancel_handle))
 }
 
 /// The staging body, run with `EXEC_STARTED` already claimed by
@@ -1246,12 +1287,12 @@ mod tests {
     use crate::api::bind_param::sql_bind_parameter;
     use crate::api::odbc_types::{
         SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
-        SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG,
+        SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_CHAR, SQL_C_SLONG,
         SQL_DATA_AT_EXEC, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
         SQL_DESC_BIND_TYPE, SQL_DESC_ROWS_PROCESSED_PTR, SQL_INTEGER, SQL_NULL_HANDLE,
         SQL_PARAM_ERROR, SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED,
-        SQL_PARAM_UNUSED, SQL_SUCCESS, SQL_VARCHAR, SqlInteger, SqlLen, SqlPointer, SqlSmallInt,
-        SqlULen,
+        SQL_PARAM_UNUSED, SQL_SS_UDT, SQL_SUCCESS, SQL_VARCHAR, SqlInteger, SqlLen, SqlPointer,
+        SqlSmallInt, SqlULen,
     };
     use crate::api::util::rewrite_param_markers;
     use crate::handles::DescHandle;
@@ -1356,7 +1397,7 @@ mod tests {
 
     fn stage_and_restore_plan(raw: SqlHandle) -> (Option<StatementId>, Option<StatementId>) {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
-        let staging = stage_execution(stmt).unwrap_or_else(|rc| {
+        let (staging, _) = stage_execution(stmt).unwrap_or_else(|rc| {
             panic!(
                 "staging returned {rc}: {:?}",
                 stmt.inner.lock().unwrap().diag_records
@@ -2313,16 +2354,13 @@ mod tests {
                 set_cached_desc_field(h.ipd(), field, 16);
             }
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let ExecutionStaging::NeedData(execution) = stage_execution(stmt).unwrap() else {
+            let (ExecutionStaging::NeedData(execution), _) = stage_execution(stmt).unwrap() else {
                 panic!("expected DAE staging");
             };
             let expected = ((!changed).then_some(id), changed.then_some(id));
             assert_eq!((execution.prepared.stmt.id(), execution.orphaned), expected);
             assert_eq!(
-                execution
-                    .dae_params
-                    .iter()
-                    .any(|param| param.plan.is_buffered()),
+                execution.dae_params.iter().any(|param| param.is_buffered()),
                 deferred
             );
             let client = tds_client_from_tokens(Vec::new());
@@ -2449,6 +2487,47 @@ mod tests {
         drop(state);
         set_cached_desc_field(h.ipd(), SQL_DESC_LENGTH, 40);
         assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(new_id)));
+    }
+
+    #[test]
+    fn streamed_udt_without_a_type_name_fails_on_execute_before_need_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        set_prepared(h.stmt, "SELECT CAST(? AS hierarchyid)");
+        let mut token = 0_u8;
+        let mut indicator = SQL_DATA_AT_EXEC;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_BINARY,
+                    SQL_SS_UDT,
+                    0,
+                    0,
+                    (&raw mut token).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_MISSING_UDT_TYPE_NAME.state
+        );
+        assert!(
+            state.diag_records[0]
+                .message
+                .ends_with(ERR_MISSING_UDT_TYPE_NAME.text)
+        );
+        assert!(!state.needs_data());
     }
 
     #[test]
@@ -2838,7 +2917,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().pending_unprepare = Some(orphan);
 
-        let staging = stage_execution(stmt).expect("staging should succeed");
+        let (staging, _) = stage_execution(stmt).expect("staging should succeed");
         let (exec_prepared_sql, exec_orphaned) = match staging {
             ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
             ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
@@ -2861,7 +2940,7 @@ mod tests {
         set_prepared(h.stmt, "SELECT 1");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
-        let staging = stage_execution(stmt).expect("staging should succeed");
+        let (staging, _) = stage_execution(stmt).expect("staging should succeed");
         let (exec_prepared_sql, exec_orphaned) = match staging {
             ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
             ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
@@ -2883,7 +2962,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().query_timeout = 42;
 
-        let staging = stage_execution(stmt).expect("staging should succeed");
+        let (staging, _) = stage_execution(stmt).expect("staging should succeed");
         let query_timeout = match staging {
             ExecutionStaging::Ready(e) => e.query_timeout,
             ExecutionStaging::NeedData(e) => e.query_timeout,
@@ -2901,7 +2980,7 @@ mod tests {
         set_prepared(h.stmt, "SELECT 1");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
-        let staging = stage_execution(stmt).expect("staging should succeed");
+        let (staging, _) = stage_execution(stmt).expect("staging should succeed");
         let query_timeout = match staging {
             ExecutionStaging::Ready(e) => e.query_timeout,
             ExecutionStaging::NeedData(e) => e.query_timeout,
@@ -2955,7 +3034,7 @@ mod tests {
         );
         set_array_size(h.apd(), 3);
 
-        let ExecutionStaging::Batch(batch) =
+        let (ExecutionStaging::Batch(batch), _) =
             stage_execution(stmt).expect("array staging should succeed")
         else {
             panic!("expected array staging");
@@ -3053,7 +3132,7 @@ mod tests {
         );
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let ExecutionStaging::Batch(batch) =
+        let (ExecutionStaging::Batch(batch), _) =
             stage_execution(stmt).expect("array staging should succeed")
         else {
             panic!("expected array staging");
@@ -3194,7 +3273,7 @@ mod tests {
             (&raw mut *processed) as SqlULen,
         );
         set_array_size(h.apd(), 4);
-        let ExecutionStaging::Batch(batch) =
+        let (ExecutionStaging::Batch(batch), _) =
             stage_execution(stmt).expect("array staging should succeed")
         else {
             panic!("expected array staging");
@@ -3381,7 +3460,7 @@ mod tests {
         );
         set_array_size(h.apd(), 3);
 
-        let ExecutionStaging::Batch(batch) =
+        let (ExecutionStaging::Batch(batch), _) =
             stage_execution(stmt).expect("an unknown operation value must not fail")
         else {
             panic!("expected array staging");
@@ -3446,7 +3525,7 @@ mod tests {
         );
         set_array_size(h.apd(), 3);
 
-        let ExecutionStaging::Batch(batch) =
+        let (ExecutionStaging::Batch(batch), _) =
             stage_execution(stmt).expect("array staging should succeed")
         else {
             panic!("expected array staging");
@@ -3876,7 +3955,7 @@ mod tests {
         };
         assert_eq!(bind_ret, SQL_SUCCESS);
 
-        let staging = stage_execution(stmt).expect("staging should succeed");
+        let (staging, _) = stage_execution(stmt).expect("staging should succeed");
         match staging {
             ExecutionStaging::NeedData(dae) => {
                 // The single param is DAE: its index is in dae_indices.

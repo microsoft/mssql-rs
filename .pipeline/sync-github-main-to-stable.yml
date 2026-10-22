@@ -3,6 +3,8 @@
 # every update to main (via the Azure Pipelines GitHub App) and can also be run
 # manually. The Azure Repos mssql-rs repository is a 'git' resource we push the
 # sync branch to and open the PR against, authenticated with System.AccessToken.
+# The only push destination is sync/github-main-to-stable; manual runs do not
+# accept a destination parameter or variable.
 # Skips PR creation if:
 # - An active PR into the target branch from the sync branch already exists
 # - There are no changes between GitHub main and the target branch
@@ -11,17 +13,12 @@
 # - GitHub microsoft/mssql-rs configured as this pipeline's source repository.
 # - The Build Service identity has Contribute + Create branch on the Azure Repos
 #   mssql-rs repository and permission to create pull requests.
+# - Force push permission is needed only on sync/github-main-to-stable, not stable.
 
 trigger:
 - main
 
 pr: none
-
-parameters:
-- name: syncBranch
-  displayName: Intermediate ADO branch carrying GitHub main
-  type: string
-  default: sync/github-main-to-stable
 
 resources:
   repositories:
@@ -60,6 +57,10 @@ steps:
 
 - script: |
     set -euo pipefail
+
+    # Assign in the shell, not pipeline variables/env: queue-time values must not
+    # redirect the force push. Replace any inherited value and prevent reassignment.
+    readonly SYNC_BRANCH='sync/github-main-to-stable'
 
     ADO_DIR="$(Agent.BuildDirectory)/s/ado"
     GH_DIR="$(Agent.BuildDirectory)/s/gh"
@@ -114,6 +115,5 @@ steps:
   displayName: Sync GitHub main to target branch
   env:
     TARGET_BRANCH: stable
-    SYNC_BRANCH: ${{ parameters.syncBranch }}
     ADO_REPOSITORY: mssql-rs
     AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

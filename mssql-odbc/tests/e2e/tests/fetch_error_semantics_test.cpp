@@ -17,24 +17,10 @@
 // than assumed to follow.
 
 #include "odbc_test_fixture.h"
+#include "odbc_sql_server_types.h"
 
 #include <cstring>
 #include <string>
-
-#ifndef SQL_C_SS_TIME2
-#define SQL_C_TYPES_EXTENDED 0x04000L
-#define SQL_C_SS_TIME2 (SQL_C_TYPES_EXTENDED + 0)
-
-typedef struct tagSS_TIME2_STRUCT {
-    SQLUSMALLINT hour;
-    SQLUSMALLINT minute;
-    SQLUSMALLINT second;
-    SQLUINTEGER fraction;
-} SQL_SS_TIME2_STRUCT;
-#endif
-
-static_assert(sizeof(SQL_SS_TIME2_STRUCT) == 12,
-              "SQL_SS_TIME2_STRUCT layout does not match the msodbcsql ABI");
 
 class FetchErrorSemanticsLiveTest : public ODBCTest {
 protected:

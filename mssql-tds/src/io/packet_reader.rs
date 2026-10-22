@@ -90,6 +90,17 @@ macro_rules! define_tds_packet_reader {
                 None
             }
 
+            /// Data Classification version negotiated for the connection this
+            /// reader serves. The `0xA3` payload has no length or version field,
+            /// so its parser needs this to know the layout. `None` makes the
+            /// parser reject the token as not negotiated.
+            #[allow(private_interfaces)]
+            fn negotiated_data_classification_version(
+                &self,
+            ) -> Option<crate::token::data_classification::DataClassificationVersion> {
+                None
+            }
+
             fn read_byte(&mut self) -> impl Future<Output = TdsResult<u8>> + Send;
             fn read_int16_big_endian(&mut self) -> impl Future<Output = TdsResult<i16>> + Send;
             fn read_int32_big_endian(&mut self) -> impl Future<Output = TdsResult<i32>> + Send;

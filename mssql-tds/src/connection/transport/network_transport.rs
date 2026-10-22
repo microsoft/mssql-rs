@@ -3,9 +3,12 @@
 
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::dns_cache::{self, Resolution};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
-use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
+use crate::connection::transport::parallel_connect::{
+    ParallelConnectConfig, parallel_connect_resolving,
+};
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
@@ -30,6 +33,7 @@ use crate::io::token_stream::{
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
 use crate::message::messages::{PacketStatusFlags, PacketType, Request, ResetConnectionMode};
+use crate::token::data_classification::DataClassificationVersion;
 use crate::token::tokens::{ColMetadataToken, DoneStatus, TokenType, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -177,7 +181,8 @@ pub(crate) const PRE_NEGOTIATED_PACKET_SIZE: u32 = 4096;
 
 /// Creates a base stream for the specified transport context.
 /// This function handles the transport-specific connection logic (TCP, Named Pipe, Shared Memory)
-/// and returns a boxed Stream that can be used with any TDS version.
+/// and returns a boxed Stream that can be used with any TDS version, along with
+/// what a TCP host resolved to for the login's DNS caching verdict.
 ///
 /// # Arguments
 ///
@@ -194,10 +199,10 @@ async fn create_base_stream(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Option<Resolution>)> {
     match transport_context {
         TransportContext::Tcp { host, port, .. } => {
-            if multi_subnet_failover {
+            let (stream, resolution) = if multi_subnet_failover {
                 // Use parallel connection mode for MultiSubnetFailover
                 create_base_stream_parallel(
                     host,
@@ -206,7 +211,7 @@ async fn create_base_stream(
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
                 )
-                .await
+                .await?
             } else {
                 // Use sequential connection mode (original behavior)
                 create_base_stream_sequential(
@@ -217,8 +222,9 @@ async fn create_base_stream(
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
                 )
-                .await
-            }
+                .await?
+            };
+            Ok((stream, Some(resolution)))
         }
         #[cfg(windows)]
         TransportContext::NamedPipe { pipe_name } => {
@@ -235,7 +241,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(pipe_name).await?;
 
             info!("Connected to Named Pipe: {}", pipe_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
         #[cfg(not(windows))]
         TransportContext::NamedPipe { .. } => Err(crate::error::Error::from(std::io::Error::new(
@@ -278,7 +284,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
 
             info!("Connected to Shared Memory (LPC-over-NP): {}", pipe_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
         #[cfg(not(windows))]
         TransportContext::SharedMemory { .. } => {
@@ -311,7 +317,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
 
             info!("Connected to LocalDB instance: {}", instance_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
     }
 }
@@ -349,7 +355,7 @@ async fn create_base_stream_sequential(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Resolution)> {
     info!(
         "Connecting to TCP transport (sequential): {}:{}",
         host, port
@@ -359,9 +365,10 @@ async fn create_base_stream_sequential(
     // `std::net::ToSocketAddrs::to_socket_addrs`) awaits the resolution instead of
     // blocking the calling thread, so a slow or stuck resolver stays subject to the
     // `timeout()`/deadline machinery in the retry loop above this call instead of
-    // silently escaping it.
-    let mut socket_addresses: Vec<SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
+    // silently escaping it. A failed resolution falls back to the DNS cache.
+    let resolution = dns_cache::lookup_host(host, port).await?;
+    // Sorted as a copy, so the cache keeps the resolver's order.
+    let mut socket_addresses = resolution.addresses().to_vec();
 
     let mut last_error = None;
     let mut tcp_stream = None;
@@ -417,7 +424,7 @@ async fn create_base_stream_sequential(
 
     // We don't have a valid TCP stream, so we need to return the last error.
     if let Some(stream) = tcp_stream {
-        Ok(Box::new(stream))
+        Ok((Box::new(stream), resolution))
     } else {
         Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
             std::io::Error::new(
@@ -437,7 +444,7 @@ async fn create_base_stream_parallel(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Resolution)> {
     info!(
         "Connecting to TCP transport (parallel/MultiSubnetFailover): {}:{}",
         host, port
@@ -449,14 +456,14 @@ async fn create_base_stream_parallel(
         keep_alive_interval_in_ms,
     };
 
-    let result = parallel_connect(host, port, &config).await?;
+    let (result, resolution) = parallel_connect_resolving(host, port, &config).await?;
 
     info!(
         "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
         result.connected_address, result.total_addresses, result.failed_attempts
     );
 
-    Ok(Box::new(result.stream))
+    Ok((Box::new(result.stream), resolution))
 }
 
 /// Creates a NetworkTransport configured for the specified TDS version.
@@ -509,7 +516,8 @@ async fn create_transport_for_version(
     }
 }
 
-/// Creates a network transport for the specified parameters.
+/// Creates a network transport for the specified parameters, along with what a
+/// TCP host resolved to, which the login's DNS caching verdict applies to.
 ///
 /// # Arguments
 ///
@@ -531,11 +539,11 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<NetworkTransport> {
+) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
     let encryption_mode = encryption_options.mode;
 
     // Step 1: Create the base stream (transport-specific)
-    let stream = create_base_stream(
+    let (stream, resolution) = create_base_stream(
         ipaddress_preference,
         transport_context,
         keep_alive_in_ms,
@@ -546,14 +554,15 @@ pub(crate) async fn create_transport(
     .await?;
 
     // Step 2: Apply TDS version-specific wrapping (uniform for all transports)
-    create_transport_for_version(
+    let transport = create_transport_for_version(
         stream,
         tds_version,
         transport_context,
         encryption_options,
         encryption_mode,
     )
-    .await
+    .await?;
+    Ok((transport, resolution))
 }
 
 /// SSL/TLS lifecycle callbacks for a transport.
@@ -817,7 +826,11 @@ where
         None
     } else {
         attention_stream.map(|stream| {
-            let deadline = Instant::now() + Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+            let timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+            let deadline = cancel_handle.map_or_else(
+                || Instant::now() + timeout,
+                |handle| handle.settlement_deadline(timeout),
+            );
             (deadline, stream)
         })
     };
@@ -871,6 +884,8 @@ pub(crate) struct NetworkTransport {
     /// `read_nbc_bitmap`.
     nbc_bitmap_scratch: Option<Arc<[u8]>>,
     column_encryption_supported: bool,
+    /// Data Classification version from login, used to parse `0xA3` tokens.
+    data_classification_version: Option<DataClassificationVersion>,
     /// Tokens drained by the transport but still needed by client state handling.
     attention_settlement: Option<Box<AttentionSettlement>>,
 }
@@ -894,6 +909,7 @@ impl NetworkReaderWriter for NetworkTransport {
 
     fn notify_session_setting_change(&mut self, setting: &SessionSettings) {
         self.packet_size = setting.packet_size;
+        self.data_classification_version = setting.data_classification_version();
         // Note: The read buffer's max_packet_size is updated in reset_reader(),
         // which is called before each command execution. This ensures the buffer
         // is properly sized when we start reading the server's response.
@@ -987,6 +1003,7 @@ impl NetworkTransport {
             known_dead: false,
             nbc_bitmap_scratch: None,
             column_encryption_supported: false,
+            data_classification_version: None,
             attention_settlement: None,
         }
     }
@@ -1721,6 +1738,9 @@ impl NetworkTransport {
                 false
             }
             Tokens::Row(_) => false,
+            // Result-set metadata for a cancelled result; the client never
+            // replays it, so retaining it would only count toward the limit.
+            Tokens::DataClassification(_) => false,
             Tokens::Done(done) => {
                 let acknowledged = done.status.contains(DoneStatus::ATTN) && !done.has_more();
                 context.metadata = None;
@@ -1961,6 +1981,10 @@ impl TdsPacketReader for NetworkTransport {
     #[inline]
     fn buffered_slice(&self) -> &[u8] {
         self.tds_read_buffer.get_buffered_slice()
+    }
+
+    fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
+        self.data_classification_version
     }
 
     fn reset_reader(&mut self) {
@@ -3196,6 +3220,191 @@ pub(crate) mod tests {
     // The choice of 8192 is large enough for sending data. This stream should have a buffer large enough for send.
     // The test would keep the payload lower than this size to make sure that the duplex stream can handle it.
     pub(crate) const MAX_BUFFER_SIZE: usize = 8192;
+
+    mod data_classification {
+        use super::*;
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::message::features::data_classification::DataClassificationFeature;
+        use crate::message::login::Feature;
+        use crate::token::data_classification::SensitivityRank;
+
+        /// One unclassified column; v2 adds a NotDefined result-set rank.
+        fn classification_token(version: DataClassificationVersion) -> Vec<u8> {
+            let mut bytes = vec![TokenType::DataClassification as u8, 0, 0, 0, 0];
+            if version == DataClassificationVersion::Version2 {
+                bytes.extend_from_slice(&(-1i32).to_le_bytes());
+            }
+            bytes.extend_from_slice(&[1, 0, 0, 0]);
+            bytes
+        }
+
+        fn transport_with(tokens: &[u8]) -> NetworkTransport {
+            let done = [TokenType::Done as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            create_network_transport_with_data(
+                &TestPacketBuilder::new(PacketType::TabularResult)
+                    .append_bytes(tokens)
+                    .append_bytes(&done)
+                    .build(),
+            )
+        }
+
+        fn negotiate(transport: &mut NetworkTransport, ack: &[u8]) {
+            negotiate_requesting(transport, DataClassificationVersion::Version2, ack);
+        }
+
+        fn negotiate_requesting(
+            transport: &mut NetworkTransport,
+            requested: DataClassificationVersion,
+            ack: &[u8],
+        ) {
+            let mut settings = create_test_negotiated_settings_internal().session_settings;
+            let mut feature = DataClassificationFeature::new(requested);
+            feature.set_acknowledged(true);
+            feature.deserialize(ack).unwrap();
+            settings.supported_features.push(Box::new(feature));
+            transport.notify_session_setting_change(&settings);
+        }
+
+        /// [MS-TDS] 2.2.7.5 sends ranks only when the request and the
+        /// acknowledgement are both V2, so either mixed pair carries the V1
+        /// layout. Parsing it as V2 would read the column count as a rank.
+        #[tokio::test]
+        async fn mixed_versions_parse_the_v1_layout() {
+            for (requested, ack_version) in [
+                (DataClassificationVersion::Version1, 0x02),
+                (DataClassificationVersion::Version2, 0x01),
+            ] {
+                let mut transport =
+                    transport_with(&classification_token(DataClassificationVersion::Version1));
+                negotiate_requesting(&mut transport, requested, &[ack_version, 0x01]);
+
+                let token = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                let Tokens::DataClassification(metadata) = token else {
+                    panic!("expected a DataClassification token, got {token:?}");
+                };
+                assert_eq!(metadata.version, DataClassificationVersion::Version1);
+                assert_eq!(metadata.rank, None);
+                assert_eq!(metadata.columns.len(), 1);
+
+                let next = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn login_negotiated_version_drives_0xa3_parsing() {
+            for (ack_version, version, rank) in [
+                (0x01, DataClassificationVersion::Version1, None),
+                (
+                    0x02,
+                    DataClassificationVersion::Version2,
+                    Some(SensitivityRank::NotDefined),
+                ),
+            ] {
+                let mut transport = transport_with(&classification_token(version));
+                negotiate(&mut transport, &[ack_version, 0x01]);
+
+                let token = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                let Tokens::DataClassification(metadata) = token else {
+                    panic!("expected a DataClassification token, got {token:?}");
+                };
+                assert_eq!(metadata.version, version);
+                assert_eq!(metadata.rank, rank);
+                assert_eq!(metadata.columns.len(), 1);
+                assert!(!metadata.columns[0].is_classified());
+
+                let next = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_0xa3_unless_the_server_enabled_the_feature() {
+            let version = DataClassificationVersion::Version2;
+            for ack in [None, Some([0x02, 0x00])] {
+                let mut transport = transport_with(&classification_token(version));
+                if let Some(ack) = ack {
+                    negotiate(&mut transport, &ack);
+                }
+
+                let error = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("not negotiated"), "{error}");
+            }
+        }
+
+        /// A reconnect or redirect performs a fresh login, whose settings
+        /// replace the cached version rather than adding to it.
+        #[tokio::test]
+        async fn a_new_login_replaces_the_cached_version() {
+            let mut transport = transport_with(&[]);
+            negotiate(&mut transport, &[0x02, 0x01]);
+            assert_eq!(
+                transport.negotiated_data_classification_version(),
+                Some(DataClassificationVersion::Version2)
+            );
+
+            transport.notify_session_setting_change(
+                &create_test_negotiated_settings_internal().session_settings,
+            );
+            assert_eq!(transport.negotiated_data_classification_version(), None);
+        }
+
+        /// A cancelled classified result set drains through DONE_ATTN without
+        /// retaining its DATACLASSIFICATION tokens for replay.
+        #[tokio::test(start_paused = true)]
+        async fn attention_drain_discards_classification_tokens() {
+            let version = DataClassificationVersion::Version2;
+            let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+                .continuation()
+                .append_bytes(&classification_token(version))
+                .append_bytes(&classification_token(version))
+                .build();
+            stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&stream);
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+            )
+            .await
+            .expect("the attention drain hung on a classification token");
+
+            assert!(
+                matches!(result, Err(OperationCancelledError(_))),
+                "{result:?}"
+            );
+            assert!(!is_known_dead(&transport));
+            let settlement = transport
+                .take_attention_settlement()
+                .expect("the acknowledgement must produce settlement state");
+            assert!(
+                settlement
+                    .tokens
+                    .iter()
+                    .all(|token| !matches!(token, Tokens::DataClassification(_))),
+                "{:?}",
+                settlement.tokens
+            );
+            assert_eq!(settlement.tokens.len(), 1, "only DONE_ATTN is retained");
+        }
+    }
 
     fn int4_row_context(column_count: usize) -> ParserContext {
         ParserContext::ColumnMetadata(
@@ -5617,6 +5826,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// Connects to `host`, a name the resolver fails (`.invalid`), after a
+    /// login allowed DNS caching for it with a local listener's address, and
+    /// checks the connect hands that resolution on to its own login.
+    async fn connects_through_the_dns_cache(host: &str, multi_subnet_failover: bool) {
+        use crate::connection::dns_cache::{DnsCache, Resolution};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![address]), true);
+
+        let transport_context = TransportContext::Tcp {
+            host: host.to_string(),
+            port: address.port(),
+            instance_name: None,
+        };
+        let (_stream, resolution) = create_base_stream(
+            IPAddressPreference::IPv4First,
+            &transport_context,
+            30_000,
+            1_000,
+            multi_subnet_failover,
+            5_000,
+        )
+        .await
+        .expect("connects with the cached address");
+        assert!(
+            timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .is_ok()
+        );
+        assert_eq!(resolution, Some(Resolution::new(host, vec![address])));
+    }
+
+    #[tokio::test]
+    async fn sequential_connect_falls_back_to_the_dns_cache() {
+        connects_through_the_dns_cache("sequential.dns-cache.invalid", false).await;
+    }
+
+    #[tokio::test]
+    async fn multi_subnet_failover_connect_falls_back_to_the_dns_cache() {
+        connects_through_the_dns_cache("parallel.dns-cache.invalid", true).await;
+    }
+
     /// `skip_bytes` spins the same way, and it runs on the discard path that
     /// large-value reads use, so a stall there is just as unbounded.
     #[tokio::test]
@@ -6106,6 +6358,35 @@ pub(crate) mod tests {
             matches!(result, Err(TimeoutError(_))),
             "the caller must still see its timeout, got {result:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_timeout_bounds_attention_for_cancel_and_query_timeout() {
+        for seconds in [1, 7, 120] {
+            for cancelled in [false, true] {
+                let (mut transport, _written) =
+                    create_network_transport_with_live_peer_capturing_writes(&[]);
+                let mut handle = CancelHandle::new();
+                handle.set_cancel_timeout_secs(seconds);
+                if cancelled {
+                    handle.cancel();
+                }
+                let request_timeout = (!cancelled).then_some(Duration::from_millis(50));
+                let start = Instant::now();
+                let result = transport
+                    .receive_token(&ParserContext::None(()), request_timeout, Some(&handle))
+                    .await;
+                assert!(
+                    matches!(result, Err(OperationCancelledError(_))) && cancelled
+                        || matches!(result, Err(TimeoutError(_))) && !cancelled
+                );
+                assert_eq!(
+                    start.elapsed(),
+                    Duration::from_secs(u64::from(seconds)) + request_timeout.unwrap_or_default()
+                );
+                assert!(is_known_dead(&transport));
+            }
+        }
     }
 
     /// An unacknowledged ATTENTION leaves the TDS stream at an unknown point,

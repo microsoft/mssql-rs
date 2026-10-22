@@ -12,11 +12,12 @@ use crate::token::parsers::TokenParser;
 use crate::token::parsers::done_parser::{DONE_PAYLOAD_LEN, buffered_done_token, read_done_token};
 use crate::token::parsers::returnstatus_parser::{RETURN_STATUS_PAYLOAD_LEN, read_return_status};
 use crate::token::parsers::{
-    ColInfoTokenParser, ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser,
-    DoneTokenParser, EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser,
-    FedAuthInfoTokenParser, InfoTokenParser, LoginAckTokenParser, NbcRowTokenParser,
-    OrderTokenParser, ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser,
-    SessionStateTokenParser, SspiTokenParser, TabNameTokenParser,
+    ColInfoTokenParser, ColMetadataTokenParser, DataClassificationTokenParser,
+    DoneInProcTokenParser, DoneProcTokenParser, DoneTokenParser, EnvChangeTokenParser,
+    ErrorTokenParser, FeatureExtAckTokenParser, FedAuthInfoTokenParser, InfoTokenParser,
+    LoginAckTokenParser, NbcRowTokenParser, OrderTokenParser, ReturnStatusTokenParser,
+    ReturnValueTokenParser, RowTokenParser, SessionStateTokenParser, SspiTokenParser,
+    TabNameTokenParser,
 };
 use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
@@ -458,6 +459,7 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
         TokenParsers::FedAuthInfo(parser) => parser.parse(reader, context).await,
         TokenParsers::FeatureExtAck(parser) => parser.parse(reader, context).await,
         TokenParsers::ColMetadata(parser) => parser.parse(reader, context).await,
+        TokenParsers::DataClassification(parser) => parser.parse(reader, context).await,
         TokenParsers::Row(parser) => parser.parse(reader, context).await,
         TokenParsers::Order(parser) => parser.parse(reader, context).await,
         TokenParsers::ReturnStatus(_) => read_return_status(reader).await.map(Tokens::from),
@@ -1159,6 +1161,10 @@ impl Default for GenericTokenParserRegistry {
             TokenParsers::from(ColMetadataTokenParser),
         );
         internal_registry.insert(
+            TokenType::DataClassification,
+            TokenParsers::from(DataClassificationTokenParser),
+        );
+        internal_registry.insert(
             TokenType::Row,
             TokenParsers::from(RowTokenParser::default()),
         );
@@ -1209,6 +1215,7 @@ pub enum TokenParsers {
     FedAuthInfo(FedAuthInfoTokenParser),
     FeatureExtAck(FeatureExtAckTokenParser),
     ColMetadata(ColMetadataTokenParser),
+    DataClassification(DataClassificationTokenParser),
     Row(RowTokenParser<GenericDecoder>),
     Order(OrderTokenParser),
     ReturnStatus(ReturnStatusTokenParser),
@@ -1243,6 +1250,7 @@ impl_from_token_parser!(
     FedAuthInfoTokenParser => FedAuthInfo,
     FeatureExtAckTokenParser => FeatureExtAck,
     ColMetadataTokenParser => ColMetadata,
+    DataClassificationTokenParser => DataClassification,
     RowTokenParser<GenericDecoder> => Row,
     OrderTokenParser => Order,
     ReturnStatusTokenParser => ReturnStatus,
@@ -2293,7 +2301,7 @@ mod tests {
     #[test]
     fn test_parser_registry_count() {
         let registry = GenericTokenParserRegistry::default();
-        let expected_count = 15; // Number of token types registered in default()
+        let expected_count = 16; // Number of token types registered in default()
 
         let token_types = [
             TokenType::EnvChange,
@@ -2306,6 +2314,7 @@ mod tests {
             TokenType::FeatureExtAck,
             TokenType::FedAuthInfo,
             TokenType::ColMetadata,
+            TokenType::DataClassification,
             TokenType::Row,
             TokenType::Order,
             TokenType::ReturnStatus,
@@ -2318,5 +2327,64 @@ mod tests {
             .filter(|tt| registry.get_parser(tt).is_some())
             .count();
         assert_eq!(count, expected_count);
+    }
+
+    #[tokio::test]
+    async fn data_classification_token_is_recognized_but_rejected_until_negotiated() {
+        use crate::token::parsers::common::test_utils::MockReader;
+
+        let mut reader = MockReader::new(vec![
+            TokenType::DataClassification as u8,
+            0,
+            0, // sensitivity-label count
+            0,
+            0, // information-type count
+            0,
+            0, // result-set column count
+        ]);
+        let registry = GenericTokenParserRegistry::default();
+
+        let error = receive_token_internal(&mut reader, &registry, &ParserContext::default())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("DATACLASSIFICATION"), "{error}");
+        assert!(error.contains("not negotiated"), "{error}");
+        assert!(!error.contains("Unknown token type"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn data_classification_token_is_parsed_with_the_negotiated_version() {
+        use crate::token::data_classification::DataClassificationVersion;
+        use crate::token::parsers::common::test_utils::MockReader;
+
+        let mut reader = MockReader::new(vec![
+            TokenType::DataClassification as u8,
+            0,
+            0, // sensitivity-label count
+            0,
+            0, // information-type count
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF, // result-set rank: NotDefined (v2 only)
+            0,
+            0, // result-set column count
+            TokenType::Done as u8,
+        ])
+        .with_data_classification_version(DataClassificationVersion::Version2);
+        let registry = GenericTokenParserRegistry::default();
+
+        let token = receive_token_internal(&mut reader, &registry, &ParserContext::default())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&token, Tokens::DataClassification(metadata)
+                if metadata.version == DataClassificationVersion::Version2),
+            "{token:?}"
+        );
+        assert_eq!(reader.remaining(), 1, "the next token must be left unread");
     }
 }

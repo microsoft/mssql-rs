@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +33,7 @@ pub(crate) enum ConnectionState {
 /// msodbcsql's connection-level critical section.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
+    pub(crate) trace: Arc<mssql_tds::trace_context::ConnectionTrace>,
     pub(crate) object_type: HandleType,
     /// Back-pointer to the parent ENV handle. Stored as opaque pointer because
     /// the ENV owns the DBC's lifetime, not the other way around.
@@ -145,11 +147,12 @@ pub(crate) struct DbcState {
     pub(crate) warn_on_cp_error: bool,
     /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. `0` is the ODBC default and
     /// means "no timeout". Honored only by the driver's own internal
-    /// connection-scoped query — the `SQL_USER_NAME` lookup — which is the same
-    /// attribute msodbcsql bounds it with (`GetNetIOTimeOut`, `sqlcprot.h:1605`
-    /// over `sqlccmd.cpp:10369`). Application statements take their deadline
-    /// from `SQL_ATTR_QUERY_TIMEOUT` instead; extending this attribute to the
-    /// rest of the connection-scoped paths is residual work.
+    /// connection-scoped queries — the `SQL_USER_NAME` and alias-type lookups —
+    /// which is the attribute msodbcsql bounds its combined lookup with
+    /// (`GetNetIOTimeOut`, `sqlcprot.h:1605` over `sqlccmd.cpp:10369`).
+    /// Application statements take their deadline from `SQL_ATTR_QUERY_TIMEOUT`
+    /// instead; extending this attribute to the rest of the connection-scoped
+    /// paths is residual work.
     pub(crate) connection_timeout: u32,
     /// `SQL_ATTR_PACKET_SIZE` in bytes: the app-set attribute (or default),
     /// surviving `SQLDisconnect` so the next connect attempt on this handle
@@ -250,6 +253,12 @@ pub(crate) struct DbcState {
     /// with the client's database-change count so a `USE` the driver did not
     /// issue — including a `USE [X]` while already in `X` — still invalidates.
     pub(crate) database_user_name: Option<CachedDatabaseUserName>,
+    /// Alias type names (`sp_addtype`, `CREATE TYPE ... FROM`) for
+    /// `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME`, read lazily on the
+    /// first description of an alias-typed column. Cleared when the session
+    /// changes; otherwise invalidated by its key, as
+    /// [`database_user_name`](Self::database_user_name) is.
+    pub(crate) alias_types: Option<AliasTypeCache>,
     /// Last-known database code page for `SQL_COLLATION_SEQ`, refreshed each
     /// time an execution claims the client. Answers `SQLGetInfo` while a
     /// data-at-execution sequence has moved the client onto a statement
@@ -264,14 +273,27 @@ pub(crate) struct DbcState {
     pub(crate) last_char_set: Option<String>,
 }
 
+impl DbcState {
+    pub(crate) fn cancel_timeout_secs(&self) -> u32 {
+        if self.connection_timeout == 0 {
+            120
+        } else {
+            self.connection_timeout
+        }
+    }
+}
+
 /// The connection identity that does not vary by database.
 ///
 /// Deliberately holds no credential: the connection string is never retained,
 /// and neither the login name nor the password or access token is kept. The
 /// login is not here because no information type reports it — `SQL_USER_NAME`
 /// is the *database* user, which [`DbcState::database_user_name`] caches.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ConnectionIdentity {
+    /// Shared with TDS so a transparent reconnect updates the getter even
+    /// while a statement owns the client outside the DBC mutex.
+    pub(crate) client_connection_id: Option<Arc<mssql_tds::trace_context::ConnectionTrace>>,
     /// `SQL_DATA_SOURCE_NAME`. Empty for a DSN-less connection, matching
     /// msodbcsql18.
     pub(crate) data_source_name: String,
@@ -315,6 +337,20 @@ pub(crate) struct CachedDatabaseUserName {
     pub(crate) value: String,
 }
 
+/// A [`DbcState::alias_types`] entry: `systypes` names keyed by the
+/// database-scoped `UserType` that `COLMETADATA` reports for a column, valid
+/// only for the session state they were read in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AliasTypeCache {
+    /// The database the names were read from, compared exactly like
+    /// [`CachedDatabaseUserName::catalog`].
+    pub(crate) catalog: String,
+    /// [`TdsClient::database_change_count`] when the names were read, compared
+    /// alongside [`catalog`](Self::catalog).
+    pub(crate) database_change_count: u64,
+    pub(crate) names: HashMap<u32, String>,
+}
+
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
 // messages; presence is shown, the value is redacted (mirrors `ConnectionParams`).
 impl std::fmt::Debug for DbcState {
@@ -338,6 +374,7 @@ impl std::fmt::Debug for DbcState {
             .field("stmt_query_timeout", &self.stmt_query_timeout)
             .field("identity", &self.identity)
             .field("database_user_name", &self.database_user_name)
+            .field("alias_types", &self.alias_types)
             .finish()
     }
 }
@@ -354,6 +391,7 @@ impl HasDiagnostics for DbcState {
 impl DbcHandle {
     pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
+            trace: Arc::default(),
             object_type: HandleType::Dbc,
             parent_env,
             runtime,
@@ -384,6 +422,7 @@ impl DbcHandle {
                 identity: ConnectionIdentity::default(),
                 session_generation: 0,
                 database_user_name: None,
+                alias_types: None,
                 last_collation_code_page: None,
                 last_char_set: None,
             }),
@@ -416,6 +455,17 @@ mod tests {
     use crate::test_support::TestHandles;
 
     use super::*;
+
+    #[test]
+    fn cancellation_timeout_uses_default_only_for_zero() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        for (configured, expected) in [(0, 120), (1, 1), (30, 30), (u32::MAX, u32::MAX)] {
+            state.connection_timeout = configured;
+            assert_eq!(state.cancel_timeout_secs(), expected);
+        }
+    }
 
     #[test]
     fn debug_redacts_the_token_and_reports_the_attribute_state() {

@@ -4,12 +4,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
+use mssql_tds::core::CancelHandle;
 use mssql_tds::error::Error as TdsError;
 
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
@@ -20,7 +21,7 @@ use crate::api::odbc_types::{
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::client_encoding::ClientEncoding;
 use crate::conversion::fetch_convert::TextOutput;
-use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
+use crate::conversion::param_convert::{DaeLengthLimit, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::desc::UdtNames;
 use crate::params::{BoundParam, ParamSnapshot};
@@ -80,6 +81,8 @@ pub(crate) struct ActivePlpStream {
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
     pub(crate) narrow_decoder: Option<ResolvedDecoder>,
+    /// Whether the narrow decoder has received the final end-of-stream signal.
+    /// Converted output may still need later calls to drain after finalization.
     pub(crate) narrow_decoder_finished: bool,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
@@ -303,6 +306,7 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("pending_high_surrogate", &self.pending_high_surrogate)
             .field("pending_bytes", &self.pending_bytes.len())
             .field("narrow_decoder", &self.narrow_decoder.is_some())
+            .field("narrow_decoder_finished", &self.narrow_decoder_finished)
             .field("pending_units", &self.pending_units.len())
             .field(
                 "prefetched_wire_remaining",
@@ -416,6 +420,7 @@ pub(crate) const STMT_STATE_FETCH_IN_PROGRESS: u32 = 0x0000_2000;
 /// Created by `SQLAllocHandle(SQL_HANDLE_STMT, hdbc, ...)`.
 #[derive(Debug)]
 pub(crate) struct StmtHandle {
+    pub(crate) trace: Option<std::sync::Arc<mssql_tds::trace_context::StatementTrace>>,
     pub(crate) object_type: HandleType,
     /// Back-pointer to the parent DBC handle. Stored as opaque pointer because
     /// the DBC owns the STMT's lifetime, not the other way around.
@@ -437,6 +442,10 @@ pub(crate) struct StmtHandle {
     pub(crate) apd: *mut c_void,
     pub(crate) ird: *mut c_void,
     pub(crate) ipd: *mut c_void,
+    /// Independent of `inner` so SQLCancel never waits for the executing call.
+    /// Replaced under the execution claim; retained for the whole batch lifetime.
+    cancel: Mutex<StatementCancellation>,
+    operation_finished: Condvar,
     pub(crate) inner: Mutex<StmtState>,
 }
 
@@ -447,6 +456,9 @@ pub(crate) struct StmtState {
     pub(crate) text_output: TextOutput,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// Advances whenever `column_metadata` is replaced or cleared, so a value
+    /// read for one result set without the lock is not applied to the next.
+    pub(crate) result_generation: u64,
     /// UTF-16 column names built once when result metadata changes.
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
     /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
@@ -827,8 +839,8 @@ pub(crate) struct DaeParam {
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
-    /// Whether the value streams to the wire or is collected first.
-    pub(crate) plan: DaePlan,
+    /// Whether the value must be collected before the RPC can open.
+    buffered: bool,
     /// `ColumnSize` applied to the accumulated chunk total as the chunks
     /// arrive, so the `22001` lands on the same `SQLPutData` msodbcsql puts it
     /// on. `None` when the bound is left to the close-time conversion.
@@ -851,7 +863,7 @@ impl DaeParam {
     pub(crate) fn new(
         bound_index: usize,
         expected_len: Option<usize>,
-        plan: DaePlan,
+        buffered: bool,
         length_limit: Option<DaeLengthLimit>,
         binding: BoundParam,
         udt_names: Option<Arc<UdtNames>>,
@@ -861,7 +873,7 @@ impl DaeParam {
             target: DaeTarget::Parameter,
             value_ptr: binding.parameter_value_ptr,
             expected_len,
-            plan,
+            buffered,
             length_limit,
             binding,
             udt_names,
@@ -882,7 +894,6 @@ impl DaeParam {
         value_ptr: SqlPointer,
         expected_len: Option<usize>,
     ) -> Self {
-        use mssql_tds::message::parameters::rpc_parameters::StreamedSqlType;
         let binding = BoundParam {
             input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
             c_type: crate::api::odbc_types::SQL_C_BINARY,
@@ -896,14 +907,7 @@ impl DaeParam {
             strlen_or_ind_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
         };
-        Self::new(
-            bound_index,
-            expected_len,
-            DaePlan::Stream(StreamedSqlType::VarBinaryMax),
-            None,
-            binding,
-            None,
-        )
+        Self::new(bound_index, expected_len, false, None, binding, None)
     }
 
     /// Same, with the binding's C and SQL types set, for the tests that depend
@@ -922,6 +926,15 @@ impl DaeParam {
     pub(crate) fn with_length_limit(mut self, limit: DaeLengthLimit) -> Self {
         self.length_limit = Some(limit);
         self
+    }
+
+    pub(crate) fn is_buffered(&self) -> bool {
+        self.buffered
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_buffered(&mut self, buffered: bool) {
+        self.buffered = buffered;
     }
 }
 
@@ -1106,7 +1119,7 @@ impl DaeState {
             Some(cursor) => self
                 .params
                 .get(cursor..)
-                .is_some_and(|rest| !rest.is_empty() && rest.iter().all(|p| !p.plan.is_buffered())),
+                .is_some_and(|rest| !rest.is_empty() && rest.iter().all(|p| !p.is_buffered())),
             None => false,
         }
     }
@@ -1115,10 +1128,16 @@ impl DaeState {
     /// giving each remaining parameter the transcode its chunks need.
     pub(crate) fn begin_streaming_phase(&mut self, client: TdsClient, collation: SqlCollation) {
         for param in &mut self.params {
-            if !param.plan.is_buffered() && param.transcode.is_none() {
-                let transcode =
+            if !param.is_buffered() && param.transcode.is_none() {
+                let validates_encoded_input = param
+                    .length_limit
+                    .is_some_and(|limit| limit.requires_encoded_input());
+                let mut transcode =
                     DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
-                if !transcode.is_passthrough() {
+                if validates_encoded_input {
+                    transcode = transcode.with_passthrough_validation();
+                }
+                if validates_encoded_input || !transcode.is_passthrough() {
                     param.transcode = Some(transcode);
                 }
             }
@@ -1502,6 +1521,7 @@ impl StmtState {
     /// command ordinal restarts rather than climbing across executions.
     pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
         self.column_metadata = metadata;
+        self.result_generation = self.result_generation.wrapping_add(1);
         self.refresh_metadata_caches();
         self.rows_returned = 0;
         self.current_command += 1;
@@ -1520,6 +1540,7 @@ impl StmtState {
     /// Clears result metadata and every cache derived from it.
     pub(crate) fn clear_result_metadata(&mut self) {
         self.column_metadata.clear();
+        self.result_generation = self.result_generation.wrapping_add(1);
         self.column_names_utf16.clear();
     }
 
@@ -1658,7 +1679,194 @@ impl HasDiagnostics for StmtState {
 unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
+#[derive(Debug, Default)]
+struct StatementCancellation {
+    handle: CancelHandle,
+    active: bool,
+    trace_execution: Option<u64>,
+    requested: bool,
+    waiters: usize,
+    cancelling: bool,
+}
+
+impl StatementCancellation {
+    fn replace_handle(&mut self) {
+        let timeout_secs = self.handle.cancel_timeout_secs();
+        self.handle = CancelHandle::new();
+        if let Some(seconds) = timeout_secs {
+            self.handle.set_cancel_timeout_secs(seconds);
+        }
+    }
+}
+
+pub(crate) struct StatementOperation<'a> {
+    stmt: &'a StmtHandle,
+    active: bool,
+}
+
+impl StatementOperation<'_> {
+    /// Atomically finish a DAE call if cancellation did not arrive. Otherwise
+    /// retain ownership while its buffered/parked request is unwound.
+    pub(crate) fn finish_unless_cancelled(&mut self) -> Result<bool, odbc_types::SqlReturn> {
+        let Ok(mut state) = self.stmt.cancel.lock() else {
+            error!("finishing DAE operation: cancel mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        if state.requested {
+            return Ok(false);
+        }
+        state.active = false;
+        self.active = false;
+        self.stmt.operation_finished.notify_all();
+        Ok(true)
+    }
+}
+
+impl Drop for StatementOperation<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        match self.stmt.cancel.lock() {
+            Ok(mut state) => {
+                // This call settled the signal; the latched token must not
+                // reach a later call that reuses the statement's handle.
+                if state.requested {
+                    state.replace_handle();
+                }
+                state.active = false;
+                self.stmt.operation_finished.notify_all();
+            }
+            Err(_) => error!("finishing statement operation: cancel mutex poisoned"),
+        }
+    }
+}
+
+pub(crate) struct StatementCancel<'a> {
+    stmt: &'a StmtHandle,
+    pub(crate) interrupted: bool,
+}
+
+impl Drop for StatementCancel<'_> {
+    fn drop(&mut self) {
+        match self.stmt.cancel.lock() {
+            Ok(mut state) => {
+                state.waiters -= 1;
+                state.cancelling = false;
+                self.stmt.operation_finished.notify_all();
+            }
+            Err(_) => error!("finishing cancellation: cancel mutex poisoned"),
+        }
+    }
+}
+
 impl StmtHandle {
+    #[cfg(test)]
+    pub(crate) fn cancellation_state_for_test(&self) -> (bool, bool) {
+        let state = self.cancel.lock().unwrap();
+        (state.active, state.requested)
+    }
+
+    fn cancel_timeout_secs(&self) -> Result<u32, odbc_types::SqlReturn> {
+        let Ok(state) = self.parent_dbc().inner.lock() else {
+            error!("reading cancellation timeout: dbc mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        Ok(state.cancel_timeout_secs())
+    }
+
+    /// Track the whole call, including its final client hand-back and state
+    /// updates. The guard holds no mutex across I/O.
+    pub(crate) fn begin_operation(&self) -> Result<StatementOperation<'_>, odbc_types::SqlReturn> {
+        let timeout_secs = self.cancel_timeout_secs()?;
+        let Ok(mut state) = self.cancel.lock() else {
+            error!("starting statement operation: cancel mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        while state.active || state.waiters != 0 {
+            state = match self.operation_finished.wait(state) {
+                Ok(state) => state,
+                Err(_) => {
+                    error!("waiting for statement operation: cancel mutex poisoned");
+                    return Err(odbc_types::SQL_ERROR);
+                }
+            };
+        }
+        state.trace_execution = self
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.operation_execution());
+        state.active = true;
+        state.requested = false;
+        state.handle.set_cancel_timeout_secs(timeout_secs);
+        Ok(StatementOperation {
+            stmt: self,
+            active: true,
+        })
+    }
+
+    /// Signal before waiting, and keep a new call from entering until this
+    /// cancellation has finished inspecting any parked DAE state.
+    pub(crate) fn cancel_operation(&self) -> Result<StatementCancel<'_>, odbc_types::SqlReturn> {
+        let timeout_secs = self.cancel_timeout_secs()?;
+        let Ok(mut state) = self.cancel.lock() else {
+            error!("cancelling statement operation: cancel mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        let interrupted = state.active;
+        if let Some(trace) = &self.trace {
+            trace.correlate_cancellation(if interrupted {
+                state.trace_execution
+            } else {
+                trace.last_execution()
+            });
+        }
+        state.handle.set_cancel_timeout_secs(timeout_secs);
+        if interrupted {
+            state.requested = true;
+            state.handle.cancel();
+        }
+        state.waiters += 1;
+        while state.active || state.cancelling {
+            state = match self.operation_finished.wait(state) {
+                Ok(state) => state,
+                Err(_) => {
+                    error!("waiting for cancellation settlement: cancel mutex poisoned");
+                    return Err(odbc_types::SQL_ERROR);
+                }
+            };
+        }
+        state.cancelling = true;
+        Ok(StatementCancel {
+            stmt: self,
+            interrupted,
+        })
+    }
+
+    /// Publish while holding `inner`, before setting EXEC_STARTED. Cancellation
+    /// and replacement serialize on `cancel`, so an old signal cannot reach a
+    /// subsequent execution.
+    pub(crate) fn new_execution_cancel(&self) -> Result<CancelHandle, odbc_types::SqlReturn> {
+        let Ok(mut cancel) = self.cancel.lock() else {
+            error!("starting execution: cancel mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        cancel.replace_handle();
+        if cancel.requested {
+            cancel.handle.cancel();
+        }
+        Ok(cancel.handle.child_handle())
+    }
+
+    /// Continue the same execution when SQLParamData opens a deferred RPC.
+    pub(crate) fn execution_cancel(&self) -> Result<CancelHandle, odbc_types::SqlReturn> {
+        let Ok(cancel) = self.cancel.lock() else {
+            error!("continuing execution: cancel mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        Ok(cancel.handle.child_handle())
+    }
+
     /// Called after releasing descriptor locks. Records beyond this SQL's
     /// markers cannot change its prepared declaration.
     /// A plan parked in DAE is not a mutation target: SQLBindParameter and
@@ -1684,6 +1892,7 @@ impl StmtHandle {
     /// zero (msodbcsql `sqlcfunc.cpp:173`).
     pub(crate) fn new(parent_dbc: *mut c_void, query_timeout: u32) -> Self {
         Self {
+            trace: mssql_tds::trace_context::enabled().then(std::sync::Arc::default),
             object_type: HandleType::Stmt,
             parent_dbc,
             ard: handle_to_raw(Box::new(DescHandle::new(
@@ -1706,10 +1915,13 @@ impl StmtHandle {
                 SQL_DESC_ALLOC_AUTO,
                 parent_dbc,
             ))),
+            cancel: Mutex::new(StatementCancellation::default()),
+            operation_finished: Condvar::new(),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 text_output: TextOutput::UTF8,
                 column_metadata: Vec::new(),
+                result_generation: 0,
                 column_names_utf16: Vec::new(),
                 plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
@@ -1793,6 +2005,124 @@ impl Drop for StmtHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_timeout_reaches_existing_execution_children() {
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let operation = stmt.begin_operation().unwrap();
+        let child = stmt.new_execution_cancel().unwrap();
+        assert_eq!(child.cancel_timeout_secs(), Some(120));
+        drop(operation);
+        stmt.parent_dbc().inner.lock().unwrap().connection_timeout = 2;
+        let fetch = stmt.begin_operation().unwrap();
+        assert_eq!(child.cancel_timeout_secs(), Some(2));
+        drop(fetch);
+        stmt.parent_dbc().inner.lock().unwrap().connection_timeout = 3;
+        let cancel = stmt.cancel_operation().unwrap();
+        assert_eq!(child.cancel_timeout_secs(), Some(3));
+        drop(cancel);
+    }
+
+    #[test]
+    fn concurrent_cancellers_serialize_cleanup_and_exclude_new_operations() {
+        use std::time::{Duration, Instant};
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let operation = stmt.begin_operation().unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut releases = Vec::new();
+            for id in 0..2 {
+                let tx = tx.clone();
+                let (release, released) = std::sync::mpsc::channel();
+                releases.push(release);
+                scope.spawn(move || {
+                    let cancellation = stmt.cancel_operation().unwrap();
+                    tx.send(id).unwrap();
+                    released.recv_timeout(Duration::from_secs(2)).unwrap();
+                    drop(cancellation);
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while stmt.cancel.lock().unwrap().waiters != 2 {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            scope.spawn(move || {
+                let _next = stmt.begin_operation().unwrap();
+                tx.send(2).unwrap();
+            });
+            drop(operation);
+            let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(first < 2);
+            assert!(rx.recv_timeout(Duration::from_millis(25)).is_err());
+            releases[first].send(()).unwrap();
+            let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(second < 2);
+            assert!(rx.recv_timeout(Duration::from_millis(25)).is_err());
+            releases[second].send(()).unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn cancellation_waits_for_operation_cleanup_without_holding_statement_locks() {
+        use std::time::{Duration, Instant};
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            "SELECT 1",
+            mssql_mock_tds::QueryResponse::select_one().with_delay(Duration::from_millis(100)),
+        );
+        let operation = stmt.begin_operation().unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cancel = scope.spawn(move || {
+                let cancellation = stmt.cancel_operation().unwrap();
+                assert!(cancellation.interrupted);
+                tx.send(()).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !stmt.cancel.lock().unwrap().requested {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            // A cancellation before token publication must reach this request.
+            let handle = stmt.new_execution_cancel().unwrap();
+            let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+            let result = dbc.runtime.block_on(client.execute(
+                "SELECT 1".to_string(),
+                mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(&handle),
+            ));
+            assert!(matches!(result, Err(TdsError::OperationCancelledError(_))));
+            dbc.inner.lock().unwrap().client = Some(client);
+            assert!(rx.try_recv().is_err());
+            drop(stmt.inner.lock().unwrap());
+            drop(stmt.parent_dbc().inner.lock().unwrap());
+            drop(operation);
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cancel.join().unwrap();
+        });
+        let next = stmt.begin_operation().unwrap();
+        let fresh = stmt.new_execution_cancel().unwrap();
+        assert!(!stmt.cancel.lock().unwrap().requested);
+        let mut client = dbc.inner.lock().unwrap().client.take().unwrap();
+        dbc.runtime.block_on(async {
+            client
+                .execute(
+                    "SELECT 1".to_string(),
+                    mssql_tds::connection::tds_client::ExecuteOptions::new().cancel(&fresh),
+                )
+                .await
+                .unwrap();
+            client.close_query().await.unwrap();
+        });
+        dbc.inner.lock().unwrap().client = Some(client);
+        drop(next);
+    }
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
     use mssql_tds::test_client_support::int_columns;
@@ -1919,7 +2249,7 @@ mod tests {
     #[test]
     fn buffered_phase_completes_only_when_remaining_params_stream() {
         let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
-        buffered.plan = DaePlan::Buffer;
+        buffered.set_buffered(true);
         let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None);
         let mut dae = DaeState::for_test(vec![buffered, streamed], None);
 
@@ -1940,14 +2270,14 @@ mod tests {
                 row_index: 0,
             },
         );
-        row_control.plan = DaePlan::Buffer;
+        row_control.set_buffered(true);
         let mut cell =
             DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(DaeTarget::TvpCell {
                 tvp_index: 0,
                 row_index: 0,
                 column_index: 0,
             });
-        cell.plan = DaePlan::Buffer;
+        cell.set_buffered(true);
         let next_param = DaeParam::unbounded(1, std::ptr::null_mut(), None);
         let mut dae = DaeState::for_test(
             vec![
@@ -1984,7 +2314,7 @@ mod tests {
         use mssql_tds::test_client_support::tds_client_from_tokens;
 
         let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
-        buffered.plan = DaePlan::Buffer;
+        buffered.set_buffered(true);
         let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None)
             .with_binding_types(SQL_C_CHAR, SQL_WVARCHAR);
         let mut dae = DaeState::for_test(vec![buffered, streamed], Some(1));

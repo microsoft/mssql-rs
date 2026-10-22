@@ -11,6 +11,7 @@ pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
 pub(crate) const SQLSTATE_01S00: [u8; 5] = *b"01S00";
 pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
+pub(crate) const SQLSTATE_01S05: [u8; 5] = *b"01S05";
 pub(crate) const SQLSTATE_01S07: [u8; 5] = *b"01S07";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
@@ -66,6 +67,7 @@ pub(crate) const SQLSTATE_HY113: [u8; 5] = *b"HY113";
 /// elapsed before the driver got a response. Distinct from `HY000` so an
 /// application can tell "my deadline passed" from "something else broke".
 pub(crate) const SQLSTATE_HYT00: [u8; 5] = *b"HYT00";
+pub(crate) const SQLSTATE_HY008: [u8; 5] = *b"HY008";
 
 // Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
 // message text. Bundling the two means a call site posts one value and can't
@@ -85,6 +87,10 @@ pub(crate) struct DiagMsg {
 pub(crate) const ERR_INVALID_CURSOR_STATE: DiagMsg = DiagMsg {
     state: SQLSTATE_24000,
     text: "Invalid cursor state",
+};
+pub(crate) const ERR_OPERATION_CANCELED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY008,
+    text: "Operation canceled",
 };
 pub(crate) const ERR_CONNECTION_DOES_NOT_EXIST: DiagMsg = DiagMsg {
     state: SQLSTATE_08003,
@@ -374,6 +380,10 @@ pub(crate) const ERR_ATTRIBUTE_CANNOT_BE_SET_NOW: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
     state: SQLSTATE_01S00,
     text: "Invalid connection string attribute",
+};
+pub(crate) const WARN_CANCEL_TREATED_AS_CLOSE: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S05,
+    text: "Cancel treated as FreeStmt/Close",
 };
 pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
     state: SQLSTATE_HY090,
@@ -708,6 +718,8 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     let sqlstate = match err {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
+        TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
+        TdsError::OperationCancelledError(_) => SQLSTATE_HY008,
         _ => default,
     };
     post_sql_error(state, sqlstate, 0, err.to_string());
@@ -960,6 +972,19 @@ mod tests {
         assert_eq!(s.records[0].native_error, 0);
     }
 
+    #[test]
+    fn encoded_value_overflow_maps_to_22001() {
+        let mut s = FakeState::default();
+        let err = TdsError::EncodedValueTooLong {
+            actual: 5,
+            maximum: 3,
+        };
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_22001);
+        assert_eq!(s.records[0].native_error, 0);
+    }
+
     /// A client-side deadline elapsing (`SQL_ATTR_QUERY_TIMEOUT` /
     /// `SQL_ATTR_CONNECTION_TIMEOUT`) must report `HYT00` regardless of the
     /// caller's `default`, matching msodbcsql — see mssql-rs#439.
@@ -973,6 +998,15 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HYT00);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn post_tds_error_cancel_maps_to_hy008_regardless_of_default() {
+        let mut s = FakeState::default();
+        let err = TdsError::OperationCancelledError("Request was cancelled".to_string());
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HY008);
     }
 
     #[test]

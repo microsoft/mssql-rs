@@ -57,6 +57,24 @@ implements it, and deliberate departures from msodbcsql are recorded in the
 [parity registry](docs/parity-deviations.md). Subsystem design notes live in
 [`docs/`](docs/).
 
+### Data-at-execution parameters
+
+PLP-capable values supplied through `SQLParamData`/`SQLPutData` are streamed to
+SQL Server as chunks rather than retained as a complete value. This includes
+`varchar(max)`, `nvarchar(max)`, `varbinary(max)`, XML, and CLR UDT parameters.
+Character input is transcoded incrementally when its application and wire
+encodings differ. XML uses UTF-16LE on the wire and is normalized to exactly one
+leading byte-order mark; CLR UDT chunks remain their opaque serialized bytes.
+
+Streaming keeps peak memory bounded by the active conversion and packet buffers
+when every remaining DAE parameter is streamable. Bind order is observable in a
+mixed sequence: a streamable parameter before a fixed-width or otherwise
+buffered parameter is collected whole until that later parameter is available,
+because `SQLParamData` tokens must remain in bind order. Once no buffered
+parameters remain, subsequent PLP values stream normally. Validation that
+depends on the completed value can occur during `SQLPutData` or when
+`SQLParamData` closes the parameter rather than at bind time.
+
 ## Platform artifacts
 
 | Platform | Driver Manager | Library |
@@ -97,6 +115,14 @@ Run the Rust test suite from the repository root:
 
 ```bash
 cargo nextest run -p mssqlodbc --lib
+```
+
+The application-thread stack regression also runs in debug/coverage builds with
+a larger 512 KiB budget for unoptimized frames. To enforce the 128 KiB release
+stack budget, run:
+
+```bash
+cargo nextest run --release --frozen -p mssqlodbc --lib -E 'test(exec_direct_on_small_stack)'
 ```
 
 ### C++ end-to-end tests
@@ -225,6 +251,58 @@ creates trace files with mode `0600`, and warns on stderr when
 system temporary directory. Configuration is captured on the first ODBC call: a
 relative directory is resolved to an absolute path at that point, and the
 settings cannot be changed while the driver stays loaded.
+
+Connection-scoped events include `dbc` (process-local connection handle ID) and
+`cid` (the full physical client connection GUID). Statement calls also include
+`stmt`; command execution and subsequent fetch/result calls include `exec`.
+For example:
+
+```text
+2026-10-09T17:24:01.108Z, 19, ERROR, mssqlodbc::api::exec_direct, dbc=17 cid=8A73124F-61D2-4B8E-9A37-2C095D8146AB stmt=42 exec=8 SQLExecDirectW: execution failed
+```
+
+Filter by `cid` to find the connection directly, or by `dbc`, `stmt`, and `exec`
+to isolate an execution. Local IDs are scoped to one driver load/process; retain
+the process-identifying filenames when combining captures. A reconnect changes
+`cid` but retains `dbc`. Pool reset without reconnect retains `cid`. Startup,
+environment-wide calls, invalid handles, and connection attempts before PRELOGIN
+have `cid=-`. Authentication workers retain the identity of the attempt that
+started them, even if a timeout lets a later attempt begin.
+MultiSubnetFailover connection tasks carry context during each future poll;
+TCP attempts, including retries, redirects, and recovery, have `cid=-` until
+PRELOGIN supplies a GUID. The connection-ID getter retains the last established
+GUID until recovery succeeds. `SQLDescribeParam`
+metadata RPCs have their own execution sequence; cached descriptions do not
+replace the active result's sequence.
+Only result/stream continuation and cleanup APIs inherit the last accepted
+execution's `exec`; this includes `SQLRowCount` after a completed no-row command.
+Preparation, binding, and statement-configuration calls omit `exec` so their
+errors cannot be attributed to an earlier command.
+`SQLCancel`'s entry event omits `exec` until it selects the target under the
+cancellation lock. Its target/return events then identify the interrupted
+operation, including cancellation before the starter publishes its token.
+Successful preparation also invalidates the prior execution identity: metadata
+probes for the replacement statement have no `exec` until it executes.
+Diagnostic retrieval logs identify the connection and statement but omit `exec`:
+a rejected concurrent call may have replaced diagnostics without replacing the
+active result. Use the generating call's error/return event for its execution ID.
+Unassociated background-library events have no connection context.
+
+Applications can retrieve the same uppercase GUID string using
+`SQLGetConnectAttrW(SQL_COPT_SS_CLIENT_CONNECTION_ID)`: it needs 74 bytes including
+the UTF-16 terminator, and the returned length is 72 bytes. This is a string, not
+a binary GUID. The attribute is read-only and requires an established connection.
+The GUID matches PRELOGIN's connection ID and SQL Server Extended Events that
+capture `client_connection_id`. `exec` is a local execution sequence, not a TDS
+ActivityID or a server request identifier.
+
+At `warn`, failing events carry correlation but successful command history is
+not collected. Use `warn,mssqlodbc=debug` for command entry/return events; add
+`mssql_tds=debug` for more protocol detail. Correlation itself adds no SQL text
+or parameter values, but existing events can contain them. Full GUIDs increase
+trace size and make files rotate sooner. Disabled tracing skips correlation
+lookup, formatting, and statement trace allocation; enabled API calls look up
+handle identity once, and event formatting takes no handle locks.
 
 Writing starts in `mssql_tds_trace_<timestamp>_<pid>.log`. Each rollover creates
 the next numbered file (`.1.log`, `.2.log`, ...) and continues there, so the

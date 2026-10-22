@@ -77,37 +77,16 @@ msodbcsql build is measured.
    AB#47564 removes the retrieval deviation: columns and output parameters
    use platform client encoding, with native conversion and optional
    `SQL_COPT_SS_WARN_ON_CP_ERROR` diagnostics. `SQL_C_WCHAR` remains UTF-16LE.
-4. **Parameter length is measured in UTF-16 units for both character C types.**
-   msodbcsql counts UTF-16 units in three of its four arms - both wide-source
-   arms, and the narrow-to-wide walk, which counts an astral character as two
-   (`odbc/sqlcfunc.cpp:2935`) - but counts source bytes for narrow-to-narrow
-   (`cchDest = cbData`, `:2952`). That byte count is the wire length only while
-   no client-side transcode happens: TDS carries a collation with char data, so
-   the bytes normally ship under a declared collation and the server converts.
-   `DoCharToCharConversion` (`odbc/sqlcprot.h:4113`) enables client-side
-   conversion for an encoding TDS cannot name - a UTF-8 client against a
-   non-UTF-8 server, or the ISO-8859-x range - and translation is on by default
-   (`SQL_XL_DEFAULT`). In that configuration msodbcsql transcodes yet still
-   measures the *pre-transcode* UTF-8 bytes, so it rejects a four-character
-   accented string from a `varchar(4)` that the four bytes it actually sends
-   would fit, while accepting the same value as `SQL_C_WCHAR`. Because this
-   driver's `SQL_C_CHAR` is always UTF-8, copying the byte rule made that
-   latent msodbcsql defect unconditional. The uniform unit is therefore taken
-   to stop the two C types disagreeing on one value, not to match msodbcsql -
-   it is a divergence in the configuration closest to this driver, on the same
-   footing as the narrow-to-wide off-by-one at `sqlcfunc.cpp:2926` that is also
-   deliberately not replicated. The count still errs low against a `_UTF8` or
-   DBCS collation: a bounded `char`/`varchar` surfaces `HY000` from
-   `serialize_char_varchar_direct` rather than `22001`, and the `max` and
-   `text`/`ntext` types carry no check at all and send the over-long value.
-   **This regresses a subset of inputs rather than being a pure win** - three
-   U+2615 into `varchar(3)` was a correct `22001` and is now an opaque failure,
-   so CJK and astral input bound with an exact character count is the shape that
-   suffers. Taken because over-rejection has no application workaround while
-   under-rejection still errors, and because byte-counting both C types would
-   break the wide arm that msodbcsql gets right. Exactness needs the collation at
-   this layer. Signed off by Theekshna Kotian (product owner) on 2026-08-27.
-   Tracked in AB#47584.
+4. **Narrow parameter length is measured after destination transcoding.**
+   `varchar(n)` bounds bytes in the database collation, so both `SQL_C_CHAR`
+   and `SQL_C_WCHAR` are converted to that encoding before the bound is
+   applied. msodbcsql follows this rule for wide input, but its
+   narrow-to-narrow arm can count client bytes before conversion
+   (`odbc/sqlcfunc.cpp:2952`). Because this driver's `SQL_C_CHAR` is always
+   UTF-8, copying that rule would reject an accented UTF-8 value that becomes
+   one byte in CP1252. The driver therefore measures the actual destination
+   bytes for both C types. Overflow consisting only of trailing spaces is
+   trimmed; any other overflow is `22001`. Implemented by AB#47584.
 5. **An integer parameter bound to a character type is length-checked.**
    msodbcsql length-checks no integer C type (`odbc/sqlcfunc.cpp:2586`, `:2854`,
    `:3165`, `:3177`); what it does instead is undefined per build. Binding
@@ -816,12 +795,10 @@ msodbcsql build is measured.
     previously sent the LCID's single-byte encoding under a collation they had
     declared as `_UTF8` or a CP437/CP850 sort ID, storing corrupt cells rather
     than merely mis-framed ones; that is fixed. The corollary is that
-    deviation 4's over-length behaviour now reaches them as well -- a cell that
-    fit before can exceed its declared length once the encoding grows it, and
-    on those routes it surfaces mid-stream rather than before the first row is
-    written. Deviation 4's sign-off was given for the ODBC parameter layer and
-    does not extend to bulk copy or TVP; AB#47584 owns closing that gap for all
-    three.
+    encoded-length validation now reaches them as well -- a cell that fit
+    before can exceed its declared length once the encoding grows it. Bulk copy
+    and TVP serialization report the typed overflow where the row is written;
+    RPC parameters preflight it before the request is sent.
 25. **An array size of 0 is rejected with `HY024` on three of the four
     spellings; msodbcsql accepts and stores it on all four.** msodbcsql has no
     lower-bound check anywhere: `IsSetStmtOptionValid` (`odbc/sqlcmisc.cpp`)
@@ -914,8 +891,8 @@ msodbcsql build is measured.
     makes it a supported application path that reaches the driver normally. A
     `--compare-with-msodbcsql` case that writes the descriptor from one thread
     while another is blocked in `SQLFetch`/`SQLExecute` would close it. That
-    case does not exist yet: the e2e suite has no two-thread fixture outside
-    `session_recovery_test`, and the Rust unit tests reach the refusal by
+    case does not exist yet: the e2e suite does not exercise concurrent
+    descriptor-header writes, and the Rust unit tests reach the refusal by
     setting `STMT_STATE_FETCH_IN_PROGRESS` / `STMT_STATE_EXEC_STARTED`
     directly rather than through a real in-flight call. Until it does, treat
     the msodbcsql half of this entry as read from source and not observed.
@@ -924,3 +901,212 @@ msodbcsql build is measured.
     status and rows-processed pointers, and to every header-alias attribute
     plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
     so reaches the same `readers_through` walk through `set_desc_header`.
+
+27. **Cancellation of a blocked `SQLMoreResults` reports `SQL_ERROR` / `HY008`
+    rather than silently ending result navigation.** In the measured sequence
+    (an unread large first row, `WAITFOR`, then a second result), native
+    `SQLMoreResults` returns `SQL_NO_DATA` after cross-thread cancellation.
+    Its synchronous path flushes the old result and reports no data when the
+    batch no longer owns pending results (`Sql/Ntdbms/sqlncli/odbc/sqlcresl.cpp`,
+    `ExportImp::SQLMoreResults`, the `!IsBusyWithMe` / no-results branch at
+    lines 238-246); the explicit cancellation-to-`IDS_S1_008` check at lines
+    170-185 is in its asynchronous branch.
+
+    This driver preserves the explicit cancellation outcome across execute,
+    fetch, GetData, and MoreResults instead of treating cancellation as normal
+    exhaustion. This does not change teardown ordering: both drivers settle the
+    interrupted operation before successful cross-thread SQLCancel returns, so
+    immediately calling SQLFreeStmt(SQL_CLOSE) is safe.
+
+    The same choice covers a signal that lands after the call's last read but
+    before it returns. msodbcsql's `SQLCancel` sends ATTN while that call still
+    holds `csStmt` (`sqlcmisc.cpp:759`), and the next call to read the batch
+    reports `HY008` (`sqlccmd.cpp:11821-11826`). This driver settles the
+    pending response in the call that was interrupted, so `HY008` is reported
+    one call earlier and a cancellation never reaches a later call or a
+    subsequent close. A response already fully received is left intact in both
+    drivers. This half is read from source and covered by Rust unit tests; it
+    has not been measured against native, because the window is not
+    reproducible from an application.
+
+    **Evidence level: measured.** The `CancelLiveTest` MoreResults cases record
+    `SQL_DRIVER_VER` and assert each driver's exact return code. Measured on
+    Linux through unixODBC with `Threading=0`, native library
+    `libmsodbcsql-18.6.so.1.1` / `SQL_DRIVER_VER=18.06.0001`, against SQL Server
+    2025 CU9 (`17.0.5005.3`). The same sequence was also measured through
+    Windows Driver Manager against native `SQL_DRIVER_VER=18.06.0001` with
+    the same result. Other native builds have not been measured.
+
+    Explicitly approved by the requester on 2026-10-07 for
+    [AB#49223](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49223):
+    retain HY008, document the difference, and match native teardown ordering.
+28. **Connection-scoped trace events carry the full client connection GUID.**
+    Classic ODBC's `CConnection::SendPreloginPacket`
+    (`Sql/Ntdbms/sqlncli/tds/prelogin.cpp`, TRACEID branch) logs the GUID at
+    PRELOGIN; its BID handle-allocation records link statements to connections.
+    AB#48090 requests direct correlation rather than that two-step lookup.
+    This driver adds `dbc`, `cid`, `stmt`, and `exec` context to existing events,
+    including nested TDS events, without rendering arbitrary tracing-span fields.
+    Environment-wide and invalid-handle events do not invent a connection ID.
+    Command returns are DEBUG events so a DEBUG collection includes both ends.
+
+    This deliberately increases enabled trace volume in exchange for
+    independently useful incident lines and correlation across rotated files.
+    No wire request or query is added. The full GUID is preferred to a
+    collision-prone abbreviation. Approved by David Engel on 2026-10-09.
+    Tracked in [AB#48090](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48090).
+
+    The native per-line-format comparison is source evidence, not a captured
+    retail BID trace; a retail BID capture remains the measurement needed to
+    confirm that half. The connection-ID attribute itself is not a deviation:
+    Windows msodbcsql `SQL_DRIVER_VER=18.06.0001` (DLL file version
+    `2018.0186.0001.01`), tested against SQL LocalDB 17.0.4085.5, returns an
+    uppercase 36-character GUID string (72 UTF-16 bytes),
+    supports a null length probe, reports `01004` on truncation, `HY092` on SET,
+    and `08003` after disconnect. Its getter's `PrintGUID`/`fCopyStrToBuffer`
+    branch in `odbc/sqlcmisc.cpp` is the implementation reference.
+    On the same server, the Rust getter, command trace, and an Extended Events
+    `sql_batch_starting` capture with the `client_connection_id` action reported
+    the identical GUID; the deterministic PRELOGIN test pins the byte order
+    and the connection/activity field order independently.
+
+29. **A large XML input supplied through data-at-execution treats its
+    `ColumnSize` as unlimited.** msodbcsql rejects `SQL_SS_XML` above 4,000 with
+    `HY104`: `CheckSqlPrec`'s `SQL_XML_MAPPED` arm uses the
+    `SQL_PREC_NCHAR` ceiling (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`), reached
+    from `SQLBindParameter` through `CheckSqlPrecScale<TRUE>`. This driver keeps
+    that result for materialized XML, but admits an input or input/output
+    binding above the ceiling because `StrLen_or_IndPtr` is deferred input and
+    need not be initialized until execution. The original `ColumnSize` remains
+    in the descriptor and is revalidated against the positioned execution-time
+    indicator: data-at-execution values use unlimited XML semantics, including
+    when a mixed DAE sequence must collect an earlier value to preserve bind
+    order. A non-DAE materialized value reports `HY104` from
+    `SQLExecute`/`SQLExecDirect` rather than from `SQLBindParameter`.
+
+    mssql-python preserves the caller's `setinputsizes((SQL_SS_XML, n, 0))`
+    size when it switches values above 4,000 to data-at-execution. Rejecting
+    that shape prevents the PLP streaming path from running at all, while XML
+    has no bounded TDS declaration to preserve. The exception is limited to
+    input and input/output bindings, and execution-time revalidation keeps
+    ordinary oversized materialized values rejected. `LargeXmlStreamsThroughDataAtExecution`
+    covers the consumer's binding shape and is skipped on the comparison leg
+    because the reference driver rejects it. Tracked in AB#48349.
+
+30. **A streamed XML value that already starts with a UTF-16LE byte-order mark
+    keeps exactly one mark; msodbcsql sends two.** msodbcsql's
+    `ConvertLongData` uses `fPrependXmlBOM` (`odbc/sqlccnvt.cpp:879-911`),
+    selected by `WAITING_FOR_DATA` on the first `SQLPutData` call
+    (`odbc/sqlccmd.cpp:4860-4876`), to prepend `XML_BOM_BYTES` before forwarding
+    the application's bytes unchanged. It does not inspect those bytes, so an
+    application-supplied `FF FE` follows the driver's `FF FE`.
+
+    This driver buffers at most the first two XML bytes across `SQLPutData`
+    calls. It emits one `FF FE` itself and suppresses the buffered bytes only
+    when they are the same mark. This matches the materialized XML serializer,
+    avoids a duplicate XML declaration marker, and preserves all non-BOM input.
+    Wire-level tests cover an absent BOM, a BOM split across calls, and later
+    chunks after BOM classification. Tracked in AB#48349.
+
+31. **A busy connection's alias-type lookup logs in with the session's own
+    authentication and encryption settings.** Both drivers read alias type
+    names for `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME` on the session
+    when it is idle, and on a separate login while rows are pending
+    (`RefreshShilohUDTCache`, `sqlccmd.cpp`). msodbcsql's `SpawnConnection`
+    (`sqlcinfo.cpp`) builds that login from a fixed list of keywords - DSN,
+    server or read-only routing target, failover partner, UID, PWD, current
+    database, language, application intent, multi-subnet failover, TNIR,
+    column encryption, vector support, `ConnectRetryCount=0` - and copies only
+    the login timeout and `SQL_COPT_SS_INTEGRATED_SECURITY` among connection
+    attributes. It carries no `Authentication` keyword, no
+    `SQL_COPT_SS_ACCESS_TOKEN`, and no `Encrypt` or `TrustServerCertificate`;
+    a `TrustServerCertificate=yes` in the session's DSN does not reach it
+    either. An Entra- or token-authenticated session's lookup therefore logs in
+    without its credentials, and against a server that forces encryption with a
+    certificate the client trusts only through `TrustServerCertificate`, the
+    lookup fails the certificate check; either way the column keeps its base
+    type name. This driver logs in from the session's retained login context
+    (`TdsClient::secondary_client_context`), with the current database and
+    connection retry disabled, so the lookup succeeds wherever the session's
+    own login did, for every method that signs in silently. Methods that may
+    prompt (`ActiveDirectoryInteractive`, `ActiveDirectoryDeviceCodeFlow`) are
+    never replayed, which leaves those sessions with msodbcsql's result rather
+    than a sign-in window mid-call. Matching the reference would mean
+    discarding credentials and trust settings the application supplied only to
+    make the lookup fail. `SQL_USER_NAME` never takes this path (AB#48942; see
+    `docs/sql-get-info-plan.md`).
+    Measured with msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`), SQL
+    authentication, and `TrustServerCertificate=Yes` against SQL Server 2025,
+    2026-10-15. On a server that does not force encryption (17.00.4025),
+    msodbcsql reports the alias name through the Windows Driver Manager and
+    through unixODBC on Ubuntu 22.04. On one that forces encryption with a
+    self-signed certificate (17.00.4085), it reports `varchar` through both,
+    with the setting in the connection string or, on Ubuntu, in the DSN, as it
+    does against CI's server (`forceencryption = 1`, a certificate from a CA
+    the test container does not trust; build 183236). This driver reports the
+    alias name against both, so
+    `AliasTypeLiveTest.NameIsReportedWhileTheCursorIsOpen` asserts only its
+    leg. **Evidence limit:** the Entra and access-token sessions are a source
+    reading only. The same test on an Entra-authenticated connection with
+    `SQL_DRIVER_VER` recorded would close it. Tracked in AB#48044. Human parity
+    sign-off has not been recorded.
+
+32. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's alias-type
+    lookup, its login included.** msodbcsql bounds the lookup on an idle
+    session with the connection timeout (`GetNetIOTimeOut`), but on a busy one
+    `RefreshShilohUDTCache` (`sqlccmd.cpp`) reads the timeout of the connection
+    it spawned, which `SpawnConnection` (`sqlcinfo.cpp`) never sets: the read
+    is unbounded and the login has only the login timeout it copies. A
+    separate login's `systypes` read waits on the session's own uncommitted
+    `CREATE TYPE`, so describing a column inside that transaction blocks
+    `SQLColAttribute` indefinitely. This driver applies one connection-timeout
+    deadline to the login and the read; past it the column keeps its base type
+    name and the next description retries. With the default timeout of 0 the
+    drivers match: the read is unbounded and the login has the login timeout.
+    `connection_timeout_bounds_a_secondary_login_and_its_read`
+    (`alias_types.rs`) pins the bound. Measured on SQL Server 2025 (17.00.4025),
+    2026-10-15: a second connection's `systypes` read blocked behind another
+    session's uncommitted `CREATE TYPE` until its 3-second command timeout.
+    **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
+    Tracked in AB#48044. Human parity sign-off has not been recorded.
+
+33. **DNS fallback is published only by a completed, accepted login.**
+    Source comparison: SNI's `GetCachedAddrInfo`
+    (`Sql/Common/DK/sni/src/dns_cache.cpp`) adds every successful resolution
+    before login and consults that cache when `GetAddressInfo` fails.
+    `BATCHCTX::ProcessFeatureExtAck`
+    (`Sql/Ntdbms/sqlncli/tds/Parse.cpp`, `FEACK_DNSCACHE` and `_EXIT`) passes its
+    local `useDNScache` verdict to `SNISetInfo`; the
+    `SNI_QUERY_CONN_DNSCACHE` arm in `Sql/Common/DK/sni/src/sni.cpp` deletes the
+    host on a false verdict. A DNS allow parsed before another malformed
+    feature remains true at that exit; no FEATUREEXTACK invokes no setter.
+
+    This driver's shared `mssql-tds` path instead retains each resolution on
+    its connection, publishing it only after LOGINACK, a successful terminal
+    DONE, and a positive DNS acknowledgement in the last FEATUREEXTACK.
+    A completed accepted response with a negative or missing DNS
+    acknowledgement removes the host. A malformed FEATUREEXTACK also
+    revokes it after that accepted response is drained, rather than keeping
+    a partial allow as SNI's source does. Rejected, incomplete, and
+    authentication-continuation responses cannot publish or remove an entry.
+    **No FEATUREEXTACK leaves the cache unchanged**, including a routing
+    response from an Azure gateway; it is not treated as a negative verdict.
+
+    The intent is to share only server-allowed addresses and keep a transient
+    rejected login from destroying the fallback needed by its next retry.
+    Consequently, a resolution followed by a failed or unacknowledged first
+    login cannot prime fallback as SNI's eager path can. Concurrent logins
+    publish their own addresses in completed-verdict order, rather than
+    keeping the most recent DNS lookup. The per-connection candidate follows
+    SqlClient's `pendingSQLDNSObject` model, not SNI's eager insertion.
+    Deterministic replay tests cover rejection after FEATUREEXTACK,
+    continuations, truncation, malformed acknowledgements, and routing with
+    no FEATUREEXTACK. Mock-server tests exercise the public connect path,
+    retained fallback, explicit revocation, and MultiSubnetFailover with an
+    unreachable first address.
+
+    **Evidence limit:** these msodbcsql comparisons are source readings, not
+    a retail-driver measurement. A controlled DNS-outage comparison against
+    a named retail build, with `SQL_DRIVER_VER` recorded, remains necessary;
+    Azure SQL Proxy/Redirect and session-recovery outage tests have not been
+    run. No human parity sign-off has been recorded. Tracked in AB#49294.

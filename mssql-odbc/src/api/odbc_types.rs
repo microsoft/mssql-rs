@@ -66,6 +66,9 @@ pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
 pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
 pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
 
+/// Physical client connection GUID string. Get-only; requires a connection.
+pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
+
 /// `SQL_COPT_SS_WARN_ON_CP_ERROR` (`SQL_COPT_SS_BASE_EX + 3`). Takes
 /// [`SQL_WARN_NO`] / [`SQL_WARN_YES`]; see
 /// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).
@@ -752,6 +755,7 @@ pub const SQL_DESC_AUTO_UNIQUE_VALUE: SqlUSmallInt = 11;
 pub const SQL_DESC_CASE_SENSITIVE: SqlUSmallInt = 12;
 pub const SQL_DESC_SEARCHABLE: SqlUSmallInt = 13;
 pub const SQL_DESC_TYPE_NAME: SqlUSmallInt = 14;
+pub const SQL_DESC_LOCAL_TYPE_NAME: SqlUSmallInt = 29;
 pub const SQL_DESC_TABLE_NAME: SqlUSmallInt = 15;
 pub const SQL_DESC_SCHEMA_NAME: SqlUSmallInt = 16;
 pub const SQL_DESC_CATALOG_NAME: SqlUSmallInt = 17;

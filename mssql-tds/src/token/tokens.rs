@@ -24,6 +24,7 @@ pub(crate) enum TokenType {
     AltRow = 0xD3,
     ColMetadata = 0x81,
     ColInfo = 0xA5,
+    DataClassification = 0xA3,
     Done = 0xFD,
     DoneProc = 0xFE,
     DoneInProc = 0xFF,
@@ -53,6 +54,7 @@ impl TryFrom<u8> for TokenType {
             0xD3 => Ok(TokenType::AltRow),
             0x81 => Ok(TokenType::ColMetadata),
             0xA5 => Ok(TokenType::ColInfo),
+            0xA3 => Ok(TokenType::DataClassification),
             0xFD => Ok(TokenType::Done),
             0xFE => Ok(TokenType::DoneProc),
             0xFF => Ok(TokenType::DoneInProc),
@@ -99,6 +101,8 @@ pub(crate) enum Tokens {
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
+    #[allow(dead_code)] // Metadata is read once it is attached to result sets.
+    DataClassification(crate::token::data_classification::DataClassificationMetadata),
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
@@ -124,6 +128,8 @@ pub enum Tokens {
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
+    /// Parsed `DATACLASSIFICATION` (0xA3) metadata.
+    DataClassification(crate::token::data_classification::DataClassificationMetadata),
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
@@ -170,6 +176,7 @@ impl Token for Tokens {
             Tokens::Sspi(token) => token.token_type(),
             Tokens::Row(token) => token.token_type(),
             Tokens::ColMetadata(token) => token.token_type(),
+            Tokens::DataClassification(_) => TokenType::DataClassification,
             Tokens::Order(token) => token.token_type(),
             Tokens::ReturnStatus(token) => token.token_type(),
             Tokens::ReturnValue(token) => token.token_type(),
@@ -185,7 +192,10 @@ pub(crate) enum EnvChangeContainer {
     String(EnvChangeTokenValuePairs<String>),
     SqlCollation(EnvChangeTokenValuePairs<Option<SqlCollation>>),
     UInt32(EnvChangeTokenValuePairs<u32>),
-    RoutingType(EnvChangeTokenValuePairs<Option<RoutingInfo>>),
+    /// Boxed: routing arrives at most once per login, and inline it would be the
+    /// largest token, growing every future that holds one
+    /// (`row_fetch_futures_stay_small`).
+    RoutingType(EnvChangeTokenValuePairs<Option<Box<RoutingInfo>>>),
     BytesType(EnvChangeTokenValuePairs<Vec<u8>>),
     UInt64(EnvChangeTokenValuePairs<u64>),
 }
@@ -212,8 +222,9 @@ impl From<(u32, u32)> for EnvChangeContainer {
 
 impl From<(Option<RoutingInfo>, Option<RoutingInfo>)> for EnvChangeContainer {
     fn from(value: (Option<RoutingInfo>, Option<RoutingInfo>)) -> Self {
-        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::<Option<RoutingInfo>>::new(
-            value.0, value.1,
+        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::new(
+            value.0.map(Box::new),
+            value.1.map(Box::new),
         ))
     }
 }
@@ -1156,6 +1167,7 @@ pub(crate) enum EnvChangeTokenSubType {
     ResetConnection,
     UserInstanceName,
     Routing,
+    EnhancedRouting,
     Unknown(u8),
 }
 
@@ -1183,6 +1195,7 @@ impl TryFrom<u8> for EnvChangeTokenSubType {
             18 => EnvChangeTokenSubType::ResetConnection,
             19 => EnvChangeTokenSubType::UserInstanceName,
             20 => EnvChangeTokenSubType::Routing,
+            21 => EnvChangeTokenSubType::EnhancedRouting,
             unknown => EnvChangeTokenSubType::Unknown(unknown),
         })
     }
@@ -1211,6 +1224,7 @@ impl EnvChangeTokenSubType {
             EnvChangeTokenSubType::ResetConnection => 18,
             EnvChangeTokenSubType::UserInstanceName => 19,
             EnvChangeTokenSubType::Routing => 20,
+            EnvChangeTokenSubType::EnhancedRouting => 21,
             EnvChangeTokenSubType::Unknown(val) => *val,
         }
     }
@@ -1231,6 +1245,10 @@ mod env_change_tests {
             EnvChangeTokenSubType::try_from(20).unwrap(),
             EnvChangeTokenSubType::Routing
         ));
+        assert!(matches!(
+            EnvChangeTokenSubType::try_from(21).unwrap(),
+            EnvChangeTokenSubType::EnhancedRouting
+        ));
 
         // Test invalid values (should not panic, should return Unknown)
         assert!(matches!(
@@ -1247,6 +1265,7 @@ mod env_change_tests {
     fn test_env_change_token_subtype_as_u8() {
         assert_eq!(EnvChangeTokenSubType::Database.as_u8(), 1);
         assert_eq!(EnvChangeTokenSubType::Routing.as_u8(), 20);
+        assert_eq!(EnvChangeTokenSubType::EnhancedRouting.as_u8(), 21);
         assert_eq!(EnvChangeTokenSubType::Unknown(30).as_u8(), 30);
     }
 }
@@ -1292,6 +1311,7 @@ mod coverage_tests {
             (0xD3, TokenType::AltRow),
             (0x81, TokenType::ColMetadata),
             (0xA5, TokenType::ColInfo),
+            (0xA3, TokenType::DataClassification),
             (0xFD, TokenType::Done),
             (0xFE, TokenType::DoneProc),
             (0xFF, TokenType::DoneInProc),
@@ -1317,8 +1337,14 @@ mod coverage_tests {
 
     #[test]
     fn token_type_try_from_invalid() {
-        assert!(TokenType::try_from(0x00).is_err());
-        assert!(TokenType::try_from(0x42).is_err());
+        let zero_error = TokenType::try_from(0x00).unwrap_err();
+        let unrelated_error = TokenType::try_from(0x42).unwrap_err();
+        assert!(zero_error.to_string().contains("Unknown token type: 0x0"));
+        assert!(
+            unrelated_error
+                .to_string()
+                .contains("Unknown token type: 0x42")
+        );
     }
 
     // ── SqlCollation accessors ──
@@ -1404,6 +1430,7 @@ mod coverage_tests {
             protocol: 0,
             port: 1433,
             server: "host.example.com".into(),
+            database: None,
         };
         let container: EnvChangeContainer = (Some(routing), None).into();
         let dbg = format!("{container:?}");

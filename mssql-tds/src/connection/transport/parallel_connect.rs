@@ -34,6 +34,7 @@ use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
+use crate::connection::dns_cache::{self, Resolution};
 use crate::core::TdsResult;
 use crate::error::Error;
 
@@ -120,6 +121,18 @@ pub async fn parallel_connect(
     port: u16,
     config: &ParallelConnectConfig,
 ) -> TdsResult<ParallelConnectResult> {
+    parallel_connect_resolving(host, port, config)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// [`parallel_connect`], also returning what `host` resolved to, which the
+/// connection's login DNS caching verdict applies to.
+pub(crate) async fn parallel_connect_resolving(
+    host: &str,
+    port: u16,
+    config: &ParallelConnectConfig,
+) -> TdsResult<(ParallelConnectResult, Resolution)> {
     info!(
         "Starting parallel connection to {}:{} with timeout {}ms",
         host, port, config.timeout_ms
@@ -132,14 +145,14 @@ pub async fn parallel_connect(
     // Resolve DNS to get all IP addresses. `lookup_host` awaits the resolution
     // instead of blocking the calling thread (unlike `std::net::ToSocketAddrs`),
     // so a slow or stuck resolver stays subject to `deadline` instead of
-    // silently escaping it.
-    let addresses: Vec<SocketAddr> = match timeout(
+    // silently escaping it. A failed resolution falls back to the DNS cache.
+    let resolution = match timeout(
         deadline.saturating_duration_since(Instant::now()),
-        tokio::net::lookup_host((host, port)),
+        dns_cache::lookup_host(host, port),
     )
     .await
     {
-        Ok(Ok(resolved)) => resolved.take(MAX_PARALLEL_IPS).collect(),
+        Ok(Ok(resolution)) => resolution,
         Ok(Err(e)) => return Err(Error::from(e)),
         Err(_elapsed) => {
             warn!(
@@ -151,6 +164,12 @@ pub async fn parallel_connect(
             )));
         }
     };
+    let addresses: Vec<SocketAddr> = resolution
+        .addresses()
+        .iter()
+        .take(MAX_PARALLEL_IPS)
+        .copied()
+        .collect();
 
     if addresses.is_empty() {
         return Err(Error::ConnectionError(format!(
@@ -212,12 +231,15 @@ pub async fn parallel_connect(
                 "Parallel connection succeeded to {} after {} failed attempts",
                 addr, failed_attempts
             );
-            Ok(ParallelConnectResult {
-                stream,
-                connected_address: addr,
-                total_addresses,
-                failed_attempts,
-            })
+            Ok((
+                ParallelConnectResult {
+                    stream,
+                    connected_address: addr,
+                    total_addresses,
+                    failed_attempts,
+                },
+                resolution,
+            ))
         }
         Ok(Err(last_error)) => {
             warn!(
@@ -394,7 +416,7 @@ async fn race_connections(
         .into_iter()
         .map(|fut| {
             let tx = tx.clone();
-            tokio::spawn(async move {
+            tokio::spawn(crate::trace_context::propagate_future(async move {
                 let result = fut.await;
                 match result {
                     Ok((stream, addr, idx)) => {
@@ -406,7 +428,7 @@ async fn race_connections(
                         let _ = tx.send(Err(e)).await;
                     }
                 }
-            })
+            }))
         })
         .collect();
 
@@ -448,6 +470,46 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn parallel_attempt_tasks_inherit_context_without_leaking_it() {
+        use crate::trace_context::{self, ConnectionTrace, Context, Snapshot, snapshot};
+        use std::sync::Arc;
+
+        trace_context::enable();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let connection = Arc::new(ConnectionTrace::default());
+        let _scope = Context::connection(connection).pending_connection().enter();
+        let expected = snapshot();
+        assert!(expected.dbc.is_some());
+        assert_eq!(expected.cid, None, "TCP attempts precede PRELOGIN");
+        let attempts = (0..2)
+            .map(|index| async move {
+                assert_eq!(snapshot(), expected);
+                tokio::task::yield_now().await;
+                assert_eq!(snapshot(), expected);
+                Err((
+                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    index,
+                ))
+            })
+            .collect();
+        let result = runtime.block_on(race_connections(attempts));
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert_eq!(snapshot(), expected);
+        let worker_context = runtime
+            .block_on(runtime.spawn(async { snapshot() }))
+            .unwrap();
+        assert_eq!(worker_context, Snapshot::default());
+    }
 
     /// Regression coverage for AB#47704: `parallel_connect` used to resolve
     /// DNS via blocking `to_socket_addrs()`, which never yields to the
