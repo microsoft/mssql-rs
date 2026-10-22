@@ -121,17 +121,20 @@ pub async fn parallel_connect(
     port: u16,
     config: &ParallelConnectConfig,
 ) -> TdsResult<ParallelConnectResult> {
-    parallel_connect_resolving(host, port, config)
+    parallel_connect_resolving(host, port, config, |_| {})
         .await
         .map(|(result, _)| result)
 }
 
 /// [`parallel_connect`], also returning what `host` resolved to, which the
-/// connection's login DNS caching verdict applies to.
+/// connection's login DNS caching verdict applies to, and handing
+/// `dns_fell_back` the resolver's error when the DNS cache supplied the
+/// addresses instead.
 pub(crate) async fn parallel_connect_resolving(
     host: &str,
     port: u16,
     config: &ParallelConnectConfig,
+    dns_fell_back: impl FnOnce(&std::io::Error),
 ) -> TdsResult<(ParallelConnectResult, Resolution)> {
     info!(
         "Starting parallel connection to {}:{} with timeout {}ms",
@@ -148,7 +151,7 @@ pub(crate) async fn parallel_connect_resolving(
     // silently escaping it. A failed resolution falls back to the DNS cache.
     let resolution = match timeout(
         deadline.saturating_duration_since(Instant::now()),
-        dns_cache::lookup_host(host, port),
+        dns_cache::lookup_host(host, port, dns_fell_back),
     )
     .await
     {

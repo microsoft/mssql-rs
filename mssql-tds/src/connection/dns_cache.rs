@@ -84,6 +84,22 @@ impl DnsCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
     {
+        self.resolve_reporting(host, port, lookup, |_| {}).await
+    }
+
+    /// [`Self::resolve`], handing `fell_back` the resolver's error when the
+    /// allowed addresses are used instead.
+    pub(crate) async fn resolve_reporting<F, Fut>(
+        &self,
+        host: &str,
+        port: u16,
+        lookup: F,
+        fell_back: impl FnOnce(&io::Error),
+    ) -> io::Result<Resolution>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
+    {
         let addresses = match lookup().await {
             Ok(addresses) => addresses,
             Err(error) => {
@@ -96,6 +112,7 @@ impl DnsCache {
                     ?addresses,
                     "DNS resolution failed; connecting with cached addresses"
                 );
+                fell_back(&error);
                 addresses
             }
         };
@@ -135,10 +152,16 @@ impl DnsCache {
     }
 }
 
-/// Resolves `host` for a TCP connect through the process-wide DNS cache.
-pub(crate) async fn lookup_host(host: &str, port: u16) -> io::Result<Resolution> {
+/// Resolves `host` for a TCP connect through the process-wide DNS cache,
+/// handing `fell_back` the resolver's error when the connect falls back to the
+/// cached addresses.
+pub(crate) async fn lookup_host(
+    host: &str,
+    port: u16,
+    fell_back: impl FnOnce(&io::Error),
+) -> io::Result<Resolution> {
     DnsCache::global()
-        .resolve(host, port, || system_lookup(host, port))
+        .resolve_reporting(host, port, || system_lookup(host, port), fell_back)
         .await
 }
 
