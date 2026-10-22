@@ -20,7 +20,7 @@ protected:
 
 // SQLMoreResults closes any open cursor (matches msodbcsql) and reports no
 // more result sets. This is the path sqlcmd uses between batches.
-ODBC_TEST_F(MoreResultsLiveTest, ClosesCursorAfterFetchEof) {
+ODBC_TEST_F_MODES(MoreResultsLiveTest, ClosesCursorAfterFetchEof, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -40,13 +40,13 @@ ODBC_TEST_F(MoreResultsLiveTest, ClosesCursorAfterFetchEof) {
 }
 
 // SQLMoreResults on a statement with no cursor returns SQL_NO_DATA (not error).
-ODBC_TEST_F(MoreResultsLiveTest, OnNoCursor) {
+ODBC_TEST_F_MODES(MoreResultsLiveTest, OnNoCursor, odbc_concurrency::kAllModes) {
     SQLRETURN rc = SQLMoreResults(stmt_);
     EXPECT_EQ(SQL_NO_DATA, rc);
 }
 
 // Multi-resultset batch: SELECT 1; SELECT 2; - SQLMoreResults advances to rs2.
-ODBC_TEST_F(MoreResultsLiveTest, MultipleSelectBatchAdvances) {
+ODBC_TEST_F_MODES(MoreResultsLiveTest, MultipleSelectBatchAdvances, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1; SELECT 2;");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -88,7 +88,8 @@ ODBC_TEST_F(MoreResultsLiveTest, MultipleSelectBatchAdvances) {
 // a "read diagnostics" hint, so the driver defers such messages to the next
 // boundary-reporting call (SQLMoreResults advance, or SQLCloseCursor) rather than
 // posting them under SQL_NO_DATA where many applications never read them.
-ODBC_TEST_F(MoreResultsLiveTest, TrailingInfoBetweenResultSetsSurfacesWithHint) {
+ODBC_TEST_F_MODES(MoreResultsLiveTest, TrailingInfoBetweenResultSetsSurfacesWithHint,
+                  odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
         "SELECT 1 AS a; PRINT N'between result sets info'; SELECT 2 AS b;");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
@@ -142,7 +143,7 @@ ODBC_TEST_F(MoreResultsLiveTest, TrailingInfoBetweenResultSetsSurfacesWithHint) 
 }
 
 // SQLMoreResults called before consuming rows of rs1 drains and advances.
-ODBC_TEST_F(MoreResultsLiveTest, BeforeFetchDrainsAndAdvances) {
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BeforeFetchDrainsAndAdvances, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
         "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3; SELECT 99;");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
@@ -165,7 +166,7 @@ ODBC_TEST_F(MoreResultsLiveTest, BeforeFetchDrainsAndAdvances) {
 }
 
 // Re-exec is allowed after SQLMoreResults returns SQL_NO_DATA (cursor closed).
-ODBC_TEST_F(MoreResultsLiveTest, ReExecAfterExhausted) {
+ODBC_TEST_F_MODES(MoreResultsLiveTest, ReExecAfterExhausted, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1; SELECT 2;");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -187,7 +188,8 @@ ODBC_TEST_F(MoreResultsLiveTest, ReExecAfterExhausted) {
 // of order, fails here. The batch interleaves DML counts with result sets; the
 // order (count, rows, count, rows) matches msodbcsql's statement-wise
 // navigation, see row_count_test.cpp.
-ODBC_TEST_F(MoreResultsLiveTest, RunUniqueResultsAndRowCountsStayInOrder) {
+ODBC_TEST_F_MODES(MoreResultsLiveTest, RunUniqueResultsAndRowCountsStayInOrder,
+                  odbc_concurrency::kAllModes) {
     const int inserted = 2 + Worker() * 3 + Iteration() % 3;
     const int negated = 1 + (Worker() + Iteration()) % inserted;
     const std::string token = WorkerToken("results");

@@ -53,7 +53,8 @@ protected:
 // (SQL_NO_ROWCOUNT_TOTAL) default only surfaces once a statement has executed;
 // that path is covered directly (bypassing the DM) by the unit test in
 // src/api/row_count.rs.
-ODBC_TEST_F(RowCountLiveTest, FreshStatementReturnsSequenceError) {
+ODBC_TEST_F_MODES(RowCountLiveTest, FreshStatementReturnsSequenceError,
+                  odbc_concurrency::kAllModes) {
     SQLLEN rows = 12345;
     SQLRETURN rc = SQLRowCount(stmt_, &rows);
     EXPECT_EQ(SQL_ERROR, rc);
@@ -85,7 +86,7 @@ ODBC_TEST_F(RowCountLiveTest, DeleteReportsAffectedRows) {
 
 // A result-returning SELECT reports -1 on a forward-only cursor — the row
 // count is unavailable until fully fetched (msodbcsql parity).
-ODBC_TEST_F(RowCountLiveTest, SelectReportsNoRowCount) {
+ODBC_TEST_F_MODES(RowCountLiveTest, SelectReportsNoRowCount, odbc_concurrency::kAllModes) {
     Exec("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
     EXPECT_EQ(-1, RowCount());
 
@@ -193,7 +194,8 @@ ODBC_TEST_F(RowCountLiveTest, PreparedDmlReportsAffectedRows) {
 // SQLRowCount tracks the currently-positioned result set: after SQLMoreResults
 // advances to the next SELECT, the count reflects that result set (-1), not a
 // stale value from the previous one.
-ODBC_TEST_F(RowCountLiveTest, RowCountRefreshedAcrossResultSets) {
+ODBC_TEST_F_MODES(RowCountLiveTest, RowCountRefreshedAcrossResultSets,
+                  odbc_concurrency::kAllModes) {
     Exec("SELECT 1 AS a; SELECT 2 AS b;");
     EXPECT_EQ(-1, RowCount());
 

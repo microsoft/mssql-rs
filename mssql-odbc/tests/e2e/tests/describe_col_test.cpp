@@ -47,7 +47,8 @@ protected:
     }
 };
 
-ODBC_TEST_F(DescribeColLiveTest, FreshStatementReturnsSequenceError) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, FreshStatementReturnsSequenceError,
+                  odbc_concurrency::kAllModes) {
     SQLSMALLINT dataType = 0;
     SQLULEN colSize = 0;
     SQLSMALLINT decDigits = 0;
@@ -62,7 +63,7 @@ ODBC_TEST_F(DescribeColLiveTest, FreshStatementReturnsSequenceError) {
     }
 }
 
-ODBC_TEST_F(DescribeColLiveTest, BasicMetadata) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, BasicMetadata, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1 AS INT) AS i, CAST('abc' AS VARCHAR(10)) AS v, CAST(N'xy' AS NVARCHAR(12)) AS n");
 
     SQLTCHAR name[32] = {};
@@ -98,7 +99,7 @@ ODBC_TEST_F(DescribeColLiveTest, BasicMetadata) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(DescribeColLiveTest, NameTruncationReturnsInfo) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, NameTruncationReturnsInfo, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS this_is_a_long_column_name");
 
     SQLTCHAR name[8] = {};
@@ -121,7 +122,7 @@ ODBC_TEST_F(DescribeColLiveTest, NameTruncationReturnsInfo) {
 // Both column 0 (reserved as the bookmark column without bookmarks enabled)
 // and ordinals past the last column must be rejected with 07009
 // (invalid descriptor index).
-ODBC_TEST_F(DescribeColLiveTest, InvalidColumnOrdinal) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, InvalidColumnOrdinal, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS i");
 
     SQLSMALLINT dataType = 0;
@@ -140,7 +141,8 @@ ODBC_TEST_F(DescribeColLiveTest, InvalidColumnOrdinal) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(3.14 AS DECIMAL(10,2)) AS d, CAST(6.28 AS NUMERIC(12,3)) AS n, 1.5 AS "
         "literal");
@@ -174,7 +176,7 @@ ODBC_TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(DescribeColLiveTest, NullableFlag) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, NullableFlag, odbc_concurrency::kAllModes) {
     // Use sys.objects: `name` is NVARCHAR(128) NOT NULL, `principal_id` is INT NULL.
     // Stable across SQL Server versions, no DDL needed.
     ExecDirect("SELECT TOP 1 name, principal_id FROM sys.objects");
@@ -201,7 +203,7 @@ ODBC_TEST_F(DescribeColLiveTest, NullableFlag) {
 
 // datetime2 has no ODBC core equivalent for sub-second precision, but maps to
 // SQL_TYPE_TIMESTAMP. datetimeoffset is SQL Server-specific → SQL_SS_TIMESTAMPOFFSET (-155).
-ODBC_TEST_F(DescribeColLiveTest, DateTime2AndDateTimeOffset) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, DateTime2AndDateTimeOffset, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(SYSDATETIME() AS DATETIME2) AS dt2, "
                "CAST(SYSDATETIMEOFFSET() AS DATETIMEOFFSET) AS dto");
 
@@ -225,7 +227,7 @@ ODBC_TEST_F(DescribeColLiveTest, DateTime2AndDateTimeOffset) {
 
 // ColumnSize for character types is in characters, not bytes. NVARCHAR(100) on the wire
 // occupies 200 bytes but must be reported as 100.
-ODBC_TEST_F(DescribeColLiveTest, NVarCharColumnSizeIsCharCount) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, NVarCharColumnSizeIsCharCount, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(N'x' AS NVARCHAR(100)) AS n");
 
     SQLSMALLINT dataType = 0;
@@ -242,7 +244,7 @@ ODBC_TEST_F(DescribeColLiveTest, NVarCharColumnSizeIsCharCount) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(DescribeColLiveTest, ClrUdtColumnsReportSqlSsUdt) {
+ODBC_TEST_F_MODES(DescribeColLiveTest, ClrUdtColumnsReportSqlSsUdt, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(NULL AS geography) AS geography_col, "
                "CAST(NULL AS geometry) AS geometry_col, "
                "CAST(NULL AS hierarchyid) AS hierarchyid_col");

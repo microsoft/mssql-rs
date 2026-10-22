@@ -143,7 +143,8 @@ TEST(ColAttributeTest, NullHandle) {
     EXPECT_EQ(SQL_INVALID_HANDLE, rc);
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, FreshStatementReturnsSequenceError) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, FreshStatementReturnsSequenceError,
+                  odbc_concurrency::kAllModes) {
     SQLLEN value = 0;
     SQLRETURN rc =
         SQLColAttribute(stmt_, 1, SQL_DESC_CONCISE_TYPE, nullptr, 0, nullptr, &value);
@@ -151,7 +152,7 @@ ODBC_TEST_F(ColAttributeLiveTest, FreshStatementReturnsSequenceError) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, InvalidColumnOrdinal) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, InvalidColumnOrdinal, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1 AS INT) AS c1");
     for (SQLUSMALLINT col : {static_cast<SQLUSMALLINT>(0), static_cast<SQLUSMALLINT>(2)}) {
         SQLLEN value = 0;
@@ -165,7 +166,7 @@ ODBC_TEST_F(ColAttributeLiveTest, InvalidColumnOrdinal) {
 
 // An identifier this driver does not report is rejected rather than answered
 // with a silent zero. msodbcsql reports a wider set, so only compare our leg.
-ODBC_TEST_F(ColAttributeLiveTest, UnknownFieldIdentifier) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, UnknownFieldIdentifier, odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("SELECT CAST(1 AS INT) AS c1");
     SQLLEN value = 0;
@@ -177,14 +178,14 @@ ODBC_TEST_F(ColAttributeLiveTest, UnknownFieldIdentifier) {
 
 // SQL_DESC_COUNT describes the result set, so it answers for a column number
 // that would otherwise be out of range.
-ODBC_TEST_F(ColAttributeLiveTest, DescCountIgnoresColumnNumber) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, DescCountIgnoresColumnNumber, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS a, 2 AS b, 3 AS c");
     EXPECT_EQ(3, NumericAttr(stmt_, 1, SQL_DESC_COUNT));
     EXPECT_EQ(3, NumericAttr(stmt_, 99, SQL_DESC_COUNT));
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, ConciseTypePerColumnType) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, ConciseTypePerColumnType, odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(1 AS INT) AS i, CAST('a' AS VARCHAR(10)) AS v,"
         " CAST(N'b' AS NVARCHAR(10)) AS n, CAST(1.5 AS DECIMAL(10,2)) AS d");
@@ -347,7 +348,7 @@ ODBC_TEST_F_MODES(AliasTypeLiveTest, LookupOnTheSessionBeginsNoImplicitTransacti
 // Matches retail msodbcsql 18.6.2.1. GetIRDField in
 // Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp copies these four UDT name-pool entries,
 // keeps SQL_DESC_TYPE_NAME as "udt", and returns empty entries for non-UDT columns.
-ODBC_TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, ClrUdtDescriptorFields, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(NULL AS geography) AS geography_col, "
                "CAST(NULL AS geometry) AS geometry_col, "
                "CAST(NULL AS hierarchyid) AS hierarchyid_col");
@@ -398,7 +399,8 @@ ODBC_TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, ClrUdtIdentityFieldsAreEmptyForNonUdtColumns) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, ClrUdtIdentityFieldsAreEmptyForNonUdtColumns,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1 AS int)");
 
     for (SQLUSMALLINT field : {
@@ -412,7 +414,7 @@ ODBC_TEST_F(ColAttributeLiveTest, ClrUdtIdentityFieldsAreEmptyForNonUdtColumns) 
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, TypeNameAndRadix) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, TypeNameAndRadix, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1 AS INT) AS i, CAST(1.5 AS FLOAT) AS f,"
                " CAST('a' AS VARCHAR(10)) AS v");
 
@@ -430,7 +432,7 @@ ODBC_TEST_F(ColAttributeLiveTest, TypeNameAndRadix) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, PrecisionScaleAndNullable) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, PrecisionScaleAndNullable, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1.5 AS DECIMAL(10,2)) AS d,"
                " CAST(NULL AS INT) AS n");
     EXPECT_EQ(10, NumericAttr(stmt_, 1, SQL_DESC_PRECISION));
@@ -443,7 +445,8 @@ ODBC_TEST_F(ColAttributeLiveTest, PrecisionScaleAndNullable) {
 // SQL_DESC_UNSIGNED is SQL_FALSE only for the signed numeric types. Every
 // nonnumeric column is "unsigned" by the ODBC definition, which is the opposite
 // of the intuitive reading and the easiest field to get backwards.
-ODBC_TEST_F(ColAttributeLiveTest, UnsignedIsFalseOnlyForSignedNumerics) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, UnsignedIsFalseOnlyForSignedNumerics,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(1 AS TINYINT) AS c1, CAST(1 AS SMALLINT) AS c2,"
         "       CAST(1 AS INT) AS c3, CAST(1 AS BIGINT) AS c4,"
@@ -470,7 +473,7 @@ ODBC_TEST_F(ColAttributeLiveTest, UnsignedIsFalseOnlyForSignedNumerics) {
 // Display size is the rendered width, not the column size: an int needs a
 // character for the sign, a GUID renders as 36, and binary renders as two hex
 // characters per byte.
-ODBC_TEST_F(ColAttributeLiveTest, DisplaySizeIsRenderedWidth) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, DisplaySizeIsRenderedWidth, odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(1 AS INT) AS c1, CAST(1 AS TINYINT) AS c2,"
         "       CAST(1 AS SMALLINT) AS c3, CAST(1 AS BIGINT) AS c4,"
@@ -494,7 +497,8 @@ ODBC_TEST_F(ColAttributeLiveTest, DisplaySizeIsRenderedWidth) {
 
 // The approximate numerics report the width of their rendered exponential form,
 // which is unrelated to both the column size and the wire width.
-ODBC_TEST_F(ColAttributeLiveTest, DisplaySizeForApproximateNumerics) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, DisplaySizeForApproximateNumerics,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1 AS REAL) AS c1, CAST(1 AS FLOAT) AS c2");
     EXPECT_EQ(14, NumericAttr(stmt_, 1, SQL_DESC_DISPLAY_SIZE)) << "real";
     EXPECT_EQ(24, NumericAttr(stmt_, 2, SQL_DESC_DISPLAY_SIZE)) << "float";
@@ -505,7 +509,7 @@ ODBC_TEST_F(ColAttributeLiveTest, DisplaySizeForApproximateNumerics) {
 // temporal types report their C struct size, not the TDS payload width. A date
 // is 3 bytes on the wire but transfers as a 6-byte SQL_DATE_STRUCT; reporting
 // the wire width would have callers allocate short.
-ODBC_TEST_F(ColAttributeLiveTest, OctetLengthIsTransferSize) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, OctetLengthIsTransferSize, odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST('2020-01-01' AS DATE) AS c1,"
         "       CAST(SYSDATETIME() AS TIME(3)) AS c2,"
@@ -541,7 +545,8 @@ ODBC_TEST_F(ColAttributeLiveTest, OctetLengthIsTransferSize) {
 // SQL_DESC_TYPE is the verbose field: the timestamp family collapses to
 // SQL_DATETIME with the member in SQL_DESC_DATETIME_INTERVAL_CODE, while
 // SQL_DESC_CONCISE_TYPE keeps SQL_TYPE_TIMESTAMP.
-ODBC_TEST_F(ColAttributeLiveTest, VerboseTypeDiffersFromConciseForTimestamps) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VerboseTypeDiffersFromConciseForTimestamps,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(SYSDATETIME() AS DATETIME) AS c1,"
         "       CAST(SYSDATETIME() AS SMALLDATETIME) AS c2,"
@@ -558,7 +563,8 @@ ODBC_TEST_F(ColAttributeLiveTest, VerboseTypeDiffersFromConciseForTimestamps) {
 // Having collapsed the verbose type to SQL_DATETIME, the driver still answers
 // which member it was. msodbcsql rejects this field through SQLColAttribute, so
 // only our leg is compared.
-ODBC_TEST_F(ColAttributeLiveTest, DatetimeSubtypeAccompaniesTheVerboseType) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, DatetimeSubtypeAccompaniesTheVerboseType,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
         "SELECT CAST(SYSDATETIME() AS DATETIME) AS c1,"
@@ -573,7 +579,8 @@ ODBC_TEST_F(ColAttributeLiveTest, DatetimeSubtypeAccompaniesTheVerboseType) {
 
 // date, time and datetimeoffset sit outside the ODBC datetime range, so the
 // verbose and concise fields agree.
-ODBC_TEST_F(ColAttributeLiveTest, VerboseTypeMatchesConciseForNonTimestamps) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VerboseTypeMatchesConciseForNonTimestamps,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST('2020-01-01' AS DATE) AS c1,"
         "       CAST(SYSDATETIME() AS TIME(3)) AS c2,"
@@ -589,7 +596,8 @@ ODBC_TEST_F(ColAttributeLiveTest, VerboseTypeMatchesConciseForNonTimestamps) {
 
 // Searchability is derived from the type: the LOB text types take only LIKE and
 // xml/image take neither, so a blanket SQL_PRED_SEARCHABLE overstates them.
-ODBC_TEST_F(ColAttributeLiveTest, SearchableIsDerivedFromTheType) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, SearchableIsDerivedFromTheType,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST('a' AS VARCHAR(10)) AS c1, CAST(N'a' AS NVARCHAR(10)) AS c2,"
         "       CAST('2020-01-01' AS DATE) AS c3, CAST(1 AS INT) AS c4,"
@@ -647,7 +655,7 @@ ODBC_TEST_F(ColAttributeLiveTest, AliasedColumnDoesNotReportTheAliasAsBaseColumn
 }
 
 // The wide entry point reports string lengths in bytes, not characters.
-ODBC_TEST_F(ColAttributeLiveTest, NameIsReportedInBytes) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, NameIsReportedInBytes, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS abcd");
     SQLTCHAR name[32] = {};
     SQLSMALLINT nameLen = 0;
@@ -659,7 +667,7 @@ ODBC_TEST_F(ColAttributeLiveTest, NameIsReportedInBytes) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, NameTruncationReturnsInfo) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, NameTruncationReturnsInfo, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS averylongcolumnname");
     SQLTCHAR name[3] = {};
     SQLSMALLINT nameLen = 0;
@@ -678,7 +686,8 @@ ODBC_TEST_F(ColAttributeLiveTest, NameTruncationReturnsInfo) {
 // `SQL_CA_SS_VARIANT_SERVER_TYPE` case does `SETRC_SERR_GOTO(retcode, ErrorRet)`
 // with the same error — so the diagnostic it prepares is never actually returned.
 // Recorded in the divergence table in docs/typed-columnar-fetch-plan.md.
-ODBC_TEST_F(ColAttributeLiveTest, VariantTypeOnNonVariantColumn) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VariantTypeOnNonVariantColumn,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("SELECT CAST(1 AS INT) AS c1");
     SQLLEN value = 0;
@@ -693,7 +702,8 @@ ODBC_TEST_F(ColAttributeLiveTest, VariantTypeOnNonVariantColumn) {
 // column, probe it with a zero-length SQL_C_BINARY read, then ask for the
 // underlying C type. The underlying type belongs to the value, so it tracks the
 // row rather than the column.
-ODBC_TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(42 AS SQL_VARIANT) AS v"
         " UNION ALL SELECT CAST(CAST('abc' AS VARCHAR(10)) AS SQL_VARIANT)");
@@ -739,7 +749,7 @@ ODBC_TEST_F_MODES(ColAttributeOdbc3LiveTest, Odbc3TemporalVariantTypes, kColAttr
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(ColAttributeLiveTest, Odbc38TemporalVariantTypes) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, Odbc38TemporalVariantTypes, odbc_concurrency::kAllModes) {
     ExecDirect(TEMPORAL_VARIANTS_QUERY);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -774,7 +784,8 @@ ODBC_TEST_F(ColAttributeLiveTest, Odbc38TemporalVariantTypes) {
 // either, so this test asserts the parts that matter without pinning that
 // difference; it is invisible to mssql-python, whose probe is gated on
 // SQL_SUCCEEDED.
-ODBC_TEST_F(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(CAST('' AS VARBINARY(8)) AS SQL_VARIANT) AS v");
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -799,7 +810,8 @@ ODBC_TEST_F(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType
 // SQL_SUCCESS_WITH_INFO/01004 for a variant wrapping an empty value, where this
 // driver answers SQL_SUCCESS. Registry entry 13 records the decision; if a
 // later msodbcsql build stops warning here, this test is what reports it.
-ODBC_TEST_F(ColAttributeLiveTest, EmptyVariantProbeReturnsSuccessWithoutWarning) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, EmptyVariantProbeReturnsSuccessWithoutWarning,
+                  odbc_concurrency::kAllModes) {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
 
@@ -823,7 +835,8 @@ ODBC_TEST_F(ColAttributeLiveTest, EmptyVariantProbeReturnsSuccessWithoutWarning)
 // A NULL sql_variant is just a zero length on the wire, with no base type or
 // property byte following it. Reading those anyway would consume the next
 // column's bytes, so the column after the variant is what actually proves it.
-ODBC_TEST_F(ColAttributeLiveTest, NullVariantDoesNotDisturbTheFollowingColumn) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, NullVariantDoesNotDisturbTheFollowingColumn,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(NULL AS SQL_VARIANT) AS v, CAST(12345 AS INT) AS following");
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -844,7 +857,7 @@ ODBC_TEST_F(ColAttributeLiveTest, NullVariantDoesNotDisturbTheFollowingColumn) {
 
 // The base type belongs to the value that was probed, so probing one variant
 // column must not answer for another.
-ODBC_TEST_F(ColAttributeLiveTest, VariantTypeIsPerColumn) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VariantTypeIsPerColumn, odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("SELECT CAST(42 AS SQL_VARIANT) AS a,"
                " CAST(CAST('x' AS VARCHAR(5)) AS SQL_VARIANT) AS b");
@@ -869,7 +882,8 @@ ODBC_TEST_F(ColAttributeLiveTest, VariantTypeIsPerColumn) {
 
 // Without the probe there is no value to report a type for; msodbcsql relies on
 // the same ordering, so this only pins our diagnostic.
-ODBC_TEST_F(ColAttributeLiveTest, VariantTypeBeforeProbeIsSequenceError) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VariantTypeBeforeProbeIsSequenceError,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("SELECT CAST(42 AS SQL_VARIANT) AS v");
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -890,7 +904,8 @@ ODBC_TEST_F(ColAttributeLiveTest, VariantTypeBeforeProbeIsSequenceError) {
 // and 4) that the driver maps separately.
 //
 // This compares against msodbcsql: the value is the whole point of the test.
-ODBC_TEST_F(ColAttributeLiveTest, VariantExactNumericsReportNumeric) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VariantExactNumericsReportNumeric,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         const char* label;
         const char* expr;
@@ -924,7 +939,8 @@ ODBC_TEST_F(ColAttributeLiveTest, VariantExactNumericsReportNumeric) {
 // character fetch that mssql-python actually performs after reading the
 // attribute has to keep working, digits intact. Compared against msodbcsql,
 // which renders the same padded form.
-ODBC_TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(CAST(999.99 AS DECIMAL(18, 4)) AS SQL_VARIANT) AS v");
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -954,7 +970,8 @@ ODBC_TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
 //
 // Temporal types are covered separately above because their expected values
 // depend on the declared ODBC version.
-ODBC_TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
+ODBC_TEST_F_MODES(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         const char* label;
         const char* expr;
