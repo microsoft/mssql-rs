@@ -440,27 +440,36 @@ impl DbcHandle {
     /// Returns `false`, closing the lease's client, on a poisoned mutex or when
     /// the lease's session was torn down while it was out.
     pub(crate) fn return_lease(&self, lease: WireLease, how: LeaseReturn) -> bool {
-        self.return_lease_generation(lease, how).is_some()
+        self.return_lease_and_publish(lease, how, |_| ()).is_some()
     }
 
-    /// Returns the restored session's generation under the same lock that
-    /// validates the lease. A caller that publishes connection-scoped state
-    /// after hand-back must compare this generation while holding the DBC lock:
-    /// disconnect/reconnect can replace the restored session before that
-    /// publication lock is acquired.
-    pub(crate) fn return_lease_generation(
+    /// Restores a lease and publishes its outcome before another operation can
+    /// claim the wire.
+    pub(crate) fn return_lease_and_publish<R>(
         &self,
         lease: WireLease,
         how: LeaseReturn,
-    ) -> Option<u64> {
+        publish: impl FnOnce(&mut DbcState) -> R,
+    ) -> Option<R> {
+        self.return_lease_and_publish_inner(lease, how, || {}, publish)
+    }
+
+    fn return_lease_and_publish_inner<R>(
+        &self,
+        lease: WireLease,
+        how: LeaseReturn,
+        after_restore: impl FnOnce(),
+        publish: impl FnOnce(&mut DbcState) -> R,
+    ) -> Option<R> {
         let Ok(mut state) = self.inner.lock() else {
             error!(owner = ?lease.owner(), "dbc mutex poisoned returning a wire lease");
             return None;
         };
-        state
-            .wire
-            .restore(lease, how)
-            .then_some(state.session_generation)
+        if !state.wire.restore(lease, how) {
+            return None;
+        }
+        after_restore();
+        Some(publish(&mut state))
     }
 }
 
@@ -554,5 +563,63 @@ mod tests {
 
         assert!(!dbc.return_lease(lease, LeaseReturn::Release));
         assert!(dbc.inner.lock().unwrap().wire.client().is_none());
+    }
+
+    #[test]
+    fn returning_a_lease_keeps_restoration_and_publication_atomic() {
+        use std::sync::mpsc;
+
+        use super::super::wire::{ClaimPolicy, WireOwner};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+
+        std::thread::scope(|scope| {
+            let (restored_tx, restored_rx) = mpsc::channel();
+            let (claim_tx, claim_rx) = mpsc::channel();
+            scope.spawn(move || {
+                restored_rx.recv().unwrap();
+                let claimed = dbc.inner.try_lock().is_ok_and(|mut state| {
+                    state
+                        .wire
+                        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                        .is_ok()
+                });
+                claim_tx.send(claimed).unwrap();
+            });
+
+            let published = dbc.return_lease_and_publish_inner(
+                lease,
+                LeaseReturn::Release,
+                || {
+                    restored_tx.send(()).unwrap();
+                    assert!(
+                        !claim_rx.recv().unwrap(),
+                        "another operation claimed the restored wire before publication"
+                    );
+                },
+                |state| {
+                    state.autocommit = false;
+                    true
+                },
+            );
+            assert_eq!(published, Some(true));
+        });
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.autocommit);
+        assert!(state.wire.client().is_some());
     }
 }

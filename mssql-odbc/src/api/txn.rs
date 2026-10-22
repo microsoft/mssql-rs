@@ -150,44 +150,14 @@ pub(super) fn release_dbc_client(dbc: &DbcHandle, client: WireLease) -> bool {
     dbc.return_lease(client, LeaseReturn::Release)
 }
 
-/// Restores a connection-scoped lease and returns the session generation that
-/// was current in the restoration critical section.
-fn release_dbc_client_generation(dbc: &DbcHandle, client: WireLease) -> Option<u64> {
-    dbc.return_lease_generation(client, LeaseReturn::Release)
-}
-
-/// Publishes an operation result only if the session restored by
-/// [`release_dbc_client_generation`] is still current.
-fn publish_dbc_result<R>(
-    dbc: &DbcHandle,
-    generation: u64,
-    op: &str,
-    publish: impl FnOnce(&mut DbcState) -> R,
-) -> Result<R, SqlReturn> {
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{op}: dbc mutex poisoned");
-        return Err(SQL_ERROR);
-    };
-    if state.connection_state != ConnectionState::Connected
-        || state.session_generation != generation
-    {
-        error!("{op}: the restored session was replaced before its outcome was recorded");
-        post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
-        return Err(SQL_ERROR);
-    }
-    Ok(publish(&mut state))
-}
-
 pub(super) fn release_dbc_client_and_publish<R>(
     dbc: &DbcHandle,
     client: WireLease,
     op: &str,
     publish: impl FnOnce(&mut DbcState) -> R,
 ) -> Result<R, SqlReturn> {
-    let Some(generation) = release_dbc_client_generation(dbc, client) else {
-        return Err(fail_lost_session(dbc, op));
-    };
-    publish_dbc_result(dbc, generation, op, publish)
+    dbc.return_lease_and_publish(client, LeaseReturn::Release, publish)
+        .ok_or_else(|| fail_lost_session(dbc, op))
 }
 
 /// Fails a connection-scoped operation whose lease could not be returned. Its
@@ -660,27 +630,6 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// with a `01000` warning; a driver-begun piggyback transaction is rolled back
 /// silently (`sqlcconn.cpp:3692-3741`).
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    let (had_user_txn, generation) = match dbc.inner.lock() {
-        Ok(state) => (state.local_tran_started, state.session_generation),
-        Err(_) => {
-            error!("{op}: dbc mutex poisoned");
-            return SQL_ERROR;
-        }
-    };
-
-    if had_user_txn {
-        let ret = end_transaction(dbc, true, op);
-        if ret != SQL_SUCCESS {
-            return ret;
-        }
-        return publish_dbc_result(dbc, generation, op, |state| {
-            state.autocommit = true;
-            post_diag(state, WARN_TRANSACTION_COMMITTED);
-            SQL_SUCCESS_WITH_INFO
-        })
-        .unwrap_or_else(|ret| ret);
-    }
-
     if close_all_cursors(dbc) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
@@ -688,7 +637,17 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         Ok(c) => c,
         Err(ret) => return ret,
     };
-    let result = if client.has_active_transaction() {
+    let had_user_txn = match dbc.inner.lock() {
+        Ok(state) => state.local_tran_started,
+        Err(_) => {
+            error!("{op}: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    let result = if had_user_txn && client.has_active_transaction() {
+        debug!("{op}: committing user transaction");
+        dbc.runtime.block_on(client.commit_transaction(None, None))
+    } else if client.has_active_transaction() {
         debug!("{op}: rolling back driver-begun transaction");
         dbc.runtime
             .block_on(client.rollback_transaction(None, None))
@@ -697,13 +656,23 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     };
     release_dbc_client_and_publish(dbc, client, op, |state| {
         if let Err(e) = result {
-            error!(%e, "{op}: rollback of driver-begun transaction failed");
-            post_tds_error(state, &e, SQLSTATE_HY000);
+            if had_user_txn {
+                error!(%e, "{op}: transaction-manager request failed");
+                post_tds_error(state, &e, SQLSTATE_08007);
+            } else {
+                error!(%e, "{op}: rollback of driver-begun transaction failed");
+                post_tds_error(state, &e, SQLSTATE_HY000);
+            }
             return SQL_ERROR;
         }
         state.autocommit = true;
         state.local_tran_started = false;
-        SQL_SUCCESS
+        if had_user_txn {
+            post_diag(state, WARN_TRANSACTION_COMMITTED);
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        }
     })
     .unwrap_or_else(|ret| ret)
 }
@@ -1047,10 +1016,7 @@ fn finish_post_connect_txn_settings(
     failure: Option<String>,
     op: &str,
 ) -> SqlReturn {
-    let Some(generation) = release_dbc_client_generation(dbc, client) else {
-        return fail_lost_session(dbc, op);
-    };
-    match publish_dbc_result(dbc, generation, op, |state| {
+    match release_dbc_client_and_publish(dbc, client, op, |state| {
         if isolation_applied {
             state.server_isolation_unknown = false;
         }
@@ -1140,8 +1106,6 @@ mod tests {
                 .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
                 .unwrap()
         };
-        let generation = release_dbc_client_generation(dbc, client).unwrap();
-
         {
             let mut state = dbc.inner.lock().unwrap();
             drop(state.wire.uninstall());
@@ -1152,7 +1116,7 @@ mod tests {
         let published = Cell::new(false);
 
         assert_eq!(
-            publish_dbc_result(dbc, generation, "test", |state| {
+            release_dbc_client_and_publish(dbc, client, "test", |state| {
                 published.set(true);
                 state.autocommit = false;
             }),
@@ -1911,6 +1875,48 @@ mod tests {
             .expect("same client reused across cycle");
         assert!(!client.is_connection_dead());
         assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn enabling_autocommit_commits_user_work_and_publishes_the_warning() {
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_commit_transaction, tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(
+                    vec![env_change_commit_transaction(), done_no_more()],
+                    0xDEAD_BEEF,
+                ));
+            state.autocommit = false;
+            state.local_tran_started = true;
+        }
+
+        assert_eq!(
+            set_autocommit(dbc, u64::from(SQL_AUTOCOMMIT_ON)),
+            SQL_SUCCESS_WITH_INFO
+        );
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.autocommit);
+        assert!(!state.local_tran_started);
+        assert!(
+            !state
+                .wire
+                .client()
+                .expect("client restored after commit")
+                .has_active_transaction()
+        );
+        assert_eq!(state.diag_records().len(), 1);
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_01000);
     }
 
     /// The AB#47510 guard on the `SQLDisconnect` rollback. A host that
