@@ -1233,8 +1233,7 @@ fn normalize_captured_plp_suffix(
             let source_offset = state
                 .text_output
                 .encoding
-                .utf8_offset_for_client_bytes(text, byte_offset)
-                .map_err(DiagMsg::from)?;
+                .utf8_offset_for_client_bytes(text, byte_offset)?;
             value.bytes.drain(..source_offset);
         } else {
             value.bytes.drain(..byte_offset.min(value.bytes.len()));
@@ -3277,14 +3276,12 @@ fn encode_plp_pending_with_loss(
     payload_capacity: usize,
 ) -> Result<(), DiagMsg> {
     let text = std::str::from_utf8(&pending[start..]).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
-    let encoded = encoding.encode(text).map_err(DiagMsg::from)?;
+    let encoded = encoding.encode(text)?;
     if encoded.had_loss {
         let mut offset = start;
         let mut scalar = [0; 4];
         for ch in text.chars() {
-            let character = encoding
-                .encode(ch.encode_utf8(&mut scalar))
-                .map_err(DiagMsg::from)?;
+            let character = encoding.encode(ch.encode_utf8(&mut scalar))?;
             let end = offset.saturating_add(character.bytes.len());
             if character.had_loss {
                 if let Some(previous) = loss_ranges.last_mut().filter(|range| range.end == offset) {
@@ -3365,12 +3362,10 @@ fn append_typed_plp_text(
             let text = std::str::from_utf8(source).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
             let offset = stream
                 .pending_bytes_encoding
-                .utf8_offset_for_client_bytes(text, *delivered)
-                .map_err(DiagMsg::from)?;
+                .utf8_offset_for_client_bytes(text, *delivered)?;
             stream
                 .pending_bytes_encoding
-                .encode(&text[..offset])
-                .map_err(DiagMsg::from)?
+                .encode(&text[..offset])?
                 .bytes
                 .len()
                 .saturating_sub(*delivered)
@@ -3380,8 +3375,7 @@ fn append_typed_plp_text(
         };
         let text = stream
             .pending_bytes_encoding
-            .decode(&stream.pending_bytes[skip..])
-            .map_err(DiagMsg::from)?;
+            .decode(&stream.pending_bytes[skip..])?;
         reserve_typed_plp_bytes(bytes, text.len())?;
         bytes.extend_from_slice(text.as_bytes());
     } else {
@@ -4413,6 +4407,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_codec_hex_failure_after_wire_read_reacquires_diagnostics() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
+
+        let (h, _server) = open_mock_plp_column(
+            ColumnDefinition::new("value", SqlDataType::VarBinaryMax),
+            ColumnValue::VarBinaryMax(vec![vec![0xab]]),
+        );
+        client_code_page(&h, 12000, false);
+        let mut output = [0xcc_u8; 16];
+        let mut length = -99;
+        let rc = with_failure(Call::Encode, 1, || unsafe {
+            crate::api::exports::SQLGetData(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                output.as_mut_ptr().cast(),
+                16,
+                &mut length,
+            )
+        });
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(output, [0xcc; 16]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_INTERNAL_CONVERSION,
+        );
+        let mut following = 0_i32;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    (&raw mut following).cast(),
+                    4,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(following, 42);
+        assert_eq!(length, 4);
     }
 
     #[test]

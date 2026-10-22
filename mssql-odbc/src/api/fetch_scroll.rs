@@ -3848,6 +3848,138 @@ mod tests {
         assert_eq!(length, -99);
     }
 
+    #[test]
+    fn truncated_narrow_plp_reencode_failure_preserves_prefix_and_drains() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for fail in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt_encoding(client_output(1252, false).encoding);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut column = ColumnDefinition::new("value", SqlDataType::VarCharMax);
+            column.collation = [0x09, 0x04, 0, 0x04, 0];
+            let response = QueryResponse::new(
+                vec![column, ColumnDefinition::new("following", SqlDataType::Int)],
+                vec![Row::new(vec![
+                    ColumnValue::VarCharMax(
+                        "\u{e9}\u{20ac}Z"
+                            .as_bytes()
+                            .iter()
+                            .map(|byte| vec![*byte])
+                            .collect(),
+                    ),
+                    ColumnValue::Int(42),
+                ])],
+            );
+            let _server =
+                crate::test_support::connect_mock_server(dbc, "SELECT narrow_failure", response);
+            let sql: Vec<u16> = "SELECT narrow_failure".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLExecDirectW(
+                        h.stmt,
+                        sql.as_ptr(),
+                        sql.len().try_into().unwrap(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let mut output = [0xcc_u8; 4];
+            let mut length = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLBindCol(
+                        h.stmt,
+                        1,
+                        SQL_C_CHAR,
+                        output.as_mut_ptr().cast(),
+                        2,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let fetch = || unsafe { crate::api::exports::SQLFetch(h.stmt) };
+            let rc = if fail {
+                with_failure(Call::Encode, 1, fetch)
+            } else {
+                fetch()
+            };
+            assert_eq!(
+                rc,
+                if fail {
+                    SQL_ERROR
+                } else {
+                    SQL_SUCCESS_WITH_INFO
+                }
+            );
+            assert_eq!(output[0], 0xe9);
+            assert_eq!(&output[2..], &[0xcc; 2]);
+            if !fail {
+                assert_eq!(output[1], 0);
+                assert_eq!(length, 3);
+            }
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            {
+                let state = stmt.inner.lock().unwrap();
+                let expected = if fail {
+                    ERR_INTERNAL_CONVERSION
+                } else {
+                    WARN_STRING_TRUNCATION
+                };
+                let diagnostic = state.diag_records.last().unwrap();
+                assert_eq!(diagnostic.sql_state, expected.state);
+                assert!(diagnostic.message.ends_with(expected.text));
+            }
+            let mut following = 0_i32;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&raw mut following).cast(),
+                        4,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(following, 42);
+        }
+    }
+
+    #[test]
+    fn narrow_decoder_finalization_has_no_complete_text_left_to_reencode() {
+        use mssql_tds::datatypes::sql_string::ResolvedEncoding;
+
+        let cases: &[(&encoding_rs::Encoding, &[u8])] = &[
+            (encoding_rs::UTF_8, b"A\xc3\xa9\xe2\x82"),
+            (encoding_rs::SHIFT_JIS, b"A\x82\xa0\x82"),
+            (encoding_rs::BIG5, b"A\x88\x62\x88"),
+            (encoding_rs::EUC_KR, b"A\xb0\xa1\xb0"),
+            (encoding_rs::GBK, b"A\xc4\xe3\x81"),
+            (encoding_rs::GB18030, b"A\x81\x30\x81\x30\x81\x30\x81"),
+            (encoding_rs::WINDOWS_1252, b"A\xe9\x80"),
+            (encoding_rs::WINDOWS_1258, b"A\xea\xec"),
+        ];
+        for &(encoding, bytes) in cases {
+            for end in 0..=bytes.len() {
+                let resolved: ResolvedEncoding = encoding.into();
+                let mut decoder = resolved.new_decoder_without_bom_handling();
+                let mut decoded = Vec::new();
+                decode_narrow_into_pending(&mut decoder, &mut decoded, &bytes[..end], false);
+                assert!(std::str::from_utf8(&decoded).is_ok());
+                decoded.resize(decoder.max_utf8_buffer_length(0).unwrap(), 0);
+                let (result, read, written) =
+                    decoder.decode_to_utf8_without_replacement(&[], &mut decoded, true);
+                assert_ne!(result, encoding_rs::DecoderResult::OutputFull);
+                assert_eq!(read, 0);
+                assert_eq!(written, 0, "{} at source offset {end}", encoding.name());
+            }
+        }
+    }
+
     // The live BoundTruncationPreservesOnlyCompletePairs test covers SQL Server.
     // This mock additionally forces the pair across a PLP wire-chunk boundary.
     #[test]

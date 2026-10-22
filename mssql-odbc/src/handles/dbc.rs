@@ -44,6 +44,8 @@ pub(crate) struct DbcHandle {
     pub(crate) runtime: Arc<SharedRuntime>,
     /// `SQL_ATTR_CONNECTION_TIMEOUT`, shared by internal metadata queries and
     /// cancellation. Zero means unlimited for queries and 120 seconds for cancel.
+    /// Native: GetNetIOTimeOut/GetCancelTimeoutValue (sqlcprot.h:1605,1625);
+    /// broader connection-scoped timeout enforcement remains follow-up work.
     connection_timeout: AtomicU32,
     pub(crate) inner: Mutex<DbcState>,
 }
