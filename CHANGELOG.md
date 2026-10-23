@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: `SecurityContextProvider` trait and
+  `ClientContext::security_context_provider` to replace the built-in
+  SSPI/GSSAPI context for integrated auth, e.g. NTLM on Linux/macOS (#707).
+
 - Shared MultiSubnetFailover (MSF) startup configuration: explicit connection
   setting > application default > `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT`
   (`true`/`false`) > built-in on. Rust, native Python, and Node.js expose

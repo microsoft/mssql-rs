@@ -710,7 +710,7 @@ impl LoginHandler<'_> {
 
         // If using integrated security, create SSPI handler and get initial token
         let (sspi_token, sspi_handler) = if is_integrated_security {
-            let mut config = context.integrated_auth_config();
+            let mut config = context.integrated_auth_config_for(transport_context);
 
             // Bind the authentication exchange to the TLS channel (Extended
             // Protection for Authentication). The token is only present when
@@ -733,7 +733,12 @@ impl LoginHandler<'_> {
                 server, port
             );
 
-            let mut handler = SspiAuthHandler::new(&config, &server, port)?;
+            let mut handler = SspiAuthHandler::new(
+                &config,
+                &server,
+                port,
+                context.security_context_provider.as_deref(),
+            )?;
             let initial_token = handler.get_initial_token()?;
 
             debug!(

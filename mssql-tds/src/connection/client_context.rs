@@ -378,6 +378,9 @@ pub struct ClientContext {
     ///
     /// `None` writes the dialled address, which is the previous behaviour.
     pub login_server_name: Option<String>,
+    /// Overrides the built-in SSPI/GSSAPI context for integrated auth. Default: `None`.
+    pub security_context_provider:
+        Option<std::sync::Arc<dyn crate::security::SecurityContextProvider>>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
@@ -589,6 +592,7 @@ impl ClientContext {
             user_name: "".to_string(),
             workstation_id: ClientContext::default_workstation_id(hostname::get),
             access_token: None,
+            security_context_provider: None,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
                 port: 1433,
@@ -656,6 +660,7 @@ impl ClientContext {
             server_spn: None,
             login_server_name: None,
             access_token: None,
+            security_context_provider: None,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
                 port: 1433,
@@ -725,25 +730,15 @@ impl ClientContext {
     ///
     /// This is used when setting up SSPI/GSSAPI authentication.
     pub fn integrated_auth_config(&self) -> IntegratedAuthConfig {
-        let is_loopback = match &self.transport_context {
-            TransportContext::Tcp { host, .. } => is_loopback_address(host),
-            // For named pipes, extract server from pipe_name (\\server\pipe\...)
-            TransportContext::NamedPipe { pipe_name } => {
-                // Extract server from \\server\pipe\... format
-                let server = pipe_name
-                    .trim_start_matches("\\\\")
-                    .split('\\')
-                    .next()
-                    .unwrap_or(".");
-                is_loopback_address(server)
-            }
-            // Shared memory is always local
-            TransportContext::SharedMemory { .. } => true,
-            // LocalDB is always local
-            #[cfg(windows)]
-            TransportContext::LocalDB { .. } => true,
-        };
+        self.integrated_auth_config_for(&self.transport_context)
+    }
 
+    /// Like [`Self::integrated_auth_config`], but for the endpoint being dialled,
+    /// which differs from `self.transport_context` after a routing redirect.
+    pub(crate) fn integrated_auth_config_for(
+        &self,
+        transport_context: &TransportContext,
+    ) -> IntegratedAuthConfig {
         IntegratedAuthConfig {
             server_spn: self.server_spn.clone(),
             security_package: Default::default(),
@@ -751,7 +746,7 @@ impl ClientContext {
             // engine's channel binding token (see
             // `NetworkWriter::channel_binding_token`).
             channel_bindings: None,
-            is_loopback,
+            is_loopback: transport_context.is_loopback(),
         }
     }
 
@@ -991,6 +986,7 @@ impl Clone for ClientContext {
             server_spn: self.server_spn.clone(),
             login_server_name: self.login_server_name.clone(),
             access_token: self.access_token.clone(),
+            security_context_provider: self.security_context_provider.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
             column_encryption_setting: self.column_encryption_setting,
@@ -1048,6 +1044,28 @@ pub enum TransportContext {
 }
 
 impl TransportContext {
+    /// Whether this endpoint is the local machine.
+    pub(crate) fn is_loopback(&self) -> bool {
+        match self {
+            TransportContext::Tcp { host, .. } => is_loopback_address(host),
+            // For named pipes, extract server from pipe_name (\\server\pipe\...)
+            TransportContext::NamedPipe { pipe_name } => {
+                // Extract server from \\server\pipe\... format
+                let server = pipe_name
+                    .trim_start_matches("\\\\")
+                    .split('\\')
+                    .next()
+                    .unwrap_or(".");
+                is_loopback_address(server)
+            }
+            // Shared memory is always local
+            TransportContext::SharedMemory { .. } => true,
+            // LocalDB is always local
+            #[cfg(windows)]
+            TransportContext::LocalDB { .. } => true,
+        }
+    }
+
     /// Create a TCP TransportContext from a routing token.
     ///
     /// Routing tokens can legitimately contain both `host\instance` and a port,
@@ -1307,6 +1325,20 @@ impl TransportContext {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_integrated_auth_config_for_uses_dialled_endpoint() {
+        let mut ctx = ClientContext::with_data_source("tcp:sql.contoso.com,1433");
+        ctx.parse_datasource("tcp:sql.contoso.com,1433").unwrap();
+        let routed = TransportContext::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 1434,
+            instance_name: None,
+        };
+
+        assert!(!ctx.integrated_auth_config().is_loopback);
+        assert!(ctx.integrated_auth_config_for(&routed).is_loopback);
+    }
 
     #[test]
     fn prepared_policy_survives_cloning_and_can_be_explicitly_overridden() {

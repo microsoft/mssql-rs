@@ -221,6 +221,81 @@ mod redirection_tests {
         let _ = gw_handle.await;
     }
 
+    /// A custom `SecurityContextProvider` must see the routed endpoint, not the
+    /// original one.
+    #[tokio::test]
+    async fn test_redirect_passes_routed_endpoint_to_security_context_provider() {
+        use mssql_mock_tds::MockTdsServer;
+        use mssql_tds::connection::client_context::TdsAuthenticationMethod;
+        use mssql_tds::security::mock::MockSecurityContext;
+        use mssql_tds::security::{
+            IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityError,
+        };
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::oneshot;
+
+        #[derive(Default)]
+        struct RecordingProvider(Mutex<Vec<(String, u16, bool)>>);
+
+        impl SecurityContextProvider for RecordingProvider {
+            fn create_context(
+                &self,
+                config: &IntegratedAuthConfig,
+                server: &str,
+                port: u16,
+            ) -> Result<Box<dyn SecurityContext>, SecurityError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((server.to_string(), port, config.is_loopback));
+                Ok(Box::new(MockSecurityContext::single_round(b"t".to_vec())))
+            }
+        }
+
+        let destination_server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let destination_port = destination_server.local_addr().port();
+        let gateway_server =
+            MockTdsServer::new_with_redirection("127.0.0.1:0", "127.0.0.1", destination_port)
+                .await
+                .unwrap();
+        let gateway_port = gateway_server.local_addr().port();
+
+        let (dest_shutdown_tx, dest_shutdown_rx) = oneshot::channel();
+        let (gw_shutdown_tx, gw_shutdown_rx) = oneshot::channel();
+        let dest_handle = tokio::spawn(async move {
+            let _ = destination_server.run_with_shutdown(dest_shutdown_rx).await;
+        });
+        let gw_handle = tokio::spawn(async move {
+            let _ = gateway_server.run_with_shutdown(gw_shutdown_rx).await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let recorder = Arc::new(RecordingProvider::default());
+        let mut context = create_test_context();
+        context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
+        context.security_context_provider = Some(recorder.clone());
+
+        let datasource = format!("tcp:127.0.0.1,{gateway_port}");
+        let result = TdsConnectionProvider {}
+            .create_client(context, &datasource, None)
+            .await;
+        assert!(result.is_ok(), "connect failed: {:?}", result.err());
+
+        let calls = recorder.0.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("127.0.0.1".to_string(), gateway_port, true),
+                ("127.0.0.1".to_string(), destination_port, true),
+            ]
+        );
+
+        let _ = dest_shutdown_tx.send(());
+        let _ = gw_shutdown_tx.send(());
+        let _ = dest_handle.await;
+        let _ = gw_handle.await;
+    }
+
     /// Test redirection chain with exactly 10 redirects (at the limit).
     ///
     /// This should succeed because the limit is > 10, not >= 10.
