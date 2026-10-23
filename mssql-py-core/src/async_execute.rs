@@ -15,7 +15,7 @@ use mssql_tds::connection::tds_client::{
 use mssql_tds::error::{Error, SqlInfoMessage};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
-use mssql_tds::query::metadata::ColumnMetadata;
+use mssql_tds::query::metadata::ResultColumnMetadata;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
@@ -204,7 +204,7 @@ impl ExecuteResources {
 enum ExecuteOutcome {
     NoRows(i64),
     TerminalNoRows(i64),
-    Rows(Vec<ColumnMetadata>),
+    Rows(Vec<ResultColumnMetadata>),
 }
 
 impl ExecuteOutcome {
@@ -340,7 +340,7 @@ async fn execute_on_client(
             .await?
     };
     Ok(match first {
-        StatementResult::Rows => ExecuteOutcome::Rows(client.get_metadata().clone()),
+        StatementResult::Rows => ExecuteOutcome::Rows(client.get_result_metadata()),
         StatementResult::NoRows { rows_affected } if client.has_open_batch() => {
             ExecuteOutcome::NoRows(rowcount_from_rows_affected(rows_affected))
         }
@@ -524,7 +524,7 @@ async fn execute_many_on_client(
                 .map_err(|failure| ExecuteManyFailure { failure, row_index })?;
             match next {
                 StatementResult::Rows => {
-                    let metadata = client.get_metadata().clone();
+                    let metadata = client.get_result_metadata();
                     results.push_back(
                         read_buffered_row_set(client, metadata)
                             .await
@@ -559,7 +559,7 @@ async fn execute_many_on_client(
 
 async fn read_buffered_row_set(
     client: &mut TdsClient,
-    metadata: Vec<ColumnMetadata>,
+    metadata: Vec<ResultColumnMetadata>,
 ) -> Result<BufferedRowSet, ExecuteFailure> {
     let mut rows = VecDeque::new();
     loop {
