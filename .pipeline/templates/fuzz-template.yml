@@ -72,20 +72,24 @@ steps:
     FUZZ_EXIT_CODE=$?
     set -e
     
-    # Check for crashes
+    # Check for findings. libFuzzer names each artifact by defect class:
+    # crash-* (panic/sanitizer), timeout-* (hang), oom-* (out of memory),
+    # leak-* (leak), slow-unit-* (slow input). Matching only crash-* let
+    # hangs, OOMs and leaks pass as a green build even though the fuzzer
+    # found and saved a reproducer.
     CRASH_COUNT=0
     if [ -d "artifacts/${{ parameters.fuzzTarget }}" ]; then
-      CRASH_COUNT=$(find artifacts/${{ parameters.fuzzTarget }} -type f -name "crash-*" 2>/dev/null | wc -l)
+      CRASH_COUNT=$(find artifacts/${{ parameters.fuzzTarget }} -type f \( -name "crash-*" -o -name "timeout-*" -o -name "oom-*" -o -name "leak-*" -o -name "slow-unit-*" \) 2>/dev/null | wc -l)
       
       if [ $CRASH_COUNT -gt 0 ]; then
-        echo "##vso[task.logissue type=error]Found $CRASH_COUNT crash(es) during fuzzing"
-        echo "Crashes found in artifacts/${{ parameters.fuzzTarget }}/"
+        echo "##vso[task.logissue type=error]Found $CRASH_COUNT fuzz finding(s) (crash/timeout/oom/leak/slow-unit) during fuzzing"
+        echo "Findings saved in artifacts/${{ parameters.fuzzTarget }}/"
         
-        # List crash files
-        echo "Crash files:"
-        find artifacts/${{ parameters.fuzzTarget }} -type f -name "crash-*" -exec basename {} \;
+        # List finding files
+        echo "Finding files:"
+        find artifacts/${{ parameters.fuzzTarget }} -type f \( -name "crash-*" -o -name "timeout-*" -o -name "oom-*" -o -name "leak-*" -o -name "slow-unit-*" \) -exec basename {} \;
         
-        # Set variable to indicate crashes were found
+        # Set variable to indicate findings were found
         echo "##vso[task.setvariable variable=FuzzCrashesFound]true"
       else
         echo "No crashes found"
@@ -118,16 +122,16 @@ steps:
     cd ${{ parameters.fuzzDir }}
     
     if [ -d "artifacts/${{ parameters.fuzzTarget }}" ]; then
-      CRASH_COUNT=$(find artifacts/${{ parameters.fuzzTarget }} -type f -name "crash-*" 2>/dev/null | wc -l)
+      CRASH_COUNT=$(find artifacts/${{ parameters.fuzzTarget }} -type f \( -name "crash-*" -o -name "timeout-*" -o -name "oom-*" -o -name "leak-*" -o -name "slow-unit-*" \) 2>/dev/null | wc -l)
       
       if [ $CRASH_COUNT -gt 0 ]; then
         # Create artifact directory
         mkdir -p $(Build.ArtifactStagingDirectory)/fuzz-crashes
         
-        # Copy all crash artifacts
+        # Copy all finding artifacts
         cp -r artifacts/${{ parameters.fuzzTarget }}/* $(Build.ArtifactStagingDirectory)/fuzz-crashes/
         
-        echo "Copied $CRASH_COUNT crash file(s) to staging directory"
+        echo "Copied $CRASH_COUNT finding file(s) to staging directory"
       fi
     fi
   displayName: Prepare Crash Artifacts
