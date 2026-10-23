@@ -252,6 +252,12 @@ private:
     std::vector<std::string> typeNames_;
 };
 
+// Not /SharedEnv or /SharedDbc: concurrent CREATE and DROP TYPE from other
+// workers deadlock the best-effort systypes lookup (error 1205), which then
+// falls back to the base type name. msodbcsql fails the same way at 8 x 20.
+constexpr unsigned kAliasTypeModes =
+    odbc_concurrency::kSingle | odbc_concurrency::kCrossThread | odbc_concurrency::kSharedStmt;
+
 // The first description happens with the cursor's rows pending, so the names
 // are read without touching the session that is serving them.
 //
@@ -261,7 +267,7 @@ private:
 // only through TrustServerCertificate, as CI's does, its lookup fails and the
 // column keeps its base type name. Where that login succeeds, msodbcsql 18.6.2.1
 // reports the alias name too.
-ODBC_TEST_F(AliasTypeLiveTest, NameIsReportedWhileTheCursorIsOpen) {
+ODBC_TEST_F_MODES(AliasTypeLiveTest, NameIsReportedWhileTheCursorIsOpen, kAliasTypeModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     const std::string typeName = CreateAliasType();
     SelectAliasColumn(typeName);
@@ -274,7 +280,7 @@ ODBC_TEST_F(AliasTypeLiveTest, NameIsReportedWhileTheCursorIsOpen) {
 }
 
 // Once every row has been read the session is idle and answers itself.
-ODBC_TEST_F(AliasTypeLiveTest, NameIsReportedOnceTheRowsAreRead) {
+ODBC_TEST_F_MODES(AliasTypeLiveTest, NameIsReportedOnceTheRowsAreRead, kAliasTypeModes) {
     const std::string typeName = CreateAliasType();
     SelectAliasColumn(typeName);
     FetchAliasValues();
@@ -288,7 +294,8 @@ ODBC_TEST_F(AliasTypeLiveTest, NameIsReportedOnceTheRowsAreRead) {
 // until a database change, even one that returns to the same database. Each
 // column is described after its rows are read, so both drivers read the names
 // on the session.
-ODBC_TEST_F(AliasTypeLiveTest, TypeCreatedAfterTheReadIsNamedAfterADatabaseChange) {
+ODBC_TEST_F_MODES(AliasTypeLiveTest, TypeCreatedAfterTheReadIsNamedAfterADatabaseChange,
+                  kAliasTypeModes) {
     const std::string earlier = CreateAliasType();
     SelectAliasColumn(earlier);
     FetchAliasValues();
@@ -313,7 +320,8 @@ ODBC_TEST_F(AliasTypeLiveTest, TypeCreatedAfterTheReadIsNamedAfterADatabaseChang
 // names inside sp_executesql with the option turned off there (sqlcstr.cpp
 // g_szSqlUdtQuery), so the lookup on the idle session neither begins a
 // transaction nor changes the application's setting.
-ODBC_TEST_F(AliasTypeLiveTest, LookupOnTheSessionBeginsNoImplicitTransaction) {
+ODBC_TEST_F_MODES(AliasTypeLiveTest, LookupOnTheSessionBeginsNoImplicitTransaction,
+                  kAliasTypeModes) {
     const std::string typeName = CreateAliasType();
     SelectAliasColumn(typeName);
     FetchAliasValues();

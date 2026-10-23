@@ -59,9 +59,25 @@
 //                                  of a non-Single test: the fixture's SetUp,
 //                                  the run, and its TearDown; see Watchdog for
 //                                  what happens on expiry
-//   MSSQL_ODBC_MT_DUMP_DIR         Where the watchdog writes a Windows
-//                                  minidump (default: working directory)
+//   MSSQL_ODBC_MT_DUMP_DIR         Where Windows minidumps go (default: working
+//                                  directory): the watchdog's for a hang, and,
+//                                  with --gtest_catch_exceptions=0 and this
+//                                  variable set, a crash's or abort()'s (see
+//                                  UnattendedCrashReporting)
+//   MSSQL_ODBC_MT_SKIP_MODES       Comma-separated concurrent modes to report
+//                                  as skipped instead of running, e.g.
+//                                  "SharedDbc,SharedStmt"; "none" or unset
+//                                  skips nothing. An unknown name fails every
+//                                  concurrent variant.
+//   MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER
+//                                  "1" lets the watchdog terminate a process
+//                                  that is being traced; set by the CI launcher
+//                                  that runs tests under gdb for backtraces
 //   CrossThread ignores the first two: it always runs the body once.
+//
+// ctest runs the concurrent variants of each converted executable as a separate
+// entry, <name>_mt, so they do not hide its single-threaded results; see
+// tests/e2e/CMakeLists.txt and the runners' stress profiles.
 
 #pragma once
 
@@ -70,6 +86,7 @@
 #include <gtest/gtest-spi.h>
 
 #if defined(_WIN32)
+#include <crtdbg.h>
 #include <dbghelp.h>
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -83,6 +100,8 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -148,24 +167,30 @@ namespace detail {
 
 constexpr int kMaxConflictRetries = 10000;
 
-// Fails the test and returns |fallback| when the setting is present but invalid.
-inline int ReadSetting(const char* name, int fallback, int max_value) {
+// Returns false when |name| is unset; an empty value counts as set.
+inline bool ReadEnv(const char* name, std::string& value) {
 #ifdef _WIN32
     char* buffer = nullptr;
     size_t length = 0;
     if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr) {
-        return fallback;
+        return false;
     }
-    const std::string text(buffer);
+    value = buffer;
     free(buffer);
 #else
     const char* env = std::getenv(name);
     if (env == nullptr) {
-        return fallback;
+        return false;
     }
-    const std::string text(env);
+    value = env;
 #endif
-    if (text.empty()) {
+    return true;
+}
+
+// Fails the test and returns |fallback| when the setting is present but invalid.
+inline int ReadSetting(const char* name, int fallback, int max_value) {
+    std::string text;
+    if (!ReadEnv(name, text) || text.empty()) {
         return fallback;
     }
     errno = 0;
@@ -177,6 +202,45 @@ inline int ReadSetting(const char* name, int fallback, int max_value) {
         return fallback;
     }
     return static_cast<int>(parsed);
+}
+
+// Parses MSSQL_ODBC_MT_SKIP_MODES into a mode mask. Names are matched exactly,
+// around optional spaces; "none" (or an empty value) skips nothing. Returns
+// false with |error| set for a name that is not a concurrent mode, so a typo
+// cannot silently run the mode it meant to skip.
+inline bool SkippedModes(unsigned& mask, std::string& error) {
+    mask = 0;
+    std::string text;
+    if (!ReadEnv("MSSQL_ODBC_MT_SKIP_MODES", text) || text == "none") {
+        return true;
+    }
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(',', start);
+        const size_t stop = comma == std::string::npos ? text.size() : comma;
+        std::string name = text.substr(start, stop - start);
+        name.erase(0, name.find_first_not_of(' '));
+        name.erase(name.find_last_not_of(' ') + 1);
+        if (!name.empty()) {
+            bool known = false;
+            for (Mode mode : kModes) {
+                if (mode != kSingle && name == ModeName(mode)) {
+                    mask |= mode;
+                    known = true;
+                }
+            }
+            if (!known) {
+                error = "MSSQL_ODBC_MT_SKIP_MODES names '" + name +
+                        "', which is not one of CrossThread, SharedEnv, SharedDbc, SharedStmt";
+                return false;
+            }
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return true;
 }
 
 struct Config {
@@ -223,7 +287,10 @@ class StartGate {
 //   Others   abort(), so the OS writes a core file when core dumps are enabled.
 // A process under a debugger is never terminated: sitting at a breakpoint for
 // longer than the timeout is not a hang. Nor is one whose debugger status
-// cannot be determined (detection exists for Windows, Linux, and macOS).
+// cannot be determined (detection exists for Windows, Linux, and macOS). The
+// exception is MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER=1: the stress launcher
+// runs tests under gdb in batch mode only to print every thread's stack when
+// the process dies, so a hang must still end in abort() there.
 //
 // Env: MSSQL_ODBC_MT_DUMP_DIR  directory for the Windows minidump (default:
 //      the working directory).
@@ -258,32 +325,40 @@ inline DebuggerState QueryDebugger() {
 #endif
 }
 
-[[noreturn]] inline void TerminateHungProcess() {
 #if defined(_WIN32)
-    std::string dir = ".";
-    char* env = nullptr;
-    size_t length = 0;
-    if (_dupenv_s(&env, &length, "MSSQL_ODBC_MT_DUMP_DIR") == 0 && env != nullptr) {
-        if (*env != '\0') {
-            dir = env;
-        }
-        free(env);
+// Writes a minidump of every thread to MSSQL_ODBC_MT_DUMP_DIR (default: the
+// working directory) as odbc-mt-<kind>-<pid>.dmp and prints its path. Uses no
+// heap, so it is safe from a crashed process. |exception| may be null.
+inline bool WriteMinidump(const char* kind, EXCEPTION_POINTERS* exception, DWORD thread_id) {
+    char dir[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableA("MSSQL_ODBC_MT_DUMP_DIR", dir, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        dir[0] = '.';
+        dir[1] = '\0';
     }
-    const std::string path =
-        dir + "\\odbc-mt-watchdog-" + std::to_string(GetCurrentProcessId()) + ".dmp";
-    const HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+    char path[MAX_PATH + 64] = {};
+    snprintf(path, sizeof(path), "%s\\odbc-mt-%s-%lu.dmp", dir, kind, GetCurrentProcessId());
+    const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                     FILE_ATTRIBUTE_NORMAL, nullptr);
+    MINIDUMP_EXCEPTION_INFORMATION info = {thread_id, exception, FALSE};
     const bool written =
         file != INVALID_HANDLE_VALUE &&
         MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
                           static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo |
                                                      MiniDumpWithUnloadedModules),
-                          nullptr, nullptr, nullptr) != FALSE;
+                          exception != nullptr ? &info : nullptr, nullptr, nullptr) != FALSE;
     if (file != INVALID_HANDLE_VALUE) {
         CloseHandle(file);
     }
-    std::cerr << (written ? "  minidump: " : "  minidump failed: ") << path << "\n";
-    std::cerr.flush();
+    fprintf(stderr, "  minidump%s: %s\n", written ? "" : " failed", path);
+    fflush(stderr);
+    return written;
+}
+#endif
+
+[[noreturn]] inline void TerminateHungProcess() {
+#if defined(_WIN32)
+    WriteMinidump("watchdog", nullptr, GetCurrentThreadId());
     std::_Exit(124);
 #else
     std::cerr << "  aborting for a core dump\n";
@@ -302,7 +377,11 @@ class Watchdog {
                   return;
               }
               const DebuggerState debugger = QueryDebugger();
-              if (debugger != DebuggerState::kAbsent) {
+              std::string terminate_under_debugger;
+              const bool override_debugger =
+                  ReadEnv("MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER", terminate_under_debugger) &&
+                  terminate_under_debugger == "1";
+              if (debugger != DebuggerState::kAbsent && !override_debugger) {
                   std::cerr << label << ": watchdog expired after " << timeout.count() << "s "
                             << (debugger == DebuggerState::kAttached
                                     ? "with a debugger attached"
@@ -312,7 +391,11 @@ class Watchdog {
                   return;
               }
               std::cerr << label << ": watchdog expired after " << timeout.count()
-                        << "s; terminating.\n";
+                        << "s; terminating"
+                        << (debugger != DebuggerState::kAbsent
+                                ? " (MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER=1)"
+                                : "")
+                        << ".\n";
               for (size_t i = 0; i < progress.size(); ++i) {
                   std::cerr << "  worker " << i << ": completed_iterations=" << progress[i].load()
                             << "\n";
@@ -1010,8 +1093,103 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
 
 }  // namespace detail
 
+#if defined(_WIN32)
+// The stress profiles run with --gtest_catch_exceptions=0 so a crash ends the
+// process instead of becoming a test failure, and set MSSQL_ODBC_MT_DUMP_DIR so
+// it leaves a minidump there. Windows Error Reporting cannot be relied on for
+// that: ctest runs each test in a job object with
+// JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, so WER never sees the crash. The
+// process's own unhandled-exception filter still runs, so the dump is written
+// in-process: by that filter for an access violation or other SEH exception,
+// and by a SIGABRT handler for abort() and std::terminate(). Not covered:
+// __fastfail exits (a /GS cookie failure, Rust's abort on a double panic),
+// which bypass both. The dump is written from a second thread, so a crash on an
+// exhausted stack still gets one.
+//
+// Also, gtest leaves the CRT alone when it does not catch exceptions, so in a
+// Debug build abort() and failed CRT assertions open a modal dialog. Their
+// reports go to stderr instead, as gtest does when it catches.
+//
+// None of this happens under a debugger, which should see the crash first.
+namespace detail {
+
+struct CrashDumpRequest {
+    EXCEPTION_POINTERS* exception;
+    DWORD thread_id;
+    const char* kind;
+};
+
+inline DWORD WINAPI WriteCrashDumpThread(LPVOID parameter) {
+    const CrashDumpRequest* request = static_cast<const CrashDumpRequest*>(parameter);
+    WriteMinidump(request->kind, request->exception, request->thread_id);
+    return 0;
+}
+
+inline void WriteCrashDumpOnAnotherThread(const char* kind, EXCEPTION_POINTERS* exception) {
+    CrashDumpRequest request = {exception, GetCurrentThreadId(), kind};
+    const HANDLE writer = CreateThread(nullptr, 0, WriteCrashDumpThread, &request, 0, nullptr);
+    if (writer == nullptr) {
+        WriteMinidump(kind, exception, request.thread_id);
+        return;
+    }
+    WaitForSingleObject(writer, 60000);
+    CloseHandle(writer);
+}
+
+inline LONG WINAPI DumpUnhandledException(EXCEPTION_POINTERS* exception) {
+    fprintf(stderr, "Unhandled exception 0x%08lX; writing a minidump.\n",
+            exception != nullptr && exception->ExceptionRecord != nullptr
+                ? exception->ExceptionRecord->ExceptionCode
+                : 0ul);
+    WriteCrashDumpOnAnotherThread("crash", exception);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+inline void DumpOnAbort(int) {
+    fputs("abort() called; writing a minidump.\n", stderr);
+    WriteCrashDumpOnAnotherThread("abort", nullptr);
+}
+
+}  // namespace detail
+
+class UnattendedCrashReporting : public ::testing::Environment {
+   public:
+    void SetUp() override {
+        if (GTEST_FLAG_GET(catch_exceptions) || IsDebuggerPresent() != FALSE) {
+            return;
+        }
+        _set_error_mode(_OUT_TO_STDERR);
+#ifdef _DEBUG
+        for (int report : {_CRT_WARN, _CRT_ERROR, _CRT_ASSERT}) {
+            (void)_CrtSetReportMode(report, _CRTDBG_MODE_FILE);
+            (void)_CrtSetReportFile(report, _CRTDBG_FILE_STDERR);
+        }
+#endif
+        std::string dump_dir;
+        if (detail::ReadEnv("MSSQL_ODBC_MT_DUMP_DIR", dump_dir) && !dump_dir.empty()) {
+            SetUnhandledExceptionFilter(detail::DumpUnhandledException);
+            signal(SIGABRT, detail::DumpOnAbort);
+        }
+    }
+};
+
+inline ::testing::Environment* const kUnattendedCrashReporting =
+    ::testing::AddGlobalTestEnvironment(new UnattendedCrashReporting);
+#endif
+
 template <typename T>
 void RunTest(T& test, Mode mode, const char* name) {
+    if (mode != kSingle) {
+        unsigned skipped = 0;
+        std::string error;
+        if (!detail::SkippedModes(skipped, error)) {
+            ADD_FAILURE() << name << ": " << error;
+            return;
+        }
+        if ((skipped & mode) != 0) {
+            GTEST_SKIP() << ModeName(mode) << " excluded by MSSQL_ODBC_MT_SKIP_MODES";
+        }
+    }
     switch (mode) {
         case kSingle:
             test.ConcurrentBody();
