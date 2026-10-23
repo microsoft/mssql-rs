@@ -153,6 +153,11 @@ fn sql_exec_direct_w_operation(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        if let Err(rc) =
+            super::exec_common::validate_parameter_focus(&mut stmt_state, "SQLExecDirectW")
+        {
+            return rc;
+        }
         let cancel_handle = match stmt.new_execution_cancel() {
             Ok(handle) => handle,
             Err(rc) => return rc,
@@ -807,6 +812,39 @@ mod tests {
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
         assert_eq!(status, -1);
         assert_eq!(status_ind, 0);
+    }
+
+    #[test]
+    fn execution_entry_points_reject_nonzero_tvp_focus_before_reading_buffers() {
+        use crate::handles::stmt::PreparedPlan;
+        use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test(
+                    "SELECT @P1",
+                    StatementId::from_raw_for_test(42),
+                ),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+        }
+        let sql: Vec<u16> = "SELECT ?".encode_utf16().chain(Some(0)).collect();
+        for direct in [true, false] {
+            let rc = if direct {
+                unsafe { crate::api::exports::SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS) }
+            } else {
+                unsafe { crate::api::exports::SQLExecute(h.stmt) }
+            };
+            assert_eq!(rc, SQL_ERROR);
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY024);
+            assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        }
     }
 
     #[test]

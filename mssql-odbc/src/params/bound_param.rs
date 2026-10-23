@@ -309,11 +309,15 @@ impl BoundParam {
                     param,
                     // Filtered to match the doc on the field, and for the same
                     // reason `parameter_definition` filters: `classify_field`
-                    // gates the `SQL_CA_SS_UDT_*` fields on `DescKind::ImpParam`
-                    // alone, so an application can leave an identity on a
-                    // record it later rebinds to a scalar type.
+                    // gates the `SQL_CA_SS_*` name fields on `DescKind::ImpParam`
+                    // alone, so an application can leave an identity on a record
+                    // it later rebinds to a scalar type. Both `SQL_SS_UDT` and
+                    // `SQL_SS_TABLE` carry a server type name in this storage.
                     udt_names: ipd_record
-                        .filter(|ipd| ipd.concise_type == crate::api::odbc_types::SQL_SS_UDT)
+                        .filter(|ipd| {
+                            ipd.concise_type == crate::api::odbc_types::SQL_SS_UDT
+                                || ipd.concise_type == crate::api::odbc_types::SQL_SS_TABLE
+                        })
                         .and_then(|ipd| ipd.udt_names.clone()),
                 })
             })

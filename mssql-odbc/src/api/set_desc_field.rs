@@ -23,17 +23,18 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_NUMERIC, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
-    SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME, SQL_CODE_DATE, SQL_CODE_TIME,
-    SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
-    SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
-    SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH,
-    SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
-    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
-    SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT,
-    SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_PREC_NUMERIC, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_UNNAMED, SqlHandle, SqlInteger, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_C_NUMERIC, SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME,
+    SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME,
+    SQL_CA_SS_UDT_TYPE_NAME, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME,
+    SQL_DECIMAL, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
+    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
+    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
+    SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT,
+    SQL_PREC_NUMERIC, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TYPE_DATE, SQL_TYPE_TIME,
+    SQL_TYPE_TIMESTAMP, SQL_UNNAMED, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_CANNOT_MODIFY_IRD, ERR_INCONSISTENT_DESCRIPTOR_INFO, ERR_INVALID_ATTRIBUTE_VALUE,
@@ -370,8 +371,11 @@ fn set_record_field(
         SQL_CA_SS_UDT_CATALOG_NAME
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
-        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => {
-            set_udt_name(state, field, record_number, value_ptr, buffer_length)
+        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+        | SQL_CA_SS_CATALOG_NAME
+        | SQL_CA_SS_SCHEMA_NAME
+        | SQL_CA_SS_TYPE_NAME => {
+            set_user_type_name(state, field, record_number, value_ptr, buffer_length)
         }
         SQL_DESC_UNNAMED => set_unnamed(state, record_number, value_ptr),
         SQL_DESC_PARAMETER_TYPE => set_parameter_type(state, record_number, value_ptr),
@@ -726,7 +730,7 @@ fn read_descriptor_string(
 /// Only the type name is required on the wire; an application that leaves the
 /// catalog and schema unset lets the server resolve the type against the
 /// current database and default schema.
-fn set_udt_name(
+fn set_user_type_name(
     state: &mut DescState,
     field: SqlUSmallInt,
     record_number: SqlSmallInt,
@@ -738,25 +742,26 @@ fn set_udt_name(
     };
     write_record_field(state, record_number, |r| {
         let names = Arc::make_mut(r.udt_names.get_or_insert_with(Default::default));
-        // Claim only the part written. The assembly name never reaches the
-        // wire, so writing it claims nothing and leaves the rest the server's
-        // to supply.
+        // Claim only the part written. The UDT and TVP spellings resolve to the
+        // same catalog/schema/type storage; the assembly name never reaches the
+        // wire, so writing it claims nothing and leaves the rest the server's to
+        // supply.
         match field {
-            SQL_CA_SS_UDT_CATALOG_NAME => {
+            SQL_CA_SS_UDT_CATALOG_NAME | SQL_CA_SS_CATALOG_NAME => {
                 names.catalog = value;
                 r.udt_name_claimed.catalog = true;
             }
-            SQL_CA_SS_UDT_SCHEMA_NAME => {
+            SQL_CA_SS_UDT_SCHEMA_NAME | SQL_CA_SS_SCHEMA_NAME => {
                 names.schema = value;
                 r.udt_name_claimed.schema = true;
             }
-            SQL_CA_SS_UDT_TYPE_NAME => {
+            SQL_CA_SS_UDT_TYPE_NAME | SQL_CA_SS_TYPE_NAME => {
                 names.type_name = value;
                 r.udt_name_claimed.type_name = true;
             }
             SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => names.assembly_type_name = value,
-            // `set_record_field` routes only the four fields above here.
-            _ => debug_assert!(false, "unexpected UDT name field {field}"),
+            // `set_record_field` routes only the fields above here.
+            _ => debug_assert!(false, "unexpected user-type name field {field}"),
         }
     })
 }
@@ -935,6 +940,68 @@ mod tests {
             assert_eq!(ret, SQL_SUCCESS, "GET failed for field {field}");
             let chars = text_len as usize / size_of::<u16>();
             assert_eq!(String::from_utf16_lossy(&buf[..chars]), expected);
+        }
+    }
+
+    /// The TVP spelling of the server type-name fields
+    /// (`SQL_CA_SS_CATALOG_NAME`/`SCHEMA_NAME`/`TYPE_NAME`, 1225-1227) is what
+    /// mssql-python reads for a table-valued parameter. It must round-trip the
+    /// same way the UDT trio does, and must resolve to the same stored
+    /// catalog/schema/type - a name written through the UDT spelling reads back
+    /// through the TVP spelling and vice versa, since a parameter is never both.
+    #[test]
+    fn tvp_name_fields_round_trip_and_share_udt_storage() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ipd = h.ipd();
+
+        // Write through the TVP spelling.
+        for (field, value) in [
+            (SQL_CA_SS_CATALOG_NAME, "mydb"),
+            (SQL_CA_SS_SCHEMA_NAME, "sales"),
+            (SQL_CA_SS_TYPE_NAME, "OrderList"),
+        ] {
+            let mut buf: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+            let ret = unsafe {
+                sql_set_desc_field_w(
+                    ipd,
+                    1,
+                    field as SqlSmallInt,
+                    buf.as_mut_ptr() as SqlPointer,
+                    SqlInteger::from(SQL_NTS),
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "SET failed for TVP field {field}");
+        }
+
+        // Read back through both the TVP spelling and the UDT spelling: both
+        // resolve to the same catalog/schema/type storage.
+        for (field, expected) in [
+            (SQL_CA_SS_CATALOG_NAME, "mydb"),
+            (SQL_CA_SS_UDT_CATALOG_NAME, "mydb"),
+            (SQL_CA_SS_SCHEMA_NAME, "sales"),
+            (SQL_CA_SS_UDT_SCHEMA_NAME, "sales"),
+            (SQL_CA_SS_TYPE_NAME, "OrderList"),
+            (SQL_CA_SS_UDT_TYPE_NAME, "OrderList"),
+        ] {
+            let mut out = [0u16; 64];
+            let mut text_len: SqlInteger = 0;
+            let ret = unsafe {
+                sql_get_desc_field_w(
+                    ipd,
+                    1,
+                    field as SqlSmallInt,
+                    out.as_mut_ptr() as SqlPointer,
+                    (out.len() * size_of::<u16>()) as SqlInteger,
+                    &mut text_len,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "GET failed for field {field}");
+            let chars = text_len as usize / size_of::<u16>();
+            assert_eq!(
+                String::from_utf16_lossy(&out[..chars]),
+                expected,
+                "field {field}"
+            );
         }
     }
 

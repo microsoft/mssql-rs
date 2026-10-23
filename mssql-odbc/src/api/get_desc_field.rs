@@ -15,6 +15,7 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
+    SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME,
     SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME,
     SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
     SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
@@ -232,16 +233,21 @@ fn record_field_value(record: &DescRecord, field: SqlUSmallInt) -> Option<FieldV
         SQL_DESC_DATA_PTR => FieldValue::Pointer(record.data_ptr),
         SQL_DESC_INDICATOR_PTR => FieldValue::Pointer(record.indicator_ptr),
         SQL_DESC_OCTET_LENGTH_PTR => FieldValue::Pointer(record.octet_length_ptr),
-        // A UDT name part that was never set reads back empty, the same answer
-        // a record with no UDT identity at all gives.
+        // A type-name part that was never set reads back empty, the same answer
+        // a record with no server type identity at all gives. The UDT trio and
+        // the TVP trio (`SQL_CA_SS_CATALOG_NAME`/`SCHEMA_NAME`/`TYPE_NAME`)
+        // resolve to the same stored catalog/schema/type.
         SQL_CA_SS_UDT_CATALOG_NAME
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
-        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => {
+        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+        | SQL_CA_SS_CATALOG_NAME
+        | SQL_CA_SS_SCHEMA_NAME
+        | SQL_CA_SS_TYPE_NAME => {
             let part = record.udt_names.as_deref().map(|n| match field {
-                SQL_CA_SS_UDT_CATALOG_NAME => &n.catalog,
-                SQL_CA_SS_UDT_SCHEMA_NAME => &n.schema,
-                SQL_CA_SS_UDT_TYPE_NAME => &n.type_name,
+                SQL_CA_SS_UDT_CATALOG_NAME | SQL_CA_SS_CATALOG_NAME => &n.catalog,
+                SQL_CA_SS_UDT_SCHEMA_NAME | SQL_CA_SS_SCHEMA_NAME => &n.schema,
+                SQL_CA_SS_UDT_TYPE_NAME | SQL_CA_SS_TYPE_NAME => &n.type_name,
                 _ => &n.assembly_type_name,
             });
             FieldValue::Text(part.cloned().unwrap_or_default())

@@ -527,13 +527,19 @@ impl RpcParameter {
     /// Formats a table-valued parameter's declaration name for `sp_executesql`,
     /// e.g. `[dbo].[MyType] READONLY`.
     ///
-    /// The schema defaults to `dbo` when unspecified (SQL Server's default
-    /// schema). The catalog/database part is intentionally omitted: SQL Server
+    /// An absent schema resolves against the caller's default schema.
+    /// The catalog/database part is intentionally omitted: SQL Server
     /// forbids cross-database TVP types in parameter declarations. The
     /// `READONLY` suffix is mandatory for TVP parameters.
     fn format_tvp_sql_name(type_name: &TvpTypeName) -> String {
-        let schema = type_name.schema_name.as_deref().unwrap_or("dbo");
-        format!("[{schema}].[{}] READONLY", type_name.type_name)
+        match type_name
+            .schema_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            Some(schema) => format!("[{schema}].[{}] READONLY", type_name.type_name),
+            None => format!("[{}] READONLY", type_name.type_name),
+        }
     }
 
     /// Formats a UDT's declaration name for `sp_executesql`, e.g.
@@ -1714,7 +1720,7 @@ mod tests {
     }
 
     /// Table-valued parameters are declared by their schema-qualified table type
-    /// name with the mandatory `READONLY` suffix; the schema defaults to `dbo`.
+    /// name with the mandatory `READONLY` suffix; an absent schema stays unqualified.
     #[test]
     fn test_get_sql_name_tvp() {
         use crate::datatypes::sql_tvp::TvpTypeName;
@@ -1731,7 +1737,7 @@ mod tests {
         let default_schema = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
         assert_eq!(
             RpcParameter::get_sql_name(&default_schema, None).unwrap(),
-            "[dbo].[OrderList] READONLY"
+            "[OrderList] READONLY"
         );
     }
 
