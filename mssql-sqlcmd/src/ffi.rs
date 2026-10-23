@@ -740,7 +740,7 @@ mod tests {
             "\"text\": \"SELECT 1\"",
             "\"rowsAffected\": 2",
             "\"count\": 3",
-            "\"number\": 50000,\n      \"severity\": 16,\n      \"state\": 1,\n      \"server\": \"db01\",\n      \"procedure\": \"p\",\n      \"line\": 2,\n      \"sqlState\": \"42000\",\n      \"text\": \"boom\"",
+            "\"number\": 50000,\n      \"severity\": 16,\n      \"state\": 1,\n      \"server\": \"db01\",\n      \"procedure\": \"p\",\n      \"line\": 2,\n      \"text\": \"boom\"",
         ] {
             assert!(
                 rendered.contains(expected),
