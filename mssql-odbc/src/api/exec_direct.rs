@@ -953,7 +953,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
             // active_stmt stays None => connection idle and claimable.
         }
 
@@ -968,8 +968,8 @@ mod tests {
 
         // Connection stays busy on this statement with the client returned.
         let ds = dbc.inner.lock().unwrap();
-        assert_eq!(ds.active_stmt, Some(h.stmt));
-        assert!(ds.client.is_some());
+        assert_eq!(ds.wire.statement_owner(), Some(h.stmt));
+        assert!(ds.wire.client().is_some());
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,
@@ -1110,7 +1110,7 @@ mod tests {
             col_metadata(int_columns(1)),
             done_no_more(),
         ]);
-        dbc.inner.lock().unwrap().client = Some(client);
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let ret = sql_exec_direct_w_safe(
@@ -1147,7 +1147,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
         }
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1180,7 +1180,7 @@ mod tests {
         let client = tds_client_from_tokens(vec![col_metadata_empty()]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
         }
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
@@ -1220,7 +1220,7 @@ mod tests {
         let client = tds_client_from_tokens(vec![done_no_more()]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
         }
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {

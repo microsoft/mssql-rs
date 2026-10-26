@@ -350,6 +350,7 @@ mod tests {
     use crate::error::diag::DiagRecord;
     use crate::handles::{DescHandle, handle_from_raw};
     use crate::test_support::TestHandles;
+    use crate::test_support::assert_last_diag;
 
     // `SQL_DESC_*` field-identifier constants are `SqlUSmallInt`-typed (shared
     // with `SQLColAttributeW`'s unsigned `FieldIdentifier`), but
@@ -367,17 +368,6 @@ mod tests {
         crate::api::odbc_types::SQL_DESC_PARAMETER_TYPE as SqlSmallInt;
     const SQL_DESC_UNNAMED: SqlSmallInt = crate::api::odbc_types::SQL_DESC_UNNAMED as SqlSmallInt;
     const SQL_DESC_NAME: SqlSmallInt = crate::api::odbc_types::SQL_DESC_NAME as SqlSmallInt;
-
-    fn assert_last_diag(records: &[DiagRecord], expected: crate::api::sqlstate::DiagMsg) {
-        let d = records.last().expect("expected a diagnostic record");
-        assert_eq!(d.sql_state, expected.state, "SQLSTATE mismatch");
-        assert!(
-            d.message.contains(expected.text),
-            "message {:?} did not contain {:?}",
-            d.message,
-            expected.text
-        );
-    }
 
     fn desc_diags(handle: SqlHandle) -> Vec<DiagRecord> {
         let desc = unsafe { handle_from_raw::<DescHandle>(handle) };

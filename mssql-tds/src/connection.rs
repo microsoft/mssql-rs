@@ -21,6 +21,7 @@ pub(crate) mod dns_cache;
 pub(crate) mod execution_context;
 pub(crate) mod instance_cache;
 pub(crate) mod metadata_retriever;
+pub mod multi_subnet_failover;
 pub(crate) mod session_recovery;
 /// Primary client type and result set traits.
 pub mod tds_client;

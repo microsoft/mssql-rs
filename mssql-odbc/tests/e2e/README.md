@@ -375,7 +375,15 @@ infrastructure works (`runtests.c`).
   `Threading=1`, so unixODBC serializes calls on each handle as the Windows
   Driver Manager does, except `SQLCancel`, which it locks only at level 3. At
   the unixODBC default of 0, the `/SharedStmt` variants crash inside
-  `libodbc` with either driver.
+  `libodbc` with either driver. `Threading=1` does not eliminate the diagnostic-list
+  race fixed by [lurcher/unixODBC#244](https://github.com/lurcher/unixODBC/pull/244).
+  The `/SharedStmt` variants of
+  `GetDataLiveTest.DefaultTargetStreamsAVarcharMaxAcrossChunks` and
+  `GetDataLiveTest.RunUniqueValuesSurviveEveryRetrievalPath` are temporarily
+  unregistered on non-Windows platforms; their other variants and all Windows
+  coverage remain enabled. Restore their default modes once a fixed unixODBC
+  release propagates through all supported OS package channels, or the
+  mssql-odbc pipelines build and use latest unixODBC code containing the fix.
 
 - **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
   `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server (Rust)`, so an

@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- Shared MultiSubnetFailover (MSF) startup configuration: explicit connection
+  setting > application default > `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT`
+  (`true`/`false`) > built-in on. Rust, native Python, and Node.js expose
+  startup setters; the CLI accepts `--multi-subnet-failover true|false`.
+  Defaults freeze on first use; late setters fail. Connection policy and its
+  source are traced and retained for recovery and secondary connections
+  (AB#49293).
+
+- `mssql-odbc`: `SQL_COPT_SS_MULTISUBNET_FAILOVER` accepts off/on before
+  connecting, overrides the matching keyword, and reports the connection's
+  effective policy. Out-of-range values are `HY024`; changes while connected
+  are `HY011` (AB#49293).
+
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing
   bound-fetch 1 MiB source-data cap (AB#47238).
@@ -76,6 +89,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- Eligible TCP connections now default to immediate parallel MSF attempts,
+  without TNIR's first-address phase. Explicit non-TCP transports, failover
+  partners, and named instances requiring SSRP suppress an inherited on
+  default; Windows local targets without a protocol or port retain their
+  shared-memory-first path unless MSF is explicitly enabled for the connection.
+  Explicitly enabling incompatible MSF is an error. More than 64
+  resolved addresses is an error with MSF on, not a truncated race; MSF off
+  walks the full list sequentially. See parity decisions 34 and 35 (AB#49293).
+
+- Rust API migration: `ClientContext::multi_subnet_failover` is now
+  `Option<bool>`: use `None` to inherit, or `Some(false)` to opt out.
+  Python dictionary and JS object options preserve omission and explicit false.
+  Native Python `multi_subnet_failover=None` also inherits the default.
+
+- TNIR is deliberately unsupported. ODBC
+  `TransparentNetworkIPResolution=Disabled` / `SQL_COPT_SS_TNIR=OFF` and native
+  Python `False` / `"Disabled"` are compatibility no-ops, **not MSF opt-outs**.
+  Enabling TNIR returns `HYC00` in ODBC or an exception in native Python;
+  malformed values are rejected. Use `MultiSubnetFailover=No` or the equivalent
+  native option to select sequential connections (AB#49293).
 
 - `mssql-tds`: `Error::Redirection` has a new `database` field, set when the
   server routes the connection with Enhanced Routing. Routing ENVCHANGEs are
@@ -159,6 +193,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds`: a parallel TCP connect now aborts its remaining attempts when it is cancelled
+  or the login deadline expires. Before, those attempts kept their sockets
+  open until the OS connect timeout (AB#49293).
+
+- `mssql-odbc`: `SQLGetConnectAttr` now writes the four-byte width of an
+  integer attribute to `StringLengthPtr`, as msodbcsql does. Before, the
+  caller's variable was left unchanged (AB#49293).
+
 - `mssql-tds`: a route received over shared memory, the first transport tried
   for a local named instance, is now followed over TCP like a route received
   over any other transport. The connection previously failed with
@@ -184,6 +226,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `mssql-odbc` reports indicator `0` rather than `SQL_NULL_DATA` (matching
   msodbcsql), `mssql-py-core` returns `b""` rather than `None`, and `mssql-js`
   returns an empty `Buffer` rather than `null`. A genuine NULL is unchanged.
+
+- `mssql-odbc`: a statement that finds a shared, non-MARS connection in use now
+  always fails with `HY000` "Connection is busy with results for another
+  command", matching msodbcsql. Racing a cursor close or a connection-scoped
+  operation (`SQLEndTran`, autocommit/isolation/catalog changes, the
+  `SQL_USER_NAME` lookup) could instead report "No active TDS client", which
+  applications do not retry (AB#49225).
 
 - `mssql-tds` / `mssql-odbc`: a character with no representation in the narrow
   encoding a value is sent in is now replaced with `?` instead of being

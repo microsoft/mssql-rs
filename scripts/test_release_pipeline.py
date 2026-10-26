@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -38,7 +39,7 @@ _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
 _VERIFY_WHEELS_SCRIPT = _ROOT / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
 _SQLCMD_PACK_SCRIPT = _ROOT / ".pipeline" / "scripts" / "pack-mssql-sqlcmd.ps1"
 _SWITCHES = (
-    "publishNuGet",
+    "publishToFeed",
     "publishMssqlTds",
     "publishMssqlMockTds",
     "validateCratesOnly",
@@ -1325,28 +1326,17 @@ def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc:
 
 
 @pytest.mark.parametrize(
-    ("build_reason", "is_official", "expected_version"),
+    ("build_reason", "is_official", "expected_suffix"),
     [
-        ("Schedule", False, "0.1.0-nightly.20260910"),
-        ("IndividualCI", False, "0.1.0-dev.20260910.12345"),
-        ("Manual", False, "0.1.0-dev.20260910.12345"),
-        ("Manual", True, "0.1.0"),
+        ("Schedule", False, ".dev{date}"),
+        ("IndividualCI", False, ".dev{date}12345"),
+        ("Manual", False, ".dev{date}12345"),
+        ("Manual", True, ""),
     ],
 )
-def test_nonofficial_nuget_versions_follow_python_distribution(
-    tmp_path: Path, build_reason: str, is_official: bool, expected_version: str
+def test_wheel_versions_follow_pep440(
+    build_reason: str, is_official: bool, expected_suffix: str
 ) -> None:
-    source = tmp_path / "source"
-    package = source / "mssql-py-core"
-    package.mkdir(parents=True)
-    (package / "Cargo.toml").write_text(
-        '[package]\nname = "mssql-py-core"\nversion = "0.1.10"\n', encoding="utf-8"
-    )
-    (package / "pyproject.toml").write_text(
-        '[project]\nname = "mssql-python-rs"\nversion = "0.1.0"\n', encoding="utf-8"
-    )
-    staging = tmp_path / "staging"
-    staging.mkdir()
     flags = _stage_flags(
         buildAllTargets=True,
         buildPythonWheels=True,
@@ -1357,38 +1347,295 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
         publishToFeed=True,
     )
     pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
-    publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
-    step = next(
-        step
-        for step in publish["jobs"][0]["steps"]
-        if step.get("displayName") == "Generate NuGet package metadata"
-    )
-    script = step["pwsh"].replace(
-        '$dateStamp = Get-Date -Format "yyyyMMdd"', '$dateStamp = "20260910"'
-    )
-    variables = {
-        "Build.SourcesDirectory": str(source),
-        "Build.StagingDirectory": str(staging),
-        "Build.Reason": build_reason,
-        "Build.BuildId": "12345",
-        "Build.SourceVersion": "a" * 40,
-        "Build.BuildNumber": "20260910.1",
-    }
-    for key, value in variables.items():
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job["job"] == "ComputeWheelVersion")
+    step = next(step for step in job["steps"] if step.get("name") == "compute")
+    script = step["pwsh"]
+    for key, value in {"Build.Reason": build_reason, "Build.BuildId": "12345"}.items():
         script = script.replace(f"$({key})", value)
 
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-Command", script],
-        cwd=tmp_path,
+        cwd=_ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
 
     assert result.returncode == 0, result.stderr
-    assert f"Package version: {expected_version}" in result.stdout
-    metadata = ET.parse(staging / "mssql-python-rs-wheels.nuspec").find("metadata")
-    assert metadata.findtext("version") == expected_version
+    match = re.search(
+        r"##vso\[task.setvariable variable=pyCoreWheelVersion;isOutput=true\](.*)",
+        result.stdout,
+    )
+    assert match is not None, result.stdout
+    # Never empty: ADO leaves an empty $(pyCoreWheelVersion) macro unexpanded.
+    emitted = match.group(1).strip()
+    from datetime import datetime, timezone
+
+    date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    pyproject = (_ROOT / "mssql-py-core" / "pyproject.toml").read_text(encoding="utf-8")
+    base = re.search(r'(?ms)^\[project\].*?^version\s*=\s*"([^"]+)"', pyproject).group(1)
+    assert emitted == base + expected_suffix.format(date=date)
+
+
+@pytest.mark.parametrize("build_sqlcmd", (False, True))
+def test_publish_stage_splits_twine_wheels_from_sqlcmd_nuget(build_sqlcmd: bool) -> None:
+    flags = _stage_flags(publishToFeed=True, buildMssqlSqlcmd=build_sqlcmd)
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
+    jobs = {job["job"]: job for job in publish["jobs"]}
+    assert set(jobs) == {"PackageAndPublish"} | ({"PublishMssqlSqlcmd"} if build_sqlcmd else set())
+
+    wheels = jobs["PackageAndPublish"]
+    names = [step.get("displayName") for step in wheels["steps"]]
+    assert "ob_nugetPublishing_enabled" not in wheels["variables"]
+    assert not any(step.get("task") == "NuGetCommand@2" for step in wheels["steps"])
+    assert names.index("Validate wheel metadata and ODBC payloads") < names.index(
+        "twine upload to feed"
+    )
+    assert "compute.pyCoreWheelVersion" in wheels["variables"]["pyCoreWheelVersion"]
+
+    if build_sqlcmd:
+        sqlcmd = jobs["PublishMssqlSqlcmd"]
+        assert sqlcmd["variables"]["ob_nugetPublishing_enabled"] is True
+        assert "isCustom" not in sqlcmd["pool"]
+        assert sqlcmd["steps"][0]["artifact"] == "drop_Build_MssqlSqlcmd_Package"
+
+
+def test_publish_validation_reads_wheel_version_from_env() -> None:
+    flags = _stage_flags(publishToFeed=True)
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
+    step = next(
+        step
+        for step in publish["jobs"][0]["steps"]
+        if step.get("displayName") == "Validate wheel metadata and ODBC payloads"
+    )
+    # Inside a pwsh string, "$(pyCoreWheelVersion)" is a subexpression, not text.
+    assert "$(pyCoreWheelVersion)" not in step["pwsh"]
+    assert step["env"]["PY_CORE_WHEEL_VERSION"] == "$(pyCoreWheelVersion)"
+
+
+_STAMP_PYPROJECT = """[build-system]
+requires = ["maturin>=1.0,<2.0"]
+
+[project]
+name = "mssql-python-rs"
+version = "0.3.0"
+requires-python = ">=3.10"
+
+[project.urls]
+Source = "https://github.com/microsoft/mssql-rs"
+
+[tool.example]
+version = "9.9.9"
+"""
+_STAMP_CARGO = """[package]
+name = "mssql-py-core"
+version = "0.1.10"
+
+[dependencies]
+pyo3 = { version = "0.29.0" }
+
+[dependencies.foo]
+version = "2.0"
+"""
+
+
+def _run_stamp(tmp_path: Path, runner: str, version: str, pyproject: str = _STAMP_PYPROJECT):
+    package = tmp_path / "mssql-py-core"
+    package.mkdir(exist_ok=True)
+    (package / "pyproject.toml").write_text(pyproject, encoding="utf-8", newline="\n")
+    (package / "Cargo.toml").write_text(_STAMP_CARGO, encoding="utf-8", newline="\n")
+    if runner == "pwsh":
+        command = [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File",
+            str(_ROOT / ".pipeline" / "scripts" / "stamp-python-wheel-version.ps1"),
+            "-Version", version,
+        ]
+    else:
+        if shutil.which("bash") is None:
+            pytest.skip("bash is not available")
+        # Run from a wrapper file next to the manifests: WSL bash on Windows neither
+        # maps Windows paths nor inherits env, and re-parses `bash -c` arguments.
+        shutil.copy2(
+            _ROOT / ".pipeline" / "scripts" / "stamp-python-wheel-version.sh",
+            tmp_path / "stamp.sh",
+        )
+        (tmp_path / "run.sh").write_text(
+            f"WHEEL_VERSION={shlex.quote(version)} bash stamp.sh\n", encoding="utf-8", newline="\n"
+        )
+        command = ["bash", "run.sh"]
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    return (
+        result,
+        (package / "pyproject.toml").read_text(encoding="utf-8"),
+        (package / "Cargo.toml").read_text(encoding="utf-8"),
+    )
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+def test_stamp_rewrites_only_project_version(tmp_path: Path, runner: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, "0.3.0.dev2026101912345")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pyproject == _STAMP_PYPROJECT.replace(
+        'version = "0.3.0"', 'version = "0.3.0.dev2026101912345"'
+    )
+    assert 'version = "9.9.9"' in pyproject
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+def test_stamp_with_committed_version_is_a_no_op(tmp_path: Path, runner: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, "0.3.0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pyproject == _STAMP_PYPROJECT
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+@pytest.mark.parametrize("version", ("$(pyCoreWheelVersion)", "", "0.3.0-dev.1"))
+def test_stamp_rejects_values_that_are_not_pep440(tmp_path: Path, runner: str, version: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, version)
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "not a PEP 440 version" in output
+    assert f"'{version}'" in output.replace("\n", "")
+    assert pyproject == _STAMP_PYPROJECT
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+@pytest.mark.parametrize(
+    "pyproject",
+    (
+        _STAMP_PYPROJECT.replace('version = "0.3.0"\n', ""),
+        _STAMP_PYPROJECT.replace('version = "0.3.0"\n', 'version = "0.3.0"\nversion = "0.4.0"\n'),
+    ),
+    ids=("missing", "duplicate"),
+)
+def test_stamp_requires_exactly_one_project_version(
+    tmp_path: Path, runner: str, pyproject: str
+) -> None:
+    result, after, _ = _run_stamp(tmp_path, runner, "0.3.0.dev1", pyproject)
+    assert result.returncode != 0
+    assert "Expected one version line in [project]" in result.stdout + result.stderr
+    assert after == pyproject
+
+
+_TWINE_UPLOAD = _ROOT / ".pipeline" / "scripts" / "twine-upload.ps1"
+_WHEELS = (
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-win_amd64.whl",
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-manylinux_2_34_x86_64.whl",
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-macosx_15_0_universal2.whl",
+)
+
+
+def _run_twine_upload(tmp_path: Path, published: dict[str, str] | None, status: int = 200):
+    """Run twine-upload.ps1 against a local simple index and a stub twine.
+
+    published maps wheel filename -> sha256 on the fake feed; None means the
+    package page returns `status` with no body (404 = never published).
+    """
+    import http.server
+    import threading
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    for name in _WHEELS:
+        (dist / name).write_bytes(name.encode())
+
+    anchors = "".join(
+        f'<a href="https://feed.example/download/{name}#sha256={digest}">{name}</a>\n'
+        for name, digest in (published or {}).items()
+    )
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            ok = published is not None and self.path == "/simple/mssql-python-rs/"
+            self.send_response(200 if ok else status)
+            self.end_headers()
+            if ok:
+                self.wfile.write(f"<html><body>{anchors}</body></html>".encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "twine.log"
+    (bin_dir / "twine.cmd").write_text(f'@echo %* > "{log}"\r\n', encoding="utf-8")
+    posix_stub = bin_dir / "twine"
+    posix_stub.write_text(f'#!/bin/sh\necho "$@" > "{log}"\n', encoding="utf-8")
+    posix_stub.chmod(0o755)
+
+    env = os.environ | {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    try:
+        result = subprocess.run(
+            [
+                "pwsh", "-NoProfile", "-File", str(_TWINE_UPLOAD),
+                "-FeedName", "feed", "-ConfigFile", "pypirc", "-DistDir", str(dist),
+                "-SimpleIndexUrl", f"http://127.0.0.1:{server.server_port}/simple/",
+            ],
+            capture_output=True, text=True, env=env, check=False,
+        )
+    finally:
+        server.shutdown()
+    uploaded = sorted(
+        Path(arg).name for arg in log.read_text().split() if arg.endswith(".whl")
+    ) if log.exists() else None
+    return result, uploaded
+
+
+def _sha(name: str) -> str:
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def test_twine_upload_uploads_everything_when_package_is_new(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, None, status=404)
+    assert result.returncode == 0, result.stderr
+    assert uploaded == sorted(_WHEELS)
+
+
+def test_twine_upload_resumes_after_partial_upload(tmp_path: Path) -> None:
+    published = {name: _sha(name) for name in _WHEELS[:2]}
+    result, uploaded = _run_twine_upload(tmp_path, published)
+    assert result.returncode == 0, result.stderr
+    assert uploaded == [_WHEELS[2]]
+    assert "Uploading 1 of 3" in result.stdout
+
+
+def test_twine_upload_is_a_no_op_when_everything_is_published(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, {name: _sha(name) for name in _WHEELS})
+    assert result.returncode == 0, result.stderr
+    assert uploaded is None
+    assert "nothing to upload" in result.stdout
+
+
+def test_twine_upload_rejects_published_file_with_different_hash(tmp_path: Path) -> None:
+    published = {_WHEELS[0]: _sha(_WHEELS[0]), _WHEELS[1]: "0" * 64}
+    result, uploaded = _run_twine_upload(tmp_path, published)
+    assert result.returncode != 0
+    assert uploaded is None
+    assert "different SHA-256" in result.stdout + result.stderr
+
+
+def test_twine_upload_fails_closed_when_index_is_unreadable(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, None, status=500)
+    assert result.returncode != 0
+    assert uploaded is None
+    assert "HTTP 500" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1561,7 +1808,7 @@ def test_release_switch_graph(values):
     flags = dict(zip(_SWITCHES, values))
     pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
     stages = {stage["stage"]: stage for stage in pipeline["extends"]["parameters"]["stages"]}
-    nuget, core, mock, dry_run, tag = values
+    to_feed, core, mock, dry_run, tag = values
     for stage in stages.values():
         for job in stage["jobs"]:
             custom = job["pool"].get("isCustom", False)
@@ -1587,22 +1834,20 @@ def test_release_switch_graph(values):
     assert not evaluate(release.get("condition", "succeeded()"), flags, succeeded=False)
     assert len(release["jobs"]) == 1
     assert release["jobs"][0]["job"] == "PublishRelease"
-    assert release["jobs"][0]["variables"]["ob_nugetPublishing_enabled"] == str(nuget).lower()
+    assert "ob_nugetPublishing_enabled" not in release["jobs"][0]["variables"]
     release_steps = release["jobs"][0]["steps"]
     release_names = [step.get("displayName") for step in release_steps]
     assert any(step.get("download") == "officialBuild" for step in release_steps)
     assert "Validate official Python wheels" in release_names
-    for name in ("Prepare release NuGet package", "Create NuGet package", "Verify NuGet package"):
-        assert (name in release_names) == nuget
-        if nuget:
+    for name in ("Collect wheels for upload", "Authenticate twine to feed", "twine upload release wheels"):
+        assert (name in release_names) == to_feed
+        if to_feed:
             assert release_names.index("Validate official Python wheels") < release_names.index(name)
-    assert any(step.get("task") == "NuGetCommand@2" for step in release_steps) == nuget
-    if not nuget:
-        assert ".nuspec" not in str(release_steps)
-        assert ".nupkg" not in str(release_steps)
-    assert pipeline["extends"]["parameters"]["nugetPublishing"]["feeds"] == [
-        {"name": "public/mssql-rs_Public", "continueOnConflict": True}
-    ]
+    assert any(step.get("task") == "TwineAuthenticate@1" for step in release_steps) == to_feed
+    assert ".nuspec" not in str(release_steps)
+    assert ".nupkg" not in str(release_steps)
+    assert not any(step.get("task") == "NuGetCommand@2" for step in release_steps)
+    assert "nugetPublishing" not in pipeline["extends"]["parameters"]
     for name, stage in stages.items():
         if name != "Release":
             assert "verify-python-wheels" not in str(stage)
@@ -1705,9 +1950,6 @@ def test_release_switch_graph(values):
                 assert step["pwsh"].index("verify-python-wheels.ps1") < step["pwsh"].index(
                     f"task.setvariable variable={variable}"
                 )
-                if nuget:
-                    preparation = release_steps[release_names.index("Prepare release NuGet package")]
-                    assert f"$({variable})" in preparation["pwsh"]
         if name == "Tag":
             git_commands = re.findall(r"^\s*git .+$", step["pwsh"], re.MULTILINE)
             assert len(git_commands) == 4
@@ -2562,8 +2804,10 @@ def source_repositories(tmp_path):
     return remote, checkout, selected
 
 
-@pytest.mark.parametrize("nuget,wheels_present", [(False, False), (False, True), (True, True)])
-def test_wheel_validation_and_optional_nuspec(source_repositories, tmp_path, nuget, wheels_present):
+@pytest.mark.parametrize("to_feed,wheels_present", [(False, False), (False, True), (True, True)])
+def test_wheel_validation_and_optional_feed_publish(
+    source_repositories, tmp_path, to_feed, wheels_present
+):
     remote, checkout, _ = source_repositories
     (remote / "mssql-py-core" / "pyproject.toml").write_text(
         '[project]\nname = "mssql-python-rs"\nversion = "0.1.0"\n', encoding="utf-8"
@@ -2579,9 +2823,12 @@ def test_wheel_validation_and_optional_nuspec(source_repositories, tmp_path, nug
     if wheels_present:
         write_wheel_matrix(artifact_wheels)
     staging = tmp_path / "staging"
-    flags = dict.fromkeys(_SWITCHES, False) | {"publishNuGet": nuget}
+    flags = dict.fromkeys(_SWITCHES, False) | {"publishToFeed": to_feed}
     pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
     steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    step_names = [step.get("displayName") for step in steps]
+    for name in ("Collect wheels for upload", "Authenticate twine to feed", "twine upload release wheels"):
+        assert (name in step_names) == to_feed
     variables = {
         "Build.SourcesDirectory": str(checkout),
         "Build.StagingDirectory": str(staging),
@@ -2615,13 +2862,6 @@ def test_wheel_validation_and_optional_nuspec(source_repositories, tmp_path, nug
     assert variables["releaseVersion"] == "0.1.0"
     assert variables["sourceCommit"] == selected
     assert variables["releaseDistributionName"] == "mssql-python-rs"
-    if nuget:
-        result = run_step("Prepare release NuGet package")
-        assert result.returncode == 0, result.stderr
-        metadata = ET.parse(staging / "mssql-python-rs-wheels.nuspec").find("metadata")
-        assert metadata.findtext("version") == "0.1.0"
-        assert selected[:8] in metadata.findtext("description")
-        assert "mssql-python-rs" in metadata.findtext("description")
 
 
 def read_metadata(checkout, commit, cwd, branch="refs/heads/main", wheels=True):

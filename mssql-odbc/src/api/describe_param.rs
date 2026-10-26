@@ -18,7 +18,7 @@ use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
 use super::exec_common::{
     claim_connection, deduct_query_timeout, fail_with_tds, flush_pending_unprepare,
-    query_timeout_expired_error, return_client_idle,
+    query_timeout_expired_error,
 };
 use super::odbc_types::*;
 use super::sqlstate::*;
@@ -34,6 +34,7 @@ use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 use std::sync::{Arc, MutexGuard};
 
 use super::set_desc_field::datetime_interval_code_for;
+use crate::handles::wire::{LeaseReturn, WireLease};
 
 const DESCRIBE_PARAMETERS_PROC: &str = "sp_describe_undeclared_parameters";
 
@@ -422,7 +423,6 @@ fn describe_param_operation(
                 return fail_metadata_response(
                     dbc,
                     stmt,
-                    statement_handle,
                     client,
                     "metadata RPC returned no result set",
                 );
@@ -466,7 +466,7 @@ fn describe_param_operation(
     let mut descriptions = match parse_result.and_then(|()| collector.finish()) {
         Ok(descriptions) => descriptions,
         Err(e) => {
-            return fail_metadata_response(dbc, stmt, statement_handle, client, &e);
+            return fail_metadata_response(dbc, stmt, client, &e);
         }
     };
 
@@ -489,45 +489,82 @@ fn describe_param_operation(
     // not promised in ordinal order, so this cannot assume the push order.
     udt_names.sort_unstable_by_key(|(index, _)| *index);
 
-    let info_messages = client.take_info_messages();
-    return_client_idle(dbc, statement_handle, client);
-
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLDescribeParam: stmt mutex poisoned storing metadata");
-        return SQL_ERROR;
-    };
-    stmt_state.parameter_metadata = descriptions.clone();
-    stmt_state.parameter_udt_names = udt_names.clone();
-    stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    let has_info = post_tds_info_messages(&mut stmt_state, &info_messages);
-
-    let Some(description) = stmt_state
-        .parameter_metadata
-        .get(usize::from(parameter_number) - 1)
-        .copied()
-    else {
-        post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
-        return SQL_ERROR;
-    };
-    // Dropped before refine_ipd locks the IPD: this crate never holds a
-    // STMT lock while acquiring a DESC lock (see bind_col.rs's rationale).
-    drop(stmt_state);
-    if refine_ipd(stmt, &descriptions, &udt_names) != SQL_SUCCESS {
-        return post_refine_failure(stmt);
-    }
-    write_description(
-        description,
+    finish_describe_param(
+        dbc,
+        stmt,
+        client,
+        descriptions,
+        udt_names,
+        parameter_number,
         data_type_ptr,
         parameter_size_ptr,
         decimal_digits_ptr,
         nullable_ptr,
-    );
+    )
+}
 
-    if has_info {
-        SQL_SUCCESS_WITH_INFO
-    } else {
-        SQL_SUCCESS
+#[allow(clippy::too_many_arguments)]
+fn finish_describe_param(
+    dbc: &crate::handles::DbcHandle,
+    stmt: &StmtHandle,
+    mut client: WireLease,
+    descriptions: Vec<ParameterDescription>,
+    udt_names: Vec<(usize, Arc<UdtNames>)>,
+    parameter_number: SqlUSmallInt,
+    data_type_ptr: *mut SqlSmallInt,
+    parameter_size_ptr: *mut SqlULen,
+    decimal_digits_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    let info_messages = client.take_info_messages();
+    dbc.return_lease_and_publish(client, LeaseReturn::Release, |_| {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLDescribeParam: stmt mutex poisoned storing metadata");
+            return SQL_ERROR;
+        };
+        stmt_state.parameter_metadata = descriptions.clone();
+        stmt_state.parameter_udt_names = udt_names.clone();
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        let has_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+
+        let Some(description) = stmt_state
+            .parameter_metadata
+            .get(usize::from(parameter_number) - 1)
+            .copied()
+        else {
+            post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+            return SQL_ERROR;
+        };
+        // Dropped before refine_ipd locks the IPD: this crate never holds a
+        // STMT lock while acquiring a DESC lock (see bind_col.rs's rationale).
+        drop(stmt_state);
+        if refine_ipd(stmt, &descriptions, &udt_names) != SQL_SUCCESS {
+            return post_refine_failure(stmt);
+        }
+        write_description(
+            description,
+            data_type_ptr,
+            parameter_size_ptr,
+            decimal_digits_ptr,
+            nullable_ptr,
+        );
+
+        if has_info {
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        }
+    })
+    .unwrap_or_else(|| fail_lost_describe_session(stmt))
+}
+
+fn fail_lost_describe_session(stmt: &StmtHandle) -> SqlReturn {
+    error!("SQLDescribeParam: the session ended before parameter metadata was recorded");
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        post_diag(&mut stmt_state, ERR_CONNECTION_DOES_NOT_EXIST);
     }
+    SQL_ERROR
 }
 
 /// Refines `stmt`'s IPD records from server-described `descriptions` — one
@@ -749,23 +786,24 @@ fn post_refine_failure(stmt: &StmtHandle) -> SqlReturn {
 fn fail_metadata_response(
     dbc: &crate::handles::DbcHandle,
     stmt: &StmtHandle,
-    statement_handle: SqlHandle,
-    mut client: mssql_tds::connection::tds_client::TdsClient,
+    mut client: WireLease,
     message: &str,
 ) -> SqlReturn {
     let info_messages = client.take_info_messages();
-    return_client_idle(dbc, statement_handle, client);
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HY000,
-            0,
-            format!("Invalid parameter metadata returned by SQL Server: {message}"),
-        );
-        post_tds_info_messages(&mut stmt_state, &info_messages);
-        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    }
-    SQL_ERROR
+    dbc.return_lease_and_publish(client, LeaseReturn::Release, |_| {
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                format!("Invalid parameter metadata returned by SQL Server: {message}"),
+            );
+            post_tds_info_messages(&mut stmt_state, &info_messages);
+            stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        }
+        SQL_ERROR
+    })
+    .unwrap_or_else(|| fail_lost_describe_session(stmt))
 }
 
 /// The `@tsql` argument of `sp_describe_undeclared_parameters`, which is
@@ -1548,7 +1586,10 @@ mod tests {
                 crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
             };
             assert_eq!(SQL_SUCCESS, exec());
-            assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+            assert_eq!(
+                dbc.inner.lock().unwrap().wire.statement_owner(),
+                Some(h.stmt)
+            );
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.prepared = Some(crate::handles::stmt::PreparedPlan {
@@ -1628,8 +1669,8 @@ mod tests {
             }
             {
                 let state = dbc.inner.lock().unwrap();
-                assert!(state.active_stmt.is_none());
-                assert!(!state.client.as_ref().unwrap().is_connection_dead());
+                assert!(state.wire.owner().is_none());
+                assert!(!state.wire.client().unwrap().is_connection_dead());
             }
             assert_eq!(SQL_SUCCESS, exec());
             for _ in 0..3 {
@@ -1663,7 +1704,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
         }
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1704,8 +1745,8 @@ mod tests {
         drop(ss);
 
         let ds = dbc.inner.lock().unwrap();
-        assert!(ds.client.is_some());
-        assert_eq!(ds.active_stmt, None);
+        assert!(ds.wire.client().is_some());
+        assert_eq!(ds.wire.statement_owner(), None);
     }
 
     // Pins the branch `ATempTableParameterCannotBeDescribedButStillBinds` can
@@ -1730,7 +1771,7 @@ mod tests {
         ]);
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
+            ds.wire.put_client_for_test(client);
         }
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1770,8 +1811,85 @@ mod tests {
         drop(ss);
 
         let ds = dbc.inner.lock().unwrap();
-        assert!(ds.client.is_some(), "the client must come back for reuse");
-        assert_eq!(ds.active_stmt, None);
+        assert!(
+            ds.wire.client().is_some(),
+            "the client must come back for reuse"
+        );
+        assert_eq!(ds.wire.statement_owner(), None);
+    }
+
+    #[test]
+    fn stale_describe_lease_publishes_no_metadata_or_outputs() {
+        use crate::handles::dbc::DbcHandle;
+        use crate::handles::wire::{ClaimPolicy, WireOwner};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let old_description = param_description(SQL_VARCHAR, 32, 0, SQL_NULLABLE);
+        let new_description = param_description(SQL_INTEGER, 10, 0, SQL_NO_NULLS);
+
+        assert_eq!(refine_ipd(stmt, &[old_description], &[]), SQL_SUCCESS);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.parameter_metadata = vec![old_description];
+            state.parameter_udt_names = Vec::new();
+            state.set_state(STMT_STATE_EXEC_STARTED);
+        }
+
+        let lease = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Statement(h.stmt), ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+
+        let mut data_type = SQL_UNKNOWN_TYPE;
+        let mut parameter_size = 99;
+        let mut decimal_digits = 99;
+        let mut nullable = 99;
+        assert_eq!(
+            finish_describe_param(
+                dbc,
+                stmt,
+                lease,
+                vec![new_description],
+                Vec::new(),
+                1,
+                &mut data_type,
+                &mut parameter_size,
+                &mut decimal_digits,
+                &mut nullable,
+            ),
+            SQL_ERROR
+        );
+
+        assert_eq!(data_type, SQL_UNKNOWN_TYPE);
+        assert_eq!(parameter_size, 99);
+        assert_eq!(decimal_digits, 99);
+        assert_eq!(nullable, 99);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.parameter_metadata, vec![old_description]);
+        assert!(state.parameter_udt_names.is_empty());
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_08003);
+        drop(state);
+        assert_eq!(ipd_records(&h)[0].concise_type, SQL_VARCHAR);
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.wire.client().is_some());
+        assert_eq!(state.wire.statement_owner(), None);
     }
 
     #[test]

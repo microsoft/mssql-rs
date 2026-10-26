@@ -55,9 +55,9 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | Attribute | Set | Get | Note |
 |---|---|---|---|
 | `SQL_ATTR_LOGIN_TIMEOUT` | ✅ | ✅ | clamped to `0xFFFE`, `01S02` on clamp |
-| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-owned batches and transaction requests, including catalog/isolation changes, autocommit transitions, commit/rollback, and reset/disconnect rollback; also bounds internal `SQL_USER_NAME` and alias-type lookups. Zero means no request deadline, with the separate 120-second cancellation default. Statement query timeout remains independent. A busy connection's alias-type login and read are bounded too (deviation 32). See `transactions_plan.md` for scope and source evidence. |
+| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-owned batches and transaction requests, including catalog/isolation changes, autocommit transitions, commit/rollback, and reset/disconnect rollback; also bounds internal `SQL_USER_NAME`, alias-type, and database-updateability lookups. Zero means no request deadline, with the separate 120-second cancellation default. Statement query timeout remains independent. Secondary logins and reads share the connection-timeout deadline (deviation 32). See `transactions_plan.md` for scope and source evidence. |
 | `SQL_ATTR_PACKET_SIZE` | ✅ | ✅ | pre-connect only |
-| `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | |
+| `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | stored hint, not DML enforcement; an actually read-only database overrides the connected getter (see below) |
 | `SQL_ATTR_AUTOCOMMIT` | ✅ | ✅ | |
 | `SQL_ATTR_TXN_ISOLATION` / `SQL_COPT_SS_TXN_ISOLATION` | ✅ | ✅ | |
 | `SQL_ATTR_RESET_CONNECTION` / `SQL_COPT_SS_RESET_CONNECTION` | ✅ | — | |
@@ -98,6 +98,72 @@ Unknown identifiers return `HY092`; recognized optional behavior that is not
 implemented returns `HYC00`.
 
 ---
+
+### Access mode: hint versus database state
+
+`SQL_ATTR_ACCESS_MODE` stores `SQL_MODE_READ_WRITE` (`0`, the default) or
+`SQL_MODE_READ_ONLY` (`1`) before and after connect. The read-only hint does
+not block DML, set `ApplicationIntent`, or reject a login to a read-only
+database when the caller requested read/write. Other values return `HY024`
+without changing the stored hint.
+
+While connected, the getter returns `SQL_MODE_READ_ONLY` if the current
+database is actually read-only; otherwise it returns the stored hint.
+Setting `SQL_MODE_READ_WRITE` while connected to an actually read-only
+database returns `SQL_ERROR` / `HY024` and preserves that hint. Switching
+back to a writable database therefore exposes the previous stored value.
+`SQL_DATA_SOURCE_READ_ONLY` reports actual database state independently of
+the hint; see [SQLGetInfo support](sql-get-info-plan.md#database-read-only-state).
+The shared database-state cache is keyed by catalog and
+`database_change_count`. Catalog changes, including raw `USE`, invalidate
+the result; connect, disconnect, and reset clear it.
+A cold lookup while another statement is streaming must preserve that
+statement's rows, using a secondary connection rather than issuing metadata
+SQL on its occupied session. An idle connection queries its original session.
+Lookup failures propagate instead of being treated as a writable database;
+missing, NULL, or invalid scalar answers produce `HY000`.
+
+Reference evidence: retail msodbcsql **18.7.1.1**,
+`SQL_DRIVER_VER=18.07.0001`, SQL Server **16.0.4305.5**. The owning classic
+source is `sqlcmisc.cpp`, `ExportImp::SQLSetConnectAttrW`'s access-mode
+validation and connected read/write rejection branch, and
+`ExportImp::SQLGetConnectAttrW`'s `IsDataBaseReadOnly` override.
+`sqlcinfo.cpp`, `SQLGetInfoW` and `ExecOption`, supply the corresponding
+database-state information path. These measurements distinguish the stored
+hint from server state; they do not imply client-side write filtering.
+
+Regression coverage in `tests/e2e/tests/attributes_test.cpp`:
+
+- `AccessModeReadOnlyHintAllowsDml` and `AccessModeInvalidValuePreservesMode`.
+- `AccessModeColdGetPreservesStreamingCursor` and
+  `AccessModeColdGetInfoPreservesStreamingCursor`, with worker-specific data.
+- `AccessModePreConnectRoundTripsAndSurvivesConnect` for both hint values.
+- `AccessModeTracksReadOnlyDatabaseAndRawUse` for both pre-connect values,
+  read-only login, idle lookups in both getter orders, rejected setter,
+  preserved storage, and cache invalidation across writable/read-only raw
+  `USE` switches.
+- `AccessModeTracksReadOnlyDatabaseDuringStream` exercises the read-only
+  database with cold lookups while rows are pending.
+
+Idle-session assertions run on both parity legs. The three streaming cases
+skip the reference leg: msodbcsql's spawned login omits the session's trust
+settings and fails against CI's force-encryption server (deviation 31).
+Build 184911 confirms all nine streaming cases, including concurrency
+variants, failed on the pinned msodbcsql 18.6.2.1 leg while the Rust leg passed.
+The writable cases use the normal writable suite database. The read-only
+case needs generated DSN-less settings (`ODBC_TEST_SERVER`,
+`ODBC_TEST_DATABASE`, and the usual authentication variables; no
+`ODBC_TEST_DSN` or `ODBC_TEST_CONNSTR`) and permission to create, alter, and
+drop a private database. It capability-skips if provisioning is unavailable.
+It creates a random `odbc_access_mode_*` database, never changes the shared
+suite database to read-only, and uses RAII cleanup even on fatal assertions.
+Connect/provisioning cases use `TEST_F`; the remaining cases use `ODBC_TEST_F`.
+
+Run from the repository root with the normal e2e connection environment:
+
+```powershell
+.\mssql-odbc\tests\e2e\run_e2e.ps1 -CompareWithMsodbcsql -FilterTests attributes_test
+```
 
 ## 3. Findings that shape the split
 
@@ -543,6 +609,7 @@ the two cannot drift.
 the vendor band have S1 sweep return codes but no *confirmed routing*. They are
 left to S5b rather than wired up on the assumption that they behave like the
 three above — which the `CURRENT_CATALOG` contrast shows is not safe.
+(`MULTISUBNET_FAILOVER` was routed later in AB#49293; `TNIR` accepts off only.)
 
 **Size:** M. **Depends on:** S1, S3.
 
@@ -554,9 +621,11 @@ three above — which the `CURRENT_CATALOG` contrast shows is not safe.
 
 **Scope**
 - **Route the remaining keyword-equivalent attributes (F5)**, each one measured
-  first: `AUTHENTICATION`, `APPLICATION_INTENT`, `MULTISUBNET_FAILOVER`, `TNIR`,
-  `CONNECT_RETRY_COUNT`, `CONNECT_RETRY_INTERVAL`, `SERVER_SPN`,
-  `FAILOVER_PARTNER`, `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`.
+  first: `AUTHENTICATION`, `APPLICATION_INTENT`, `CONNECT_RETRY_COUNT`,
+  `CONNECT_RETRY_INTERVAL`, `SERVER_SPN`, `FAILOVER_PARTNER`,
+  `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`. `MULTISUBNET_FAILOVER`
+  is routed (AB#49293); `TNIR` is deliberately omitted, with off accepted as a
+  no-op and on returning `HYC00`.
 - **Read-only/diagnostic:** `SQL_COPT_SS_CLIENT_CONNECTION_ID`, `SQL_COPT_SS_SPID`,
   `SQL_COPT_SS_USER_DATA`.
 - **Standard leftovers:** `SQL_ATTR_METADATA_ID = SQL_TRUE` (currently `HYC00`

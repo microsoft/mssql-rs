@@ -15,6 +15,7 @@ pub const CATALOG_INDEX: usize = 1;
 pub const SCHEMA_INDEX: usize = 2;
 pub const TABLE_INDEX: usize = 3;
 pub const MAX_PARTS: usize = 4;
+const BULK_COPY_MAX_PARTS: usize = 3;
 
 /// Parse a SQL Server multipart identifier.
 ///
@@ -46,6 +47,22 @@ pub const MAX_PARTS: usize = 4;
 pub fn parse_multipart_identifier(
     name: &str,
     allow_empty: bool,
+) -> TdsResult<[Option<String>; MAX_PARTS]> {
+    parse_multipart_identifier_with_max_parts(name, allow_empty, MAX_PARTS)
+}
+
+/// Parse a bulk-copy destination, which supports at most catalog.schema.table.
+pub(crate) fn parse_bulk_copy_target_identifier(
+    name: &str,
+    allow_empty: bool,
+) -> TdsResult<[Option<String>; MAX_PARTS]> {
+    parse_multipart_identifier_with_max_parts(name, allow_empty, BULK_COPY_MAX_PARTS)
+}
+
+fn parse_multipart_identifier_with_max_parts(
+    name: &str,
+    allow_empty: bool,
+    max_parts: usize,
 ) -> TdsResult<[Option<String>; MAX_PARTS]> {
     // State machine states
     #[derive(Debug, PartialEq)]
@@ -199,11 +216,11 @@ pub fn parse_multipart_identifier(
     }
 
     // Validate part count
-    if parts.len() > MAX_PARTS {
+    if parts.len() > max_parts {
         return Err(crate::error::Error::UsageError(format!(
             "Too many identifier parts: {} (maximum is {})",
             parts.len(),
-            MAX_PARTS
+            max_parts
         )));
     }
 

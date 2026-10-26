@@ -753,6 +753,16 @@ pub fn env_change_begin_transaction(descriptor: u64) -> ScriptedToken {
     }))
 }
 
+/// A `CommitTransaction` ENVCHANGE token — the acknowledgement the server
+/// emits for a Transaction Manager commit request, clearing the client's
+/// transaction descriptor.
+pub fn env_change_commit_transaction() -> ScriptedToken {
+    ScriptedToken(Tokens::EnvChange(EnvChangeToken {
+        sub_type: EnvChangeTokenSubType::CommitTransaction,
+        change_type: EnvChangeContainer::from((0u64, 0u64)),
+    }))
+}
+
 /// A `RollbackTransaction` ENVCHANGE token — the acknowledgement the server
 /// emits for a Transaction Manager rollback request, clearing the client's
 /// transaction descriptor.

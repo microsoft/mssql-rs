@@ -1008,7 +1008,7 @@ msodbcsql build is measured.
     Wire-level tests cover an absent BOM, a BOM split across calls, and later
     chunks after BOM classification. Tracked in AB#48349.
 
-31. **A busy connection's alias-type lookup logs in with the session's own
+31. **A busy connection's metadata lookups log in with the session's own
     authentication and encryption settings.** Both drivers read alias type
     names for `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME` on the session
     when it is idle, and on a separate login while rows are pending
@@ -1051,8 +1051,27 @@ msodbcsql build is measured.
     `SQL_DRIVER_VER` recorded would close it. Tracked in AB#48044. Human parity
     sign-off has not been recorded.
 
-32. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's alias-type
-    lookup, its login included.** msodbcsql bounds the lookup on an idle
+    Database-updateability lookups for `SQL_ATTR_ACCESS_MODE` (get and the
+    connected `READ_WRITE` setter) and `SQL_DATA_SOURCE_READ_ONLY` use the
+    same secondary-login policy. Their reference path is `IsDataBaseReadOnly`
+    (`sqlcmisc.cpp:1697-1716`, `3045-3058`, `8817-8845`) through `ExecOption`
+    (`sqlcinfo.cpp:494-573`): a failed spawned login propagates `SQL_ERROR`
+    instead of the alias-type lookup's base-name fallback. This driver
+    retains authentication and trust settings, reports the database state,
+    and rejects `READ_WRITE` on a read-only database with `HY024`.
+    CI build 184911 measured the pinned msodbcsql 18.6.2.1 package failing
+    both cold streaming getter tests in every concurrency mode and the
+    read-only-database streaming case, while all Rust-driver cases passed.
+    The three streaming tests in `attributes_test.cpp` therefore assert only
+    the Rust leg; idle-session and raw `USE` assertions remain on both legs.
+    **Evidence limit:** the CI log records the package version, not a separate
+    `SQL_DRIVER_VER` measurement for these access-mode cases; their
+    authentication/encryption mechanism shares the source and retail
+    evidence above. Tracked in AB#49297. Human parity sign-off has not been
+    recorded.
+
+32. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's metadata
+    lookup, its login included.** msodbcsql bounds the alias-type lookup on an idle
     session with the connection timeout (`GetNetIOTimeOut`), but on a busy one
     `RefreshShilohUDTCache` (`sqlccmd.cpp`) reads the timeout of the connection
     it spawned, which `SpawnConnection` (`sqlcinfo.cpp`) never sets: the read
@@ -1069,6 +1088,21 @@ msodbcsql build is measured.
     session's uncommitted `CREATE TYPE` until its 3-second command timeout.
     **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
     Tracked in AB#48044. Human parity sign-off has not been recorded.
+
+    Database-updateability lookups share this driver's deadline across the
+    login and read. Unlike `RefreshShilohUDTCache`, msodbcsql's `ExecOption`
+    (`sqlcinfo.cpp:504`, `548`) uses the parent's `GetNetIOTimeOut` for the
+    spawned read, so only login/deadline accounting differs here: its login
+    uses the copied login timeout, whereas this driver's connection timeout
+    also bounds the login and the time remaining for the read. With a
+    connection timeout of 0, the inherited login timeout still applies.
+    `secondary_login_timeout_is_reported_and_original_session_remains_usable`
+    and `secondary_read_timeout_leaves_the_original_session_untouched`
+    (`database_read_only.rs`) pin error propagation without disturbing the
+    original session. **Evidence limit:** the reference timeout behavior is
+    source-only; no stalled retail login/read measurement is recorded for
+    access mode. Tracked in AB#49297. Human parity sign-off has not been
+    recorded.
 
 33. **DNS fallback is published only by a completed, accepted login.**
     Source comparison: SNI's `GetCachedAddrInfo`
@@ -1110,3 +1144,121 @@ msodbcsql build is measured.
     a named retail build, with `SQL_DRIVER_VER` recorded, remains necessary;
     Azure SQL Proxy/Redirect and session-recovery outage tests have not been
     run. No human parity sign-off has been recorded. Tracked in AB#49294.
+
+34. **Eligible TCP connections default to MultiSubnetFailover (MSF) on.**
+    msodbcsql's login construction in `ConnectIt`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp`, `MultiSubnetFailover` branch)
+    defaults `conninfo.fMultiSubnetFailover` to zero. Its reset path also seeds
+    `SQL_COPT_SS_MULTISUBNET_FAILOVER` off. This driver instead resolves
+    explicit connection > application startup default > deployment environment
+    > built-in true. The ODBC attribute overrides the keyword; explicit off
+    remains off. Startup defaults freeze before connection creation and are
+    retained by recovery and secondary contexts. ODBC applications configure
+    the default with `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=true|false` before
+    first use; native Rust, Python, and JS also expose a startup setter.
+    Separately loaded modules do not share that setter's state.
+
+    Inherited on is suppressed for explicit non-TCP transports, DAC, a
+    failover partner, and instances needing SSRP; explicitly requesting
+    incompatible MSF is an error. On Windows, local targets without a protocol
+    or port also suppress inherited on, preserving the shared-memory-first
+    waterfall for local instances with TCP/IP disabled. Explicit MSF on,
+    `tcp:`, or a port still selects TCP. Bare non-local names, and bare names
+    on other platforms, select TCP when enabled. MSF off restores the waterfall
+    and full sequential address walk. More than 64 addresses fails before opening
+    sockets, not by racing a truncated list. The native reference's
+    `Tcp::ParallelOpen` -> `SocketOpenParallel` ->
+    `ParallelConnectWaitSet::Initialize` (`Sql/Common/DK/sni/src/tcp.cpp`,
+    `dwAddresses > 64`) also reports `SNIE_47`; that comparison is source evidence,
+    not a retail multi-address measurement.
+
+    **Measurement:** Windows x64 retail 18.7.1.1
+    (`SQL_DRIVER_VER=18.07.0001`), 2026-10-21, direct exported APIs:
+    a new DBC reports MSF 0; setters 0/1 succeed and 2 returns `HY024`.
+    This PR's debug DLL reports MSF 1, accepts 0/1, and returns `HY024` for 2.
+    Both report a four-byte numeric length. These are disconnected-handle
+    measurements: the Driver Manager caches pre-connect setters and does not
+    exercise the driver's validation on a never-connected DBC. A local
+    Driver Manager login to the mock did not complete, so connected keyword
+    precedence and network behavior are not claimed as retail measurements.
+    `MultiSubnetFailoverReportsTheEffectiveSetting` pins each driver's
+    expected connected values for explicitly addressed TCP endpoints, not the
+    implicit local Windows waterfall. Its connection-string/attribute matrix
+    requires `ODBC_TEST_SERVER` (and an explicit port for a named instance).
+    Running that suite
+    against the CI-pinned retail build and SQL Server closes this evidence gap.
+
+    The intent is one immediate parallel strategy rather than TNIR's staged
+    behavior, aligned with the planned next-major Microsoft.Data.SqlClient
+    direction, **not a claim about a shipped .NET default**. Existing SqlClient
+    releases expose `Switch.Microsoft.Data.SqlClient.EnableMultiSubnetFailoverByDefault`
+    in `LocalAppContextSwitches`; `DbConnectionStringDefaults` uses it only
+    when a connection does not explicitly specify MSF.
+    The author approved implementing this revised direction on 2026-10-21.
+    Maintainer product/parity approval remains pending on
+    [PR #746](https://github.com/microsoft/mssql-rs/pull/746). Tracked in AB#49293.
+
+35. **TNIR is omitted; only disabled compatibility inputs are accepted.**
+    msodbcsql's `ConnectIt` (`odbc/sqlcconn.cpp`, `Tnir` branch)
+    defaults `conninfo.fTnir` on and accepts `Enabled`/`Disabled`.
+    `ExportImp::SQLSetConnectAttrW` (`odbc/sqlcmisc.cpp`, `SQL_COPT_SS_TNIR`) accepts 0/1
+    before connect and rejects larger values with `HY024`.
+    `Tcp::Open` (`sni/src/tcp.cpp`) selects sequential-first or parallel
+    behavior from `transparentNetworkIPResolution`.
+
+    This driver has no TNIR algorithm or enabled state.
+    `TransparentNetworkIPResolution=Disabled` and `SQL_COPT_SS_TNIR=OFF`
+    succeed as no-ops; `Enabled`/`ON` returns `HYC00`, malformed keyword values
+    and numeric values above 1 return `HY024`. Its getter always returns off.
+    A connected setter remains `HY011`. Native Python mirrors this policy
+    with exceptions. TNIR off never changes MSF: use `MultiSubnetFailover=No`
+    to request sequential TCP.
+
+    **Measurement:** the same Windows x64 retail 18.7.1.1
+    (`SQL_DRIVER_VER=18.07.0001`) direct-API probe accepts TNIR 0/1, rejects 2
+    with `HY024`, and reports 0 on a fresh DBC. This PR's debug DLL accepts 0,
+    rejects 1 with `HYC00`, rejects 2 with `HY024`, and reports 0.
+    The reference's initial getter is stored state, not proof that its
+    algorithm is disabled. `TnirOffIsAcceptedAndOnIsUnsupported` compares
+    attribute OFF through connect and keyword ON at the connection boundary;
+    the exported-API unit test pins the attribute ON rejection. Build 184802's
+    Windows ARM leg demonstrated that the Windows Driver Manager also caches
+    pre-connect setters after `SQLDisconnect`, so a setter's success there
+    does not measure driver validation. Connected retail comparison remains
+    tracked as described in entry 34.
+
+    This deliberate omission avoids maintaining TNIR's additional staged
+    connection behavior after the senior review identified its support burden.
+    Modern .NET SqlClient likewise does not implement TNIR; .NET Framework
+    retains it for compatibility and deprecates it in 7.1. That is supporting
+    design context, not the ODBC parity authority. The implementation decision
+    was approved by the author on 2026-10-21; maintainer product/parity sign-off
+    remains pending. Tracked in AB#49293.
+
+36. **Failover-partner keywords constrain MSF on every platform, without
+    implementing database mirroring.** This driver accepts `Failover_Partner`
+    and `FailoverPartner` on Windows, Linux, and macOS without an unknown-keyword
+    warning. A nonempty partner suppresses inherited MSF; explicit MSF on is an
+    error. It does not connect to the partner, and `FailoverPartnerSPN` remains
+    recognized but ignored. Database-mirroring failover is still an implementation
+    gap, not a feature supplied by this keyword mapping.
+
+    **Source-level comparison:** msodbcsql's `SQLDriverConnectW` passes
+    `x_ullBitMapDriverConnectKeys` to `ParseAttrStr`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp`). That bitmap includes
+    `KEY_FAILOVERPARTNER` and `KEY_FAILOVERPARTNERSPN` only outside
+    `MPLAT_UNIX` (the VSTS 831337 branch). `ParseAttrStr` requires both a lookup
+    match and the bitmap bit; otherwise it ignores the value and returns
+    `S_FALSE`, and the caller reports invalid-attribute information. Thus the
+    Unix source does not treat a supplied partner as an MSF constraint.
+
+    This driver deliberately retains the input as a cross-platform applicability
+    constraint rather than letting default-on MSF override an application's
+    declared partner configuration. `msf_getter_tracks_connected_policy_without_leaking_keywords_to_reconnects`
+    exercises both spellings through a mock login and confirms MSF off for the
+    connected session, without letting the keyword leak into the next login.
+    **Evidence limit:** the native Unix behavior is a source reading, not a
+    retail-driver measurement. A connected Linux/macOS comparison with the retail
+    build and `SQL_DRIVER_VER` recorded must confirm the warning and effective
+    MSF value. This does not change the separate mirroring implementation gap.
+    Maintainer parity sign-off remains pending. Tracked in AB#49293.

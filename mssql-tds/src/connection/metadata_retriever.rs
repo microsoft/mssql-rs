@@ -22,7 +22,7 @@ use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
 use crate::error::Error;
 use crate::sql_identifier::{
     CATALOG_INDEX, SCHEMA_INDEX, TABLE_INDEX, build_multipart_name, escape_identifier,
-    escape_string_literal, parse_multipart_identifier,
+    escape_string_literal, parse_bulk_copy_target_identifier,
 };
 use crate::token::tokens::ColMetadataToken;
 use async_trait::async_trait;
@@ -225,7 +225,7 @@ impl TryFrom<TableMetadataResult> for Vec<BulkCopyColumnMetadata> {
 }
 
 fn build_table_metadata_query(table_name: &str) -> TdsResult<String> {
-    let mut parts = parse_multipart_identifier(table_name, true)?;
+    let mut parts = parse_bulk_copy_target_identifier(table_name, true)?;
     let table_part = parts[TABLE_INDEX]
         .as_ref()
         .filter(|part| !part.is_empty())
@@ -299,7 +299,7 @@ EXEC {catalog_for_sproc}sp_tablecollations_100 N'{sproc_table_name}';"#
 ///   - 1-part: "table" (uses current database and default schema)
 ///   - 2-part: "schema.table"
 ///   - 3-part: "database.schema.table"
-///   - 4-part: "server.database.schema.table" (server part ignored in query context)
+///   Bulk-copy targets with more than three parts, including server-qualified names, are rejected.
 /// * `timeout_sec` - Query timeout in seconds
 /// * `cancel_handle` - Optional cancellation handle
 ///
@@ -580,6 +580,7 @@ mod tests {
             "\"\"",
             "[t",
             "[t]extra",
+            "server.db.schema.table",
             "a.b.c.d.e",
         ] {
             assert!(

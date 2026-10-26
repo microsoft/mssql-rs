@@ -370,14 +370,11 @@ async fn create_base_stream_sequential(
     // Sorted as a copy, so the cache keeps the resolver's order.
     let mut socket_addresses = resolution.addresses().to_vec();
 
-    let mut last_error = None;
-    let mut tcp_stream = None;
-
     sort_by_ip_preference(&mut socket_addresses, ipaddress_preference);
 
     info!("Socket addresses: {:?}", socket_addresses);
 
-    for socket_address in socket_addresses {
+    let stream = sequential_connect_with(&socket_addresses, connect_timeout_ms, |socket_address| {
         let socket = if socket_address.is_ipv6() {
             net::TcpSocket::new_v6()?
         } else {
@@ -394,45 +391,43 @@ async fn create_base_stream_sequential(
         socket2_socket.set_tcp_keepalive(&keep_alive_settings)?;
         socket2_socket.set_nodelay(true)?;
 
-        // Apply connection timeout to each connection attempt
-        let connect_future = socket.connect(socket_address);
-        tcp_stream = match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await
-        {
-            Ok(Ok(stream)) => {
-                info!("Connected to TCP transport: {}:{}", host, port);
-                Some(stream)
-            }
-            Ok(Err(e)) => {
-                last_error = Some(e);
-                None
-            }
+        Ok(socket.connect(socket_address))
+    })
+    .await?;
+    info!("Connected to TCP transport: {}:{}", host, port);
+    Ok((Box::new(stream), resolution))
+}
+
+async fn sequential_connect_with<C, F>(
+    addresses: &[SocketAddr],
+    connect_timeout_ms: u64,
+    connect: C,
+) -> std::io::Result<TcpStream>
+where
+    C: Fn(SocketAddr) -> std::io::Result<F>,
+    F: Future<Output = std::io::Result<TcpStream>>,
+{
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "No addresses provided for sequential connection",
+    );
+    for &address in addresses {
+        let connect_future = connect(address)?;
+        match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last_error = error,
             Err(_elapsed) => {
-                last_error = Some(std::io::Error::new(
+                last_error = std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
                         "Connection to {} timed out after {}ms",
-                        socket_address, connect_timeout_ms
+                        address, connect_timeout_ms
                     ),
-                ));
-                None
+                );
             }
-        };
-        if tcp_stream.is_some() {
-            break;
         }
     }
-
-    // We don't have a valid TCP stream, so we need to return the last error.
-    if let Some(stream) = tcp_stream {
-        Ok((Box::new(stream), resolution))
-    } else {
-        Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("Failed to connect to {host}:{port}"),
-            )
-        })))
-    }
+    Err(last_error)
 }
 
 /// Creates a TCP stream using parallel connection mode (MultiSubnetFailover).
@@ -3195,6 +3190,60 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn sequential_connect_walks_every_address_without_a_parallel_limit() {
+        use std::cell::RefCell;
+        use std::net::SocketAddr;
+
+        for count in [0, 1, 2, 64, 65] {
+            let addresses: Vec<_> = (0..count)
+                .map(|port| SocketAddr::from(([192, 0, 2, 1], 1000 + port)))
+                .collect();
+            let attempts = RefCell::new(Vec::new());
+            let error = super::sequential_connect_with(&addresses, 1000, |address| {
+                attempts.borrow_mut().push(address);
+                Ok(async { Err(std::io::ErrorKind::ConnectionRefused.into()) })
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(*attempts.borrow(), addresses);
+            assert_eq!(
+                error.kind(),
+                if count == 0 {
+                    std::io::ErrorKind::NotConnected
+                } else {
+                    std::io::ErrorKind::ConnectionRefused
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_connect_can_succeed_after_sixty_four_failures() {
+        use std::cell::Cell;
+        use std::net::SocketAddr;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let mut addresses = vec![SocketAddr::from(([192, 0, 2, 1], 1433)); 64];
+        addresses.push(live);
+        let attempts = Cell::new(0);
+        let stream = super::sequential_connect_with(&addresses, 1000, |address| {
+            attempts.set(attempts.get() + 1);
+            Ok(async move {
+                if address == live {
+                    tokio::net::TcpStream::connect(address).await
+                } else {
+                    Err(std::io::ErrorKind::ConnectionRefused.into())
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.get(), 65);
+        assert_eq!(stream.peer_addr().unwrap(), live);
+    }
+
     use super::*; // Brings in NetworkTransport, SslHandler, StreamRecoverer, etc.
     use crate::connection::client_context::ClientContext;
     use crate::connection::transport::network_transport::Stream;
