@@ -40,6 +40,13 @@ pub(crate) static RAW_DRIVER_VERSION: OnceLock<String> = OnceLock::new();
 /// Module-level runtime details, set once by the host Python package.
 pub(crate) static RUNTIME_DETAILS: OnceLock<String> = OnceLock::new();
 
+/// Configure this native runtime before its first connection.
+#[pyfunction]
+fn set_default_multi_subnet_failover(enabled: bool) -> PyResult<()> {
+    mssql_tds::connection::multi_subnet_failover::set_default_multi_subnet_failover(enabled)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
 /// Returns the driver version, falling back to the mssql-tds crate version.
 pub(crate) fn get_driver_version() -> DriverVersion {
     DRIVER_VERSION
@@ -96,6 +103,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     m.add_class::<connection::PyCoreConnection>()?;
+    m.add_function(wrap_pyfunction!(set_default_multi_subnet_failover, m)?)?;
     m.add_class::<cursor::PyCoreCursor>()?;
     m.add_class::<async_connection::PyAsyncConnection>()?;
     m.add_class::<async_cursor::PyAsyncCursor>()?;

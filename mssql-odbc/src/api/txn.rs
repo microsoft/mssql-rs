@@ -535,6 +535,7 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         Ok(mut state) => {
             state.server_isolation_unknown = true;
             state.database_user_name = None;
+            state.database_read_only = None;
             state.local_tran_started
         }
         Err(_) => {
@@ -611,6 +612,7 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // hit carrying the previous borrower's `USER_NAME()`. Re-asserted here with
         // the isolation flag; the clear that closes the window is the early one.
         state.database_user_name = None;
+        state.database_read_only = None;
         // Re-assert the invalidation under the lock that records the completed arm,
         // and bump the generation. The early set above narrows the window before
         // arming; this pair is what makes the invalidation stick afterwards. A

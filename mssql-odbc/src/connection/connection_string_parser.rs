@@ -52,7 +52,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "network",
     "net",
     "mars_connection",
-    "failover_partner",
     "failoverpartnerspn",
     "autotranslate",
     "querylog_on",
@@ -66,7 +65,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "attachdbfilename",
     "clientcertificate",
     "columnencryption",
-    "transparentnetworkipresolution",
     "keystoreauthentication",
     "keystoreprincipalid",
     "keystoresecret",
@@ -91,6 +89,9 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
 
 // Valid attribute values
 const YES_NO: &[&str] = &["yes", "no"];
+// `TransparentNetworkIPResolution` alone uses Enabled/Disabled (msodbcsql
+// `IsAttrStrValid`, `KEY_TNIR`).
+const ENABLED_DISABLED: &[&str] = &["Enabled", "Disabled"];
 const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
 const APPLICATION_INTENT_VALUES: &[&str] = &["ReadOnly", "ReadWrite"];
 // Shown in the diagnostic when a numeric attribute (PacketSize, ConnectRetryCount,
@@ -137,6 +138,8 @@ enum ConnAttrKey {
     App,
     ApplicationIntent,
     MultiSubnetFailover,
+    FailoverPartner,
+    TransparentNetworkIpResolution,
     ConnectRetryCount,
     ConnectRetryInterval,
     KeepAlive,
@@ -207,6 +210,8 @@ pub(crate) struct ConnectionParams {
     pub(crate) application_name: Option<String>,
     pub(crate) application_intent: Option<String>,
     pub(crate) multi_subnet_failover: Option<bool>,
+    pub(crate) failover_partner: Option<String>,
+    pub(crate) transparent_network_ip_resolution: Option<bool>,
     pub(crate) connect_retry_count: Option<u32>,
     pub(crate) connect_retry_interval: Option<u32>,
     pub(crate) keep_alive: Option<u32>,
@@ -264,6 +269,15 @@ impl ConnectionParams {
             parts.push(format!(
                 "MultiSubnetFailover={}",
                 if multi_subnet_failover { "yes" } else { "no" }
+            ));
+        }
+        if let Some(partner) = &self.failover_partner {
+            parts.push(format!("Failover_Partner={}", quote_odbc_value(partner)));
+        }
+        if let Some(tnir) = self.transparent_network_ip_resolution {
+            parts.push(format!(
+                "TransparentNetworkIPResolution={}",
+                if tnir { "Enabled" } else { "Disabled" }
             ));
         }
         if let Some(connect_retry_count) = self.connect_retry_count {
@@ -330,6 +344,11 @@ impl fmt::Debug for ConnectionParams {
             .field("application_name", &self.application_name)
             .field("application_intent", &self.application_intent)
             .field("multi_subnet_failover", &self.multi_subnet_failover)
+            .field("failover_partner", &self.failover_partner)
+            .field(
+                "transparent_network_ip_resolution",
+                &self.transparent_network_ip_resolution,
+            )
             .field("connect_retry_count", &self.connect_retry_count)
             .field("connect_retry_interval", &self.connect_retry_interval)
             .field("keep_alive", &self.keep_alive)
@@ -387,6 +406,12 @@ const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
     ("app", ConnAttrKey::App),
     ("applicationintent", ConnAttrKey::ApplicationIntent),
     ("multisubnetfailover", ConnAttrKey::MultiSubnetFailover),
+    ("failover_partner", ConnAttrKey::FailoverPartner),
+    ("failoverpartner", ConnAttrKey::FailoverPartner),
+    (
+        "transparentnetworkipresolution",
+        ConnAttrKey::TransparentNetworkIpResolution,
+    ),
     ("connectretrycount", ConnAttrKey::ConnectRetryCount),
     ("connectretryinterval", ConnAttrKey::ConnectRetryInterval),
     ("keepalive", ConnAttrKey::KeepAlive),
@@ -462,6 +487,11 @@ fn assign_value(
         ConnAttrKey::MultiSubnetFailover => {
             validate_attr(lower, value, YES_NO)?;
             params.multi_subnet_failover = Some(is_yes(value));
+        }
+        ConnAttrKey::FailoverPartner => params.failover_partner = Some(value.to_string()),
+        ConnAttrKey::TransparentNetworkIpResolution => {
+            validate_attr(lower, value, ENABLED_DISABLED)?;
+            params.transparent_network_ip_resolution = Some(value.eq_ignore_ascii_case("enabled"));
         }
         ConnAttrKey::ConnectRetryCount => {
             params.connect_retry_count = Some(parse_uint_in_range(
@@ -1313,7 +1343,6 @@ mod tests {
             "AutoTranslate",
             "QuotedId",
             "ColumnEncryption",
-            "TransparentNetworkIPResolution",
             "OEMToANSI",
         ] {
             let s = format!("Server=h;{key}=whatever;UID=u;PWD=p");
@@ -1422,6 +1451,34 @@ mod tests {
         assert_eq!(err.key, "multisubnetfailover");
     }
 
+    /// msodbcsql accepts only Enabled/Disabled, in any case (`IsAttrStrValid`,
+    /// `KEY_TNIR`); an absent keyword leaves the default to the connection.
+    #[test]
+    fn transparent_network_ip_resolution_is_enabled_disabled() {
+        for (value, expected) in [
+            ("Enabled", true),
+            ("enabled", true),
+            ("Disabled", false),
+            ("DISABLED", false),
+        ] {
+            let s = format!("Server=h;TransparentNetworkIPResolution={value};UID=u");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn, "{value}");
+            assert_eq!(
+                p.transparent_network_ip_resolution,
+                Some(expected),
+                "{value}"
+            );
+        }
+        let (p, _) = parse_connection_string("Server=h;UID=u").unwrap();
+        assert_eq!(p.transparent_network_ip_resolution, None);
+        for value in ["yes", "no", "on"] {
+            let s = format!("Server=h;TransparentNetworkIPResolution={value};UID=u");
+            let err = parse_connection_string(&s).unwrap_err();
+            assert_eq!(err.key, "transparentnetworkipresolution", "{value:?}");
+        }
+    }
+
     #[test]
     fn ip_address_preference_accepts_any_value() {
         for val in ["IPv4First", "ipv6first", "UsePlatformDefault"] {
@@ -1517,13 +1574,14 @@ mod tests {
     #[test]
     fn fmt_as_odbc_conn_str_includes_new_keys() {
         let (p, _) = parse_connection_string(
-            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;APP=MyApp;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
+            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;TransparentNetworkIPResolution=Disabled;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;APP=MyApp;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
         )
         .unwrap();
         let out = p.fmt_as_odbc_conn_str();
         for expected in [
             "ApplicationIntent=ReadOnly",
             "MultiSubnetFailover=yes",
+            "TransparentNetworkIPResolution=Disabled",
             "ConnectRetryCount=2",
             "ConnectRetryInterval=10",
             "KeepAlive=30",

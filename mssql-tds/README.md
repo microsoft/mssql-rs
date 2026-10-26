@@ -9,6 +9,80 @@ Low-level TDS client handling connection negotiation (prelogin, TLS, login7),
 query execution, result set streaming, bulk copy, RPC calls, and transaction
 management. Built on Tokio.
 
+## Connection policy and migration
+
+Eligible TCP connections default to MultiSubnetFailover (MSF): attempt all
+resolved addresses immediately and use the first successful connection. There
+is no Transparent Network IP Resolution (TNIR) first-address phase. One address
+is attempted once; zero addresses or more than 64 is an error with MSF on.
+MSF off attempts the complete address list sequentially, respecting
+`IPAddressPreference`. Parallel mode does not prioritize an address family.
+Parallel attempts share the TCP-connect budget, including DNS; sequential
+attempts retain their per-address budgets. Both remain inside the existing
+login deadline. Cancelling a parallel race aborts its remaining socket tasks.
+
+Precedence is **explicit connection > application startup default > deployment
+environment > built-in true**. Set `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT` to
+case-insensitive `true` or `false` before starting the application. Other values
+are errors unless a higher-priority setting overrides them; the variable is
+never reread after the first connection attempt or default lookup. Rust
+applications can instead call
+`connection::multi_subnet_failover::set_default_multi_subnet_failover(false)`
+before first use. Late calls fail. Set this before opening pools; separately
+loaded native modules have separate startup state, so use the environment to
+configure multiple bindings together. Changing the environment or a default
+does not change an established connection, a recovery, or a secondary login.
+
+The Rust `ClientContext::multi_subnet_failover` field changed from `bool` to
+`Option<bool>`:
+
+| Value | Meaning |
+|---|---|
+| `None` | Inherit startup defaults |
+| `Some(false)` | Explicit opt-out; sequential TCP |
+| `Some(true)` | Explicit MSF; incompatible options are errors |
+
+An inherited on default is suppressed for named pipes, shared memory, LocalDB,
+DAC (`admin:`), a nonempty failover partner, or a named instance requiring SQL
+Browser (SSRP). Those retain their existing transport/discovery paths.
+`tcp:host\instance,port` is eligible because discovery is unnecessary. On Windows,
+a local target without a protocol or port (`localhost`, `.`, `(local)`, loopback
+IP, or the machine name) also suppresses inherited MSF. Local aliases are
+case-insensitive, including `(Local)` and `(LOCAL)`. This retains the
+shared-memory-first waterfall, so a local instance with TCP/IP disabled remains
+reachable. An explicit per-connection MSF-on value, `tcp:`, or a port still selects
+TCP; application and environment defaults do not force local connections onto it.
+On other platforms, or for non-local targets, bare names without discovery select
+TCP when MSF is on. When TCP is selected, local aliases (`localhost`, `.`, `(local)`)
+remain `localhost` for resolution and certificate hostname validation rather than
+becoming the machine hostname.
+With certificate hostname validation enabled, connecting by IP requires a
+matching IP SAN or an explicit expected hostname (`host_name_in_cert` /
+ODBC `HostnameInCertificate`). MSF does not relax TLS validation.
+This does not implement database-mirroring failover.
+
+`TdsClient::multi_subnet_failover_policy()` reports the captured value, source,
+and any applicability suppression; the same fields appear in connection
+tracing. Cloned contexts preserve this policy. A caller can deliberately change
+the explicit override on a secondary context before opening a new connection;
+it cannot bypass the new endpoint's applicability checks.
+
+| Surface | Explicit opt-out | Application startup default |
+|---|---|---|
+| Rust | `context.multi_subnet_failover = Some(false)` | `set_default_multi_subnet_failover(false)?` |
+| ODBC | `MultiSubnetFailover=No` or `SQL_COPT_SS_MULTISUBNET_FAILOVER=OFF` | Set the process environment before driver use |
+| Native Python, sync/async | `{"multi_subnet_failover": False}` (also `"No"`) | `mssql_py_core.set_default_multi_subnet_failover(False)` |
+| Node.js | `multiSubnetFailover: false` | `setDefaultMultiSubnetFailover(false)` |
+| CLI | `--multi-subnet-failover false` | Environment |
+
+ODBC attributes outrank keywords. Omitted native options remain inherited;
+native Python also treats `multi_subnet_failover=None` as omission, not false.
+Legacy TNIR off/`Disabled` inputs in ODBC and native Python are accepted no-ops;
+on/`Enabled` is unsupported, and invalid values fail validation. **Disabling
+TNIR does not disable MSF.** See the
+[parity decisions](../mssql-odbc/docs/parity-deviations.md) for the intentional
+differences from msodbcsql and outstanding approval/evidence.
+
 ## DNS fallback caching
 
 LOGIN7 advertises DNS caching (`0x0B`). Each TCP connection keeps its resolved
