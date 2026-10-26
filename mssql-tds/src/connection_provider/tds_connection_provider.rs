@@ -1311,6 +1311,9 @@ mod tests {
                 login_timeout: Some(2),
                 connect_retry_count: 0,
                 ssrp_timeout_ms: 300,
+                // These tests follow the sequential connect, one stage per
+                // address; MultiSubnetFailover is on by default otherwise.
+                multi_subnet_failover: Some(false),
                 ..Default::default()
             };
             context.encryption_options.mode = crate::core::EncryptionSetting::PreferOff;

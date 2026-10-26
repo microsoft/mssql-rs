@@ -73,7 +73,10 @@ impl DnsCache {
     }
 
     /// Resolves `host` with `lookup`, falling back to the addresses a server
-    /// allowed when that fails.
+    /// allowed when that fails. Production code uses
+    /// [`Self::resolve_reporting`], which also reports the fallback; this is
+    /// for tests and the `test-util` helpers.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn resolve<F, Fut>(
         &self,
         host: &str,
@@ -87,8 +90,9 @@ impl DnsCache {
         self.resolve_reporting(host, port, lookup, |_| {}).await
     }
 
-    /// [`Self::resolve`], handing `fell_back` the resolver's error when the
-    /// allowed addresses are used instead.
+    /// Resolves `host` with `lookup`, falling back to the addresses a server
+    /// allowed when that fails, and hands `fell_back` the resolver's error
+    /// when the allowed addresses are used instead.
     pub(crate) async fn resolve_reporting<F, Fut>(
         &self,
         host: &str,
