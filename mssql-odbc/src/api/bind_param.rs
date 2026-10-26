@@ -1552,6 +1552,38 @@ mod tests {
         };
         assert_eq!(parts.magnitude(), 123);
         assert_eq!(parts.scale, 2);
+
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetDescFieldW(
+                    apd,
+                    1,
+                    SQL_DESC_SCALE as SqlSmallInt,
+                    10isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetDescFieldW(
+                    apd,
+                    1,
+                    SQL_DESC_PRECISION as SqlSmallInt,
+                    5isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_ERROR
+        );
+        let desc = unsafe { handle_from_raw::<crate::handles::DescHandle>(apd) };
+        assert_eq!(
+            desc.inner.lock().unwrap().diag_records[0].sql_state,
+            crate::api::sqlstate::ERR_INVALID_PRECISION_OR_SCALE.state
+        );
+        let column = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
+        assert_eq!((column.app_precision, column.app_scale), (10, 10));
     }
 
     #[test]

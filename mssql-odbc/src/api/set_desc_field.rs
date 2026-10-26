@@ -185,11 +185,12 @@ fn sql_set_desc_field_w_safe(
                         };
                         if focused_bindings.iter().any(|binding| {
                             binding.c_type == SQL_C_NUMERIC
-                                && !(1..=SQL_PREC_NUMERIC).contains(&precision)
+                                && (!(1..=SQL_PREC_NUMERIC).contains(&precision)
+                                    || binding.app_scale > precision)
                         }) {
                             error!(
                                 precision,
-                                "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC precision"
+                                "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC precision/scale"
                             );
                             return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
                         }
