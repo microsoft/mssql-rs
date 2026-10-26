@@ -529,11 +529,11 @@ mod tests {
     /// whole packets - the error would then arrive as a half-sent RPC needing
     /// cancel-and-drain rather than a local failure.
     ///
-    /// Covers all three fallible metadata checks: a UDT name too long for its
-    /// B_VARCHAR count, a `sql_variant` whose inner type it cannot hold, and a
-    /// vector whose declaration disagrees with its value.
+    /// Covers a UDT name too long for its B_VARCHAR count, an unsupported
+    /// sql_variant inner type, vector metadata, and raw NTEXT byte alignment.
     #[test]
     fn an_invalid_later_parameter_sends_nothing() {
+        use crate::datatypes::sql_string::EncodingType;
         use crate::datatypes::sql_udt::UdtTypeName;
 
         let invalid_values = [
@@ -559,6 +559,8 @@ mod tests {
                 7,
                 crate::datatypes::sqldatatypes::VectorBaseType::Float32,
             ),
+            SqlType::NText(Some(SqlString::new(vec![b'a'], EncodingType::Utf16))),
+            SqlType::NText(Some(SqlString::new(vec![b'a'], EncodingType::DelayedSet))),
         ];
 
         for invalid in invalid_values {

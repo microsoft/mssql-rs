@@ -241,7 +241,7 @@ ODBC_TEST_F(LongParameterTest, ExplicitMaxTypesAreUnaffected) {
     }
 }
 
-ODBC_TEST_F(LongParameterTest, DescribedLongNullsKeepTheDescribedType) {
+ODBC_TEST_F(LongParameterTest, DescribedLongNullsExecuteTheDescribedInsert) {
     SetLongAsMax(SQL_XL_OFF);
     for (const auto& type : kTypes) {
         const std::string table = "[##" + WorkerToken(type.legacy) + "]";
@@ -256,7 +256,23 @@ ODBC_TEST_F(LongParameterTest, DescribedLongNullsKeepTheDescribedType) {
                       SQL_HANDLE_STMT, stmt_);
         ASSERT_EQ(type.sql_type, sql_type);
         ASSERT_GT(size, SQLULEN(0));
-        Probe(type, false, true, false, ValueKind::Null, "", size);
+        SQLLEN indicator = SQL_NULL_DATA;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                      sql_type, size, digits, nullptr, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        Drain();
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_SQL_OK(Direct("SELECT v FROM " + table), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLCHAR value[8] = {};
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, value, sizeof(value), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_NULL_DATA, length);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        Drain();
         ASSERT_SQL_OK(Direct("DROP TABLE " + table), SQL_HANDLE_STMT, stmt_);
         Drain();
     }

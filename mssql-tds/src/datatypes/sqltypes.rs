@@ -1119,8 +1119,8 @@ impl SqlType {
     /// request that has to be cancelled and drained.
     ///
     /// Every fallible *scalar* metadata check in `write_type_info` belongs
-    /// here: today the UDT name, the `sql_variant` inner type, and the vector
-    /// dimension/base-type bounds. The duplicates in `write_type_info` stay,
+    /// here: the UDT name, the `sql_variant` inner type, vector dimension/base-type
+    /// bounds, and raw NTEXT byte alignment. The duplicates in the serializer stay,
     /// since that function must remain correct for callers that reach it by
     /// another route.
     ///
@@ -1137,6 +1137,7 @@ impl SqlType {
     ) -> TdsResult<()> {
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
+            SqlType::NText(Some(value)) => Self::validate_ntext(value),
             SqlType::Variant(inner) => {
                 Self::validate_variant_inner(inner)?;
                 inner.validate_for_send(db_collation, None)
@@ -1241,6 +1242,20 @@ impl SqlType {
         }
     }
 
+    fn validate_ntext(value: &SqlString) -> TdsResult<()> {
+        if matches!(
+            value.encoding_type(),
+            crate::datatypes::sql_string::EncodingType::Utf16
+                | crate::datatypes::sql_string::EncodingType::DelayedSet
+        ) && !value.bytes.len().is_multiple_of(2)
+        {
+            return Err(Error::UsageError(
+                "NTEXT data must contain complete UTF-16 code units.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn legacy_lob_wire_bytes(
         &self,
         collation: &SqlCollation,
@@ -1252,6 +1267,7 @@ impl SqlType {
                 Ok((Some(bytes), had_loss))
             }
             Self::NText(Some(value)) => {
+                Self::validate_ntext(value)?;
                 let bytes = match value.encoding_type() {
                     crate::datatypes::sql_string::EncodingType::Utf16
                     | crate::datatypes::sql_string::EncodingType::DelayedSet => {
@@ -1265,11 +1281,6 @@ impl SqlType {
                             .collect(),
                     ),
                 };
-                if bytes.len() % 2 != 0 {
-                    return Err(Error::UsageError(
-                        "NTEXT data must contain complete UTF-16 code units.".to_string(),
-                    ));
-                }
                 Ok((Some(bytes), false))
             }
             Self::Image(Some(bytes)) => Ok((Some(Cow::Borrowed(bytes)), false)),
@@ -1446,6 +1457,33 @@ mod legacy_lob_tests {
     use crate::datatypes::sql_string::EncodingType;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
+
+    #[test]
+    fn ntext_preflight_checks_only_raw_utf16_alignment() {
+        let collation = SqlCollation::default();
+        for encoding in [
+            EncodingType::Utf16,
+            EncodingType::DelayedSet,
+            EncodingType::Utf8,
+            EncodingType::LcidBased(collation),
+        ] {
+            for length in 0..=3 {
+                let value = SqlType::NText(Some(SqlString::new(vec![b'a'; length], encoding)));
+                let expected = length.is_multiple_of(2)
+                    || !matches!(encoding, EncodingType::Utf16 | EncodingType::DelayedSet);
+                assert_eq!(
+                    value.validate_for_send(&collation, None).is_ok(),
+                    expected,
+                    "{encoding:?}, {length} bytes"
+                );
+            }
+        }
+        assert!(
+            SqlType::NText(None)
+                .validate_for_send(&collation, None)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn legacy_length_has_a_signed_32_bit_ceiling() {
