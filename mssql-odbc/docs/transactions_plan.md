@@ -58,7 +58,15 @@ drive the same code path and are readable back through `SQLGetConnectAttr`.
 Setting the level already in effect is a no-op, mirroring the same-value
 short-circuit `SetCommitModeOption` uses for autocommit (`sqlcmisc.cpp:1720`), so
 an application that explicitly selects the default at startup does not pay a
-cursor sweep and a round trip.
+round trip.
+
+Changing isolation preserves application cursors, their result metadata, and
+statement diagnostics. Only the connection's diagnostics are cleared for the
+new call. An exhausted cursor does not prevent the change; unread results
+occupying the wire cause `SQL_ERROR` / `HY000` without discarding rows. This
+matches msodbcsql's isolation branch, which executes and closes only its private
+driver statement (`sqlcmisc.cpp:1808-1822`), not the connection-wide cursor sweep
+used for transaction completion.
 
 ### G4 — Transaction-safe disconnect
 

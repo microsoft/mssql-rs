@@ -69,9 +69,8 @@ fn fail_cursor_close(dbc: &DbcHandle, op: &str) -> SqlReturn {
 /// Claims the connection's TDS client for a connection-scoped operation that no
 /// statement owns (commit, rollback, isolation change, autocommit change).
 ///
-/// The caller must have closed every cursor first (see [`close_all_cursors`])
-/// so the connection is genuinely idle. Returns `Err` with the diagnostic
-/// already posted to the DBC.
+/// Requires an idle wire, not closed cursors: exhausted cursors may remain
+/// open. Returns `Err` with the diagnostic already posted to the DBC.
 pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<WireLease, SqlReturn> {
     let Ok(mut state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned");
@@ -727,6 +726,8 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
 
 /// Applies `SQL_ATTR_TXN_ISOLATION` (msodbcsql `sqlcmisc.cpp:1754-1827`), and
 /// its vendor spelling `SQL_COPT_SS_TXN_ISOLATION`.
+/// Preserves application cursors and diagnostics; unread results make the
+/// connection busy rather than being discarded.
 pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_TXN_ISOLATION)";
 
@@ -750,8 +751,7 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // (`sqlcmisc.cpp:1720`). Checked before the open-transaction rejection
         // below so that asking for no change never fails: an application that
         // explicitly selects the default READ COMMITTED at startup pays neither
-        // an error inside a transaction nor a cursor sweep and round trip
-        // outside one.
+        // an error inside a transaction nor a round trip outside one.
         //
         // This cache tracks only isolation set through this attribute. Raw T-SQL
         // can therefore make SQLGetConnectAttr report a stale value.
@@ -787,9 +787,8 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         (level, tsql, state.reset_generation)
     };
 
-    if close_all_cursors(dbc) == SQL_ERROR {
-        return fail_cursor_close(dbc, OP);
-    }
+    // msodbcsql closes only its private driver statement after the SET
+    // (`sqlcmisc.cpp:1822`), never the application's statements.
     let mut client = match claim_dbc_client(dbc, OP) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -1042,6 +1041,173 @@ fn finish_post_connect_txn_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_changes_preserve_statement_diagnostics() {
+        use crate::api::SQLSetConnectAttrW;
+        use crate::api::odbc_types::{
+            SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION, SqlPointer,
+        };
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        for attribute in [SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION] {
+            let mut h = TestHandles::with_env_dbc_stmt();
+            let extra = h.alloc_extra_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state
+                    .wire
+                    .put_client_for_test(tds_client_from_tokens(vec![done_no_more()]));
+                post_sql_error(&mut state, SQLSTATE_HY000, 0, "old connection error");
+            }
+            for handle in [h.stmt, extra] {
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(handle) };
+                let mut state = stmt.inner.lock().unwrap();
+                post_sql_error(&mut state, SQLSTATE_HY000, 42, "statement error");
+                post_sql_error(&mut state, SQLSTATE_01000, 43, "statement warning");
+            }
+
+            assert_eq!(
+                unsafe {
+                    SQLSetConnectAttrW(
+                        h.dbc,
+                        attribute,
+                        usize::try_from(SQL_TXN_SERIALIZABLE).unwrap() as SqlPointer,
+                        0,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.txn_isolation, SQL_TXN_SERIALIZABLE);
+            assert!(state.diag_records().is_empty());
+            drop(state);
+            for handle in [h.stmt, extra] {
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(handle) };
+                let state = stmt.inner.lock().unwrap();
+                let records = state.diag_records();
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].sql_state, SQLSTATE_HY000);
+                assert_eq!(records[0].native_error, 42);
+                assert!(records[0].message.ends_with("statement error"));
+                assert_eq!(records[1].sql_state, SQLSTATE_01000);
+                assert_eq!(records[1].native_error, 43);
+                assert!(records[1].message.ends_with("statement warning"));
+            }
+        }
+    }
+
+    #[test]
+    fn isolation_changes_preserve_cursors_and_reject_pending_results() {
+        use crate::api::odbc_types::{
+            SQL_ATTR_TXN_ISOLATION, SQL_C_SLONG, SQL_COPT_SS_TXN_ISOLATION, SQL_NO_DATA, SqlPointer,
+        };
+        use crate::api::sqlstate::ERR_CONNECTION_BUSY;
+        use crate::api::{
+            SQLCloseCursor, SQLExecDirectW, SQLFetch, SQLGetData, SQLNumResultCols,
+            SQLSetConnectAttrW,
+        };
+        use crate::test_support::{TestHandles, assert_last_diag, connect_mock_server};
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for attribute in [SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION] {
+            for pending in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+                let server = connect_mock_server(
+                    dbc,
+                    "SELECT isolation_probe",
+                    QueryResponse::new(
+                        vec![ColumnDefinition::new("value", SqlDataType::Int)],
+                        (1..=3)
+                            .map(|value| Row::new(vec![ColumnValue::Int(value)]))
+                            .collect(),
+                    ),
+                );
+                server.register_query(
+                    txn_isolation_to_tsql(SQL_TXN_SERIALIZABLE).unwrap(),
+                    QueryResponse::new(vec![], vec![]),
+                );
+                let sql: Vec<u16> = "SELECT isolation_probe".encode_utf16().collect();
+                assert_eq!(
+                    unsafe { SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap()) },
+                    SQL_SUCCESS
+                );
+                assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_SUCCESS);
+                if !pending {
+                    assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_SUCCESS);
+                    assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_SUCCESS);
+                    assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_NO_DATA);
+                }
+                let set_isolation = || unsafe {
+                    SQLSetConnectAttrW(
+                        h.dbc,
+                        attribute,
+                        usize::try_from(SQL_TXN_SERIALIZABLE).unwrap() as SqlPointer,
+                        0,
+                    )
+                };
+                assert_eq!(
+                    set_isolation(),
+                    if pending { SQL_ERROR } else { SQL_SUCCESS }
+                );
+                {
+                    let state = dbc.inner.lock().unwrap();
+                    assert_eq!(
+                        state.txn_isolation,
+                        if pending {
+                            SQL_TXN_READ_COMMITTED
+                        } else {
+                            SQL_TXN_SERIALIZABLE
+                        }
+                    );
+                    assert_eq!(
+                        state.wire.statement_owner(),
+                        if pending { Some(h.stmt) } else { None }
+                    );
+                    if pending {
+                        assert_last_diag(state.diag_records(), ERR_CONNECTION_BUSY);
+                    }
+                }
+                let mut columns = 0;
+                assert_eq!(
+                    unsafe { SQLNumResultCols(h.stmt, &mut columns) },
+                    SQL_SUCCESS
+                );
+                assert_eq!(columns, 1);
+                if pending {
+                    assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_SUCCESS);
+                    let mut value = 0i32;
+                    let mut length = 0;
+                    assert_eq!(
+                        unsafe {
+                            SQLGetData(
+                                h.stmt,
+                                1,
+                                SQL_C_SLONG,
+                                std::ptr::from_mut(&mut value).cast(),
+                                4,
+                                &mut length,
+                            )
+                        },
+                        SQL_SUCCESS
+                    );
+                    assert_eq!((value, length), (2, 4));
+                }
+                assert_eq!(unsafe { SQLCloseCursor(h.stmt) }, SQL_SUCCESS);
+                if pending {
+                    assert_eq!(set_isolation(), SQL_SUCCESS);
+                    assert_eq!(
+                        dbc.inner.lock().unwrap().txn_isolation,
+                        SQL_TXN_SERIALIZABLE
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn implicit_begin_records_server_transaction_even_when_its_response_fails() {

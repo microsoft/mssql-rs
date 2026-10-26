@@ -197,7 +197,7 @@ pub(super) fn free_stmt_close_locked(
 }
 
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
-/// (`SQLEndTran`, an autocommit switch, an isolation change, disconnect).
+/// (`SQLEndTran`, an autocommit switch, connection reset, disconnect).
 ///
 /// Reproduces what msodbcsql's sweep does to each statement. `CommitAbortTran`
 /// calls `SQLFreeStmt(lpstmt, SQL_CLOSE)` on every statement it visits

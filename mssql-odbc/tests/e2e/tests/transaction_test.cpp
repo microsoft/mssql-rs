@@ -9,7 +9,7 @@
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
-#include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 
 #include <chrono>
 #include <functional>
@@ -575,6 +575,87 @@ TEST_F(TransactionLiveTest, IsolationIsAppliedOnTheServer) {
         EXPECT_EQ(server_level, ServerIsolation()) << "level 0x" << std::hex << odbc_level;
     }
     ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+}
+
+// Benefits-from-mock-tds: verify that isolation sends only its own batch, not cursor cleanup.
+ODBC_TEST_F(TransactionLiveTest, IsolationPreservesDiagnosticsAndExhaustedCursors) {
+    SQLHSTMT failed = AllocStmt();
+    SQLHSTMT failed2 = AllocStmt();
+    ASSERT_NE(nullptr, failed);
+    ASSERT_NE(nullptr, failed2);
+    const SQLINTEGER expected = 1000 * Worker() + 10 * Iteration() + 1;
+
+    for (SQLINTEGER attribute : {SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION}) {
+        SCOPED_TRACE(attribute);
+        for (SQLHSTMT handle : {failed, failed2}) {
+            ASSERT_EQ(SQL_ERROR, Run(handle, "SELECT * FROM this_table_does_not_exist_xyz"));
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, handle, "42S02");
+        }
+        ASSERT_SQL_OK(Run(stmt_, "SELECT " + std::to_string(expected)), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER value = 0;
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(expected, value);
+        ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+        ASSERT_SQL_OK(SQLSetConnectAttr(
+                          dbc_, attribute,
+                          reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SERIALIZABLE)),
+                          SQL_IS_UINTEGER),
+                      SQL_HANDLE_DBC, dbc_);
+        for (SQLHSTMT handle : {failed, failed2}) {
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, handle, "42S02");
+        }
+        SQLSMALLINT columns = 0;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(1, columns);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(4, ServerIsolation());
+        ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+    }
+}
+
+// Benefits-from-mock-tds: verify that the busy rejection sends no isolation batch.
+ODBC_TEST_F(TransactionLiveTest, IsolationRejectsBusyWireWithoutDiscardingRowsOrDiagnostics) {
+    SQLHSTMT failed = AllocStmt();
+    ASSERT_NE(nullptr, failed);
+    const SQLINTEGER first = 1000 * Worker() + 10 * Iteration() + 1;
+
+    for (SQLINTEGER attribute : {SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION}) {
+        SCOPED_TRACE(attribute);
+        ASSERT_EQ(SQL_ERROR, Run(failed, "SELECT * FROM this_table_does_not_exist_xyz"));
+        ASSERT_SQL_OK(
+            Run(stmt_, "SELECT " + std::to_string(first) + " UNION ALL SELECT " +
+                           std::to_string(first + 1) + " UNION ALL SELECT " +
+                           std::to_string(first + 2)),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        EXPECT_SQL_ERROR(SQLSetConnectAttr(
+            dbc_, attribute,
+            reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SERIALIZABLE)),
+            SQL_IS_UINTEGER));
+        EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY000");
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, failed, "42S02");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER value = 0;
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(first + 1, value);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2, ServerIsolation());
+
+        ASSERT_SQL_OK(SQLSetConnectAttr(
+                          dbc_, attribute,
+                          reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SERIALIZABLE)),
+                          SQL_IS_UINTEGER),
+                      SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(4, ServerIsolation());
+        ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+    }
 }
 
 // A server-side lock timeout is a statement error, not a client query timeout.
