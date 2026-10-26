@@ -65,7 +65,9 @@ def release_state(version):
     if pypi.get("info", {}).get("version") != version:
         raise ValueError(f"PyPI returned unexpected metadata for {PYPI_NAME} {version}")
 
-    nuget = fetch_json(NUGET_INDEX)
+    nuget = fetch_json(NUGET_INDEX, missing_is_none=True)
+    if nuget is None:
+        return False
     versions = nuget.get("versions")
     if not isinstance(versions, list) or not all(isinstance(item, str) for item in versions):
         raise ValueError(f"{NUGET_NAME}: invalid NuGet version index")

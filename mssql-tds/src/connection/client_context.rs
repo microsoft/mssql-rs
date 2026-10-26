@@ -317,8 +317,11 @@ pub struct ClientContext {
     pub auth_method_map: HashMap<TdsAuthenticationMethod, Box<dyn CloneableEntraIdTokenFactory>>,
     /// Enable Multiple Active Result Sets.
     pub mars_enabled: bool,
-    /// Enable multi-subnet failover for AlwaysOn availability groups.
-    pub multi_subnet_failover: bool,
+    /// Explicit MSF override. `None` inherits the frozen startup default (on).
+    /// `Some(false)` always selects sequential TCP connection attempts.
+    pub multi_subnet_failover: Option<bool>,
+    pub(crate) resolved_multi_subnet_failover:
+        Option<super::multi_subnet_failover::MultiSubnetFailoverPolicy>,
     /// Timeout in milliseconds for SQL Browser (SSRP) instance resolution.
     /// Defaults to 1000ms.
     pub ssrp_timeout_ms: u64,
@@ -571,7 +574,8 @@ impl ClientContext {
             driver_version: DriverVersion::from_cargo_version(),
             auth_method_map: HashMap::new(),
             mars_enabled: false,
-            multi_subnet_failover: false,
+            multi_subnet_failover: None,
+            resolved_multi_subnet_failover: None,
             ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
@@ -637,7 +641,8 @@ impl ClientContext {
             driver_version: DriverVersion::from_cargo_version(),
             auth_method_map: HashMap::new(),
             mars_enabled: false,
-            multi_subnet_failover: false,
+            multi_subnet_failover: None,
+            resolved_multi_subnet_failover: None,
             ssrp_timeout_ms: crate::ssrp::DEFAULT_SSRP_TIMEOUT_MS,
             new_password: "".to_string(),
             packet_size: 8000,
@@ -811,6 +816,55 @@ impl Default for ClientContext {
 }
 
 impl ClientContext {
+    /// The policy captured when this context was prepared for a connection.
+    pub fn multi_subnet_failover_policy(
+        &self,
+    ) -> Option<super::multi_subnet_failover::MultiSubnetFailoverPolicy> {
+        self.resolved_multi_subnet_failover
+    }
+
+    pub(crate) fn prepare_datasource(&mut self, datasource: &str) -> TdsResult<ParsedDataSource> {
+        use super::multi_subnet_failover::{
+            MultiSubnetFailoverSource, resolve_connection_policy, resolve_policy,
+        };
+
+        let mut parsed = ParsedDataSource::parse(datasource, false)?;
+        let policy = match self.resolved_multi_subnet_failover {
+            Some(policy)
+                if self.multi_subnet_failover.is_some()
+                    || policy.source != MultiSubnetFailoverSource::Connection =>
+            {
+                resolve_policy(
+                    self.multi_subnet_failover,
+                    Ok(policy),
+                    &parsed,
+                    &self.failover_partner,
+                )?
+            }
+            _ => resolve_connection_policy(
+                self.multi_subnet_failover,
+                &parsed,
+                &self.failover_partner,
+            )?,
+        };
+        if policy.enabled {
+            parsed = ParsedDataSource::parse(datasource, true)?;
+        }
+        self.data_source = datasource.to_string();
+        self.transport_context = TransportContext::from_parsed_datasource(&parsed)?;
+        if !parsed.instance_name.is_empty() {
+            self.database_instance = parsed.instance_name.clone();
+        }
+        self.resolved_multi_subnet_failover = Some(policy);
+        tracing::info!(
+            enabled = policy.enabled,
+            source = ?policy.source,
+            inapplicable = ?policy.inapplicable,
+            "Resolved MultiSubnetFailover policy"
+        );
+        Ok(parsed)
+    }
+
     /// Generates a default workstation ID based on the hostname.
     /// If the hostname is longer than 128 characters, it truncates it to 128 characters.
     /// This function is used to ensure that the workstation ID does not exceed the maximum length
@@ -866,8 +920,8 @@ impl ClientContext {
 
     /// Parse a data source string with MultiSubnetFailover support
     ///
-    /// Similar to parse_datasource but allows specifying MultiSubnetFailover option
-    /// which restricts protocol selection to TCP only.
+    /// Also records an explicit connection override. Unlike an inherited default,
+    /// an enabled override rejects transports other than TCP.
     ///
     /// # Arguments
     /// * `datasource` - The data source string to parse
@@ -890,6 +944,8 @@ impl ClientContext {
             self.database_instance = parsed.instance_name.clone();
         }
 
+        self.multi_subnet_failover = Some(multi_subnet_failover);
+        self.resolved_multi_subnet_failover = None;
         Ok(parsed)
     }
 }
@@ -921,6 +977,7 @@ impl Clone for ClientContext {
             auth_method_map: self.clone_auth_method_map(),
             mars_enabled: self.mars_enabled,
             multi_subnet_failover: self.multi_subnet_failover,
+            resolved_multi_subnet_failover: self.resolved_multi_subnet_failover,
             ssrp_timeout_ms: self.ssrp_timeout_ms,
             new_password: self.new_password.clone(),
             packet_size: self.packet_size,
@@ -1250,6 +1307,62 @@ impl TransportContext {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_policy_survives_cloning_and_can_be_explicitly_overridden() {
+        use crate::connection::multi_subnet_failover::MultiSubnetFailoverSource;
+
+        for enabled in [false, true] {
+            let mut context = ClientContext::with_data_source("tcp:host,1433");
+            context.multi_subnet_failover = Some(enabled);
+            assert_eq!(
+                context
+                    .prepare_datasource("tcp:host,1433")
+                    .unwrap()
+                    .parallel_connect,
+                enabled
+            );
+            let policy = context.multi_subnet_failover_policy().unwrap();
+            assert_eq!(policy.source, MultiSubnetFailoverSource::Connection);
+            let mut secondary = context.clone();
+            assert_eq!(secondary.multi_subnet_failover_policy(), Some(policy));
+            secondary.prepare_datasource("tcp:routed,1433").unwrap();
+            assert_eq!(secondary.multi_subnet_failover_policy(), Some(policy));
+            secondary.multi_subnet_failover = Some(!enabled);
+            secondary.prepare_datasource("tcp:routed,1433").unwrap();
+            assert_eq!(
+                secondary.multi_subnet_failover_policy().unwrap().enabled,
+                !enabled
+            );
+            assert_eq!(context.multi_subnet_failover_policy(), Some(policy));
+        }
+    }
+
+    #[test]
+    fn parsing_an_explicit_option_preserves_false_for_connection_preparation() {
+        let mut context = ClientContext::with_data_source("tcp:host,1433");
+        context
+            .parse_datasource_with_options("tcp:host,1433", false)
+            .unwrap();
+        assert_eq!(context.multi_subnet_failover, Some(false));
+        assert!(
+            !context
+                .prepare_datasource("tcp:host,1433")
+                .unwrap()
+                .parallel_connect
+        );
+    }
+
+    #[test]
+    fn cloned_explicit_policy_cannot_bypass_new_incompatibilities() {
+        let mut context = ClientContext::with_data_source("tcp:host,1433");
+        context.multi_subnet_failover = Some(true);
+        context.prepare_datasource("tcp:host,1433").unwrap();
+        let mut secondary = context.clone();
+        secondary.failover_partner = "partner".to_string();
+        assert!(secondary.prepare_datasource("tcp:host,1433").is_err());
+        assert!(context.prepare_datasource("tcp:host\\instance").is_err());
+    }
 
     #[test]
     fn test_with_data_source_constructor() {

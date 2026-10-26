@@ -17,7 +17,6 @@ pub(crate) struct SessionRecoveryFeature {
     acknowledged: bool,
     connect_retry_count: u32,
     /// None for initial login, Some for reconnection.
-    /// Boxed to avoid ~16KB on the stack (two 256-element arrays).
     recovery_data: Option<Box<SessionRecoveryData>>,
     /// Initial session state data received from FEATUREEXTACK, stored for
     /// later use by RecoveryContext.
@@ -285,8 +284,8 @@ mod tests {
         use crate::token::tokens::SqlCollation;
 
         let data = SessionRecoveryData {
-            initial_state: std::array::from_fn(|_| None),
-            delta: std::array::from_fn(|_| None),
+            initial_state: crate::connection::session_recovery::empty_state_slots(),
+            delta: crate::connection::session_recovery::empty_state_slots(),
             initial_database: "testdb".to_string(),
             initial_language: "us_english".to_string(),
             initial_collation: SqlCollation::default(),
@@ -305,8 +304,8 @@ mod tests {
 
     fn make_recovery_data_empty() -> SessionRecoveryData {
         SessionRecoveryData {
-            initial_state: std::array::from_fn(|_| None),
-            delta: std::array::from_fn(|_| None),
+            initial_state: crate::connection::session_recovery::empty_state_slots(),
+            delta: crate::connection::session_recovery::empty_state_slots(),
             initial_database: String::new(),
             initial_language: String::new(),
             initial_collation: SqlCollation::default(),

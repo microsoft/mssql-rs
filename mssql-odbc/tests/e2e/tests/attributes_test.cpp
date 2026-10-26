@@ -2172,10 +2172,11 @@ TEST_F(AttributesTest, MaxRowsTruncatesARowsetRatherThanRoundingIt) {
 // Vendor connection attributes (spec 4.2.2 / 4.10)
 //
 // mssql-python applies `attrs_before` unfiltered at connect, so the attribute
-// forms of Encrypt / TrustServerCertificate / Trusted_Connection can arrive
-// alongside -- or instead of -- the keywords that mean the same thing. That
-// makes two things part of the contract: which one wins when they disagree,
-// and what a later get reports.
+// forms of Encrypt / TrustServerCertificate / Trusted_Connection /
+// MultiSubnetFailover / TransparentNetworkIPResolution can arrive alongside --
+// or instead of -- the keywords that mean the same thing. That makes two
+// things part of the contract: which one wins when they disagree, and what a
+// later get reports.
 //
 // Both were measured against msodbcsql rather than read off a header, because
 // the ranking is not uniform: these attributes beat their keyword, while
@@ -2184,7 +2185,11 @@ TEST_F(AttributesTest, MaxRowsTruncatesARowsetRatherThanRoundingIt) {
 
 #define SQL_COPT_SS_INTEGRATED_SECURITY 1203
 #define SQL_COPT_SS_ENCRYPT 1223
+#define SQL_COPT_SS_TXN_ISOLATION 1227
 #define SQL_COPT_SS_TRUST_SERVER_CERTIFICATE 1228
+#define SQL_COPT_SS_WARN_ON_CP_ERROR 1243
+#define SQL_COPT_SS_MULTISUBNET_FAILOVER 1248
+#define SQL_COPT_SS_TNIR 1249
 
 namespace {
 
@@ -2337,15 +2342,17 @@ TEST_F(AttributesTest, OutOfRangeEncryptValueNormalizesToOn) {
 }
 
 // -------------------------------------------------------------------
-// Variation 61 - all three select something the handshake fixes: the
-// transport, the certificate policy, and the credential. A late set could
-// never apply, and both drivers reject it with HY011 rather than accepting it
-// and silently doing nothing.
+// Variation 61 - each selects something the handshake fixes: the transport,
+// the certificate policy, the credential, or how the TCP connect walks the
+// server's addresses. A late set could never apply, and both drivers reject
+// it with HY011 rather than accepting it and silently doing nothing.
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, VendorConnectionAttributesAreRejectedAfterConnect) {
     for (SQLINTEGER attribute : {SQL_COPT_SS_ENCRYPT,
                                  SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
-                                 SQL_COPT_SS_INTEGRATED_SECURITY}) {
+                                 SQL_COPT_SS_INTEGRATED_SECURITY,
+                                 SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                                 SQL_COPT_SS_TNIR}) {
         SCOPED_TRACE(attribute);
 
         SQLHDBC dbc = SQL_NULL_HDBC;
@@ -2423,4 +2430,137 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
 
     SQLDisconnect(encrypted);
     SQLFreeHandle(SQL_HANDLE_DBC, encrypted);
+}
+
+// -------------------------------------------------------------------
+// Variation 63 - explicit MSF values and attribute precedence agree.
+// The inherited default differs (parity-deviations entry 34). TNIR Disabled
+// is not an MSF opt-out in either driver.
+// -------------------------------------------------------------------
+ODBC_TEST_F(AttributesTest, MultiSubnetFailoverReportsTheEffectiveSetting) {
+    const auto& cfg = ODBCTestConfig::Instance();
+    if (cfg.HasConnStr() || cfg.HasDSN() || cfg.Server().empty()) {
+        GTEST_SKIP() << "Requires ODBC_TEST_SERVER to select an explicit TCP endpoint";
+    }
+    std::string server = cfg.Server();
+    if (server.find(',') == std::string::npos) {
+        if (server.find('\\') != std::string::npos) {
+            GTEST_SKIP() << "MSF requires an explicit TCP port for a named instance";
+        }
+        server += ",1433";
+    }
+    // Address outranks Server; an explicit port avoids the local Windows
+    // shared-memory exemption without changing the inherited MSF value.
+    const std::string tcp_address = "Address=" + server + ";";
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
+    constexpr SQLUINTEGER kUnset = 0xFFFFFFFFu;
+    struct Case {
+        const char* keyword;
+        SQLUINTEGER attr;
+        SQLUINTEGER expected_msf;
+    };
+    const Case cases[] = {
+        {"", kUnset, comparing_msodbcsql ? 0u : 1u},
+        {"MultiSubnetFailover=No;", kUnset, 0},
+        {"MultiSubnetFailover=Yes;", kUnset, 1},
+        {"MultiSubnetFailover=Yes;", 0, 0},
+        {"MultiSubnetFailover=No;", 1, 1},
+        {"TransparentNetworkIPResolution=Disabled;", kUnset,
+         comparing_msodbcsql ? 0u : 1u},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(std::string(c.keyword) + " attr=" +
+                     (c.attr == kUnset ? std::string("unset")
+                                       : std::to_string(c.attr)));
+
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+        if (c.attr != kUnset) {
+            EXPECT_TRUE(
+                SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                                           c.attr)));
+        }
+        ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, tcp_address + c.keyword)))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+
+        SQLRETURN rc = SQL_ERROR;
+        EXPECT_EQ(c.expected_msf,
+                  GetVendorAttr(dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER, &rc));
+        EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+        SQLDisconnect(dbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 64 - TNIR is deliberately omitted (parity-deviations entry 35).
+// OFF is accepted for compatibility; ON is HYC00 rather than silently ignored.
+// -------------------------------------------------------------------
+ODBC_TEST_F(AttributesTest, TnirOffIsAcceptedAndOnIsUnsupported) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+    // The DM can cache pre-connect setters even after SQLDisconnect.
+    // Exercise OFF through connect; direct exported-API tests pin ON's HYC00.
+    EXPECT_TRUE(SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_TNIR, 0)));
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "MultiSubnetFailover=Yes;")))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+    SQLRETURN rc = SQL_ERROR;
+    EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_TNIR, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(1u, GetVendorAttr(dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(SQLDisconnect(dbc)));
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+    rc = ConnectWith(dbc, "TransparentNetworkIPResolution=Enabled;");
+    if (comparing_msodbcsql) {
+        EXPECT_TRUE(SQL_SUCCEEDED(rc))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+        SQLDisconnect(dbc);
+    } else {
+        EXPECT_EQ(SQL_ERROR, rc);
+        EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc, "HYC00");
+    }
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+}
+
+// -------------------------------------------------------------------
+// Variation 65 - the connection-attribute twin of variation 55: a
+// successful integer get writes the value's four-byte width into
+// StringLength. msodbcsql does for every one of these (GetParamValue and
+// the getter's shared tail, sqlcmisc.cpp); GetVendorAttr passes a null
+// length, so the variations above cannot see it.
+// -------------------------------------------------------------------
+ODBC_TEST_F(AttributesTest, ConnectionIntegerGetsReportTheValueWidth) {
+    const SQLINTEGER attributes[] = {
+        SQL_ATTR_ACCESS_MODE,
+        SQL_ATTR_AUTOCOMMIT,
+        SQL_ATTR_CONNECTION_TIMEOUT,
+        SQL_ATTR_PACKET_SIZE,
+        SQL_ATTR_TXN_ISOLATION,
+        SQL_COPT_SS_TXN_ISOLATION,
+        SQL_COPT_SS_WARN_ON_CP_ERROR,
+        SQL_COPT_SS_ENCRYPT,
+        SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+        SQL_COPT_SS_INTEGRATED_SECURITY,
+        SQL_COPT_SS_MULTISUBNET_FAILOVER,
+        SQL_COPT_SS_TNIR,
+    };
+
+    for (SQLINTEGER attribute : attributes) {
+        SCOPED_TRACE(attribute);
+        SQLUINTEGER value = 0;
+        SQLINTEGER written = -1;
+        EXPECT_SQL_OK(
+            SQLGetConnectAttr(dbc_, attribute, &value, sizeof(value), &written),
+            SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(static_cast<SQLINTEGER>(sizeof(SQLUINTEGER)), written);
+    }
 }

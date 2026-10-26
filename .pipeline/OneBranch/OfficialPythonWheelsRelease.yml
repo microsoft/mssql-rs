@@ -1,7 +1,7 @@
 #################################################################################
 #                        OneBranch Pipelines - Official Release                 #
-# Downloads artifacts from the Official Build pipeline, publishes the wheel    #
-# NuGet package to Azure Artifacts, and can publish Rust crates to crates.io.   #
+# Downloads artifacts from the Official Build pipeline, publishes the wheels to  #
+# the Azure Artifacts PyPI feed, and can publish Rust crates to crates.io.       #
 # It can also tag the source commit and create a release branch.                #
 #                                                                               #
 # This pipeline does NOT build anything — it consumes artifacts produced by    #
@@ -24,8 +24,8 @@ trigger: none
 pr: none
 
 parameters:
-  - name: publishNuGet
-    displayName: 'Publish NuGet package to Azure Artifacts'
+  - name: publishToFeed
+    displayName: 'Publish wheels to the Azure Artifacts PyPI feed'
     type: boolean
     default: false  # Safety: default to false to prevent accidental releases
 
@@ -54,6 +54,14 @@ variables:
   LinuxContainerImage: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
   WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
   DEBIAN_FRONTEND: noninteractive
+  # Project-scoped Azure Artifacts feed (<project>/<feed>) that also serves the
+  # PyPI protocol. mssql-python-rs wheels are twine-uploaded here for pip install.
+  pythonArtifactFeed: 'public/mssql-rs_Public'
+  # Twine repository name matching the .pypirc entry TwineAuthenticate@1 writes.
+  pythonFeedName: 'mssql-rs_Public'
+  # Anonymous-read PEP 503 index for the same feed; the upload step reads it to
+  # skip wheels an earlier, partially failed attempt already published.
+  pythonSimpleIndex: 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/'
 
 resources:
   repositories:
@@ -85,17 +93,13 @@ extends:
         enabled: true
       policheck:
         enabled: true
-    nugetPublishing:
-      feeds:
-      - name: public/mssql-rs_Public
-        continueOnConflict: true
 
     stages:
     ###########################################################################
-    # Stage 1: Always validate wheels; optionally package and publish NuGet
+    # Stage 1: Always validate wheels; optionally publish to the PyPI feed
     ###########################################################################
     - stage: Release
-      displayName: 'Validate Wheels and Optionally Publish NuGet'
+      displayName: 'Validate Wheels and Optionally Publish to Feed'
       dependsOn: []
       jobs:
       - job: PublishRelease
@@ -104,7 +108,6 @@ extends:
           type: windows
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-          ob_nugetPublishing_enabled: ${{ parameters.publishNuGet }}
           ob_git_fetchDepth: 0
           ob_git_persistCredentials: true
         steps:
@@ -151,8 +154,8 @@ extends:
             $commitSha = $metadata.SourceCommit
             $distributionName = $metadata.DistributionName
             $pythonVersion = $metadata.PythonVersion
-            # NuGet transports the wheels and therefore uses their distribution
-            # version, independent of the Rust crate version used for tagging.
+            # The wheels carry their own distribution version, independent of the
+            # Rust crate version used for tagging.
             $packageVersion = $pythonVersion
 
             Write-Host "Release version: $packageVersion"
@@ -183,48 +186,26 @@ extends:
           displayName: 'Validate official Python wheels'
           workingDirectory: '$(Build.SourcesDirectory)'
 
-        - ${{ if eq(parameters.publishNuGet, true) }}:
-          - pwsh: |
-              $ErrorActionPreference = 'Stop'
-              $packageVersion = "$(releaseVersion)"
-              $distributionName = "$(releaseDistributionName)"
-              $shortSha = "$(sourceCommit)".Substring(0, 8)
-
-              $nuspecContent = @"
-              <?xml version="1.0"?>
-              <package>
-                <metadata>
-                  <id>mssql-python-rs-wheels</id>
-                  <version>$packageVersion</version>
-                  <description>Python wheels containing the $distributionName TDS core and ODBC driver. Commit: $shortSha. Build: $(resources.pipeline.officialBuild.runID)</description>
-                  <authors>SqlClientDrivers</authors>
-                </metadata>
-                <files>
-                  <file src="wheels\**\*.whl" target="wheels" />
-                </files>
-              </package>
-              "@
-
-              $nuspecPath = "$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec"
-              $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
-              Write-Host "Created nuspec: $nuspecPath"
-            displayName: 'Prepare release NuGet package'
-
-          - task: NuGetCommand@2
-            displayName: 'Create NuGet package'
+        - ${{ if eq(parameters.publishToFeed, true) }}:
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.12'
             inputs:
-              command: pack
-              packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
-              packDestination: '$(ob_outputDirectory)/packages'
-              basePath: '$(Build.StagingDirectory)'
+              versionSpec: '3.12'
+              architecture: 'x64'
+              addToPath: true
 
-          - pwsh: |
-              Write-Host "=== Release NuGet package ==="
-              Get-ChildItem "$(ob_outputDirectory)/packages" -Filter *.nupkg | ForEach-Object {
-                Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
-              }
-              Write-Host "NuGet WILL be published to feed (publishNuGet=true)"
-            displayName: 'Verify NuGet package'
+          - pwsh: .pipeline/scripts/collect-wheels.ps1 -StagingDir '$(Build.StagingDirectory)' -SourceRoot '$(Build.StagingDirectory)/wheels'
+            displayName: 'Collect wheels for upload'
+            workingDirectory: '$(Build.SourcesDirectory)'
+
+          - task: TwineAuthenticate@1
+            displayName: 'Authenticate twine to feed'
+            inputs:
+              artifactFeed: '$(pythonArtifactFeed)'
+
+          - pwsh: .pipeline/scripts/twine-upload.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)' -SimpleIndexUrl '$(pythonSimpleIndex)'
+            displayName: 'twine upload release wheels'
+            workingDirectory: '$(Build.SourcesDirectory)'
 
     ###########################################################################
     # Rust: offline integrity -> registry preflight -> ESRP -> availability.

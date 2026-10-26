@@ -1,7 +1,9 @@
 #################################################################################
 #                        OneBranch Pipelines - NonOfficial                      #
-# Builds Python wheels and Rust crates. Packages the wheels into a NuGet       #
-# archive published to Azure Artifacts and retains crates as build artifacts.  #
+# Builds Python wheels from PyO3 bindings across 9 tags, stamps a PEP 440      #
+# dev/nightly version into each wheel, and twine-uploads them to the           #
+# mssql-rs_Public Azure Artifacts PyPI feed (pip-installable dev + nightly).   #
+# Also builds Rust crates and retains them as build artifacts.                 #
 # Documentation:  https://aka.ms/obpipelines                                    #
 # Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
 # Retail Tasks:   https://aka.ms/obpipelines/tasks                              #
@@ -27,7 +29,7 @@ schedules:
 
 parameters:
 - name: publishToFeed
-  displayName: 'Publish NuGet package to Azure Artifacts feed'
+  displayName: 'Publish wheels to the Azure Artifacts PyPI feed'
   type: boolean
   default: true
 
@@ -46,6 +48,14 @@ variables:
   # The pipeline build service account needs Collaborator permissions on this feed.
   # See https://aka.ms/rustinado for setup details.
   toolchainFeed: 'https://sqlclientdrivers.pkgs.visualstudio.com/mssql-rs/_packaging/mssql-rs/nuget/v3/index.json'
+  # Project-scoped Azure Artifacts feed (<project>/<feed>) that also serves the
+  # PyPI protocol. mssql-python-rs wheels are twine-uploaded here for pip install.
+  pythonArtifactFeed: 'public/mssql-rs_Public'
+  # Twine repository name matching the .pypirc entry TwineAuthenticate@1 writes.
+  pythonFeedName: 'mssql-rs_Public'
+  # Anonymous-read PEP 503 index for the same feed; the upload step reads it to
+  # skip wheels an earlier, partially failed attempt already published.
+  pythonSimpleIndex: 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/'
 
 resources:
   repositories:
@@ -66,6 +76,8 @@ extends:
         scanOutputDirectoryOnly: true
       clippy:
         enabled: true
+    # Python wheels publish to this feed's PyPI index via twine; the
+    # mssql-sqlcmd NuGet package still publishes through nugetPublishing.
     nugetPublishing:
       feeds:
       - name: public/mssql-rs_Public

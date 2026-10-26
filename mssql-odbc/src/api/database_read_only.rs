@@ -24,6 +24,7 @@ use super::util::write_if_some;
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{CachedDatabaseReadOnly, ConnectionState};
+use crate::handles::wire::{LeaseReturn, WireLease};
 
 // A table-free SELECT does not start an implicit transaction.
 const READ_ONLY_QUERY: &str = "SELECT CASE CAST(DATABASEPROPERTYEX(DB_NAME(), \
@@ -113,7 +114,7 @@ pub(super) fn database_read_only(dbc: &DbcHandle) -> Result<bool, SqlReturn> {
         if state.connection_state != ConnectionState::Connected {
             return Ok(false);
         }
-        let Some(client) = state.client.as_ref() else {
+        let Some(client) = state.wire.client() else {
             post_diag(&mut state, ERR_CONNECTION_BUSY);
             return Err(SQL_ERROR);
         };
@@ -145,7 +146,7 @@ pub(super) fn database_read_only(dbc: &DbcHandle) -> Result<bool, SqlReturn> {
                 return Err(SQL_ERROR);
             };
             if claimed_generation != generation {
-                super::txn::release_dbc_client(dbc, client);
+                let _ = super::txn::release_dbc_client(dbc, client);
                 let Ok(mut state) = dbc.inner.lock() else {
                     return Err(SQL_ERROR);
                 };
@@ -193,20 +194,14 @@ fn is_current(cache: &CachedDatabaseReadOnly, client: &TdsClient) -> bool {
 
 fn publish(
     dbc: &DbcHandle,
-    client: Option<TdsClient>,
+    client: Option<WireLease>,
     generation: u64,
     reset_generation: u64,
     lookup: TdsResult<CachedDatabaseReadOnly>,
 ) -> Result<bool, SqlReturn> {
-    let mut state = match dbc.inner.lock() {
-        Ok(state) => state,
-        Err(mut poisoned) => {
-            error!("database updateability lookup: dbc mutex poisoned");
-            if client.is_some() {
-                poisoned.get_mut().connection_state = ConnectionState::Disconnected;
-            }
-            return Err(SQL_ERROR);
-        }
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("database updateability lookup: dbc mutex poisoned");
+        return Err(SQL_ERROR);
     };
     if state.session_generation != generation
         || state.connection_state != ConnectionState::Connected
@@ -214,8 +209,11 @@ fn publish(
         post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
         return Err(SQL_ERROR);
     }
-    if client.is_some() {
-        state.client = client;
+    if let Some(client) = client
+        && !state.wire.restore(client, LeaseReturn::Release)
+    {
+        post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+        return Err(SQL_ERROR);
     }
     if state.reset_generation != reset_generation {
         post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
@@ -224,8 +222,8 @@ fn publish(
     match lookup {
         Ok(cache) => {
             if !state
-                .client
-                .as_ref()
+                .wire
+                .client()
                 .is_some_and(|client| is_current(&cache, client))
             {
                 post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
@@ -296,6 +294,7 @@ mod tests {
     use crate::api::{SQLGetConnectAttrW, SQLGetInfoW, SQLSetConnectAttrW};
     use crate::error::post_sql_error;
     use crate::handles::handle_from_raw;
+    use crate::handles::wire::{ClaimPolicy, WireOwner};
     use crate::test_support::{MockServer, TestHandles, connect_mock_server};
 
     fn response(value: &str) -> QueryResponse {
@@ -446,8 +445,8 @@ mod tests {
             assert_eq!(state.diag_records[0].native_error, 229);
             assert_eq!(state.access_mode, SQL_MODE_READ_ONLY);
             assert!(state.database_read_only.is_none());
-            assert!(state.client.is_some());
-            assert!(!state.client.as_ref().unwrap().has_open_batch());
+            assert!(state.wire.client().is_some());
+            assert!(!state.wire.client().unwrap().has_open_batch());
         }
         server.register_query(READ_ONLY_QUERY, response("N"));
         assert_eq!(set_mode(&h, SQL_MODE_READ_WRITE), SQL_SUCCESS);
@@ -517,13 +516,13 @@ mod tests {
             dbc.runtime
                 .block_on(
                     state
-                        .client
-                        .as_mut()
+                        .wire
+                        .client_mut_for_test()
                         .unwrap()
                         .execute("SELECT 1".to_string(), ()),
                 )
                 .unwrap();
-            state.active_stmt = Some(h.stmt);
+            state.wire.set_owner_for_test(Some(h.stmt));
         }
         assert_eq!(mode(h.dbc).1, SQL_MODE_READ_ONLY);
         assert_eq!(info(h.dbc).1, "Y");
@@ -531,21 +530,21 @@ mod tests {
         assert_diag(&h, b"HY024");
         assert_eq!(server.connection_count(), 2);
         let mut state = dbc.inner.lock().unwrap();
-        assert_eq!(state.active_stmt, Some(h.stmt));
-        let client = state.client.as_mut().unwrap();
+        assert_eq!(state.wire.statement_owner(), Some(h.stmt));
+        let client = state.wire.client_mut_for_test().unwrap();
         assert!(client.has_open_batch());
         assert!(dbc.runtime.block_on(client.next_row()).unwrap().is_some());
         dbc.runtime.block_on(client.close_query()).unwrap();
-        state.active_stmt = None;
+        state.wire.set_owner_for_test(None);
     }
 
     #[test]
     fn claimed_session_is_an_explicit_error_not_a_writable_answer() {
         let (h, _server) = fixture(response("Y"));
-        let client = dbc(&h).inner.lock().unwrap().client.take().unwrap();
+        let (client, _, _) = try_claim_idle_dbc_client(dbc(&h)).unwrap();
         assert_eq!(info(h.dbc).0, SQL_ERROR);
         assert_diag(&h, b"HY000");
-        super::super::txn::release_dbc_client(dbc(&h), client);
+        assert!(super::super::txn::release_dbc_client(dbc(&h), client));
         assert_eq!(info(h.dbc).1, "Y");
     }
 
@@ -649,7 +648,7 @@ mod tests {
         let (h, server) = fixture(response("Y"));
         {
             let mut state = dbc(&h).inner.lock().unwrap();
-            state.active_stmt = Some(h.stmt);
+            state.wire.set_owner_for_test(Some(h.stmt));
             state.connection_timeout = 1;
         }
         server.set_login_delay(Duration::from_secs(8));
@@ -657,7 +656,7 @@ mod tests {
         assert_eq!(info(h.dbc).0, SQL_ERROR);
         assert!(started.elapsed() < Duration::from_secs(5));
         let state = dbc(&h).inner.lock().unwrap();
-        assert!(state.client.is_some());
+        assert!(state.wire.client().is_some());
         assert!(state.database_read_only.is_none());
         assert!(!state.diag_records.is_empty());
     }
@@ -684,8 +683,8 @@ mod tests {
         assert!(state.diag_records.is_empty());
         assert!(
             state
-                .client
-                .as_mut()
+                .wire
+                .client_mut_for_test()
                 .unwrap()
                 .take_info_messages()
                 .is_empty()
@@ -700,7 +699,10 @@ mod tests {
             let reset_generation = state.reset_generation;
             state.reset_generation = reset_generation.wrapping_add(1);
             (
-                state.client.take().unwrap(),
+                state
+                    .wire
+                    .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                    .unwrap(),
                 state.session_generation,
                 reset_generation,
             )
@@ -722,7 +724,7 @@ mod tests {
         );
         assert_diag(&h, b"HY010");
         let state = dbc(&h).inner.lock().unwrap();
-        assert!(state.client.is_some());
+        assert!(state.wire.client().is_some());
         assert!(state.database_read_only.is_none());
     }
 
@@ -732,7 +734,7 @@ mod tests {
         for replace_session in [false, true] {
             let (generation, reset_generation, cache) = {
                 let mut state = dbc(&h).inner.lock().unwrap();
-                let client = state.client.as_ref().unwrap();
+                let client = state.wire.client().unwrap();
                 let cache = CachedDatabaseReadOnly {
                     catalog: if replace_session {
                         client.database().to_string()
@@ -754,7 +756,7 @@ mod tests {
             );
             let state = dbc(&h).inner.lock().unwrap();
             assert!(state.database_read_only.is_none());
-            assert!(state.client.is_some());
+            assert!(state.wire.client().is_some());
         }
     }
 
@@ -763,7 +765,7 @@ mod tests {
         let (h, server) = fixture(response("Y").with_delay(Duration::from_secs(8)));
         {
             let mut state = dbc(&h).inner.lock().unwrap();
-            state.active_stmt = Some(h.stmt);
+            state.wire.set_owner_for_test(Some(h.stmt));
             state.connection_timeout = 1;
         }
         let started = Instant::now();
@@ -771,8 +773,8 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(server.connection_count(), 2);
         let state = dbc(&h).inner.lock().unwrap();
-        assert!(state.client.is_some());
-        assert_eq!(state.active_stmt, Some(h.stmt));
+        assert!(state.wire.client().is_some());
+        assert_eq!(state.wire.statement_owner(), Some(h.stmt));
         assert!(state.database_read_only.is_none());
     }
 

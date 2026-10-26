@@ -224,10 +224,10 @@ parked DAE list still identifies the k-th streamed parameter and the
 | After final `SQLParamData` completes | `EXEC_CONTEXT` (cursor) or idle |
 | On error | all flags cleared, connection returns to idle |
 
-The `TdsClient` is held in the statement's `StmtState::dae` alongside the
-prepared plan and orphaned handle the sequence suspended. The DBC's `client`
-field is `None` and `active_stmt` is set to prevent concurrent access from other
-statements.
+The wire lease (the checked-out `TdsClient`) is held in the statement's
+`StmtState::dae` alongside the prepared plan and orphaned handle the sequence
+suspended. The DBC's wire stays checked out and reserved by the statement, so
+other statements see the connection as busy.
 
 ### Error Recovery
 

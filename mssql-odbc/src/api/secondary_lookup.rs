@@ -22,7 +22,7 @@ pub(super) enum Route {
 }
 
 pub(super) fn select_route(state: &DbcState, client: &TdsClient) -> Option<Route> {
-    if state.active_stmt.is_none() {
+    if state.wire.statement_owner().is_none() {
         return Some(Route::Session);
     }
     let context = client.secondary_client_context()?;

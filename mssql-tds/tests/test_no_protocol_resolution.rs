@@ -3,11 +3,8 @@
 
 //! Integration tests for no-protocol connection resolution
 //!
-//! These tests verify ODBC-compatible behavior when no explicit protocol is specified
-//! in the connection string. The driver should automatically try protocols in order:
-//! 1. Shared Memory (local only, Windows only)
-//! 2. TCP
-//! 3. Named Pipes (Windows only)
+//! Covers explicit transports and MSF's TCP selection for eligible no-prefix data
+//! sources. Disabling MSF retains the legacy protocol waterfall.
 
 #[cfg(test)]
 mod common;
@@ -256,7 +253,19 @@ mod no_protocol_resolution {
 
         // Test no protocol with loopback IP
         let datasource = "127.0.0.1";
-        let mut client = create_client_from_datasource(datasource).await?;
+        let mut context = crate::common::create_context();
+        if !context.encryption_options.trust_server_certificate {
+            context.encryption_options.mode = EncryptionSetting::Strict;
+        }
+        // If shared memory is unavailable, validate the TCP fallback against
+        // the CI certificate's localhost DNS SAN, not a loopback IP SAN.
+        context
+            .encryption_options
+            .host_name_in_cert
+            .get_or_insert_with(|| "localhost".to_string());
+        let mut client = TdsConnectionProvider::new()
+            .create_client(context, datasource, None)
+            .await?;
         test_simple_query(&mut client).await?;
 
         Ok(())
@@ -538,7 +547,7 @@ mod no_protocol_resolution {
         let mut ctx = ClientContext::default();
         ctx.user_name = "sa".to_string();
         ctx.password = "pw".to_string();
-        ctx.multi_subnet_failover = true;
+        ctx.multi_subnet_failover = Some(true);
 
         let provider = TdsConnectionProvider {};
         let err = provider
@@ -561,7 +570,7 @@ mod no_protocol_resolution {
         let mut ctx = ClientContext::default();
         ctx.user_name = "sa".to_string();
         ctx.password = "pw".to_string();
-        ctx.multi_subnet_failover = true;
+        ctx.multi_subnet_failover = Some(true);
 
         let provider = TdsConnectionProvider {};
         // This should NOT produce a UsageError — the explicit port means no SSRP.

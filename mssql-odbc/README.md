@@ -57,6 +57,31 @@ implements it, and deliberate departures from msodbcsql are recorded in the
 [parity registry](docs/parity-deviations.md). Subsystem design notes live in
 [`docs/`](docs/).
 
+### Connection defaults
+
+Eligible TCP connections use MultiSubnetFailover (MSF) by default. Set
+`MultiSubnetFailover=No` in a connection string or
+`SQL_COPT_SS_MULTISUBNET_FAILOVER=SQL_IS_OFF` before connecting to opt out.
+The attribute takes precedence over the keyword. Set
+`MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT=false` before application startup for a
+deployment or application-wide default; explicit connection settings still
+win. The default freezes on first use, including an inherited MSF attribute
+read, so configure it before loading pools or opening connections.
+
+Explicit non-TCP transports and named instances requiring SQL Browser retain
+their existing paths when MSF is inherited. On Windows, local targets without a
+protocol or port also retain the shared-memory-first path, including instances
+with TCP/IP disabled. `MultiSubnetFailover=Yes`, `tcp:`, or a port explicitly
+selects TCP instead. MSF-on connections reject hosts
+with more than 64 addresses rather than ignoring part of the address list.
+`TransparentNetworkIPResolution=Disabled` and `SQL_COPT_SS_TNIR=SQL_IS_OFF`
+are compatibility no-ops; enabling TNIR is unsupported (`HYC00`).
+Driver Managers can cache pre-connect attribute setters, deferring driver
+validation until connect; a successful cached set is not driver acceptance.
+**TNIR Disabled does not disable MSF.** See the
+[shared connection policy and migration guide](../mssql-tds/README.md#connection-policy-and-migration)
+for the full precedence and applicability rules.
+
 ### Data-at-execution parameters
 
 PLP-capable values supplied through `SQLParamData`/`SQLPutData` are streamed to

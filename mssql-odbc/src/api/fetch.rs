@@ -86,7 +86,7 @@ mod tests {
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
-            dbc_state.active_stmt = Some(other_stmt);
+            dbc_state.wire.set_owner_for_test(Some(other_stmt));
         }
 
         let ret = unsafe { sql_fetch(h.stmt) };
@@ -102,7 +102,7 @@ mod tests {
         drop(stmt_state);
 
         let dbc_state = dbc_handle.inner.lock().unwrap();
-        assert_eq!(dbc_state.active_stmt, Some(other_stmt));
+        assert_eq!(dbc_state.wire.statement_owner(), Some(other_stmt));
     }
 
     /// CURSOR_OPEN is set but `active_stmt` is `None` — i.e. a previous fetch
@@ -118,7 +118,7 @@ mod tests {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
         }
-        // Leave dbc.active_stmt as None and dbc.client as None — this mirrors
+        // Leave the wire unreserved and without a client — this mirrors
         // the post-drain state that fetch_rows_next produces on Ok(None).
 
         let ret = unsafe { sql_fetch(h.stmt) };
@@ -153,8 +153,8 @@ mod tests {
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
-            dbc_state.client = Some(client);
-            dbc_state.active_stmt = Some(h.stmt);
+            dbc_state.wire.put_client_for_test(client);
+            dbc_state.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let ret = unsafe { sql_fetch(h.stmt) };
@@ -167,7 +167,7 @@ mod tests {
 
         // The client is restored and the connection stays busy on this statement.
         let dbc_state = dbc_handle.inner.lock().unwrap();
-        assert!(dbc_state.client.is_some());
-        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+        assert!(dbc_state.wire.client().is_some());
+        assert_eq!(dbc_state.wire.statement_owner(), Some(h.stmt));
     }
 }
