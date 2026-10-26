@@ -588,7 +588,13 @@ pub(crate) async fn write_tvp_rows(
             // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
             // buffered, which would leave a half-written TVP on the wire.
             apply_column_metadata(column, &mut value)?;
-            TdsValueSerializer::serialize_value(packet_writer, &value, &ctx).await?;
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                packet_writer,
+                &value,
+                &ctx,
+                None,
+            )
+            .await?;
         }
     }
 
@@ -637,6 +643,34 @@ mod tests {
             .unwrap();
         writer.finalize().await.unwrap();
         mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
+    }
+
+    #[tokio::test]
+    async fn utf8_varchar_cell_fits_only_trailing_blanks_to_declared_byte_length() {
+        let column = TvpColumnDef::new(SqlType::Varchar(None, 3));
+        let row = vec![SqlType::Varchar(
+            Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                "é  ".to_string(),
+            )),
+            3,
+        )];
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        write_tvp_rows(&mut writer, &[column], &[row], &collation)
+            .await
+            .unwrap();
+        writer.finalize().await.unwrap();
+
+        assert_eq!(
+            &mock.data[PacketWriter::PACKET_HEADER_SIZE..],
+            &[TVP_ROW_TOKEN, 3, 0, 0xC3, 0xA9, b' ', TVP_END_TOKEN]
+        );
     }
 
     async fn row_bytes(columns: &[TvpColumnDef], rows: &[Vec<SqlType>]) -> Vec<u8> {

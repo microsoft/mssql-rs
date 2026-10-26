@@ -1376,19 +1376,11 @@ fn build_tvp_dae_params(
             let binding = column
                 .as_ref()
                 .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
-            let column = binding.with_bind_offset(bind_offset);
-            let indicator =
-                unsafe { crate::conversion::param_convert::data_at_exec_indicator(&column) };
-            let column = if indicator.is_some() {
-                column
-            } else {
-                binding
-                    .for_row(row_index, bind_offset, bind_type)
-                    .map_err(|_| ParamBuildError::InvalidBufferLength)?
-            };
-            let expected_len = indicator.and_then(dae_expected_length);
+            let column = binding
+                .for_row(row_index, bind_offset, bind_type)
+                .map_err(|_| ParamBuildError::InvalidBufferLength)?;
             staged.push(
-                DaeParam::new(tvp_index, expected_len, true, None, column, None).with_target(
+                DaeParam::new(tvp_index, None, true, None, column, None).with_target(
                     DaeTarget::TvpCell {
                         tvp_index,
                         row_index,
@@ -3664,7 +3656,7 @@ mod tests {
     }
 
     #[test]
-    fn tvp_dae_staging_positions_bound_columns_but_reuses_dae_tokens() {
+    fn tvp_dae_staging_positions_each_cell_without_reading_its_indicator() {
         let mut indicator = SQL_DATA_AT_EXEC;
         let tvp = BoundParam {
             input_output_type: SQL_PARAM_INPUT,
@@ -3681,6 +3673,10 @@ mod tests {
         };
         let mut values = [7i32, 9];
         let mut indicators = [0, crate::api::odbc_types::SQL_NULL_DATA];
+        let mut dae_indicators = [
+            SQL_LEN_DATA_AT_EXEC_OFFSET - 5,
+            crate::api::odbc_types::SQL_NULL_DATA,
+        ];
         let bound = BoundParam {
             c_type: crate::api::odbc_types::SQL_C_SLONG,
             sql_type: crate::api::odbc_types::SQL_INTEGER,
@@ -3692,6 +3688,8 @@ mod tests {
         let dae = BoundParam {
             c_type: SQL_C_CHAR,
             sql_type: SQL_VARCHAR,
+            strlen_or_ind_ptr: dae_indicators.as_mut_ptr(),
+            octet_length_ptr: dae_indicators.as_mut_ptr(),
             ..tvp
         };
         let staged = build_tvp_dae_params(
@@ -3715,10 +3713,15 @@ mod tests {
         assert_eq!(staged[4].binding.strlen_or_ind_ptr, unsafe {
             indicators.as_mut_ptr().add(1)
         });
+        assert_eq!(staged[2].expected_len, None);
+        assert_eq!(staged[5].expected_len, None);
         assert_eq!(
             staged[2].binding.strlen_or_ind_ptr,
-            staged[5].binding.strlen_or_ind_ptr
+            dae_indicators.as_mut_ptr()
         );
+        assert_eq!(staged[5].binding.strlen_or_ind_ptr, unsafe {
+            dae_indicators.as_mut_ptr().add(1)
+        });
         assert_eq!(staged[2].value_ptr, staged[5].value_ptr);
     }
 

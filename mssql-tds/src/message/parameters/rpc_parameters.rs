@@ -532,13 +532,16 @@ impl RpcParameter {
     /// forbids cross-database TVP types in parameter declarations. The
     /// `READONLY` suffix is mandatory for TVP parameters.
     fn format_tvp_sql_name(type_name: &TvpTypeName) -> String {
+        let quote = |part: &str| format!("[{}]", part.replace(']', "]]"));
         match type_name
             .schema_name
             .as_deref()
             .filter(|name| !name.is_empty())
         {
-            Some(schema) => format!("[{schema}].[{}] READONLY", type_name.type_name),
-            None => format!("[{}] READONLY", type_name.type_name),
+            Some(schema) => {
+                format!("{}.{} READONLY", quote(schema), quote(&type_name.type_name))
+            }
+            None => format!("{} READONLY", quote(&type_name.type_name)),
         }
     }
 
@@ -1738,6 +1741,20 @@ mod tests {
         assert_eq!(
             RpcParameter::get_sql_name(&default_schema, None).unwrap(),
             "[OrderList] READONLY"
+        );
+    }
+
+    #[test]
+    fn test_get_sql_name_tvp_escapes_closing_brackets() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+
+        let name = SqlType::Table(
+            TvpTypeName::new(Some("sales]x".to_string()), "Order]List".to_string()),
+            None,
+        );
+        assert_eq!(
+            RpcParameter::get_sql_name(&name, None).unwrap(),
+            "[sales]]x].[Order]]List] READONLY"
         );
     }
 

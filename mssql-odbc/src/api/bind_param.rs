@@ -462,7 +462,14 @@ fn sql_bind_parameter_safe(
                 }
             },
             Ok(None) => {}
-            Err(()) => {
+            Err(TvpTypeNameReadError::InvalidLength) => {
+                error!("SQLBindParameter: invalid TVP type name length");
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                }
+                return SQL_ERROR;
+            }
+            Err(TvpTypeNameReadError::MemoryAllocation) => {
                 error!("SQLBindParameter: failed reading TVP type name");
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     post_diag(&mut stmt_state, ERR_MEMORY_ALLOCATION);
@@ -476,6 +483,12 @@ fn sql_bind_parameter_safe(
     SQL_SUCCESS
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TvpTypeNameReadError {
+    InvalidLength,
+    MemoryAllocation,
+}
+
 /// Reads a table-valued-parameter type name from a `SQLBindParameter` value
 /// buffer: `buffer_length` bytes of UTF-16 when positive, or a NUL-terminated
 /// UTF-16 string when `SQL_NTS`. Returns `None` for a null pointer, a
@@ -484,38 +497,54 @@ fn sql_bind_parameter_safe(
 /// # Safety
 /// `ptr` must be null or address a readable UTF-16 buffer of the indicated
 /// length (or NUL-terminated for `SQL_NTS`).
-unsafe fn read_tvp_type_name(ptr: SqlPointer, buffer_length: SqlLen) -> Result<Option<String>, ()> {
+unsafe fn read_tvp_type_name(
+    ptr: SqlPointer,
+    buffer_length: SqlLen,
+) -> Result<Option<String>, TvpTypeNameReadError> {
     if ptr.is_null() {
         return Ok(None);
     }
     let ptr = ptr.cast::<u8>();
     let units: Vec<u16> = if buffer_length > 0 {
-        let count = usize::try_from(buffer_length).map_err(|_| ())? / size_of::<u16>();
+        if buffer_length % size_of::<u16>() as SqlLen != 0 {
+            return Err(TvpTypeNameReadError::InvalidLength);
+        }
+        let count = usize::try_from(buffer_length)
+            .map_err(|_| TvpTypeNameReadError::InvalidLength)?
+            / size_of::<u16>();
         let mut units = Vec::new();
-        units.try_reserve(count).map_err(|_| ())?;
+        units
+            .try_reserve(count)
+            .map_err(|_| TvpTypeNameReadError::MemoryAllocation)?;
         for i in 0..count {
             // ODBC does not require the application buffer to be aligned for
             // SQLWCHAR, so read each code unit without creating a u16 slice.
-            units.push(unsafe { ptr.add(i * size_of::<u16>()).cast::<u16>().read_unaligned() });
+            let offset = i
+                .checked_mul(size_of::<u16>())
+                .ok_or(TvpTypeNameReadError::InvalidLength)?;
+            units.push(unsafe { ptr.add(offset).cast::<u16>().read_unaligned() });
         }
         units
     } else if SqlLen::from(SQL_NTS) == buffer_length {
         let mut units = Vec::new();
         let mut i = 0usize;
         loop {
-            let unit = unsafe {
-                ptr.wrapping_add(i * size_of::<u16>())
-                    .cast::<u16>()
-                    .read_unaligned()
-            };
+            let offset = i
+                .checked_mul(size_of::<u16>())
+                .ok_or(TvpTypeNameReadError::InvalidLength)?;
+            let unit = unsafe { ptr.wrapping_add(offset).cast::<u16>().read_unaligned() };
             if unit == 0 {
                 break;
             }
             if units.len() == units.capacity() {
-                units.try_reserve(1).map_err(|_| ())?;
+                units
+                    .try_reserve(1)
+                    .map_err(|_| TvpTypeNameReadError::MemoryAllocation)?;
             }
             units.push(unit);
-            i = i.checked_add(1).ok_or(())?;
+            i = i
+                .checked_add(1)
+                .ok_or(TvpTypeNameReadError::InvalidLength)?;
         }
         units
     } else {
@@ -1205,6 +1234,13 @@ mod tests {
             )
         };
         assert_eq!(name, Ok(Some("OrderList".to_string())));
+    }
+
+    #[test]
+    fn tvp_type_name_rejects_odd_byte_lengths() {
+        let mut bytes = [b'O', 0, b'r'];
+        let name = unsafe { read_tvp_type_name(bytes.as_mut_ptr().cast(), bytes.len() as SqlLen) };
+        assert_eq!(name, Err(TvpTypeNameReadError::InvalidLength));
     }
 
     /// Helper: bind a scalar `SQL_C_SLONG` -> `SQL_INTEGER` column at
