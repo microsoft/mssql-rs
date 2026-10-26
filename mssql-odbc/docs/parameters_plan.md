@@ -424,9 +424,12 @@ return `22001`.
 
 The TDS layer reports an `EncodedValueTooLong` error with the actual and maximum
 byte counts. The ODBC layer maps that typed error to `22001`; it does not match
-error text. `SQL_LONGVARCHAR` continues to use `varchar(max)` wire framing, but
-its ODBC `ColumnSize` is carried separately and enforced against the encoded
-value. A true `varchar(max)` declaration remains unbounded.
+error text. Materialized `SQL_LONGVARCHAR` values use legacy `text` RPC framing
+when `LongAsMax` is off and `varchar(max)` framing when it is on. DAE retains
+MAX/PLP payload framing independently of the SQL declaration. The LONG binding's
+`ColumnSize` is carried separately and enforced against the encoded value in
+either mode. An explicit `SQL_VARCHAR` binding with `ColumnSize=0` remains
+unbounded.
 
 This follows msodbcsql's convert-then-validate principle without copying its
 client-code-page assumption. This driver defines `SQL_C_CHAR` as UTF-8, so
