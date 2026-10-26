@@ -45,6 +45,7 @@ mod param_data;
 mod prepare;
 mod put_data;
 mod row_count;
+mod secondary_lookup;
 pub(crate) mod set_connect_attr;
 pub(crate) mod set_desc_field;
 mod set_desc_rec;

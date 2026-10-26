@@ -366,6 +366,8 @@ protected:
         return rows;
     }
 
+    void CheckReadOnlyDatabaseAndRawUse(bool streaming);
+
     void CheckAccessModeDuringStream(bool infoFirst, const std::string& token) {
         ASSERT_SQL_OK(ExecAccessModeSql(stmt_, "USE [tempdb]"),
                       SQL_HANDLE_STMT, stmt_);
@@ -442,12 +444,16 @@ ODBC_TEST_F(AttributesTest, AccessModeInvalidValuePreservesMode) {
 // Benefits-from-mock-tds: pin the secondary metadata connection and absence of
 // metadata SQL on the occupied session; live E2E proves uninterrupted fetching.
 ODBC_TEST_F(AttributesTest, AccessModeColdGetPreservesStreamingCursor) {
+    // SpawnConnection omits the session's trust settings (deviation 31).
+    SKIP_IF_COMPARING_MSODBCSQL();
     CheckAccessModeDuringStream(false, WorkerToken("access-attr"));
 }
 
 // Benefits-from-mock-tds: pin that SQLGetInfo and SQLGetConnectAttr share one
 // database-read-only lookup rather than opening two secondary connections.
 ODBC_TEST_F(AttributesTest, AccessModeColdGetInfoPreservesStreamingCursor) {
+    // SpawnConnection omits the session's trust settings (deviation 31).
+    SKIP_IF_COMPARING_MSODBCSQL();
     CheckAccessModeDuringStream(true, WorkerToken("access-info"));
 }
 
@@ -474,9 +480,7 @@ TEST_F(AttributesTest, AccessModePreConnectRoundTripsAndSurvivesConnect) {
 
 // Creates only a private database, and skips when provisioning is unavailable.
 // Connection and database guards unwind on fatal assertions as well as skips.
-// Benefits-from-mock-tds: verify the cold secondary lookup targets the read-only
-// catalog without sending metadata SQL on the original streaming session.
-TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseAndRawUse) {
+void AttributesTest::CheckReadOnlyDatabaseAndRawUse(bool streaming) {
     const auto& config = ODBCTestConfig::Instance();
     if (config.HasConnStr() || config.HasDSN()) {
         GTEST_SKIP() << "Read-only login probe needs generated DSN-less settings";
@@ -523,13 +527,15 @@ TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseAndRawUse) {
                       SQL_HANDLE_DBC, connection.dbc);
         ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, connection.dbc, &connection.stmt),
                       SQL_HANDLE_DBC, connection.dbc);
-        ASSERT_SQL_OK(ExecAccessModeSql(
-                          connection.stmt,
-                          "WITH access_rows(n) AS (SELECT 1 UNION ALL "
-                          "SELECT n + 1 FROM access_rows WHERE n < 256) "
-                          "SELECT n, REPLICATE(CAST('x' AS varchar(max)), 8000) "
-                          "FROM access_rows OPTION (MAXRECURSION 0)"),
-                      SQL_HANDLE_STMT, connection.stmt);
+        if (streaming) {
+            ASSERT_SQL_OK(ExecAccessModeSql(
+                              connection.stmt,
+                              "WITH access_rows(n) AS (SELECT 1 UNION ALL "
+                              "SELECT n + 1 FROM access_rows WHERE n < 256) "
+                              "SELECT n, REPLICATE(CAST('x' AS varchar(max)), 8000) "
+                              "FROM access_rows OPTION (MAXRECURSION 0)"),
+                          SQL_HANDLE_STMT, connection.stmt);
+        }
         if (requested == SQL_MODE_READ_WRITE) {
             EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(connection.dbc));
             EXPECT_EQ("Y", GetDataSourceReadOnly(connection.dbc));
@@ -537,18 +543,20 @@ TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseAndRawUse) {
             EXPECT_EQ("Y", GetDataSourceReadOnly(connection.dbc));
             EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(connection.dbc));
         }
-        for (SQLINTEGER expected = 1; expected <= 256; ++expected) {
-            ASSERT_EQ(SQL_SUCCESS, SQLFetch(connection.stmt));
-            SQLINTEGER row = 0;
-            SQLLEN length = 0;
-            ASSERT_SQL_OK(SQLGetData(connection.stmt, 1, SQL_C_SLONG, &row,
-                                     sizeof(row), &length),
+        if (streaming) {
+            for (SQLINTEGER expected = 1; expected <= 256; ++expected) {
+                ASSERT_EQ(SQL_SUCCESS, SQLFetch(connection.stmt));
+                SQLINTEGER row = 0;
+                SQLLEN length = 0;
+                ASSERT_SQL_OK(SQLGetData(connection.stmt, 1, SQL_C_SLONG, &row,
+                                         sizeof(row), &length),
+                              SQL_HANDLE_STMT, connection.stmt);
+                EXPECT_EQ(expected, row);
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(connection.stmt));
+            ASSERT_SQL_OK(SQLFreeStmt(connection.stmt, SQL_CLOSE),
                           SQL_HANDLE_STMT, connection.stmt);
-            EXPECT_EQ(expected, row);
         }
-        EXPECT_EQ(SQL_NO_DATA, SQLFetch(connection.stmt));
-        ASSERT_SQL_OK(SQLFreeStmt(connection.stmt, SQL_CLOSE),
-                      SQL_HANDLE_STMT, connection.stmt);
         EXPECT_EQ(SQL_ERROR, SetAccessMode(connection.dbc, SQL_MODE_READ_WRITE));
         EXPECT_SQLSTATE(SQL_HANDLE_DBC, connection.dbc, "HY024");
         EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(connection.dbc));
@@ -569,6 +577,18 @@ TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseAndRawUse) {
         ASSERT_SQL_OK(SetAccessMode(connection.dbc, SQL_MODE_READ_ONLY),
                       SQL_HANDLE_DBC, connection.dbc);
     }
+}
+
+TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseAndRawUse) {
+    CheckReadOnlyDatabaseAndRawUse(false);
+}
+
+// Benefits-from-mock-tds: verify the cold secondary lookup targets the read-only
+// catalog without sending metadata SQL on the original streaming session.
+TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseDuringStream) {
+    // Keep idle-session and USE coverage on both legs; isolate deviation 31.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    CheckReadOnlyDatabaseAndRawUse(true);
 }
 
 TEST_F(AttributesTest, ClientConnectionIdIsAStringAndStableWithinTheConnection) {

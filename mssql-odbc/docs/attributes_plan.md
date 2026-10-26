@@ -55,7 +55,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | Attribute | Set | Get | Note |
 |---|---|---|---|
 | `SQL_ATTR_LOGIN_TIMEOUT` | ✅ | ✅ | clamped to `0xFFFE`, `01S02` on clamp |
-| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds the internal `SQL_USER_NAME` and alias-type lookups, as msodbcsql's `GetNetIOTimeOut` does on the session; a busy connection's alias-type login and read are bounded too (deviation 32) |
+| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds the internal `SQL_USER_NAME`, alias-type, and database-updateability lookups, as msodbcsql's `GetNetIOTimeOut` does on the session; secondary logins and reads share that deadline (deviation 32) |
 | `SQL_ATTR_PACKET_SIZE` | ✅ | ✅ | pre-connect only |
 | `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | stored hint, not DML enforcement; an actually read-only database overrides the connected getter (see below) |
 | `SQL_ATTR_AUTOCOMMIT` | ✅ | ✅ | |
@@ -139,12 +139,18 @@ Regression coverage in `tests/e2e/tests/attributes_test.cpp`:
   `AccessModeColdGetInfoPreservesStreamingCursor`, with worker-specific data.
 - `AccessModePreConnectRoundTripsAndSurvivesConnect` for both hint values.
 - `AccessModeTracksReadOnlyDatabaseAndRawUse` for both pre-connect values,
-  read-only login, cold streaming lookups in both getter orders, rejected
-  setter, preserved storage, and cache invalidation across writable/read-only
-  raw `USE` switches.
+  read-only login, idle lookups in both getter orders, rejected setter,
+  preserved storage, and cache invalidation across writable/read-only raw
+  `USE` switches.
+- `AccessModeTracksReadOnlyDatabaseDuringStream` exercises the read-only
+  database with cold lookups while rows are pending.
 
-All assertions run on both parity legs. The writable cases use the normal
-writable suite database and have no reference-driver skip. The read-only
+Idle-session assertions run on both parity legs. The three streaming cases
+skip the reference leg: msodbcsql's spawned login omits the session's trust
+settings and fails against CI's force-encryption server (deviation 31).
+Build 184911 confirms all nine streaming cases, including concurrency
+variants, failed on the pinned msodbcsql 18.6.2.1 leg while the Rust leg passed.
+The writable cases use the normal writable suite database. The read-only
 case needs generated DSN-less settings (`ODBC_TEST_SERVER`,
 `ODBC_TEST_DATABASE`, and the usual authentication variables; no
 `ODBC_TEST_DSN` or `ODBC_TEST_CONNSTR`) and permission to create, alter, and

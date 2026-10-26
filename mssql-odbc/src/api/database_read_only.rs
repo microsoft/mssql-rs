@@ -4,21 +4,17 @@
 //! Database updateability for SQL_ATTR_ACCESS_MODE and SQL_DATA_SOURCE_READ_ONLY.
 //! Access mode is a hint, not a write filter (msodbcsql sqlcmisc.cpp).
 
-use std::time::Duration;
-
-use mssql_tds::connection::client_context::ClientContext;
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, TdsClient};
-use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::column_values::ColumnValues;
-use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
-use tracing::{debug, error};
+use mssql_tds::error::Error as TdsError;
+use tracing::error;
 
-use super::alias_types::prompts_for_sign_in;
 use super::odbc_types::{
     SQL_ERROR, SQL_MODE_READ_ONLY, SQL_MODE_READ_WRITE, SQL_SUCCESS, SqlInteger, SqlPointer,
     SqlReturn,
 };
+use super::secondary_lookup::{Route, cache_is_current, read_on_secondary, select_route};
 use super::sqlstate::{
     ERR_CONNECTION_BUSY, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE,
     ERR_INVALID_NULL_POINTER, SQLSTATE_HY000, post_diag, post_tds_error,
@@ -33,15 +29,6 @@ use crate::handles::dbc::{CachedDatabaseReadOnly, ConnectionState};
 const READ_ONLY_QUERY: &str = "SELECT CASE CAST(DATABASEPROPERTYEX(DB_NAME(), \
     'Updateability') AS nvarchar(60)) WHEN N'READ_ONLY' THEN N'Y' \
     WHEN N'READ_WRITE' THEN N'N' END";
-
-enum Route {
-    Session,
-    Secondary {
-        context: Box<ClientContext>,
-        catalog: String,
-        database_change_count: u64,
-    },
-}
 
 pub(super) fn set_access_mode(dbc: &DbcHandle, value: u32) -> SqlReturn {
     {
@@ -135,21 +122,10 @@ pub(super) fn database_read_only(dbc: &DbcHandle) -> Result<bool, SqlReturn> {
         {
             return Ok(cache.read_only);
         }
-        let route = if state.active_stmt.is_none() {
-            Route::Session
-        } else {
-            match client.secondary_client_context() {
-                Some(context) if !prompts_for_sign_in(&context) => Route::Secondary {
-                    context: Box::new(context),
-                    catalog: client.database().to_owned(),
-                    database_change_count: client.database_change_count(),
-                },
-                _ => {
-                    error!("database updateability lookup: no silent secondary login available");
-                    post_diag(&mut state, ERR_CONNECTION_BUSY);
-                    return Err(SQL_ERROR);
-                }
-            }
+        let Some(route) = select_route(&state, client) else {
+            error!("database updateability lookup: no silent secondary login available");
+            post_diag(&mut state, ERR_CONNECTION_BUSY);
+            return Err(SQL_ERROR);
         };
         (
             state.session_generation,
@@ -192,9 +168,12 @@ pub(super) fn database_read_only(dbc: &DbcHandle) -> Result<bool, SqlReturn> {
             catalog,
             database_change_count,
         } => {
-            let read = dbc
-                .runtime
-                .block_on(read_on_secondary(context, timeout_secs));
+            let read = dbc.runtime.block_on(read_on_secondary(
+                context,
+                timeout_secs,
+                "Database updateability lookup timed out",
+                read_updateability,
+            ));
             (
                 None,
                 read.map(|read_only| CachedDatabaseReadOnly {
@@ -209,8 +188,7 @@ pub(super) fn database_read_only(dbc: &DbcHandle) -> Result<bool, SqlReturn> {
 }
 
 fn is_current(cache: &CachedDatabaseReadOnly, client: &TdsClient) -> bool {
-    cache.catalog == client.database()
-        && cache.database_change_count == client.database_change_count()
+    cache_is_current(&cache.catalog, cache.database_change_count, client)
 }
 
 fn publish(
@@ -265,30 +243,6 @@ fn publish(
     }
 }
 
-async fn read_on_secondary(context: Box<ClientContext>, timeout_secs: u32) -> TdsResult<bool> {
-    let lookup = Box::pin(async move {
-        let data_source = context.data_source.clone();
-        let mut client = TdsConnectionProvider::new()
-            .create_client(*context, &data_source, None)
-            .await?;
-        debug!(
-            client_connection_id = %client.client_connection_id(),
-            "database updateability lookup: logged in separately"
-        );
-        read_updateability(&mut client, 0).await
-    });
-    if timeout_secs == 0 {
-        return lookup.await;
-    }
-    tokio::time::timeout(Duration::from_secs(u64::from(timeout_secs)), lookup)
-        .await
-        .unwrap_or_else(|_| {
-            Err(TdsError::TimeoutError(TimeoutErrorType::String(
-                "Database updateability lookup timed out".to_string(),
-            )))
-        })
-}
-
 async fn read_updateability(client: &mut TdsClient, timeout_secs: u32) -> TdsResult<bool> {
     let read = async {
         client
@@ -328,7 +282,7 @@ fn invalid_updateability() -> TdsError {
 #[cfg(test)]
 mod tests {
     use std::ptr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use mssql_mock_tds::{
         ColumnDefinition, ColumnValue, LeadingError, QueryResponse, Row, SqlDataType,
@@ -824,7 +778,12 @@ mod tests {
 
     #[test]
     fn secondary_lookup_future_stays_small() {
-        let size = std::mem::size_of_val(&read_on_secondary(Box::default(), 1));
+        let size = std::mem::size_of_val(&read_on_secondary(
+            Box::default(),
+            1,
+            "Database updateability lookup timed out",
+            read_updateability,
+        ));
         assert!(size <= 4096, "secondary lookup future is {size} bytes");
     }
 }
