@@ -296,6 +296,15 @@ on the `master` branch.
   Publish the operation's reserved trace execution under the same cancellation
   lock as `active`, before token publication. SQLCancel binds its trace scope
   when it selects the target under that lock, not from an earlier FFI snapshot.
+  Notify the completion condition variable only when a canceller or queued
+  operation can be waiting. Track both under the cancellation mutex: the
+  canceller count alone cannot prevent missed operation wakeups. Unconditional
+  notifications issue a Linux futex wake even on uncontended per-cell calls
+  (AB#49498).
+  Read the connection's atomic timeout without taking its state mutex on each
+  call. It is the sole attribute value, not a second cache; configure the shared
+  cancellation budget before deriving execution children and refresh it before
+  signalling so existing children observe timeout changes.
 
 ### 7.1. Handle hierarchy and locking
 
@@ -586,6 +595,14 @@ For ODBC hot paths:
     drained; completed empty results may release it during execute.
   - Bound fetch reuses descriptor snapshots and conversion storage across rows;
     do not add avoidable per-row allocation or metadata cloning.
+    Keep `RowIssue` and `RowOutcome` within two bytes: converters return the
+    compact `ConvError`, mapped to a canonical diagnostic only on failure.
+    Carrying a full diagnostic enlarges every successful column conversion
+    just to preserve a rare error message (AB#49498).
+  - Client encoding is fixed at DBC allocation and inherited by each statement.
+    Fetch uses that statement value instead of locking the DBC to refresh it on
+    every rowset. The independently mutable warning setting still follows the
+    connection setter's statement fan-out.
   - Parameter-array rowsets remain visible in parameter-set order through
     fetch and `SQLMoreResults`; defer final processed/status reporting until
     each set completes, and drain unread results on cursor close without

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tracing::error;
@@ -30,8 +31,8 @@ pub(crate) enum ConnectionState {
 /// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`.
 /// Holds a back-pointer to the parent environment and connection-level state.
 ///
-/// Thread-safety: The `inner` mutex protects mutable state, mirroring
-/// msodbcsql's connection-level critical section.
+/// Thread-safety: The `inner` mutex protects mutable state except the atomic
+/// connection timeout, read on every cancellable statement call.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
     pub(crate) trace: Arc<mssql_tds::trace_context::ConnectionTrace>,
@@ -41,6 +42,11 @@ pub(crate) struct DbcHandle {
     pub(crate) parent_env: *mut c_void,
     /// Shared Tokio runtime from the parent ENV.
     pub(crate) runtime: Arc<SharedRuntime>,
+    /// `SQL_ATTR_CONNECTION_TIMEOUT`, shared by internal metadata queries and
+    /// cancellation. Zero means unlimited for queries and 120 seconds for cancel.
+    /// Native: GetNetIOTimeOut/GetCancelTimeoutValue (sqlcprot.h:1605,1625);
+    /// broader connection-scoped timeout enforcement remains follow-up work.
+    connection_timeout: AtomicU32,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -48,7 +54,7 @@ pub(crate) struct DbcHandle {
 // We assert these are safe because `parent_env` is set once at construction
 // and never mutated. The parent ENV is guaranteed alive because the DM
 // ensures all DBCs are freed before calling SQLFreeEnv.
-// All mutable state is Mutex-protected.
+// Mutable state is Mutex-protected or atomic.
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
@@ -146,15 +152,6 @@ pub(crate) struct DbcState {
     /// retrieval (`sqlcdata.h:1297,1310`); retaining our input-parameter warning
     /// is the remaining deviation in parity-deviations entry 23 (AB#47598).
     pub(crate) warn_on_cp_error: bool,
-    /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. `0` is the ODBC default and
-    /// means "no timeout". Honored only by the driver's own internal
-    /// connection-scoped queries — the `SQL_USER_NAME` and alias-type lookups —
-    /// which is the attribute msodbcsql bounds its combined lookup with
-    /// (`GetNetIOTimeOut`, `sqlcprot.h:1605` over `sqlccmd.cpp:10369`).
-    /// Application statements take their deadline from `SQL_ATTR_QUERY_TIMEOUT`
-    /// instead; extending this attribute to the rest of the connection-scoped
-    /// paths is residual work.
-    pub(crate) connection_timeout: u32,
     /// `SQL_ATTR_PACKET_SIZE` in bytes: the app-set attribute (or default),
     /// surviving `SQLDisconnect` so the next connect attempt on this handle
     /// starts from it again. Never overwritten with a resolved or negotiated
@@ -277,16 +274,6 @@ pub(crate) struct DbcState {
     pub(crate) last_char_set: Option<String>,
 }
 
-impl DbcState {
-    pub(crate) fn cancel_timeout_secs(&self) -> u32 {
-        if self.connection_timeout == 0 {
-            120
-        } else {
-            self.connection_timeout
-        }
-    }
-}
-
 /// The connection identity that does not vary by database.
 ///
 /// Deliberately holds no credential: the connection string is never retained,
@@ -399,12 +386,28 @@ impl HasDiagnostics for DbcState {
 }
 
 impl DbcHandle {
+    pub(crate) fn connection_timeout(&self) -> u32 {
+        self.connection_timeout.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_connection_timeout(&self, seconds: u32) {
+        self.connection_timeout.store(seconds, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cancel_timeout_secs(&self) -> u32 {
+        match self.connection_timeout() {
+            0 => 120,
+            seconds => seconds,
+        }
+    }
+
     pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
             trace: Arc::default(),
             object_type: HandleType::Dbc,
             parent_env,
             runtime,
+            connection_timeout: AtomicU32::new(0),
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
                 client_encoding: ClientEncoding::system_default(),
@@ -418,7 +421,6 @@ impl DbcHandle {
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
                 warn_on_cp_error: false,
-                connection_timeout: 0,
                 packet_size: DEFAULT_PACKET_SIZE,
                 effective_packet_size: None,
                 autocommit: true,
@@ -505,10 +507,10 @@ mod tests {
     fn cancellation_timeout_uses_default_only_for_zero() {
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let mut state = dbc.inner.lock().unwrap();
         for (configured, expected) in [(0, 120), (1, 1), (30, 30), (u32::MAX, u32::MAX)] {
-            state.connection_timeout = configured;
-            assert_eq!(state.cancel_timeout_secs(), expected);
+            dbc.set_connection_timeout(configured);
+            assert_eq!(dbc.connection_timeout(), configured);
+            assert_eq!(dbc.cancel_timeout_secs(), expected);
         }
     }
 

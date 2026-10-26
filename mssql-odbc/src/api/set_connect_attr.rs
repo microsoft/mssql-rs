@@ -415,7 +415,7 @@ unsafe fn sql_set_connect_attr_w_impl(
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
             // warning rather than reusing msodbcsql's "Login timeout changed".
             let requested = value_ptr as usize as u64;
-            state.connection_timeout = requested.min(MAX_LOGIN_TIMEOUT_SECS) as u32;
+            dbc.set_connection_timeout(requested.min(MAX_LOGIN_TIMEOUT_SECS) as u32);
             if requested > MAX_LOGIN_TIMEOUT_SECS {
                 post_diag(&mut state, WARN_CONNECTION_TIMEOUT_CHANGED);
                 SQL_SUCCESS_WITH_INFO
@@ -998,7 +998,7 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        assert_eq!(dbc.inner.lock().unwrap().connection_timeout, 0);
+        assert_eq!(dbc.connection_timeout(), 0);
     }
 
     #[test]
@@ -1083,7 +1083,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc.inner.lock().unwrap();
-        assert_eq!(state.connection_timeout, MAX_LOGIN_TIMEOUT_SECS as u32);
+        assert_eq!(dbc.connection_timeout(), MAX_LOGIN_TIMEOUT_SECS as u32);
 
         let record = &state.diag_records()[0];
         assert_eq!(record.sql_state, SQLSTATE_01S02);
@@ -1259,7 +1259,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.access_mode, 1);
-        assert_eq!(state.connection_timeout, 30);
+        assert_eq!(dbc.connection_timeout(), 30);
         assert_eq!(state.packet_size, 16384);
     }
 
