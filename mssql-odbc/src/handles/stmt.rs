@@ -856,6 +856,16 @@ pub(crate) struct DaeParam {
     /// How a streamed chunk is re-encoded on its way to the wire. Filled in
     /// when the sequence is parked, where the connection's collation is known.
     pub(crate) transcode: Option<DaeTranscode>,
+    /// Original TVP cell binding and child-array layout, positioned only after
+    /// the application declares the current row batch.
+    pub(crate) tvp_cell_binding: Option<TvpCellBinding>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TvpCellBinding {
+    pub(crate) binding: BoundParam,
+    pub(crate) bind_offset: isize,
+    pub(crate) bind_type: SqlULen,
 }
 
 impl DaeParam {
@@ -880,7 +890,22 @@ impl DaeParam {
             binding,
             udt_names,
             transcode: None,
+            tvp_cell_binding: None,
         }
+    }
+
+    pub(crate) fn with_tvp_cell_binding(
+        mut self,
+        binding: BoundParam,
+        bind_offset: isize,
+        bind_type: SqlULen,
+    ) -> Self {
+        self.tvp_cell_binding = Some(TvpCellBinding {
+            binding,
+            bind_offset,
+            bind_type,
+        });
+        self
     }
 
     pub(crate) fn with_target(mut self, target: DaeTarget) -> Self {
@@ -988,8 +1013,8 @@ pub(crate) struct DaeProgress {
     /// The parameter was supplied as SQL NULL, so the declared-length check is
     /// skipped, as in msodbcsql.
     pub(crate) is_null: bool,
-    /// The row-presence value supplied for a TVP row-control token.
-    pub(crate) tvp_row_present: Option<bool>,
+    /// Row count supplied for the current TVP batch; zero ends the table.
+    pub(crate) tvp_row_batch_count: Option<usize>,
     /// Chunks collected for a [`DaePlan::Buffer`] parameter, converted when it
     /// closes. Empty for a streamed one.
     pub(crate) buffer: Vec<u8>,
@@ -1043,8 +1068,10 @@ pub(crate) struct DaeState {
     /// Buffered TVP cell payloads, kept separate from top-level parameter
     /// buffers because several cells contribute to one RPC parameter.
     pub(crate) tvp_cells: Vec<BufferedTvpCell>,
-    /// Number of rows whose TVP row-control marker was true, by parameter.
+    /// Number of rows accepted from all input batches, by TVP parameter.
     pub(crate) tvp_row_counts: BTreeMap<usize, usize>,
+    /// `(first output row, exclusive end)` for the current input batch.
+    pub(crate) tvp_batches: BTreeMap<usize, (usize, usize)>,
     /// The RPC parameters as `build_named_params` materialized them at execute
     /// time, data-at-execution slots included as placeholders. The deferred
     /// execute replaces only those slots and keeps the rest verbatim.
@@ -1083,6 +1110,7 @@ impl DaeState {
             buffered: Vec::new(),
             tvp_cells: Vec::new(),
             tvp_row_counts: BTreeMap::new(),
+            tvp_batches: BTreeMap::new(),
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
@@ -1214,6 +1242,52 @@ impl DaeState {
         self.params.get(self.cursor?)
     }
 
+    pub(crate) fn tvp_row_capacity(&self, tvp_index: usize) -> Option<usize> {
+        self.params
+            .iter()
+            .filter_map(|param| match param.target {
+                DaeTarget::TvpRowControl {
+                    tvp_index: target,
+                    row_index,
+                } if target == tvp_index => Some(row_index),
+                _ => None,
+            })
+            .max()
+    }
+
+    pub(crate) fn position_current_tvp_cell(&mut self) -> Result<(), ()> {
+        let Some(DaeTarget::TvpCell {
+            tvp_index,
+            row_index,
+            ..
+        }) = self.current_param().map(|param| param.target)
+        else {
+            return Ok(());
+        };
+        let Some(&(batch_start, batch_end)) = self.tvp_batches.get(&tvp_index) else {
+            return Err(());
+        };
+        if row_index < batch_start || row_index >= batch_end {
+            return Err(());
+        }
+        let Some(param) = self.current_param_mut() else {
+            return Err(());
+        };
+        let Some(layout) = param.tvp_cell_binding else {
+            return Ok(());
+        };
+        param.binding = layout
+            .binding
+            .for_row(
+                row_index - batch_start,
+                layout.bind_offset,
+                layout.bind_type,
+            )
+            .map_err(|_| ())?;
+        param.value_ptr = param.binding.parameter_value_ptr;
+        Ok(())
+    }
+
     /// Opens the next parameter, discarding the closed one's progress. Called
     /// by every `SQLParamData`, including the first, which opens parameter 0.
     pub(crate) fn advance(&mut self) {
@@ -1263,6 +1337,7 @@ impl DaeState {
             buffered: Vec::new(),
             tvp_cells: Vec::new(),
             tvp_row_counts: BTreeMap::new(),
+            tvp_batches: BTreeMap::new(),
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,

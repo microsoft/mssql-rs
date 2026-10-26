@@ -64,6 +64,8 @@ std::string SqlWToAscii(const SQLWCHAR* text, size_t count) {
 
 class TvpTest : public ODBCTest {
 protected:
+    // TEST_F is intentional: each test creates permanent dbo objects with the
+    // same process-wide suffix, so parallel fixtures would collide.
     void SetUp() override {
         ODBCTest::SetUp();
         ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection());

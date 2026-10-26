@@ -280,14 +280,29 @@ fn sql_param_data_operation(
                     is_null,
                     value: None,
                 }),
-                DaeTarget::TvpRowControl { tvp_index, .. } => {
-                    let Some(row_present) = dae.progress.tvp_row_present else {
+                DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index,
+                } => {
+                    let Some(batch_count) = dae.progress.tvp_row_batch_count else {
                         error!("SQLParamData: TVP row-control value was not captured");
                         dae.return_client(client);
                         return SQL_ERROR;
                     };
-                    if row_present {
-                        *dae.tvp_row_counts.entry(tvp_index).or_default() += 1;
+                    if batch_count > 0 {
+                        let Some(batch_end) = row_index.checked_add(batch_count) else {
+                            error!("SQLParamData: TVP row batch count overflowed");
+                            dae.return_client(client);
+                            return SQL_ERROR;
+                        };
+                        let row_count = dae.tvp_row_counts.entry(tvp_index).or_default();
+                        let Some(total) = row_count.checked_add(batch_count) else {
+                            error!("SQLParamData: accumulated TVP row count overflowed");
+                            dae.return_client(client);
+                            return SQL_ERROR;
+                        };
+                        *row_count = total;
+                        dae.tvp_batches.insert(tvp_index, (row_index, batch_end));
                         dae.advance();
                     } else {
                         dae.advance_past_tvp(tvp_index);
@@ -298,13 +313,39 @@ fn sql_param_data_operation(
                 dae.advance();
             }
             let mut cell_error = None;
-            while let Some(param) = dae.current_param() {
-                let DaeTarget::TvpCell {
+            loop {
+                match dae.current_param().map(|param| param.target) {
+                    Some(DaeTarget::TvpRowControl {
+                        tvp_index,
+                        row_index,
+                    }) if dae
+                        .tvp_batches
+                        .get(&tvp_index)
+                        .is_some_and(|(_, batch_end)| row_index < *batch_end) =>
+                    {
+                        dae.advance();
+                        continue;
+                    }
+                    Some(DaeTarget::TvpCell { .. }) => {}
+                    _ => break,
+                }
+                let Some(DaeTarget::TvpCell {
                     tvp_index,
                     row_index,
                     column_index,
-                } = param.target
+                }) = dae.current_param().map(|param| param.target)
                 else {
+                    break;
+                };
+                if dae.position_current_tvp_cell().is_err() {
+                    cell_error = Some(super::exec_common::ParamRowBuildError::Conversion {
+                        parameter: tvp_index + 1,
+                        source:
+                            crate::conversion::param_convert::ParamBuildError::InvalidBufferLength,
+                    });
+                    break;
+                }
+                let Some(param) = dae.current_param() else {
                     break;
                 };
                 if let Some(indicator) = unsafe {
@@ -1026,12 +1067,7 @@ mod tests {
             let mut token = std::ptr::null_mut();
             assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
             assert_eq!(
-                unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 1) },
-                SQL_SUCCESS
-            );
-            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
-            assert_eq!(
-                unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 1) },
+                unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
                 SQL_SUCCESS
             );
             assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
@@ -1075,6 +1111,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn tvp_array_dae(
+        h: &TestHandles,
+        values: &mut [i32; 2],
+        indicators: &mut [SqlLen; 2],
+    ) -> DaeState {
+        let tvp = crate::params::BoundParam {
+            input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 2,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        };
+        let column = crate::params::BoundParam {
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: crate::api::odbc_types::SQL_INTEGER,
+            column_size: 10,
+            buffer_length: std::mem::size_of::<i32>() as SqlLen,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+            ..tvp
+        };
+        let mut params = crate::api::exec_common::build_tvp_dae_params(
+            0,
+            &tvp,
+            None,
+            &[Some(column)],
+            0,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+        )
+        .unwrap();
+        params.push(DaeParam::unbounded(1, std::ptr::null_mut(), None));
+        DaeState::new(
+            crate::handles::wire::WireLease::detached_for_test(
+                mssql_tds::test_client_support::tds_client_from_tokens(Vec::new()),
+                h.stmt,
+            ),
+            None,
+            None,
+            params,
+        )
+        .deferred(Vec::new(), Some("SELECT ?".into()), 0)
+    }
+
+    #[test]
+    fn tvp_dae_accepts_a_two_row_batch() {
+        use crate::api::exports::{SQLParamData, SQLPutData};
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut values = [11, 999];
+        let mut indicators = [std::mem::size_of::<i32>() as SqlLen; 2];
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(&h, &mut values, &mut indicators));
+
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(dae.tvp_row_counts.get(&0), Some(&2));
+        assert_eq!(dae.tvp_cells[0].value, Some(SqlType::Int(Some(11))));
+        assert_eq!(dae.tvp_cells[1].value, Some(SqlType::Int(Some(999))));
+        assert_eq!(dae.tvp_cells[0].row_index, 0);
+        assert_eq!(dae.tvp_cells[1].row_index, 1);
+    }
+
+    #[test]
+    fn tvp_dae_refilled_single_row_batches_restart_at_array_row_zero() {
+        use crate::api::exports::{SQLParamData, SQLPutData};
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut values = [11, 999];
+        let mut indicators = [std::mem::size_of::<i32>() as SqlLen; 2];
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(&h, &mut values, &mut indicators));
+
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 1) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+        values[0] = 22;
+        assert_eq!(values[0], 22);
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 1) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(dae.tvp_row_counts.get(&0), Some(&2));
+        assert_eq!(dae.tvp_cells[0].value, Some(SqlType::Int(Some(11))));
+        assert_eq!(dae.tvp_cells[1].value, Some(SqlType::Int(Some(22))));
+        assert_eq!(dae.tvp_cells[0].row_index, 0);
+        assert_eq!(dae.tvp_cells[1].row_index, 1);
     }
 
     #[test]

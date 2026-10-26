@@ -30,6 +30,7 @@ use crate::api::sqlstate::{
     ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
+use crate::error::post_sql_error;
 use crate::error::{HasDiagnostics, free_errors};
 use crate::handles::desc::{DescHeader, DescRecord, FieldScope, classify_field};
 use crate::handles::{DescHandle, HandleType, handle_from_raw};
@@ -122,6 +123,54 @@ fn sql_get_desc_field_w_safe(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
+    if matches!(
+        desc.kind,
+        crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
+    ) && record_number >= 1
+        && let Ok(field) = SqlUSmallInt::try_from(field_identifier)
+        && matches!(
+            field,
+            SQL_DESC_DATA_PTR | SQL_DESC_INDICATOR_PTR | SQL_DESC_OCTET_LENGTH_PTR
+        )
+        && classify_field(desc.kind, field).is_some_and(|access| access.scope == FieldScope::Record)
+    {
+        match desc.focused_tvp_bindings(record_number) {
+            Ok(bindings) => {
+                if let Some(binding) = bindings.first() {
+                    let Ok(mut state) = desc.inner.lock() else {
+                        error!("SQLGetDescFieldW: desc mutex poisoned");
+                        return SQL_ERROR;
+                    };
+                    free_errors(&mut state);
+                    let value = match field {
+                        SQL_DESC_DATA_PTR => FieldValue::Pointer(binding.parameter_value_ptr),
+                        SQL_DESC_INDICATOR_PTR => {
+                            FieldValue::Pointer(binding.strlen_or_ind_ptr.cast())
+                        }
+                        SQL_DESC_OCTET_LENGTH_PTR => {
+                            FieldValue::Pointer(binding.octet_length_ptr.cast())
+                        }
+                        _ => unreachable!(),
+                    };
+                    return value.write(value_ptr, buffer_length, string_length_ptr, &mut *state);
+                }
+            }
+            Err(()) => {
+                error!("SQLGetDescFieldW: failed reading focused TVP descriptor records");
+                if let Ok(mut state) = desc.inner.lock() {
+                    free_errors(&mut state);
+                    post_sql_error(
+                        &mut state,
+                        crate::api::sqlstate::SQLSTATE_HY000,
+                        0,
+                        "Internal error reading focused table-valued parameter descriptor",
+                    );
+                }
+                return SQL_ERROR;
+            }
+        }
+    }
+
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLGetDescFieldW: desc mutex poisoned");
         return SQL_ERROR;

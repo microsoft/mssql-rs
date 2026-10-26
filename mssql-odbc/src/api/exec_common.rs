@@ -1162,6 +1162,15 @@ pub(super) unsafe fn build_named_params_for_row(
                 .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                     ParamRowBuildError::Layout { parameter: i + 1 }
                 })?;
+            if !tvp_binding.strlen_or_ind_ptr.is_null()
+                && unsafe { tvp_binding.strlen_or_ind_ptr.read_unaligned() }
+                    == crate::api::odbc_types::SQL_NULL_DATA
+            {
+                return Err(ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source: crate::conversion::param_convert::ParamBuildError::InvalidTvpRowCount,
+                });
+            }
             if unsafe { crate::conversion::param_convert::data_at_exec_indicator(&tvp_binding) }
                 .is_some()
             {
@@ -1341,7 +1350,7 @@ pub(super) fn validate_parameter_focus(state: &mut StmtState, op: &str) -> Resul
     Ok(())
 }
 
-fn build_tvp_dae_params(
+pub(super) fn build_tvp_dae_params(
     tvp_index: usize,
     tvp: &BoundParam,
     udt_names: Option<std::sync::Arc<crate::handles::desc::UdtNames>>,
@@ -1376,17 +1385,14 @@ fn build_tvp_dae_params(
             let binding = column
                 .as_ref()
                 .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
-            let column = binding
-                .for_row(row_index, bind_offset, bind_type)
-                .map_err(|_| ParamBuildError::InvalidBufferLength)?;
             staged.push(
-                DaeParam::new(tvp_index, None, true, None, column, None).with_target(
-                    DaeTarget::TvpCell {
+                DaeParam::new(tvp_index, None, true, None, *binding, None)
+                    .with_target(DaeTarget::TvpCell {
                         tvp_index,
                         row_index,
                         column_index,
-                    },
-                ),
+                    })
+                    .with_tvp_cell_binding(*binding, bind_offset, bind_type),
             );
         }
     }
@@ -3708,21 +3714,81 @@ mod tests {
         );
         assert_eq!(
             staged[4].binding.parameter_value_ptr,
-            unsafe { values.as_mut_ptr().add(1) }.cast()
+            values.as_mut_ptr().cast()
         );
-        assert_eq!(staged[4].binding.strlen_or_ind_ptr, unsafe {
-            indicators.as_mut_ptr().add(1)
-        });
+        assert_eq!(staged[4].binding.strlen_or_ind_ptr, indicators.as_mut_ptr());
         assert_eq!(staged[2].expected_len, None);
         assert_eq!(staged[5].expected_len, None);
         assert_eq!(
             staged[2].binding.strlen_or_ind_ptr,
             dae_indicators.as_mut_ptr()
         );
-        assert_eq!(staged[5].binding.strlen_or_ind_ptr, unsafe {
-            dae_indicators.as_mut_ptr().add(1)
-        });
+        assert_eq!(
+            staged[5].binding.strlen_or_ind_ptr,
+            dae_indicators.as_mut_ptr()
+        );
         assert_eq!(staged[2].value_ptr, staged[5].value_ptr);
+    }
+
+    #[test]
+    fn tvp_dae_cells_use_batch_relative_array_positions() {
+        let mut indicator = SQL_DATA_AT_EXEC;
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 2,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut indicator,
+        };
+        let mut values = [11i32, 999];
+        let mut indicators = [SQL_DATA_AT_EXEC, SQL_DATA_AT_EXEC];
+        let column = BoundParam {
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: SQL_INTEGER,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: std::mem::size_of::<i32>() as SqlLen,
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+            ..tvp
+        };
+        let staged = build_tvp_dae_params(
+            0,
+            &tvp,
+            None,
+            &[Some(column)],
+            0,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+        )
+        .unwrap();
+        let mut dae = DaeState::for_test(staged, None);
+
+        dae.cursor = Some(1);
+        dae.tvp_batches.insert(0, (0, 2));
+        dae.position_current_tvp_cell().unwrap();
+        assert_eq!(
+            dae.current_param().unwrap().binding.parameter_value_ptr,
+            values.as_mut_ptr().cast()
+        );
+
+        dae.cursor = Some(3);
+        dae.position_current_tvp_cell().unwrap();
+        assert_eq!(
+            dae.current_param().unwrap().binding.parameter_value_ptr,
+            unsafe { values.as_mut_ptr().add(1) }.cast()
+        );
+
+        dae.tvp_batches.insert(0, (1, 2));
+        dae.position_current_tvp_cell().unwrap();
+        assert_eq!(
+            dae.current_param().unwrap().binding.parameter_value_ptr,
+            values.as_mut_ptr().cast()
+        );
     }
 
     #[test]
@@ -3813,6 +3879,37 @@ mod tests {
         ));
         assert_eq!(built.dae_params[1].value_ptr, 0x2000usize as *mut c_void);
         assert_eq!(built.params.len(), 1);
+    }
+
+    #[test]
+    fn build_named_params_rejects_null_tvp_indicator_before_dae_staging() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut indicator = crate::api::odbc_types::SQL_NULL_DATA;
+        let mut octet_length = SQL_DATA_AT_EXEC;
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 2,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut octet_length,
+        };
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(tvp));
+
+        let result = unsafe { build_named_params(&mut state, 1, 0, "test") };
+
+        assert!(matches!(result, Err(SQL_ERROR)));
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            crate::api::sqlstate::ERR_INVALID_ATTRIBUTE_VALUE.state
+        );
     }
 
     /// A streamed parameter is only declared at a narrowed length when the

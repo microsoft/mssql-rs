@@ -2434,6 +2434,9 @@ fn tvp_column_def(column: &BoundParam) -> Result<TvpColumnDef, ParamBuildError> 
         def.precision = metadata.precision;
         def.scale = metadata.scale;
     }
+    if column.sql_type == SQL_LONGVARCHAR {
+        def.narrow_string_byte_limit = Some(column.column_size.min(SQL_PREC_TEXTIMAGE));
+    }
     Ok(def)
 }
 
@@ -4409,6 +4412,17 @@ mod tests {
             tvp_type_name(None),
             Err(ParamBuildError::MissingTableTypeName)
         ));
+    }
+
+    #[test]
+    fn tvp_longvarchar_column_definition_keeps_its_byte_limit() {
+        let mut column = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        column.sql_type = SQL_LONGVARCHAR;
+        column.column_size = 3;
+
+        let definition = tvp_column_def(&column).unwrap();
+
+        assert_eq!(definition.narrow_string_byte_limit, Some(3));
     }
 
     /// The TVP octet-length slot carries the row count; `SQL_DEFAULT_PARAM` or a null

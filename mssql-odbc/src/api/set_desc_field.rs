@@ -47,6 +47,7 @@ use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
 };
 use crate::api::util::read_utf16;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::{DescKind, DescRecord, DescState, FieldScope, classify_field};
 use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
@@ -137,6 +138,53 @@ fn sql_set_desc_field_w_safe(
             buffer_length,
         )
     };
+    if matches!(desc.kind, DescKind::AppParam | DescKind::Ad)
+        && record_number >= 1
+        && let Ok(field) = SqlUSmallInt::try_from(field_identifier)
+        && matches!(
+            field,
+            SQL_DESC_DATA_PTR | SQL_DESC_INDICATOR_PTR | SQL_DESC_OCTET_LENGTH_PTR
+        )
+        && classify_field(desc.kind, field)
+            .is_some_and(|access| access.writable && access.scope == FieldScope::Record)
+    {
+        let may_route = match desc.readers_through(false, true) {
+            Ok((_, executing)) => !executing,
+            Err(()) => {
+                error!("SQLSetDescFieldW: failed checking focused descriptor readers");
+                return SQL_ERROR;
+            }
+        };
+        if may_route {
+            let Ok(mut state) = desc.inner.lock() else {
+                error!("SQLSetDescFieldW: desc mutex poisoned clearing diagnostics");
+                return SQL_ERROR;
+            };
+            free_errors(&mut state);
+            drop(state);
+            let updated = desc.update_focused_tvp_bindings(record_number, |binding| match field {
+                SQL_DESC_DATA_PTR => binding.parameter_value_ptr = value_ptr,
+                SQL_DESC_INDICATOR_PTR => binding.strlen_or_ind_ptr = value_ptr.cast::<SqlLen>(),
+                SQL_DESC_OCTET_LENGTH_PTR => binding.octet_length_ptr = value_ptr.cast::<SqlLen>(),
+                _ => unreachable!(),
+            });
+            match updated {
+                Ok(true) => return SQL_SUCCESS,
+                Ok(false) => {}
+                Err(()) => {
+                    if let Ok(mut state) = desc.inner.lock() {
+                        post_sql_error(
+                            &mut state,
+                            crate::api::sqlstate::SQLSTATE_HY000,
+                            0,
+                            "Internal error updating focused table-valued parameter descriptor",
+                        );
+                    }
+                    return SQL_ERROR;
+                }
+            }
+        }
+    }
     // The IRD/IPD status and rows-processed pointers alias attributes that
     // `SQLSetStmtAttrW` refuses mid-fetch/execute; refuse this spelling too.
     let header_pointer = matches!(

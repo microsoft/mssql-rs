@@ -381,6 +381,15 @@ fn sql_bind_parameter_safe(
     // APD/IPD, mirroring msodbcsql routing the bind to the TVP's child
     // descriptor. The column's own type was validated above like any scalar.
     if param_focus != 0 {
+        if input_output_type != SQL_PARAM_INPUT {
+            error!("SQLBindParameter: a table-valued parameter column must be input-only");
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
+                error!("SQLBindParameter: stmt mutex poisoned rejecting TVP column direction");
+                return SQL_ERROR;
+            };
+            post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+            return SQL_ERROR;
+        }
         let mut defaults =
             crate::handles::desc::DescRecord::default_for(crate::handles::desc::DescKind::AppParam);
         defaults.reset_app_type_defaults(c_type);
@@ -1185,6 +1194,35 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY105);
     }
 
+    #[test]
+    fn tvp_columns_reject_non_input_directions() {
+        for direction in [SQL_PARAM_OUTPUT, SQL_PARAM_INPUT_OUTPUT] {
+            let h = TestHandles::with_env_dbc_stmt();
+            bind_and_focus_tvp(&h, 1);
+            let mut value = 17i32;
+            let mut indicator: SqlLen = 0;
+            let ret = unsafe {
+                crate::api::exports::SQLBindParameter(
+                    h.stmt,
+                    1,
+                    direction,
+                    crate::api::odbc_types::SQL_C_SLONG,
+                    crate::api::odbc_types::SQL_INTEGER,
+                    10,
+                    0,
+                    (&raw mut value).cast(),
+                    std::mem::size_of::<i32>() as SqlLen,
+                    &mut indicator,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY105);
+            assert!(!state.tvp_column_bindings.contains_key(&1));
+        }
+    }
+
     /// The table type name supplied in the value buffer is recorded on the IPD
     /// (claimed), so execute can name the type without a prior SQLDescribeParam;
     /// the ODBC SQLBindParameter contract maps `ParameterValuePtr` to
@@ -1319,6 +1357,63 @@ mod tests {
         drop(state);
         let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
         assert_eq!(ipd.inner.lock().unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn focused_apd_data_pointer_updates_the_tvp_column_binding() {
+        use crate::api::odbc_types::{SQL_DESC_DATA_PTR, SqlPointer, SqlSmallInt};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        bind_and_focus_tvp(&h, 1);
+        let mut original = 11i32;
+        let mut indicator: SqlLen = 0;
+        assert_eq!(
+            bind_int_column(&h, 1, &mut original, &mut indicator),
+            SQL_SUCCESS
+        );
+
+        let mut replacement = 99i32;
+        let replacement_ptr = (&raw mut replacement).cast();
+        let apd = h.apd();
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetDescFieldW(
+                    apd,
+                    1,
+                    SQL_DESC_DATA_PTR as SqlSmallInt,
+                    replacement_ptr,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let mut returned: SqlPointer = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetDescFieldW(
+                    apd,
+                    1,
+                    SQL_DESC_DATA_PTR as SqlSmallInt,
+                    (&raw mut returned).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(returned, replacement_ptr);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        let column = state.tvp_column_bindings[&1][0].unwrap();
+        assert_eq!(column.parameter_value_ptr, replacement_ptr);
+        let value =
+            unsafe { crate::conversion::param_convert::bound_tvp_cell_to_value(&column) }.unwrap();
+        assert_eq!(
+            value,
+            mssql_tds::datatypes::sqltypes::SqlType::Int(Some(99))
+        );
     }
 
     #[test]
