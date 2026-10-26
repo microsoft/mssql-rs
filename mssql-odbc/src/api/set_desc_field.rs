@@ -143,7 +143,11 @@ fn sql_set_desc_field_w_safe(
         && let Ok(field) = SqlUSmallInt::try_from(field_identifier)
         && matches!(
             field,
-            SQL_DESC_DATA_PTR | SQL_DESC_INDICATOR_PTR | SQL_DESC_OCTET_LENGTH_PTR
+            SQL_DESC_DATA_PTR
+                | SQL_DESC_INDICATOR_PTR
+                | SQL_DESC_OCTET_LENGTH_PTR
+                | SQL_DESC_PRECISION
+                | SQL_DESC_SCALE
         )
         && classify_field(desc.kind, field)
             .is_some_and(|access| access.writable && access.scope == FieldScope::Record)
@@ -156,31 +160,101 @@ fn sql_set_desc_field_w_safe(
             }
         };
         if may_route {
-            let Ok(mut state) = desc.inner.lock() else {
-                error!("SQLSetDescFieldW: desc mutex poisoned clearing diagnostics");
-                return SQL_ERROR;
-            };
-            free_errors(&mut state);
-            drop(state);
-            let updated = desc.update_focused_tvp_bindings(record_number, |binding| match field {
-                SQL_DESC_DATA_PTR => binding.parameter_value_ptr = value_ptr,
-                SQL_DESC_INDICATOR_PTR => binding.strlen_or_ind_ptr = value_ptr.cast::<SqlLen>(),
-                SQL_DESC_OCTET_LENGTH_PTR => binding.octet_length_ptr = value_ptr.cast::<SqlLen>(),
-                _ => unreachable!(),
-            });
-            match updated {
-                Ok(true) => return SQL_SUCCESS,
-                Ok(false) => {}
+            let focused_bindings = match desc.focused_tvp_bindings(record_number) {
+                Ok(bindings) => bindings,
                 Err(()) => {
-                    if let Ok(mut state) = desc.inner.lock() {
-                        post_sql_error(
-                            &mut state,
-                            crate::api::sqlstate::SQLSTATE_HY000,
-                            0,
-                            "Internal error updating focused table-valued parameter descriptor",
-                        );
-                    }
+                    error!("SQLSetDescFieldW: failed reading focused descriptor bindings");
+                    let Ok(mut state) = desc.inner.lock() else {
+                        error!("SQLSetDescFieldW: desc mutex poisoned posting focused TVP error");
+                        return SQL_ERROR;
+                    };
+                    post_sql_error(
+                        &mut state,
+                        crate::api::sqlstate::SQLSTATE_HY000,
+                        0,
+                        "Internal error reading focused table-valued parameter descriptor",
+                    );
                     return SQL_ERROR;
+                }
+            };
+            if !focused_bindings.is_empty() {
+                let focused_value = match field {
+                    SQL_DESC_PRECISION => {
+                        let Ok(precision) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
+                            return post_focused_tvp_diag(desc, ERR_INVALID_ATTRIBUTE_VALUE);
+                        };
+                        if focused_bindings.iter().any(|binding| {
+                            binding.c_type == SQL_C_NUMERIC
+                                && !(1..=SQL_PREC_NUMERIC).contains(&precision)
+                        }) {
+                            error!(
+                                precision,
+                                "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC precision"
+                            );
+                            return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                        }
+                        Some(precision)
+                    }
+                    SQL_DESC_SCALE => {
+                        let Ok(scale) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
+                            return post_focused_tvp_diag(desc, ERR_INVALID_ATTRIBUTE_VALUE);
+                        };
+                        if focused_bindings.iter().any(|binding| {
+                            matches!(binding.c_type, SQL_C_NUMERIC | SQL_DECIMAL)
+                                && scale > binding.app_precision
+                        }) {
+                            error!(
+                                scale,
+                                "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC scale"
+                            );
+                            return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                        }
+                        Some(scale)
+                    }
+                    _ => None,
+                };
+
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLSetDescFieldW: desc mutex poisoned clearing diagnostics");
+                    return SQL_ERROR;
+                };
+                free_errors(&mut state);
+                drop(state);
+                let updated =
+                    desc.update_focused_tvp_bindings(record_number, |binding| match field {
+                        SQL_DESC_DATA_PTR => binding.parameter_value_ptr = value_ptr,
+                        SQL_DESC_INDICATOR_PTR => {
+                            binding.strlen_or_ind_ptr = value_ptr.cast::<SqlLen>()
+                        }
+                        SQL_DESC_OCTET_LENGTH_PTR => {
+                            binding.octet_length_ptr = value_ptr.cast::<SqlLen>()
+                        }
+                        SQL_DESC_PRECISION => {
+                            if let Some(precision) = focused_value {
+                                binding.app_precision = precision;
+                            }
+                        }
+                        SQL_DESC_SCALE => {
+                            if let Some(scale) = focused_value {
+                                binding.app_scale = scale;
+                            }
+                        }
+                        _ => unreachable!(),
+                    });
+                match updated {
+                    Ok(true) => return SQL_SUCCESS,
+                    Ok(false) => {}
+                    Err(()) => {
+                        if let Ok(mut state) = desc.inner.lock() {
+                            post_sql_error(
+                                &mut state,
+                                crate::api::sqlstate::SQLSTATE_HY000,
+                                0,
+                                "Internal error updating focused table-valued parameter descriptor",
+                            );
+                        }
+                        return SQL_ERROR;
+                    }
                 }
             }
         }
@@ -200,6 +274,19 @@ fn sql_set_desc_field_w_safe(
         }
         _ => desc.update_definition(record_number, "SQLSetDescFieldW", update),
     }
+}
+
+fn post_focused_tvp_diag(
+    desc: &DescHandle,
+    diagnostic: crate::api::sqlstate::DiagMsg,
+) -> SqlReturn {
+    let Ok(mut state) = desc.inner.lock() else {
+        error!("SQLSetDescFieldW: desc mutex poisoned posting focused TVP diagnostic");
+        return SQL_ERROR;
+    };
+    free_errors(&mut state);
+    post_diag(&mut state, diagnostic);
+    SQL_ERROR
 }
 
 fn set_desc_field(

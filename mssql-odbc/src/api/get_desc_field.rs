@@ -130,7 +130,11 @@ fn sql_get_desc_field_w_safe(
         && let Ok(field) = SqlUSmallInt::try_from(field_identifier)
         && matches!(
             field,
-            SQL_DESC_DATA_PTR | SQL_DESC_INDICATOR_PTR | SQL_DESC_OCTET_LENGTH_PTR
+            SQL_DESC_DATA_PTR
+                | SQL_DESC_INDICATOR_PTR
+                | SQL_DESC_OCTET_LENGTH_PTR
+                | SQL_DESC_PRECISION
+                | SQL_DESC_SCALE
         )
         && classify_field(desc.kind, field).is_some_and(|access| access.scope == FieldScope::Record)
     {
@@ -150,6 +154,8 @@ fn sql_get_desc_field_w_safe(
                         SQL_DESC_OCTET_LENGTH_PTR => {
                             FieldValue::Pointer(binding.octet_length_ptr.cast())
                         }
+                        SQL_DESC_PRECISION => FieldValue::SmallInt(binding.app_precision),
+                        SQL_DESC_SCALE => FieldValue::SmallInt(binding.app_scale),
                         _ => unreachable!(),
                     };
                     return value.write(value_ptr, buffer_length, string_length_ptr, &mut *state);

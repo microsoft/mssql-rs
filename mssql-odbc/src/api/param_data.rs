@@ -348,9 +348,16 @@ fn sql_param_data_operation(
                 let Some(param) = dae.current_param() else {
                     break;
                 };
-                if let Some(indicator) = unsafe {
-                    crate::conversion::param_convert::data_at_exec_indicator(&param.binding)
-                } {
+                let is_null = !param.binding.strlen_or_ind_ptr.is_null()
+                    && unsafe {
+                        param.binding.strlen_or_ind_ptr.read_unaligned()
+                            == crate::api::odbc_types::SQL_NULL_DATA
+                    };
+                if !is_null
+                    && let Some(indicator) = unsafe {
+                        crate::conversion::param_convert::data_at_exec_indicator(&param.binding)
+                    }
+                {
                     if let Some(param) = dae.current_param_mut() {
                         param.expected_len = super::exec_common::dae_expected_length(indicator);
                     }
@@ -1034,12 +1041,12 @@ mod tests {
             let mut indicators = [1, SQL_LEN_DATA_AT_EXEC_OFFSET - 3];
             let mut first_value = b'a';
             let row = |index| {
-                DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
-                    DaeTarget::TvpRowControl {
-                        tvp_index: 0,
-                        row_index: index,
-                    },
-                )
+                let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None);
+                param.binding.column_size = 2;
+                param.with_target(DaeTarget::TvpRowControl {
+                    tvp_index: 0,
+                    row_index: index,
+                })
             };
             let mut bound = DaeParam::unbounded(0, (&raw mut first_value).cast(), None)
                 .with_binding_types(SQL_C_CHAR, crate::api::odbc_types::SQL_VARCHAR)
@@ -1117,6 +1124,7 @@ mod tests {
         h: &TestHandles,
         values: &mut [i32; 2],
         indicators: &mut [SqlLen; 2],
+        lengths: &mut [SqlLen; 2],
     ) -> DaeState {
         let tvp = crate::params::BoundParam {
             input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
@@ -1150,6 +1158,12 @@ mod tests {
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
         )
         .unwrap();
+        for param in &mut params {
+            if let Some(cell_binding) = param.tvp_cell_binding.as_mut() {
+                cell_binding.binding.strlen_or_ind_ptr = indicators.as_mut_ptr();
+                cell_binding.binding.octet_length_ptr = lengths.as_mut_ptr();
+            }
+        }
         params.push(DaeParam::unbounded(1, std::ptr::null_mut(), None));
         DaeState::new(
             crate::handles::wire::WireLease::detached_for_test(
@@ -1173,7 +1187,13 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut values = [11, 999];
         let mut indicators = [std::mem::size_of::<i32>() as SqlLen; 2];
-        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(&h, &mut values, &mut indicators));
+        let mut lengths = indicators;
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut lengths,
+        ));
 
         let mut token = std::ptr::null_mut();
         assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
@@ -1202,7 +1222,13 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut values = [11, 999];
         let mut indicators = [std::mem::size_of::<i32>() as SqlLen; 2];
-        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(&h, &mut values, &mut indicators));
+        let mut lengths = indicators;
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut lengths,
+        ));
 
         let mut token = std::ptr::null_mut();
         assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
@@ -1226,6 +1252,45 @@ mod tests {
         assert_eq!(dae.tvp_cells[1].value, Some(SqlType::Int(Some(22))));
         assert_eq!(dae.tvp_cells[0].row_index, 0);
         assert_eq!(dae.tvp_cells[1].row_index, 1);
+    }
+
+    #[test]
+    fn tvp_null_indicator_overrides_separate_dae_length_marker() {
+        use crate::api::exports::{SQLParamData, SQLPutData};
+        use crate::api::odbc_types::{SQL_DATA_AT_EXEC, SQL_NEED_DATA, SQL_SUCCESS};
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut values = [11, 999];
+        let mut indicators = [crate::api::odbc_types::SQL_NULL_DATA, 0];
+        let mut lengths = [SQL_DATA_AT_EXEC, 0];
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut lengths,
+        ));
+
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 1) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(
+            dae.tvp_cells[0].value,
+            Some(SqlType::Int(None)),
+            "the independent NULL indicator must win over SQL_DATA_AT_EXEC"
+        );
+        assert!(matches!(
+            dae.current_param().map(|param| param.target),
+            Some(DaeTarget::TvpRowControl { row_index: 1, .. })
+        ));
     }
 
     #[test]
@@ -1263,6 +1328,7 @@ mod tests {
                 row_index: 0,
             },
         );
+        row0.binding.column_size = 2;
         row0.set_buffered(true);
         let mut cell0 =
             DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(DaeTarget::TvpCell {
@@ -1279,6 +1345,7 @@ mod tests {
                 row_index: 1,
             },
         );
+        row1.binding.column_size = 2;
         row1.set_buffered(true);
         let mut cell1 =
             DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(DaeTarget::TvpCell {
@@ -1293,6 +1360,7 @@ mod tests {
                 row_index: 2,
             },
         );
+        end.binding.column_size = 2;
         end.set_buffered(true);
         let mut next_parameter = DaeParam::unbounded(1, std::ptr::null_mut(), None);
         next_parameter.set_buffered(true);

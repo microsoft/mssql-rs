@@ -891,6 +891,7 @@ mod tests {
             },
         );
         let mut control = control;
+        control.binding.column_size = 1;
         control.set_buffered(true);
         {
             let mut state = stmt.inner.lock().unwrap();

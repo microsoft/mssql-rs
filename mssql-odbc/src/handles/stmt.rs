@@ -1243,16 +1243,13 @@ impl DaeState {
     }
 
     pub(crate) fn tvp_row_capacity(&self, tvp_index: usize) -> Option<usize> {
-        self.params
-            .iter()
-            .filter_map(|param| match param.target {
-                DaeTarget::TvpRowControl {
-                    tvp_index: target,
-                    row_index,
-                } if target == tvp_index => Some(row_index),
-                _ => None,
-            })
-            .max()
+        let param = self.current_param()?;
+        match param.target {
+            DaeTarget::TvpRowControl {
+                tvp_index: target, ..
+            } if target == tvp_index => Some(param.binding.column_size),
+            _ => None,
+        }
     }
 
     pub(crate) fn position_current_tvp_cell(&mut self) -> Result<(), ()> {

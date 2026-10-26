@@ -1464,6 +1464,97 @@ mod tests {
     }
 
     #[test]
+    fn focused_numeric_descriptor_precision_and_scale_update_tvp_conversion() {
+        use crate::api::odbc_types::{
+            SQL_C_NUMERIC, SQL_DECIMAL, SQL_DESC_PRECISION, SQL_DESC_SCALE, SqlNumericStruct,
+            SqlSmallInt,
+        };
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        bind_and_focus_tvp(&h, 1);
+        let mut value = SqlNumericStruct {
+            precision: 38,
+            scale: 2,
+            sign: 1,
+            val: 123u128.to_le_bytes(),
+        };
+        let mut indicator: SqlLen = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_NUMERIC,
+                    SQL_DECIMAL,
+                    10,
+                    2,
+                    (&raw mut value).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let apd = h.apd();
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetDescFieldW(
+                    apd,
+                    1,
+                    SQL_DESC_PRECISION as SqlSmallInt,
+                    10isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLSetDescFieldW(
+                    apd,
+                    1,
+                    SQL_DESC_SCALE as SqlSmallInt,
+                    2isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        for (field, expected) in [(SQL_DESC_PRECISION, 10), (SQL_DESC_SCALE, 2)] {
+            let mut actual: SqlSmallInt = -1;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetDescFieldW(
+                        apd,
+                        1,
+                        field as SqlSmallInt,
+                        (&raw mut actual).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(actual, expected);
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let column = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
+        assert_eq!((column.app_precision, column.app_scale), (10, 2));
+        let SqlType::Decimal(Some(parts)) =
+            unsafe { crate::conversion::param_convert::bound_tvp_cell_to_value(&column) }.unwrap()
+        else {
+            panic!("expected decimal cell");
+        };
+        assert_eq!(parts.magnitude(), 123);
+        assert_eq!(parts.scale, 2);
+    }
+
+    #[test]
     fn tvp_type_name_rebind_and_descriptor_changes_invalidate_prepared_definition() {
         use crate::api::odbc_types::{SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME, SQL_SS_TABLE};
         use crate::handles::stmt::PreparedPlan;
