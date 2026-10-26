@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::{path::PathBuf, sync::Arc};
@@ -218,8 +218,24 @@ impl PyCoreConnection {
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
 
-        let multi_subnet_failover =
-            Self::extract_yes_no_bool(dict, "multi_subnet_failover", "MultiSubnetFailover")?;
+        let multi_subnet_failover = Self::extract_optional_bool(
+            dict.get_item("multi_subnet_failover")?
+                .filter(|value| !value.is_none()),
+            "MultiSubnetFailover",
+            "Yes",
+            "No",
+        )?;
+        if Self::extract_optional_bool(
+            dict.get_item("transparent_network_ip_resolution")?,
+            "TransparentNetworkIPResolution",
+            "Enabled",
+            "Disabled",
+        )? == Some(true)
+        {
+            return Err(PyRuntimeError::new_err(
+                "TransparentNetworkIPResolution is not supported; use MultiSubnetFailover instead",
+            ));
+        }
 
         let trust_server_certificate =
             Self::extract_yes_no_bool(dict, "trust_server_certificate", "TrustServerCertificate")?;
@@ -503,8 +519,33 @@ impl PyCoreConnection {
         Ok(context)
     }
 
+    fn extract_optional_bool(
+        value: Option<Bound<'_, PyAny>>,
+        display_name: &str,
+        on: &str,
+        off: &str,
+    ) -> PyResult<Option<bool>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if let Ok(value) = value.extract::<bool>() {
+            return Ok(Some(value));
+        }
+        let value = value.extract::<String>().map_err(|_| {
+            PyTypeError::new_err(format!("{display_name} must be a bool or '{on}'/'{off}'"))
+        })?;
+        if value.eq_ignore_ascii_case(on) {
+            Ok(Some(true))
+        } else if value.eq_ignore_ascii_case(off) {
+            Ok(Some(false))
+        } else {
+            Err(PyRuntimeError::new_err(format!(
+                "Invalid {display_name} value '{value}'. Expected '{on}' or '{off}'."
+            )))
+        }
+    }
+
     /// Extract a Yes/No string (ODBC-style) or Python bool, defaulting to `false`.
-    /// This is to ensure that ODBC parameters like MultiSubnetFailover and TrustServerCertificate only accept valid values, while still allowing Pythonic bools for convenience.
     fn extract_yes_no_bool(
         dict: &Bound<'_, PyDict>,
         key: &str,
@@ -524,5 +565,179 @@ impl PyCoreConnection {
             Some(v) => Ok(v.extract::<bool>().unwrap_or(false)),
             None => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_msf_preserves_inheritance() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            let context = PyCoreConnection::dict_to_client_context(&dict).unwrap();
+            assert_eq!(context.multi_subnet_failover, None);
+        });
+    }
+
+    #[test]
+    fn none_msf_preserves_inheritance() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("multi_subnet_failover", py.None()).unwrap();
+            let context = PyCoreConnection::dict_to_client_context(&dict).unwrap();
+            assert_eq!(context.multi_subnet_failover, None);
+        });
+    }
+
+    #[test]
+    fn msf_strings_reach_the_client_context() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            for (value, enabled) in [("Yes", true), ("yEs", true), ("No", false), ("nO", false)] {
+                dict.set_item("multi_subnet_failover", value).unwrap();
+                let context = PyCoreConnection::dict_to_client_context(&dict).unwrap();
+                assert_eq!(context.multi_subnet_failover, Some(enabled), "{value}");
+            }
+        });
+    }
+
+    #[test]
+    fn tnir_off_does_not_disable_multi_subnet_failover() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            for multi_subnet_failover in [false, true] {
+                dict.set_item("multi_subnet_failover", multi_subnet_failover)
+                    .unwrap();
+                for disabled in ["Disabled", "dIsAbLeD"] {
+                    dict.set_item("transparent_network_ip_resolution", disabled)
+                        .unwrap();
+                    let context = PyCoreConnection::dict_to_client_context(&dict).unwrap();
+                    assert_eq!(context.multi_subnet_failover, Some(multi_subnet_failover));
+                }
+                dict.set_item("transparent_network_ip_resolution", false)
+                    .unwrap();
+                assert_eq!(
+                    PyCoreConnection::dict_to_client_context(&dict)
+                        .unwrap()
+                        .multi_subnet_failover,
+                    Some(multi_subnet_failover)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn tnir_on_is_not_supported() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            for value in ["Enabled", "eNaBlEd"] {
+                dict.set_item("transparent_network_ip_resolution", value)
+                    .unwrap();
+                let Err(error) = PyCoreConnection::dict_to_client_context(&dict) else {
+                    panic!("TNIR must not be enabled");
+                };
+                assert!(error.to_string().contains("not supported"));
+            }
+            dict.set_item("transparent_network_ip_resolution", true)
+                .unwrap();
+            assert!(PyCoreConnection::dict_to_client_context(&dict).is_err());
+        });
+    }
+
+    #[test]
+    fn tnir_rejects_invalid_strings() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            for value in ["", "yes", "no", "true", "false", "1", "EnabledExtra"] {
+                dict.set_item("transparent_network_ip_resolution", value)
+                    .unwrap();
+                let Err(error) = PyCoreConnection::dict_to_client_context(&dict) else {
+                    panic!("accepted invalid TNIR value {value:?}");
+                };
+                assert!(error.is_instance_of::<PyRuntimeError>(py));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Invalid TransparentNetworkIPResolution value")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn tnir_rejects_non_bool_non_string_values() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            for value in [0, 1, 7] {
+                dict.set_item("transparent_network_ip_resolution", value)
+                    .unwrap();
+                let Err(error) = PyCoreConnection::dict_to_client_context(&dict) else {
+                    panic!("accepted integer TNIR value {value}");
+                };
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+            dict.set_item("transparent_network_ip_resolution", py.None())
+                .unwrap();
+            let Err(error) = PyCoreConnection::dict_to_client_context(&dict) else {
+                panic!("accepted None as a TNIR value");
+            };
+            assert!(error.is_instance_of::<PyTypeError>(py));
+        });
+    }
+
+    #[test]
+    fn tnir_invalid_input_is_rejected_by_both_python_entry_points() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("transparent_network_ip_resolution", "invalid")
+                .unwrap();
+            for result in [
+                py.get_type::<PyCoreConnection>().call1((&dict,)),
+                py.get_type::<crate::async_connection::PyAsyncConnection>()
+                    .call_method1("connect", (&dict,)),
+            ] {
+                let Err(error) = result else {
+                    panic!("accepted invalid TNIR option at the Python entry point");
+                };
+                assert!(error.is_instance_of::<PyRuntimeError>(py));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Invalid TransparentNetworkIPResolution value")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn msf_invalid_input_is_rejected_by_both_python_entry_points() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            for value in ["", "false", "true", "0", "1", "Disabled"] {
+                dict.set_item("multi_subnet_failover", value).unwrap();
+                for result in [
+                    py.get_type::<PyCoreConnection>().call1((&dict,)),
+                    py.get_type::<crate::async_connection::PyAsyncConnection>()
+                        .call_method1("connect", (&dict,)),
+                ] {
+                    let error = result.unwrap_err();
+                    assert!(error.is_instance_of::<PyRuntimeError>(py));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Invalid MultiSubnetFailover value")
+                    );
+                }
+            }
+            for value in [0, 1, 7] {
+                dict.set_item("multi_subnet_failover", value).unwrap();
+                let Err(error) = PyCoreConnection::dict_to_client_context(&dict) else {
+                    panic!("integers are not MSF booleans");
+                };
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+        });
     }
 }

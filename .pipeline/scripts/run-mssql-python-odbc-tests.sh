@@ -35,6 +35,8 @@
 #   PYTEST_MARK_EXPR         pytest `-m` expression. When set (even to ""), it replaces
 #                            the `-m "not stress"` in upstream pytest.ini's addopts;
 #                            "" selects every test. Unset keeps the pytest.ini default.
+#   PYTEST_DESELECT          Whitespace-separated pytest node IDs, each passed as
+#                            `--deselect` to every file's run (default: none).
 #
 # Exit codes:
 #   0  every file passed.
@@ -57,6 +59,15 @@ declare -a MARK_ARGS=()
 if [ -n "${PYTEST_MARK_EXPR+set}" ]; then
     MARK_ARGS=(-m "$PYTEST_MARK_EXPR")
 fi
+
+declare -a DESELECT_ARGS=()
+declare -a DESELECT_IDS=()
+# -d '' reads past newlines, so IDs may be separated by any whitespace. read
+# returns 1 at end of input, which is expected here.
+read -r -d '' -a DESELECT_IDS <<< "${PYTEST_DESELECT:-}" || true
+for node_id in "${DESELECT_IDS[@]}"; do
+    DESELECT_ARGS+=(--deselect "$node_id")
+done
 
 cd "$MSSQL_PYTHON_DIR" || exit 2
 mkdir -p "$RESULTS_DIR"
@@ -140,6 +151,10 @@ fi
 echo "Running ${#TEST_FILES[@]} mssql-python test files against the mssql-odbc driver"
 echo "Per-file timeout: $PYTEST_FILE_TIMEOUT (${FILE_BUDGET_S}s) | total budget: $PYTEST_TOTAL_BUDGET (${TOTAL_BUDGET_S}s)"
 echo "Marker expression: ${PYTEST_MARK_EXPR-<pytest.ini default>}"
+if [ "${#DESELECT_IDS[@]}" -gt 0 ]; then
+    echo "Deselected tests:"
+    printf '  %s\n' "${DESELECT_IDS[@]}"
+fi
 
 declare -a SUMMARY=()
 passed=0 failed=0 crashed=0 timedout=0 empty=0 skipped=0
@@ -183,6 +198,7 @@ for idx in "${!TEST_FILES[@]}"; do
     timeout --kill-after=60s "${slice}s" \
         python -m pytest "$test_file" -v \
         "${MARK_ARGS[@]}" \
+        "${DESELECT_ARGS[@]}" \
         --junitxml="$report" \
         --capture=tee-sys \
         --cache-clear

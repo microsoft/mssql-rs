@@ -156,7 +156,7 @@ mod mock_server_tests {
         context.user_name = "sa".to_string();
         context.password = generate_test_password();
         context.database = "master".to_string();
-        context.multi_subnet_failover = multi_subnet_failover;
+        context.multi_subnet_failover = Some(multi_subnet_failover);
         context.connect_timeout = 5;
         context.encryption_options = EncryptionOptions {
             mode: EncryptionSetting::PreferOff,
@@ -174,6 +174,15 @@ mod mock_server_tests {
         let client = provider
             .create_client(context.clone(), &datasource, None)
             .await?;
+        let policy = client.multi_subnet_failover_policy().unwrap();
+        assert_eq!(policy.enabled, multi_subnet_failover);
+        assert_eq!(
+            client
+                .secondary_client_context()
+                .unwrap()
+                .multi_subnet_failover_policy(),
+            Some(policy),
+        );
         drop(client);
 
         let cached = dns_cache_fallback(&host, server_addr.port()).await;

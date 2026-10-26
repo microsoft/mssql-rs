@@ -117,16 +117,10 @@ impl TdsConnectionProvider {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
         // Parse the datasource to get the action chain
-        let parsed = context.parse_datasource(datasource)?;
+        let parsed = context.prepare_datasource(datasource)?;
 
         // Validate the ClientContext before attempting connection
         context.validate()?;
-
-        validate_multi_subnet_failover(
-            context.multi_subnet_failover,
-            &context.failover_partner,
-            parsed.needs_ssrp(),
-        )?;
 
         // Get connection timeout
         let timeout_ms = if context.connect_timeout > 0 {
@@ -604,7 +598,14 @@ impl TdsConnectionProvider {
             context.encryption_options.clone(),
             context.keep_alive_in_ms,
             context.keep_alive_interval_in_ms,
-            context.multi_subnet_failover,
+            context
+                .multi_subnet_failover_policy()
+                .ok_or_else(|| {
+                    Error::ImplementationError(
+                        "MSF policy was not resolved before connecting".to_string(),
+                    )
+                })?
+                .enabled,
             connect_timeout_ms,
         )
         .await?;
@@ -695,39 +696,6 @@ impl TdsConnectionProvider {
     }
 }
 
-/// Validate MultiSubnetFailover constraints.
-///
-/// MSF is incompatible with database mirroring (failover partner) and with
-/// named instances that require SSRP resolution (no explicit port).
-fn validate_multi_subnet_failover(
-    multi_subnet_failover: bool,
-    failover_partner: &str,
-    needs_ssrp: bool,
-) -> TdsResult<()> {
-    if !multi_subnet_failover {
-        return Ok(());
-    }
-
-    if !failover_partner.is_empty() {
-        return Err(Error::UsageError(
-            "MultiSubnetFailover cannot be used with FailoverPartner (database mirroring). \
-             These features are mutually exclusive. Remove one of the options."
-                .to_string(),
-        ));
-    }
-
-    if needs_ssrp {
-        return Err(Error::UsageError(
-            "MultiSubnetFailover cannot be used with a named instance \
-             without an explicit port. Specify a port (e.g. server\\instance,1433) \
-             or remove MultiSubnetFailover."
-                .to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +753,9 @@ mod tests {
                 .build()
                 .unwrap();
             let mut context = context_for_retry_test("127.0.0.1", port, 1, 0, 0);
+            context
+                .prepare_datasource(&format!("tcp:127.0.0.1,{port}"))
+                .unwrap();
             context.set_connection_trace(Arc::clone(&trace));
 
             for _ in 0..2 {
@@ -812,30 +783,6 @@ mod tests {
                 );
             }
         });
-    }
-
-    // ── MultiSubnetFailover validation tests ──
-
-    #[test]
-    fn msf_disabled_always_ok() {
-        assert!(validate_multi_subnet_failover(false, "partner", true).is_ok());
-    }
-
-    #[test]
-    fn msf_with_failover_partner_rejected() {
-        let err = validate_multi_subnet_failover(true, "partner", false).unwrap_err();
-        assert!(err.to_string().contains("FailoverPartner"));
-    }
-
-    #[test]
-    fn msf_with_ssrp_rejected() {
-        let err = validate_multi_subnet_failover(true, "", true).unwrap_err();
-        assert!(err.to_string().contains("named instance"));
-    }
-
-    #[test]
-    fn msf_with_explicit_port_ok() {
-        assert!(validate_multi_subnet_failover(true, "", false).is_ok());
     }
 
     // ── Shared-memory fall-through policy ──

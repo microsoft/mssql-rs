@@ -29,8 +29,27 @@ parameters:
 - name: esrpConnectedServiceName
   type: string
   default: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
+- name: wheelVersion
+  type: string
+  default: ''
+  displayName: 'PEP 440 version to stamp into [project].version (empty = do not stamp)'
 
 steps:
+# Stamp the run's resolved version into [project].version before building so the
+# wheel carries a unique PEP 440 version the PyPI feed will accept. Runs on the host
+# (container builds mount the stamped source). Skipped only when a caller passes no
+# wheelVersion; OneBranch stages always pass $(pyCoreWheelVersion), which
+# ComputeWheelVersion always sets (the committed version for official builds).
+- ${{ if ne(parameters.wheelVersion, '') }}:
+  - ${{ if eq(parameters.osType, 'Windows') }}:
+    - pwsh: .pipeline/scripts/stamp-python-wheel-version.ps1 -Version '${{ parameters.wheelVersion }}'
+      displayName: 'Stamp wheel version (${{ parameters.wheelVersion }})'
+  - ${{ if ne(parameters.osType, 'Windows') }}:
+    - script: bash .pipeline/scripts/stamp-python-wheel-version.sh
+      displayName: 'Stamp wheel version (${{ parameters.wheelVersion }})'
+      env:
+        WHEEL_VERSION: ${{ parameters.wheelVersion }}
+
 # Container-based builds for Linux (glibc - manylinux)
 - ${{ if eq(parameters.osType, 'Linux') }}:
   - script: |

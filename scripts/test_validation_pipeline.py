@@ -504,6 +504,60 @@ def test_odbc_runner_forwards_marker_expression(tmp_path, env, expected):
         assert pytest_args[pytest_args.index("-m") + 1] == expected
 
 
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ("", []),
+        ("PYTEST_DESELECT=''", []),
+        ("PYTEST_DESELECT='tests/test_a.py::test_x'", ["tests/test_a.py::test_x"]),
+        (
+            "PYTEST_DESELECT='tests/test_a.py::test_x  tests/test_b.py::test_y[1]'",
+            ["tests/test_a.py::test_x", "tests/test_b.py::test_y[1]"],
+        ),
+        (
+            "PYTEST_DESELECT=$'tests/test_a.py::test_x\\n\\ttests/test_b.py::test_y\\n'",
+            ["tests/test_a.py::test_x", "tests/test_b.py::test_y"],
+        ),
+    ],
+)
+def test_odbc_runner_forwards_deselected_tests(tmp_path, env, expected):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").touch()
+    runner = _ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh"
+    (tmp_path / "runner.sh").write_text(runner.read_text(encoding="utf-8"), newline="\n")
+    script = f"""
+    python() {{ return 0; }}
+    timeout() {{ printf '%s\\n' "$@" > "$PWD/args"; }}
+    {env} MSSQL_PYTHON_DIR="$2" TEST_RESULTS_DIR="$2/test-results" \
+        PYTEST_FILE_TIMEOUT=10s PYTEST_TOTAL_BUDGET=120s source "$1"
+    """
+    script_path = tmp_path / "run-test.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name, "./runner.sh", "."],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (tmp_path / "args").read_text(encoding="utf-8").splitlines()
+    pytest_args = args[args.index("tests/test_a.py"):]
+    deselected = [pytest_args[i + 1] for i, arg in enumerate(pytest_args) if arg == "--deselect"]
+    assert deselected == expected
+
+
+def test_mssql_python_odbc_job_deselects_only_timing_flaky_tests():
+    template = load_template("test-mssql-python-odbc-template.yml")
+    params = {p["name"]: p["default"] for p in template["parameters"]}
+    assert params["pytestDeselect"] == [
+        "tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release",
+    ]
+    step = next(
+        step for step in template["steps"]
+        if step.get("displayName") == "Run mssql-python tests against mssql-odbc"
+    )
+    assert "PYTEST_DESELECT=\"${{ join(' ', parameters.pytestDeselect) }}\"" in step["script"]
+
+
 def test_mssql_python_odbc_job_includes_non_slow_stress_tests():
     template = load_template("test-mssql-python-odbc-template.yml")
     params = {p["name"]: p["default"] for p in template["parameters"]}

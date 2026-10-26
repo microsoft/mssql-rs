@@ -44,6 +44,14 @@ parameters:
   - name: pytestMarker
     type: string
     default: 'not slow'
+  # pytest node IDs excluded from the run. The GIL-release test asserts a >2x
+  # wall-clock speedup for 10 concurrent connects, which measured 1.88x-2.82x on
+  # CI agents and fails without a GIL or driver regression
+  # (https://github.com/microsoft/mssql-rs/issues/762).
+  - name: pytestDeselect
+    type: object
+    default:
+      - tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release
 
 steps:
 - template: generate-sql-password-template.yml
@@ -224,6 +232,7 @@ steps:
     docker exec \
       -e DB_CONNECTION_STRING \
       -e PYTEST_MARK_EXPR="${{ parameters.pytestMarker }}" \
+      -e PYTEST_DESELECT="${{ join(' ', parameters.pytestDeselect) }}" \
       -e PYTEST_FILE_TIMEOUT="${{ parameters.pytestFileTimeout }}" \
       -e PYTEST_TOTAL_BUDGET="${{ parameters.pytestTotalBudget }}" \
       -e TEST_RESULTS_DIR=/workspace/test-results \

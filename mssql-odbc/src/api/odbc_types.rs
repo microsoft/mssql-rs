@@ -65,6 +65,8 @@ pub const SQL_COPT_SS_ACCESS_TOKEN: SqlInteger = 1256;
 pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
 pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
 pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
+pub const SQL_COPT_SS_MULTISUBNET_FAILOVER: SqlInteger = 1248;
+pub const SQL_COPT_SS_TNIR: SqlInteger = 1249;
 
 /// Physical client connection GUID string. Get-only; requires a connection.
 pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
@@ -122,6 +124,7 @@ pub const SQL_CD_FALSE: u32 = 0;
 
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
+pub const SQL_MODE_READ_ONLY: u32 = 1;
 
 // `SQL_ATTR_AUTOCOMMIT` values. The ODBC-mandated default is `SQL_AUTOCOMMIT_ON`
 // (msodbcsql `sqlcfunc.cpp:3462`); manual-commit is opt-in per connection.
