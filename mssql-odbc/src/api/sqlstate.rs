@@ -226,6 +226,10 @@ pub(crate) const ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
     text: "Optional feature not implemented",
 };
+pub(crate) const ERR_TNIR_NOT_SUPPORTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "TransparentNetworkIPResolution is not supported; use MultiSubnetFailover instead",
+};
 pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY003,
     text: "Invalid application buffer type",

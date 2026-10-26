@@ -207,6 +207,14 @@ blocking policy as the rest of the suite. Only the `slow` tests, including the
 fixed 5-minute sustained-load test, are left out; `pytestMarker: ''` selects
 every test. Leaving `PYTEST_MARK_EXPR` unset keeps upstream's default.
 
+Tests can be excluded through `PYTEST_DESELECT` (template parameter
+`pytestDeselect`, a list of pytest node IDs passed as `--deselect`). The default
+list holds `test_concurrent_connection_gil_release`, which asserts a >2x
+wall-clock speedup for 10 concurrent connects; CI agents measure 1.88x-2.82x, so
+it fails without a GIL or driver regression
+([#762](https://github.com/microsoft/mssql-rs/issues/762)). Remove it once the
+upstream test checks GIL release directly instead of a speedup ratio.
+
 The macOS job owns the locally built Rust and source-matched ODBC wheels and
 installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
 third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a

@@ -21,10 +21,10 @@ use crate::api::odbc_types::{
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
     SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_CLIENT_CONNECTION_ID, SQL_COPT_SS_ENCRYPT,
-    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_ON, SQL_ERROR,
-    SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer,
-    SqlReturn,
+    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_TNIR,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle,
+    SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -34,6 +34,20 @@ use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 /// Login timeout reported when the application has not set
 /// `SQL_ATTR_LOGIN_TIMEOUT`, which is what the connect path falls back to.
 const DEFAULT_LOGIN_TIMEOUT_SECS: u32 = DEFAULT_CONNECT_TIMEOUT_SECS;
+
+/// Writes an integer attribute and its four-byte width, as msodbcsql does for
+/// every integer connection attribute (`GetParamValue` and the shared tail of
+/// `SQLGetConnectAttrW`, `sqlcmisc.cpp`).
+///
+/// # Safety
+/// `value_ptr` must be writable for one `u32`, and `string_length_ptr` null or
+/// writable for one `SqlInteger`.
+unsafe fn write_u32_attr(value_ptr: SqlPointer, string_length_ptr: *mut SqlInteger, value: u32) {
+    unsafe {
+        write_if_some(value_ptr as *mut u32, value);
+        write_if_some(string_length_ptr, size_of::<u32>() as SqlInteger);
+    }
+}
 
 /// Retrieves a connection attribute.
 ///
@@ -178,7 +192,7 @@ fn sql_get_connect_attr_w_safe(
             // buffer. `Some(0)` reflects an app-set "wait indefinitely"; an
             // unset attribute reports the driver default.
             let secs = state.login_timeout.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS);
-            unsafe { write_if_some(value_ptr as *mut u32, secs) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, secs) };
             debug!(secs, "SQLGetConnectAttrW: login timeout returned");
             SQL_SUCCESS
         }
@@ -222,22 +236,24 @@ fn sql_get_connect_attr_w_safe(
                 // connection when connected, else the app-set attribute/default.
                 _ => state.effective_packet_size.unwrap_or(state.packet_size),
             };
-            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, value) };
             debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
             SQL_SUCCESS
         }
         // The `SQL_COPT_SS_*` forms of Encrypt / TrustServerCertificate /
-        // Trusted_Connection. While connected this reports the resolved setting,
-        // whether it came from the attribute or the keyword -- measured: with no
+        // Trusted_Connection / MultiSubnetFailover / TransparentNetworkIPResolution.
+        // While connected this reports the resolved setting, whether it came
+        // from the attribute or the keyword -- measured for Encrypt: with no
         // attribute set, `Encrypt=no` reads back 0.
         //
-        // Before connect there is nothing to resolve, so an unset attribute falls
-        // back to the driver defaults (encryption on, no trust, no integrated
-        // auth). That pre-connect case is inferred from the defaults, not
-        // measured, unlike the post-connect behaviour above.
+        // MSF reports the captured connection policy when connected and the
+        // explicit override or frozen startup default otherwise. TNIR is absent:
+        // its getter always reports off, and its setter accepts only off.
         SQL_COPT_SS_ENCRYPT
         | SQL_COPT_SS_TRUST_SERVER_CERTIFICATE
-        | SQL_COPT_SS_INTEGRATED_SECURITY => {
+        | SQL_COPT_SS_INTEGRATED_SECURITY
+        | SQL_COPT_SS_MULTISUBNET_FAILOVER
+        | SQL_COPT_SS_TNIR => {
             if value_ptr.is_null() {
                 error!(attribute, "SQLGetConnectAttrW: value pointer is null");
                 post_diag(&mut state, ERR_INVALID_NULL_POINTER);
@@ -254,9 +270,20 @@ fn sql_get_connect_attr_w_safe(
                 SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => {
                     settings.trust_server_certificate.unwrap_or(0)
                 }
+                SQL_COPT_SS_MULTISUBNET_FAILOVER => match settings.multi_subnet_failover {
+                    Some(value) => value,
+                    None => match mssql_tds::connection::multi_subnet_failover::default_multi_subnet_failover() {
+                        Ok(policy) => u32::from(policy.enabled),
+                        Err(error) => {
+                            post_tds_error(&mut state, &error, SQLSTATE_HY000);
+                            return SQL_ERROR;
+                        }
+                    },
+                },
+                SQL_COPT_SS_TNIR => 0,
                 _ => settings.integrated_security.unwrap_or(0),
             };
-            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, value) };
             debug!(
                 attribute,
                 value, "SQLGetConnectAttrW: vendor attribute returned"
@@ -295,7 +322,7 @@ fn sql_get_connect_attr_w_safe(
             } else {
                 SQL_CD_FALSE
             };
-            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            unsafe { write_u32_attr(value_ptr, string_length_ptr, value) };
             debug!(value, "SQLGetConnectAttrW: connection-dead returned");
             SQL_SUCCESS
         }
@@ -907,11 +934,13 @@ mod tests {
     #[test]
     fn vendor_attributes_report_driver_defaults_before_connect() {
         // Nothing has resolved yet, so these come from the driver defaults:
-        // encryption on, no trust, no integrated auth.
+        // Encryption and the built-in MSF default are on; TNIR is always off.
         let h = TestHandles::with_env_dbc();
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), SQL_EN_ON as u32);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE), 0);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_INTEGRATED_SECURITY), 0);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER), 1);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 0);
     }
 
     #[test]
@@ -924,10 +953,13 @@ mod tests {
                 encrypt: Some(0),
                 trust_server_certificate: Some(1),
                 integrated_security: Some(1),
+                multi_subnet_failover: Some(1),
             });
             state.connection_state = ConnectionState::Connected;
         }
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), 0);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_MULTISUBNET_FAILOVER), 1);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 0);
 
         dbc.inner.lock().unwrap().connection_state = ConnectionState::Disconnected;
         assert_eq!(
@@ -935,6 +967,7 @@ mod tests {
             SQL_EN_ON as u32,
             "a disconnected reusable handle reports its explicit override or default"
         );
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TNIR), 0);
     }
 
     #[test]
@@ -944,6 +977,8 @@ mod tests {
             SQL_COPT_SS_ENCRYPT,
             SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
             SQL_COPT_SS_INTEGRATED_SECURITY,
+            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+            SQL_COPT_SS_TNIR,
         ] {
             let get = unsafe {
                 sql_get_connect_attr_w(
@@ -956,5 +991,56 @@ mod tests {
             };
             assert_eq!(get, SQL_ERROR, "null value pointer for {attribute}");
         }
+    }
+
+    /// msodbcsql writes `sizeof(UDWORD)` for every integer connection attribute
+    /// (`GetParamValue` and the getter's shared tail, `sqlcmisc.cpp`); a failed
+    /// get leaves the caller's length alone.
+    #[test]
+    fn integer_gets_report_the_value_width() {
+        let h = TestHandles::with_env_dbc();
+        for attribute in [
+            SQL_ATTR_ACCESS_MODE,
+            SQL_ATTR_AUTOCOMMIT,
+            SQL_ATTR_LOGIN_TIMEOUT,
+            SQL_ATTR_CONNECTION_TIMEOUT,
+            SQL_ATTR_PACKET_SIZE,
+            SQL_ATTR_TXN_ISOLATION,
+            SQL_ATTR_CONNECTION_DEAD,
+            SQL_COPT_SS_TXN_ISOLATION,
+            SQL_COPT_SS_WARN_ON_CP_ERROR,
+            SQL_COPT_SS_ENCRYPT,
+            SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+            SQL_COPT_SS_INTEGRATED_SECURITY,
+            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+            SQL_COPT_SS_TNIR,
+        ] {
+            let mut value: u32 = 0;
+            let mut length: SqlInteger = -777;
+            let rc = unsafe {
+                crate::api::exports::SQLGetConnectAttrW(
+                    h.dbc,
+                    attribute,
+                    (&mut value as *mut u32).cast(),
+                    0,
+                    &mut length,
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "attribute {attribute}");
+            assert_eq!(length, 4, "attribute {attribute}");
+        }
+
+        let mut length: SqlInteger = -777;
+        let rc = unsafe {
+            crate::api::exports::SQLGetConnectAttrW(
+                h.dbc,
+                SQL_COPT_SS_TNIR,
+                std::ptr::null_mut(),
+                0,
+                &mut length,
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(length, -777);
     }
 }

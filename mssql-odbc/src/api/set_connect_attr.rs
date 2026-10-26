@@ -22,10 +22,11 @@ use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
     SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
     SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
-    SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_RESET_CONNECTION,
-    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
-    SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_MULTISUBNET_FAILOVER,
+    SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TNIR, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+    SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES,
+    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 #[cfg(not(windows))]
 use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
@@ -292,6 +293,46 @@ unsafe fn sql_set_connect_attr_w_impl(
                 }
                 _ => overrides.integrated_security = Some(u32::from(value != 0)),
             }
+            debug!(
+                attribute,
+                value, "SQLSetConnectAttrW: vendor override stored"
+            );
+            SQL_SUCCESS
+        }
+        // The attribute forms of MultiSubnetFailover and
+        // TransparentNetworkIPResolution. msodbcsql handles both in one arm
+        // (`sqlcmisc.cpp`): `HY011` once connected, `HY024` above `SQL_IS_ON`.
+        // MSF overrides its keyword; TNIR off is only a compatibility no-op.
+        SQL_COPT_SS_MULTISUBNET_FAILOVER | SQL_COPT_SS_TNIR => {
+            if state.connection_state != ConnectionState::Disconnected {
+                error!(
+                    attribute,
+                    "SQLSetConnectAttrW: vendor attribute set after connect"
+                );
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY011,
+                    0,
+                    "Attribute must be set before connecting",
+                );
+                return SQL_ERROR;
+            }
+            let value = value_ptr as usize as u64;
+            let Ok(value @ 0..=1) = u32::try_from(value) else {
+                error!(attribute, value, "SQLSetConnectAttrW: invalid on/off value");
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            };
+            if attribute == SQL_COPT_SS_TNIR {
+                if value != 0 {
+                    error!("SQLSetConnectAttrW: TNIR is not supported; use MultiSubnetFailover");
+                    post_diag(&mut state, ERR_TNIR_NOT_SUPPORTED);
+                    return SQL_ERROR;
+                }
+                return SQL_SUCCESS;
+            }
+            let overrides = &mut state.vendor_overrides;
+            overrides.multi_subnet_failover = Some(value);
             debug!(
                 attribute,
                 value, "SQLSetConnectAttrW: vendor override stored"
@@ -1405,6 +1446,65 @@ mod tests {
         }
     }
 
+    /// msodbcsql rejects anything above `SQL_IS_ON` for MSF with `HY024`
+    /// (`sqlcmisc.cpp`), unlike the folding attributes above.
+    #[test]
+    fn multi_subnet_failover_accepts_only_on_and_off() {
+        let attribute = SQL_COPT_SS_MULTISUBNET_FAILOVER;
+        for (raw, expected) in [(0usize, Some(0u32)), (1, Some(1)), (2, None), (7, None)] {
+            let h = TestHandles::with_env_dbc();
+            let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, raw as SqlPointer, 0) };
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            let stored = state.vendor_overrides.multi_subnet_failover;
+            assert_eq!(stored, expected, "attribute {attribute} value {raw}");
+            if expected.is_some() {
+                assert_eq!(ret, SQL_SUCCESS, "attribute {attribute} value {raw}");
+            } else {
+                assert_eq!(ret, SQL_ERROR, "attribute {attribute} value {raw}");
+                assert_eq!(
+                    state.diag_records()[0].sql_state,
+                    ERR_INVALID_ATTRIBUTE_VALUE.state,
+                    "attribute {attribute} value {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tnir_only_accepts_off_without_changing_msf() {
+        use crate::api::exports::SQLSetConnectAttrW;
+
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(
+            unsafe {
+                SQLSetConnectAttrW(
+                    h.dbc,
+                    SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                    1usize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        for (raw, expected) in [
+            (0usize, None),
+            (1, Some(SQLSTATE_HYC00)),
+            (2, Some(SQLSTATE_HY024)),
+        ] {
+            let rc = unsafe { SQLSetConnectAttrW(h.dbc, SQL_COPT_SS_TNIR, raw as SqlPointer, 0) };
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.vendor_overrides.multi_subnet_failover, Some(1));
+            if let Some(state_code) = expected {
+                assert_eq!(rc, SQL_ERROR);
+                assert_eq!(state.diag_records()[0].sql_state, state_code);
+            } else {
+                assert_eq!(rc, SQL_SUCCESS);
+            }
+        }
+    }
+
     /// `SQL_COPT_SS_WARN_ON_CP_ERROR` is a reporting preference, not a
     /// connection property, so it is settable in either state; only
     /// `SQL_WARN_YES` turns it on and anything outside the pair is `HY024`,
@@ -1460,10 +1560,14 @@ mod tests {
         // These select the transport and the credential, both fixed by the
         // handshake, so a late set could never apply. Measured against
         // msodbcsql: post-connect sets in the vendor band return HY011.
+        // MultiSubnetFailover and TNIR share msodbcsql's `HY011` arm
+        // (`sqlcmisc.cpp`).
         for attribute in [
             SQL_COPT_SS_ENCRYPT,
             SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
             SQL_COPT_SS_INTEGRATED_SECURITY,
+            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+            SQL_COPT_SS_TNIR,
         ] {
             let h = TestHandles::with_env_dbc();
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };

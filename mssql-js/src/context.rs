@@ -16,6 +16,8 @@ pub struct JsClientContext {
     pub password: String,
     pub database: String,
     pub trust_server_certificate: bool,
+    /// Omit to inherit startup defaults; false explicitly selects sequential TCP.
+    pub multi_subnet_failover: Option<bool>,
 }
 
 impl From<JsClientContext> for ClientContext {
@@ -36,6 +38,29 @@ impl From<JsClientContext> for ClientContext {
         context.password = js_ctx.password;
         context.database = js_ctx.database;
         context.encryption_options = encryption_options;
+        context.multi_subnet_failover = js_ctx.multi_subnet_failover;
         context
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msf_preserves_explicit_and_inherited_options() {
+        for choice in [None, Some(false), Some(true)] {
+            let native: ClientContext = JsClientContext {
+                server_name: "localhost".into(),
+                port: 1433,
+                user_name: String::new(),
+                password: String::new(),
+                database: String::new(),
+                trust_server_certificate: false,
+                multi_subnet_failover: choice,
+            }
+            .into();
+            assert_eq!(native.multi_subnet_failover, choice);
+        }
     }
 }

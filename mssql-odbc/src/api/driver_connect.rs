@@ -239,6 +239,9 @@ fn apply_vendor_overrides(params: &mut ConnectionParams, overrides: &VendorConnO
     if let Some(integrated) = overrides.integrated_security {
         params.trusted_connection = Some(integrated != 0);
     }
+    if let Some(multi_subnet_failover) = overrides.multi_subnet_failover {
+        params.multi_subnet_failover = Some(multi_subnet_failover != 0);
+    }
 }
 
 /// Resolves the `Encrypt=` keyword vocabulary onto an mssql-tds setting.
@@ -266,6 +269,7 @@ fn encryption_setting(encrypt: Option<&str>) -> EncryptionSetting {
 fn effective_vendor_settings(
     params: &ConnectionParams,
     connection_is_encrypted: bool,
+    multi_subnet_failover: bool,
 ) -> VendorConnOverrides {
     let mode = encryption_setting(params.encrypt.as_deref());
     let encrypt = match (mode, connection_is_encrypted) {
@@ -278,6 +282,7 @@ fn effective_vendor_settings(
         encrypt: Some(encrypt as u32),
         trust_server_certificate: Some(u32::from(trust)),
         integrated_security: Some(u32::from(params.trusted_connection.unwrap_or(false))),
+        multi_subnet_failover: Some(u32::from(multi_subnet_failover)),
     }
 }
 
@@ -360,6 +365,12 @@ fn do_connect(
             return SQL_ERROR;
         }
     };
+
+    if params.transparent_network_ip_resolution == Some(true) {
+        error!("SQLDriverConnectW: TNIR is not supported; use MultiSubnetFailover");
+        post_diag(state, super::sqlstate::ERR_TNIR_NOT_SUPPORTED);
+        return SQL_ERROR;
+    }
 
     // Pre-connect vendor attributes override the matching keyword, which is the
     // reverse of the `Database=` / `SQL_ATTR_CURRENT_CATALOG` ranking applied
@@ -491,8 +502,21 @@ fn do_connect(
     // Publish resolved values only after the connection succeeds. Explicit
     // attribute overrides remain separate so a reusable DBC does not feed a
     // previous connection string back into its next connection attempt.
-    state.effective_vendor_settings =
-        Some(effective_vendor_settings(&params, client.is_encrypted()));
+    let Some(network_policy) = client.multi_subnet_failover_policy() else {
+        error!("SQLDriverConnectW: connected client has no resolved network policy");
+        post_sql_error(
+            state,
+            super::sqlstate::SQLSTATE_HY000,
+            0,
+            "Missing connection network policy",
+        );
+        return SQL_ERROR;
+    };
+    state.effective_vendor_settings = Some(effective_vendor_settings(
+        &params,
+        client.is_encrypted(),
+        network_policy.enabled,
+    ));
     state.identity = ConnectionIdentity {
         client_connection_id: Some(std::sync::Arc::clone(&dbc.trace)),
         data_source_name: params.dsn.clone(),
@@ -585,7 +609,10 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
         };
     }
     if let Some(multi_subnet_failover) = params.multi_subnet_failover {
-        context.multi_subnet_failover = multi_subnet_failover;
+        context.multi_subnet_failover = Some(multi_subnet_failover);
+    }
+    if let Some(partner) = &params.failover_partner {
+        context.failover_partner.clone_from(partner);
     }
     if let Some(count) = params.connect_retry_count {
         context.connect_retry_count = count;
@@ -803,7 +830,7 @@ mod tests {
             let (mut params, _) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
             params.encrypt = keyword.map(str::to_string);
             assert_eq!(
-                effective_vendor_settings(&params, connection_is_encrypted).encrypt,
+                effective_vendor_settings(&params, connection_is_encrypted, true).encrypt,
                 Some(code),
                 "keyword {keyword:?}"
             );
@@ -812,7 +839,10 @@ mod tests {
 
     #[test]
     fn vendor_overrides_displace_the_matching_keyword() {
-        let base = cs("Server=h;UID=u;<PW>=p;Encrypt=no;TrustServerCertificate=yes");
+        let base = cs(
+            "Server=h;UID=u;<PW>=p;Encrypt=no;TrustServerCertificate=yes;\
+             MultiSubnetFailover=yes;TransparentNetworkIPResolution=Disabled",
+        );
         let (params, _) = parse_connection_string(&base).unwrap();
 
         // Nothing set: the connection string is left exactly as parsed.
@@ -824,6 +854,8 @@ mod tests {
             params.trust_server_certificate
         );
         assert_eq!(untouched.trusted_connection, params.trusted_connection);
+        assert_eq!(untouched.multi_subnet_failover, Some(true));
+        assert_eq!(untouched.transparent_network_ip_resolution, Some(false));
 
         // Each attribute wins over the keyword it duplicates.
         let mut overridden = params.clone();
@@ -833,11 +865,154 @@ mod tests {
                 encrypt: Some(2),
                 trust_server_certificate: Some(0),
                 integrated_security: Some(1),
+                multi_subnet_failover: Some(0),
             },
         );
         assert_eq!(overridden.encrypt.as_deref(), Some("strict"));
         assert!(!overridden.trust_server_certificate);
         assert_eq!(overridden.trusted_connection, Some(true));
+        assert_eq!(overridden.multi_subnet_failover, Some(false));
+        assert_eq!(overridden.transparent_network_ip_resolution, Some(false));
+    }
+
+    #[test]
+    fn tnir_keyword_on_and_invalid_values_have_distinct_diagnostics() {
+        for (value, expected_state) in [("Enabled", "HYC00"), ("invalid", "HY024")] {
+            let handles = TestHandles::with_env_dbc();
+            let input: Vec<u16> = format!("Server=host;TransparentNetworkIPResolution={value}")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let result = unsafe {
+                crate::api::exports::SQLDriverConnectW(
+                    handles.dbc,
+                    std::ptr::null_mut(),
+                    input.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert_eq!(result, SQL_ERROR);
+            assert_eq!(unsafe { diag_sqlstate(handles.dbc, 1) }, expected_state);
+        }
+    }
+
+    #[test]
+    fn msf_getter_tracks_connected_policy_without_leaking_keywords_to_reconnects() {
+        use crate::api::exports::{
+            SQLDisconnect, SQLDriverConnectW, SQLGetConnectAttrW, SQLSetConnectAttrW,
+        };
+        use crate::api::odbc_types::{
+            SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_TNIR, SqlPointer,
+        };
+        use mssql_mock_tds::MockTdsServer;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (address, shutdown, server_task) = runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+            let address = server.local_addr();
+            let (shutdown, receiver) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move { server.run_with_shutdown(receiver).await });
+            (address, shutdown, task)
+        });
+        let server = format!("Server=tcp:{},{};", address.ip(), address.port());
+        let address_override = format!(
+            "Server=localhost;Address={},{};",
+            address.ip(),
+            address.port(),
+        );
+        for (keyword, attribute, effective) in [
+            ("", None, 1),
+            ("MultiSubnetFailover=No;", None, 0),
+            ("MultiSubnetFailover=Yes;", Some(0), 0),
+            ("MultiSubnetFailover=No;", Some(1), 1),
+            ("TransparentNetworkIPResolution=Disabled;", None, 1),
+            ("Failover_Partner=mirror;", None, 0),
+            ("FailoverPartner=mirror;", None, 0),
+        ] {
+            let handles = TestHandles::with_env_dbc();
+            if let Some(value) = attribute {
+                assert_eq!(
+                    unsafe {
+                        SQLSetConnectAttrW(
+                            handles.dbc,
+                            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                            value as SqlPointer,
+                            0,
+                        )
+                    },
+                    SQL_SUCCESS,
+                );
+            }
+            for (endpoint, options, expected) in [
+                (&server, keyword, effective),
+                (&address_override, "", attribute.unwrap_or(1)),
+            ] {
+                let input: Vec<u16> = cs(&format!(
+                    "{endpoint}UID=sa;<PW>=unused;Encrypt=no;TrustServerCertificate=yes;{options}",
+                ))
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+                let result = unsafe {
+                    SQLDriverConnectW(
+                        handles.dbc,
+                        std::ptr::null_mut(),
+                        input.as_ptr(),
+                        SQL_NTS,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        SQL_DRIVER_NOPROMPT,
+                    )
+                };
+                assert!(
+                    matches!(result, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+                    "{options}: {result}"
+                );
+                for (attr, expected) in [
+                    (SQL_COPT_SS_MULTISUBNET_FAILOVER, expected),
+                    (SQL_COPT_SS_TNIR, 0),
+                ] {
+                    let mut value = u32::MAX;
+                    let mut length = -1;
+                    assert_eq!(
+                        unsafe {
+                            SQLGetConnectAttrW(
+                                handles.dbc,
+                                attr,
+                                (&mut value as *mut u32).cast(),
+                                4,
+                                &mut length,
+                            )
+                        },
+                        SQL_SUCCESS,
+                    );
+                    assert_eq!(value, expected as u32, "{options}");
+                    assert_eq!(length, 4);
+                }
+                assert_eq!(unsafe { SQLDisconnect(handles.dbc) }, SQL_SUCCESS);
+                let mut value = u32::MAX;
+                assert_eq!(
+                    unsafe {
+                        SQLGetConnectAttrW(
+                            handles.dbc,
+                            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                            (&mut value as *mut u32).cast(),
+                            4,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    SQL_SUCCESS,
+                );
+                assert_eq!(value, attribute.unwrap_or(1) as u32);
+            }
+        }
+        shutdown.send(()).unwrap();
+        runtime.block_on(server_task).unwrap().unwrap();
     }
 
     #[test]
@@ -847,13 +1022,40 @@ mod tests {
         let (params, _) =
             parse_connection_string(&cs("Server=h;Trusted_Connection=yes;Encrypt=no")).unwrap();
         assert_eq!(
-            effective_vendor_settings(&params, false),
+            effective_vendor_settings(&params, false, true),
             VendorConnOverrides {
                 encrypt: Some(0),
                 trust_server_certificate: Some(0),
                 integrated_security: Some(1),
+                multi_subnet_failover: Some(1),
             }
         );
+
+        let (params, _) = parse_connection_string(&cs(
+            "Server=h;MultiSubnetFailover=yes;TransparentNetworkIPResolution=Disabled",
+        ))
+        .unwrap();
+        let settings = effective_vendor_settings(&params, false, false);
+        // The captured policy, not the original keyword, controls the getter.
+        assert_eq!(settings.multi_subnet_failover, Some(0));
+    }
+
+    #[test]
+    fn msf_mapping_preserves_unspecified_and_explicit_false() {
+        let mut context = ClientContext::default();
+        assert_eq!(context.multi_subnet_failover, None);
+
+        let (params, _) = parse_connection_string(&cs(
+            "Server=h;MultiSubnetFailover=no;TransparentNetworkIPResolution=Disabled",
+        ))
+        .unwrap();
+        apply_connection_params(&mut context, &params);
+        assert_eq!(context.multi_subnet_failover, Some(false));
+
+        let (params, _) = parse_connection_string(&cs("Server=h")).unwrap();
+        let mut context = ClientContext::default();
+        apply_connection_params(&mut context, &params);
+        assert_eq!(context.multi_subnet_failover, None);
     }
 
     /// The trust flag reports the effective certificate policy, not the
@@ -874,7 +1076,7 @@ mod tests {
             let (params, _) =
                 parse_connection_string(&cs(&format!("Server=h;UID=u;<PW>=p;{keywords}"))).unwrap();
             assert_eq!(
-                effective_vendor_settings(&params, connection_is_encrypted)
+                effective_vendor_settings(&params, connection_is_encrypted, true)
                     .trust_server_certificate,
                 Some(expected),
                 "{keywords}, encrypted={connection_is_encrypted}"
@@ -1289,7 +1491,7 @@ mod tests {
             ctx.ipaddress_preference,
             IPAddressPreference::IPv6First
         ));
-        assert!(ctx.multi_subnet_failover);
+        assert_eq!(ctx.multi_subnet_failover, Some(true));
         assert_eq!(ctx.server_spn.as_deref(), Some("MSSQLSvc/host:1433"));
     }
 
