@@ -535,6 +535,7 @@ fn do_connect(
     // test — removing it changes no observable behavior, so any test for it
     // would have to write the field by hand and would pin nothing.
     state.database_user_name = None;
+    state.database_read_only = None;
     state.alias_types = None;
     // Bumped on every successful connect, and read by `publish_lookup` to tell
     // whether the session a lookup queried is still the one on the handle. The
@@ -2036,7 +2037,7 @@ mod tests {
     #[test]
     fn connect_advances_the_session_generation_and_clears_the_database_user() {
         use crate::api::disconnect::sql_disconnect;
-        use crate::handles::dbc::CachedDatabaseUserName;
+        use crate::handles::dbc::{CachedDatabaseReadOnly, CachedDatabaseUserName};
         use mssql_mock_tds::MockTdsServer;
         use std::time::Duration;
 
@@ -2098,8 +2099,19 @@ mod tests {
                 database_change_count: 0,
                 value: "first_session_user".to_string(),
             });
+            state.database_read_only = Some(Box::new(CachedDatabaseReadOnly {
+                catalog: "master".to_string(),
+                database_change_count: 0,
+                read_only: true,
+            }));
         }
         assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().database_read_only.is_none());
+        dbc.inner.lock().unwrap().database_read_only = Some(Box::new(CachedDatabaseReadOnly {
+            catalog: "master".to_string(),
+            database_change_count: 0,
+            read_only: true,
+        }));
         connect();
 
         let state = dbc.inner.lock().unwrap();
@@ -2111,6 +2123,7 @@ mod tests {
             state.database_user_name.is_none(),
             "the new session's principal is unrelated to the old one's"
         );
+        assert!(state.database_read_only.is_none());
         drop(state);
 
         let _ = shutdown_tx.send(());

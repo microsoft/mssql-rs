@@ -124,6 +124,7 @@ pub const SQL_CD_FALSE: u32 = 0;
 
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
+pub const SQL_MODE_READ_ONLY: u32 = 1;
 
 // `SQL_ATTR_AUTOCOMMIT` values. The ODBC-mandated default is `SQL_AUTOCOMMIT_ON`
 // (msodbcsql `sqlcfunc.cpp:3462`); manual-commit is opt-in per connection.

@@ -1008,7 +1008,7 @@ msodbcsql build is measured.
     Wire-level tests cover an absent BOM, a BOM split across calls, and later
     chunks after BOM classification. Tracked in AB#48349.
 
-31. **A busy connection's alias-type lookup logs in with the session's own
+31. **A busy connection's metadata lookups log in with the session's own
     authentication and encryption settings.** Both drivers read alias type
     names for `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME` on the session
     when it is idle, and on a separate login while rows are pending
@@ -1051,8 +1051,27 @@ msodbcsql build is measured.
     `SQL_DRIVER_VER` recorded would close it. Tracked in AB#48044. Human parity
     sign-off has not been recorded.
 
-32. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's alias-type
-    lookup, its login included.** msodbcsql bounds the lookup on an idle
+    Database-updateability lookups for `SQL_ATTR_ACCESS_MODE` (get and the
+    connected `READ_WRITE` setter) and `SQL_DATA_SOURCE_READ_ONLY` use the
+    same secondary-login policy. Their reference path is `IsDataBaseReadOnly`
+    (`sqlcmisc.cpp:1697-1716`, `3045-3058`, `8817-8845`) through `ExecOption`
+    (`sqlcinfo.cpp:494-573`): a failed spawned login propagates `SQL_ERROR`
+    instead of the alias-type lookup's base-name fallback. This driver
+    retains authentication and trust settings, reports the database state,
+    and rejects `READ_WRITE` on a read-only database with `HY024`.
+    CI build 184911 measured the pinned msodbcsql 18.6.2.1 package failing
+    both cold streaming getter tests in every concurrency mode and the
+    read-only-database streaming case, while all Rust-driver cases passed.
+    The three streaming tests in `attributes_test.cpp` therefore assert only
+    the Rust leg; idle-session and raw `USE` assertions remain on both legs.
+    **Evidence limit:** the CI log records the package version, not a separate
+    `SQL_DRIVER_VER` measurement for these access-mode cases; their
+    authentication/encryption mechanism shares the source and retail
+    evidence above. Tracked in AB#49297. Human parity sign-off has not been
+    recorded.
+
+32. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's metadata
+    lookup, its login included.** msodbcsql bounds the alias-type lookup on an idle
     session with the connection timeout (`GetNetIOTimeOut`), but on a busy one
     `RefreshShilohUDTCache` (`sqlccmd.cpp`) reads the timeout of the connection
     it spawned, which `SpawnConnection` (`sqlcinfo.cpp`) never sets: the read
@@ -1069,6 +1088,21 @@ msodbcsql build is measured.
     session's uncommitted `CREATE TYPE` until its 3-second command timeout.
     **Evidence limit:** msodbcsql's busy-path timeout is a source reading only.
     Tracked in AB#48044. Human parity sign-off has not been recorded.
+
+    Database-updateability lookups share this driver's deadline across the
+    login and read. Unlike `RefreshShilohUDTCache`, msodbcsql's `ExecOption`
+    (`sqlcinfo.cpp:504`, `548`) uses the parent's `GetNetIOTimeOut` for the
+    spawned read, so only login/deadline accounting differs here: its login
+    uses the copied login timeout, whereas this driver's connection timeout
+    also bounds the login and the time remaining for the read. With a
+    connection timeout of 0, the inherited login timeout still applies.
+    `secondary_login_timeout_is_reported_and_original_session_remains_usable`
+    and `secondary_read_timeout_leaves_the_original_session_untouched`
+    (`database_read_only.rs`) pin error propagation without disturbing the
+    original session. **Evidence limit:** the reference timeout behavior is
+    source-only; no stalled retail login/read measurement is recorded for
+    access mode. Tracked in AB#49297. Human parity sign-off has not been
+    recorded.
 
 33. **DNS fallback is published only by a completed, accepted login.**
     Source comparison: SNI's `GetCachedAddrInfo`
