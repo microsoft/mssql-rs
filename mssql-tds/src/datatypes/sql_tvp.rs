@@ -650,7 +650,7 @@ mod tests {
         let column = TvpColumnDef::new(SqlType::Varchar(None, 3));
         let row = vec![SqlType::Varchar(
             Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
-                "é  ".to_string(),
+                "€ ".to_string(),
             )),
             3,
         )];
@@ -669,7 +669,7 @@ mod tests {
 
         assert_eq!(
             &mock.data[PacketWriter::PACKET_HEADER_SIZE..],
-            &[TVP_ROW_TOKEN, 3, 0, 0xC3, 0xA9, b' ', TVP_END_TOKEN]
+            &[TVP_ROW_TOKEN, 3, 0, 0xE2, 0x82, 0xAC, TVP_END_TOKEN]
         );
     }
 
