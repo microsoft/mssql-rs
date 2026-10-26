@@ -288,10 +288,12 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_ATTR_ACCESS_MODE, SQL_ATTR_RESET_CONNECTION, SQL_DATA_SOURCE_READ_ONLY,
-        SQL_SUCCESS_WITH_INFO, SqlHandle, SqlSmallInt,
+        SQL_ATTR_ACCESS_MODE, SQL_ATTR_RESET_CONNECTION, SQL_C_SLONG, SQL_DATA_SOURCE_READ_ONLY,
+        SQL_NO_DATA, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlSmallInt,
     };
-    use crate::api::{SQLGetConnectAttrW, SQLGetInfoW, SQLSetConnectAttrW};
+    use crate::api::{
+        SQLExecDirectW, SQLFetch, SQLGetConnectAttrW, SQLGetData, SQLGetInfoW, SQLSetConnectAttrW,
+    };
     use crate::error::post_sql_error;
     use crate::handles::handle_from_raw;
     use crate::handles::wire::{ClaimPolicy, WireOwner};
@@ -360,6 +362,49 @@ mod tests {
             dbc(h).inner.lock().unwrap().diag_records[0].sql_state,
             *expected
         );
+    }
+
+    fn assert_row(h: &TestHandles, expected: i32) {
+        assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_SUCCESS);
+        let mut value = 0i32;
+        let mut length = 0;
+        assert_eq!(
+            unsafe {
+                SQLGetData(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    ptr::from_mut(&mut value).cast(),
+                    4,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, expected);
+        assert_eq!(length, 4);
+    }
+
+    fn open_pending_result(h: &TestHandles, server: &MockServer) {
+        const QUERY: &str = "SELECT value FROM pending_rows";
+        server.register_query(
+            QUERY,
+            QueryResponse::new(
+                vec![ColumnDefinition::new("value", SqlDataType::Int)],
+                (1..=3)
+                    .map(|value| Row::new(vec![ColumnValue::Int(value)]))
+                    .collect(),
+            ),
+        );
+        let sql: Vec<u16> = QUERY.encode_utf16().collect();
+        assert_eq!(
+            unsafe { SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap()) },
+            SQL_SUCCESS
+        );
+        assert_row(h, 1);
+        let state = dbc(h).inner.lock().unwrap();
+        assert_eq!(state.wire.statement_owner(), Some(h.stmt));
+        assert!(state.wire.client().unwrap().has_open_batch());
     }
 
     #[test]
@@ -646,19 +691,22 @@ mod tests {
     #[test]
     fn secondary_login_timeout_is_reported_and_original_session_remains_usable() {
         let (h, server) = fixture(response("Y"));
-        {
-            let mut state = dbc(&h).inner.lock().unwrap();
-            state.wire.set_owner_for_test(Some(h.stmt));
-            state.connection_timeout = 1;
-        }
+        open_pending_result(&h, &server);
+        dbc(&h).inner.lock().unwrap().connection_timeout = 1;
         server.set_login_delay(Duration::from_secs(8));
         let started = Instant::now();
         assert_eq!(info(h.dbc).0, SQL_ERROR);
         assert!(started.elapsed() < Duration::from_secs(5));
-        let state = dbc(&h).inner.lock().unwrap();
-        assert!(state.wire.client().is_some());
-        assert!(state.database_read_only.is_none());
-        assert!(!state.diag_records.is_empty());
+        {
+            let state = dbc(&h).inner.lock().unwrap();
+            assert!(state.wire.client().is_some());
+            assert_eq!(state.wire.statement_owner(), Some(h.stmt));
+            assert!(state.database_read_only.is_none());
+            assert!(!state.diag_records.is_empty());
+        }
+        assert_row(&h, 2);
+        assert_row(&h, 3);
+        assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_NO_DATA);
     }
 
     #[test]
@@ -763,19 +811,21 @@ mod tests {
     #[test]
     fn secondary_read_timeout_leaves_the_original_session_untouched() {
         let (h, server) = fixture(response("Y").with_delay(Duration::from_secs(8)));
-        {
-            let mut state = dbc(&h).inner.lock().unwrap();
-            state.wire.set_owner_for_test(Some(h.stmt));
-            state.connection_timeout = 1;
-        }
+        open_pending_result(&h, &server);
+        dbc(&h).inner.lock().unwrap().connection_timeout = 1;
         let started = Instant::now();
         assert_eq!(mode(h.dbc).0, SQL_ERROR);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(server.connection_count(), 2);
-        let state = dbc(&h).inner.lock().unwrap();
-        assert!(state.wire.client().is_some());
-        assert_eq!(state.wire.statement_owner(), Some(h.stmt));
-        assert!(state.database_read_only.is_none());
+        {
+            let state = dbc(&h).inner.lock().unwrap();
+            assert!(state.wire.client().is_some());
+            assert_eq!(state.wire.statement_owner(), Some(h.stmt));
+            assert!(state.database_read_only.is_none());
+        }
+        assert_row(&h, 2);
+        assert_row(&h, 3);
+        assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_NO_DATA);
     }
 
     #[test]
