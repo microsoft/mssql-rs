@@ -570,6 +570,8 @@ struct BufferedRowSupport {
 #[derive(Debug)]
 pub struct TdsClient {
     pub(crate) transport: AnyTransport,
+    /// An interrupted packet/TLS record forbids even graceful shutdown writes.
+    transport_shutdown_unsafe: bool,
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
@@ -791,6 +793,7 @@ impl TdsClient {
 
         Self {
             transport,
+            transport_shutdown_unsafe: false,
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
@@ -881,7 +884,7 @@ impl TdsClient {
         );
 
         // Close the dead transport (best-effort)
-        let _ = self.transport.close_transport().await;
+        let _ = self.close_transport_if_safe().await;
 
         let deadline = Instant::now() + timeout;
         let connect_retry_count = client_context.connect_retry_count;
@@ -1016,6 +1019,7 @@ impl TdsClient {
         session_state_tokens: &[crate::token::tokens::SessionStateToken],
     ) -> TdsResult<()> {
         self.transport = transport;
+        self.transport_shutdown_unsafe = false;
         let database_changes = self.negotiated_settings.database_change_count;
         self.negotiated_settings = settings;
         // A recovered session is a *different* session — new login, so the
@@ -2782,7 +2786,7 @@ impl TdsClient {
         // RPC's first return value into the handle map.
         self.abort_pending_prepare_capture();
         self.transport.mark_known_dead();
-        if let Err(error) = self.transport.close_transport().await {
+        if let Err(error) = self.close_transport_if_safe().await {
             warn!(%error, "Failed to close transport after streamed write abort");
         }
     }
@@ -3053,8 +3057,10 @@ impl TdsClient {
     /// incomplete one, so the socket is all that is left to discard. Clearing
     /// the open-batch flag lets the next `check_and_reconnect` recover.
     async fn abort_partial_request(&mut self) {
-        self.retire_without_writing();
-        if let Err(error) = self.transport.close_transport().await {
+        self.execution_context.set_has_open_batch(false);
+        self.abort_pending_prepare_capture();
+        self.transport.mark_known_dead();
+        if let Err(error) = self.close_transport_if_safe().await {
             warn!(%error, "Failed to close transport after a partial request abort");
         }
     }
@@ -3067,9 +3073,17 @@ impl TdsClient {
     /// stream. `send_attention_and_wait` avoids it the same way, by marking the
     /// connection dead and never writing again.
     fn retire_without_writing(&mut self) {
+        self.transport_shutdown_unsafe = true;
         self.execution_context.set_has_open_batch(false);
         self.abort_pending_prepare_capture();
         self.transport.mark_known_dead();
+    }
+
+    async fn close_transport_if_safe(&mut self) -> TdsResult<()> {
+        if self.transport_shutdown_unsafe {
+            return Ok(());
+        }
+        self.transport.close_transport().await
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -8990,7 +9004,7 @@ impl TdsClient {
         // so a later call on a lingering handle cannot silently resurrect it.
         self.recovery_context.session_recovery_negotiated = false;
         self.transport.mark_known_dead();
-        self.transport.close_transport().await?;
+        self.close_transport_if_safe().await?;
         Ok(())
     }
 
@@ -9135,18 +9149,21 @@ impl TdsClient {
         self.remaining_request_timeout = resolved.duration();
         self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
-        let transaction =
-            TransactionManagementRequest::new(transaction_params, &self.execution_context);
-        let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
-        let sent = transaction.serialize(&mut packet_writer).await;
-        let message = packet_writer.suspend();
-        drop(transaction);
-        self.finish_send(sent, message).await?;
-
-        self.consume_transaction_response().await?;
-
-        Ok(())
+        let result = async {
+            let transaction =
+                TransactionManagementRequest::new(transaction_params, &self.execution_context);
+            let mut packet_writer =
+                transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
+            let sent = transaction.serialize(&mut packet_writer).await;
+            let message = packet_writer.suspend();
+            drop(transaction);
+            self.finish_send(sent, message).await?;
+            self.consume_transaction_response().await
+        }
+        .await;
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        result
     }
 
     /// Create a savepoint within the current transaction.
@@ -14751,7 +14768,11 @@ mod tests {
         }
     }
 
-    async fn assert_bulk_partial_send_timeout(column_count: usize, row_count: usize) {
+    async fn assert_bulk_partial_send_timeout(
+        column_count: usize,
+        row_count: usize,
+        active_transaction: bool,
+    ) {
         use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
         use crate::datatypes::sqldatatypes::TdsDataType;
 
@@ -14761,7 +14782,11 @@ mod tests {
         let closes = Arc::clone(&transport.close_calls);
         let attentions = Arc::clone(&transport.attentions);
         let mut client = create_test_client_with_transport(transport);
-        client.execution_context.set_transaction_descriptor(42);
+        if active_transaction {
+            client.execution_context.set_transaction_descriptor(42);
+        } else {
+            client.recovery_context.session_recovery_negotiated = true;
+        }
         let columns = (0..column_count)
             .map(|index| {
                 BulkCopyColumnMetadata::new(
@@ -14818,30 +14843,54 @@ mod tests {
         }
         assert_eq!(wire[offset], PacketType::BulkLoad as u8);
         assert_eq!(wire.len() - offset, 8, "no writes after the partial packet");
-        assert!(matches!(
-            client.rollback_transaction(None, None).await,
-            Err(crate::error::Error::ConnectionClosed(_))
-        ));
+        if active_transaction {
+            assert!(matches!(
+                client.rollback_transaction(None, None).await,
+                Err(crate::error::Error::ConnectionClosed(_))
+            ));
+        } else {
+            assert!(
+                client
+                    .recovery_context
+                    .is_recovery_possible(&client.execution_context)
+            );
+            let cancel = CancelHandle::new();
+            cancel.cancel();
+            assert!(matches!(
+                client.check_and_reconnect(Some(1), Some(&cancel)).await,
+                Err(crate::error::Error::SessionRecoveryFailed { .. })
+            ));
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            client.close_connection().await.unwrap();
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
         assert_eq!(
             *sent.lock().unwrap(),
             wire,
-            "rollback must not write either"
+            "cleanup and recovery must not write either"
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn bulk_metadata_timeout_retires_partial_send_without_writing() {
-        assert_bulk_partial_send_timeout(300, 1).await;
+        assert_bulk_partial_send_timeout(300, 1, true).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn bulk_row_timeout_retires_partial_send_without_writing() {
-        assert_bulk_partial_send_timeout(1, 2000).await;
+        assert_bulk_partial_send_timeout(1, 2000, true).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn bulk_end_timeout_retires_partial_send_without_writing() {
-        assert_bulk_partial_send_timeout(1, 1).await;
+        assert_bulk_partial_send_timeout(1, 1, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_interrupted_send_recovery_never_shuts_down_the_damaged_transport() {
+        for (columns, rows) in [(300, 1), (1, 2000), (1, 1)] {
+            assert_bulk_partial_send_timeout(columns, rows, false).await;
+        }
     }
 
     #[tokio::test]
@@ -20375,6 +20424,8 @@ mod tests {
             };
             assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
             assert_eq!(start.elapsed(), Duration::from_secs(1));
+            assert!(client.remaining_request_timeout.is_none());
+            assert!(client.cancel_handle.is_none());
             assert!(client.is_connection_dead());
             assert!(client.has_active_transaction());
             assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -20456,6 +20507,8 @@ mod tests {
                 Err(crate::error::Error::OperationCancelledError(_))
             ));
             assert_eq!(start.elapsed(), Duration::from_secs(3));
+            assert!(client.remaining_request_timeout.is_none());
+            assert!(client.cancel_handle.is_none());
             assert!(client.is_connection_dead());
             assert!(client.has_active_transaction());
             assert_eq!(sent.lock().unwrap().len(), 8);
@@ -20495,6 +20548,53 @@ mod tests {
                 };
                 result.unwrap();
                 assert_eq!(*timeouts.lock().unwrap(), vec![None]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_request_options_do_not_leak_into_later_requests() {
+        for commit in [true, false] {
+            for response_fails in [true, false] {
+                for dtc in [true, false] {
+                    let mut tokens = Vec::new();
+                    if response_fails {
+                        tokens.push(Tokens::Error(error_token_with_severity(16)));
+                    }
+                    tokens.extend([done_no_more(), done_no_more()]);
+                    let transport = TestTransport::with_tokens(tokens);
+                    let timeouts = Arc::clone(&transport.receive_timeouts);
+                    let mut client = create_test_client_with_transport(transport);
+                    client.execution_context.set_transaction_descriptor(42);
+                    let cancel = CancelHandle::new();
+                    let options = ExecuteOptions::new().timeout_secs(1).cancel(&cancel);
+                    let result = if commit {
+                        client
+                            .commit_transaction_with_options(None, None, options)
+                            .await
+                    } else {
+                        client
+                            .rollback_transaction_with_options(
+                                Some("savepoint".to_string()),
+                                None,
+                                options,
+                            )
+                            .await
+                    };
+                    assert_eq!(result.is_err(), response_fails);
+                    cancel.cancel();
+                    if dtc {
+                        client.get_dtc_address().await.unwrap();
+                    } else {
+                        client
+                            .save_transaction("next_savepoint".to_string())
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(timeouts.lock().unwrap().last(), Some(&None));
+                    assert!(client.remaining_request_timeout.is_none());
+                    assert!(client.cancel_handle.is_none());
+                }
             }
         }
     }
@@ -22594,6 +22694,25 @@ mod tests {
             8,
             "the recovered session must not reuse a count a cache could already hold"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_transport_can_shut_down_after_an_interrupted_old_transport() {
+        let mut client = create_test_client();
+        client.retire_without_writing();
+        let transport = TestTransport::new();
+        let closes = Arc::clone(&transport.close_calls);
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(transport),
+                crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .unwrap();
+        client.close_connection().await.unwrap();
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Regression: the cursor RPCs consume their responses via `drain_stream`
