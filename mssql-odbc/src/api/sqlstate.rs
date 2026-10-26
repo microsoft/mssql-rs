@@ -85,6 +85,25 @@ pub(crate) struct DiagMsg {
     pub(crate) text: &'static str,
 }
 
+impl From<crate::conversion::error::ConvError> for DiagMsg {
+    fn from(error: crate::conversion::error::ConvError) -> Self {
+        use crate::conversion::error::ConvError;
+
+        match error {
+            ConvError::OutOfRange => ERR_NUMERIC_OUT_OF_RANGE,
+            ConvError::DatetimeFieldOverflow => ERR_DATETIME_FIELD_OVERFLOW,
+            ConvError::InvalidDatetimeFormat => ERR_INVALID_DATETIME_FORMAT,
+            ConvError::Restricted => ERR_RESTRICTED_DATA_TYPE,
+            ConvError::InvalidCharacterValue => ERR_INVALID_CHARACTER_VALUE,
+            ConvError::Internal => ERR_INTERNAL_CONVERSION,
+            ConvError::NotHandledHere => Self {
+                state: SQLSTATE_HYC00,
+                text: "Column type conversion not yet implemented",
+            },
+        }
+    }
+}
+
 pub(crate) const ERR_INVALID_CURSOR_STATE: DiagMsg = DiagMsg {
     state: SQLSTATE_24000,
     text: "Invalid cursor state",

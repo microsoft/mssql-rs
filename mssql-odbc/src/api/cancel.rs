@@ -1370,7 +1370,7 @@ mod tests {
                 server.set_tm_begin_delay(Duration::from_secs(8));
                 dbc.inner.lock().unwrap().autocommit = false;
             }
-            dbc.inner.lock().unwrap().connection_timeout = 1;
+            dbc.set_connection_timeout(1);
             let sql: Vec<u16> = match path {
                 "rpc" => "{call cancel_test}",
                 "parameterized" | "array" => "WAITFOR DELAY '00:00:08'; SELECT ?",
