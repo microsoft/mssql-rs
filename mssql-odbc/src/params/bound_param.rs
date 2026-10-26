@@ -62,7 +62,7 @@ pub(crate) struct BoundParam {
     pub(crate) octet_length_ptr: *mut SqlLen,
 }
 
-/// One parameter ordinal's execute-time snapshot: the POD binding plus the
+/// One ordinal's execute-time binding, connection type policy, and optional
 /// UDT identity from the IPD's `SQL_CA_SS_UDT_*` fields.
 ///
 /// The name is kept out of [`BoundParam`] deliberately. It varies per ordinal
@@ -73,6 +73,8 @@ pub(crate) struct BoundParam {
 #[derive(Debug, Clone)]
 pub(crate) struct ParamSnapshot {
     pub(crate) param: BoundParam,
+    /// Effective connection policy captured once for this execution.
+    pub(crate) long_as_max: bool,
     /// `None` for every parameter that is not a `SQL_SS_UDT`.
     pub(crate) udt_names: Option<Arc<UdtNames>>,
 }
@@ -81,6 +83,7 @@ impl From<BoundParam> for ParamSnapshot {
     fn from(param: BoundParam) -> Self {
         Self {
             param,
+            long_as_max: false,
             udt_names: None,
         }
     }
@@ -297,6 +300,7 @@ impl BoundParam {
         apd_state: &DescState,
         ipd_state: &DescState,
         odbc_version: OdbcVersion,
+        long_as_max: bool,
     ) -> Vec<Option<ParamSnapshot>> {
         apd_state
             .records
@@ -307,6 +311,7 @@ impl BoundParam {
                 let param = Self::from_records(apd_record, ipd_record, odbc_version)?;
                 Some(ParamSnapshot {
                     param,
+                    long_as_max,
                     // Filtered to match the doc on the field, and for the same
                     // reason `parameter_definition` filters: `classify_field`
                     // gates the `SQL_CA_SS_UDT_*` fields on `DescKind::ImpParam`
@@ -760,7 +765,8 @@ mod tests {
             .records
             .push(DescRecord::default_for(DescKind::AppParam));
 
-        let params = BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION);
+        let params =
+            BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION, false);
         assert_eq!(params.len(), 2);
         assert!(params[0].is_some());
         assert!(params[1].is_none());
@@ -785,7 +791,8 @@ mod tests {
         apd_state.records.push(apd);
         ipd_state.records.push(ipd);
 
-        let params = BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION);
+        let params =
+            BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION, false);
         assert!(
             params[0].as_ref().unwrap().udt_names.is_none(),
             "a scalar parameter must carry no UDT identity"

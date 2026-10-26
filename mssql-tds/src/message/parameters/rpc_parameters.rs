@@ -1016,6 +1016,7 @@ impl From<&SqlType> for TdsDataType {
             SqlType::NChar(_, _) => TdsDataType::NChar,
             SqlType::Text(_) => TdsDataType::Text,
             SqlType::NText(_) => TdsDataType::NText,
+            SqlType::Image(_) => TdsDataType::Image,
             SqlType::Json(_) => TdsDataType::Json,
             SqlType::Money(_) => TdsDataType::Money,
             SqlType::SmallMoney(_) => TdsDataType::Money4,
@@ -1363,6 +1364,127 @@ mod tests {
         let collation = SqlCollation::default();
         block_on(value.write_type_info(&mut w, &collation, None, None)).unwrap();
         payload(&w)
+    }
+
+    #[test]
+    fn legacy_lob_rpc_framing_preserves_the_following_parameter() {
+        use crate::datatypes::sql_string::{EncodingType, SqlString};
+
+        let collation = SqlCollation {
+            info: 0x00000409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let cases: Vec<(SqlType, u8, Option<Vec<u8>>)> = vec![
+            (
+                SqlType::Text(Some(SqlString::new(
+                    "caf\u{e9}".as_bytes().to_vec(),
+                    EncodingType::Utf8,
+                ))),
+                0x23,
+                Some(b"caf\xe9".to_vec()),
+            ),
+            (
+                SqlType::Text(Some(SqlString::new(
+                    vec![0xe9, 0, b'x'],
+                    EncodingType::DelayedSet,
+                ))),
+                0x23,
+                Some(vec![0xe9, 0, b'x']),
+            ),
+            (
+                SqlType::NText(Some(SqlString::new(
+                    "A\u{1f600}".as_bytes().to_vec(),
+                    EncodingType::Utf8,
+                ))),
+                0x63,
+                Some(vec![b'A', 0, 0x3d, 0xd8, 0, 0xde]),
+            ),
+            (
+                SqlType::NText(Some(SqlString::new(
+                    vec![0xe9, b'a'],
+                    EncodingType::LcidBased(collation),
+                ))),
+                0x63,
+                Some(vec![0xe9, 0, b'a', 0]),
+            ),
+            (
+                SqlType::Image(Some(vec![0, 0xff, 7])),
+                0x22,
+                Some(vec![0, 0xff, 7]),
+            ),
+            (
+                SqlType::Text(Some(SqlString::from_utf8_string(String::new()))),
+                0x23,
+                Some(vec![]),
+            ),
+            (
+                SqlType::NText(Some(SqlString::from_utf8_string(String::new()))),
+                0x63,
+                Some(vec![]),
+            ),
+            (SqlType::Image(Some(vec![])), 0x22, Some(vec![])),
+            (SqlType::Text(None), 0x23, None),
+            (SqlType::NText(None), 0x63, None),
+            (SqlType::Image(None), 0x22, None),
+        ];
+        for (value, tds_type, data) in cases {
+            let mut mock = MockNetworkWriter::new(4096);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            let parameter = RpcParameter::new(None, StatusFlags::NONE, value);
+            let next = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(7)));
+            block_on(parameter.serialize(&mut writer, &collation, true, &GenericEncoder::new()))
+                .unwrap();
+            block_on(next.serialize(&mut writer, &collation, true, &GenericEncoder::new()))
+                .unwrap();
+
+            let length = u32::try_from(data.as_deref().map_or(0, <[u8]>::len)).unwrap();
+            let mut expected = vec![0, 0, tds_type];
+            expected.extend_from_slice(&length.to_le_bytes());
+            if tds_type != 0x22 {
+                expected.extend_from_slice(&[0x09, 0x04, 0, 0, 52]);
+            }
+            expected
+                .extend_from_slice(&if data.is_some() { length } else { u32::MAX }.to_le_bytes());
+            if let Some(data) = data {
+                expected.extend_from_slice(&data);
+            }
+            expected.extend_from_slice(&[0, 0, 0x26, 4, 4, 7, 0, 0, 0]);
+            assert_eq!(payload(&writer), expected, "{parameter:?}");
+        }
+    }
+
+    #[test]
+    fn streamed_legacy_declaration_keeps_a_max_wire_header() {
+        for (wire_type, declaration, name, type_byte) in [
+            (
+                StreamedSqlType::VarcharMax,
+                SqlType::Text(None),
+                "text",
+                0xa7,
+            ),
+            (
+                StreamedSqlType::NVarcharMax,
+                SqlType::NText(None),
+                "ntext",
+                0xe7,
+            ),
+            (
+                StreamedSqlType::VarBinaryMax,
+                SqlType::Image(None),
+                "image",
+                0xa5,
+            ),
+        ] {
+            let parameter =
+                RpcParameter::data_at_exec(Some("@p".into()), StatusFlags::NONE, wire_type)
+                    .with_streamed_declaration(declaration);
+            assert_eq!(parameter.sql_declaration().unwrap(), name);
+            let bytes = serialize_param(&parameter);
+            assert_eq!(&bytes[6..9], &[type_byte, 0xff, 0xff]);
+            assert_eq!(bytes.len(), if type_byte == 0xa5 { 9 } else { 14 });
+        }
     }
 
     /// A short encrypted value is serialized as a BIGVARBINARY with the

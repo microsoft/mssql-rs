@@ -137,6 +137,17 @@ can therefore receive leading characters that were previously stripped or decode
 under the wrong encoding. Malformed-sequence handling is unchanged; preserving
 raw unpaired UTF-16 units in ODBC `SQL_C_WCHAR` buffers is a separate behavior.
 
+## Legacy LOB RPC parameters
+
+`SqlType::Text`, `SqlType::NText`, and `SqlType::Image` support materialized,
+empty, and NULL RPC values. Their RPC metadata uses the encoded byte length,
+and their values use a four-byte length or NULL marker. Bulk-copy ROW values
+retain their separate text-pointer/timestamp framing.
+
+DAE values can retain a legacy declaration through
+`RpcParameter::with_streamed_declaration` while their payload uses the matching
+MAX/PLP wire type, without buffering the entire value.
+
 ## Feature flags
 
 | Flag | Default | Description |

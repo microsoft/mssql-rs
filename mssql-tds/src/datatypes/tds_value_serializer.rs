@@ -1492,58 +1492,7 @@ impl TdsValueSerializer {
                 }
             }
             VARCHAR | CHAR | TEXT => {
-                // VARCHAR/CHAR/TEXT - single-byte encoding
-                // If the bytes are already in wire format (DelayedSet or LcidBased),
-                // use them directly without decode→re-encode roundtrip.
-                // This is critical for the RPC path where bytes are pre-encoded.
-                if let Some(raw_bytes) = value.as_raw_wire_bytes() {
-                    return Self::serialize_char_varchar_direct(
-                        writer,
-                        raw_bytes,
-                        ctx,
-                        narrow_string_byte_limit,
-                        fit_narrow_overflow,
-                    )
-                    .await;
-                }
-
-                // `EncodingType::Utf8` is a declaration, not a guarantee --
-                // `SqlString::new` stores whatever bytes it is handed -- so the
-                // validity is checked rather than assumed, as `get_data.rs`'s
-                // narrow passthrough does. Invalid bytes fall through to the
-                // established path, which is what they did before this fast
-                // path existed.
-                //
-                // Skipping the encode is sound because `collation.utf8()` is
-                // `try_resolve_collation`'s first branch, so the resolved
-                // encoding is UTF-8 unconditionally, and UTF-8 represents every
-                // character, so no substitution can be lost.
-                //
-                // Reachable only since AB#48437: before it this arm resolved a
-                // UTF-8 collation to the LCID's single-byte page, so source and
-                // target never matched.
-                let borrowed = match value.encoding_type() {
-                    EncodingType::Utf8 => std::str::from_utf8(&value.bytes).ok(),
-                    _ => None,
-                };
-                if borrowed.is_some() && ctx.collation.is_some_and(|c| c.utf8()) {
-                    return Self::serialize_char_varchar_direct(
-                        writer,
-                        &value.bytes,
-                        ctx,
-                        narrow_string_byte_limit,
-                        fit_narrow_overflow,
-                    )
-                    .await;
-                }
-
-                // Declared-but-malformed UTF-8 takes the `Owned` arm and still
-                // panics inside `to_utf8_string`; that is AB#47576's to change.
-                let decoded_str: Cow<'_, str> = match borrowed {
-                    Some(text) => Cow::Borrowed(text),
-                    None => Cow::Owned(value.to_utf8_string()),
-                };
-                let encoded = Self::encode_narrow_for_wire(&decoded_str, ctx.collation);
+                let (bytes, had_loss) = Self::narrow_string_wire_bytes(value, ctx.collation);
                 // Marked only once the value has actually serialized.
                 // `serialize_char_varchar_direct` rejects an over-length value
                 // before writing a byte, and a substitution shortens nothing
@@ -1553,13 +1502,13 @@ impl TdsValueSerializer {
                 // (AB#47598).
                 let result = Self::serialize_char_varchar_direct(
                     writer,
-                    &encoded.bytes,
+                    &bytes,
                     ctx,
                     narrow_string_byte_limit,
                     fit_narrow_overflow,
                 )
                 .await;
-                if result.is_ok() && encoded.had_loss {
+                if result.is_ok() && had_loss {
                     writer.note_code_page_conversion_loss();
                 }
                 return result;
@@ -1710,6 +1659,31 @@ impl TdsValueSerializer {
         }
 
         Ok(())
+    }
+
+    /// Resolve once when RPC metadata and the value both need the encoded length.
+    pub(crate) fn narrow_string_wire_bytes(
+        value: &crate::datatypes::sql_string::SqlString,
+        collation: Option<SqlCollation>,
+    ) -> (Cow<'_, [u8]>, bool) {
+        if let Some(raw_bytes) = value.as_raw_wire_bytes() {
+            return (Cow::Borrowed(raw_bytes), false);
+        }
+        // A declared encoding is not proof that the bytes are valid. Preserve
+        // the existing decoder path for malformed input (AB#47576).
+        let borrowed = match value.encoding_type() {
+            EncodingType::Utf8 => std::str::from_utf8(&value.bytes).ok(),
+            _ => None,
+        };
+        if borrowed.is_some() && collation.is_some_and(|c| c.utf8()) {
+            return (Cow::Borrowed(&value.bytes), false);
+        }
+        let decoded = match borrowed {
+            Some(text) => Cow::Borrowed(text),
+            None => Cow::Owned(value.to_utf8_string()),
+        };
+        let encoded = Self::encode_narrow_for_wire(&decoded, collation);
+        (Cow::Owned(encoded.bytes), encoded.had_loss)
     }
 
     /// Encodes `text` into the wire representation used for VARCHAR/CHAR/TEXT:
@@ -1945,7 +1919,7 @@ impl TdsValueSerializer {
     /// Helper to serialize a single-byte string for CHAR/VARCHAR types.
     ///
     /// Takes single-byte encoded data and serializes it according to the TDS type context.
-    fn fit_narrow_bytes(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
+    pub(crate) fn fit_narrow_bytes(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
         if bytes.len() <= maximum {
             return Ok(bytes);
         }
