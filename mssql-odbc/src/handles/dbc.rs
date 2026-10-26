@@ -121,8 +121,7 @@ pub(crate) struct DbcState {
     /// resolved by one connection is never reused as an explicit attribute on
     /// the next connection attempt.
     pub(crate) effective_vendor_settings: Option<VendorConnOverrides>,
-    /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
-    /// does not yet vary its behaviour on it.
+    /// Requested `SQL_ATTR_ACCESS_MODE`; a read-only database overrides it on get.
     pub(crate) access_mode: u32,
     /// `SQL_COPT_SS_WARN_ON_CP_ERROR`. When `true`, a value carrying a character
     /// the narrow encoding it is sent in could not represent — substituted with
@@ -255,6 +254,9 @@ pub(crate) struct DbcState {
     /// with the client's database-change count so a `USE` the driver did not
     /// issue — including a `USE [X]` while already in `X` — still invalidates.
     pub(crate) database_user_name: Option<CachedDatabaseUserName>,
+    /// Actual database updateability, shared by the access-mode attributes and
+    /// `SQL_DATA_SOURCE_READ_ONLY`. Invalidated by database and session changes.
+    pub(crate) database_read_only: Option<Box<CachedDatabaseReadOnly>>,
     /// Alias type names (`sp_addtype`, `CREATE TYPE ... FROM`) for
     /// `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME`, read lazily on the
     /// first description of an alias-typed column. Cleared when the session
@@ -337,6 +339,13 @@ pub(crate) struct CachedDatabaseUserName {
     /// already cleared by then, so it reports the old value and stops asking.
     /// Empty when there was no previous answer to keep.
     pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedDatabaseReadOnly {
+    pub(crate) catalog: String,
+    pub(crate) database_change_count: u64,
+    pub(crate) read_only: bool,
 }
 
 /// A [`DbcState::alias_types`] entry: `systypes` names keyed by the
@@ -422,6 +431,7 @@ impl DbcHandle {
                 identity: ConnectionIdentity::default(),
                 session_generation: 0,
                 database_user_name: None,
+                database_read_only: None,
                 alias_types: None,
                 last_collation_code_page: None,
                 last_char_set: None,

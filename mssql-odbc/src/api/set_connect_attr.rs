@@ -193,6 +193,9 @@ unsafe fn sql_set_connect_attr_w_impl(
     // The transaction attributes talk to the server, which must not happen while
     // the DBC mutex is held, so they manage their own locking.
     match attribute {
+        SQL_ATTR_ACCESS_MODE => {
+            return super::database_read_only::set_access_mode(dbc, value_ptr as usize as u32);
+        }
         SQL_ATTR_AUTOCOMMIT => return set_autocommit(dbc, value_ptr as usize as u64),
         // Both spellings drive the same session setting. The vendor attribute is
         // the only one that can carry SQL_TXN_SS_SNAPSHOT, because the Driver
@@ -403,11 +406,6 @@ unsafe fn sql_set_connect_attr_w_impl(
             } else {
                 SQL_SUCCESS
             }
-        }
-        // Access mode remains stored-only; packet size is a login setting.
-        SQL_ATTR_ACCESS_MODE => {
-            state.access_mode = value_ptr as usize as u32;
-            SQL_SUCCESS
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
             // Statement cancellation reads this at entry and again when signalled.
