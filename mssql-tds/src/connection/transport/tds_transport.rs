@@ -37,6 +37,12 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// This should cleanly shut down any underlying network connections.
     async fn close_transport(&mut self) -> TdsResult<()>;
 
+    /// Releases the connection without writing or polling graceful shutdown.
+    /// Transports owning I/O resources must override the in-memory default.
+    fn abort_transport(&mut self) {
+        self.mark_known_dead();
+    }
+
     /// Send an attention packet and drain the response to its acknowledgment
     /// with a timeout.
     ///

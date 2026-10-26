@@ -3148,6 +3148,12 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         Ok(())
     }
 
+    fn abort_transport(&mut self) {
+        self.known_dead = true;
+        self.stream = None;
+        self.extractable_stream_handle = None;
+    }
+
     /// Send an attention packet and wait for acknowledgment with a timeout.
     ///
     /// This implements the attention sending flow with a configurable timeout:
@@ -3576,6 +3582,43 @@ pub(crate) mod tests {
     struct HookTrackingStream {
         inner: DuplexStream,
         events: Arc<Mutex<[bool; 4]>>,
+    }
+
+    #[tokio::test]
+    async fn abort_transport_drops_tls_base_stream_without_shutdown() {
+        use crate::connection::transport::tds_transport::TdsTransport;
+
+        let (inner, mut peer) = duplex(1);
+        let events = Arc::new(Mutex::new([false; 4]));
+        let (handle, stream) =
+            extractable_stream::ExtractableStreamHandle::new(Box::new(HookTrackingStream {
+                inner,
+                events: Arc::clone(&events),
+            }));
+        let context = ClientContext::default();
+        let mut transport = NetworkTransport::new(
+            Box::new(stream),
+            SslHandler {
+                server_host_name: context.transport_context.get_server_name().clone(),
+                encryption_options: context.encryption_options.clone(),
+            },
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        );
+        transport.extractable_stream_handle = Some(handle);
+        TdsTransport::abort_transport(&mut transport);
+        transport.close_transport().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut received))
+            .await
+            .expect("abort must release all stream owners")
+            .unwrap();
+        assert!(received.is_empty());
+        assert_eq!(*events.lock().unwrap(), [false; 4]);
+        assert!(transport.stream.is_none());
+        assert!(transport.extractable_stream_handle.is_none());
+        assert!(transport.connection_known_dead());
     }
 
     impl AsyncRead for HookTrackingStream {

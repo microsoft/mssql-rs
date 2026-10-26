@@ -3076,11 +3076,12 @@ impl TdsClient {
         self.transport_shutdown_unsafe = true;
         self.execution_context.set_has_open_batch(false);
         self.abort_pending_prepare_capture();
-        self.transport.mark_known_dead();
+        self.transport.abort_transport();
     }
 
     async fn close_transport_if_safe(&mut self) -> TdsResult<()> {
         if self.transport_shutdown_unsafe {
+            self.transport.abort_transport();
             return Ok(());
         }
         self.transport.close_transport().await
@@ -22713,6 +22714,35 @@ mod tests {
             .unwrap();
         client.close_connection().await.unwrap();
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_after_interrupted_send_disconnects_peer_while_client_is_retained() {
+        use tokio::io::AsyncReadExt;
+
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let transport = crate::test_packet_support::build_duplex_transport(stream);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        let error = client
+            .execute(
+                "SELECT 1".to_string(),
+                ExecuteOptions::new().timeout_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::TimeoutError(_)));
+        client.close_connection().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut received))
+            .await
+            .expect("close must release the socket without dropping the client")
+            .unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "only the interrupted packet prefix was sent"
+        );
+        assert!(client.is_connection_dead());
     }
 
     /// Regression: the cursor RPCs consume their responses via `drain_stream`
