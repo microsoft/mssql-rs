@@ -728,12 +728,15 @@ async fn create_base_stream_parallel(
         os_error = tracing::field::Empty,
         io_kind = tracing::field::Empty,
         error = tracing::field::Empty,
+        resolver_os_error = tracing::field::Empty,
+        resolver_io_kind = tracing::field::Empty,
+        resolver_error = tracing::field::Empty,
         ok = tracing::field::Empty
     );
     let mut fell_back = false;
     let (result, resolution) = parallel_connect_resolving(host, port, &config, |e| {
         fell_back = true;
-        connect_stage::record_dns_fallback(&tcp_stage, e);
+        connect_stage::record_resolver_fallback(&tcp_stage, e);
     })
     .await
     .inspect_err(|e| connect_stage::record_error(&tcp_stage, e))?;
@@ -7488,7 +7491,7 @@ mod dns_stage_tests {
     }
 
     /// With MultiSubnetFailover the `tcp` stage covers resolving, so it
-    /// records the fallback to the DNS cache.
+    /// records the fallback to the DNS cache, in the resolver's own fields.
     #[test]
     fn a_multi_subnet_failover_dns_fallback_is_recorded_on_the_tcp_stage() {
         let host = "parallel-stage.dns-cache.invalid";
@@ -7511,8 +7514,57 @@ mod dns_stage_tests {
             tcp.field(connect_stage::SOURCE),
             Some(connect_stage::SOURCE_FALLBACK_CACHE)
         );
-        assert_eq!(tcp.field(connect_stage::IO_KIND), Some("NotFound"));
+        assert_eq!(tcp.field(connect_stage::RESOLVER_IO_KIND), Some("NotFound"));
+        assert!(
+            tcp.field(connect_stage::RESOLVER_ERROR).is_some(),
+            "{tcp:#?}"
+        );
+        assert_eq!(tcp.field(connect_stage::IO_KIND), None);
+        assert_eq!(tcp.field(connect_stage::ERROR), None);
         assert_eq!(tcp.field(connect_stage::ADDRESS), Some("127.0.0.1"));
         assert_eq!(tcp.field(connect_stage::OK), Some("true"));
+    }
+
+    /// With MultiSubnetFailover, when the DNS cache supplied the addresses and
+    /// none of them accepts, the `tcp` stage's error is the connect's, and
+    /// the resolver's error stays in its own fields.
+    #[test]
+    fn a_failed_multi_subnet_failover_connect_keeps_the_resolver_error_apart() {
+        let host = "parallel-refused.dns-cache.invalid";
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![refused]), true);
+
+        let (result, log) = recording(create_base_stream_parallel(
+            host,
+            refused.port(),
+            30_000,
+            1_000,
+            5_000,
+        ));
+
+        assert!(result.is_err(), "nothing listens on {refused}");
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(tcp.field(connect_stage::OK), Some("false"));
+        assert_eq!(
+            tcp.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_FALLBACK_CACHE)
+        );
+        assert_eq!(tcp.field(connect_stage::RESOLVER_IO_KIND), Some("NotFound"));
+        let error = tcp
+            .field(connect_stage::ERROR)
+            .expect("the connect's error");
+        assert_ne!(
+            Some(error),
+            tcp.field(connect_stage::RESOLVER_ERROR),
+            "{tcp:#?}"
+        );
+        assert_ne!(
+            tcp.field(connect_stage::IO_KIND),
+            Some("NotFound"),
+            "{tcp:#?}"
+        );
     }
 }

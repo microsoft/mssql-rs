@@ -39,8 +39,10 @@ pub const DNS: &str = "dns";
 /// limit ran out. With MultiSubnetFailover, one span covers resolving the
 /// host and racing every address ([`ADDRESS`] is the one that answered
 /// first), and no `dns` span is opened; it records [`SOURCE`] as `dns` does
-/// once the host resolved, with the resolver's error when the DNS cache
-/// supplied the addresses. A diagnostic connection that asks for every
+/// once the host resolved. When the DNS cache supplied the addresses, the
+/// resolver's error is in [`RESOLVER_OS_ERROR`], [`RESOLVER_IO_KIND`] and
+/// [`RESOLVER_ERROR`], so [`OS_ERROR`], [`IO_KIND`] and [`ERROR`] describe
+/// only the connect. A diagnostic connection that asks for every
 /// address also connects to the addresses after the one that answered, each
 /// in a span of its own.
 pub const TCP: &str = "tcp";
@@ -114,6 +116,14 @@ pub const IO_KIND: &str = "io_kind";
 pub const TIMED_OUT: &str = "timed_out";
 /// The text of the error a stage failed with.
 pub const ERROR: &str = "error";
+/// On a MultiSubnetFailover [`TCP`] stage whose addresses came from the DNS
+/// cache: the resolver's operating-system error code, kept apart from
+/// [`OS_ERROR`], which describes the connect.
+pub const RESOLVER_OS_ERROR: &str = "resolver_os_error";
+/// Like [`RESOLVER_OS_ERROR`]: the resolver error's `std::io::ErrorKind`.
+pub const RESOLVER_IO_KIND: &str = "resolver_io_kind";
+/// Like [`RESOLVER_OS_ERROR`]: the resolver error's text.
+pub const RESOLVER_ERROR: &str = "resolver_error";
 /// The stable code of a failed instance lookup.
 pub const RESULT: &str = "result";
 
@@ -172,6 +182,22 @@ pub(crate) fn record_dns_fallback(stage: &tracing::Span, error: &std::io::Error)
         return;
     }
     record_io_error_fields(stage, error);
+    stage.record(SOURCE, SOURCE_FALLBACK_CACHE);
+}
+
+/// [`record_dns_fallback`] for a MultiSubnetFailover [`TCP`] stage, which
+/// resolves and connects in one span: the resolver's error goes in the
+/// `resolver_*` fields, so a connect that fails afterwards records its own
+/// error without the resolver's leaking into it.
+pub(crate) fn record_resolver_fallback(stage: &tracing::Span, error: &std::io::Error) {
+    if stage.is_disabled() {
+        return;
+    }
+    if let Some(code) = error.raw_os_error() {
+        stage.record(RESOLVER_OS_ERROR, code);
+    }
+    stage.record(RESOLVER_IO_KIND, tracing::field::debug(error.kind()));
+    stage.record(RESOLVER_ERROR, tracing::field::display(error));
     stage.record(SOURCE, SOURCE_FALLBACK_CACHE);
 }
 
@@ -311,6 +337,53 @@ pub(crate) mod tests {
         assert!(tcp.field(super::IO_KIND).is_some());
         assert!(tcp.field(super::ERROR).is_some());
         assert!(tcp.closed);
+    }
+
+    /// A MultiSubnetFailover stage that resolved from the DNS cache and then
+    /// failed to connect: the connect's error is the stage's, and the
+    /// resolver's stays in its own fields.
+    #[test]
+    fn a_failed_parallel_connect_keeps_the_resolver_error_apart() {
+        let log = StageLog::default();
+        tracing::subscriber::with_default(log.clone(), || {
+            let stage = tracing::info_span!(
+                target: super::TARGET,
+                super::TCP,
+                address = tracing::field::Empty,
+                port = 1433u16,
+                source = tracing::field::Empty,
+                os_error = tracing::field::Empty,
+                io_kind = tracing::field::Empty,
+                error = tracing::field::Empty,
+                resolver_os_error = tracing::field::Empty,
+                resolver_io_kind = tracing::field::Empty,
+                resolver_error = tracing::field::Empty,
+                ok = tracing::field::Empty
+            );
+            super::record_resolver_fallback(&stage, &std::io::Error::from_raw_os_error(11001));
+            super::record_error(
+                &stage,
+                &crate::error::Error::ConnectionError("all parallel attempts failed".into()),
+            );
+        });
+        let tcp = &log.named(super::TCP)[0];
+        assert_eq!(tcp.field(super::OK), Some("false"));
+        assert_eq!(tcp.field(super::SOURCE), Some(super::SOURCE_FALLBACK_CACHE));
+        assert_eq!(tcp.field(super::RESOLVER_OS_ERROR), Some("11001"));
+        assert!(tcp.field(super::RESOLVER_IO_KIND).is_some());
+        assert!(tcp.field(super::RESOLVER_ERROR).is_some());
+        assert_eq!(
+            tcp.field(super::OS_ERROR),
+            None,
+            "the resolver's code leaked"
+        );
+        assert_eq!(
+            tcp.field(super::IO_KIND),
+            None,
+            "the resolver's kind leaked"
+        );
+        let error = tcp.field(super::ERROR).expect("the connect's error");
+        assert!(error.contains("all parallel attempts failed"), "{error}");
     }
 
     #[test]
