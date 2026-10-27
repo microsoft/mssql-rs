@@ -222,10 +222,10 @@ login, unmatched RPCs, and transaction-begin replies respectively.
 |---|---|
 | SQL execution | No SQL engine or persistent data. Batch matching is case-insensitive and exact after parsing; no regex or wildcard matching. |
 | Unregistered requests | Unmatched SQL batches and RPCs return an empty DONE response, not an unknown-query error. Register expected responses explicitly. |
-| RPC | Matches uppercased registered text within the request. No general parameter decoder, stored-procedure execution, or cursor engine. |
+| RPC | Matches registered text as uppercase UTF-16LE bytes within the raw request; send uppercase SQL on this path. No general parameter decoder, stored-procedure execution, or cursor engine. |
 | Transactions | Begin/commit/rollback messages are acknowledged; isolation and data changes are not enforced. |
 | Types and metadata | Only the types above are exposed; metadata is simplified, not a full SQL Server schema model. |
-| Packet sizes | Response payloads are not fragmented. Keep complete serialized response packets within the 65,535-byte packet-length field. |
+| Packet sizes | Responses are not fragmented. Keep each complete response within the advertised 4096-byte packet size, including the 8-byte header and all tokens; clients such as `TdsClient` reject larger packets. |
 | Authentication | Login flows and token inspection are test aids, not credential verification. |
 | TLS redirection | CLI redirection is ignored in TLS modes; public constructors do not combine TLS with redirection. |
 

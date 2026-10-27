@@ -36,8 +36,9 @@ compactly:
 
 - **Header.** `contractVersion` is `major.minor`: the major version changes only
   for an incompatible change. `platform` is the runtime (`win-x64`,
-  `linux-musl-arm64`, ...). `serverVersion` and `connectMs` appear once sqlcmd
-  has connected. `startTime` (UTC) and `durationMs` cover the whole run.
+  `linux-musl-arm64`, ...). `connectMs` appears after connection succeeds;
+  `serverVersion` appears when supplied by the caller. `startTime` (UTC) and
+  `durationMs` cover the whole run.
 - **Status.** `executionStatus` says whether sqlcmd carried out the run:
   `completed`, `canceled` (Ctrl+C) or `invalidInvocation` (the command line was
   rejected). `operationOutcome` is `succeeded`, `failed`, `canceled` or
@@ -60,13 +61,17 @@ compactly:
   gets its own entry instead, `{ "type": "rowsAffected", "count": 3 }`.
 - **`FOR JSON` / `FOR XML`** output is ordinary result-set rows: one string
   per row the server returned, not parsed, combined or embedded.
-- **Messages and errors** carry what the console shows for them, in its order:
+- **Messages and errors** carry what the console shows for them:
   `number` (Msg), `severity` (Level), `state`, and when known `server`,
   `procedure`, `line` and `source` (the driver, e.g. `Microsoft ODBC Driver 18 for
   SQL Server`, or `Sqlcmd`, when the server did not send it). `sqlState` is the
   ODBC SQLSTATE (`28000` for a refused login, `08001` for a connection failure,
   `HYT00` for a timeout), the stable field to classify errors by. `text` is the
   message itself.
+
+`output` entries follow the order they began. A result set contains all its
+rows, so a message received between rows follows the entire result set rather
+than being interleaved with its rows.
 
 The whole document is held in memory until sqlcmd exits, because it begins
 with details only known then (the exit code). Peak memory is a few times the
