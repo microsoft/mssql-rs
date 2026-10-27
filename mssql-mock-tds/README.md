@@ -30,7 +30,7 @@ service.
 ## CLI
 
 ```sh
-cargo install mssql-mock-tds --version 0.3.0 --locked
+cargo install mssql-mock-tds --locked
 mssql-mock-tds --port 1433
 ```
 

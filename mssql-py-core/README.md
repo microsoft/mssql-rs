@@ -30,8 +30,9 @@ Prebuilt wheels for CPython 3.10+:
 - **Linux** — glibc (`manylinux_2_28`, `manylinux_2_34`) and musl
   (`musllinux_1_2`), on x86_64 and aarch64
 
-The glibc wheels require system OpenSSL: 1.1 for `manylinux_2_28`, or 3 for
-`manylinux_2_34`. Windows and macOS do not require OpenSSL.
+The Linux wheels require system OpenSSL: 1.1 for `manylinux_2_28`, or 3 for
+`manylinux_2_34` and `musllinux_1_2` (`libssl3` on Alpine). Windows and macOS
+do not require OpenSSL.
 
 ## Native connection settings
 

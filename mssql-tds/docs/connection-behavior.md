@@ -69,6 +69,12 @@ it cannot bypass the new endpoint's applicability checks.
 | Node.js | `multiSubnetFailover: false` | `setDefaultMultiSubnetFailover(false)` |
 | CLI | `--multi-subnet-failover false` | Environment |
 
+Native Python reads `multi_subnet_failover` and
+`transparent_network_ip_resolution` from the context dictionary passed to
+`PyCoreConnection` or `PyAsyncConnection.connect`. These are dictionary options,
+not an ODBC connection-string parser; higher-level clients must forward them.
+Check the consuming SDK's mapper before relying on either setting.
+
 ODBC attributes outrank keywords. Omitted native options remain inherited;
 native Python also treats `multi_subnet_failover=None` as omission, not false.
 Native Python accepts case-insensitive `"Yes"`/`"No"` strings as well as booleans;
