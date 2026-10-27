@@ -12,9 +12,25 @@
 #   ./run_e2e.sh [--release] [--verbose] [--retries=N] [--coverage[=OUTPUT]]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
 #                [--skip-build] [--driver=PATH]
-#                [--filter=REGEX]
+#                [--filter=REGEX] [--mt-profile=pr|nightly|weekly]
 #
 # Default: runs the e2e suite against mssql-odbc only.
+#
+# --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
+# registers them as a separate <name>_mt entry per converted executable):
+#   pr       (default) every ctest entry; concurrent variants, every mode, at the
+#            harness default of 2 threads x 1 iteration.
+#   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
+#   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
+# nightly and weekly ignore --retries (an intermittent failure is what they
+# look for) and run each entry under gdb through run_mt_test.sh when gdb is
+# installed, so a crash or a watchdog abort prints every thread's stack. With
+# --compare-with-msodbcsql the msodbcsql leg runs at 2 x 1: it checks that the
+# tests suit the modes, not msodbcsql's thread safety. /SharedStmt is left out
+# of the stress profiles because unixODBC releases up to 2.3.14 corrupt their
+# own diagnostic list when two threads use one statement (unixODBC #243, fixed
+# on master in ea454e49). Already-set MSSQL_ODBC_MT_THREADS, MSSQL_ODBC_MT_ITERS
+# and MSSQL_ODBC_MT_SKIP_MODES ("none" skips nothing) override a profile.
 #
 # --skip-build reuses a driver and CMake `build/` produced earlier by
 # build_e2e.sh (no cargo/cmake needed — only the unixODBC runtime). Combine
@@ -49,12 +65,12 @@
 #
 # Both legs run with unixODBC Threading=1, registered in one temporary
 # odbcinst.ini (the msodbcsql section is copied from --msodbcsql-ini, which is
-# not modified). Level 1 serializes calls on each handle, as the Windows Driver
-# Manager does, except SQLCancel: unixODBC locks SQLCancel only at level 3, so
-# a cross-thread cancel still reaches the driver while another call runs on
-# that statement. The unixODBC default, 0, takes no lock at all, and its own
-# per-handle diagnostic list then races when two threads use one statement:
-# the ODBC_TEST_F /SharedStmt variants crash inside libodbc with either driver.
+# not modified). Level 1 takes a lock per handle for most of each call, but
+# unixODBC clears a handle's diagnostics on entry before taking it, so two
+# threads on one statement can still corrupt that list (unixODBC #243; the
+# /SharedStmt variants crash inside libodbc). SQLCancel is locked only at level
+# 3, so a cross-thread cancel still reaches the driver while another call runs
+# on that statement. The unixODBC default, 0, takes no lock at all.
 #
 # Rust driver logs are controlled by MSSQL_TDS_TRACE and
 # MSSQL_TDS_TRACE_LEVEL.
@@ -142,6 +158,9 @@ MSODBCSQL_INI="/etc/odbcinst.ini"
 SKIP_BUILD=0
 DRIVER_OVERRIDE=""
 TEST_FILTER=""
+MT_PROFILE="pr"
+# Extra environment for the msodbcsql leg only (see apply_mt_profile).
+MS_LEG_ENV=()
 
 CTEST_ARGS=(--output-on-failure)
 RUST_INI_DIR=""    # tempdir holding our generated odbcinst.ini
@@ -174,10 +193,49 @@ parse_args() {
             --skip-build) SKIP_BUILD=1 ;;
             --driver=*) DRIVER_OVERRIDE="${arg#--driver=}" ;;
             --filter=*) TEST_FILTER="${arg#--filter=}" ;;
+            --mt-profile=*) MT_PROFILE="${arg#--mt-profile=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
     done
+}
+
+# ----------------------------------------------------------------------------
+# --mt-profile: sizes and modes for the ODBC_TEST_F concurrent variants (see the
+# header). Settings already in the environment win over the profile.
+# ----------------------------------------------------------------------------
+apply_mt_profile() {
+    local threads iters
+    case "$MT_PROFILE" in
+        pr)
+            ;;
+        nightly|weekly)
+            if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
+            export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
+            export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"
+            export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
+            # run_mt_test.sh runs each <name>_mt entry under gdb; the watchdog must
+            # still end a hang inside the traced process.
+            export MSSQL_ODBC_MT_GDB="${MSSQL_ODBC_MT_GDB:-1}"
+            export MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER=1
+            if [ "$MSSQL_ODBC_MT_GDB" = 1 ] && ! command -v gdb >/dev/null 2>&1; then
+                echo "Warning: gdb is not installed; a crash in a stress run will leave no stacks." >&2
+            fi
+            # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
+            # this only bounds an entry whose many phases all progress slowly.
+            CTEST_ARGS+=(-L mt --timeout 3600)
+            if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
+                echo "--mt-profile=$MT_PROFILE ignores --retries=$RETRIES: an intermittent failure is the signal."
+                RETRIES=0
+            fi
+            MS_LEG_ENV=(MSSQL_ODBC_MT_THREADS=2 MSSQL_ODBC_MT_ITERS=1)
+            ;;
+        *)
+            echo "Unknown --mt-profile '$MT_PROFILE' (expected pr, nightly, or weekly)" >&2
+            exit 2
+            ;;
+    esac
+    echo "MT profile: $MT_PROFILE (threads=${MSSQL_ODBC_MT_THREADS:-2} iterations=${MSSQL_ODBC_MT_ITERS:-1} skip_modes='${MSSQL_ODBC_MT_SKIP_MODES:-}')"
 }
 
 # ----------------------------------------------------------------------------
@@ -432,14 +490,19 @@ configure_and_build_tests() {
 #   $2 = ODBCSYSINI directory
 #   $3 = absolute path to JUnit XML output
 #   $4 = odbcinst.ini section name the tests should connect through
+#   $5... = extra NAME=VALUE environment for this leg only
 # Returns ctest's exit code (does not abort the script).
 # ----------------------------------------------------------------------------
 run_tests() {
     local label="$1" ini_dir="$2" junit_out="$3" driver_name="$4"
+    shift 4
     echo ""
     echo "=== Running e2e tests against $label ==="
     echo "ODBCSYSINI=$ini_dir"
     echo "ODBC_TEST_DRIVER=$driver_name"
+    if [ "$#" -gt 0 ]; then
+        echo "Leg environment: $*"
+    fi
 
     local rc=0
     (
@@ -448,8 +511,8 @@ run_tests() {
         # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can
         # SKIP_IF_COMPARING_MSODBCSQL() on the reference-driver leg.
         # ODBC_TEST_DRIVER selects the driver by name in the connection string.
-        ODBC_TEST_TARGET="$label" ODBC_TEST_DRIVER="$driver_name" \
-            ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
+        env ODBC_TEST_TARGET="$label" ODBC_TEST_DRIVER="$driver_name" \
+            ODBCSYSINI="$ini_dir" "$@" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
     ) || rc=$?
     return $rc
 }
@@ -509,6 +572,7 @@ generate_coverage_report() {
 # ----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    apply_mt_profile
     if [ -n "$TEST_FILTER" ]; then
         CTEST_ARGS+=(-R "$TEST_FILTER")
     fi
@@ -554,7 +618,8 @@ main() {
     fi
 
     # Comparison mode: also run against the C++ driver, then print the table.
-    run_tests "msodbcsql" "$RUST_INI_DIR" "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" || ms_rc=$?
+    run_tests "msodbcsql" "$RUST_INI_DIR" "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" \
+        ${MS_LEG_ENV[@]+"${MS_LEG_ENV[@]}"} || ms_rc=$?
     assert_tests_executed "$ms_junit" "msodbcsql"
 
     local parity_rc=0
