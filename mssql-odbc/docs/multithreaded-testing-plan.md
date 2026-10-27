@@ -494,9 +494,9 @@ local SQL Server:
   bug from a reference-driver one.
 - `check/msodbcsql_types_check.cpp` compiles `include/odbc_sql_server_types.h`
   against Microsoft's `msodbcsql.h` where the build finds it (the Windows SDK,
-  so the Windows legs; the Linux msodbcsql18 package ships no header) and fails
-  the build on a differing constant, struct size, member offset, or member
-  type.
+  or `/opt/microsoft/msodbcsql18/include` from the Linux msodbcsql18 package)
+  and fails the build on a differing constant, struct size, member offset, or
+  member type.
 
 ## Known failures
 

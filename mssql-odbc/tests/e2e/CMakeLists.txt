@@ -114,10 +114,10 @@ endif()
 
 # ---------------------------------------------------------------------------
 # include/odbc_sql_server_types.h copies values and layouts from msodbcsql.h
-# rather than depending on it. Where msodbcsql.h is installed (the msodbcsql18
-# SDK feature on Windows, part of a default MSI install; the Linux
-# msodbcsql18 package ships no header), compile a check that the two still
-# agree; a mismatch fails the build. Nothing is linked or shipped.
+# rather than depending on it. Where msodbcsql.h is installed, compile a check
+# that the two still agree; a mismatch fails the build. Nothing is linked or
+# shipped. The header comes with the msodbcsql18 SDK feature on Windows (part of
+# a default MSI install) and with the msodbcsql18 package on Linux.
 # Override the search with -DMSODBCSQL_INCLUDE_DIR=<dir>.
 # ---------------------------------------------------------------------------
 set(_msodbcsql_hints)
@@ -125,6 +125,8 @@ if(WIN32)
     file(TO_CMAKE_PATH "$ENV{ProgramFiles}" _program_files)
     list(APPEND _msodbcsql_hints
          "${_program_files}/Microsoft SQL Server/Client SDK/ODBC/180/SDK/Include")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND _msodbcsql_hints "/opt/microsoft/msodbcsql18/include")
 endif()
 find_path(MSODBCSQL_INCLUDE_DIR msodbcsql.h HINTS ${_msodbcsql_hints})
 if(MSODBCSQL_INCLUDE_DIR)
