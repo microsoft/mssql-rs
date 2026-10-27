@@ -9,8 +9,8 @@
 //! `SQL_DESC_NULLABLE` — for any descriptor kind, unlike `SQLGetDescFieldW`'s
 //! arbitrary single-field lookup. Reading `DescRecord`'s fields directly
 //! (rather than routing through `get_desc_field.rs`'s single-field
-//! `record_field_value`) still answers with the exact same stored values:
-//! there is nothing left to reconcile since both read the same record.
+//! `record_field_value`) answers with the same stored values. Under TVP
+//! parameter focus, the child binding is materialized as an APD record first.
 
 use tracing::{debug, error};
 
@@ -18,9 +18,12 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlLen, SqlReturn, SqlSmallInt, SqlWChar,
 };
-use crate::api::sqlstate::{ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag};
+use crate::api::sqlstate::{
+    ERR_INVALID_DESCRIPTOR_INDEX, SQLSTATE_HY000, WARN_STRING_TRUNCATION, post_diag,
+};
 use crate::api::util::{copy_with_nul, write_if_some};
-use crate::error::free_errors;
+use crate::error::{free_errors, post_sql_error};
+use crate::handles::desc::{DescKind, DescRecord};
 use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
 /// Implementation of [`SQLGetDescRecW`](super::exports::SQLGetDescRecW).
@@ -146,6 +149,32 @@ fn sql_get_desc_rec_w_safe(
         "SQLGetDescRecW: DM should reject negative buffer_length (HY090)"
     );
 
+    let focused_record =
+        if record_number >= 1 && matches!(desc.kind, DescKind::AppParam | DescKind::Ad) {
+            match desc.focused_tvp_bindings(record_number) {
+                Ok(bindings) => bindings
+                    .first()
+                    .copied()
+                    .map(|binding| focused_tvp_record(binding, desc.kind)),
+                Err(()) => {
+                    let Ok(mut state) = desc.inner.lock() else {
+                        error!("SQLGetDescRecW: desc mutex poisoned posting focused lookup error");
+                        return SQL_ERROR;
+                    };
+                    free_errors(&mut state);
+                    post_sql_error(
+                        &mut state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error reading focused table-valued parameter descriptor",
+                    );
+                    return SQL_ERROR;
+                }
+            }
+        } else {
+            None
+        };
+
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLGetDescRecW: desc mutex poisoned");
         return SQL_ERROR;
@@ -166,7 +195,10 @@ fn sql_get_desc_rec_w_safe(
     // within SQL_DESC_COUNT but never populated answers its stored defaults
     // (`DescRecord::default_for`) — already the same values a fresh record
     // holds, so no separate "no data for this column" branch is needed.
-    let Some(record) = state.record(record_number) else {
+    let Some(record) = focused_record
+        .as_ref()
+        .or_else(|| state.record(record_number))
+    else {
         debug!(record_number, "SQLGetDescRecW: record past SQL_DESC_COUNT");
         return SQL_NO_DATA;
     };
@@ -189,6 +221,15 @@ fn sql_get_desc_rec_w_safe(
     } else {
         SQL_SUCCESS
     }
+}
+
+fn focused_tvp_record(binding: crate::params::BoundParam, kind: DescKind) -> DescRecord {
+    let mut record = DescRecord::default_for(kind);
+    let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
+    binding.write_to_records(&mut record, &mut ipd_record);
+    record.precision = binding.app_precision;
+    record.scale = binding.app_scale;
+    record
 }
 
 #[cfg(test)]

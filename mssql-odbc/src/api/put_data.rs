@@ -10,7 +10,8 @@
 //! parameter as SQL `NULL` (no chunks); any other valid value is a byte count
 //! for `data_ptr`. For a TVP row-control token, the sentinel pointer `1` with
 //! a positive `strlen_or_ind` declares that many rows in the current batch;
-//! null with zero ends the table.
+//! null with zero ends the table, and `SQL_DEFAULT_PARAM` on the first
+//! row-control token declares an empty table.
 
 use std::borrow::Cow;
 use std::mem::size_of;
@@ -20,8 +21,8 @@ use tracing::{debug, error};
 use super::exec_common::{abort_dae_with_diag, fail_with_tds, return_client_idle};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_C_CHAR, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_DATA, SQL_SUCCESS,
-    SqlHandle, SqlLen, SqlPointer, SqlReturn,
+    SQL_C_CHAR, SQL_C_WCHAR, SQL_DEFAULT_PARAM, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS,
+    SQL_NULL_DATA, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn,
 };
 use crate::conversion::param_convert::reserve_dae_buffer;
 use crate::error::free_errors;
@@ -178,7 +179,9 @@ unsafe fn sql_put_data_operation(
                     post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                     return SQL_ERROR;
                 }
-                let batch_count = if data_ptr as usize == 1 && strlen_or_ind > 0 {
+                let batch_count = if row_index == 0 && strlen_or_ind == SQL_DEFAULT_PARAM {
+                    Some(0)
+                } else if data_ptr as usize == 1 && strlen_or_ind > 0 {
                     usize::try_from(strlen_or_ind).ok()
                 } else if data_ptr.is_null() && strlen_or_ind == 0 {
                     Some(0)
@@ -937,6 +940,59 @@ mod tests {
             state.dae.as_ref().unwrap().progress.tvp_row_batch_count,
             Some(0)
         );
+    }
+
+    #[test]
+    fn default_parameter_marker_declares_an_empty_tvp_on_the_first_row_control() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(vec![control], Some(0)));
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_DEFAULT_PARAM) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let state = stmt.inner.lock().unwrap();
+        let progress = &state.dae.as_ref().unwrap().progress;
+        assert!(progress.put_data_called);
+        assert_eq!(progress.tvp_row_batch_count, Some(0));
+        assert!(progress.buffer.is_empty());
+    }
+
+    #[test]
+    fn default_parameter_marker_is_rejected_after_the_first_row_control() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let later_control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 1,
+            },
+        );
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(vec![later_control], Some(0)));
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_DEFAULT_PARAM) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_INVALID_STRING_OR_BUFFER_LENGTH.state
+        );
+        let progress = &state.dae.as_ref().unwrap().progress;
+        assert!(!progress.put_data_called);
+        assert_eq!(progress.tvp_row_batch_count, None);
     }
 
     /// The hazard the missing-binding guard exists to prevent: a defaulted C

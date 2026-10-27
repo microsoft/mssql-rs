@@ -4768,6 +4768,96 @@ mod tests {
     }
 
     #[test]
+    fn tvp_numeric_bound_cells_reject_rounding_carry_past_precision() {
+        use crate::handles::desc::UdtNames;
+
+        let mut source = numeric_struct(9995, 1, 3);
+        let mut indicator = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut column = param(SQL_C_NUMERIC, (&raw mut source).cast(), &mut indicator);
+        column.sql_type = SQL_DECIMAL;
+        column.column_size = 3;
+        column.decimal_digits = 2;
+        column.app_precision = 3;
+        column.app_scale = 3;
+
+        assert!(matches!(
+            unsafe { bound_tvp_cell_to_value(&column) },
+            Err(ParamBuildError::Value(ConvError::OutOfRange))
+        ));
+
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let mut row_count: SqlLen = 1;
+        let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut row_count);
+        tvp.column_size = 1;
+        let result = unsafe {
+            build_tvp_param(
+                None,
+                &tvp,
+                Some(&names),
+                &[Some(column)],
+                0,
+                0,
+                SQL_BIND_BY_COLUMN,
+            )
+        };
+        assert!(matches!(
+            result,
+            Err(ParamBuildError::TvpCellConversion {
+                row: 0,
+                column: 0,
+                diagnostic
+            }) if diagnostic.state == ERR_NUMERIC_OUT_OF_RANGE.state
+        ));
+    }
+
+    #[test]
+    fn tvp_numeric_dae_cells_reject_rounding_carry_past_precision() {
+        use crate::handles::desc::UdtNames;
+        use crate::handles::stmt::BufferedTvpCell;
+
+        let source = numeric_struct(9995, 1, 3);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const source).cast::<u8>(),
+                std::mem::size_of::<SqlNumericStruct>(),
+            )
+        }
+        .to_vec();
+        let mut column = param(SQL_C_NUMERIC, std::ptr::null_mut(), std::ptr::null_mut());
+        column.sql_type = SQL_DECIMAL;
+        column.column_size = 3;
+        column.decimal_digits = 2;
+        column.app_precision = 3;
+        column.app_scale = 3;
+        let mut cells = [BufferedTvpCell {
+            tvp_index: 0,
+            row_index: 0,
+            column_index: 0,
+            bytes,
+            is_null: false,
+            value: None,
+        }];
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+
+        let result =
+            build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &mut cells);
+        assert!(matches!(
+            result,
+            Err(ParamBuildError::TvpCellConversion {
+                row: 0,
+                column: 0,
+                diagnostic
+            }) if diagnostic.state == ERR_NUMERIC_OUT_OF_RANGE.state
+        ));
+    }
+
+    #[test]
     fn empty_dae_tvp_has_the_same_default_status_as_a_bound_empty_table() {
         let names = crate::handles::desc::UdtNames {
             type_name: "OrderList".into(),

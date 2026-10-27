@@ -146,6 +146,7 @@ fn sql_set_desc_field_w_safe(
             SQL_DESC_DATA_PTR
                 | SQL_DESC_INDICATOR_PTR
                 | SQL_DESC_OCTET_LENGTH_PTR
+                | SQL_DESC_OCTET_LENGTH
                 | SQL_DESC_PRECISION
                 | SQL_DESC_SCALE
         )
@@ -169,6 +170,7 @@ fn sql_set_desc_field_w_safe(
                 }
                 _ => None,
             };
+            let focused_length = (field == SQL_DESC_OCTET_LENGTH).then_some(value_ptr as SqlLen);
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 |binding| match (field, focused_value) {
@@ -190,6 +192,11 @@ fn sql_set_desc_field_w_safe(
                     }
                     SQL_DESC_OCTET_LENGTH_PTR => {
                         binding.octet_length_ptr = value_ptr.cast::<SqlLen>()
+                    }
+                    SQL_DESC_OCTET_LENGTH => {
+                        if let Some(length) = focused_length {
+                            binding.buffer_length = length;
+                        }
                     }
                     SQL_DESC_PRECISION => {
                         if let Some(precision) = focused_value {
