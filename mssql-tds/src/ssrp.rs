@@ -533,8 +533,9 @@ where
 /// Send `request` to every address in `addrs` (one UDP socket per address family)
 /// and return the first valid response by `deadline`.
 ///
-/// Uses `recv_from` and validates the sender address against `addrs` to prevent
-/// spoofed UDP packets from redirecting instance resolution.
+/// Uses `recv_from` and accepts a datagram only from one of `addrs`, its IP
+/// address and port both (the Browser answers from the port it was asked
+/// on), to keep spoofed UDP packets from redirecting instance resolution.
 async fn send_and_receive_first(
     request: &[u8],
     addrs: &[SocketAddr],
@@ -544,8 +545,10 @@ async fn send_and_receive_first(
     let has_v6 = addrs.iter().any(|a| a.is_ipv6());
 
     let mut sockets: Vec<Arc<UdpSocket>> = Vec::new();
-    let expected_ips: std::collections::HashSet<std::net::IpAddr> =
-        addrs.iter().map(|a| a.ip()).collect();
+    // IP and port only: an IPv6 reply may carry a scope or flow label the
+    // address asked did not.
+    let expected: std::collections::HashSet<(std::net::IpAddr, u16)> =
+        addrs.iter().map(|a| (a.ip(), a.port())).collect();
 
     // IPv4
     let mut any_send_succeeded = false;
@@ -599,19 +602,19 @@ async fn send_and_receive_first(
     }
 
     // Race all socket recv futures against the timeout.
-    // Use recv_from and validate the source IP against resolved addresses
-    // to reject spoofed datagrams.
-    let expected_ips = Arc::new(expected_ips);
+    // Use recv_from and accept only an address asked, IP and port, to
+    // reject spoofed datagrams.
+    let expected = Arc::new(expected);
     let recv_futures: Vec<_> = sockets
         .iter()
         .map(|sock| {
             let sock = Arc::clone(sock);
-            let expected = Arc::clone(&expected_ips);
+            let expected = Arc::clone(&expected);
             Box::pin(async move {
                 loop {
                     let mut buf = vec![0u8; RECV_BUF_SIZE];
                     let (n, sender) = sock.recv_from(&mut buf).await?;
-                    if expected.contains(&sender.ip()) {
+                    if expected.contains(&(sender.ip(), sender.port())) {
                         buf.truncate(n);
                         return Ok::<Vec<u8>, std::io::Error>(buf);
                     }
@@ -863,5 +866,60 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "timedOut", "{error}");
         assert!(started.elapsed() < Duration::from_millis(1500));
+    }
+
+    fn browser_answer(port: u16) -> Vec<u8> {
+        let payload =
+            format!("ServerName;MOCK;InstanceName;I;IsClustered;No;Version;16.0;tcp;{port};;");
+        let mut resp = vec![SVR_RESP];
+        resp.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        resp.extend_from_slice(payload.as_bytes());
+        resp
+    }
+
+    /// A Browser asked on 127.0.0.1: an answer from that IP address but
+    /// another port comes first (`impostor`), then, when `answer` is set,
+    /// the Browser's own.
+    async fn browser_with_impostor(answer: bool) -> u16 {
+        let browser = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let impostor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = browser.local_addr().unwrap().port();
+        assert_ne!(impostor.local_addr().unwrap().port(), port);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            let (_, client) = browser.recv_from(&mut buf).await.unwrap();
+            impostor
+                .send_to(&browser_answer(1111), client)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if answer {
+                browser
+                    .send_to(&browser_answer(2222), client)
+                    .await
+                    .unwrap();
+            }
+            // Keep both sockets until the lookup has ended.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        port
+    }
+
+    /// Only the address asked, IP address and port, is taken for the
+    /// Browser: an answer from the same IP address on another port is
+    /// ignored and the lookup keeps waiting for the Browser.
+    #[tokio::test]
+    async fn an_answer_from_another_port_is_ignored() {
+        let port = browser_with_impostor(true).await;
+        let info = get_instance_info_ext("127.0.0.1", "I", port, 2000)
+            .await
+            .unwrap();
+        assert_eq!(info[0].tcp_port, Some(2222));
+
+        let port = browser_with_impostor(false).await;
+        let error = query_instance("127.0.0.1", "I", port, 300, false, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "noAnswer", "{error}");
     }
 }
