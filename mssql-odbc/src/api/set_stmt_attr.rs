@@ -595,11 +595,11 @@ unsafe fn sql_set_stmt_attr_w_safe(
                         return SQL_ERROR;
                     }
                 };
-                let Ok(mut state) = stmt.inner.lock() else {
-                    error!("SQLSetStmtAttrW: stmt mutex poisoned validating PARAM_FOCUS");
-                    return SQL_ERROR;
-                };
                 if !valid {
+                    let Ok(mut state) = stmt.inner.lock() else {
+                        error!("SQLSetStmtAttrW: stmt mutex poisoned validating PARAM_FOCUS");
+                        return SQL_ERROR;
+                    };
                     error!(
                         focus,
                         "SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS does not name a bound table-valued parameter"
@@ -607,10 +607,32 @@ unsafe fn sql_set_stmt_attr_w_safe(
                     post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
                     return SQL_ERROR;
                 }
+                // Focused APD descriptor updates hold the parent DBC lock
+                // across validation and mutation; serialize focus changes with
+                // those updates.
+                let dbc = stmt.parent_dbc();
+                let Ok(_dbc_state) = dbc.inner.lock() else {
+                    error!("SQLSetStmtAttrW: dbc mutex poisoned setting PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                let Ok(mut state) = stmt.inner.lock() else {
+                    error!("SQLSetStmtAttrW: stmt mutex poisoned setting PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
                 state.vendor_attrs.store_param_focus(focus);
                 debug!(focus, "SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS set");
                 SQL_SUCCESS
             } else {
+                drop(state);
+                let dbc = stmt.parent_dbc();
+                let Ok(_dbc_state) = dbc.inner.lock() else {
+                    error!("SQLSetStmtAttrW: dbc mutex poisoned clearing PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                let Ok(mut state) = stmt.inner.lock() else {
+                    error!("SQLSetStmtAttrW: stmt mutex poisoned clearing PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
                 state.vendor_attrs.store_param_focus(0);
                 debug!("SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS cleared");
                 SQL_SUCCESS

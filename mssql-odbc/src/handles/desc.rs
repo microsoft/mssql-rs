@@ -835,7 +835,17 @@ impl DescHandle {
         &self,
         record_number: SqlSmallInt,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
+        update: impl FnMut(&mut crate::params::BoundParam),
+    ) -> Result<Option<bool>, ()> {
+        self.update_focused_tvp_bindings_after_validation(record_number, is_valid, update, || {})
+    }
+
+    fn update_focused_tvp_bindings_after_validation(
+        &self,
+        record_number: SqlSmallInt,
+        is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         mut update: impl FnMut(&mut crate::params::BoundParam),
+        after_validation: impl FnOnce(),
     ) -> Result<Option<bool>, ()> {
         let Some(column_index) = usize::try_from(record_number)
             .ok()
@@ -882,6 +892,9 @@ impl DescHandle {
             return Ok(None);
         }
 
+        after_validation();
+
+        let mut updated = false;
         for &raw in &dbc_state.statements {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
             let Ok(mut state) = stmt.inner.lock() else {
@@ -903,10 +916,14 @@ impl DescHandle {
                 .get_mut(&focus)
                 .and_then(|columns| columns.get_mut(column_index))
             {
+                if !is_valid(binding) {
+                    return Ok(Some(false));
+                }
                 update(binding);
+                updated = true;
             }
         }
-        Ok(Some(true))
+        Ok(updated.then_some(true))
     }
 
     pub(crate) fn focused_tvp_bindings(
@@ -1176,6 +1193,53 @@ mod tests {
             };
             assert_eq!(lps(old), lps(new), "{old}");
         }
+    }
+
+    #[test]
+    fn focused_tvp_update_revalidates_after_focus_changes() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_NUMERIC, SQL_PARAM_INPUT};
+
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            let binding = |precision, scale| {
+                Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: SQL_C_NUMERIC,
+                    sql_type: SQL_NUMERIC,
+                    column_size: 10,
+                    decimal_digits: scale,
+                    app_precision: precision,
+                    app_scale: scale,
+                    parameter_value_ptr: std::ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: std::ptr::null_mut(),
+                    octet_length_ptr: std::ptr::null_mut(),
+                })
+            };
+            state.tvp_column_bindings.insert(1, vec![binding(10, 2)]);
+            state.tvp_column_bindings.insert(2, vec![binding(10, 8)]);
+        }
+
+        let result = desc.update_focused_tvp_bindings_after_validation(
+            1,
+            |binding| binding.app_scale <= 5,
+            |binding| binding.app_precision = 5,
+            || {
+                let mut state = stmt.inner.lock().unwrap();
+                state.vendor_attrs.store_param_focus(2);
+            },
+        );
+
+        assert!(matches!(result, Ok(Some(false))));
+        let state = stmt.inner.lock().unwrap();
+        let a = state.tvp_column_bindings[&1][0].unwrap();
+        let b = state.tvp_column_bindings[&2][0].unwrap();
+        assert_eq!((a.app_precision, a.app_scale), (10, 2));
+        assert_eq!((b.app_precision, b.app_scale), (10, 8));
     }
 
     #[test]
