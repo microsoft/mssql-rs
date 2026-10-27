@@ -60,7 +60,9 @@ pub struct TdsConnectionProvider;
 pub enum DiagnosticStop {
     /// After the name or instance is resolved: SQL Server Browser asked, the
     /// TCP host resolved, a LocalDB instance's pipe found; before anything
-    /// is connected to.
+    /// is connected to. A local named instance without a protocol prefix is
+    /// tried over shared memory first (Windows), so there it stops before
+    /// shared memory is opened, without a Browser lookup.
     Resolution,
     /// After the transport opened (a TCP connection, or a pipe), before
     /// pre-login. With strict encryption (TDS 8.0) the TLS handshake is part
@@ -224,9 +226,14 @@ impl TdsConnectionProvider {
     /// same connection attempt, observed through its connect-stage spans
     /// ([`connect_stage`](crate::connection::connect_stage)), stopped after
     /// `stop_after` when given. A diagnostic attempt does not use or update
-    /// the instance cache, so a named instance is always looked up, and its
-    /// SQL Server Browser lookup counts resolving the server against the
-    /// lookup's time limit. Over TCP without MultiSubnetFailover, once an
+    /// the instance cache, so a named instance is looked up whenever the
+    /// attempt reaches SQL Server Browser, and that lookup counts resolving
+    /// the server against the lookup's time limit. As the client does, it
+    /// tries a local named instance without a protocol prefix over shared
+    /// memory first (Windows) and asks SQL Server Browser only if that does
+    /// not connect; a [`DiagnosticStop::Resolution`] stop on that path
+    /// happens before shared memory is opened, without a Browser lookup.
+    /// Over TCP without MultiSubnetFailover, once an
     /// address accepts the connection, it also connects to the addresses
     /// after it (at most 64, as MultiSubnetFailover tries), at the same time
     /// and each within the connect timeout, closing each connection at once,
@@ -331,7 +338,8 @@ impl TdsConnectionProvider {
 
             // Try Shared Memory before SSRP for local named instances (Windows only).
             // SM doesn't need instance resolution — it uses the name directly.
-            // If SM succeeds, we skip SSRP entirely. This matches ODBC/SNI behavior.
+            // If SM succeeds, we skip SSRP entirely. This matches ODBC/SNI behavior,
+            // and a diagnostic connection follows it as the real connection does.
             #[cfg(windows)]
             if action_chain.requires_ssrp()
                 && let Some(sm_transport) = action_chain.first_shared_memory_transport()
@@ -406,8 +414,9 @@ impl TdsConnectionProvider {
                         )
                     })?;
 
-                // A diagnostic connection always asks SQL Server Browser,
-                // and does not leave its answer in the cache.
+                // A diagnostic connection that gets here asks SQL Server
+                // Browser even on a cache hit, and does not leave its answer
+                // in the cache.
                 if action_chain.uses_cache() && diagnosis.is_none() {
                     if let Some(cached) = InstanceCache::global().get(server, instance)? {
                         debug!(?cached, server, instance, "SSRP cache hit");
@@ -1480,8 +1489,8 @@ mod tests {
             assert_eq!(log.named(stage::TCP).len(), 1, "{:#?}", log.stages());
         }
 
-        /// The diagnostic lookup always asks SQL Server Browser, past the
-        /// instance cache, and records why it failed; a normal connection
+        /// The diagnostic lookup asks SQL Server Browser past the instance
+        /// cache, and records why it failed; a normal connection
         /// fails with the same message as before.
         #[test]
         fn the_instance_lookup_is_recorded_and_its_message_kept() {
@@ -1510,6 +1519,46 @@ mod tests {
                 )),
                 "{error}"
             );
+        }
+
+        /// A local named instance without a protocol prefix is tried over
+        /// shared memory first, as the client does: a resolution stop comes
+        /// before shared memory is opened and asks no Browser, and SQL Server
+        /// Browser is asked only once shared memory has failed.
+        #[cfg(windows)]
+        #[test]
+        fn a_local_named_instance_tries_shared_memory_before_the_browser() {
+            let datasource = r".\NoSuchDiagnoseInstance";
+            let (result, log) = diagnose(datasource, Some(DiagnosticStop::Resolution));
+            assert!(stopped(&result), "{:#?}", log.stages());
+            assert!(log.stages().is_empty(), "{:#?}", log.stages());
+
+            for stop_after in [Some(DiagnosticStop::Transport), None] {
+                let (result, log) = diagnose(datasource, stop_after);
+                assert!(result.is_err(), "{stop_after:?}: {:#?}", log.stages());
+                let stages = log.stages();
+                let shared_memory = stages
+                    .iter()
+                    .position(|s| {
+                        s.name == stage::PIPE
+                            && s.field(stage::KIND) == Some(stage::KIND_SHARED_MEMORY)
+                    })
+                    .unwrap_or_else(|| panic!("{stop_after:?}: {stages:#?}"));
+                assert_eq!(
+                    stages[shared_memory].field(stage::OK),
+                    Some("false"),
+                    "{stop_after:?}: {stages:#?}"
+                );
+                let lookup = stages
+                    .iter()
+                    .position(|s| s.name == stage::INSTANCE_LOOKUP)
+                    .unwrap_or_else(|| panic!("{stop_after:?}: {stages:#?}"));
+                assert!(shared_memory < lookup, "{stop_after:?}: {stages:#?}");
+                assert_eq!(
+                    stages[lookup].field(stage::INSTANCE),
+                    Some("NoSuchDiagnoseInstance")
+                );
+            }
         }
 
         /// A pipe stops before it is opened, and records how its opening
