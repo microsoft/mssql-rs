@@ -122,6 +122,11 @@ The hook at `dev/hooks/pre-commit` auto-runs `cargo fmt` on workspace + `mssql-p
 - No excessive blank lines or formatting noise
 - Doc comments (`///`) should add value — explain *why*, not *what*
 - Would a senior Rust engineer roll their eyes at this? Then don't write it.
+- Package-facing READMEs (`mssql-tds/README.md`, `mssql-mock-tds/README.md`,
+  `mssql-py-core/README.md`, `mssql-sqlcmd/README.md`, and
+  `mssql-js/npm/*/README.md`) are user-facing package documentation.
+  Update them when relevant to consumers, keeping content concise and links
+  absolute. Put detailed implementation and maintainer procedures in linked guides.
 
 ## What NOT to Do
 
