@@ -25,9 +25,7 @@ use mssql_tds::datatypes::column_values::{
     SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime, SqlXml,
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
-use mssql_tds::datatypes::sql_string::{
-    EncodingType, SqlString, encode_narrow, fit_narrow_byte_limit,
-};
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
 use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
 use mssql_tds::datatypes::sql_udt::UdtTypeName;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
@@ -2380,9 +2378,7 @@ fn normalize_tvp_cell(column: &BoundParam, mut value: SqlType) -> Result<SqlType
         && let SqlType::VarcharMax(Some(string)) = &mut value
     {
         let maximum = column.column_size.min(SQL_PREC_TEXTIMAGE);
-        let fitted = fit_narrow_byte_limit(&string.bytes, maximum)
-            .map_err(|_| ParamBuildError::StringTruncation)?;
-        string.bytes.truncate(fitted.len());
+        string.set_narrow_string_byte_limit(maximum);
     }
 
     let parts = match &value {
@@ -4423,7 +4419,23 @@ mod tests {
     }
 
     #[test]
-    fn tvp_longvarchar_cell_trims_only_trailing_padding_to_its_byte_limit() {
+    fn tvp_longvarchar_cell_defers_byte_limit_until_collation_encoding() {
+        let mut column = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        column.sql_type = SQL_LONGVARCHAR;
+        column.column_size = 2;
+
+        let value = SqlType::VarcharMax(Some(SqlString::new(
+            "éé".as_bytes().to_vec(),
+            EncodingType::Utf8,
+        )));
+        let SqlType::VarcharMax(Some(value)) = normalize_tvp_cell(&column, value).unwrap() else {
+            panic!("expected varchar(max) cell");
+        };
+        assert_eq!(value.bytes, "éé".as_bytes());
+    }
+
+    #[test]
+    fn tvp_longvarchar_cell_preserves_trailing_space_until_collation_encoding() {
         let mut column = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
         column.sql_type = SQL_LONGVARCHAR;
         column.column_size = 3;
@@ -4435,23 +4447,7 @@ mod tests {
         let SqlType::VarcharMax(Some(value)) = normalize_tvp_cell(&column, value).unwrap() else {
             panic!("expected varchar(max) cell");
         };
-        assert_eq!(value.bytes, "€".as_bytes());
-    }
-
-    #[test]
-    fn tvp_longvarchar_cell_rejects_non_padding_byte_overflow() {
-        let mut column = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
-        column.sql_type = SQL_LONGVARCHAR;
-        column.column_size = 3;
-
-        let value = SqlType::VarcharMax(Some(SqlString::new(
-            "€a".as_bytes().to_vec(),
-            EncodingType::Utf8,
-        )));
-        assert!(matches!(
-            normalize_tvp_cell(&column, value),
-            Err(ParamBuildError::StringTruncation)
-        ));
+        assert_eq!(value.bytes, "€ ".as_bytes());
     }
 
     /// The TVP octet-length slot carries the row count; `SQL_DEFAULT_PARAM` or a null

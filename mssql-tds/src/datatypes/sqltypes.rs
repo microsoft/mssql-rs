@@ -1100,6 +1100,16 @@ impl SqlType {
         db_collation: &SqlCollation,
         narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()> {
+        let value_has_narrow_string_byte_limit = match self {
+            SqlType::Char(Some(value), _)
+            | SqlType::Varchar(Some(value), _)
+            | SqlType::VarcharMax(Some(value))
+            | SqlType::Text(Some(value)) => value.narrow_string_byte_limit().is_some(),
+            _ => false,
+        };
+        let has_narrow_string_byte_limit =
+            narrow_string_byte_limit.is_some() || value_has_narrow_string_byte_limit;
+
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
             SqlType::Variant(inner) => {
@@ -1107,13 +1117,11 @@ impl SqlType {
                 inner.validate_for_send(db_collation, None)
             }
             SqlType::Varchar(_, length)
-                if narrow_string_byte_limit.is_none() && *length > VAR_TDS_MAX_LENGTH =>
+                if !has_narrow_string_byte_limit && *length > VAR_TDS_MAX_LENGTH =>
             {
                 Ok(())
             }
-            SqlType::VarcharMax(_) | SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
-                Ok(())
-            }
+            SqlType::VarcharMax(_) | SqlType::Text(_) if !has_narrow_string_byte_limit => Ok(()),
             SqlType::Vector(vector, dimensions, base_type) => {
                 Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
             }
