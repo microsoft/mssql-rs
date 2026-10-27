@@ -873,7 +873,7 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
 /// reading `StmtState::bound_params` exactly as it did before AB#47437.
 ///
-/// `Err(SQL_ERROR)` on a poisoned STMT/env/APD/IPD mutex: the caller posts a
+/// `Err(SQL_ERROR)` on a poisoned STMT/DBC/env/APD/IPD mutex: the caller posts a
 /// diagnostic against the statement and fails the execute outright, rather
 /// than silently snapshotting "every parameter unbound" — which used to let
 /// a zero-marker statement execute successfully despite the internal
