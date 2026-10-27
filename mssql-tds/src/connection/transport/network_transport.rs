@@ -733,16 +733,25 @@ async fn create_base_stream_parallel(
         resolver_error = tracing::field::Empty,
         ok = tracing::field::Empty
     );
-    let mut fell_back = false;
-    let (result, resolution) = parallel_connect_resolving(host, port, &config, |e| {
-        fell_back = true;
-        connect_stage::record_resolver_fallback(&tcp_stage, e);
-    })
+    // Where the addresses came from is recorded once the host resolved, before
+    // the race, so a race that fails keeps it.
+    let fell_back = std::sync::atomic::AtomicBool::new(false);
+    let (result, resolution) = parallel_connect_resolving(
+        host,
+        port,
+        &config,
+        |e| {
+            fell_back.store(true, std::sync::atomic::Ordering::Relaxed);
+            connect_stage::record_resolver_fallback(&tcp_stage, e);
+        },
+        || {
+            if !fell_back.load(std::sync::atomic::Ordering::Relaxed) {
+                tcp_stage.record(connect_stage::SOURCE, connect_stage::SOURCE_RESOLVER);
+            }
+        },
+    )
     .await
     .inspect_err(|e| connect_stage::record_error(&tcp_stage, e))?;
-    if !fell_back {
-        tcp_stage.record(connect_stage::SOURCE, connect_stage::SOURCE_RESOLVER);
-    }
     tcp_stage.record(
         connect_stage::ADDRESS,
         tracing::field::display(connect_stage::ScopedIp(&result.connected_address)),
@@ -7566,5 +7575,52 @@ mod dns_stage_tests {
             Some("NotFound"),
             "{tcp:#?}"
         );
+    }
+
+    /// With MultiSubnetFailover, a host the resolver answered for keeps
+    /// `source: resolver` on the `tcp` stage even when no address accepts.
+    #[test]
+    fn a_refused_multi_subnet_failover_connect_keeps_the_resolver_as_the_source() {
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let (result, log) = recording(create_base_stream_parallel(
+            "127.0.0.1",
+            refused.port(),
+            30_000,
+            1_000,
+            5_000,
+        ));
+
+        assert!(result.is_err(), "nothing listens on {refused}");
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(tcp.field(connect_stage::OK), Some("false"));
+        assert_eq!(
+            tcp.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_RESOLVER),
+            "{tcp:#?}"
+        );
+        assert_eq!(tcp.field(connect_stage::RESOLVER_ERROR), None);
+        assert!(tcp.field(connect_stage::ERROR).is_some(), "{tcp:#?}");
+    }
+
+    /// With MultiSubnetFailover, a host that does not resolve, and has no
+    /// cached addresses, records no source.
+    #[test]
+    fn an_unresolved_multi_subnet_failover_host_records_no_source() {
+        let (result, log) = recording(create_base_stream_parallel(
+            "parallel-unresolved.no-cache.invalid",
+            1433,
+            30_000,
+            1_000,
+            5_000,
+        ));
+
+        assert!(result.is_err());
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(tcp.field(connect_stage::OK), Some("false"));
+        assert_eq!(tcp.field(connect_stage::SOURCE), None, "{tcp:#?}");
     }
 }

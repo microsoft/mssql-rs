@@ -123,20 +123,23 @@ pub async fn parallel_connect(
     port: u16,
     config: &ParallelConnectConfig,
 ) -> TdsResult<ParallelConnectResult> {
-    parallel_connect_resolving(host, port, config, |_| {})
+    parallel_connect_resolving(host, port, config, |_| {}, || {})
         .await
         .map(|(result, _)| result)
 }
 
 /// [`parallel_connect`], also returning what `host` resolved to, which the
-/// connection's login DNS caching verdict applies to, and handing
+/// connection's login DNS caching verdict applies to. It hands
 /// `dns_fell_back` the resolver's error when the DNS cache supplied the
-/// addresses instead.
+/// addresses instead, and calls `resolved` once the host has resolved, before
+/// the race, so a caller can record where the addresses came from even when
+/// no address then accepts.
 pub(crate) async fn parallel_connect_resolving(
     host: &str,
     port: u16,
     config: &ParallelConnectConfig,
     dns_fell_back: impl FnOnce(&std::io::Error),
+    resolved: impl FnOnce(),
 ) -> TdsResult<(ParallelConnectResult, Resolution)> {
     info!(
         "Starting parallel connection to {}:{} with timeout {}ms",
@@ -169,6 +172,7 @@ pub(crate) async fn parallel_connect_resolving(
             )));
         }
     };
+    resolved();
     validate_address_count(resolution.addresses().len())?;
     let addresses = resolution.addresses();
 
