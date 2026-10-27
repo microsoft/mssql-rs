@@ -160,102 +160,77 @@ fn sql_set_desc_field_w_safe(
             }
         };
         if may_route {
-            let focused_bindings = match desc.focused_tvp_bindings(record_number) {
-                Ok(bindings) => bindings,
-                Err(()) => {
-                    error!("SQLSetDescFieldW: failed reading focused descriptor bindings");
-                    let Ok(mut state) = desc.inner.lock() else {
-                        error!("SQLSetDescFieldW: desc mutex poisoned posting focused TVP error");
-                        return SQL_ERROR;
+            let focused_value = match field {
+                SQL_DESC_PRECISION | SQL_DESC_SCALE => {
+                    let Ok(value) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
+                        return post_focused_tvp_diag(desc, ERR_INVALID_ATTRIBUTE_VALUE);
                     };
-                    post_sql_error(
-                        &mut state,
-                        crate::api::sqlstate::SQLSTATE_HY000,
-                        0,
-                        "Internal error reading focused table-valued parameter descriptor",
-                    );
-                    return SQL_ERROR;
+                    Some(value)
                 }
+                _ => None,
             };
-            if !focused_bindings.is_empty() {
-                let focused_value = match field {
+            let updated = desc.update_focused_tvp_bindings(
+                record_number,
+                |binding| match (field, focused_value) {
+                    (SQL_DESC_PRECISION, Some(precision)) => {
+                        binding.c_type != SQL_C_NUMERIC
+                            || ((1..=SQL_PREC_NUMERIC).contains(&precision)
+                                && binding.app_scale <= precision)
+                    }
+                    (SQL_DESC_SCALE, Some(scale)) => {
+                        !matches!(binding.c_type, SQL_C_NUMERIC | SQL_DECIMAL)
+                            || scale <= binding.app_precision
+                    }
+                    _ => true,
+                },
+                |binding| match field {
+                    SQL_DESC_DATA_PTR => binding.parameter_value_ptr = value_ptr,
+                    SQL_DESC_INDICATOR_PTR => {
+                        binding.strlen_or_ind_ptr = value_ptr.cast::<SqlLen>()
+                    }
+                    SQL_DESC_OCTET_LENGTH_PTR => {
+                        binding.octet_length_ptr = value_ptr.cast::<SqlLen>()
+                    }
                     SQL_DESC_PRECISION => {
-                        let Ok(precision) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
-                            return post_focused_tvp_diag(desc, ERR_INVALID_ATTRIBUTE_VALUE);
-                        };
-                        if focused_bindings.iter().any(|binding| {
-                            binding.c_type == SQL_C_NUMERIC
-                                && (!(1..=SQL_PREC_NUMERIC).contains(&precision)
-                                    || binding.app_scale > precision)
-                        }) {
-                            error!(
-                                precision,
-                                "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC precision/scale"
-                            );
-                            return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                        if let Some(precision) = focused_value {
+                            binding.app_precision = precision;
                         }
-                        Some(precision)
                     }
                     SQL_DESC_SCALE => {
-                        let Ok(scale) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
-                            return post_focused_tvp_diag(desc, ERR_INVALID_ATTRIBUTE_VALUE);
-                        };
-                        if focused_bindings.iter().any(|binding| {
-                            matches!(binding.c_type, SQL_C_NUMERIC | SQL_DECIMAL)
-                                && scale > binding.app_precision
-                        }) {
-                            error!(
-                                scale,
-                                "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC scale"
-                            );
-                            return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                        if let Some(scale) = focused_value {
+                            binding.app_scale = scale;
                         }
-                        Some(scale)
                     }
-                    _ => None,
-                };
-
-                let Ok(mut state) = desc.inner.lock() else {
-                    error!("SQLSetDescFieldW: desc mutex poisoned clearing diagnostics");
-                    return SQL_ERROR;
-                };
-                free_errors(&mut state);
-                drop(state);
-                let updated =
-                    desc.update_focused_tvp_bindings(record_number, |binding| match field {
-                        SQL_DESC_DATA_PTR => binding.parameter_value_ptr = value_ptr,
-                        SQL_DESC_INDICATOR_PTR => {
-                            binding.strlen_or_ind_ptr = value_ptr.cast::<SqlLen>()
-                        }
-                        SQL_DESC_OCTET_LENGTH_PTR => {
-                            binding.octet_length_ptr = value_ptr.cast::<SqlLen>()
-                        }
-                        SQL_DESC_PRECISION => {
-                            if let Some(precision) = focused_value {
-                                binding.app_precision = precision;
-                            }
-                        }
-                        SQL_DESC_SCALE => {
-                            if let Some(scale) = focused_value {
-                                binding.app_scale = scale;
-                            }
-                        }
-                        _ => unreachable!(),
-                    });
-                match updated {
-                    Ok(true) => return SQL_SUCCESS,
-                    Ok(false) => {}
-                    Err(()) => {
-                        if let Ok(mut state) = desc.inner.lock() {
-                            post_sql_error(
-                                &mut state,
-                                crate::api::sqlstate::SQLSTATE_HY000,
-                                0,
-                                "Internal error updating focused table-valued parameter descriptor",
-                            );
-                        }
+                    _ => unreachable!(),
+                },
+            );
+            match updated {
+                Ok(Some(true)) => {
+                    let Ok(mut state) = desc.inner.lock() else {
+                        error!("SQLSetDescFieldW: desc mutex poisoned clearing diagnostics");
                         return SQL_ERROR;
+                    };
+                    free_errors(&mut state);
+                    return SQL_SUCCESS;
+                }
+                Ok(Some(false)) => {
+                    error!(
+                        field,
+                        "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC precision/scale"
+                    );
+                    return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    if let Ok(mut state) = desc.inner.lock() {
+                        post_sql_error(
+                            &mut state,
+                            crate::api::sqlstate::SQLSTATE_HY000,
+                            0,
+                            "Internal error updating focused table-valued parameter descriptor",
+                        );
                     }
+                    return SQL_ERROR;
                 }
             }
         }
@@ -972,7 +947,7 @@ mod tests {
     use crate::api::sqlstate::ERR_FUNCTION_SEQUENCE;
     use crate::error::diag::DiagRecord;
     use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
-    use crate::handles::{DescHandle, handle_from_raw};
+    use crate::handles::{DescHandle, StmtHandle, handle_from_raw};
     use crate::test_support::TestHandles;
     use crate::test_support::assert_last_diag;
 
@@ -1979,6 +1954,101 @@ mod tests {
             unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, 5isize as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(get_small_int(h.apd(), 1, SQL_DESC_SCALE), 5);
+    }
+
+    #[test]
+    fn concurrent_focused_tvp_precision_and_scale_updates_stay_consistent() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        state.vendor_attrs.store_param_focus(1);
+        state.tvp_column_bindings.insert(
+            1,
+            vec![Some(crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_NUMERIC,
+                sql_type: SQL_NUMERIC,
+                column_size: 10,
+                decimal_digits: 2,
+                app_precision: 10,
+                app_scale: 2,
+                parameter_value_ptr: ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: ptr::null_mut(),
+                octet_length_ptr: ptr::null_mut(),
+            })],
+        );
+        drop(state);
+
+        let descriptor = h.apd() as usize;
+        for _ in 0..64 {
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                let binding = state
+                    .tvp_column_bindings
+                    .get_mut(&1)
+                    .and_then(|columns| columns.first_mut())
+                    .and_then(Option::as_mut)
+                    .expect("focused TVP column should be bound");
+                binding.app_precision = 10;
+                binding.app_scale = 2;
+            }
+
+            let barrier = Arc::new(Barrier::new(3));
+            let precision_barrier = Arc::clone(&barrier);
+            let precision = thread::spawn(move || {
+                precision_barrier.wait();
+                unsafe {
+                    sql_set_desc_field_w(
+                        descriptor as SqlHandle,
+                        1,
+                        SQL_DESC_PRECISION,
+                        5isize as SqlPointer,
+                        0,
+                    )
+                }
+            });
+            let scale_barrier = Arc::clone(&barrier);
+            let scale = thread::spawn(move || {
+                scale_barrier.wait();
+                unsafe {
+                    sql_set_desc_field_w(
+                        descriptor as SqlHandle,
+                        1,
+                        SQL_DESC_SCALE,
+                        8isize as SqlPointer,
+                        0,
+                    )
+                }
+            });
+            barrier.wait();
+
+            let results = [precision.join().unwrap(), scale.join().unwrap()];
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|&&result| result == SQL_SUCCESS)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|&&result| result == SQL_ERROR)
+                    .count(),
+                1
+            );
+
+            let state = stmt.inner.lock().unwrap();
+            let binding = state.tvp_column_bindings[&1][0].unwrap();
+            assert!(
+                (binding.app_precision, binding.app_scale) == (5, 2)
+                    || (binding.app_precision, binding.app_scale) == (10, 8)
+            );
+        }
     }
 
     #[test]

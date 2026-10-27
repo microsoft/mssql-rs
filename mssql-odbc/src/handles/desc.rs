@@ -831,6 +831,84 @@ impl DescHandle {
         Ok((fetching, executing))
     }
 
+    pub(crate) fn update_focused_tvp_bindings(
+        &self,
+        record_number: SqlSmallInt,
+        is_valid: impl Fn(&crate::params::BoundParam) -> bool,
+        mut update: impl FnMut(&mut crate::params::BoundParam),
+    ) -> Result<Option<bool>, ()> {
+        let Some(column_index) = usize::try_from(record_number)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+        else {
+            return Ok(None);
+        };
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("updating focused TVP descriptor records: dbc mutex poisoned");
+            return Err(());
+        };
+
+        let mut found = false;
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(state) = stmt.inner.lock() else {
+                error!("validating focused TVP descriptor records: stmt mutex poisoned");
+                return Err(());
+            };
+            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus == 0 {
+                continue;
+            }
+            if let Some(binding) = state
+                .tvp_column_bindings
+                .get(&focus)
+                .and_then(|columns| columns.get(column_index))
+                .and_then(Option::as_ref)
+            {
+                found = true;
+                if !is_valid(binding) {
+                    return Ok(Some(false));
+                }
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(mut state) = stmt.inner.lock() else {
+                error!("updating focused TVP descriptor records: stmt mutex poisoned");
+                return Err(());
+            };
+            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus == 0 {
+                continue;
+            }
+            if let Some(Some(binding)) = state
+                .tvp_column_bindings
+                .get_mut(&focus)
+                .and_then(|columns| columns.get_mut(column_index))
+            {
+                update(binding);
+            }
+        }
+        Ok(Some(true))
+    }
+
     pub(crate) fn focused_tvp_bindings(
         &self,
         record_number: SqlSmallInt,
@@ -872,51 +950,6 @@ impl DescHandle {
             }
         }
         Ok(bindings)
-    }
-
-    pub(crate) fn update_focused_tvp_bindings(
-        &self,
-        record_number: SqlSmallInt,
-        mut update: impl FnMut(&mut crate::params::BoundParam),
-    ) -> Result<bool, ()> {
-        let Some(column_index) = usize::try_from(record_number)
-            .ok()
-            .and_then(|number| number.checked_sub(1))
-        else {
-            return Ok(false);
-        };
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
-        let Ok(dbc_state) = dbc.inner.lock() else {
-            error!("updating focused TVP descriptor records: dbc mutex poisoned");
-            return Err(());
-        };
-        let mut updated = false;
-        for &raw in &dbc_state.statements {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
-            let Ok(mut state) = stmt.inner.lock() else {
-                error!("updating focused TVP descriptor records: stmt mutex poisoned");
-                return Err(());
-            };
-            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
-                continue;
-            }
-            let focus = state
-                .vendor_attrs
-                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
-                .unwrap_or(0);
-            if focus == 0 {
-                continue;
-            }
-            if let Some(Some(binding)) = state
-                .tvp_column_bindings
-                .get_mut(&focus)
-                .and_then(|columns| columns.get_mut(column_index))
-            {
-                update(binding);
-                updated = true;
-            }
-        }
-        Ok(updated)
     }
 
     fn invalidate_prepared_owner(&self, first_changed: usize) -> Result<(), ()> {

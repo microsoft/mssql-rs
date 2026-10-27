@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::{
+    core::TdsResult,
+    error::Error,
     query::metadata::ColumnMetadata,
     token::tokens::{CODE_PAGE_FROM_SORT_ID, SqlCollation},
 };
@@ -38,6 +40,21 @@ pub struct SqlString {
     /// Raw encoded bytes.
     pub bytes: Vec<u8>,
     encoding_type: EncodingType,
+}
+
+/// Applies a narrow-string byte limit, allowing only trailing ASCII spaces
+/// beyond the limit to be discarded.
+pub fn fit_narrow_byte_limit(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
+    if bytes.len() <= maximum {
+        return Ok(bytes);
+    }
+    if bytes[maximum..].iter().all(|byte| *byte == b' ') {
+        return Ok(&bytes[..maximum]);
+    }
+    Err(Error::EncodedValueTooLong {
+        actual: bytes.len(),
+        maximum,
+    })
 }
 
 /// Resolves `collation` to its narrow encoding, or `None` when neither the

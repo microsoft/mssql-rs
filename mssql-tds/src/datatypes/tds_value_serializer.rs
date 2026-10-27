@@ -1942,20 +1942,8 @@ impl TdsValueSerializer {
         Ok(())
     }
 
-    /// Helper to serialize a single-byte string for CHAR/VARCHAR types.
-    ///
-    /// Takes single-byte encoded data and serializes it according to the TDS type context.
     fn fit_narrow_bytes(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
-        if bytes.len() <= maximum {
-            return Ok(bytes);
-        }
-        if bytes[maximum..].iter().all(|byte| *byte == b' ') {
-            return Ok(&bytes[..maximum]);
-        }
-        Err(Error::EncodedValueTooLong {
-            actual: bytes.len(),
-            maximum,
-        })
+        crate::datatypes::sql_string::fit_narrow_byte_limit(bytes, maximum)
     }
 
     async fn serialize_char_varchar_direct<'a, 'b>(

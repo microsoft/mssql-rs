@@ -129,9 +129,6 @@ pub struct TvpColumnDef {
     /// `DateTimeOffset` columns. Row values are converted to this scale;
     /// conversions that would discard fractional data are rejected.
     pub scale: Option<u8>,
-    /// Optional byte limit for narrow string values whose wire type is PLP.
-    /// Unlike bounded types, the PLP type context does not carry this limit.
-    pub narrow_string_byte_limit: Option<usize>,
 }
 
 impl TvpColumnDef {
@@ -143,7 +140,6 @@ impl TvpColumnDef {
             flags: TvpColumnFlags::NULLABLE,
             precision: None,
             scale: None,
-            narrow_string_byte_limit: None,
         }
     }
 
@@ -596,7 +592,7 @@ pub(crate) async fn write_tvp_rows(
                 packet_writer,
                 &value,
                 &ctx,
-                column.narrow_string_byte_limit,
+                None,
             )
             .await?;
         }
@@ -677,56 +673,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn utf8_varchar_max_cell_uses_explicit_byte_limit() {
-        let mut column = TvpColumnDef::new(SqlType::VarcharMax(None));
-        column.narrow_string_byte_limit = Some(3);
-        let row = vec![SqlType::VarcharMax(Some(
-            crate::datatypes::sql_string::SqlString::from_utf8_string("€ ".to_string()),
-        ))];
-        let collation = SqlCollation {
-            info: 0,
-            lcid_language_id: 0,
-            col_flags: 0x40,
-            sort_id: 0,
-        };
-        let mut mock = MockNetworkWriter::new(4096);
-        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        write_tvp_rows(&mut writer, &[column], &[row], &collation)
-            .await
-            .unwrap();
-        writer.finalize().await.unwrap();
-        let bytes = &mock.data[PacketWriter::PACKET_HEADER_SIZE..];
-
-        assert!(bytes.windows(3).any(|window| window == [0xE2, 0x82, 0xAC]));
-        assert!(
-            !bytes
-                .windows(4)
-                .any(|window| window == [0xE2, 0x82, 0xAC, b' '])
+    #[test]
+    fn narrow_string_limit_discards_only_trailing_ascii_spaces() {
+        assert_eq!(
+            crate::datatypes::sql_string::fit_narrow_byte_limit("€ ".as_bytes(), 3).unwrap(),
+            "€".as_bytes()
         );
-    }
-
-    #[tokio::test]
-    async fn utf8_varchar_max_rejects_non_padding_overflow() {
-        let mut column = TvpColumnDef::new(SqlType::VarcharMax(None));
-        column.narrow_string_byte_limit = Some(3);
-        let row = vec![SqlType::VarcharMax(Some(
-            crate::datatypes::sql_string::SqlString::from_utf8_string("€a".to_string()),
-        ))];
-        let collation = SqlCollation {
-            info: 0,
-            lcid_language_id: 0,
-            col_flags: 0x40,
-            sort_id: 0,
-        };
-        let mut mock = MockNetworkWriter::new(4096);
-        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-
-        assert!(
-            write_tvp_rows(&mut writer, &[column], &[row], &collation)
-                .await
-                .is_err()
-        );
+        assert!(crate::datatypes::sql_string::fit_narrow_byte_limit("€a".as_bytes(), 3).is_err());
     }
 
     async fn row_bytes(columns: &[TvpColumnDef], rows: &[Vec<SqlType>]) -> Vec<u8> {
