@@ -807,6 +807,11 @@ pub(crate) fn buffered_dae_to_value(
         SqlLen::try_from(buffer.len()).map_err(|_| ParamBuildError::StringTruncation)?
     };
     let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
+    if synthetic.c_type == SQL_C_NUMERIC
+        && matches!(sql_family(synthetic.sql_type), Some(SqlFamily::Decimal))
+    {
+        return unsafe { numeric_tvp_cell_value(&synthetic) }.map(|value| (value, ConvOk::Exact));
+    }
     let ((value, _), outcome) = unsafe { bound_param_to_value_with_outcome(&synthetic, None) }?;
     Ok((value, outcome))
 }
@@ -2369,8 +2374,55 @@ pub(crate) unsafe fn bound_tvp_cell_to_value(
     column: &BoundParam,
 ) -> Result<SqlType, ParamBuildError> {
     unsafe { stamp_numeric_apd(column) };
+    if column.c_type == SQL_C_NUMERIC
+        && matches!(sql_family(column.sql_type), Some(SqlFamily::Decimal))
+    {
+        return unsafe { numeric_tvp_cell_value(column) };
+    }
     let ((value, _), _) = unsafe { bound_param_to_value_with_outcome(column, None) }?;
     normalize_tvp_cell(column, value)
+}
+
+/// # Safety
+/// The binding's buffers must remain valid through this conversion.
+unsafe fn numeric_tvp_cell_value(column: &BoundParam) -> Result<SqlType, ParamBuildError> {
+    if is_output_only(column.input_output_type) {
+        return typed_null(
+            column.sql_type,
+            column.column_size,
+            column.decimal_digits,
+            None,
+        )
+        .map(|value| value.0);
+    }
+    let len_spec = match unsafe { read_indicator(column) }? {
+        Indicator::Null => {
+            return typed_null(
+                column.sql_type,
+                column.column_size,
+                column.decimal_digits,
+                None,
+            )
+            .map(|value| value.0);
+        }
+        Indicator::Length(len) => len,
+    };
+    let AppValue::Numeric(source) = unsafe { read_param_value(column, len_spec) }? else {
+        return Err(ParamBuildError::ConversionNotImplemented);
+    };
+    let source_scale = if numeric_apd_matches_ipd(column) {
+        i64::from(source.scale)
+    } else {
+        i64::from(column.app_scale)
+    };
+    let magnitude = i128::try_from(u128::from_le_bytes(source.val))
+        .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+    let mantissa = if source.sign == 0 {
+        -magnitude
+    } else {
+        magnitude
+    };
+    normalize_tvp_decimal(column, mantissa, source_scale)
 }
 
 fn normalize_tvp_cell(column: &BoundParam, mut value: SqlType) -> Result<SqlType, ParamBuildError> {
@@ -2385,9 +2437,6 @@ fn normalize_tvp_cell(column: &BoundParam, mut value: SqlType) -> Result<SqlType
         SqlType::Decimal(Some(parts)) | SqlType::Numeric(Some(parts)) => parts,
         _ => return Ok(value),
     };
-    let metadata = decimal_metadata(column.column_size, column.decimal_digits)?;
-    let precision = metadata.precision.unwrap_or(0);
-    let scale = metadata.scale.unwrap_or(0);
     let magnitude = i128::try_from(parts.magnitude())
         .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
     let mantissa = if parts.is_positive {
@@ -2395,10 +2444,24 @@ fn normalize_tvp_cell(column: &BoundParam, mut value: SqlType) -> Result<SqlType
     } else {
         -magnitude
     };
-    let (mut scaled, _) = rescale_mantissa(mantissa, i64::from(parts.scale), scale)?;
-    if parts.scale > scale {
+    normalize_tvp_decimal(column, mantissa, i64::from(parts.scale))
+}
+
+fn normalize_tvp_decimal(
+    column: &BoundParam,
+    mantissa: i128,
+    source_scale: i64,
+) -> Result<SqlType, ParamBuildError> {
+    let metadata = decimal_metadata(column.column_size, column.decimal_digits)?;
+    let precision = metadata.precision.unwrap_or(0);
+    let scale = metadata.scale.unwrap_or(0);
+    let (mut scaled, _) = rescale_mantissa(mantissa, source_scale, scale)?;
+    if source_scale > i64::from(scale) {
         let divisor = 10i128
-            .checked_pow(u32::from(parts.scale - scale))
+            .checked_pow(
+                u32::try_from(source_scale - i64::from(scale))
+                    .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?,
+            )
             .ok_or(ParamBuildError::Value(ConvError::OutOfRange))?;
         if (mantissa % divisor).abs() >= divisor / 2 {
             scaled += mantissa.signum();
@@ -4605,6 +4668,102 @@ mod tests {
         assert_eq!(
             normalize_tvp_cell(&column, value).unwrap(),
             SqlType::Numeric(Some(decimal_from_magnitude(1200, 5, 2).unwrap()))
+        );
+    }
+
+    #[test]
+    fn tvp_numeric_bound_cells_round_from_application_scale() {
+        use crate::handles::desc::UdtNames;
+        use mssql_tds::test_client_support::rpc_parameter_value;
+
+        let mut source = numeric_struct(1235, 1, 1);
+        let mut indicator = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut column = param(SQL_C_NUMERIC, (&raw mut source).cast(), &mut indicator);
+        column.sql_type = SQL_DECIMAL;
+        column.column_size = 10;
+        column.decimal_digits = 2;
+        column.app_precision = 10;
+        column.app_scale = 3;
+
+        assert_eq!(
+            unsafe { bound_param_to_value(&column) }.unwrap().0,
+            SqlType::Decimal(Some(DecimalParts::new(true, 10, 2, 123)))
+        );
+
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let mut row_count: SqlLen = 1;
+        let mut tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut row_count);
+        tvp.column_size = 1;
+        let rpc = unsafe {
+            build_tvp_param(
+                None,
+                &tvp,
+                Some(&names),
+                &[Some(column)],
+                0,
+                0,
+                SQL_BIND_BY_COLUMN,
+            )
+        }
+        .unwrap();
+        let SqlType::Table(_, Some(data)) = rpc_parameter_value(&rpc).unwrap() else {
+            panic!("expected a materialized TVP");
+        };
+        assert_eq!(
+            data.rows,
+            vec![vec![SqlType::Decimal(Some(DecimalParts::new(
+                true, 10, 2, 124
+            )))]]
+        );
+        assert_eq!(source.scale, 3);
+    }
+
+    #[test]
+    fn tvp_numeric_dae_cells_round_from_application_scale() {
+        use crate::handles::desc::UdtNames;
+        use crate::handles::stmt::BufferedTvpCell;
+        use mssql_tds::test_client_support::rpc_parameter_value;
+
+        let source = numeric_struct(1235, 1, 1);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const source).cast::<u8>(),
+                std::mem::size_of::<SqlNumericStruct>(),
+            )
+        }
+        .to_vec();
+        let mut column = param(SQL_C_NUMERIC, std::ptr::null_mut(), std::ptr::null_mut());
+        column.sql_type = SQL_DECIMAL;
+        column.column_size = 10;
+        column.decimal_digits = 2;
+        column.app_precision = 10;
+        column.app_scale = 3;
+        let mut cells = [BufferedTvpCell {
+            tvp_index: 0,
+            row_index: 0,
+            column_index: 0,
+            bytes,
+            is_null: false,
+            value: None,
+        }];
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+
+        let rpc = build_tvp_param_from_dae(None, Some(&names), &[Some(column)], 0, 1, &mut cells)
+            .unwrap();
+        let SqlType::Table(_, Some(data)) = rpc_parameter_value(&rpc).unwrap() else {
+            panic!("expected a materialized TVP");
+        };
+        assert_eq!(
+            data.rows,
+            vec![vec![SqlType::Decimal(Some(DecimalParts::new(
+                true, 10, 2, 124
+            )))]]
         );
     }
 
