@@ -147,7 +147,6 @@ fn parse_iso_datetime(value: &str) -> Option<(NaiveDate, NaiveTime, &str)> {
         if remainder.is_empty() {
             return Some((date, NaiveTime::MIN, ""));
         }
-        // Validate the time before choosing an ambiguous ISO week-date prefix.
         let clock = &remainder[remainder.chars().next()?.len_utf8()..];
         let offset_start = clock.find(['+', '-', 'Z']);
         let (clock, zone) = offset_start.map_or((clock, ""), |index| clock.split_at(index));
@@ -169,26 +168,56 @@ fn parse_iso_datetime(value: &str) -> Option<(NaiveDate, NaiveTime, &str)> {
         )?;
         return with_time((date, &value[10..]));
     }
-    ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u", "%GW%V%u"]
-        .iter()
-        .find_map(|format| {
-            NaiveDate::parse_and_remainder(value, format)
-                .ok()
-                .and_then(with_time)
-        })
-        .or_else(|| {
-            ["%G-W%V", "%GW%V"].iter().find_map(|format| {
-                let mut parsed = chrono::format::Parsed::new();
-                let remainder = chrono::format::parse_and_remainder(
-                    &mut parsed,
-                    value,
-                    chrono::format::StrftimeItems::new(format),
-                )
-                .ok()?;
-                parsed.set_weekday(chrono::Weekday::Mon).ok()?;
-                with_time((parsed.to_naive_date().ok()?, remainder))
-            })
-        })
+    let bytes = value.as_bytes();
+    let week_boundary = if bytes.get(4..6) == Some(b"-W") {
+        // Match CPython's boundary choice, not whichever date/time split parses first.
+        // In YYYY-Www-12..., '-' separates the clock unless position 10 is nonnumeric.
+        Some(
+            if bytes.get(8) == Some(&b'-') && !bytes.get(10).is_some_and(u8::is_ascii_digit) {
+                (10, "%G-W%V-%u", false)
+            } else {
+                (8, "%G-W%V", true)
+            },
+        )
+    } else if bytes.get(4) == Some(&b'W') {
+        let digit_end = 7 + bytes
+            .get(7..)?
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let boundary = if digit_end < 9 {
+            digit_end
+        } else if digit_end % 2 == 0 {
+            7
+        } else {
+            8
+        };
+        Some((
+            boundary,
+            if boundary == 7 { "%GW%V" } else { "%GW%V%u" },
+            boundary == 7,
+        ))
+    } else {
+        None
+    };
+    if let Some((boundary, format, monday)) = week_boundary {
+        let mut parsed = chrono::format::Parsed::new();
+        chrono::format::parse(
+            &mut parsed,
+            value.get(..boundary)?,
+            chrono::format::StrftimeItems::new(format),
+        )
+        .ok()?;
+        if monday {
+            parsed.set_weekday(chrono::Weekday::Mon).ok()?;
+        }
+        return with_time((parsed.to_naive_date().ok()?, value.get(boundary..)?));
+    }
+    ["%Y-%m-%d", "%Y%m%d"].iter().find_map(|format| {
+        NaiveDate::parse_and_remainder(value, format)
+            .ok()
+            .and_then(with_time)
+    })
 }
 
 /// Represents the source Python type for conversion mapping.
@@ -2156,41 +2185,150 @@ mod tests {
     }
 
     #[test]
+    fn compact_week_dates_preserve_clock_and_fraction() {
+        for (input, ticks) in [
+            ("2024-W27-120000", 432_000_000_000),
+            ("2024-W27-120000.1234567", 432_001_234_567),
+            ("2024-W27-1T120000.1234567", 432_001_234_567),
+            ("2024W271T120000.1234567", 432_001_234_567),
+            ("2024W271120000.1234567", 432_001_234_567),
+            ("2024W27120000.1234567", 1_234_567),
+            ("2024W271112:00:00.1234567", 432_001_234_567),
+            ("2024-07-011120000.1234567", 432_001_234_567),
+        ] {
+            for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+                let datetime = match convert(input, sql_type, 7).unwrap() {
+                    ColumnValues::DateTime2(value) => value,
+                    ColumnValues::DateTimeOffset(value) => {
+                        assert_eq!(value.offset, 0);
+                        value.datetime2
+                    }
+                    other => panic!("Unexpected value: {other:?}"),
+                };
+                assert_eq!(datetime.days, 739_067, "{input}");
+                assert_eq!(datetime.time.time_nanoseconds, ticks, "{input}");
+            }
+        }
+    }
+
+    #[test]
     fn week_date_separators_match_python_datetime() {
-        let metadata = BulkCopyColumnMetadata::new(
-            "event_time",
-            SqlDbType::DateTime2,
-            SqlDbType::DateTime2.to_tds_type(),
-        )
-        .with_scale(7);
         Python::attach(|py| {
             let datetime = py.import("datetime").unwrap().getattr("datetime").unwrap();
-            for date in ["2024-W27", "2024W27", "2024-W27-1", "2024W271"] {
-                for separator in ["T", " ", "-", "+", "1", ":", "Z", "x", "\u{20ac}"] {
-                    for hour in [0u32, 1, 7, 10, 12, 23] {
-                        let input = format!("{date}{separator}{hour:02}:00:00.123456");
-                        let Ok(expected) = datetime.call_method1("fromisoformat", (&input,)) else {
-                            continue;
-                        };
-                        let ColumnValues::DateTime2(actual) =
-                            parse_bulk_datetime(&input, &metadata).unwrap()
-                        else {
-                            panic!("Expected DATETIME2");
-                        };
-                        let ordinal: u32 = expected
-                            .call_method0("toordinal")
-                            .unwrap()
-                            .extract()
-                            .unwrap();
-                        assert_eq!(actual.days, ordinal - 1, "{input}");
-                        assert_eq!(
-                            actual.time.time_nanoseconds,
-                            u64::from(hour) * 36_000_000_000 + 1_234_560,
-                            "{input}"
-                        );
+            // Python 3.10 has no week-date support; fixed-value regressions still run there.
+            let supports_week_dates = datetime
+                .call_method1("fromisoformat", ("2024-W27",))
+                .is_ok();
+            let mut checked = 0;
+            for date in [
+                "2024-07-01",
+                "20240701",
+                "2024-W27",
+                "2024W27",
+                "2024-W27-1",
+                "2024W271",
+                "2020-W53-7",
+                "2020W537",
+            ] {
+                if date.contains('W') && !supports_week_dates {
+                    continue;
+                }
+                for separator in ["T", " ", "-", "+", ":", "Z", "x", "\u{20ac}"] {
+                    for hour in 0..24 {
+                        for clock in [
+                            format!("{hour:02}"),
+                            format!("{hour:02}34"),
+                            format!("{hour:02}3456"),
+                            format!("{hour:02}:34"),
+                            format!("{hour:02}:34:56"),
+                        ] {
+                            for fraction in ["", ".123456"] {
+                                for zone in ["", "Z", "+05:30", "-07:00"] {
+                                    let input = format!("{date}{separator}{clock}{fraction}{zone}");
+                                    let expected =
+                                        datetime.call_method1("fromisoformat", (&input,));
+                                    for sql_type in
+                                        [SqlDbType::DateTime2, SqlDbType::DateTimeOffset]
+                                    {
+                                        let metadata = BulkCopyColumnMetadata::new(
+                                            "event_time",
+                                            sql_type,
+                                            sql_type.to_tds_type(),
+                                        )
+                                        .with_scale(7);
+                                        let actual = parse_bulk_datetime(&input, &metadata);
+                                        let Ok(expected) = &expected else {
+                                            // Older Python also rejects valid compact clocks and Z.
+                                            if supports_week_dates {
+                                                assert!(actual.is_err(), "{input}: {actual:?}");
+                                            }
+                                            continue;
+                                        };
+                                        let component = |name: &str| {
+                                            expected
+                                                .getattr(name)
+                                                .unwrap()
+                                                .extract::<i64>()
+                                                .unwrap()
+                                        };
+                                        let ordinal = expected
+                                            .call_method0("toordinal")
+                                            .unwrap()
+                                            .extract::<i64>()
+                                            .unwrap();
+                                        let mut ticks = (ordinal - 1) * 864_000_000_000
+                                            + component("hour") * 36_000_000_000
+                                            + component("minute") * 600_000_000
+                                            + component("second") * 10_000_000
+                                            + component("microsecond") * 10;
+                                        let offset = expected.call_method0("utcoffset").unwrap();
+                                        let offset_seconds = if offset.is_none() {
+                                            0
+                                        } else {
+                                            offset
+                                                .call_method0("total_seconds")
+                                                .unwrap()
+                                                .extract::<f64>()
+                                                .unwrap()
+                                                as i64
+                                        };
+                                        let actual = match actual
+                                            .unwrap_or_else(|error| panic!("{input}: {error}"))
+                                        {
+                                            ColumnValues::DateTime2(value) => value,
+                                            ColumnValues::DateTimeOffset(value) => {
+                                                assert_eq!(
+                                                    i64::from(value.offset) * 60,
+                                                    offset_seconds,
+                                                    "{input}"
+                                                );
+                                                ticks -= offset_seconds * 10_000_000;
+                                                value.datetime2
+                                            }
+                                            other => panic!("Unexpected value: {other:?}"),
+                                        };
+                                        assert_eq!(
+                                            i64::from(actual.days),
+                                            ticks.div_euclid(864_000_000_000),
+                                            "{input}"
+                                        );
+                                        assert_eq!(
+                                            actual.time.time_nanoseconds as i64,
+                                            ticks.rem_euclid(864_000_000_000),
+                                            "{input}"
+                                        );
+                                        checked += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
+            assert!(
+                checked > 1_000,
+                "Compatibility comparisons must not be vacuous"
+            );
         });
     }
 
@@ -2352,6 +2490,12 @@ mod tests {
                 "2024-07-01T12:00:00Z12",
                 "2024-07-01T1:00:00",
                 "2024-07-01T0\u{20ac}00",
+                "2024-W27-1120000",
+                "2024-W27-",
+                "2024-W27-8T120000",
+                "2024W278T120000",
+                "2024-W54-1T120000",
+                "2024-W27-\u{20ac}120000",
             ] {
                 assert!(convert(input, sql_type, 7).is_err(), "{input}");
             }
