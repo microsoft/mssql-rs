@@ -87,23 +87,7 @@ fn parse_bulk_datetime(value: &str, metadata: &BulkCopyColumnMetadata) -> TdsRes
             metadata.column_name
         ))
     };
-    let (date, remainder) = ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u", "%GW%V%u"]
-        .iter()
-        .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok())
-        .or_else(|| {
-            ["%G-W%V", "%GW%V"].iter().find_map(|format| {
-                let mut parsed = chrono::format::Parsed::new();
-                let remainder = chrono::format::parse_and_remainder(
-                    &mut parsed,
-                    value,
-                    chrono::format::StrftimeItems::new(format),
-                )
-                .ok()?;
-                parsed.set_weekday(chrono::Weekday::Mon).ok()?;
-                Some((parsed.to_naive_date().ok()?, remainder))
-            })
-        })
-        .ok_or_else(invalid)?;
+    let (date, remainder) = parse_iso_date(value).ok_or_else(invalid)?;
     if !(1..=9999).contains(&date.year()) {
         return Err(invalid());
     }
@@ -166,6 +150,41 @@ fn parse_bulk_datetime(value: &str, metadata: &BulkCopyColumnMetadata) -> TdsRes
     } else {
         Ok(ColumnValues::DateTime2(datetime2))
     }
+}
+
+fn parse_iso_date(value: &str) -> Option<(NaiveDate, &str)> {
+    if let Some(prefix) = value.as_bytes().get(..10)
+        && prefix[4] == b'-'
+        && prefix[7] == b'-'
+        && prefix
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        // Fixed-width ASCII dates avoid reinterpreting a format string per row.
+        let date = NaiveDate::from_ymd_opt(
+            value[..4].parse().ok()?,
+            value[5..7].parse().ok()?,
+            value[8..10].parse().ok()?,
+        )?;
+        return Some((date, &value[10..]));
+    }
+    ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u", "%GW%V%u"]
+        .iter()
+        .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok())
+        .or_else(|| {
+            ["%G-W%V", "%GW%V"].iter().find_map(|format| {
+                let mut parsed = chrono::format::Parsed::new();
+                let remainder = chrono::format::parse_and_remainder(
+                    &mut parsed,
+                    value,
+                    chrono::format::StrftimeItems::new(format),
+                )
+                .ok()?;
+                parsed.set_weekday(chrono::Weekday::Mon).ok()?;
+                Some((parsed.to_naive_date().ok()?, remainder))
+            })
+        })
 }
 
 /// Represents the source Python type for conversion mapping.
@@ -498,27 +517,13 @@ impl PythonRowAdapter {
                 Ok(Some(result))
             }
 
-            // String → DateTime2: Parse ISO format datetime string for DATETIME2
-            (SourcePythonType::String, SqlDbType::DateTime2) => {
-                let result = Self::coerce_string_to_datetime2(py_obj, target_meta)?;
+            (SourcePythonType::String, SqlDbType::DateTime2 | SqlDbType::DateTimeOffset) => {
+                let result = Self::coerce_string_to_temporal(py_obj, target_meta)?;
                 Ok(Some(result))
             }
 
-            // DateTime → DateTime2: Convert Python datetime to DATETIME2
-            (SourcePythonType::DateTime, SqlDbType::DateTime2) => {
-                let result = Self::coerce_datetime_to_datetime2(py_obj, target_meta)?;
-                Ok(Some(result))
-            }
-
-            // String → DateTimeOffset: Parse ISO format datetime string with timezone
-            (SourcePythonType::String, SqlDbType::DateTimeOffset) => {
-                let result = Self::coerce_string_to_datetimeoffset(py_obj, target_meta)?;
-                Ok(Some(result))
-            }
-
-            // DateTime → DateTimeOffset: Convert Python datetime to DATETIMEOFFSET
-            (SourcePythonType::DateTime, SqlDbType::DateTimeOffset) => {
-                let result = Self::coerce_datetime_to_datetimeoffset(py_obj, target_meta)?;
+            (SourcePythonType::DateTime, SqlDbType::DateTime2 | SqlDbType::DateTimeOffset) => {
+                let result = py_to_column_value(py_obj, Some(target_meta))?;
                 Ok(Some(result))
             }
 
@@ -1380,11 +1385,7 @@ impl PythonRowAdapter {
         ))
     }
 
-    /// Coerce a Python string to a SQL Server DATETIME2 value.
-    ///
-    /// Parses an ISO format datetime string (YYYY-MM-DD HH:MM:SS[.fffffff])
-    /// and converts to SqlDateTime2 format.
-    fn coerce_string_to_datetime2(
+    fn coerce_string_to_temporal(
         py_obj: &Bound<'_, PyAny>,
         target_meta: &BulkCopyColumnMetadata,
     ) -> TdsResult<ColumnValues> {
@@ -1397,50 +1398,6 @@ impl PythonRowAdapter {
             .map_err(|e| Error::UsageError(format!("Failed to extract string: {}", e)))?;
 
         parse_bulk_datetime(s, target_meta)
-    }
-
-    /// Coerce a Python datetime object to a SQL Server DATETIME2 value.
-    ///
-    /// This ensures Python datetime objects are properly converted to DATETIME2 format
-    /// when the target column is DATETIME2.
-    fn coerce_datetime_to_datetime2(
-        py_obj: &Bound<'_, PyAny>,
-        target_meta: &BulkCopyColumnMetadata,
-    ) -> TdsResult<ColumnValues> {
-        // Use the metadata-aware conversion to handle DATETIME2
-        crate::types::py_to_column_value(py_obj, Some(target_meta))
-    }
-
-    /// Coerce a Python string to a SQL Server DATETIMEOFFSET value.
-    ///
-    /// Parses ISO 8601 datetime strings with timezone offsets (e.g., "2024-01-15T09:30:45+00:00")
-    /// and converts them to DATETIMEOFFSET format.
-    fn coerce_string_to_datetimeoffset(
-        py_obj: &Bound<'_, PyAny>,
-        target_meta: &BulkCopyColumnMetadata,
-    ) -> TdsResult<ColumnValues> {
-        // Cast to PyString and extract the string value
-        let py_str = py_obj
-            .cast::<PyString>()
-            .map_err(|e| Error::UsageError(format!("Failed to cast to string: {}", e)))?;
-
-        let datetime_str = py_str
-            .to_str()
-            .map_err(|e| Error::UsageError(format!("Failed to extract string: {}", e)))?;
-
-        parse_bulk_datetime(datetime_str, target_meta)
-    }
-
-    /// Coerce a Python datetime object to a SQL Server DATETIMEOFFSET value.
-    ///
-    /// This ensures Python datetime objects (with or without timezone info) are properly
-    /// converted to DATETIMEOFFSET format when the target column is DATETIMEOFFSET.
-    fn coerce_datetime_to_datetimeoffset(
-        py_obj: &Bound<'_, PyAny>,
-        target_meta: &BulkCopyColumnMetadata,
-    ) -> TdsResult<ColumnValues> {
-        // Use the metadata-aware conversion to handle DATETIMEOFFSET
-        crate::types::py_to_column_value(py_obj, Some(target_meta))
     }
 
     /// Coerce a Python float to a SQL Server FLOAT (f64).
@@ -2114,12 +2071,76 @@ impl BulkLoadRow for PythonRowAdapter {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "Manual release-mode parser measurement"]
+    fn datetime_string_parser_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for (sql_type, input) in [
+            (SqlDbType::DateTime2, "2024-07-01 12:00:00.1234567"),
+            (
+                SqlDbType::DateTimeOffset,
+                "2024-07-01T12:00:00.1234567+05:30",
+            ),
+            (SqlDbType::DateTime2, "2024W271T120000.1234567"),
+        ] {
+            let metadata =
+                BulkCopyColumnMetadata::new("event_time", sql_type, sql_type.to_tds_type())
+                    .with_scale(7);
+            for _ in 0..10_000 {
+                black_box(parse_bulk_datetime(black_box(input), black_box(&metadata)).unwrap());
+            }
+            let mut timings = [0u128; 7];
+            for timing in &mut timings {
+                let start = Instant::now();
+                for _ in 0..100_000 {
+                    black_box(parse_bulk_datetime(black_box(input), black_box(&metadata)).unwrap());
+                }
+                *timing = start.elapsed().as_nanos() / 100_000;
+            }
+            timings.sort_unstable();
+            println!("{sql_type:?} {input}: median {} ns/value", timings[3]);
+        }
+    }
+
     fn convert(value: &str, sql_type: SqlDbType, scale: u8) -> TdsResult<ColumnValues> {
         let metadata = BulkCopyColumnMetadata::new("event_time", sql_type, sql_type.to_tds_type())
             .with_scale(scale);
         Python::attach(|py| {
             PythonRowAdapter::convert_by_target_type(PyString::new(py, value).as_any(), &metadata)
         })
+    }
+
+    #[test]
+    fn fixed_width_dates_match_chrono_validation() {
+        for year in [1, 4, 100, 400, 1900, 2000, 2024, 9999] {
+            for month in 1..=12 {
+                for day in 1..=31 {
+                    let value = format!("{year:04}-{month:02}-{day:02}T12:00:00.1234567");
+                    assert_eq!(
+                        parse_iso_date(&value),
+                        NaiveDate::parse_and_remainder(&value, "%Y-%m-%d").ok(),
+                        "{value}"
+                    );
+                }
+            }
+        }
+        for value in [
+            "2024-7-1T12:00:00",
+            "20240701T12:00:00",
+            "2024-W27-1T12:00:00",
+            "2024-07-\u{20ac}T12:00:00",
+            "\u{20ac}024-07-01T12:00:00",
+        ] {
+            assert_eq!(
+                parse_iso_date(value),
+                ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u"]
+                    .iter()
+                    .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok()),
+                "{value}"
+            );
+        }
     }
 
     #[test]

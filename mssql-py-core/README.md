@@ -29,6 +29,8 @@ Both space and `T` separators and a trailing `Z` are supported on every supporte
 Python version. Fractions longer than seven digits are rejected rather than
 silently truncated. The destination column's scale is applied by the TDS
 serializer, using the existing truncation behavior for lower scales.
+Fixed-width `YYYY-MM-DD` dates use a direct parsing path; other supported ISO
+formats retain the general parser and the same precision and validation.
 
 `DATETIME2` retains the local date and time when an offset is present.
 `DATETIMEOFFSET` preserves the offset and normalizes its wire timestamp to UTC;
