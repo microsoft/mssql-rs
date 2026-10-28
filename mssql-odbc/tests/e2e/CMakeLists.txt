@@ -98,8 +98,8 @@ if(NOT WIN32)
     find_package(Iconv REQUIRED)
     target_link_libraries(odbc_test_lib PUBLIC Iconv::Iconv)
 endif()
-# odbc_concurrent_test.h runs test bodies on std::thread workers, and its hang
-# watchdog writes a minidump through dbghelp on Windows.
+# odbc_concurrent_test.h runs test bodies on std::thread workers, and on Windows
+# writes hang and crash minidumps through dbghelp.
 if(TARGET Threads::Threads)
     target_link_libraries(odbc_test_lib PUBLIC Threads::Threads)
 endif()
@@ -113,14 +113,101 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# include/odbc_sql_server_types.h copies values and layouts from msodbcsql.h
+# rather than depending on it. Where msodbcsql.h is installed, compile a check
+# that the two still agree; a mismatch fails the build. Nothing is linked or
+# shipped. The header comes with the msodbcsql18 SDK feature on Windows (part of
+# a default MSI install) and with the msodbcsql18 package on Linux.
+# Override the search with -DMSODBCSQL_INCLUDE_DIR=<dir>.
+# ---------------------------------------------------------------------------
+set(_msodbcsql_hints)
+if(WIN32)
+    file(TO_CMAKE_PATH "$ENV{ProgramFiles}" _program_files)
+    list(APPEND _msodbcsql_hints
+         "${_program_files}/Microsoft SQL Server/Client SDK/ODBC/180/SDK/Include")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND _msodbcsql_hints "/opt/microsoft/msodbcsql18/include")
+endif()
+find_path(MSODBCSQL_INCLUDE_DIR msodbcsql.h HINTS ${_msodbcsql_hints})
+if(MSODBCSQL_INCLUDE_DIR)
+    message(STATUS "Checking odbc_sql_server_types.h against ${MSODBCSQL_INCLUDE_DIR}/msodbcsql.h")
+    add_library(msodbcsql_types_check OBJECT check/msodbcsql_types_check.cpp)
+    target_include_directories(msodbcsql_types_check PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${MSODBCSQL_INCLUDE_DIR})
+    if(ODBC_INCLUDE_DIR)
+        target_include_directories(msodbcsql_types_check PRIVATE ${ODBC_INCLUDE_DIR})
+    endif()
+else()
+    message(STATUS "msodbcsql.h not found; skipping the odbc_sql_server_types.h check")
+endif()
+
+# ---------------------------------------------------------------------------
+# Test registration
+#
+# An executable whose sources invoke ODBC_TEST_F or ODBC_TEST_F_MODES at the
+# start of a line (odbc_concurrent_test.h) is registered twice, so a concurrency
+# failure cannot hide the single-threaded verdict in the parity report:
+#   <name>     single-threaded tests only
+#   <name>_mt  the concurrent variants only, labelled "mt" (ctest -L mt)
+# Both filter on the mode suffixes rather than "*/*", because parameterized
+# TEST_P names contain "/" too. A source converted after the last configure
+# still runs every variant in <name> until CMake re-runs, so nothing is lost.
+# On Unix <name>_mt runs through run_mt_test.sh, which can run it under gdb so
+# a crash or watchdog abort prints every thread's stack (MSSQL_ODBC_MT_GDB=1).
+# Such executables link lib/odbc_skip_aware_main.cpp: MSSQL_ODBC_MT_SKIP_MODES
+# can skip every variant an entry selects, which must read as skipped (77), not
+# as a pass.
+# ---------------------------------------------------------------------------
+set(ODBC_MT_MODE_FILTER "*/CrossThread:*/SharedEnv:*/SharedDbc:*/SharedStmt")
+
+# Sets ${OUT_VAR} to ON when any of the sources uses ODBC_TEST_F(_MODES).
+function(odbc_uses_concurrent_tests OUT_VAR)
+    set(concurrent OFF)
+    foreach(source IN LISTS ARGN)
+        get_filename_component(path "${source}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        if(EXISTS "${path}")
+            file(STRINGS "${path}" invocations REGEX "^ODBC_TEST_F(_MODES)?\\(")
+            if(invocations)
+                set(concurrent ON)
+            endif()
+        endif()
+    endforeach()
+    set(${OUT_VAR} ${concurrent} PARENT_SCOPE)
+endfunction()
+
+function(odbc_register_ctest TEST_NAME)
+    odbc_uses_concurrent_tests(concurrent ${ARGN})
+    if(concurrent)
+        add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME} "--gtest_filter=-${ODBC_MT_MODE_FILTER}")
+        if(UNIX)
+            add_test(NAME ${TEST_NAME}_mt
+                     COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/run_mt_test.sh"
+                             $<TARGET_FILE:${TEST_NAME}> "--gtest_filter=${ODBC_MT_MODE_FILTER}")
+        else()
+            add_test(NAME ${TEST_NAME}_mt
+                     COMMAND ${TEST_NAME} "--gtest_filter=${ODBC_MT_MODE_FILTER}")
+        endif()
+        set_tests_properties(${TEST_NAME}_mt PROPERTIES SKIP_RETURN_CODE 77 LABELS mt)
+    else()
+        add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+    endif()
+    set_tests_properties(${TEST_NAME} PROPERTIES SKIP_RETURN_CODE 77)
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Helper function: add a test executable under tests/
 # Usage:  add_odbc_test(smoke_test tests/smoke_test.cpp)
 # ---------------------------------------------------------------------------
 function(add_odbc_test TEST_NAME)
-    add_executable(${TEST_NAME} ${ARGN})
-    target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib gtest_main)
-    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
-    set_tests_properties(${TEST_NAME} PROPERTIES SKIP_RETURN_CODE 77)
+    odbc_uses_concurrent_tests(concurrent ${ARGN})
+    if(concurrent)
+        add_executable(${TEST_NAME} ${ARGN} lib/odbc_skip_aware_main.cpp)
+        target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib)
+    else()
+        add_executable(${TEST_NAME} ${ARGN})
+        target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib gtest_main)
+    endif()
+    odbc_register_ctest(${TEST_NAME} ${ARGN})
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -133,8 +220,7 @@ endfunction()
 function(add_odbc_direct_load_test TEST_NAME)
     add_executable(${TEST_NAME} ${ARGN} lib/odbc_skip_aware_main.cpp)
     target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib)
-    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
-    set_tests_properties(${TEST_NAME} PROPERTIES SKIP_RETURN_CODE 77)
+    odbc_register_ctest(${TEST_NAME} ${ARGN})
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -158,8 +244,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         lib/odbc_iso88591_main.cpp
     )
     target_link_libraries(get_data_iso88591_test PRIVATE odbc_test_lib)
-    add_test(NAME get_data_iso88591_test COMMAND get_data_iso88591_test)
-    set_tests_properties(get_data_iso88591_test PROPERTIES SKIP_RETURN_CODE 77)
+    odbc_register_ctest(get_data_iso88591_test tests/get_data_iso88591_test.cpp)
 endif()
 add_odbc_test(num_result_cols_test tests/num_result_cols_test.cpp)
 add_odbc_test(get_diag_field_test tests/get_diag_field_test.cpp)
