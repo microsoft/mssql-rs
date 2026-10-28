@@ -84,7 +84,6 @@ def _capture_pycore_context(cursor, table="__param_test"):
     cursor.execute(f"CREATE TABLE {table} (id INT)")
 
     captured = {}
-    original_pycore = __import__("mssql_py_core")
 
     class SpyPyCoreConnection:
         def __init__(self, ctx, **kwargs):
@@ -94,7 +93,11 @@ def _capture_pycore_context(cursor, table="__param_test"):
             pass
 
     try:
-        with patch.object(original_pycore, "PyCoreConnection", SpyPyCoreConnection):
+        # Older drivers use the package export; newer ones import the native module.
+        with (
+            patch("mssql_py_core.mssql_py_core.PyCoreConnection", SpyPyCoreConnection),
+            patch("mssql_py_core.PyCoreConnection", SpyPyCoreConnection, create=True),
+        ):
             with pytest.raises(RuntimeError, match="Spy: captured context"):
                 cursor.bulkcopy(table, [(1,)], timeout=30)
     finally:
