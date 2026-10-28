@@ -2318,6 +2318,24 @@ mod tests {
     }
 
     #[test]
+    fn datetime2_strings_ignore_subminute_offsets() {
+        for offset in ["+00:00:30", "-00:00:30", "+00:00:00.1", "-00:00:30.1234567"] {
+            let input = format!("2024-07-01T00:00:00.1234567{offset}");
+            let ColumnValues::DateTime2(value) = convert(&input, SqlDbType::DateTime2, 7).unwrap()
+            else {
+                panic!("Expected DATETIME2");
+            };
+            assert_eq!(value.days, 739_067, "{input}");
+            assert_eq!(value.time.time_nanoseconds, 1_234_567, "{input}");
+            assert_eq!(value.time.scale, 7);
+            assert!(
+                convert(&input, SqlDbType::DateTimeOffset, 7).is_err(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn datetime_strings_reject_invalid_values() {
         for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
             for input in [
