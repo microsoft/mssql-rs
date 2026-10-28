@@ -17,6 +17,10 @@ handle SIGPIPE nostop noprint pass
 
 run
 
+if !$_isvoid($_exitsignal)
+    echo \n=== run_mt_test: terminated by a signal; no live process for stacks ===\n
+    quit 128 + $_exitsignal
+end
 if $_isvoid($_exitcode)
     echo \n=== run_mt_test: stopped on a signal; stacks of all threads follow ===\n
     info threads
