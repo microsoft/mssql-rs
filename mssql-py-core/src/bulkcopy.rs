@@ -87,40 +87,30 @@ fn parse_bulk_datetime(value: &str, metadata: &BulkCopyColumnMetadata) -> TdsRes
             metadata.column_name
         ))
     };
-    let (date, remainder) = parse_iso_date(value).ok_or_else(invalid)?;
+    let (date, time, zone) = parse_iso_datetime(value).ok_or_else(invalid)?;
     if !(1..=9999).contains(&date.year()) {
         return Err(invalid());
     }
 
-    let (time, offset) = if remainder.is_empty() {
-        (NaiveTime::MIN, 0)
-    } else {
-        // ISO datetime permits a single separator between the date and time.
-        let clock = &remainder[remainder.chars().next().ok_or_else(invalid)?.len_utf8()..];
-        let offset_start = clock.find(['+', '-', 'Z']);
-        let (clock, zone) = offset_start.map_or((clock, ""), |index| clock.split_at(index));
-        let time = parse_iso_time(clock).ok_or_else(invalid)?;
-        let offset = match zone {
-            "" | "Z" => 0,
-            _ if zone.starts_with(['+', '-']) => {
-                let offset = parse_iso_time(&zone[1..]).ok_or_else(invalid)?;
-                if metadata.sql_type == SqlDbType::DateTimeOffset
-                    && (offset.second() != 0 || offset.nanosecond() != 0)
-                {
-                    return Err(Error::UsageError(
-                        "DATETIMEOFFSET requires a whole-minute UTC offset".into(),
-                    ));
-                }
-                let seconds = i64::from(offset.num_seconds_from_midnight());
-                if zone.starts_with('-') {
-                    -seconds
-                } else {
-                    seconds
-                }
+    let offset = match zone {
+        "" | "Z" => 0,
+        _ if zone.starts_with(['+', '-']) => {
+            let offset = parse_iso_time(&zone[1..]).ok_or_else(invalid)?;
+            if metadata.sql_type == SqlDbType::DateTimeOffset
+                && (offset.second() != 0 || offset.nanosecond() != 0)
+            {
+                return Err(Error::UsageError(
+                    "DATETIMEOFFSET requires a whole-minute UTC offset".into(),
+                ));
             }
-            _ => return Err(invalid()),
-        };
-        (time, offset)
+            let seconds = i64::from(offset.num_seconds_from_midnight());
+            if zone.starts_with('-') {
+                -seconds
+            } else {
+                seconds
+            }
+        }
+        _ => return Err(invalid()),
     };
     let mut datetime = date.and_time(time);
     if metadata.sql_type == SqlDbType::DateTimeOffset {
@@ -152,7 +142,17 @@ fn parse_bulk_datetime(value: &str, metadata: &BulkCopyColumnMetadata) -> TdsRes
     }
 }
 
-fn parse_iso_date(value: &str) -> Option<(NaiveDate, &str)> {
+fn parse_iso_datetime(value: &str) -> Option<(NaiveDate, NaiveTime, &str)> {
+    fn with_time((date, remainder): (NaiveDate, &str)) -> Option<(NaiveDate, NaiveTime, &str)> {
+        if remainder.is_empty() {
+            return Some((date, NaiveTime::MIN, ""));
+        }
+        // Validate the time before choosing an ambiguous ISO week-date prefix.
+        let clock = &remainder[remainder.chars().next()?.len_utf8()..];
+        let offset_start = clock.find(['+', '-', 'Z']);
+        let (clock, zone) = offset_start.map_or((clock, ""), |index| clock.split_at(index));
+        Some((date, parse_iso_time(clock)?, zone))
+    }
     if let Some(prefix) = value.as_bytes().get(..10)
         && prefix[4] == b'-'
         && prefix[7] == b'-'
@@ -167,11 +167,15 @@ fn parse_iso_date(value: &str) -> Option<(NaiveDate, &str)> {
             value[5..7].parse().ok()?,
             value[8..10].parse().ok()?,
         )?;
-        return Some((date, &value[10..]));
+        return with_time((date, &value[10..]));
     }
     ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u", "%GW%V%u"]
         .iter()
-        .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok())
+        .find_map(|format| {
+            NaiveDate::parse_and_remainder(value, format)
+                .ok()
+                .and_then(with_time)
+        })
         .or_else(|| {
             ["%G-W%V", "%GW%V"].iter().find_map(|format| {
                 let mut parsed = chrono::format::Parsed::new();
@@ -182,7 +186,7 @@ fn parse_iso_date(value: &str) -> Option<(NaiveDate, &str)> {
                 )
                 .ok()?;
                 parsed.set_weekday(chrono::Weekday::Mon).ok()?;
-                Some((parsed.to_naive_date().ok()?, remainder))
+                with_time((parsed.to_naive_date().ok()?, remainder))
             })
         })
 }
@@ -2119,8 +2123,15 @@ mod tests {
                 for day in 1..=31 {
                     let value = format!("{year:04}-{month:02}-{day:02}T12:00:00.1234567");
                     assert_eq!(
-                        parse_iso_date(&value),
-                        NaiveDate::parse_and_remainder(&value, "%Y-%m-%d").ok(),
+                        parse_iso_datetime(&value).map(|(date, time, zone)| {
+                            assert_eq!(time.hour(), 12);
+                            assert_eq!(time.nanosecond(), 123_456_700);
+                            assert_eq!(zone, "");
+                            date
+                        }),
+                        NaiveDate::parse_and_remainder(&value, "%Y-%m-%d")
+                            .ok()
+                            .map(|(date, _)| date),
                         "{value}"
                     );
                 }
@@ -2134,13 +2145,53 @@ mod tests {
             "\u{20ac}024-07-01T12:00:00",
         ] {
             assert_eq!(
-                parse_iso_date(value),
+                parse_iso_datetime(value).map(|(date, _, _)| date),
                 ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u"]
                     .iter()
-                    .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok()),
+                    .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok())
+                    .map(|(date, _)| date),
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn week_date_separators_match_python_datetime() {
+        let metadata = BulkCopyColumnMetadata::new(
+            "event_time",
+            SqlDbType::DateTime2,
+            SqlDbType::DateTime2.to_tds_type(),
+        )
+        .with_scale(7);
+        Python::attach(|py| {
+            let datetime = py.import("datetime").unwrap().getattr("datetime").unwrap();
+            for date in ["2024-W27", "2024W27", "2024-W27-1", "2024W271"] {
+                for separator in ["T", " ", "-", "+", "1", ":", "Z", "x", "\u{20ac}"] {
+                    for hour in [0u32, 1, 7, 10, 12, 23] {
+                        let input = format!("{date}{separator}{hour:02}:00:00.123456");
+                        let Ok(expected) = datetime.call_method1("fromisoformat", (&input,)) else {
+                            continue;
+                        };
+                        let ColumnValues::DateTime2(actual) =
+                            parse_bulk_datetime(&input, &metadata).unwrap()
+                        else {
+                            panic!("Expected DATETIME2");
+                        };
+                        let ordinal: u32 = expected
+                            .call_method0("toordinal")
+                            .unwrap()
+                            .extract()
+                            .unwrap();
+                        assert_eq!(actual.days, ordinal - 1, "{input}");
+                        assert_eq!(
+                            actual.time.time_nanoseconds,
+                            u64::from(hour) * 36_000_000_000 + 1_234_560,
+                            "{input}"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     #[test]
@@ -2239,6 +2290,7 @@ mod tests {
             "2024-W27-1T12:00:00,1234567",
             "2024W271T120000.1234567",
             "2024-W27T12:00:00.1234567",
+            "2024-W27-12:00:00.1234567",
             "2024W27T120000.1234567",
             "2024-07-01T12:00:00.1234567+0530",
             "2024-07-01T12:00:00.1234567-07",
