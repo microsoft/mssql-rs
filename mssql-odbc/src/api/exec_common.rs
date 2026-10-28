@@ -2984,6 +2984,22 @@ mod tests {
         assert!(snapshot_bound_params(stmt).is_err());
     }
 
+    /// A poisoned DBC must fail the snapshot rather than silently default the
+    /// LongAsMax policy to legacy declarations.
+    #[test]
+    fn snapshot_bound_params_fails_cleanly_on_a_poisoned_dbc() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dbc.inner.lock().unwrap();
+            panic!("poison the dbc lock");
+        }));
+        let snapshot = snapshot_bound_params(stmt);
+        dbc.inner.clear_poison();
+        assert!(matches!(snapshot, Err(SQL_ERROR)));
+    }
+
     #[test]
     fn build_named_params_zero_markers_yields_empty() {
         let h = TestHandles::with_env_dbc_stmt();
