@@ -757,6 +757,9 @@ pub(crate) fn dae_length_limit(
 ///
 /// `is_null` carries a parameter that `SQLPutData` marked `SQL_NULL_DATA`, which
 /// must produce a typed NULL rather than an empty value.
+///
+/// LONG values keep the MAX/PLP framing they would have streamed with, as
+/// msodbcsql's `PutParamData` does; LongAsMax selects only their declaration.
 pub(crate) fn buffered_dae_to_rpc(
     name: String,
     binding: &BoundParam,
@@ -771,7 +774,18 @@ pub(crate) fn buffered_dae_to_rpc(
         SqlLen::try_from(buffer.len()).map_err(|_| ParamBuildError::StringTruncation)?
     };
     let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
-    unsafe { bound_param_to_rpc(name, &synthetic, udt_names, long_as_max) }
+    let (parameter, outcome) = unsafe { bound_param_to_rpc(name, &synthetic, udt_names, true) }?;
+    let declaration = match binding.sql_type {
+        SQL_LONGVARCHAR | SQL_WLONGVARCHAR | SQL_LONGVARBINARY => {
+            dae_streamed_declaration(binding.sql_type, binding.column_size, long_as_max)?
+        }
+        _ => None,
+    };
+    let parameter = match declaration {
+        Some(declaration) => parameter.with_streamed_declaration(declaration),
+        None => parameter,
+    };
+    Ok((parameter, outcome))
 }
 
 fn buffered_dae_binding(binding: &BoundParam, buffer: &[u8], indicator: &mut SqlLen) -> BoundParam {
@@ -4378,10 +4392,28 @@ mod tests {
     fn long_as_max_controls_values_nulls_and_buffered_dae_without_changing_bounds() {
         use mssql_tds::test_client_support::rpc_parameter_declaration;
 
-        for (sql_type, c_type, legacy, max) in [
-            (SQL_LONGVARCHAR, SQL_C_CHAR, "text", "varchar(MAX)"),
-            (SQL_WLONGVARCHAR, SQL_C_CHAR, "ntext", "nvarchar(MAX)"),
-            (SQL_LONGVARBINARY, SQL_C_BINARY, "image", "varbinary(MAX)"),
+        for (sql_type, c_type, legacy, max, wire) in [
+            (
+                SQL_LONGVARCHAR,
+                SQL_C_CHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
+            (
+                SQL_WLONGVARCHAR,
+                SQL_C_CHAR,
+                "ntext",
+                "nvarchar(MAX)",
+                "NVarcharMax",
+            ),
+            (
+                SQL_LONGVARBINARY,
+                SQL_C_BINARY,
+                "image",
+                "varbinary(MAX)",
+                "VarBinaryMax",
+            ),
         ] {
             for long_as_max in [false, true] {
                 let expected = if long_as_max { max } else { legacy };
@@ -4411,6 +4443,11 @@ mod tests {
                     )
                     .unwrap();
                     assert_eq!(rpc_parameter_declaration(&buffered).unwrap(), expected);
+                    let framing = format!("{buffered:?}");
+                    assert!(
+                        framing.contains(&format!("Materialized({wire}(")),
+                        "buffered DAE must keep PLP framing: {framing}"
+                    );
                 }
                 let mut bytes = *b"abcd";
                 let mut indicator = 4;
@@ -4419,6 +4456,10 @@ mod tests {
                 binding.column_size = 3;
                 assert!(matches!(
                     unsafe { bound_param_to_rpc(None, &binding, None, long_as_max) },
+                    Err(ParamBuildError::StringTruncation)
+                ));
+                assert!(matches!(
+                    buffered_dae_to_rpc("@P1".into(), &binding, None, b"abcd", false, long_as_max),
                     Err(ParamBuildError::StringTruncation)
                 ));
             }

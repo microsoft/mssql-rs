@@ -198,8 +198,8 @@ pub struct RpcParameter {
     /// A bound SQL numeric definition may differ from its incoming wire value.
     numeric_declaration: Option<NumericDeclaration>,
 
-    /// Declaration for a streamed parameter whose `@params` type is narrower
-    /// than its PLP body. See [`RpcParameter::with_streamed_declaration`].
+    /// `@params` declaration that differs from the value's wire type. See
+    /// [`RpcParameter::with_streamed_declaration`].
     /// Cold metadata stays boxed to keep ordinary parameter arrays compact.
     streamed_declaration: Option<Box<SqlType>>,
 
@@ -256,18 +256,19 @@ impl RpcParameter {
         }
     }
 
-    /// Declares a streamed parameter as `declaration` in the `@params` string
-    /// while its value body stays PLP-framed.
+    /// Declares this parameter as `declaration` in the `@params` string while
+    /// its value keeps its own wire type.
     ///
     /// The two are independent: PLP framing needs an unknown-length opener, so
-    /// the wire `TYPE_INFO` is always a `max`, but the variable the value is
-    /// assigned to can still be a bounded `varchar(n)`. That is how a streamed
-    /// parameter honours `ColumnSize` without giving up chunking, and it is
-    /// what msodbcsql sends (`odbc/sqlccmd.cpp:4676` passes `cbColDef`
-    /// alongside `VARMAX_INDICATOR`).
+    /// a streamed parameter's wire `TYPE_INFO` is always a `max`, but the
+    /// variable the value is assigned to can still be a bounded `varchar(n)`.
+    /// That is how a streamed parameter honours `ColumnSize` without giving up
+    /// chunking, and it is what msodbcsql sends (`odbc/sqlccmd.cpp:4676`
+    /// passes `cbColDef` alongside `VARMAX_INDICATOR`).
     ///
-    /// Ignored for a materialized parameter, whose declaration comes from its
-    /// own value.
+    /// A materialized value accepts the same override, so a data-at-execution
+    /// value collected before sending can keep its PLP framing under a legacy
+    /// `text`, `ntext`, or `image` declaration.
     pub fn with_streamed_declaration(mut self, declaration: SqlType) -> Self {
         self.streamed_declaration = Some(Box::new(declaration));
         self
@@ -358,6 +359,9 @@ impl RpcParameter {
     }
 
     pub(crate) fn sql_declaration(&self) -> TdsResult<String> {
+        if let Some(declaration) = &self.streamed_declaration {
+            return Self::get_sql_name(declaration, self.type_metadata);
+        }
         match &self.value {
             RpcValue::Materialized(value) => {
                 let metadata = self
@@ -370,10 +374,7 @@ impl RpcParameter {
                     });
                 Self::get_sql_name(value, metadata)
             }
-            RpcValue::Streamed(streamed) => match &self.streamed_declaration {
-                Some(declaration) => Self::get_sql_name(declaration, self.type_metadata),
-                None => streamed.sql_name(),
-            },
+            RpcValue::Streamed(streamed) => streamed.sql_name(),
         }
     }
 
@@ -1484,6 +1485,34 @@ mod tests {
             let bytes = serialize_param(&parameter);
             assert_eq!(&bytes[6..9], &[type_byte, 0xff, 0xff]);
             assert_eq!(bytes.len(), if type_byte == 0xa5 { 9 } else { 14 });
+        }
+    }
+
+    /// A data-at-execution value collected before sending keeps the MAX/PLP
+    /// framing it would have streamed with; only the declaration is legacy.
+    #[test]
+    fn materialized_legacy_declaration_keeps_plp_framing() {
+        for (value, declaration, name, type_byte) in [
+            (SqlType::VarcharMax(None), SqlType::Text(None), "text", 0xa7),
+            (
+                SqlType::NVarcharMax(None),
+                SqlType::NText(None),
+                "ntext",
+                0xe7,
+            ),
+            (
+                SqlType::VarBinaryMax(None),
+                SqlType::Image(None),
+                "image",
+                0xa5,
+            ),
+        ] {
+            let parameter = RpcParameter::new(Some("@p".into()), StatusFlags::NONE, value)
+                .with_streamed_declaration(declaration);
+            assert_eq!(parameter.sql_declaration().unwrap(), name);
+            let bytes = serialize_param(&parameter);
+            assert_eq!(&bytes[6..9], &[type_byte, 0xff, 0xff]);
+            assert_eq!(&bytes[bytes.len() - 8..], &[0xff; 8], "PLP NULL");
         }
     }
 

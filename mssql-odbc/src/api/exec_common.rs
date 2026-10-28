@@ -3481,11 +3481,35 @@ mod tests {
         };
         use mssql_tds::test_client_support::rpc_parameter_declaration;
 
-        for (c_type, sql_type, legacy, max) in [
-            (SQL_C_CHAR, SQL_LONGVARCHAR, "text", "varchar(MAX)"),
-            (SQL_C_CHAR, SQL_WLONGVARCHAR, "ntext", "nvarchar(MAX)"),
-            (SQL_C_BINARY, SQL_LONGVARBINARY, "image", "varbinary(MAX)"),
-            (SQL_C_BINARY, SQL_LONGVARCHAR, "text", "varchar(MAX)"),
+        for (c_type, sql_type, legacy, max, wire) in [
+            (
+                SQL_C_CHAR,
+                SQL_LONGVARCHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
+            (
+                SQL_C_CHAR,
+                SQL_WLONGVARCHAR,
+                "ntext",
+                "nvarchar(MAX)",
+                "NVarcharMax",
+            ),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARBINARY,
+                "image",
+                "varbinary(MAX)",
+                "VarBinaryMax",
+            ),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARCHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
         ] {
             for long_as_max in [false, true] {
                 let h = TestHandles::with_env_dbc_stmt();
@@ -3530,6 +3554,11 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(rpc_parameter_declaration(&rebuilt[0]).unwrap(), expected);
+                let framing = format!("{:?}", rebuilt[0]);
+                assert!(
+                    framing.contains(&format!("Materialized({wire}(")),
+                    "a rebuilt DAE value must keep PLP framing: {framing}"
+                );
             }
         }
     }
