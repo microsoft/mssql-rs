@@ -36,9 +36,19 @@ fn parse_iso_time(value: &str) -> Option<NaiveTime> {
     if !value.is_ascii() {
         return None;
     }
-    let (clock, fraction) = value
+    let (mut clock, mut fraction) = value
         .split_once(['.', ','])
         .map_or((value, None), |(clock, fraction)| (clock, Some(fraction)));
+    // Python also accepts HHMMSSff and HH:MM:SS:f without a decimal separator.
+    if fraction.is_none() {
+        if clock.as_bytes().get(8) == Some(&b':') {
+            fraction = Some(&clock[9..]);
+            clock = &clock[..8];
+        } else if clock.len() >= 8 && !clock.contains(':') {
+            fraction = Some(&clock[6..]);
+            clock = &clock[..6];
+        }
+    }
     let nanoseconds = match fraction {
         Some(fraction)
             if !fraction.is_empty()
@@ -2212,6 +2222,50 @@ mod tests {
     }
 
     #[test]
+    fn datetime_strings_preserve_legacy_fractional_forms() {
+        for (clock, fractional_ticks) in [
+            ("12000000", 0),
+            ("12000012", 1_200_000),
+            ("120000123", 1_230_000),
+            ("1200001234", 1_234_000),
+            ("12000012345", 1_234_500),
+            ("120000123456", 1_234_560),
+            ("1200001234567", 1_234_567),
+            ("1200000000001", 1),
+            ("1200009999999", 9_999_999),
+            ("12:00:00:00", 0),
+            ("12:00:00:1", 1_000_000),
+            ("12:00:00:12", 1_200_000),
+            ("12:00:00:123456", 1_234_560),
+            ("12:00:00:1234567", 1_234_567),
+            ("12:00:00:0000001", 1),
+            ("12:00:00:9999999", 9_999_999),
+        ] {
+            for (zone, offset) in [("", 0), ("Z", 0), ("+05:30", 330), ("-07:00", -420)] {
+                let input = format!("2024-07-01T{clock}{zone}");
+                for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+                    let (datetime, offset_ticks) = match convert(&input, sql_type, 7)
+                        .unwrap_or_else(|error| panic!("{input}: {error}"))
+                    {
+                        ColumnValues::DateTime2(value) => (value, 0),
+                        ColumnValues::DateTimeOffset(value) => {
+                            assert_eq!(value.offset, offset, "{input}");
+                            (value.datetime2, i64::from(offset) * 600_000_000)
+                        }
+                        other => panic!("Unexpected value: {other:?}"),
+                    };
+                    assert_eq!(datetime.days, 739_067, "{input}");
+                    assert_eq!(
+                        datetime.time.time_nanoseconds as i64,
+                        432_000_000_000 + fractional_ticks - offset_ticks,
+                        "{input}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn week_date_separators_match_python_datetime() {
         Python::attach(|py| {
             let datetime = py.import("datetime").unwrap().getattr("datetime").unwrap();
@@ -2235,15 +2289,24 @@ mod tests {
                 }
                 for separator in ["T", " ", "-", "+", ":", "Z", "x", "\u{20ac}"] {
                     for hour in 0..24 {
-                        for clock in [
-                            format!("{hour:02}"),
-                            format!("{hour:02}34"),
-                            format!("{hour:02}3456"),
-                            format!("{hour:02}:34"),
-                            format!("{hour:02}:34:56"),
+                        for (clock, has_fraction) in [
+                            (format!("{hour:02}"), false),
+                            (format!("{hour:02}34"), false),
+                            (format!("{hour:02}3456"), false),
+                            (format!("{hour:02}345612"), true),
+                            (format!("{hour:02}3456123456"), true),
+                            (format!("{hour:02}:34"), false),
+                            (format!("{hour:02}:34:56"), false),
+                            (format!("{hour:02}:34:56:1"), true),
+                            (format!("{hour:02}:34:56:123456"), true),
                         ] {
                             for fraction in ["", ".123456"] {
-                                for zone in ["", "Z", "+05:30", "-07:00"] {
+                                if has_fraction && !fraction.is_empty() {
+                                    continue;
+                                }
+                                for zone in
+                                    ["", "Z", "+05:30", "-07:00", "+05300000", "-07:00:00:0"]
+                                {
                                     let input = format!("{date}{separator}{clock}{fraction}{zone}");
                                     let expected =
                                         datetime.call_method1("fromisoformat", (&input,));
@@ -2457,7 +2520,16 @@ mod tests {
 
     #[test]
     fn datetime2_strings_ignore_subminute_offsets() {
-        for offset in ["+00:00:30", "-00:00:30", "+00:00:00.1", "-00:00:30.1234567"] {
+        for offset in [
+            "+00:00:30",
+            "-00:00:30",
+            "+00:00:00.1",
+            "-00:00:30.1234567",
+            "+00000012",
+            "-0000301234567",
+            "+00:00:00:1",
+            "-00:00:30:1234567",
+        ] {
             let input = format!("2024-07-01T00:00:00.1234567{offset}");
             let ColumnValues::DateTime2(value) = convert(&input, SqlDbType::DateTime2, 7).unwrap()
             else {
@@ -2484,6 +2556,16 @@ mod tests {
                 "2024-07-01T24:00:00",
                 "2024-07-01T12:60:00",
                 "2024-07-01T12:00:60",
+                "2024-07-01T1",
+                "2024-07-01T123",
+                "2024-07-01T1200001",
+                "2024-07-01T12000012345678",
+                "2024-07-01T12000012.34",
+                "2024-07-01T120000x12",
+                "2024-07-01T12:00:00:",
+                "2024-07-01T12:00:00:12:34",
+                "2024-07-01T12:00:00:12.34",
+                "2024-07-01T12:00:00:12345678",
                 "2024-07-01T12:00:00.",
                 "2024-07-01T12:00:00.12345678",
                 "2024-07-01T12:00:00+24:00",

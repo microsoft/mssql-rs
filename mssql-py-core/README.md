@@ -31,6 +31,8 @@ silently truncated. The destination column's scale is applied by the TDS
 serializer, using the existing truncation behavior for lower scales.
 Fixed-width `YYYY-MM-DD` dates use a direct parsing path; other supported ISO
 formats retain the general parser and the same precision and validation.
+Python-compatible fractional forms such as `12000012` and `12:00:00:12`
+are retained; both represent `12:00:00.12`.
 
 `DATETIME2` retains the local date and time when an offset is present.
 `DATETIMEOFFSET` preserves the offset and normalizes its wire timestamp to UTC;
