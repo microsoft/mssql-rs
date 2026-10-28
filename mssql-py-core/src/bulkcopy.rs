@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 use crate::types::py_to_column_value;
 use async_trait::async_trait;
+use chrono::{Datelike, NaiveDate, NaiveTime, TimeDelta, Timelike};
 use mssql_tds::connection::bulk_copy::{BulkLoadRow, ResolvedColumnMapping};
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType};
-use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::column_values::{ColumnValues, SqlDateTime2, SqlDateTimeOffset, SqlTime};
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_vector::SqlVector;
@@ -30,6 +31,142 @@ use pyo3::types::{PyString, PyTuple};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use tracing::instrument;
+
+fn parse_iso_time(value: &str) -> Option<NaiveTime> {
+    if !value.is_ascii() {
+        return None;
+    }
+    let (clock, fraction) = value
+        .split_once(['.', ','])
+        .map_or((value, None), |(clock, fraction)| (clock, Some(fraction)));
+    let nanoseconds = match fraction {
+        Some(fraction)
+            if !fraction.is_empty()
+                && fraction.len() <= 7
+                && fraction.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            fraction.parse::<u32>().ok()? * 10u32.pow(9 - fraction.len() as u32)
+        }
+        Some(_) => return None,
+        None => 0,
+    };
+    let (hour, minute, second) = if clock.contains(':') {
+        let mut parts = clock.split(':');
+        let hour = parts.next()?;
+        let minute = parts.next()?;
+        let second = parts.next().unwrap_or("00");
+        if parts.next().is_some() {
+            return None;
+        }
+        (hour, minute, second)
+    } else {
+        match clock.len() {
+            2 => (clock, "00", "00"),
+            4 => (&clock[..2], &clock[2..], "00"),
+            6 => (&clock[..2], &clock[2..4], &clock[4..]),
+            _ => return None,
+        }
+    };
+    let component = |part: &str| {
+        (part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse::<u32>().ok())
+            .flatten()
+    };
+    NaiveTime::from_hms_nano_opt(
+        component(hour)?,
+        component(minute)?,
+        component(second)?,
+        nanoseconds,
+    )
+}
+
+fn parse_bulk_datetime(value: &str, metadata: &BulkCopyColumnMetadata) -> TdsResult<ColumnValues> {
+    let invalid = || {
+        Error::UsageError(format!(
+            "Invalid ISO datetime '{value}' for column '{}': expected a valid date and time with at most seven fractional digits",
+            metadata.column_name
+        ))
+    };
+    let (date, remainder) = ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u", "%GW%V%u"]
+        .iter()
+        .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok())
+        .or_else(|| {
+            ["%G-W%V", "%GW%V"].iter().find_map(|format| {
+                let mut parsed = chrono::format::Parsed::new();
+                let remainder = chrono::format::parse_and_remainder(
+                    &mut parsed,
+                    value,
+                    chrono::format::StrftimeItems::new(format),
+                )
+                .ok()?;
+                parsed.set_weekday(chrono::Weekday::Mon).ok()?;
+                Some((parsed.to_naive_date().ok()?, remainder))
+            })
+        })
+        .ok_or_else(invalid)?;
+    if !(1..=9999).contains(&date.year()) {
+        return Err(invalid());
+    }
+
+    let (time, offset) = if remainder.is_empty() {
+        (NaiveTime::MIN, 0)
+    } else {
+        // ISO datetime permits a single separator between the date and time.
+        let clock = &remainder[remainder.chars().next().ok_or_else(invalid)?.len_utf8()..];
+        let offset_start = clock.find(['+', '-', 'Z']);
+        let (clock, zone) = offset_start.map_or((clock, ""), |index| clock.split_at(index));
+        let time = parse_iso_time(clock).ok_or_else(invalid)?;
+        let offset = match zone {
+            "" | "Z" => 0,
+            _ if zone.starts_with(['+', '-']) => {
+                let offset = parse_iso_time(&zone[1..]).ok_or_else(invalid)?;
+                if metadata.sql_type == SqlDbType::DateTimeOffset
+                    && (offset.second() != 0 || offset.nanosecond() != 0)
+                {
+                    return Err(Error::UsageError(
+                        "DATETIMEOFFSET requires a whole-minute UTC offset".into(),
+                    ));
+                }
+                let seconds = i64::from(offset.num_seconds_from_midnight());
+                if zone.starts_with('-') {
+                    -seconds
+                } else {
+                    seconds
+                }
+            }
+            _ => return Err(invalid()),
+        };
+        (time, offset)
+    };
+    let mut datetime = date.and_time(time);
+    if metadata.sql_type == SqlDbType::DateTimeOffset {
+        if !(-840 * 60..=840 * 60).contains(&offset) {
+            return Err(Error::UsageError(
+                "Timezone offset is outside the DATETIMEOFFSET range (-14:00 to +14:00)".into(),
+            ));
+        }
+        datetime = datetime
+            .checked_sub_signed(TimeDelta::seconds(offset))
+            .filter(|datetime| (1..=9999).contains(&datetime.year()))
+            .ok_or_else(invalid)?;
+    }
+    let datetime2 = SqlDateTime2 {
+        days: (datetime.num_days_from_ce() - 1) as u32,
+        time: SqlTime {
+            time_nanoseconds: u64::from(datetime.num_seconds_from_midnight()) * 10_000_000
+                + u64::from(datetime.nanosecond()) / 100,
+            scale: metadata.scale,
+        },
+    };
+    if metadata.sql_type == SqlDbType::DateTimeOffset {
+        Ok(ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+            datetime2,
+            offset: (offset / 60) as i16,
+        }))
+    } else {
+        Ok(ColumnValues::DateTime2(datetime2))
+    }
+}
 
 /// Represents the source Python type for conversion mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1245,7 +1382,7 @@ impl PythonRowAdapter {
 
     /// Coerce a Python string to a SQL Server DATETIME2 value.
     ///
-    /// Parses an ISO format datetime string (YYYY-MM-DD HH:MM:SS[.ffffff])
+    /// Parses an ISO format datetime string (YYYY-MM-DD HH:MM:SS[.fffffff])
     /// and converts to SqlDateTime2 format.
     fn coerce_string_to_datetime2(
         py_obj: &Bound<'_, PyAny>,
@@ -1259,30 +1396,7 @@ impl PythonRowAdapter {
             .to_str()
             .map_err(|e| Error::UsageError(format!("Failed to extract string: {}", e)))?;
 
-        // Use Python's datetime.datetime.fromisoformat() to parse ISO datetime string
-        let py = py_obj.py();
-        let datetime_module = py
-            .import("datetime")
-            .map_err(|e| Error::UsageError(format!("Failed to import datetime module: {}", e)))?;
-
-        let datetime_class = datetime_module
-            .getattr("datetime")
-            .map_err(|e| Error::UsageError(format!("Failed to get datetime class: {}", e)))?;
-
-        // Replace space with 'T' for ISO format compatibility if needed
-        let iso_str = s.replace(' ', "T");
-
-        let parsed_datetime = datetime_class
-            .call_method1("fromisoformat", (iso_str.as_str(),))
-            .map_err(|e| {
-                Error::UsageError(format!(
-                    "Invalid datetime format '{}'. Expected ISO format like '2024-01-15 09:30:00' or '2024-01-15T09:30:00': {}",
-                    s, e
-                ))
-            })?;
-
-        // Now convert the datetime object to ColumnValues using the metadata-aware conversion
-        crate::types::py_to_column_value(&parsed_datetime, Some(target_meta))
+        parse_bulk_datetime(s, target_meta)
     }
 
     /// Coerce a Python datetime object to a SQL Server DATETIME2 value.
@@ -1305,8 +1419,6 @@ impl PythonRowAdapter {
         py_obj: &Bound<'_, PyAny>,
         target_meta: &BulkCopyColumnMetadata,
     ) -> TdsResult<ColumnValues> {
-        let py = py_obj.py();
-
         // Cast to PyString and extract the string value
         let py_str = py_obj
             .cast::<PyString>()
@@ -1316,27 +1428,7 @@ impl PythonRowAdapter {
             .to_str()
             .map_err(|e| Error::UsageError(format!("Failed to extract string: {}", e)))?;
 
-        // Import datetime module
-        let datetime_module = PyModule::import(py, "datetime")
-            .map_err(|e| Error::UsageError(format!("Failed to import datetime module: {}", e)))?;
-
-        let datetime_class = datetime_module
-            .getattr("datetime")
-            .map_err(|e| Error::UsageError(format!("Failed to get datetime class: {}", e)))?;
-
-        // Parse the ISO format datetime string with timezone
-        // Python's datetime.fromisoformat() handles ISO 8601 format with timezone offsets
-        let parsed_datetime = datetime_class
-            .call_method1("fromisoformat", (datetime_str,))
-            .map_err(|e| {
-                Error::UsageError(format!(
-                    "Failed to parse datetime string '{}' for DATETIMEOFFSET column '{}': {}. Expected ISO 8601 format with timezone (e.g., '2024-01-15T09:30:45+00:00')",
-                    datetime_str, target_meta.column_name, e
-                ))
-            })?;
-
-        // Now convert the datetime object to ColumnValues using the metadata-aware conversion
-        crate::types::py_to_column_value(&parsed_datetime, Some(target_meta))
+        parse_bulk_datetime(datetime_str, target_meta)
     }
 
     /// Coerce a Python datetime object to a SQL Server DATETIMEOFFSET value.
@@ -2015,5 +2107,176 @@ impl BulkLoadRow for PythonRowAdapter {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convert(value: &str, sql_type: SqlDbType, scale: u8) -> TdsResult<ColumnValues> {
+        let metadata = BulkCopyColumnMetadata::new("event_time", sql_type, sql_type.to_tds_type())
+            .with_scale(scale);
+        Python::attach(|py| {
+            PythonRowAdapter::convert_by_target_type(PyString::new(py, value).as_any(), &metadata)
+        })
+    }
+
+    #[test]
+    fn datetime_strings_preserve_seven_fractional_digits() {
+        for (fraction, ticks) in [
+            ("", 0),
+            (".1", 1_000_000),
+            (".12", 1_200_000),
+            (".123", 1_230_000),
+            (".1234", 1_234_000),
+            (".12345", 1_234_500),
+            (".123456", 1_234_560),
+            (".1234567", 1_234_567),
+            (".0000001", 1),
+            (".9999999", 9_999_999),
+        ] {
+            for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+                for separator in [" ", "T"] {
+                    for zone in ["", "Z", "+00:00"] {
+                        let input = format!("2024-07-01{separator}12:00:00{fraction}{zone}");
+                        for scale in 0..=7 {
+                            let datetime = match convert(&input, sql_type, scale).unwrap() {
+                                ColumnValues::DateTime2(value) => value,
+                                ColumnValues::DateTimeOffset(value) => {
+                                    assert_eq!(value.offset, 0);
+                                    value.datetime2
+                                }
+                                other => panic!("Unexpected value: {other:?}"),
+                            };
+                            assert_eq!(datetime.days, 739_067, "{input}");
+                            assert_eq!(
+                                datetime.time.time_nanoseconds,
+                                432_000_000_000 + ticks,
+                                "{input}"
+                            );
+                            assert_eq!(datetime.time.scale, scale);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn datetimeoffset_strings_normalize_to_utc() {
+        for (input, days, ticks, offset) in [
+            (
+                "2024-07-01T12:00:00.1234567+05:30",
+                739_067,
+                234_001_234_567,
+                330,
+            ),
+            (
+                "2024-07-01T12:00:00.1234567-07:00",
+                739_067,
+                684_001_234_567,
+                -420,
+            ),
+            (
+                "2024-07-01T00:00:00.0000001+14:00",
+                739_066,
+                360_000_000_001,
+                840,
+            ),
+            (
+                "2024-07-01T23:59:59.9999999-14:00",
+                739_068,
+                503_999_999_999,
+                -840,
+            ),
+            ("0001-01-01T00:00:00Z", 0, 0, 0),
+            (
+                "9999-12-31T23:59:59.9999999Z",
+                3_652_058,
+                863_999_999_999,
+                0,
+            ),
+        ] {
+            let ColumnValues::DateTimeOffset(value) =
+                convert(input, SqlDbType::DateTimeOffset, 7).unwrap()
+            else {
+                panic!("Expected DATETIMEOFFSET");
+            };
+            assert_eq!(value.datetime2.days, days, "{input}");
+            assert_eq!(value.datetime2.time.time_nanoseconds, ticks, "{input}");
+            assert_eq!(value.offset, offset, "{input}");
+        }
+    }
+
+    #[test]
+    fn datetime2_strings_keep_local_time_and_iso_variants() {
+        for input in [
+            "2024-07-01T12:00:00.1234567+05:30",
+            "2024-07-01T12:00:00.1234567-07:00",
+            "20240701T120000.1234567",
+            "2024-W27-1T12:00:00,1234567",
+            "2024W271T120000.1234567",
+            "2024-W27T12:00:00.1234567",
+            "2024W27T120000.1234567",
+            "2024-07-01T12:00:00.1234567+0530",
+            "2024-07-01T12:00:00.1234567-07",
+        ] {
+            let ColumnValues::DateTime2(value) = convert(input, SqlDbType::DateTime2, 7).unwrap()
+            else {
+                panic!("Expected DATETIME2");
+            };
+            assert_eq!(value.days, 739_067);
+            assert_eq!(value.time.time_nanoseconds, 432_001_234_567);
+        }
+        for (input, ticks) in [
+            ("2024-07-01", 0),
+            ("2024-W27", 0),
+            ("2024W27", 0),
+            ("2024-07-01T12", 432_000_000_000),
+            ("2024-07-01T12:30", 450_000_000_000),
+        ] {
+            let ColumnValues::DateTime2(value) = convert(input, SqlDbType::DateTime2, 7).unwrap()
+            else {
+                panic!("Expected DATETIME2");
+            };
+            assert_eq!(value.time.time_nanoseconds, ticks);
+        }
+    }
+
+    #[test]
+    fn datetime_strings_reject_invalid_values() {
+        for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+            for input in [
+                "",
+                "2024-02-30T12:00:00",
+                "0000-01-01",
+                "10000-01-01",
+                "2024-07-01T24:00:00",
+                "2024-07-01T12:60:00",
+                "2024-07-01T12:00:60",
+                "2024-07-01T12:00:00.",
+                "2024-07-01T12:00:00.12345678",
+                "2024-07-01T12:00:00+24:00",
+                "2024-07-01T12:00:00Z12",
+                "2024-07-01T1:00:00",
+                "2024-07-01T0\u{20ac}00",
+            ] {
+                assert!(convert(input, sql_type, 7).is_err(), "{input}");
+            }
+        }
+        for input in [
+            "2024-07-01T12:00:00+14:01",
+            "2024-07-01T12:00:00-14:01",
+            "2024-07-01T12:00:00+00:00:30",
+            "2024-07-01T12:00:00+00:00:00.1",
+            "0001-01-01T00:00:00+00:01",
+            "9999-12-31T23:59:59.9999999-00:01",
+        ] {
+            assert!(
+                convert(input, SqlDbType::DateTimeOffset, 7).is_err(),
+                "{input}"
+            );
+        }
     }
 }

@@ -55,6 +55,22 @@ connection attribute. See the
 [connection policy](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/README.md#connection-policy-and-migration)
 for applicability, address limits, and recovery behavior.
 
+## Bulk-copy datetime strings
+
+Bulk copy parses ISO datetime strings targeting `DATETIME2` and `DATETIMEOFFSET`
+in Rust, preserving all seven fractional-second digits (100 ns precision).
+Both space and `T` separators and a trailing `Z` are supported on every supported
+Python version. Fractions longer than seven digits are rejected rather than
+silently truncated. The destination column's scale is applied by the TDS
+serializer, using the existing truncation behavior for lower scales.
+
+`DATETIME2` retains the local date and time when an offset is present.
+`DATETIMEOFFSET` preserves the offset and normalizes its wire timestamp to UTC;
+offsets must be whole minutes within `-14:00` through `+14:00`, and both the local
+and UTC dates must be within years 1 through 9999. Strings without an offset
+continue to use UTC for `DATETIMEOFFSET`. Python `datetime` objects retain their
+existing microsecond resolution.
+
 ## Platforms
 
 Prebuilt CPython 3.10+ wheels for:
