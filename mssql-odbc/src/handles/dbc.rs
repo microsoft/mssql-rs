@@ -32,7 +32,7 @@ pub(crate) enum ConnectionState {
 /// Holds a back-pointer to the parent environment and connection-level state.
 ///
 /// Thread-safety: The `inner` mutex protects mutable state except the atomic
-/// connection timeout, read on every cancellable statement call.
+/// connection timeout, read without that mutex when signalling cancellation.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
     pub(crate) trace: Arc<mssql_tds::trace_context::ConnectionTrace>,

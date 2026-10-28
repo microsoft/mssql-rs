@@ -52,7 +52,8 @@ pub(crate) enum LeaseReturn {
 /// always has an owner; a connection-scoped owner never outlives its lease.
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionWire {
-    client: Option<TdsClient>,
+    // Allocate once per connection, not a large client move on every rowset.
+    client: Option<Box<TdsClient>>,
     owner: Option<WireOwner>,
     lease: Option<u64>,
     next_lease_id: u64,
@@ -64,7 +65,7 @@ impl ConnectionWire {
             self.client.is_none() && self.lease.is_none(),
             "installing a client over a live session"
         );
-        self.client = Some(client);
+        self.client = Some(Box::new(client));
         self.owner = None;
         self.lease = None;
     }
@@ -73,12 +74,12 @@ impl ConnectionWire {
     pub(crate) fn uninstall(&mut self) -> Option<TdsClient> {
         self.owner = None;
         self.lease = None;
-        self.client.take()
+        self.client.take().map(|client| *client)
     }
 
     /// The parked client; `None` while a lease is out.
     pub(crate) fn client(&self) -> Option<&TdsClient> {
-        self.client.as_ref()
+        self.client.as_deref()
     }
 
     pub(crate) fn statement_owner(&self) -> Option<*mut c_void> {
@@ -133,7 +134,7 @@ impl ConnectionWire {
         policy: ClaimPolicy,
     ) -> Result<&mut TdsClient, ClaimError> {
         self.check(owner, policy)?;
-        self.client.as_mut().ok_or(ClaimError::NoClient)
+        self.client.as_deref_mut().ok_or(ClaimError::NoClient)
     }
 
     /// Only after `parked_client_mut` succeeded for `statement` under the same
@@ -179,12 +180,12 @@ impl ConnectionWire {
     }
 
     pub(crate) fn put_client_for_test(&mut self, client: TdsClient) {
-        self.client = Some(client);
+        self.client = Some(Box::new(client));
         self.lease = None;
     }
 
     pub(crate) fn clear_client_for_test(&mut self) -> Option<TdsClient> {
-        self.client.take()
+        self.client.take().map(|client| *client)
     }
 
     pub(crate) fn set_owner_for_test(&mut self, statement: Option<*mut c_void>) {
@@ -192,7 +193,7 @@ impl ConnectionWire {
     }
 
     pub(crate) fn client_mut_for_test(&mut self) -> Option<&mut TdsClient> {
-        self.client.as_mut()
+        self.client.as_deref_mut()
     }
 
     pub(crate) fn take_lease_for_test(&mut self, statement: *mut c_void) -> WireLease {
@@ -210,7 +211,7 @@ impl ConnectionWire {
 #[derive(Debug)]
 #[must_use = "a wire lease must be returned to its connection"]
 pub(crate) struct WireLease {
-    client: TdsClient,
+    client: Box<TdsClient>,
     owner: WireOwner,
     id: u64,
 }
@@ -220,7 +221,7 @@ impl WireLease {
         self.owner
     }
 
-    fn into_parts(self) -> (TdsClient, WireOwner, u64) {
+    fn into_parts(self) -> (Box<TdsClient>, WireOwner, u64) {
         (self.client, self.owner, self.id)
     }
 
@@ -228,7 +229,7 @@ impl WireLease {
     #[cfg(test)]
     pub(crate) fn detached_for_test(client: TdsClient, statement: *mut c_void) -> Self {
         Self {
-            client,
+            client: Box::new(client),
             owner: WireOwner::Statement(statement),
             id: 0,
         }
@@ -263,6 +264,21 @@ mod tests {
         let mut wire = ConnectionWire::default();
         wire.install(tds_client_from_tokens(Vec::new()));
         wire
+    }
+
+    #[test]
+    fn leasing_keeps_the_client_allocation_in_place() {
+        assert!(size_of::<WireLease>() <= 32);
+        let mut wire = connected_wire();
+        let address = std::ptr::from_ref(wire.client().unwrap());
+        for _ in 0..3 {
+            let lease = wire
+                .claim(WireOwner::Statement(STMT_A), ClaimPolicy::IdleOrOwn)
+                .unwrap();
+            assert_eq!(std::ptr::from_ref::<TdsClient>(&lease), address);
+            assert!(wire.restore(lease, LeaseReturn::KeepReservation));
+            assert_eq!(std::ptr::from_ref(wire.client().unwrap()), address);
+        }
     }
 
     #[test]
