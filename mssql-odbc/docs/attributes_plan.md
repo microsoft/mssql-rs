@@ -55,7 +55,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | Attribute | Set | Get | Note |
 |---|---|---|---|
 | `SQL_ATTR_LOGIN_TIMEOUT` | ✅ | ✅ | clamped to `0xFFFE`, `01S02` on clamp |
-| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds the internal `SQL_USER_NAME`, alias-type, and database-updateability lookups, as msodbcsql's `GetNetIOTimeOut` does on the session; secondary logins and reads share that deadline (deviation 32) |
+| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-owned batches and transaction requests, including catalog/isolation changes, autocommit transitions, commit/rollback, and reset/disconnect rollback; also bounds internal `SQL_USER_NAME`, alias-type, and database-updateability lookups. Zero means no request deadline, with the separate 120-second cancellation default. Statement query timeout remains independent. Secondary logins and reads share the connection-timeout deadline (deviation 32). See `transactions_plan.md` for scope and source evidence. |
 | `SQL_ATTR_PACKET_SIZE` | ✅ | ✅ | pre-connect only |
 | `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | stored hint, not DML enforcement; an actually read-only database overrides the connected getter (see below) |
 | `SQL_ATTR_AUTOCOMMIT` | ✅ | ✅ | |

@@ -1087,16 +1087,10 @@ impl<'a> BulkCopy<'a> {
         // second batch's verdict would overwrite the first's, and a bulk copy
         // whose only substitution happened early would report none (AB#47598).
         //
-        // Unlike `accumulated_info`, this is mirrored back onto the client as
-        // soon as it is updated, so the invariant "the client holds the verdict
-        // for every batch attempted so far" holds at *every* point after a
-        // drain. The loop has exits that do not pass through an epilogue — the
-        // two timeout returns and the `begin_transaction` `?` below — and a
-        // restore placed only at the end would drop an earlier batch's
-        // substitution on each of them. Nothing between batches clears the flag
-        // (the transaction calls build their own `PacketWriter`s and never
-        // reach `finish_send`), so the mirrored value survives until the next
-        // batch assigns a fresh one.
+        // Mirror this after each batch and internal transaction request.
+        // Transactions reach `finish_send` and replace the flag with their own
+        // verdict, so restoring only at the epilogue would lose earlier batches'
+        // substitutions on a transaction failure or an inter-batch timeout.
         let mut accumulated_cp_loss = false;
 
         loop {
@@ -1153,9 +1147,13 @@ impl<'a> BulkCopy<'a> {
             // This mirrors .NET SqlBulkCopy.CopyBatchesAsync behavior
             // ═══════════════════════════════════════════════════════════════════
             if use_internal_transaction {
-                self.client
+                let result = self
+                    .client
                     .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
-                    .await?;
+                    .await;
+                self.client
+                    .set_code_page_conversion_loss(accumulated_cp_loss);
+                result?;
             }
 
             // Execute streaming bulk load with zero-copy path
@@ -1186,16 +1184,20 @@ impl<'a> BulkCopy<'a> {
                     // COMMIT TRANSACTION: Commit on successful batch completion
                     // This mirrors .NET SqlBulkCopy.CommitTransaction() behavior
                     // ═══════════════════════════════════════════════════════════
-                    if use_internal_transaction
-                        && let Err(e) = self.client.commit_transaction(None, None).await
-                    {
+                    let commit_result = if use_internal_transaction {
+                        let result = self.client.commit_transaction(None, None).await;
+                        self.client
+                            .set_code_page_conversion_loss(accumulated_cp_loss);
+                        result
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(e) = commit_result {
                         // The commit itself failed. Restore the INFO accumulated up to
                         // and including this batch before propagating the error, so it
                         // stays retrievable via `client.info_messages()` — consistent
                         // with the Err(e) arm below. Drop any residual INFO left by the
-                        // failed commit first. The substitution verdict needs no restore
-                        // here: it was mirrored onto the client above and the commit
-                        // cannot have disturbed it.
+                        // failed commit first.
                         let _ = self.client.take_info_messages();
                         self.client
                             .extend_info_messages(std::mem::take(&mut accumulated_info));
@@ -1221,6 +1223,8 @@ impl<'a> BulkCopy<'a> {
                     if use_internal_transaction && self.client.has_active_transaction() {
                         // Attempt rollback, but don't mask the original error
                         let _ = self.client.rollback_transaction(None, None).await;
+                        self.client
+                            .set_code_page_conversion_loss(accumulated_cp_loss);
                     }
 
                     // Restore the INFO accumulated up to the failure so a mid-stream
@@ -1230,8 +1234,7 @@ impl<'a> BulkCopy<'a> {
                     // itself; INFO is a separate, complementary channel (INFO tokens vs
                     // ERROR tokens) and this mirrors .NET's InfoMessage events having
                     // already fired for the batches that completed. Drop any residual
-                    // INFO left by the rollback first. The substitution verdict was
-                    // mirrored onto the client above; the rollback cannot disturb it.
+                    // INFO left by the rollback first.
                     let _ = self.client.take_info_messages();
                     self.client
                         .extend_info_messages(std::mem::take(&mut accumulated_info));
@@ -1266,12 +1269,7 @@ impl<'a> BulkCopy<'a> {
         // buffer left by the final internal commit first, so only bulk-load INFO remains.
         let _ = self.client.take_info_messages();
         self.client.extend_info_messages(accumulated_info);
-        // Belt and braces: the verdict was already mirrored onto the client after
-        // each batch, and this helper only runs with at least one row, so the
-        // loop has always executed by now. Kept so the accumulator and the
-        // client cannot drift if a future exit is added between the last mirror
-        // and here. The empty-copy case is handled by the reset in
-        // `write_to_server_zerocopy`, which is the only caller.
+        // The empty-copy case is reset in `write_to_server_zerocopy`.
         self.client
             .set_code_page_conversion_loss(accumulated_cp_loss);
 

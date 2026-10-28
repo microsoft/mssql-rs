@@ -14,7 +14,7 @@ use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::error::Error;
-use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
+use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
 use crate::sql_identifier::{
     TABLE_INDEX, build_multipart_name, escape_identifier, parse_bulk_copy_target_identifier,
 };
@@ -510,6 +510,23 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// Returns an error if:
     /// - Network errors occur during transmission
     pub async fn end(mut self) -> TdsResult<u64> {
+        self.end_internal().await
+    }
+
+    /// Preserves framing state on every exit so the client can safely retract
+    /// serialization failures, or retire an interrupted packet without writing.
+    pub(crate) async fn end_with_message(
+        mut self,
+        serialize_result: TdsResult<()>,
+    ) -> (TdsResult<u64>, SuspendedMessage) {
+        let result = match serialize_result {
+            Ok(()) => self.end_internal().await,
+            Err(error) => Err(error),
+        };
+        (result, self.packet_writer.take_message())
+    }
+
+    async fn end_internal(&mut self) -> TdsResult<u64> {
         if !self.metadata_written {
             return Err(Error::ProtocolError(
                 "Must call begin() before end()".to_string(),

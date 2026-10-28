@@ -192,6 +192,16 @@ per-command timeout, cancellation handle, Always Encrypted override, or
 statement-error mode. It returns a `StatementResult` for the first result in
 the batch; use `advance()` to move through the rest of a multi-statement batch.
 
+`begin_transaction_with_options`, `commit_transaction_with_options`, and
+`rollback_transaction_with_options` accept the same timeout and cancellation
+options. These options expire when the transaction request returns, including
+on error; later savepoint or DTC requests do not inherit them.
+
+If a timeout interrupts a packet send, the client retires that transport without
+further writes, including graceful TLS shutdown during recovery or close.
+The no-write abort releases the socket immediately, even if the client is retained.
+Recovery, when permitted by the session state, uses a fresh transport.
+
 ## Cancelling an outstanding response
 
 Use `client.cancel_query(timeout_secs).await` to abandon remaining server work
