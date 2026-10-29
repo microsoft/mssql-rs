@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <array>
@@ -48,7 +49,7 @@ protected:
 
 // Benefits-from-mock-tds: assert the return tokens are captured before the
 // connection's client is published idle, not just the later buffer contents.
-TEST_F(OutputParamsTest, PendingValuesSurviveAnotherStatementUsingTheConnection) {
+ODBC_TEST_F(OutputParamsTest, PendingValuesSurviveAnotherStatementUsingTheConnection) {
     ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=73; RETURN 19");
     SQLINTEGER status = -1, output = -1;
@@ -76,7 +77,7 @@ TEST_F(OutputParamsTest, PendingValuesSurviveAnotherStatementUsingTheConnection)
     FreeStmt(other);
 }
 
-TEST_F(OutputParamsTest, ResetBindingsDiscardsPendingWrites) {
+ODBC_TEST_F(OutputParamsTest, ResetBindingsDiscardsPendingWrites) {
     ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=73");
     SQLINTEGER output = -1;
@@ -92,7 +93,7 @@ TEST_F(OutputParamsTest, ResetBindingsDiscardsPendingWrites) {
     EXPECT_EQ(-1, length);
 }
 
-TEST_F(OutputParamsTest, NonAsciiCharacterOutputUsesNativeClientEncoding) {
+ODBC_TEST_F(OutputParamsTest, NonAsciiCharacterOutputUsesNativeClientEncoding) {
     ExecDirect("CREATE PROCEDURE #native_output @v nvarchar(16) OUTPUT AS "
                "SET NOCOUNT ON; SET @v=NCHAR(233)+NCHAR(8364)+NCHAR(241)");
     const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9\xE2\x82\xAC\xC3\xB1");
@@ -110,7 +111,7 @@ TEST_F(OutputParamsTest, NonAsciiCharacterOutputUsesNativeClientEncoding) {
     EXPECT_EQ(0xCC, output[expected.size() + 1]);
 }
 
-TEST_F(OutputParamsTest, RebindingRedirectsPendingWrites) {
+ODBC_TEST_F(OutputParamsTest, RebindingRedirectsPendingWrites) {
     ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=73");
     SQLINTEGER old_output = -1, new_output = -2;
@@ -127,7 +128,7 @@ TEST_F(OutputParamsTest, RebindingRedirectsPendingWrites) {
     EXPECT_EQ(sizeof(SQLINTEGER), new_length);
 }
 
-TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
+ODBC_TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
     ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=73");
     std::array<SQLINTEGER, 4> values = {-1, -1, -1, -1};
@@ -156,7 +157,7 @@ TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
 
 // AB#49060: outputs are written after the result sets, so the APD offset
 // pointer in force then (not at execute) decides where they land.
-TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterExecute) {
+ODBC_TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterExecute) {
     ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=73");
     std::array<SQLINTEGER, 4> values = {-1, -1, -1, -1};
@@ -180,7 +181,7 @@ TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterExecute
     EXPECT_EQ(sizeof(SQLINTEGER), indicators[1]);
 }
 
-TEST_F(OutputParamsTest, OutputConversionErrorsReachTheApiReturnCode) {
+ODBC_TEST_F(OutputParamsTest, OutputConversionErrorsReachTheApiReturnCode) {
     ExecDirect("CREATE PROCEDURE #outputs @v varchar(8) OUTPUT AS "
                "SET NOCOUNT ON; SET @v='invalid'");
     SQLINTEGER output = -1;
@@ -193,7 +194,7 @@ TEST_F(OutputParamsTest, OutputConversionErrorsReachTheApiReturnCode) {
     EXPECT_EQ(-1, output);
 }
 
-TEST_F(OutputParamsTest, IndicatorOnlyOutputBinding) {
+ODBC_TEST_F(OutputParamsTest, IndicatorOnlyOutputBinding) {
     ExecDirect("CREATE PROCEDURE #indicator @v int OUTPUT AS SET NOCOUNT ON; SET @v=73");
     SQLLEN length = -2;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG,
@@ -208,7 +209,7 @@ TEST_F(OutputParamsTest, IndicatorOnlyOutputBinding) {
     EXPECT_EQ(SQL_NULL_DATA, length);
 }
 
-TEST_F(OutputParamsTest, NullOutputsPreserveCharacterBuffers) {
+ODBC_TEST_F(OutputParamsTest, NullOutputsPreserveCharacterBuffers) {
     struct Source {
         const char* name;
         SQLSMALLINT type;
@@ -238,7 +239,7 @@ TEST_F(OutputParamsTest, NullOutputsPreserveCharacterBuffers) {
     }
 }
 
-TEST_F(OutputParamsTest, IndicatorOnlyCharacterOutputIgnoresBufferLength) {
+ODBC_TEST_F(OutputParamsTest, IndicatorOnlyCharacterOutputIgnoresBufferLength) {
     ExecDirect("CREATE PROCEDURE #indicator @v varchar(8) OUTPUT AS SET NOCOUNT ON; SET @v='hello'");
     SQLLEN length = -2;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
@@ -249,7 +250,7 @@ TEST_F(OutputParamsTest, IndicatorOnlyCharacterOutputIgnoresBufferLength) {
     EXPECT_EQ(5, length);
 }
 
-TEST_F(OutputParamsTest, StringTruncationReachesTheApiReturnCode) {
+ODBC_TEST_F(OutputParamsTest, StringTruncationReachesTheApiReturnCode) {
     ExecDirect("CREATE PROCEDURE #outputs @v varchar(8) OUTPUT AS "
                "SET NOCOUNT ON; SET @v='abcdefgh'");
     char output[4] = {};
@@ -263,7 +264,7 @@ TEST_F(OutputParamsTest, StringTruncationReachesTheApiReturnCode) {
     EXPECT_EQ(8, length);
 }
 
-TEST_F(OutputParamsTest, FractionalTruncationIsNotStringTruncation) {
+ODBC_TEST_F(OutputParamsTest, FractionalTruncationIsNotStringTruncation) {
     ExecDirect("CREATE PROCEDURE #outputs @v float OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=12.75");
     SQLDOUBLE original_output = -1;
@@ -286,7 +287,7 @@ TEST_F(OutputParamsTest, FractionalTruncationIsNotStringTruncation) {
     EXPECT_EQ(12, output);
 }
 
-TEST_F(OutputParamsTest, ExhaustedFastPathReportsConversionWarningsAndErrorsOnce) {
+ODBC_TEST_F(OutputParamsTest, ExhaustedFastPathReportsConversionWarningsAndErrorsOnce) {
     ExecDirect("CREATE PROCEDURE #outputs @v varchar(8) OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v='abcdefgh'");
     for (bool invalid_conversion : {false, true}) {
