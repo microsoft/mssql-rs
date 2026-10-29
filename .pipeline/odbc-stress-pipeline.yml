@@ -21,7 +21,8 @@
 # each entry under gdb and print every thread's stack into the test log, from a
 # release driver built with symbols and line tables. Test results are published
 # per leg. A manual run can also enable driver tracing (driverTrace), published
-# as the OdbcDriverTraces_* artifacts.
+# as the OdbcDriverTraces_* artifacts. Every leg samples agent load once a
+# second into the OdbcLoad_* artifacts.
 #
 # Plan: mssql-odbc/docs/multithreaded-testing-plan.md, "Stress Profiles". The
 # schedule targets GitHub main; this definition lives only in the mssql-rs
@@ -151,6 +152,7 @@ stages:
       timeoutInMinutes: 120
       driverTrace: ${{ parameters.driverTrace }}
       driverTraceLevel: ${{ parameters.driverTraceLevel }}
+      collectLoad: true
       matrix:
         Ubuntu24:
           container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
@@ -167,6 +169,7 @@ stages:
       timeoutInMinutes: 120
       driverTrace: ${{ parameters.driverTrace }}
       driverTraceLevel: ${{ parameters.driverTraceLevel }}
+      collectLoad: true
       matrix:
         Alpine3_21:
           container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -207,9 +210,23 @@ stages:
         $env:ODBC_TEST_UID        = 'sa'
         $env:ODBC_TEST_PWD        = $env:SQL_PASSWORD
         $env:ODBC_TEST_TRUST_CERT = 'Yes'
-        ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
-          -MtProfile '$(odbcMtProfile)' `
-          -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
+        # Agent load once a second, so a slow or failed test can be lined up
+        # against CPU starvation. SQL Server shares this agent with the workers.
+        # A process that is not running leaves its column blank.
+        $loadDir = "$(Build.ArtifactStagingDirectory)/odbc-load"
+        New-Item -ItemType Directory -Force -Path $loadDir | Out-Null
+        $sampler = Start-Process typeperf -PassThru -NoNewWindow `
+          -RedirectStandardOutput "$loadDir/typeperf.out" -ArgumentList @(
+            '"\Processor(_Total)\% Processor Time"', '"\System\Processor Queue Length"',
+            '"\Memory\Available MBytes"', '"\Process(sqlservr)\% Processor Time"',
+            '-si', '1', '-f', 'CSV', '-o', "`"$loadDir/agent-load.csv`"", '-y')
+        try {
+          ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
+            -MtProfile '$(odbcMtProfile)' `
+            -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
+        } finally {
+          if (-not $sampler.HasExited) { Stop-Process -Id $sampler.Id }
+        }
       displayName: Run ODBC stress ($(odbcMtProfile)) with msodbcsql parity leg
       env:
         SQL_PASSWORD: $(SQL_PASSWORD)
@@ -241,6 +258,13 @@ stages:
       inputs:
         targetPath: $(Build.ArtifactStagingDirectory)/odbc-mt-dumps
         artifact: OdbcMtDumps_Windows_$(System.JobAttempt)
+    - task: PublishPipelineArtifact@1
+      displayName: Publish agent load samples
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/odbc-load
+        artifact: OdbcLoad_Windows_$(System.JobAttempt)
     - ${{ if parameters.driverTrace }}:
       - task: PublishPipelineArtifact@1
         displayName: Publish driver traces

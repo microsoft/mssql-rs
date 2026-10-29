@@ -21,6 +21,9 @@ parameters:
   # default: it changes timing (see odbc-stress-pipeline.yml).
   driverTrace: false
   driverTraceLevel: 'warn,mssqlodbc=debug'
+  # Sample agent CPU, memory and per-container load during the run into the
+  # OdbcLoad_* artifact (.pipeline/scripts/sample-load.sh).
+  collectLoad: false
   jobDisplayName: 'ODBC e2e Linux amd64'
   timeoutInMinutes: 60
 
@@ -60,6 +63,12 @@ jobs:
           # (both jobs mount the repo at /workspace).
           rm -rf mssql-odbc/tests/e2e/build
           cp -r "$(Pipeline.Workspace)/odbc-drop/build" mssql-odbc/tests/e2e/build
+
+          if [ "${ODBC_COLLECT_LOAD:-}" = "true" ]; then
+            bash .pipeline/scripts/sample-load.sh "$(Build.ArtifactStagingDirectory)/odbc-load" &
+            sampler=$!
+            trap 'kill "$sampler" 2> /dev/null || true' EXIT
+          fi
 
           # SQL Server needs a cert to serve TLS; generate and mount one.
           scripts/generate_cert.sh
@@ -145,6 +154,8 @@ jobs:
           CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
           ${{ if eq(parameters.driverTrace, true) }}:
             ODBC_DRIVER_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
+          ${{ if eq(parameters.collectLoad, true) }}:
+            ODBC_COLLECT_LOAD: 'true'
       - task: PublishTestResults@2
         condition: succeededOrFailed()
         displayName: "Publish ODBC e2e results"
@@ -152,6 +163,14 @@ jobs:
           testResultsFormat: "JUnit"
           testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
           testRunTitle: $(System.PhaseName)
+      - ${{ if eq(parameters.collectLoad, true) }}:
+        - task: PublishPipelineArtifact@1
+          displayName: Publish agent load samples
+          condition: always()
+          continueOnError: true
+          inputs:
+            targetPath: $(Build.ArtifactStagingDirectory)/odbc-load
+            artifact: OdbcLoad_Linux${{ parameters.nameSuffix }}_$(System.JobName)_$(System.JobAttempt)
       - ${{ if eq(parameters.driverTrace, true) }}:
         # The container writes the traces as root with mode 0600.
         - script: |
