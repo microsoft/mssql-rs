@@ -257,8 +257,24 @@ protected:
     // Only idle cancellation uses this gate; running-command cancellation must
     // remain concurrent with the executing call.
     SQLRETURN CancelIdleStatement() {
+        const auto requested = std::chrono::steady_clock::now();
         std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
-        return SQLCancel(stmt_);
+        const auto locked = std::chrono::steady_clock::now();
+        const SQLRETURN rc = SQLCancel(stmt_);
+        idle_cancel_lock_wait_ = locked - requested;
+        idle_cancel_call_ = std::chrono::steady_clock::now() - locked;
+        return rc;
+    }
+    // A slow idle cancel under SharedStmt can be time spent waiting for the
+    // observers' shared locks rather than in SQLCancel; add this to timing
+    // assertions so a failure says which.
+    std::string IdleCancelTiming() const {
+        using std::chrono::duration_cast;
+        using std::chrono::milliseconds;
+        return "idle cancel: lock_wait_ms=" +
+               std::to_string(duration_cast<milliseconds>(idle_cancel_lock_wait_).count()) +
+               " sqlcancel_ms=" +
+               std::to_string(duration_cast<milliseconds>(idle_cancel_call_).count());
     }
     std::shared_mutex diagnostics_mutex_;
 
@@ -267,4 +283,6 @@ private:
     SQLHDBC lent_dbc_ = SQL_NULL_HDBC;
     std::vector<SQLHSTMT> extra_stmts_;
     std::chrono::steady_clock::time_point test_start_;
+    std::chrono::steady_clock::duration idle_cancel_lock_wait_{};
+    std::chrono::steady_clock::duration idle_cancel_call_{};
 };

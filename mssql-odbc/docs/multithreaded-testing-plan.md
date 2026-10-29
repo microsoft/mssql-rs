@@ -490,6 +490,21 @@ local SQL Server:
   (measured in Ubuntu 24.04 and Alpine 3.21 containers). The stress drops keep
   the release driver's symbols and line tables (`keepDebugInfo`), so driver
   frames are named.
+- **Assertion failures leave no dump or stack.** A slow or wrong result needs
+  the driver's side instead: rerun the stress pipeline manually with
+  `driverTrace` on, which sets `MSSQL_TDS_TRACE*` for the Rust driver on every
+  leg and publishes the files as `OdbcDriverTraces_*`. Scheduled runs keep it
+  off because tracing changes timing. Idle-cancel timing assertions report
+  how long `CancelIdleStatement` waited for `/SharedStmt` observers to release
+  the diagnostics lock separately from the time spent in `SQLCancel`.
+- **Agent load.** Every stress leg samples the agent once a second and
+  publishes the samples as `OdbcLoad_*`: total CPU, processor queue length,
+  available memory and `sqlservr` CPU on Windows (`typeperf`; `sqlservr` is
+  summed across cores, and `agent.txt` records the core count); CPU busy,
+  runnable threads, load average, available memory and per-container
+  `docker stats` on Linux (`.pipeline/scripts/sample-load.sh`). Line a slow
+  iteration's log timestamp up with them to tell agent starvation from a
+  driver delay without a rerun.
 - A skipped mode reports a gtest skip; an entry whose variants are all skipped
   exits 77, so ctest and the parity report show it as skipped, not passed.
 - msodbcsql has failed or exited without a result a few times at 8 x 20 or more

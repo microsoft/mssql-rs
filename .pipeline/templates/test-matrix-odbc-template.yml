@@ -17,6 +17,13 @@ parameters:
   mtProfile: 'pr'
   # ctest until-pass retries; the stress profiles ignore it.
   retries: 3
+  # Rust driver tracing into the published OdbcDriverTraces_* artifact. Off by
+  # default: it changes timing (see odbc-stress-pipeline.yml).
+  driverTrace: false
+  driverTraceLevel: 'warn,mssqlodbc=debug'
+  # Sample agent CPU, memory and per-container load during the run into the
+  # OdbcLoad_* artifact (.pipeline/scripts/sample-load.sh).
+  collectLoad: false
   jobDisplayName: 'ODBC e2e Linux amd64'
   timeoutInMinutes: 60
 
@@ -56,6 +63,12 @@ jobs:
           # (both jobs mount the repo at /workspace).
           rm -rf mssql-odbc/tests/e2e/build
           cp -r "$(Pipeline.Workspace)/odbc-drop/build" mssql-odbc/tests/e2e/build
+
+          if [ "${ODBC_COLLECT_LOAD:-}" = "true" ]; then
+            bash .pipeline/scripts/sample-load.sh "$(Build.ArtifactStagingDirectory)/odbc-load" &
+            sampler=$!
+            trap 'kill "$sampler" 2> /dev/null || true' EXIT
+          fi
 
           # SQL Server needs a cert to serve TLS; generate and mount one.
           scripts/generate_cert.sh
@@ -111,6 +124,16 @@ jobs:
             exit 1
           fi
 
+          trace_args=()
+          if [ "${ODBC_DRIVER_TRACE:-}" = "true" ]; then
+            trace_args=(-e "MSSQL_TDS_TRACE=true"
+                        -e "MSSQL_TDS_TRACE_DIR=/workspace/odbc-driver-traces")
+            if [ -n "${ODBC_DRIVER_TRACE_LEVEL:-}" ]; then
+              trace_args+=(-e "MSSQL_TDS_TRACE_LEVEL=$ODBC_DRIVER_TRACE_LEVEL")
+            fi
+            echo "Driver tracing on: MSSQL_TDS_TRACE_LEVEL=${ODBC_DRIVER_TRACE_LEVEL:-<driver default>}"
+          fi
+
           bash .pipeline/scripts/docker-cargo-run.sh --rm \
             -v "$PWD:/workspace" \
             -w /workspace \
@@ -121,6 +144,7 @@ jobs:
             -e "ODBC_E2E_RETRIES=${{ parameters.retries }}" \
             -e "ODBC_E2E_MT_PROFILE=${{ parameters.mtProfile }}" \
             -e "RUST_BACKTRACE=full" \
+            "${trace_args[@]}" \
             --network testnet \
             $(container) /workspace/scripts/dockerentry/$(entry)
         workingDirectory: "$(Build.SourcesDirectory)"
@@ -130,6 +154,11 @@ jobs:
           SQL_PASSWORD: $(SQL_PASSWORD)
           CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
           CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+          ${{ if eq(parameters.driverTrace, true) }}:
+            ODBC_DRIVER_TRACE: 'true'
+            ODBC_DRIVER_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
+          ${{ if eq(parameters.collectLoad, true) }}:
+            ODBC_COLLECT_LOAD: 'true'
       - task: PublishTestResults@2
         condition: succeededOrFailed()
         displayName: "Publish ODBC e2e results"
@@ -137,3 +166,28 @@ jobs:
           testResultsFormat: "JUnit"
           testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
           testRunTitle: $(System.PhaseName)
+      - ${{ if eq(parameters.collectLoad, true) }}:
+        - task: PublishPipelineArtifact@1
+          displayName: Publish agent load samples
+          condition: always()
+          continueOnError: true
+          inputs:
+            targetPath: $(Build.ArtifactStagingDirectory)/odbc-load
+            artifact: OdbcLoad_Linux${{ parameters.nameSuffix }}_$(System.JobName)_$(System.JobAttempt)
+      - ${{ if eq(parameters.driverTrace, true) }}:
+        # The container writes the traces as root with mode 0600.
+        - script: |
+            if [ -d odbc-driver-traces ]; then
+              sudo chown -R "$(id -u):$(id -g)" odbc-driver-traces
+            fi
+          workingDirectory: "$(Build.SourcesDirectory)"
+          displayName: Make driver traces readable
+          condition: always()
+          continueOnError: true
+        - task: PublishPipelineArtifact@1
+          displayName: Publish driver traces
+          condition: always()
+          continueOnError: true
+          inputs:
+            targetPath: $(Build.SourcesDirectory)/odbc-driver-traces
+            artifact: OdbcDriverTraces_Linux${{ parameters.nameSuffix }}_$(System.JobName)_$(System.JobAttempt)

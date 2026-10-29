@@ -20,7 +20,9 @@
 # test executables and PDBs, in the OdbcMtDumps_Windows artifact; Linux legs run
 # each entry under gdb and print every thread's stack into the test log, from a
 # release driver built with symbols and line tables. Test results are published
-# per leg.
+# per leg. A manual run can also enable driver tracing (driverTrace), published
+# as the OdbcDriverTraces_* artifacts. Every leg samples agent load once a
+# second into the OdbcLoad_* artifacts.
 #
 # Plan: mssql-odbc/docs/multithreaded-testing-plan.md, "Stress Profiles". The
 # schedule targets GitHub main; this definition lives only in the mssql-rs
@@ -64,6 +66,19 @@ parameters:
   displayName: Agent image for x64 Linux jobs
   type: string
   default: RUST-AZL3
+
+# Off on scheduled runs: tracing adds per-call work that changes timing, so it
+# can hide a race or fail a timing assertion. Turn it on for a manual rerun of a
+# failure that needs the driver's side. Traces can contain SQL text.
+- name: driverTrace
+  displayName: Driver trace (manual diagnosis only; changes timing)
+  type: boolean
+  default: false
+
+- name: driverTraceLevel
+  displayName: Driver trace filter (MSSQL_TDS_TRACE_LEVEL)
+  type: string
+  default: warn,mssqlodbc=debug
 
 variables:
   # Same pinned reference driver as validation-pipeline.yml.
@@ -135,6 +150,9 @@ stages:
       mtProfile: $(odbcMtProfile)
       retries: 0
       timeoutInMinutes: 120
+      driverTrace: ${{ parameters.driverTrace }}
+      driverTraceLevel: ${{ parameters.driverTraceLevel }}
+      collectLoad: true
       matrix:
         Ubuntu24:
           container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
@@ -149,6 +167,9 @@ stages:
       mtProfile: $(odbcMtProfile)
       retries: 0
       timeoutInMinutes: 120
+      driverTrace: ${{ parameters.driverTrace }}
+      driverTraceLevel: ${{ parameters.driverTraceLevel }}
+      collectLoad: true
       matrix:
         Alpine3_21:
           container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -189,13 +210,35 @@ stages:
         $env:ODBC_TEST_UID        = 'sa'
         $env:ODBC_TEST_PWD        = $env:SQL_PASSWORD
         $env:ODBC_TEST_TRUST_CERT = 'Yes'
-        ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
-          -MtProfile '$(odbcMtProfile)' `
-          -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
+        # Agent load once a second, so a slow or failed test can be lined up
+        # against CPU starvation. SQL Server shares this agent with the workers.
+        # A process that is not running leaves its column blank.
+        $loadDir = "$(Build.ArtifactStagingDirectory)/odbc-load"
+        New-Item -ItemType Directory -Force -Path $loadDir | Out-Null
+        # sqlservr % Processor Time is summed across cores (0-100 x cpus).
+        "cpus=$([Environment]::ProcessorCount)" | Set-Content "$loadDir/agent.txt"
+        $sampler = Start-Process typeperf -PassThru -NoNewWindow `
+          -RedirectStandardOutput "$loadDir/typeperf.out" -ArgumentList @(
+            '"\Processor(_Total)\% Processor Time"', '"\System\Processor Queue Length"',
+            '"\Memory\Available MBytes"', '"\Process(sqlservr)\% Processor Time"',
+            '-si', '1', '-f', 'CSV', '-o', "`"$loadDir/agent-load.csv`"", '-y')
+        try {
+          ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
+            -MtProfile '$(odbcMtProfile)' `
+            -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
+        } finally {
+          if (-not $sampler.HasExited) { Stop-Process -Id $sampler.Id }
+        }
       displayName: Run ODBC stress ($(odbcMtProfile)) with msodbcsql parity leg
       env:
         SQL_PASSWORD: $(SQL_PASSWORD)
         RUST_BACKTRACE: full
+        ${{ if parameters.driverTrace }}:
+          # Read only by the Rust driver, so the msodbcsql leg is unaffected.
+          MSSQL_TDS_TRACE: 'true'
+          MSSQL_TDS_TRACE_DIR: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
+          ${{ if ne(parameters.driverTraceLevel, '') }}:
+            MSSQL_TDS_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
     - task: PublishTestResults@2
       displayName: Publish ODBC stress results (Windows)
       condition: succeededOrFailed()
@@ -218,3 +261,18 @@ stages:
       inputs:
         targetPath: $(Build.ArtifactStagingDirectory)/odbc-mt-dumps
         artifact: OdbcMtDumps_Windows_$(System.JobAttempt)
+    - task: PublishPipelineArtifact@1
+      displayName: Publish agent load samples
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/odbc-load
+        artifact: OdbcLoad_Windows_$(System.JobAttempt)
+    - ${{ if parameters.driverTrace }}:
+      - task: PublishPipelineArtifact@1
+        displayName: Publish driver traces
+        condition: always()
+        continueOnError: true
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
+          artifact: OdbcDriverTraces_Windows_$(System.JobAttempt)
