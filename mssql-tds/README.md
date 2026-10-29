@@ -79,8 +79,8 @@ SQL Server accepts non-finite vector elements.
 Float16 live integration tests are ignored by default. Explicit opt-in requires nextest
 `--run-ignored ignored-only` with the `test(vector16)` filter, `VECTOR16_TEST=1`, an explicit `DB_DATABASE`,
 and `DB_HOST`/`DB_PORT` for a server with float16 support preprovisioned by an
-administrator. The general integration helper defaults
-`DB_DATABASE` to `master` when unset, but float16 tests reject that fallback.
+administrator. The general integration helper always connects to `master`,
+but float16 tests use a separate helper that requires `DB_DATABASE` with no fallback.
 When selected without `VECTOR16_TEST=1` they return early with a diagnostic; with opt-in they fail on bad
 configuration. Tests never change database configuration or global flags.
 See the [transport test guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/tests/TRANSPORT_TESTS_README.md#float16-vector-integration-tests)
