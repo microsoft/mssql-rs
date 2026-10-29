@@ -9,6 +9,7 @@
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <cstdlib>
@@ -212,20 +213,23 @@ protected:
     std::string DatabaseCollation() {
         // Each step returns early: EXPECT_* is non-fatal, and falling through to
         // GetColumnChar on an unfetched row reports a collation mismatch instead
-        // of the prepare or fetch that actually failed.
-        EXPECT_SQL_OK(
-            Prepare("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation')"
-                    " AS VARCHAR(128))"),
-            SQL_HANDLE_STMT, stmt_);
-        if (::testing::Test::HasFailure()) {
+        // of the prepare or fetch that actually failed. Branch on the return
+        // code, not HasFailure(): the concurrent modes capture failures per
+        // worker, where HasFailure() cannot see them.
+        SQLRETURN rc = Prepare("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation')"
+                               " AS VARCHAR(128))");
+        EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        if (!SQL_SUCCEEDED(rc)) {
             return std::string();
         }
-        EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
-        if (::testing::Test::HasFailure()) {
+        rc = SQLExecute(stmt_);
+        EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        if (!SQL_SUCCEEDED(rc)) {
             return std::string();
         }
-        EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-        if (::testing::Test::HasFailure()) {
+        rc = SQLFetch(stmt_);
+        EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        if (!SQL_SUCCEEDED(rc)) {
             return std::string();
         }
         const std::string collation = GetColumnChar(1);
@@ -306,7 +310,7 @@ protected:
 // the collation declared alongside them, which a CAST result cannot separate.
 // The exact bytes are pinned meanwhile by the collation cases in
 // mssql-tds/tests/test_narrow_param_encoding.rs.
-TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
+ODBC_TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
     // What the engine itself stores for U+00E9 in a varchar under the database
     // collation, as hex, or empty when that collation cannot hold it exactly.
     const std::optional<std::string> engine_bytes = EngineNarrowBytesForEAcute();
@@ -347,7 +351,7 @@ TEST_F(CharConversionLiveTest, NarrowParamEncodesForTheDatabaseCollation) {
 // UTF-8 input buffer, and re-encoding it to the collation's code page - by
 // capturing the parameter as it is written rather than after the server has
 // applied its own conversion.
-TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
+ODBC_TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
     SKIP_IF_COMPARING_MSODBCSQL();  // SQL_C_CHAR is UTF-8 here, the client code page there.
 
     const std::optional<std::string> engine_bytes = EngineNarrowBytesForEAcute();
@@ -380,7 +384,7 @@ TEST_F(CharConversionLiveTest, NarrowCTypeParamEncodesForTheDatabaseCollation) {
 // SQL_VARIANT_PROPERTY reports the base type the server actually received, which
 // the round-tripped text alone cannot show. `text`/`ntext` are excluded because
 // they cannot be cast to sql_variant.
-TEST_F(CharConversionLiveTest, CharParamDeclaresTheParameterType) {
+ODBC_TEST_F(CharConversionLiveTest, CharParamDeclaresTheParameterType) {
     struct Case {
         SQLSMALLINT c_type;
         SQLSMALLINT sql_type;
@@ -425,7 +429,7 @@ TEST_F(CharConversionLiveTest, CharParamDeclaresTheParameterType) {
 // UTF-8 here, while msodbcsql decodes them in the client code page (CP1252 reads
 // 0xC3 0xA9 as two characters). Native fetch output from AB#47564 does not change
 // this server-side UNICODE probe, so its comparison skip is still needed.
-TEST_F(CharConversionLiveTest, CrossFamilyCharParamRoundTripsNonAscii) {
+ODBC_TEST_F(CharConversionLiveTest, CrossFamilyCharParamRoundTripsNonAscii) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     // U+00E9 is the fourth character; 233 is its code point.
@@ -459,7 +463,7 @@ TEST_F(CharConversionLiveTest, CrossFamilyCharParamRoundTripsNonAscii) {
 
 // A value longer than ColumnSize is 22001 at execute, for every target that
 // carries a declared length; a value exactly at it is not.
-TEST_F(CharConversionLiveTest, OverlongCharParamIs22001) {
+ODBC_TEST_F(CharConversionLiveTest, OverlongCharParamIs22001) {
     struct Case {
         SQLSMALLINT c_type;
         SQLSMALLINT sql_type;
@@ -520,7 +524,7 @@ TEST_F(CharConversionLiveTest, OverlongCharParamIs22001) {
 // stMaxLen = max(*pstMaxLen, stLen) (sqlcmisc.cpp:7458) sends more characters
 // than declared. SQL_VARIANT_PROPERTY 'MaxLength' reports 6 bytes, i.e.
 // nvarchar(3), the declared size. Only the debug assert reproduces from source.
-TEST_F(CharConversionLiveTest, NarrowToWideOverlongParamIs22001) {
+ODBC_TEST_F(CharConversionLiveTest, NarrowToWideOverlongParamIs22001) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     for (SQLSMALLINT sql_type : {SQL_WCHAR, SQL_WVARCHAR, SQL_WLONGVARCHAR}) {
@@ -558,7 +562,7 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverlongParamIs22001) {
 // 18.6.2.1 and drop the skip if it matches. Note all six characters reach
 // DescribeRPCParam untrimmed yet retail still declares nvarchar(3), so the
 // fallthrough at :7459 does not describe what the retail binary does.
-TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
+ODBC_TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -586,7 +590,7 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
 // pre-transcode UTF-8 bytes: it counts 5 and rejects a value that the 4 bytes it
 // actually sends would fit. That defect is deliberately not replicated.
 //
-TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInCollationBytes) {
+ODBC_TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInCollationBytes) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     const std::optional<int> eacute_bytes = DatabaseNarrowByteLengthOfEAcute();
@@ -637,7 +641,7 @@ TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInCollationBytes) {
 // The wide counterpart SQL_WLONGVARCHAR is covered by
 // NarrowToWideOverlongParamIs22001 instead: it is a narrow -> wide binding, and
 // msodbcsql mishandles those.
-TEST_F(CharConversionLiveTest, TextParamIsBoundedByColumnSize) {
+ODBC_TEST_F(CharConversionLiveTest, TextParamIsBoundedByColumnSize) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     std::vector<SQLCHAR> value = {'a', 'b', 'c', 'd'};
     SQLLEN ind = static_cast<SQLLEN>(value.size());
@@ -670,7 +674,7 @@ TEST_F(CharConversionLiveTest, TextParamIsBoundedByColumnSize) {
 // checks the overflow with CheckTrailingChars / CheckTrailingWChars before
 // raising 22001, picking between them on the C type (sqlcfunc.cpp:2957). Both
 // arms of that ternary are covered here.
-TEST_F(CharConversionLiveTest, OverflowingBlanksAreTrimmedSilently) {
+ODBC_TEST_F(CharConversionLiveTest, OverflowingBlanksAreTrimmedSilently) {
     struct Case {
         SQLSMALLINT c_type;
         SQLSMALLINT sql_type;
@@ -701,7 +705,7 @@ TEST_F(CharConversionLiveTest, OverflowingBlanksAreTrimmedSilently) {
 // Blanks are only dropped to make a value fit. Nothing above trims a value that
 // already fits, so a driver that trimmed unconditionally would pass every one of
 // those tests; DATALENGTH 4 on a varchar(8) is what rules that out.
-TEST_F(CharConversionLiveTest, TrailingBlanksThatFitAreKept) {
+ODBC_TEST_F(CharConversionLiveTest, TrailingBlanksThatFitAreKept) {
     for (SQLSMALLINT sql_type : {SQL_VARCHAR, SQL_WVARCHAR}) {
         ASSERT_SQL_OK(Prepare("SELECT CAST(DATALENGTH(?) AS VARCHAR(16))"),
                       SQL_HANDLE_STMT, stmt_);
@@ -726,7 +730,7 @@ TEST_F(CharConversionLiveTest, TrailingBlanksThatFitAreKept) {
 // was actually declared with: the fixed-length types pad out to ColumnSize and
 // the variable-length ones do not. A driver that ignored ParameterType and sent
 // everything as varchar(max) would report the payload length for all six rows.
-TEST_F(CharConversionLiveTest, DeclaredLengthReachesTheServer) {
+ODBC_TEST_F(CharConversionLiveTest, DeclaredLengthReachesTheServer) {
     struct Case {
         SQLSMALLINT c_type;
         SQLSMALLINT sql_type;
@@ -759,7 +763,7 @@ TEST_F(CharConversionLiveTest, DeclaredLengthReachesTheServer) {
 // ColumnSize 0 is the unbounded sentinel. These payloads are past the non-max
 // ceilings (8000 bytes, 4000 units), so they only survive if the parameter was
 // declared varchar(max)/nvarchar(max) rather than a bounded length.
-TEST_F(CharConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues) {
+ODBC_TEST_F(CharConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(DATALENGTH(?) AS VARCHAR(16))"),
                   SQL_HANDLE_STMT, stmt_);
     std::vector<SQLCHAR> narrow(9000, 'x');
@@ -799,7 +803,7 @@ TEST_F(CharConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert the RPC parameter was
 // declared varchar(max)/nvarchar(max) directly.
-TEST_F(CharConversionLiveTest, UnboundedColumnSizeIsMaxEvenForASmallValue) {
+ODBC_TEST_F(CharConversionLiveTest, UnboundedColumnSizeIsMaxEvenForASmallValue) {
     const std::pair<SQLSMALLINT, SQLSMALLINT> cases[] = {
         {SQL_C_CHAR, SQL_VARCHAR},
         {SQL_C_WCHAR, SQL_WVARCHAR},
@@ -821,7 +825,7 @@ TEST_F(CharConversionLiveTest, UnboundedColumnSizeIsMaxEvenForASmallValue) {
 // A zero-length value is an empty string, not a NULL - only SQL_NULL_DATA in the
 // indicator means NULL. The fixed-length targets still pad out to ColumnSize,
 // which is the one case where an empty value has a non-zero DATALENGTH.
-TEST_F(CharConversionLiveTest, EmptyCharParamIsNotNull) {
+ODBC_TEST_F(CharConversionLiveTest, EmptyCharParamIsNotNull) {
     struct Case {
         SQLSMALLINT sql_type;
         const char* data_length;
@@ -863,7 +867,7 @@ TEST_F(CharConversionLiveTest, EmptyCharParamIsNotNull) {
 // Also the one place the mechanism differs: we send the actual length and let the
 // server pad, msodbcsql pads client-side under SQL_COPT_SS_ANSI_NPW
 // (sqlcmisc.cpp:7466).
-TEST_F(CharConversionLiveTest, FixedLengthCharParamIsSpacePadded) {
+ODBC_TEST_F(CharConversionLiveTest, FixedLengthCharParamIsSpacePadded) {
     for (SQLSMALLINT sql_type : {SQL_CHAR, SQL_WCHAR}) {
         ASSERT_SQL_OK(
             Prepare("SELECT CAST(UNICODE(SUBSTRING(?, 5, 1)) AS VARCHAR(16))"),
@@ -888,7 +892,7 @@ TEST_F(CharConversionLiveTest, FixedLengthCharParamIsSpacePadded) {
 // not reach the server. The narrow case crosses families, where a DATALENGTH of
 // 6 is three UTF-16 units and 8 would mean the NUL was included; the wide case
 // scans for a UTF-16 terminator instead, a separate path.
-TEST_F(CharConversionLiveTest, NullTerminatedBuffersDropTheNul) {
+ODBC_TEST_F(CharConversionLiveTest, NullTerminatedBuffersDropTheNul) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(DATALENGTH(?) AS VARCHAR(16))"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -926,7 +930,7 @@ TEST_F(CharConversionLiveTest, NullTerminatedBuffersDropTheNul) {
 // An explicit indicator means the buffer is not terminated, so a NUL inside the
 // value is data and must reach the server. A driver that stopped at the first
 // NUL would report DATALENGTH 1 here.
-TEST_F(CharConversionLiveTest, EmbeddedNulSurvivesAnExplicitLength) {
+ODBC_TEST_F(CharConversionLiveTest, EmbeddedNulSurvivesAnExplicitLength) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(DATALENGTH(?) AS VARCHAR(16))"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -961,7 +965,7 @@ TEST_F(CharConversionLiveTest, EmbeddedNulSurvivesAnExplicitLength) {
 // A byte count that is not a whole number of UTF-16 units is floored, not
 // rejected - msodbcsql does the same with cbData &= ~1 (sqlcfunc.cpp:2862).
 // Seven bytes over a four-unit buffer must yield three characters.
-TEST_F(CharConversionLiveTest, OddByteCountOnWideBufferIsFloored) {
+ODBC_TEST_F(CharConversionLiveTest, OddByteCountOnWideBufferIsFloored) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLWCHAR wide[] = {'a', 'b', 'c', 'd'};
@@ -982,7 +986,7 @@ TEST_F(CharConversionLiveTest, OddByteCountOnWideBufferIsFloored) {
 // happen at all, and a low surrogate is not a blank, so the pair raises 22001
 // instead. One unit further and it goes through whole - DATALENGTH 8 is four
 // units, so neither half was dropped.
-TEST_F(CharConversionLiveTest, SurrogatePairIsNotSplitAtTheBoundary) {
+ODBC_TEST_F(CharConversionLiveTest, SurrogatePairIsNotSplitAtTheBoundary) {
     SQLWCHAR wide[] = {0x0061, 0x0062, 0xD83D, 0xDE00};
     SQLLEN len = static_cast<SQLLEN>(sizeof(wide));
 
@@ -1010,7 +1014,7 @@ TEST_F(CharConversionLiveTest, SurrogatePairIsNotSplitAtTheBoundary) {
 // The declaration is rebuilt from the binding on every execute, so a longer
 // value against the same ColumnSize must fail even though the first execute
 // succeeded - and the statement must still be usable afterwards.
-TEST_F(CharConversionLiveTest, RebindingChangesTheTruncationVerdict) {
+ODBC_TEST_F(CharConversionLiveTest, RebindingChangesTheTruncationVerdict) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> fits = {'a', 'b', 'c'};
@@ -1046,7 +1050,7 @@ TEST_F(CharConversionLiveTest, RebindingChangesTheTruncationVerdict) {
 // Each parameter carries its own declaration, so two cross-family bindings in
 // opposite directions must not borrow each other's type. 6 is three UTF-16
 // units, 3 is three single-byte ones.
-TEST_F(CharConversionLiveTest, MixedFamilyCharParamsInOneStatement) {
+ODBC_TEST_F(CharConversionLiveTest, MixedFamilyCharParamsInOneStatement) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(DATALENGTH(?) AS VARCHAR(16)) + '/'"
                           " + CAST(DATALENGTH(?) AS VARCHAR(16))"),
                   SQL_HANDLE_STMT, stmt_);
@@ -1089,7 +1093,7 @@ TEST_F(CharConversionLiveTest, MixedFamilyCharParamsInOneStatement) {
 // Runs on both legs: '?' is what msodbcsql sends as well, and the exact
 // SQL_SUCCESS is asserted rather than SQL_SUCCEEDED so "silent by default"
 // is actually pinned.
-TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstituted) {
+ODBC_TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstituted) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
     }
@@ -1175,7 +1179,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstituted) {
 // stored; the exact bytes are pinned meanwhile by
 // `a_lone_surrogate_reaching_a_narrow_target_is_substituted` in
 // mssql-tds/tests/test_narrow_param_encoding.rs.
-TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCharacter) {
+ODBC_TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCharacter) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
     }
@@ -1230,7 +1234,7 @@ TEST_F(CharConversionLiveTest, UnpairedSurrogateIsSubstitutedLikeAnyUnmappableCh
 // are not the same value on the two drivers and no assertion can hold for both.
 // Measured with the skip removed: msodbcsql answers 230/3 here, CP1252 reading
 // the three UTF-8 bytes as three separate characters.
-TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForANarrowCType) {
+ODBC_TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForANarrowCType) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     if (!DatabaseIsLatin1()) {
@@ -1270,7 +1274,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForANarrowCType) 
 // character itself instead of handing it to msodbcsql's per-WCHAR EILSEQ loop.
 // musl compiles //TRANSLIT out and is not measured. This driver is
 // platform-independent and follows the Windows/engine answer.
-TEST_F(CharConversionLiveTest, AstralUnmappableCharacterSubstitutesPerUtf16Unit) {
+ODBC_TEST_F(CharConversionLiveTest, AstralUnmappableCharacterSubstitutesPerUtf16Unit) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     if (!DatabaseIsLatin1()) {
@@ -1306,7 +1310,7 @@ TEST_F(CharConversionLiveTest, AstralUnmappableCharacterSubstitutesPerUtf16Unit)
 // not hold stable across its own platforms.
 //
 // Skipped under comparison: this is the disagreement, by design.
-TEST_F(CharConversionLiveTest, BestFitMappableCharacterDeviates) {
+ODBC_TEST_F(CharConversionLiveTest, BestFitMappableCharacterDeviates) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     if (!DatabaseIsLatin1()) {
@@ -1367,7 +1371,7 @@ TEST_F(CharConversionLiveTest, BestFitMappableCharacterDeviates) {
 //
 // SQL_LONGVARCHAR has its own case because ASCII(text) requires an explicit
 // cast; the parameter still reaches the server as text on both drivers.
-TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForEveryNarrowTarget) {
+ODBC_TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForEveryNarrowTarget) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
     }
@@ -1408,7 +1412,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForEveryNarrowTar
 
 // text is a legal parameter declaration, but ASCII(text) is not. Cast only
 // after the parameter reaches the server so its narrow encoding stays tested.
-TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForLongVarchar) {
+ODBC_TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForLongVarchar) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
     }
@@ -1443,7 +1447,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForLongVarchar) {
 // (varchar/99/...) but reports 6 bytes to our 4, because it sent the six raw
 // bytes as six CP1252 characters rather than transcoding "caf" + U+65E5 to
 // "caf?". That is parity-deviations entry 3, not a substitution difference.
-TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedInsideASqlVariant) {
+ODBC_TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedInsideASqlVariant) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     if (!DatabaseIsLatin1()) {
@@ -1482,7 +1486,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedInsideASqlVariant
 // path, so it returns plain SQL_SUCCESS here however the attribute is set.
 // This driver also applies it to parameters (AB#47598). Native SQL_C_CHAR
 // fetch conversion is covered separately in get_data_test.cpp (AB#47564).
-TEST_F(CharConversionLiveTest, UnmappableCharacterWarnsWhenAsked) {
+ODBC_TEST_F(CharConversionLiveTest, UnmappableCharacterWarnsWhenAsked) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     if (!DatabaseIsLatin1()) {
@@ -1535,7 +1539,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterWarnsWhenAsked) {
 // both drivers, and with no attribute set so only the substitution is asserted.
 // The warning half is a deviation and lives in
 // DataAtExecutionUnmappableCharacterWarnsWhenAsked.
-TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterIsSubstituted) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterIsSubstituted) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
     }
@@ -1575,7 +1579,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterIsSubstituted) 
 // Skipped under comparison: parity-deviations entry 23, same as
 // UnmappableCharacterWarnsWhenAsked - msodbcsql does not consult the attribute
 // on any input-parameter path.
-TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterWarnsWhenAsked) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterWarnsWhenAsked) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     if (!DatabaseIsLatin1()) {
@@ -1626,7 +1630,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionUnmappableCharacterWarnsWhenAsked)
 //
 // Skipped under comparison: parity-deviations entry 23, same as
 // DataAtExecutionUnmappableCharacterWarnsWhenAsked.
-TEST_F(CharConversionLiveTest, DataAtExecutionTruncatedTailWarnsWhenAsked) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionTruncatedTailWarnsWhenAsked) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     if (!DatabaseIsLatin1()) {
@@ -1683,7 +1687,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionTruncatedTailWarnsWhenAsked) {
 // Strands msodbcsql: parameter 2 fails `ParamToSQLType` with parameter 1 already
 // on the wire. This driver rejects it before serializing, so it takes the
 // local-discard branch. Both must end with a usable connection.
-TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUsable) {
+ODBC_TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUsable) {
     const std::string spid = CurrentSpid();
     ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
 
@@ -1716,7 +1720,7 @@ TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUs
 // count that let it through. A multi-byte *mappable* character is what is left.
 // Actual partial-send recovery is covered without a server by mssql-tds'
 // `cancel_streamed_write_after_partial_send_ignores_and_drains`.
-TEST_F(CharConversionLiveTest, PreflightEncodingFailureLeavesTheConnectionUsable) {
+ODBC_TEST_F(CharConversionLiveTest, PreflightEncodingFailureLeavesTheConnectionUsable) {
     const std::string collation = DatabaseCollation();
     // Japanese / Chinese / Korean collations select a DBCS code page, where a
     // single BMP character is two bytes.
@@ -1759,7 +1763,7 @@ TEST_F(CharConversionLiveTest, PreflightEncodingFailureLeavesTheConnectionUsable
 // Runs on both legs: msodbcsql applies the same cchMaxPrec bound and
 // CheckTrailingChars rule to each call, accumulating cbDataSentToServer across
 // them (sqlccmd.cpp:11085-11108).
-TEST_F(CharConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -1783,7 +1787,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
 // buffer has. Both directions are covered: without the bound the client would
 // declare a length and then stream past it, since a streamed value never
 // reaches the close-time conversion that bounds a materialized one.
-TEST_F(CharConversionLiveTest, DataAtExecutionBoundsAWidenessMismatch) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionBoundsAWidenessMismatch) {
     // Narrow buffer against a wide declaration.
     {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -1829,7 +1833,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionBoundsAWidenessMismatch) {
 // The other half of the rule for the character family: an overflow of blanks is
 // dropped rather than reported, so the value lands trimmed to ColumnSize. The
 // pad byte differs from the binary path -- a blank, not a zero.
-TEST_F(CharConversionLiveTest, DataAtExecutionTrimsBlankOverflowToColumnSize) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionTrimsBlankOverflowToColumnSize) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -1854,7 +1858,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionTrimsBlankOverflowToColumnSize) {
 // A wide streamed parameter is measured in characters, so its byte budget is
 // twice ColumnSize. Two chunks of one character each fit nvarchar(2); a third
 // does not, and the overflow is not a blank.
-TEST_F(CharConversionLiveTest, DataAtExecutionWideColumnSizeCountsCharacters) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionWideColumnSizeCountsCharacters) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -1879,7 +1883,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionWideColumnSizeCountsCharacters) {
 
 // A max declaration has no length to enforce, so a streamed value of any size
 // still goes out whole. ColumnSize 0 is how SQLDescribeParam reports one.
-TEST_F(CharConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -1906,7 +1910,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded) {
 // whole when SQLParamData closes the parameter, which is the branch msodbcsql
 // serves with WriteToExtBuffer (sqlccmd.cpp:4913). The declaration and the
 // blank padding are what prove it went out as `char(8)` rather than a `max`.
-TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredChar) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredChar) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(SQL_VARIANT_PROPERTY(CAST(? AS SQL_VARIANT),"
                           " 'BaseType') AS VARCHAR(32)) + '/' + CAST(LEN(?) AS VARCHAR(8))"),
                   SQL_HANDLE_STMT, stmt_);
@@ -1940,7 +1944,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredCh
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthOverflowIs22001OnSecondChunk) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthOverflowIs22001OnSecondChunk) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
@@ -1961,7 +1965,7 @@ TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthOverflowIs22001OnSecondC
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
 }
 
-TEST_F(CharConversionLiveTest, DataAtExecutionBoundedFixedWidthReassemblesSplitUtf8) {
+ODBC_TEST_F(CharConversionLiveTest, DataAtExecutionBoundedFixedWidthReassemblesSplitUtf8) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
