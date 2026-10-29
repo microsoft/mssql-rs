@@ -526,6 +526,9 @@ pub async fn resolve_localdb_instance(instance_name: &str) -> TdsResult<String> 
         "LocalDB instance '{}' is not running; starting it on a blocking thread",
         instance_name
     );
+    // Both paths act as the same identity: the check above runs on the thread
+    // polling this future, and `off_runtime_thread` captures that thread's
+    // impersonation token here, with no await in between, for the pool thread.
     // LocalDBApi holds the module handle, which is not Send, so the blocking
     // thread loads it again; the DLL is already loaded, and this is small next
     // to starting an instance.
