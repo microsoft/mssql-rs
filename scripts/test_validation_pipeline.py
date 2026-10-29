@@ -30,6 +30,53 @@ def load_template(name):
     return yaml.safe_load((_TEMPLATES / name).read_text(encoding="utf-8"))
 
 
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("profile", "threads", "iterations"),
+    [("pr", "2", "1"), ("nightly", "8", "20"), ("weekly", "16", "50")],
+)
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ("unset MSSQL_ODBC_MT_SKIP_MODES", "SharedStmt"),
+        ("export MSSQL_ODBC_MT_SKIP_MODES=''", "SharedStmt"),
+        ("export MSSQL_ODBC_MT_SKIP_MODES=none", "none"),
+        ("export MSSQL_ODBC_MT_SKIP_MODES=SharedEnv,SharedDbc", "SharedEnv,SharedDbc"),
+    ],
+)
+def test_unix_odbc_profiles_skip_shared_stmt(tmp_path, profile, threads, iterations,
+                                           override, expected):
+    runner = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.sh").read_text(
+        encoding="utf-8"
+    )
+    function = re.search(r"^apply_mt_profile\(\) \{\n.*?^\}", runner, re.M | re.S)
+    assert function, "apply_mt_profile not found"
+    script = f"""
+set -euo pipefail
+unset MSSQL_ODBC_MT_THREADS MSSQL_ODBC_MT_ITERS MSSQL_ODBC_MT_GDB
+{override}
+MT_PROFILE={profile}
+RETRIES=0
+CTEST_ARGS=()
+MS_LEG_ENV=()
+{function.group()}
+apply_mt_profile
+bash -c 'printf "rust:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
+"${{MSSQL_ODBC_MT_THREADS:-2}}" "${{MSSQL_ODBC_MT_ITERS:-1}}"'
+env ${{MS_LEG_ENV[@]+"${{MS_LEG_ENV[@]}}"}} \
+bash -c 'printf "reference:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
+"${{MSSQL_ODBC_MT_THREADS:-2}}" "${{MSSQL_ODBC_MT_ITERS:-1}}"'
+"""
+    script_path = tmp_path / "profile.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name], cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"rust:{expected}:{threads}:{iterations}" in result.stdout.splitlines()
+    assert f"reference:{expected}:2:1" in result.stdout.splitlines()
+
+
 @pytest.mark.parametrize(
     "selector",
     [
