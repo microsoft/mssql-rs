@@ -495,7 +495,8 @@ local SQL Server:
   the diagnostics lock separately from the time spent in `SQLCancel`.
 - **Agent load.** Every stress leg samples the agent once a second and
   publishes the samples as `OdbcLoad_*`: total CPU, processor queue length,
-  available memory and `sqlservr` CPU on Windows (`typeperf`); CPU busy,
+  available memory and `sqlservr` CPU on Windows (`typeperf`; `sqlservr` is
+  summed across cores, and `agent.txt` records the core count); CPU busy,
   runnable threads, load average, available memory and per-container
   `docker stats` on Linux (`.pipeline/scripts/sample-load.sh`). Line a slow
   iteration's log timestamp up with them to tell agent starvation from a
