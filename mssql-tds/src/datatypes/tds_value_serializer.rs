@@ -1907,8 +1907,19 @@ impl TdsValueSerializer {
     /// - 8 bytes: header [layout_format=0xA9, version=0x01, dims:u16, base_type:u8, 0,0,0]
     /// - n bytes: element values (little-endian)
     ///
-    /// Float16 conversion uses `half`'s IEEE 754 round-to-nearest-even semantics:
-    /// nonfinite values are preserved, overflow becomes infinity, and underflow may become signed zero.
+    /// Float16 elements are narrowed with `half::f16::from_f32` (IEEE 754
+    /// round-to-nearest, ties-to-even), matching the msodbcsql
+    /// `Float32ToFloat16Bits` reference. The conversion is lossy and never fails:
+    /// - Magnitudes that round above `65504.0` (i.e. `>= 65520.0`, including
+    ///   `f32::MAX`) become signed infinity with no error or diagnostic. Values in
+    ///   `(65504.0, 65520.0)`, such as `65505.0`, round to the finite `±65504.0`.
+    /// - Magnitudes below the smallest binary16 subnormal (`2^-24`) round to signed
+    ///   zero; exactly `2^-25` ties to even and also becomes zero. Binary16
+    ///   subnormals themselves are preserved, not flushed to zero.
+    /// - `±inf` is preserved and NaN stays NaN (payload may change).
+    ///
+    /// Callers that need to reject out-of-range input must validate before building
+    /// the vector.
     #[inline(always)]
     async fn serialize_vector<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,

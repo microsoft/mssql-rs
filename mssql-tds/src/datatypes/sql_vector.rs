@@ -53,6 +53,11 @@ impl SqlVector {
     ///
     /// # Arguments
     /// * `values` - The vector dimension values (passed as f32, but treated as Float16)
+    ///
+    /// Values are stored unchanged and are not validated against the binary16 range.
+    /// They are narrowed to binary16 only when serialized, where out-of-range
+    /// magnitudes (`>= 65520.0`) become infinity and tiny magnitudes (`<= 2^-25`)
+    /// become zero without error. See `serialize_vector` for the exact rules.
     pub fn try_from_f16(values: Vec<f32>) -> TdsResult<Self> {
         let vector = Self {
             base_type: VectorBaseType::Float16,

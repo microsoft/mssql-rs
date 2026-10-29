@@ -68,10 +68,13 @@ guarantee server support.
 `as_f32()`; constructing a float16 vector does not immediately round its values.
 Serialization narrows each element to IEEE 754 binary16 using `half::f16`, and
 deserialization widens the received binary16 values to `f32`. Conversion is lossy:
-round-to-nearest, ties-to-even can lose precision, tiny values can underflow, and
-sufficiently large magnitudes can round to infinity. For example, `65505.0f32`
-rounds to the finite value `65504.0`, not infinity. These conversion semantics do
-not imply that SQL Server accepts non-finite vector elements.
+round-to-nearest, ties-to-even can lose precision, magnitudes at or below `2^-25`
+become signed zero, and magnitudes of `65520.0` or more (including `f32::MAX`)
+become infinity without an error. Values between `65504.0` and `65520.0`, such as
+`65505.0f32`, round to the finite `65504.0`. This matches the msodbcsql
+`Float32ToFloat16Bits` behavior; callers that need to reject out-of-range input must
+validate it before building the vector. These conversion semantics do not imply that
+SQL Server accepts non-finite vector elements.
 
 Float16 live integration tests are ignored by default. Explicit opt-in requires nextest
 `--run-ignored ignored-only` with the `test(vector16)` filter, `VECTOR16_TEST=1`, an explicit `DB_DATABASE`,
