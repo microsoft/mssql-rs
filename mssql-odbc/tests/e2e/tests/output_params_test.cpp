@@ -4,7 +4,9 @@
 #include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
+#include <algorithm>
 #include <array>
+#include <iterator>
 #include <string>
 
 class OutputParamsTest : public ODBCTest {
@@ -334,4 +336,79 @@ ODBC_TEST_F(OutputParamsTest, ExhaustedFastPathReportsConversionWarningsAndError
         EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
         ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
     }
+}
+
+// Run-unique inputs, outputs, an input/output value and a return status through
+// one procedure executed twice, so under the concurrent modes a value written
+// into another worker's buffer, or left from the previous execute, fails here.
+// The procedure is named per worker and iteration and recreated by a retried
+// /SharedDbc attempt, so workers sharing a session never share it.
+ODBC_TEST_F_MODES(OutputParamsTest, RunUniqueOutputParametersReturnToTheirOwnBuffers,
+                  odbc_concurrency::kAllModes) {
+    const std::string proc =
+        "#outputs_w" + std::to_string(Worker()) + "_i" + std::to_string(Iteration());
+    const SQLRETURN dropped =
+        Direct("IF OBJECT_ID('tempdb.." + proc + "') IS NOT NULL DROP PROCEDURE " + proc);
+    ASSERT_TRUE(dropped == SQL_SUCCESS || dropped == SQL_NO_DATA)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Direct("CREATE PROCEDURE " + proc +
+                         " @i int, @t nvarchar(64), @o int OUTPUT, @s nvarchar(80) OUTPUT,"
+                         " @io int OUTPUT AS SET NOCOUNT ON; SET @o = @i * 2 + 1;"
+                         " SET @s = @t + N'!'; SET @io = @io + 7; RETURN @i % 100"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER status = 0, input = 0, output = 0, in_out = 0;
+    SQLWCHAR text[65] = {};
+    SQLWCHAR result[81] = {};
+    SQLLEN status_length = 0, input_length = 0, text_length = SQL_NTS;
+    SQLLEN output_length = 0, result_length = 0, in_out_length = 0;
+    const SqlTString call =
+        ODBCTestUtils::ToSqlTStr("{? = call " + proc + "(?, ?, ?, ?, ?)}");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(call.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   &status, 0, &status_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   &input, 0, &input_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 64, 0,
+                                   text, sizeof(text), &text_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 4, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   &output, 0, &output_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 5, SQL_PARAM_OUTPUT, SQL_C_WCHAR, SQL_WVARCHAR, 80, 0,
+                                   result, sizeof(result), &result_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 6, SQL_PARAM_INPUT_OUTPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   10, 0, &in_out, 0, &in_out_length),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (int round = 0; round < 2; ++round) {
+        SCOPED_TRACE(round);
+        const std::string token = WorkerToken("output") + "-r" + std::to_string(round);
+        input = (Worker() * 1000 + Iteration() % 1000) * 10 + round;
+        std::fill(std::begin(text), std::end(text), SQLWCHAR{0});
+        std::copy(token.begin(), token.end(), text);
+        std::fill(std::begin(result), std::end(result), SQLWCHAR{0});
+        status = output = -1;
+        in_out = input + 3;
+        result_length = -1;
+
+        const SQLRETURN rc = SQLExecute(stmt_);
+        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_NO_DATA)
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_NO_DATA, Exhaust(rc));
+        EXPECT_EQ(input % 100, status);
+        EXPECT_EQ(input * 2 + 1, output);
+        EXPECT_EQ(input + 10, in_out);
+        const std::string expected = token + "!";
+        ASSERT_EQ(static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), result_length);
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(), result)) << "nvarchar output";
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Direct("DROP PROCEDURE " + proc), SQL_HANDLE_STMT, stmt_);
 }
