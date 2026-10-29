@@ -358,6 +358,8 @@ impl CursorClient for TdsClient {
         let timeout_sec = resolved.seconds();
         let request_timeout = resolved.duration();
 
+        self.ensure_parameter_features_supported(params.iter())?;
+
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
@@ -601,6 +603,8 @@ impl CursorClient for TdsClient {
         let timeout_sec = resolved.seconds();
         let request_timeout = resolved.duration();
 
+        self.ensure_parameter_features_supported(values.iter())?;
+
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
@@ -755,6 +759,8 @@ impl CursorClient for TdsClient {
         let timeout_sec = resolved.seconds();
         let request_timeout = resolved.duration();
 
+        self.ensure_parameter_features_supported(params.iter())?;
+
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         self.return_values.clear();
@@ -863,6 +869,8 @@ impl CursorClient for TdsClient {
         let resolved = budget.into_timeout()?;
         let timeout_sec = resolved.seconds();
         let request_timeout = resolved.duration();
+
+        self.ensure_parameter_features_supported(params.iter())?;
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
@@ -1140,5 +1148,133 @@ impl TdsClient {
             return Err(crate::error::Error::from_sql_errors(server_errors));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datatypes::sql_vector::SqlVector;
+    use crate::datatypes::sqldatatypes::VectorBaseType;
+    use crate::message::features::vectorfeature::VectorFeature;
+    use crate::message::login::{Feature, FeatureExtension};
+    use crate::test_client_support::tds_client_from_tokens;
+
+    async fn call_cursor_route(
+        client: &mut TdsClient,
+        route: u8,
+        params: Vec<RpcParameter>,
+    ) -> TdsResult<()> {
+        match route {
+            0 => client
+                .cursor_open_with_params(
+                    "SELECT @v",
+                    params,
+                    CursorScrollOption::empty(),
+                    CursorConcurrency::empty(),
+                    0,
+                    Some(30),
+                    None,
+                )
+                .await
+                .map(|_| ()),
+            1 => client
+                .cursor_prepexec(
+                    "SELECT @v",
+                    params,
+                    CursorScrollOption::empty(),
+                    CursorConcurrency::empty(),
+                    0,
+                    Some(30),
+                    None,
+                )
+                .await
+                .map(|_| ()),
+            2 => client
+                .cursor_execute(
+                    1,
+                    params,
+                    CursorScrollOption::empty(),
+                    CursorConcurrency::empty(),
+                    0,
+                    Some(30),
+                    None,
+                )
+                .await
+                .map(|_| ()),
+            3 => {
+                client
+                    .perform_cursor_operation(
+                        1,
+                        CursorOperation::empty(),
+                        1,
+                        "",
+                        params,
+                        Some(30),
+                        None,
+                    )
+                    .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_routes_validate_vector_parameters() {
+        for version in 0..=2 {
+            for route in 0..4 {
+                for base_type in [VectorBaseType::Float16, VectorBaseType::Float32] {
+                    for is_null in [false, true] {
+                        let mut client = tds_client_from_tokens(Vec::new());
+                        client
+                            .negotiated_settings
+                            .session_settings
+                            .supported_features
+                            .retain(|f| f.feature_identifier() != FeatureExtension::Vector);
+                        if version != 0 {
+                            let mut feature = VectorFeature::new(2);
+                            feature.deserialize(&[version]).unwrap();
+                            feature.set_acknowledged(true);
+                            client
+                                .negotiated_settings
+                                .session_settings
+                                .supported_features
+                                .push(Box::new(feature));
+                        }
+
+                        let value = if is_null {
+                            None
+                        } else {
+                            Some(match base_type {
+                                VectorBaseType::Float16 => {
+                                    SqlVector::try_from_f16(vec![1.0]).unwrap()
+                                }
+                                VectorBaseType::Float32 => {
+                                    SqlVector::try_from_f32(vec![1.0]).unwrap()
+                                }
+                            })
+                        };
+                        let params = vec![RpcParameter::new(
+                            Some("@v".to_string()),
+                            StatusFlags::NONE,
+                            SqlType::Vector(value, 1, base_type),
+                        )];
+
+                        let error = call_cursor_route(&mut client, route, params)
+                            .await
+                            .unwrap_err();
+                        if base_type == VectorBaseType::Float16 && version < 2 {
+                            assert!(matches!(error, UsageError(ref message)
+                                if message.contains("require negotiated vector version 2")));
+                            assert!(client.remaining_request_timeout.is_none());
+                        } else {
+                            // The empty replay stream ends only after the RPC is sent.
+                            assert!(matches!(error, crate::error::Error::ConnectionClosed(_)));
+                            assert!(client.remaining_request_timeout.is_some());
+                        }
+                    }
+                }
+            }
+        }
     }
 }

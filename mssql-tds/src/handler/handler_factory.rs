@@ -108,6 +108,14 @@ pub(crate) struct NegotiatedSettings {
 }
 
 impl NegotiatedSettings {
+    pub(crate) fn vector_version(&self) -> u8 {
+        self.session_settings
+            .supported_features
+            .iter()
+            .find(|f| f.feature_identifier() == FeatureExtension::Vector && f.is_acknowledged())
+            .map_or(0, |f| f.negotiated_version())
+    }
+
     fn new(
         session_settings: SessionSettings,
         database_collation: SqlCollation,

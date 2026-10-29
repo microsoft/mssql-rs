@@ -7,7 +7,9 @@ mod common;
 mod bulk_copy_vector_tests {
     #[cfg(windows)]
     use crate::common::build_named_pipe_datasource;
-    use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
+    use crate::common::{
+        begin_connection, begin_vector16_connection, build_tcp_datasource, init_tracing,
+    };
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
     use mssql_tds::connection::tds_client::ResultSet;
@@ -507,6 +509,17 @@ mod bulk_copy_vector_tests {
             "Expected bulk copy to fail with dimension mismatch (2 vs 3)"
         );
 
+        // A failed bulk load may leave the connection unusable; isolate the next attempt.
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyVectorMismatchTest (id INT NOT NULL, vector_col VECTOR(3))"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
         // Try to insert vector with wrong dimensions (4 instead of 3)
         let rows_too_long = vec![VectorRow {
             id: 2,
@@ -583,8 +596,11 @@ mod bulk_copy_vector_tests {
 
     /// Bulk copy into a `VECTOR(n, float16)` column.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_bulk_copy_vector16_basic() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         client
             .execute(
@@ -664,8 +680,11 @@ mod bulk_copy_vector_tests {
 
     /// Bulk copy float16 vectors at the maximum dimension count (3996).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_bulk_copy_vector16_max_dimensions() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         let dims = VectorBaseType::Float16.max_dimensions();
 
@@ -741,8 +760,11 @@ mod bulk_copy_vector_tests {
     /// Bulk copy float16 values that are not exactly representable as IEEE 754
     /// halves, verifying the server round-trips the narrowed values.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_bulk_copy_vector16_precision_loss() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         client
             .execute(
@@ -803,8 +825,11 @@ mod bulk_copy_vector_tests {
     /// Bulk copy into a table holding both float32 and float16 vector columns,
     /// exercising per-column base types in the bulk load column metadata.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_bulk_copy_mixed_vector_base_types() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_bulk_copy_vector16_mixed_base_types() {
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         client
             .execute(
@@ -955,19 +980,22 @@ mod bulk_copy_vector_tests {
     /// A float16 vector whose dimension count does not match the target column
     /// must be rejected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_bulk_copy_vector16_dimension_mismatch() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
-
-        client
-            .execute(
-                "CREATE TABLE #BulkCopyVector16MismatchTest (id INT NOT NULL, vector_col VECTOR(3, float16))"
-                    .to_string(),
-                (),
-            )
-            .await
-            .unwrap();
-
         for (id, values) in [(1, vec![1.0, 2.0]), (2, vec![1.0, 2.0, 3.0, 4.0])] {
+            // Each failed attempt gets a fresh connection and its own temporary table.
+            let Some(mut client) = begin_vector16_connection(None).await else {
+                return;
+            };
+            client
+                .execute(
+                    "CREATE TABLE #BulkCopyVector16MismatchTest (id INT NOT NULL, vector_col VECTOR(3, float16))"
+                        .to_string(),
+                    (),
+                )
+                .await
+                .unwrap();
+
             let dims = values.len();
             let rows = vec![Vector16Row {
                 id,
@@ -982,9 +1010,11 @@ mod bulk_copy_vector_tests {
                     .await
             };
 
+            let error = result.expect_err("Expected a vector dimension mismatch");
             assert!(
-                result.is_err(),
-                "Expected bulk copy to fail with dimension mismatch ({} vs 3)",
+                matches!(&error, mssql_tds::error::Error::TypeConversionError(message)
+                    if message.contains("Vector dimension mismatch:")),
+                "Expected dimension mismatch ({} vs 3), got {error:?}",
                 dims
             );
         }

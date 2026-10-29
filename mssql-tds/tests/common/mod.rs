@@ -7,6 +7,7 @@ use std::env;
 use std::sync::Once;
 
 use dotenv::dotenv;
+use mssql_tds::connection::client_context::VectorVersion;
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult, TdsClient};
 use mssql_tds::core::{EncryptionOptions, TdsResult};
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -142,6 +143,59 @@ pub async fn create_client(datasource: &str) -> TdsResult<TdsClient> {
 #[allow(dead_code)]
 pub async fn begin_connection(datasource: &str) -> TdsClient {
     create_client(datasource).await.unwrap()
+}
+
+/// Opt in explicitly; connection, configuration, and query failures must not become skips.
+#[allow(dead_code)]
+pub async fn begin_vector16_connection(version: Option<VectorVersion>) -> Option<TdsClient> {
+    dotenv().ok();
+    if env::var("VECTOR16_TEST").as_deref() != Ok("1") {
+        eprintln!(
+            "Skipping float16 integration test: set VECTOR16_TEST=1 and DB_DATABASE, \
+             and point DB_HOST/DB_PORT at a server with float16 support preprovisioned"
+        );
+        return None;
+    }
+
+    let database = env::var("DB_DATABASE").expect(
+        "VECTOR16_TEST=1 requires an explicit DB_DATABASE; no fallback database is allowed",
+    );
+    assert!(
+        !database.trim().is_empty(),
+        "VECTOR16_TEST=1 requires a nonempty DB_DATABASE"
+    );
+    let mut context = create_context();
+    if let Some(version) = version {
+        context.vector_version = version;
+    }
+    let mut client = TdsConnectionProvider {}
+        .create_client(context, &build_tcp_datasource(), None)
+        .await
+        .expect("VECTOR16_TEST=1 requires a working connection to the configured database");
+    let instance_check = env::var("VECTOR16_EXPECTED_INSTANCE")
+        .map(|instance| {
+            format!(
+                " AND CONVERT(nvarchar(128), SERVERPROPERTY('InstanceName')) = N'{}'",
+                instance.replace('\'', "''")
+            )
+        })
+        .unwrap_or_default();
+    client
+        .execute(
+            format!(
+                "SELECT CASE WHEN DB_NAME() = N'{}'{instance_check} THEN 1 ELSE 0 END",
+                database.replace('\'', "''")
+            ),
+            (),
+        )
+        .await
+        .expect("Failed to verify the configured test database");
+    assert_eq!(
+        get_scalar_value(&mut client).await.unwrap(),
+        Some(ColumnValues::Int(1)),
+        "Float16 integration tests must connect to the configured database and expected instance"
+    );
+    Some(client)
 }
 
 pub async fn validate_results(

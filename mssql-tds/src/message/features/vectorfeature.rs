@@ -29,15 +29,6 @@ impl VectorFeature {
             client_version,
         }
     }
-
-    /// Returns the negotiated version after successful feature exchange.
-    /// The negotiated version is min(client_version, server_version).
-    /// Returns 0 if feature has not been acknowledged.
-    #[allow(dead_code)]
-    // This method is not used currently, and exists for completeness.
-    pub fn negotiated_version(&self) -> u8 {
-        self.negotiated_version
-    }
 }
 
 impl Default for VectorFeature {
@@ -58,6 +49,14 @@ impl From<VectorVersion> for Option<VectorFeature> {
 
 #[async_trait]
 impl Feature for VectorFeature {
+    fn negotiated_version(&self) -> u8 {
+        if self.acknowledged {
+            self.negotiated_version
+        } else {
+            0
+        }
+    }
+
     fn feature_identifier(&self) -> FeatureExtension {
         FeatureExtension::Vector
     }
@@ -161,11 +160,29 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_v2_acknowledged() {
+    fn test_zero_acknowledgement_and_reset() {
         let mut feature = VectorFeature::default();
         feature.set_acknowledged(true);
         feature.deserialize(&[2u8]).unwrap();
+        assert_eq!(feature.negotiated_version(), 2);
+        feature.deserialize(&[0u8]).unwrap();
         assert!(feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 0);
+
+        feature.deserialize(&[2u8]).unwrap();
+        feature.set_acknowledged(false);
+        assert!(!feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 0);
+        feature.set_acknowledged(true);
+        assert_eq!(feature.negotiated_version(), 0);
+    }
+
+    #[test]
+    fn test_deserialize_without_acknowledgement() {
+        let mut feature = VectorFeature::default();
+        feature.deserialize(&[2u8]).unwrap();
+        assert_eq!(feature.negotiated_version(), 0);
+        feature.set_acknowledged(true);
         assert_eq!(feature.negotiated_version(), 2);
     }
 

@@ -305,6 +305,7 @@ pub struct ClientContext {
     pub server_spn: Option<String>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
+    /// Default: [`VectorVersion::V2`].
     pub vector_version: VectorVersion,
     /// Always Encrypted (column encryption) setting for the connection.
     /// Default: [`ColumnEncryptionSetting::Disabled`].

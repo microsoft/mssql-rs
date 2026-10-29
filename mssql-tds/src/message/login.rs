@@ -117,6 +117,10 @@ pub(crate) trait Feature: Send + Sync + Debug {
     async fn serialize(&self, packet_writer: &mut PacketWriter) -> TdsResult<()>;
     fn deserialize(&mut self, data: &[u8]) -> TdsResult<()>;
 
+    fn negotiated_version(&self) -> u8 {
+        0
+    }
+
     /// Raw FEATUREEXTACK initial session-state payload, if this feature carries
     /// one. Only SessionRecovery does; it must be echoed in the reconnect LOGIN7.
     fn session_recovery_initial_state(&self) -> Option<&[u8]> {
