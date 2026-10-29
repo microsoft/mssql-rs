@@ -73,20 +73,20 @@ Set an explicit `DB_DATABASE` and point `DB_HOST`/`DB_PORT` at a server with flo
 vector support. The helper verifies the current database matches that configuration.
 It does not require a particular developer instance or database name.
 
-For local PR365 validation, use only instance `SQLSERVERVECTOR` and database `UserDb`:
+Requirements:
 
-- Set `DB_DATABASE=UserDb` explicitly. The general helper defaults to `master`; the
-   float16 helper rejects an omitted or empty database before connecting.
-- Point `DB_HOST` and `DB_PORT` at the TCP endpoint for `SQLSERVERVECTOR`. TCP uses the
-   explicit port; setting `DB_INSTANCE` alone does not select a named instance for TCP.
-- Set `VECTOR16_EXPECTED_INSTANCE=SQLSERVERVECTOR` to verify the instance on each
-   float16 connection. This optional safeguard accepts any configured instance name.
-- Set `DB_INSTANCE=SQLSERVERVECTOR` for any Named Pipe/Shared Memory tests in the same run.
-- Have an administrator preprovision preview support in `UserDb` on a server build that
-   supports float16 vectors and Vector feature V2. Tests never enable preview features,
-   change database configuration, set global flags, or issue `USE` statements.
+- Set `DB_DATABASE` explicitly. The general helper defaults to `master`; the float16
+   helper rejects an omitted or empty database before connecting.
+- Point `DB_HOST` and `DB_PORT` at the TCP endpoint of a float16-capable server. TCP uses
+   the explicit port; setting `DB_INSTANCE` alone does not select a named instance for TCP.
+- Optionally set `VECTOR16_EXPECTED_INSTANCE` to verify the instance name on each float16
+   connection. This safeguard accepts any configured instance name.
+- Set `DB_INSTANCE` for any Named Pipe/Shared Memory tests in the same run.
+- Have an administrator preprovision preview support in the target database on a server
+   build that supports float16 vectors and Vector feature V2. Tests never enable preview
+   features, change database configuration, set global flags, or issue `USE` statements.
 - Verify the actual instance name and current database with a read-only query before the
-   local run. Temporary test tables/procedures are session-local; no persistent schema is created.
+   run. Temporary test tables/procedures are session-local; no persistent schema is created.
 
 All float16 live integration test names contain `vector16`, including the mixed-type cases.
 After setting the environment above, run:

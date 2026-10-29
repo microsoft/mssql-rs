@@ -3434,7 +3434,7 @@ impl TdsClient {
         if self.negotiated_settings.vector_version() < 2
             && mapped_column_metadata.iter().any(|column| {
                 column.sql_type == crate::datatypes::bulk_copy_metadata::SqlDbType::Vector
-                    && column.scale == 1
+                    && column.scale == crate::datatypes::sqldatatypes::VectorBaseType::Float16 as u8
             })
         {
             return Err(UsageError(format!(

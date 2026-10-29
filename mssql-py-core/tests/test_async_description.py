@@ -222,12 +222,13 @@ def test_description_vector_type_and_scale_match_fetched_value(client_context):
 
             assert cursor.description[0][0:2] == ("float32_vector", list)
             assert cursor.description[0][5] == 0
-            assert cursor.description[1][0:2] == ("float16_vector", str)
+            assert cursor.description[1][0:2] == ("float16_vector", list)
             assert cursor.description[1][5] == 0
             row = await cursor.fetchone()
             assert isinstance(row[0], list)
             assert row[0] == pytest.approx([1.0, 2.0, 3.0])
-            assert isinstance(row[1], str)
+            assert isinstance(row[1], list)
+            assert row[1] == pytest.approx([1.0, 2.0, 3.0])
         finally:
             if database_created:
                 await cursor.execute("USE [master]", use_prepare=False)
