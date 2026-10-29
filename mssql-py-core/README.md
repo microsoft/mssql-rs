@@ -29,8 +29,6 @@ Both space and `T` separators and a trailing `Z` are supported on every supporte
 Python version. Fractions longer than seven digits are rejected rather than
 silently truncated. The destination column's scale is applied by the TDS
 serializer, using the existing truncation behavior for lower scales.
-Fixed-width `YYYY-MM-DD` dates use a direct parsing path; other supported ISO
-formats retain the general parser and the same precision and validation.
 Python-compatible fractional forms such as `12000012` and `12:00:00:12`
 are retained; both represent `12:00:00.12`.
 

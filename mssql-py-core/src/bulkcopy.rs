@@ -172,22 +172,6 @@ fn parse_iso_datetime(value: &str) -> Option<(NaiveDate, NaiveTime, &str)> {
         let (clock, zone) = offset_start.map_or((clock, ""), |index| clock.split_at(index));
         Some((date, parse_iso_time(clock)?, zone))
     }
-    if let Some(prefix) = value.as_bytes().get(..10)
-        && prefix[4] == b'-'
-        && prefix[7] == b'-'
-        && prefix
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
-    {
-        // Fixed-width ASCII dates avoid reinterpreting a format string per row.
-        let date = NaiveDate::from_ymd_opt(
-            value[..4].parse().ok()?,
-            value[5..7].parse().ok()?,
-            value[8..10].parse().ok()?,
-        )?;
-        return with_time((date, &value[10..]));
-    }
     let bytes = value.as_bytes();
     let week_boundary = if bytes.get(4..6) == Some(b"-W") {
         // Match CPython's boundary choice, not whichever date/time split parses first.
@@ -2124,39 +2108,6 @@ impl BulkLoadRow for PythonRowAdapter {
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore = "Manual release-mode parser measurement"]
-    fn datetime_string_parser_throughput() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        for (sql_type, input) in [
-            (SqlDbType::DateTime2, "2024-07-01 12:00:00.1234567"),
-            (
-                SqlDbType::DateTimeOffset,
-                "2024-07-01T12:00:00.1234567+05:30",
-            ),
-            (SqlDbType::DateTime2, "2024W271T120000.1234567"),
-        ] {
-            let metadata =
-                BulkCopyColumnMetadata::new("event_time", sql_type, sql_type.to_tds_type())
-                    .with_scale(7);
-            for _ in 0..10_000 {
-                black_box(parse_bulk_datetime(black_box(input), black_box(&metadata)).unwrap());
-            }
-            let mut timings = [0u128; 7];
-            for timing in &mut timings {
-                let start = Instant::now();
-                for _ in 0..100_000 {
-                    black_box(parse_bulk_datetime(black_box(input), black_box(&metadata)).unwrap());
-                }
-                *timing = start.elapsed().as_nanos() / 100_000;
-            }
-            timings.sort_unstable();
-            println!("{sql_type:?} {input}: median {} ns/value", timings[3]);
-        }
-    }
-
     fn convert(value: &str, sql_type: SqlDbType, scale: u8) -> TdsResult<ColumnValues> {
         let metadata = BulkCopyColumnMetadata::new("event_time", sql_type, sql_type.to_tds_type())
             .with_scale(scale);
@@ -2165,8 +2116,43 @@ mod tests {
         })
     }
 
+    fn assert_temporal_value(input: &str, days: i64, ticks: i64, offset: i64, scale: u8) {
+        for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+            let actual = convert(input, sql_type, scale);
+            if sql_type == SqlDbType::DateTimeOffset
+                && (offset % 60 != 0 || offset.abs() > 14 * 3600)
+            {
+                assert!(actual.is_err(), "{input}");
+                continue;
+            }
+            let (value, expected_ticks) = match actual
+                .unwrap_or_else(|error| panic!("{input}: {error}"))
+            {
+                ColumnValues::DateTime2(value) if sql_type == SqlDbType::DateTime2 => {
+                    (value, ticks)
+                }
+                ColumnValues::DateTimeOffset(value) if sql_type == SqlDbType::DateTimeOffset => {
+                    assert_eq!(i64::from(value.offset) * 60, offset, "{input}");
+                    (value.datetime2, ticks - offset * 10_000_000)
+                }
+                other => panic!("Unexpected value: {other:?}"),
+            };
+            assert_eq!(
+                i64::from(value.days),
+                days + expected_ticks.div_euclid(864_000_000_000),
+                "{input}"
+            );
+            assert_eq!(
+                value.time.time_nanoseconds as i64,
+                expected_ticks.rem_euclid(864_000_000_000),
+                "{input}"
+            );
+            assert_eq!(value.time.scale, scale, "{input}");
+        }
+    }
+
     #[test]
-    fn fixed_width_dates_match_chrono_validation() {
+    fn datetime_strings_validate_calendar_dates() {
         for year in [1, 4, 100, 400, 1900, 2000, 2024, 9999] {
             for month in 1..=12 {
                 for day in 1..=31 {
@@ -2178,29 +2164,11 @@ mod tests {
                             assert_eq!(zone, "");
                             date
                         }),
-                        NaiveDate::parse_and_remainder(&value, "%Y-%m-%d")
-                            .ok()
-                            .map(|(date, _)| date),
+                        NaiveDate::from_ymd_opt(year, month, day),
                         "{value}"
                     );
                 }
             }
-        }
-        for value in [
-            "2024-7-1T12:00:00",
-            "20240701T12:00:00",
-            "2024-W27-1T12:00:00",
-            "2024-07-\u{20ac}T12:00:00",
-            "\u{20ac}024-07-01T12:00:00",
-        ] {
-            assert_eq!(
-                parse_iso_datetime(value).map(|(date, _, _)| date),
-                ["%Y-%m-%d", "%Y%m%d", "%G-W%V-%u"]
-                    .iter()
-                    .find_map(|format| NaiveDate::parse_and_remainder(value, format).ok())
-                    .map(|(date, _)| date),
-                "{value}"
-            );
         }
     }
 
@@ -2216,18 +2184,7 @@ mod tests {
             ("2024W271112:00:00.1234567", 432_001_234_567),
             ("2024-07-011120000.1234567", 432_001_234_567),
         ] {
-            for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
-                let datetime = match convert(input, sql_type, 7).unwrap() {
-                    ColumnValues::DateTime2(value) => value,
-                    ColumnValues::DateTimeOffset(value) => {
-                        assert_eq!(value.offset, 0);
-                        value.datetime2
-                    }
-                    other => panic!("Unexpected value: {other:?}"),
-                };
-                assert_eq!(datetime.days, 739_067, "{input}");
-                assert_eq!(datetime.time.time_nanoseconds, ticks, "{input}");
-            }
+            assert_temporal_value(input, 739_067, ticks, 0, 7);
         }
     }
 
@@ -2253,24 +2210,13 @@ mod tests {
         ] {
             for (zone, offset) in [("", 0), ("Z", 0), ("+05:30", 330), ("-07:00", -420)] {
                 let input = format!("2024-07-01T{clock}{zone}");
-                for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
-                    let (datetime, offset_ticks) = match convert(&input, sql_type, 7)
-                        .unwrap_or_else(|error| panic!("{input}: {error}"))
-                    {
-                        ColumnValues::DateTime2(value) => (value, 0),
-                        ColumnValues::DateTimeOffset(value) => {
-                            assert_eq!(value.offset, offset, "{input}");
-                            (value.datetime2, i64::from(offset) * 600_000_000)
-                        }
-                        other => panic!("Unexpected value: {other:?}"),
-                    };
-                    assert_eq!(datetime.days, 739_067, "{input}");
-                    assert_eq!(
-                        datetime.time.time_nanoseconds as i64,
-                        432_000_000_000 + fractional_ticks - offset_ticks,
-                        "{input}"
-                    );
-                }
+                assert_temporal_value(
+                    &input,
+                    739_067,
+                    432_000_000_000 + fractional_ticks,
+                    offset * 60,
+                    7,
+                );
             }
         }
     }
@@ -2320,78 +2266,45 @@ mod tests {
                                     let input = format!("{date}{separator}{clock}{fraction}{zone}");
                                     let expected =
                                         datetime.call_method1("fromisoformat", (&input,));
-                                    for sql_type in
-                                        [SqlDbType::DateTime2, SqlDbType::DateTimeOffset]
-                                    {
-                                        let metadata = BulkCopyColumnMetadata::new(
-                                            "event_time",
-                                            sql_type,
-                                            sql_type.to_tds_type(),
-                                        )
-                                        .with_scale(7);
-                                        let actual = parse_bulk_datetime(&input, &metadata);
-                                        let Ok(expected) = &expected else {
-                                            // Older Python also rejects valid compact clocks and Z.
-                                            if supports_week_dates {
-                                                assert!(actual.is_err(), "{input}: {actual:?}");
-                                            }
-                                            continue;
-                                        };
-                                        let component = |name: &str| {
-                                            expected
-                                                .getattr(name)
-                                                .unwrap()
-                                                .extract::<i64>()
-                                                .unwrap()
-                                        };
-                                        let ordinal = expected
-                                            .call_method0("toordinal")
-                                            .unwrap()
-                                            .extract::<i64>()
-                                            .unwrap();
-                                        let mut ticks = (ordinal - 1) * 864_000_000_000
-                                            + component("hour") * 36_000_000_000
-                                            + component("minute") * 600_000_000
-                                            + component("second") * 10_000_000
-                                            + component("microsecond") * 10;
-                                        let offset = expected.call_method0("utcoffset").unwrap();
-                                        let offset_seconds = if offset.is_none() {
-                                            0
-                                        } else {
-                                            offset
-                                                .call_method0("total_seconds")
-                                                .unwrap()
-                                                .extract::<f64>()
-                                                .unwrap()
-                                                as i64
-                                        };
-                                        let actual = match actual
-                                            .unwrap_or_else(|error| panic!("{input}: {error}"))
-                                        {
-                                            ColumnValues::DateTime2(value) => value,
-                                            ColumnValues::DateTimeOffset(value) => {
-                                                assert_eq!(
-                                                    i64::from(value.offset) * 60,
-                                                    offset_seconds,
+                                    let Ok(expected) = &expected else {
+                                        // Older Python also rejects valid compact clocks and Z.
+                                        if supports_week_dates {
+                                            for sql_type in
+                                                [SqlDbType::DateTime2, SqlDbType::DateTimeOffset]
+                                            {
+                                                assert!(
+                                                    convert(&input, sql_type, 7).is_err(),
                                                     "{input}"
                                                 );
-                                                ticks -= offset_seconds * 10_000_000;
-                                                value.datetime2
                                             }
-                                            other => panic!("Unexpected value: {other:?}"),
-                                        };
-                                        assert_eq!(
-                                            i64::from(actual.days),
-                                            ticks.div_euclid(864_000_000_000),
-                                            "{input}"
-                                        );
-                                        assert_eq!(
-                                            actual.time.time_nanoseconds as i64,
-                                            ticks.rem_euclid(864_000_000_000),
-                                            "{input}"
-                                        );
-                                        checked += 1;
-                                    }
+                                        }
+                                        continue;
+                                    };
+                                    let component = |name: &str| {
+                                        expected.getattr(name).unwrap().extract::<i64>().unwrap()
+                                    };
+                                    let days = expected
+                                        .call_method0("toordinal")
+                                        .unwrap()
+                                        .extract::<i64>()
+                                        .unwrap()
+                                        - 1;
+                                    let ticks = component("hour") * 36_000_000_000
+                                        + component("minute") * 600_000_000
+                                        + component("second") * 10_000_000
+                                        + component("microsecond") * 10;
+                                    let offset = expected.call_method0("utcoffset").unwrap();
+                                    let offset_seconds = if offset.is_none() {
+                                        0
+                                    } else {
+                                        offset
+                                            .call_method0("total_seconds")
+                                            .unwrap()
+                                            .extract::<f64>()
+                                            .unwrap() as i64
+                                    };
+                                    assert_temporal_value(&input, days, ticks, offset_seconds, 7);
+                                    checked += 2;
                                 }
                             }
                         }
@@ -2419,27 +2332,11 @@ mod tests {
             (".0000001", 1),
             (".9999999", 9_999_999),
         ] {
-            for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
-                for separator in [" ", "T"] {
-                    for zone in ["", "Z", "+00:00"] {
-                        let input = format!("2024-07-01{separator}12:00:00{fraction}{zone}");
-                        for scale in 0..=7 {
-                            let datetime = match convert(&input, sql_type, scale).unwrap() {
-                                ColumnValues::DateTime2(value) => value,
-                                ColumnValues::DateTimeOffset(value) => {
-                                    assert_eq!(value.offset, 0);
-                                    value.datetime2
-                                }
-                                other => panic!("Unexpected value: {other:?}"),
-                            };
-                            assert_eq!(datetime.days, 739_067, "{input}");
-                            assert_eq!(
-                                datetime.time.time_nanoseconds,
-                                432_000_000_000 + ticks,
-                                "{input}"
-                            );
-                            assert_eq!(datetime.time.scale, scale);
-                        }
+            for separator in [" ", "T"] {
+                for zone in ["", "Z", "+00:00"] {
+                    let input = format!("2024-07-01{separator}12:00:00{fraction}{zone}");
+                    for scale in 0..=7 {
+                        assert_temporal_value(&input, 739_067, 432_000_000_000 + ticks, 0, scale);
                     }
                 }
             }
@@ -2495,6 +2392,7 @@ mod tests {
     #[test]
     fn datetime2_strings_keep_local_time_and_iso_variants() {
         for input in [
+            "2024-7-1T12:00:00.1234567",
             "2024-07-01T12:00:00.1234567+05:30",
             "2024-07-01T12:00:00.1234567-07:00",
             "20240701T120000.1234567",
@@ -2569,49 +2467,20 @@ mod tests {
                                 "2024-07-01T12:00:00.123456{sign}{hour:02}:{minute:02}:{second:02}"
                             );
                             let expected = datetime.call_method1("fromisoformat", (&reference,));
-                            for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
-                                let actual = convert(&input, sql_type, 7);
-                                let Ok(expected) = &expected else {
-                                    assert!(actual.is_err(), "{input}");
-                                    continue;
-                                };
-                                let seconds = expected
-                                    .call_method0("utcoffset")
-                                    .unwrap()
-                                    .call_method0("total_seconds")
-                                    .unwrap()
-                                    .extract::<f64>()
-                                    .unwrap() as i64;
-                                if sql_type == SqlDbType::DateTimeOffset
-                                    && (seconds % 60 != 0 || seconds.abs() > 14 * 3600)
-                                {
-                                    assert!(actual.is_err(), "{input}");
-                                    continue;
+                            let Ok(expected) = &expected else {
+                                for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+                                    assert!(convert(&input, sql_type, 7).is_err(), "{input}");
                                 }
-                                let (value, offset) = match actual.unwrap() {
-                                    ColumnValues::DateTime2(value) => (value, 0),
-                                    ColumnValues::DateTimeOffset(value) => {
-                                        assert_eq!(
-                                            i64::from(value.offset) * 60,
-                                            seconds,
-                                            "{input}"
-                                        );
-                                        (value.datetime2, seconds)
-                                    }
-                                    other => panic!("Unexpected value: {other:?}"),
-                                };
-                                let ticks = 432_001_234_567i64 - offset * 10_000_000;
-                                assert_eq!(
-                                    i64::from(value.days),
-                                    739_067 + ticks.div_euclid(864_000_000_000),
-                                    "{input}"
-                                );
-                                assert_eq!(
-                                    value.time.time_nanoseconds as i64,
-                                    ticks.rem_euclid(864_000_000_000),
-                                    "{input}"
-                                );
-                            }
+                                continue;
+                            };
+                            let seconds = expected
+                                .call_method0("utcoffset")
+                                .unwrap()
+                                .call_method0("total_seconds")
+                                .unwrap()
+                                .extract::<f64>()
+                                .unwrap() as i64;
+                            assert_temporal_value(&input, 739_067, 432_001_234_567, seconds, 7);
                         }
                     }
                 }
@@ -2678,6 +2547,8 @@ mod tests {
                 "2024-07-01T12:00:00Z12",
                 "2024-07-01T1:00:00",
                 "2024-07-01T0\u{20ac}00",
+                "2024-07-\u{20ac}T12:00:00",
+                "\u{20ac}024-07-01T12:00:00",
                 "2024-W27-1120000",
                 "2024-W27-",
                 "2024-W27-8T120000",
