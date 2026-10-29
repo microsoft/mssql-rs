@@ -125,11 +125,13 @@ jobs:
           fi
 
           trace_args=()
-          if [ -n "${ODBC_DRIVER_TRACE_LEVEL:-}" ]; then
+          if [ "${ODBC_DRIVER_TRACE:-}" = "true" ]; then
             trace_args=(-e "MSSQL_TDS_TRACE=true"
-                        -e "MSSQL_TDS_TRACE_LEVEL=$ODBC_DRIVER_TRACE_LEVEL"
                         -e "MSSQL_TDS_TRACE_DIR=/workspace/odbc-driver-traces")
-            echo "Driver tracing on: MSSQL_TDS_TRACE_LEVEL=$ODBC_DRIVER_TRACE_LEVEL"
+            if [ -n "${ODBC_DRIVER_TRACE_LEVEL:-}" ]; then
+              trace_args+=(-e "MSSQL_TDS_TRACE_LEVEL=$ODBC_DRIVER_TRACE_LEVEL")
+            fi
+            echo "Driver tracing on: MSSQL_TDS_TRACE_LEVEL=${ODBC_DRIVER_TRACE_LEVEL:-<driver default>}"
           fi
 
           bash .pipeline/scripts/docker-cargo-run.sh --rm \
@@ -153,6 +155,7 @@ jobs:
           CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
           CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
           ${{ if eq(parameters.driverTrace, true) }}:
+            ODBC_DRIVER_TRACE: 'true'
             ODBC_DRIVER_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
           ${{ if eq(parameters.collectLoad, true) }}:
             ODBC_COLLECT_LOAD: 'true'
