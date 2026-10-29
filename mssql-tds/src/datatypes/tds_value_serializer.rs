@@ -1913,8 +1913,9 @@ impl TdsValueSerializer {
     /// - Magnitudes that round above `65504.0` (i.e. `>= 65520.0`, including
     ///   `f32::MAX`) become signed infinity with no error or diagnostic. Values in
     ///   `(65504.0, 65520.0)`, such as `65505.0`, round to the finite `±65504.0`.
-    /// - Magnitudes below the smallest binary16 subnormal (`2^-24`) round to signed
-    ///   zero; exactly `2^-25` ties to even and also becomes zero. Binary16
+    /// - Magnitudes `<= 2^-25` round to signed zero (exactly `2^-25` is a tie and
+    ///   rounds to even, i.e. zero). Magnitudes in `(2^-25, 2^-24)` round up to the
+    ///   smallest binary16 subnormal `±2^-24`, so they are not zero. Binary16
     ///   subnormals themselves are preserved, not flushed to zero.
     /// - `±inf` is preserved and NaN stays NaN (payload may change).
     ///
@@ -4237,6 +4238,9 @@ mod serializer_tests {
             (-2.0f32.powi(-25), 0x8000),
             (2.0f32.powi(-26), 0x0000),
             (-2.0f32.powi(-26), 0x8000),
+            // Strictly between 2^-25 and 2^-24 rounds up to the smallest subnormal.
+            (3.0 * 2.0f32.powi(-26), 0x0001),
+            (-3.0 * 2.0f32.powi(-26), 0x8001),
         ];
         for (value, expected_bits) in cases {
             let mut mock = MockNetworkWriter::new(64);
