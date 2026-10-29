@@ -460,7 +460,9 @@ Verified against msodbcsql source:
   bulk ROW serializer: encoded `MaxLen`, optional collation, `ActualLen`, and
   data, with `MaxLen=0` / `ActualLen=0xFFFFFFFF` for NULL. No table-name count,
   text pointer, or timestamp is emitted. Encoding is resolved once and existing
-  wire bytes are borrowed. Bulk-copy ROW framing is unchanged.
+  wire bytes are borrowed. Preflight rejects a value over 2 GiB - 1 bytes before
+  any request bytes are written, re-encoding only a value large enough to reach
+  that limit. Bulk-copy ROW framing is unchanged.
 - DAE retains PLP/MAX payload framing even with a legacy declaration, matching
   `PutParamData` (`sqlccmd.cpp:4651-4707`). `with_streamed_declaration` carries
   the independent declaration. The connection policy is captured in the

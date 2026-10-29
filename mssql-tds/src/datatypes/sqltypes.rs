@@ -164,6 +164,9 @@ pub(crate) const PLP_NULL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 pub(crate) const NO_XML_SCHEMA: u8 = 0x00;
 
+// TEXT, NTEXT, and IMAGE RPC lengths are limited to 2 GiB - 1 bytes.
+const LEGACY_LOB_MAX_BYTES: usize = 0x7fff_ffff;
+
 impl SqlType {
     fn get_nullable_type(&self) -> NullableTdsType {
         match self {
@@ -743,22 +746,17 @@ impl SqlType {
         // Resolve encoding once so MaxLen, ActualLen, and the payload agree.
         if matches!(self, Self::Text(_) | Self::NText(_) | Self::Image(_)) {
             let (encoded, had_loss) = self.legacy_lob_wire_bytes(db_collation)?;
-            let bytes = encoded
+            let fitted = encoded
                 .as_deref()
-                .map(|bytes| match narrow_string_byte_limit {
-                    Some(maximum) if matches!(self, Self::Text(_)) => {
-                        TdsValueSerializer::fit_narrow_bytes(bytes, maximum)
-                    }
-                    _ => Ok(bytes),
-                })
+                .map(|bytes| self.fit_legacy_lob(bytes, narrow_string_byte_limit))
                 .transpose()?;
-            let length = Self::legacy_lob_length(bytes.map_or(0, <[u8]>::len))?;
+            let length = fitted.map_or(0, |(_, length)| length);
             self.write_legacy_lob_type_info(packet_writer, db_collation, length)
                 .await?;
             packet_writer
-                .write_u32_async(if bytes.is_some() { length } else { u32::MAX })
+                .write_u32_async(if fitted.is_some() { length } else { u32::MAX })
                 .await?;
-            if let Some(bytes) = bytes {
+            if let Some((bytes, _)) = fitted {
                 packet_writer.write_async(bytes).await?;
             }
             if had_loss {
@@ -1120,9 +1118,9 @@ impl SqlType {
     ///
     /// Every fallible *scalar* metadata check in `write_type_info` belongs
     /// here: the UDT name, the `sql_variant` inner type, vector dimension/base-type
-    /// bounds, and raw NTEXT byte alignment. The duplicates in the serializer stay,
-    /// since that function must remain correct for callers that reach it by
-    /// another route.
+    /// bounds, raw NTEXT byte alignment, and the legacy LOB length limit. The
+    /// duplicates in the serializer stay, since that function must remain
+    /// correct for callers that reach it by another route.
     ///
     /// `SqlType::Table` is the known exception. A TVP's validation lives in
     /// `serialize_table` / `write_tvp_type_name` / `write_tvp_column_metadata`
@@ -1137,7 +1135,13 @@ impl SqlType {
     ) -> TdsResult<()> {
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
-            SqlType::NText(Some(value)) => Self::validate_ntext(value),
+            SqlType::NText(Some(value)) => {
+                Self::validate_ntext(value)?;
+                self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
+            }
+            SqlType::Image(Some(_)) => {
+                self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
+            }
             SqlType::Variant(inner) => {
                 Self::validate_variant_inner(inner)?;
                 inner.validate_for_send(db_collation, None)
@@ -1147,8 +1151,9 @@ impl SqlType {
             {
                 Ok(())
             }
-            SqlType::VarcharMax(_) | SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
-                Ok(())
+            SqlType::VarcharMax(_) if narrow_string_byte_limit.is_none() => Ok(()),
+            SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
+                self.validate_legacy_lob_length(db_collation, None)
             }
             SqlType::Vector(vector, dimensions, base_type) => {
                 Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
@@ -1162,7 +1167,8 @@ impl SqlType {
                     &value,
                     &ctx,
                     narrow_string_byte_limit,
-                )
+                )?;
+                self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
             }
             _ => Ok(()),
         }
@@ -1291,10 +1297,52 @@ impl SqlType {
         }
     }
 
+    /// Rejects a value whose RPC length would exceed the legacy LOB limit,
+    /// using the same encoding and TEXT trimming as the serializer.
+    fn validate_legacy_lob_length(
+        &self,
+        collation: &SqlCollation,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<()> {
+        let source_len = match self {
+            Self::Text(Some(value)) | Self::NText(Some(value)) => value.bytes.len(),
+            Self::Image(Some(bytes)) => bytes.len(),
+            _ => return Ok(()),
+        };
+        // Encoding at most triples a value, and a TEXT limit within the cap
+        // has already been enforced by the narrow-string check.
+        let limited_text = matches!(self, Self::Text(_))
+            && narrow_string_byte_limit.is_some_and(|maximum| maximum <= LEGACY_LOB_MAX_BYTES);
+        if limited_text || source_len <= LEGACY_LOB_MAX_BYTES / 3 {
+            return Ok(());
+        }
+        let (encoded, _) = self.legacy_lob_wire_bytes(collation)?;
+        if let Some(bytes) = encoded.as_deref() {
+            self.fit_legacy_lob(bytes, narrow_string_byte_limit)?;
+        }
+        Ok(())
+    }
+
+    /// Applies TEXT's encoded-byte limit, which may trim trailing spaces,
+    /// before the legacy LOB length limit.
+    fn fit_legacy_lob<'a>(
+        &self,
+        bytes: &'a [u8],
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<(&'a [u8], u32)> {
+        let bytes = match narrow_string_byte_limit {
+            Some(maximum) if matches!(self, Self::Text(_)) => {
+                TdsValueSerializer::fit_narrow_bytes(bytes, maximum)?
+            }
+            _ => bytes,
+        };
+        Ok((bytes, Self::legacy_lob_length(bytes.len())?))
+    }
+
     fn legacy_lob_length(length: usize) -> TdsResult<u32> {
         u32::try_from(length)
             .ok()
-            .filter(|length| *length <= 0x7fff_ffff)
+            .filter(|length| *length as usize <= LEGACY_LOB_MAX_BYTES)
             .ok_or_else(|| Error::UsageError("Legacy LOB exceeds 2 GiB - 1 bytes.".to_string()))
     }
 
