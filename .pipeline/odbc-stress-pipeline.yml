@@ -215,6 +215,8 @@ stages:
         # A process that is not running leaves its column blank.
         $loadDir = "$(Build.ArtifactStagingDirectory)/odbc-load"
         New-Item -ItemType Directory -Force -Path $loadDir | Out-Null
+        # sqlservr % Processor Time is summed across cores (0-100 x cpus).
+        "cpus=$([Environment]::ProcessorCount)" | Set-Content "$loadDir/agent.txt"
         $sampler = Start-Process typeperf -PassThru -NoNewWindow `
           -RedirectStandardOutput "$loadDir/typeperf.out" -ArgumentList @(
             '"\Processor(_Total)\% Processor Time"', '"\System\Processor Queue Length"',
