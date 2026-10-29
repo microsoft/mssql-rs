@@ -383,7 +383,13 @@ infrastructure works (`runtests.c`).
   released unixODBC ([#243](https://github.com/lurcher/unixODBC/issues/243),
   fixed by [lurcher/unixODBC#244](https://github.com/lurcher/unixODBC/pull/244)
   but not yet released). Until the pipelines test against a unixODBC build with
-  the fix (AB#49575), the stress profiles skip `/SharedStmt` on unixODBC, and
+  the fix ([AB#49575](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49575)),
+  all Unix runner profiles (including PR) skip `/SharedStmt` for both drivers.
+  Single-threaded tests and `/CrossThread`, `/SharedEnv`, and `/SharedDbc`
+  remain enabled; Windows profiles are unchanged. This temporarily removes
+  same-statement diagnostic-observer coverage on unixODBC. Set
+  `MSSQL_ODBC_MT_SKIP_MODES=none` when validating a patched Driver Manager.
+  Separately,
   the `/SharedStmt` variants of
   `GetDataLiveTest.DefaultTargetStreamsAVarcharMaxAcrossChunks` and
   `GetDataLiveTest.RunUniqueValuesSurviveEveryRetrievalPath` are unregistered
