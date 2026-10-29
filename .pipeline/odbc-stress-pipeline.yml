@@ -234,8 +234,9 @@ stages:
         ${{ if parameters.driverTrace }}:
           # Read only by the Rust driver, so the msodbcsql leg is unaffected.
           MSSQL_TDS_TRACE: 'true'
-          MSSQL_TDS_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
           MSSQL_TDS_TRACE_DIR: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
+          ${{ if ne(parameters.driverTraceLevel, '') }}:
+            MSSQL_TDS_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
     - task: PublishTestResults@2
       displayName: Publish ODBC stress results (Windows)
       condition: succeededOrFailed()

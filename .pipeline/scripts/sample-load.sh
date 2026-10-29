@@ -15,6 +15,8 @@ set -u
 
 out="${1:?usage: sample-load.sh <output-dir>}"
 mkdir -p "$out"
+# Job control puts each sampler in its own process group.
+set -m
 
 sample_host() {
     echo "# cpus=$(nproc)"
@@ -55,5 +57,7 @@ if command -v docker > /dev/null 2>&1; then
     sample_docker > "$out/docker.txt" &
     pids="$pids $!"
 fi
-trap 'kill $pids 2> /dev/null; exit 0' TERM INT
+set +m
+# Kill whole groups so an in-flight `docker stats | sed` does not outlive us.
+trap 'for p in $pids; do kill -- "-$p" 2> /dev/null; done; wait; exit 0' TERM INT
 wait
