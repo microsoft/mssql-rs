@@ -102,7 +102,8 @@ protected:
 // sql_variant cannot hold a varbinary(max) at all (server error 529), so the max
 // spelling is asserted by length in UnboundedColumnSizeCarriesOversizedValues
 // rather than here.
-ODBC_TEST_F(BinaryConversionLiveTest, BinaryParamDeclaresTheParameterType) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, BinaryParamDeclaresTheParameterType,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         SQLSMALLINT sql_type;
         const char* base_type;
@@ -118,7 +119,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, BinaryParamDeclaresTheParameterType) {
 }
 
 // The declared length reaches the server, not just the type name.
-ODBC_TEST_F(BinaryConversionLiveTest, DeclaredLengthReachesTheServer) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, DeclaredLengthReachesTheServer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(SQL_VARIANT_PROPERTY(CAST(? AS SQL_VARIANT),"
                           " 'MaxLength') AS VARCHAR(16))"),
                   SQL_HANDLE_STMT, stmt_);
@@ -126,25 +128,28 @@ ODBC_TEST_F(BinaryConversionLiveTest, DeclaredLengthReachesTheServer) {
     EXPECT_EQ("40", ExecuteAndReadBack());
 }
 
-ODBC_TEST_F(BinaryConversionLiveTest, BinaryParamRoundTrips) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, BinaryParamRoundTrips, odbc_concurrency::kAllModes) {
     EXPECT_EQ("01FF7E80", HexOfBoundParam({0x01, 0xFF, 0x7E, 0x80}, SQL_VARBINARY, 8));
 }
 
 // A zero inside the value is data, not padding, so it survives.
-ODBC_TEST_F(BinaryConversionLiveTest, InteriorZerosAreNotPadding) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, InteriorZerosAreNotPadding,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("01000002", HexOfBoundParam({0x01, 0x00, 0x00, 0x02}, SQL_VARBINARY, 4));
 }
 
 // Overflow that is entirely 0x00 is padding and is dropped silently, the way
 // overflowing blanks are on the character path - CheckTrailingZeros driving
 // sqlcfunc.cpp:2611.
-ODBC_TEST_F(BinaryConversionLiveTest, AllZeroOverflowIsTrimmedSilently) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, AllZeroOverflowIsTrimmedSilently,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("ABCD", HexOfBoundParam({0xAB, 0xCD, 0x00, 0x00, 0x00}, SQL_VARBINARY, 2));
 }
 
 // Anything else past the declared length is data, so it is 22001 rather than a
 // silent loss.
-ODBC_TEST_F(BinaryConversionLiveTest, OverflowCarryingDataIs22001) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, OverflowCarryingDataIs22001,
+                  odbc_concurrency::kAllModes) {
     for (SQLSMALLINT sql_type : {SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(BindBytes({1, 2, 3, 4, 5}, sql_type, 4), SQL_HANDLE_STMT, stmt_);
@@ -156,7 +161,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, OverflowCarryingDataIs22001) {
 
 // The scan stops at the first non-pad byte wherever it sits, so a mostly-zero
 // overflow still errors.
-ODBC_TEST_F(BinaryConversionLiveTest, PartiallyZeroOverflowIs22001) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, PartiallyZeroOverflowIs22001,
+                  odbc_concurrency::kAllModes) {
     const std::vector<std::vector<SQLCHAR>> cases = {
         {1, 2, 3, 9, 0, 0},  // non-zero first
         {1, 2, 3, 0, 0, 9},  // non-zero last
@@ -173,23 +179,26 @@ ODBC_TEST_F(BinaryConversionLiveTest, PartiallyZeroOverflowIs22001) {
 
 // An unbounded ColumnSize selects varbinary(max), so nothing is length-checked
 // and a value past the 8000-byte non-max bound reaches the server whole.
-ODBC_TEST_F(BinaryConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues,
+                  odbc_concurrency::kAllModes) {
     std::vector<SQLCHAR> value(9000, 0xEE);
     EXPECT_EQ("9000", DataLengthOfBoundParam(value, SQL_VARBINARY, 0));
 }
 
 // binary(n) is fixed width, so a short value is zero-padded out to n.
-ODBC_TEST_F(BinaryConversionLiveTest, FixedBinaryIsZeroPaddedToTheDeclaredLength) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, FixedBinaryIsZeroPaddedToTheDeclaredLength,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("AABB0000", HexOfBoundParam({0xAA, 0xBB}, SQL_BINARY, 4));
 }
 
 // A zero-length value is empty, not NULL - SQL_NULL_DATA is the only way to
 // bind a NULL.
-ODBC_TEST_F(BinaryConversionLiveTest, EmptyBinaryParamIsNotNull) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, EmptyBinaryParamIsNotNull,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("0", DataLengthOfBoundParam({}, SQL_VARBINARY, 4));
 }
 
-ODBC_TEST_F(BinaryConversionLiveTest, NullIndicatorBindsNull) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, NullIndicatorBindsNull, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(16), DATALENGTH(?))"), SQL_HANDLE_STMT,
                   stmt_);
     indicator_ = SQL_NULL_DATA;
@@ -202,7 +211,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, NullIndicatorBindsNull) {
 // binary(0) is not legal T-SQL and has no max spelling, so ColumnSize 0 is
 // HY104 - rejected at bind by both drivers, msodbcsql through CheckSqlPrec
 // (sqlcdesc.cpp:11783, which groups SQL_BINARY with SQL_CHAR).
-ODBC_TEST_F(BinaryConversionLiveTest, ZeroColumnSizeOnFixedBinaryIsRejected) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, ZeroColumnSizeOnFixedBinaryIsRejected,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, BindBytes({1, 2}, SQL_BINARY, 0));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY104");
@@ -210,21 +220,24 @@ ODBC_TEST_F(BinaryConversionLiveTest, ZeroColumnSizeOnFixedBinaryIsRejected) {
 
 // varbinary reads 0 as the max spelling, so the same ColumnSize is accepted
 // there - the split msodbcsql draws at sqlcdesc.cpp:11748.
-ODBC_TEST_F(BinaryConversionLiveTest, ZeroColumnSizeOnVarbinaryIsTheMaxSpelling) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, ZeroColumnSizeOnVarbinaryIsTheMaxSpelling,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("0102", HexOfBoundParam({1, 2}, SQL_VARBINARY, 0));
 }
 
 // image carries its value like the other two. Asserted by length rather than by
 // CONVERT: msodbcsql declares a real image, and the server refuses an explicit
 // image -> varchar conversion (error 529).
-ODBC_TEST_F(BinaryConversionLiveTest, ImageParamCarriesItsValue) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, ImageParamCarriesItsValue,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("4", DataLengthOfBoundParam({0xDE, 0xAD, 0xBE, 0xEF}, SQL_LONGVARBINARY, 16));
 }
 
 // image is the one binding whose declared type is unbounded while its enforced
 // bound is not, so both halves of the overflow rule need asserting on it
 // separately from binary and varbinary.
-ODBC_TEST_F(BinaryConversionLiveTest, ImageParamIsStillBoundedByColumnSize) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, ImageParamIsStillBoundedByColumnSize,
+                  odbc_concurrency::kAllModes) {
     // Zero overflow trims rather than reaching the server.
     EXPECT_EQ("2", DataLengthOfBoundParam({1, 2, 0, 0, 0}, SQL_LONGVARBINARY, 2));
 
@@ -239,7 +252,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, ImageParamIsStillBoundedByColumnSize) {
 
 // And past the 8000-byte varbinary(n) ceiling image is genuinely unbounded, so a
 // large ColumnSize carries a large value rather than capping it.
-ODBC_TEST_F(BinaryConversionLiveTest, ImageParamCarriesValuesPastTheNonMaxCeiling) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, ImageParamCarriesValuesPastTheNonMaxCeiling,
+                  odbc_concurrency::kAllModes) {
     std::vector<SQLCHAR> value(9000, 0xEE);
     EXPECT_EQ("9000", DataLengthOfBoundParam(value, SQL_LONGVARBINARY, 20000));
 }
@@ -247,7 +261,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, ImageParamCarriesValuesPastTheNonMaxCeilin
 // 8000 is the last accepted ColumnSize for varbinary; one past it is HY104 at
 // bind on both drivers, so `variable_length`'s widen-to-max branch is defence in
 // depth rather than a reachable path. 0 remains the way to ask for max.
-ODBC_TEST_F(BinaryConversionLiveTest, ColumnSizeAtTheNonMaxBoundary) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, ColumnSizeAtTheNonMaxBoundary,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("0102", HexOfBoundParam({1, 2}, SQL_VARBINARY, 8000));
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -263,7 +278,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, ColumnSizeAtTheNonMaxBoundary) {
 // The buffer stays bound and only the indicator changes - the shape msodbcsql's
 // own regression for a NULL binary parameter uses (BindPara.CPP:3102). A NULL
 // is typed from ParameterType alone, so it must still declare varbinary(4).
-ODBC_TEST_F(BinaryConversionLiveTest, NullIndicatorOnABoundBufferSendsNull) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, NullIndicatorOnABoundBufferSendsNull,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(16), DATALENGTH(?))"), SQL_HANDLE_STMT,
                   stmt_);
     bytes_ = {0xAA, 0xBB};
@@ -284,7 +300,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, NullIndicatorOnABoundBufferSendsNull) {
 
 // Re-executing with a longer value against the same declaration must re-run the
 // overflow check rather than reuse the previous verdict.
-ODBC_TEST_F(BinaryConversionLiveTest, RebindingChangesTheTruncationVerdict) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, RebindingChangesTheTruncationVerdict,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindBytes({1, 2}, SQL_VARBINARY, 2), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -307,7 +324,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, RebindingChangesTheTruncationVerdict) {
 
 // Two binary parameters with different declarations in one statement, so a
 // per-parameter length cannot be leaking from one slot into the other.
-ODBC_TEST_F(BinaryConversionLiveTest, TwoBinaryParamsKeepSeparateDeclarations) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, TwoBinaryParamsKeepSeparateDeclarations,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"
                           " + '|' + CONVERT(VARCHAR(32), ?, 2)"),
                   SQL_HANDLE_STMT, stmt_);
@@ -336,7 +354,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, TwoBinaryParamsKeepSeparateDeclarations) {
 // Runs on both legs: msodbcsql applies the same cbMaxPrec bound and
 // CheckTrailingZeros rule to each SQLPutData call, accumulating
 // cbDataSentToServer across them (sqlccmd.cpp:11192-11218).
-ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -358,7 +377,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsReje
 // The other half of the rule: an overflow made only of the pad byte is dropped
 // rather than reported, so the value still lands trimmed to ColumnSize. This is
 // the streamed counterpart of BinaryColumnSizeTrimsZeroOverflow.
-ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionTrimsZeroOverflowToColumnSize) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, DataAtExecutionTrimsZeroOverflowToColumnSize,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -384,7 +404,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionTrimsZeroOverflowToColumnSi
 // The bound is against the accumulated value, not each chunk. Both chunks below
 // fit ColumnSize on their own; only their total exceeds it, which is the case a
 // per-chunk check would pass.
-ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionColumnSizeSpansChunks) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, DataAtExecutionColumnSizeSpansChunks,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -408,7 +429,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionColumnSizeSpansChunks) {
 
 // A max declaration has no length to enforce, so a streamed value of any size
 // still goes out whole. ColumnSize 0 is how SQLDescribeParam reports one.
-ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -436,7 +458,8 @@ ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded) 
 // whole when SQLParamData closes the parameter, the branch msodbcsql serves
 // with WriteToExtBuffer (sqlccmd.cpp:4913). The zero padding to the declared
 // width is what proves it went out as `binary(4)` rather than a `max`.
-ODBC_TEST_F(BinaryConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredBinary) {
+ODBC_TEST_F_MODES(BinaryConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredBinary,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
