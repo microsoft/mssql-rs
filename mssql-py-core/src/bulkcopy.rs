@@ -2564,7 +2564,11 @@ mod tests {
                             let input = format!(
                                 "2024-07-01T12:00:00.1234567{sign}{hour:02}:{minute:02}:{second:02}"
                             );
-                            let expected = datetime.call_method1("fromisoformat", (&input,));
+                            // Python 3.10 rejects seven digits; this oracle only supplies the offset.
+                            let reference = format!(
+                                "2024-07-01T12:00:00.123456{sign}{hour:02}:{minute:02}:{second:02}"
+                            );
+                            let expected = datetime.call_method1("fromisoformat", (&reference,));
                             for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
                                 let actual = convert(&input, sql_type, 7);
                                 let Ok(expected) = &expected else {
