@@ -14,7 +14,7 @@ use crate::core::TdsResult;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use tracing::{debug, info};
-use windows::Win32::Foundation::{ERROR_SUCCESS, HMODULE};
+use windows::Win32::Foundation::{ERROR_SUCCESS, FILETIME, HMODULE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::core::{PCWSTR, PWSTR};
 
@@ -26,41 +26,79 @@ const LOCALDB_MAX_SQLCONNECTION_BUFFER_SIZE: usize = 260;
 #[allow(dead_code)] // Defined for completeness alongside the LocalDB API bindings
 const LOCALDB_VERSION_11_0: u32 = 0x0B000000;
 
-/// LocalDB instance information structure
+/// Maximum length of a LocalDB instance name (in characters, without the terminator).
+const MAX_LOCALDB_INSTANCE_NAME_LENGTH: usize = 128;
+
+/// Maximum length of a string SID (in characters, without the terminator).
+const MAX_STRING_SID_LENGTH: usize = 186;
+
+/// LocalDB instance information, as `LocalDBInstanceInfo` in `msodbcsql.h`.
+/// `LocalDBGetInstanceInfo` accepts only the size of a version of this struct
+/// it knows, so the layout must match the header field for field.
 #[repr(C)]
 #[derive(Debug)]
+#[allow(dead_code)] // Fields mirror the C layout; only some are read.
 pub(crate) struct LocalDBInstanceInfo {
-    /// Size of the LocalDBInstanceInfo struct
+    /// cbLocalDBInstanceInfoSize: size of this struct
     cb_size: u32,
-    /// Instance state
-    instance_state: u32,
-    /// Named pipe to use to communicate with the instance
-    ws_connection: [u16; LOCALDB_MAX_SQLCONNECTION_BUFFER_SIZE],
+    /// wszInstanceName
+    instance_name: [u16; MAX_LOCALDB_INSTANCE_NAME_LENGTH + 1],
+    /// bExists: the instance files exist on disk
+    exists: i32,
+    /// bConfigurationCorrupted
+    configuration_corrupted: i32,
+    /// bIsRunning: the instance is running at the moment
+    is_running: i32,
+    /// dwMajor, dwMinor, dwBuild, dwRevision: the LocalDB version of the instance
+    major: u32,
+    minor: u32,
+    build: u32,
+    revision: u32,
+    /// ftLastStartDateUTC
+    last_start_utc: FILETIME,
+    /// wszConnection: the TDS named pipe of the instance, when it is running
+    connection: [u16; LOCALDB_MAX_SQLCONNECTION_BUFFER_SIZE],
+    /// bIsShared
+    is_shared: i32,
+    /// wszSharedInstanceName
+    shared_instance_name: [u16; MAX_LOCALDB_INSTANCE_NAME_LENGTH + 1],
+    /// wszOwnerSID
+    owner_sid: [u16; MAX_STRING_SID_LENGTH + 1],
+    /// bIsAutomatic
+    is_automatic: i32,
 }
+
+// sizeof(LocalDBInstanceInfo) in msodbcsql.h (pack 8, no member wider than 4 bytes).
+const _: () = assert!(std::mem::size_of::<LocalDBInstanceInfo>() == 1460);
 
 impl Default for LocalDBInstanceInfo {
     fn default() -> Self {
         Self {
             cb_size: std::mem::size_of::<LocalDBInstanceInfo>() as u32,
-            instance_state: 0,
-            ws_connection: [0; LOCALDB_MAX_SQLCONNECTION_BUFFER_SIZE],
+            instance_name: [0; MAX_LOCALDB_INSTANCE_NAME_LENGTH + 1],
+            exists: 0,
+            configuration_corrupted: 0,
+            is_running: 0,
+            major: 0,
+            minor: 0,
+            build: 0,
+            revision: 0,
+            last_start_utc: FILETIME::default(),
+            connection: [0; LOCALDB_MAX_SQLCONNECTION_BUFFER_SIZE],
+            is_shared: 0,
+            shared_instance_name: [0; MAX_LOCALDB_INSTANCE_NAME_LENGTH + 1],
+            owner_sid: [0; MAX_STRING_SID_LENGTH + 1],
+            is_automatic: 0,
         }
     }
 }
 
-/// LocalDB instance states
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstanceState {
-    /// Instance exists and is running
-    Running = 1,
-    /// Instance exists but is stopped
-    Stopped = 2,
-}
+// The LocalDB API functions are __cdecl in msodbcsql.h; "C" differs from
+// "system" (stdcall) on 32-bit x86 only.
 
 /// Type alias for LocalDBStartInstance function pointer
 #[allow(non_snake_case)]
-type LocalDBStartInstanceFn = unsafe extern "system" fn(
+type LocalDBStartInstanceFn = unsafe extern "C" fn(
     pwsz_instance: PCWSTR,
     dw_flags: u32,
     wszSqlConnection: PWSTR,
@@ -69,7 +107,7 @@ type LocalDBStartInstanceFn = unsafe extern "system" fn(
 
 /// Type alias for LocalDBGetInstanceInfo function pointer
 #[allow(non_snake_case)]
-type LocalDBGetInstanceInfoFn = unsafe extern "system" fn(
+type LocalDBGetInstanceInfoFn = unsafe extern "C" fn(
     pwszInstanceName: PCWSTR,
     pInstanceInfo: *mut LocalDBInstanceInfo,
     dwInstanceInfoSize: u32,
@@ -339,8 +377,8 @@ impl LocalDBApi {
     /// * `instance_name` - The name of the LocalDB instance
     ///
     /// # Returns
-    /// LocalDBInstanceInfo structure containing instance state and connection string
-    #[allow(dead_code)]
+    /// LocalDBInstanceInfo structure: whether the instance is running and, if
+    /// so, its named pipe
     pub fn get_instance_info(&self, instance_name: &str) -> TdsResult<LocalDBInstanceInfo> {
         debug!("Getting LocalDB instance info: {}", instance_name);
 
@@ -365,9 +403,9 @@ impl LocalDBApi {
             }
 
             debug!(
-                "LocalDB instance info retrieved: state={}, connection={}",
-                instance_info.instance_state,
-                from_wide_string(&instance_info.ws_connection)
+                "LocalDB instance info retrieved: running={}, connection={}",
+                instance_info.is_running != 0,
+                from_wide_string(&instance_info.connection)
             );
 
             Ok(instance_info)
@@ -387,22 +425,14 @@ impl LocalDBApi {
     /// The named pipe path to connect to
     pub fn resolve_instance(&self, instance_name: &str) -> TdsResult<String> {
         // Start the instance (will return existing pipe if already running)
-        let pipe_name = self.start_instance(instance_name)?;
-
-        // The pipe name from LocalDB API uses "np:" prefix, but we need the raw pipe path
-        // Format: "np:\\\\.\\.\\pipe\\LOCALDB#<hash>\\tsql\\query"
-        // We need: "\\\\.\\.\\pipe\\LOCALDB#<hash>\\tsql\\query"
-        let cleaned_pipe_name = pipe_name
-            .strip_prefix("np:")
-            .map(|s| s.to_string())
-            .unwrap_or(pipe_name);
+        let pipe_name = strip_np_prefix(self.start_instance(instance_name)?);
 
         info!(
             "LocalDB instance '{}' resolved to pipe: {}",
-            instance_name, cleaned_pipe_name
+            instance_name, pipe_name
         );
 
-        Ok(cleaned_pipe_name)
+        Ok(pipe_name)
     }
 }
 
@@ -429,10 +459,49 @@ fn from_wide_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
+/// The LocalDB API gives the pipe as "np:\\.\pipe\LOCALDB#<hash>\tsql\query";
+/// the transport wants the raw pipe path, without "np:".
+fn strip_np_prefix(pipe_name: String) -> String {
+    pipe_name
+        .strip_prefix("np:")
+        .map(|s| s.to_string())
+        .unwrap_or(pipe_name)
+}
+
+/// The pipe of an instance `info` reports running, without its "np:" prefix,
+/// or `None` if it is not running or reports no pipe, and so has to be started.
+fn running_pipe(info: &LocalDBInstanceInfo) -> Option<String> {
+    if info.is_running == 0 {
+        return None;
+    }
+    let pipe_name = strip_np_prefix(from_wide_string(&info.connection));
+    (!pipe_name.is_empty()).then_some(pipe_name)
+}
+
+/// The pipe of `instance_name` if it is already running, asked of
+/// LocalDBGetInstanceInfo, which only reads the instance's state. `None` if
+/// the instance is not running, or its state could not be read.
+fn running_instance_pipe(instance_name: &str) -> TdsResult<Option<String>> {
+    let api = LocalDBApi::load()?;
+    match api.get_instance_info(instance_name) {
+        Ok(info) => Ok(running_pipe(&info)),
+        Err(error) => {
+            debug!("LocalDB instance '{instance_name}' state unavailable: {error}");
+            Ok(None)
+        }
+    }
+}
+
 /// Resolve a LocalDB instance name to a named pipe path
 ///
 /// This is the public API function that can be called from the transport layer.
-/// It loads the LocalDB API, resolves the instance, and returns the pipe path.
+///
+/// An instance that is already running resolves on the current thread:
+/// LocalDBGetInstanceInfo only reads its state and pipe, so a connection to a
+/// running instance takes no blocking-pool thread. Otherwise the instance has
+/// to be started, and LocalDBStartInstance, which can take a while or stall,
+/// runs on the blocking pool, so the login timeout and cancellation still
+/// apply. It also reports the error for an instance that does not exist.
 ///
 /// # Arguments
 /// * `instance_name` - The LocalDB instance name (e.g., "MSSQLLocalDB", "v11.0")
@@ -442,8 +511,21 @@ fn from_wide_string(buffer: &[u16]) -> String {
 pub async fn resolve_localdb_instance(instance_name: &str) -> TdsResult<String> {
     info!("Resolving LocalDB instance: {}", instance_name);
 
-    // LocalDBStartInstance can take a while, or stall, so it runs off the
-    // runtime thread.
+    if let Some(pipe_name) = running_instance_pipe(instance_name)? {
+        info!(
+            "LocalDB instance '{}' is running; resolved to pipe: {}",
+            instance_name, pipe_name
+        );
+        return Ok(pipe_name);
+    }
+
+    info!(
+        "LocalDB instance '{}' is not running; starting it on a blocking thread",
+        instance_name
+    );
+    // LocalDBApi holds the module handle, which is not Send, so the blocking
+    // thread loads it again; the DLL is already loaded, and this is small next
+    // to starting an instance.
     let instance_name = instance_name.to_string();
     off_runtime_thread(move || {
         let api = LocalDBApi::load()?;
@@ -455,6 +537,8 @@ pub async fn resolve_localdb_instance(instance_name: &str) -> TdsResult<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_load_localdb_api() {
@@ -507,5 +591,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn instance_info(is_running: bool, connection: &str) -> LocalDBInstanceInfo {
+        let mut info = LocalDBInstanceInfo {
+            is_running: is_running as i32,
+            ..Default::default()
+        };
+        let wide: Vec<u16> = connection.encode_utf16().collect();
+        info.connection[..wide.len()].copy_from_slice(&wide);
+        info
+    }
+
+    #[test]
+    fn running_pipe_of_running_instance_drops_np_prefix() {
+        let info = instance_info(true, r"np:\\.\pipe\LOCALDB#1A2B3C4D\tsql\query");
+        assert_eq!(
+            running_pipe(&info).as_deref(),
+            Some(r"\\.\pipe\LOCALDB#1A2B3C4D\tsql\query")
+        );
+    }
+
+    #[test]
+    fn running_pipe_keeps_pipe_without_np_prefix() {
+        let info = instance_info(true, r"\\.\pipe\LOCALDB#1A2B3C4D\tsql\query");
+        assert_eq!(
+            running_pipe(&info).as_deref(),
+            Some(r"\\.\pipe\LOCALDB#1A2B3C4D\tsql\query")
+        );
+    }
+
+    #[test]
+    fn running_pipe_none_for_running_instance_without_pipe() {
+        assert_eq!(running_pipe(&instance_info(true, "")), None);
+        assert_eq!(running_pipe(&instance_info(true, "np:")), None);
+    }
+
+    #[test]
+    fn running_pipe_none_for_stopped_instance() {
+        let info = instance_info(false, r"np:\\.\pipe\LOCALDB#1A2B3C4D\tsql\query");
+        assert_eq!(running_pipe(&info), None);
+    }
+
+    /// A current-thread runtime that counts the threads it starts, which are
+    /// its blocking-pool threads.
+    fn counting_runtime() -> (tokio::runtime::Runtime, Arc<AtomicUsize>) {
+        let started = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&started);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .on_thread_start(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .build()
+            .expect("runtime");
+        (runtime, started)
+    }
+
+    #[test]
+    fn test_running_instance_resolves_without_blocking_thread() {
+        // Only on machines with LocalDB installed; starting the instance
+        // first makes it the running case.
+        let Ok(api) = LocalDBApi::load() else {
+            return;
+        };
+        let started_pipe = api
+            .resolve_instance("MSSQLLocalDB")
+            .expect("MSSQLLocalDB should start where LocalDB is installed");
+
+        let info = api
+            .get_instance_info("MSSQLLocalDB")
+            .expect("LocalDBGetInstanceInfo should accept this struct's size");
+        assert_eq!(running_pipe(&info), Some(started_pipe.clone()));
+
+        let (runtime, started) = counting_runtime();
+        let pipe = runtime
+            .block_on(resolve_localdb_instance("MSSQLLocalDB"))
+            .expect("resolve running MSSQLLocalDB");
+        assert_eq!(pipe, started_pipe);
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_unknown_instance_fails_as_starting_it_does() {
+        let Ok(api) = LocalDBApi::load() else {
+            return;
+        };
+        let name = format!("MssqlRsNoSuchInstance{}", std::process::id());
+        // LocalDBGetInstanceInfo succeeds for an unknown name, reporting it
+        // neither existing nor running, so it takes the start path.
+        let info = api.get_instance_info(&name);
+        if let Ok(info) = &info {
+            assert_eq!(info.exists, 0);
+        }
+        assert_eq!(info.ok().and_then(|info| running_pipe(&info)), None);
+        let expected = api
+            .resolve_instance(&name)
+            .expect_err("unknown instance should not start")
+            .to_string();
+
+        let (runtime, started) = counting_runtime();
+        let error = runtime
+            .block_on(resolve_localdb_instance(&name))
+            .expect_err("unknown instance should not resolve");
+        assert_eq!(error.to_string(), expected);
+        assert!(started.load(Ordering::SeqCst) > 0);
     }
 }
