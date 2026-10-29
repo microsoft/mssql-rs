@@ -20,7 +20,8 @@
 # test executables and PDBs, in the OdbcMtDumps_Windows artifact; Linux legs run
 # each entry under gdb and print every thread's stack into the test log, from a
 # release driver built with symbols and line tables. Test results are published
-# per leg.
+# per leg. A manual run can also enable driver tracing (driverTrace), published
+# as the OdbcDriverTraces_* artifacts.
 #
 # Plan: mssql-odbc/docs/multithreaded-testing-plan.md, "Stress Profiles". The
 # schedule targets GitHub main; this definition lives only in the mssql-rs
@@ -64,6 +65,19 @@ parameters:
   displayName: Agent image for x64 Linux jobs
   type: string
   default: RUST-AZL3
+
+# Off on scheduled runs: tracing adds per-call work that changes timing, so it
+# can hide a race or fail a timing assertion. Turn it on for a manual rerun of a
+# failure that needs the driver's side. Traces can contain SQL text.
+- name: driverTrace
+  displayName: Driver trace (manual diagnosis only; changes timing)
+  type: boolean
+  default: false
+
+- name: driverTraceLevel
+  displayName: Driver trace filter (MSSQL_TDS_TRACE_LEVEL)
+  type: string
+  default: warn,mssqlodbc=debug
 
 variables:
   # Same pinned reference driver as validation-pipeline.yml.
@@ -135,6 +149,8 @@ stages:
       mtProfile: $(odbcMtProfile)
       retries: 0
       timeoutInMinutes: 120
+      driverTrace: ${{ parameters.driverTrace }}
+      driverTraceLevel: ${{ parameters.driverTraceLevel }}
       matrix:
         Ubuntu24:
           container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
@@ -149,6 +165,8 @@ stages:
       mtProfile: $(odbcMtProfile)
       retries: 0
       timeoutInMinutes: 120
+      driverTrace: ${{ parameters.driverTrace }}
+      driverTraceLevel: ${{ parameters.driverTraceLevel }}
       matrix:
         Alpine3_21:
           container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
@@ -196,6 +214,11 @@ stages:
       env:
         SQL_PASSWORD: $(SQL_PASSWORD)
         RUST_BACKTRACE: full
+        ${{ if parameters.driverTrace }}:
+          # Read only by the Rust driver, so the msodbcsql leg is unaffected.
+          MSSQL_TDS_TRACE: 'true'
+          MSSQL_TDS_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
+          MSSQL_TDS_TRACE_DIR: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
     - task: PublishTestResults@2
       displayName: Publish ODBC stress results (Windows)
       condition: succeededOrFailed()
@@ -218,3 +241,11 @@ stages:
       inputs:
         targetPath: $(Build.ArtifactStagingDirectory)/odbc-mt-dumps
         artifact: OdbcMtDumps_Windows_$(System.JobAttempt)
+    - ${{ if parameters.driverTrace }}:
+      - task: PublishPipelineArtifact@1
+        displayName: Publish driver traces
+        condition: always()
+        continueOnError: true
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
+          artifact: OdbcDriverTraces_Windows_$(System.JobAttempt)

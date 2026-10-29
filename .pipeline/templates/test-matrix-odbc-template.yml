@@ -17,6 +17,10 @@ parameters:
   mtProfile: 'pr'
   # ctest until-pass retries; the stress profiles ignore it.
   retries: 3
+  # Rust driver tracing into the published OdbcDriverTraces_* artifact. Off by
+  # default: it changes timing (see odbc-stress-pipeline.yml).
+  driverTrace: false
+  driverTraceLevel: 'warn,mssqlodbc=debug'
   jobDisplayName: 'ODBC e2e Linux amd64'
   timeoutInMinutes: 60
 
@@ -111,6 +115,14 @@ jobs:
             exit 1
           fi
 
+          trace_args=()
+          if [ -n "${ODBC_DRIVER_TRACE_LEVEL:-}" ]; then
+            trace_args=(-e "MSSQL_TDS_TRACE=true"
+                        -e "MSSQL_TDS_TRACE_LEVEL=$ODBC_DRIVER_TRACE_LEVEL"
+                        -e "MSSQL_TDS_TRACE_DIR=/workspace/odbc-driver-traces")
+            echo "Driver tracing on: MSSQL_TDS_TRACE_LEVEL=$ODBC_DRIVER_TRACE_LEVEL"
+          fi
+
           bash .pipeline/scripts/docker-cargo-run.sh --rm \
             -v "$PWD:/workspace" \
             -w /workspace \
@@ -121,6 +133,7 @@ jobs:
             -e "ODBC_E2E_RETRIES=${{ parameters.retries }}" \
             -e "ODBC_E2E_MT_PROFILE=${{ parameters.mtProfile }}" \
             -e "RUST_BACKTRACE=full" \
+            "${trace_args[@]}" \
             --network testnet \
             $(container) /workspace/scripts/dockerentry/$(entry)
         workingDirectory: "$(Build.SourcesDirectory)"
@@ -130,6 +143,8 @@ jobs:
           SQL_PASSWORD: $(SQL_PASSWORD)
           CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
           CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+          ${{ if eq(parameters.driverTrace, true) }}:
+            ODBC_DRIVER_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
       - task: PublishTestResults@2
         condition: succeededOrFailed()
         displayName: "Publish ODBC e2e results"
@@ -137,3 +152,20 @@ jobs:
           testResultsFormat: "JUnit"
           testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
           testRunTitle: $(System.PhaseName)
+      - ${{ if eq(parameters.driverTrace, true) }}:
+        # The container writes the traces as root with mode 0600.
+        - script: |
+            if [ -d odbc-driver-traces ]; then
+              sudo chown -R "$(id -u):$(id -g)" odbc-driver-traces
+            fi
+          workingDirectory: "$(Build.SourcesDirectory)"
+          displayName: Make driver traces readable
+          condition: always()
+          continueOnError: true
+        - task: PublishPipelineArtifact@1
+          displayName: Publish driver traces
+          condition: always()
+          continueOnError: true
+          inputs:
+            targetPath: $(Build.SourcesDirectory)/odbc-driver-traces
+            artifact: OdbcDriverTraces_Linux${{ parameters.nameSuffix }}_$(System.JobName)_$(System.JobAttempt)
