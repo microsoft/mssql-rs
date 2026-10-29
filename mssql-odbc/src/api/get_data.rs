@@ -1015,13 +1015,27 @@ fn finish_get_data(
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
-    if ready {
+    let deferred_array_update = if ready {
         stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
-    }
+        stmt_state.deferred_array_update.take()
+    } else {
+        None
+    };
     drop(stmt_state);
     if !ready {
         return rc;
     }
+    // A buffered fetch deferred the set's completion; msodbcsql reads its
+    // DONE once SQLGetData reaches the last column (measured on 18.6.2.1).
+    let rc = if deferred_array_update.is_some()
+        && super::execute::publish_deferred_parameter_array(stmt, deferred_array_update)
+            != SQL_SUCCESS
+        && rc == SQL_SUCCESS
+    {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        rc
+    };
 
     let dbc = stmt.parent_dbc();
     let Ok(mut dbc_state) = dbc.inner.lock() else {
@@ -1040,8 +1054,8 @@ fn finish_get_data(
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    let Ok((has_server_info, _, cancelled)) =
-        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false)
+    let Ok((has_server_info, _, cancelled, _)) =
+        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, false, |_| false)
     else {
         return SQL_ERROR;
     };

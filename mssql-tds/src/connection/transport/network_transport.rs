@@ -3183,6 +3183,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         self.known_dead
     }
 
+    fn response_fully_received(&self) -> bool {
+        self.tds_read_buffer.end_of_message
+    }
+
     fn mark_known_dead(&mut self) {
         self.known_dead = true;
     }
@@ -4210,6 +4214,35 @@ pub(crate) mod tests {
 
         assert!(!transport.try_read_tds_packet().unwrap());
         assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"only");
+    }
+
+    /// Statement close skips ATTENTION only once the response's final packet
+    /// has arrived; a new request's reader reset clears that knowledge.
+    #[tokio::test]
+    async fn response_fully_received_tracks_the_framed_end_of_message() {
+        use crate::connection::transport::tds_transport::TdsTransport;
+
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        assert!(!TdsTransport::response_fully_received(&transport));
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+        assert!(!TdsTransport::response_fully_received(&transport));
+        server
+            .write_all(&tabular_packet(b"last", true))
+            .await
+            .unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert!(TdsTransport::response_fully_received(&transport));
+        transport.tds_read_buffer.consume_bytes(9).unwrap();
+        TdsTransport::reset_reader(&mut transport);
+        assert!(!TdsTransport::response_fully_received(&transport));
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.

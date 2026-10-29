@@ -2061,6 +2061,13 @@ impl TdsClient {
             .map(|row| row.row_index)
     }
 
+    /// Whether the current response is a row-preserving prepared batch whose
+    /// completion records [`take_prepared_batch_results`](Self::take_prepared_batch_results)
+    /// can report.
+    pub fn has_prepared_batch(&self) -> bool {
+        self.prepared_batch.is_some()
+    }
+
     fn observe_prepared_batch_done(&mut self, token: &Tokens) -> TdsResult<()> {
         let Some(batch) = self.prepared_batch.as_mut() else {
             return Ok(());
@@ -2113,17 +2120,56 @@ impl TdsClient {
     async fn advance_prepared_batch(&mut self) -> TdsResult<StatementResult> {
         let result = self.read_prepared_batch_result().await;
         if let Err(error) = &result {
-            self.current_metadata = None;
-            self.current_result_set_has_been_read_till_end = true;
-            self.execution_context.set_has_open_batch(false);
-            self.prepared_batch = None;
-            if !matches!(
-                error,
-                crate::error::Error::TimeoutError(_)
-                    | crate::error::Error::OperationCancelledError(_)
-            ) {
-                self.retire_after_failed_drain(error);
+            self.abandon_prepared_batch(error);
+        }
+        result
+    }
+
+    fn abandon_prepared_batch(&mut self, error: &crate::error::Error) {
+        self.current_metadata = None;
+        self.current_result_set_has_been_read_till_end = true;
+        self.execution_context.set_has_open_batch(false);
+        self.prepared_batch = None;
+        if !matches!(
+            error,
+            crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
+        ) {
+            self.retire_after_failed_drain(error);
+        }
+    }
+
+    /// Reads a batched RPC's trailer after its row set, stopping at that RPC's
+    /// DONE so the next parameter set's results stay unread. msodbcsql's
+    /// `OnDone` records the set's status at the same token. Anything other than
+    /// one RETURNSTATUS and that DONE is parked for the next advance.
+    async fn settle_prepared_batch_terminator(
+        &mut self,
+        parser_context: &ParserContext,
+    ) -> TdsResult<()> {
+        self.current_result_ended_with_done_in_proc = false;
+        let result = async {
+            let mut token = self.next_response_token(parser_context).await?;
+            if let Tokens::ReturnStatus(return_status) = &token {
+                self.last_return_status = ReturnStatus::Received(return_status.value);
+                token = self.next_response_token(parser_context).await?;
             }
+            match token {
+                Tokens::Done(_) | Tokens::DoneProc(_) => {
+                    if self
+                        .prepared_batch
+                        .as_ref()
+                        .is_some_and(|batch| batch.current.is_none())
+                    {
+                        self.apply_result_boundary(ResultBoundaryKind::End);
+                    }
+                }
+                other => self.parked_token = Some(Box::new(other)),
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &result {
+            self.abandon_prepared_batch(error);
         }
         result
     }
@@ -5996,7 +6042,7 @@ impl TdsClient {
     /// the connection remains reusable.
     async fn settle_rpc_terminator(&mut self, parser_context: &ParserContext) -> TdsResult<()> {
         if self.prepared_batch.is_some() {
-            return Ok(());
+            return self.settle_prepared_batch_terminator(parser_context).await;
         }
         let mut processing_error = None;
         let mut loop_count = 0u32;
@@ -8881,6 +8927,36 @@ impl TdsClient {
         }
     }
 
+    /// Abandons an outstanding response the way an ODBC statement close does.
+    ///
+    /// Unlike [`close_query`](Self::close_query), the unread tail is discarded,
+    /// not reported: its rows, messages, statement errors, and parameter-set
+    /// completions never reach the caller, and messages captured before this
+    /// call are kept. If the response's final packet has already arrived the
+    /// server has no work left, so the buffered tail is parsed locally without
+    /// a round trip. Otherwise ATTENTION stops the remaining work, as in
+    /// [`cancel_query`](Self::cancel_query); `timeout_secs` bounds that
+    /// settlement.
+    pub async fn abandon_query(&mut self, timeout_secs: u32) -> TdsResult<()> {
+        let reported = self.info_messages.len();
+        let result = if !self.has_open_batch() || self.transport.response_fully_received() {
+            self.close_query().await
+        } else {
+            self.cancel_query(timeout_secs).await
+        };
+        self.info_messages.truncate(reported);
+        self.prepared_batch = None;
+        match result {
+            // A statement error leaves the reader synchronized after the drain.
+            Err(crate::error::Error::SqlServerError { .. })
+                if !self.transport.connection_known_dead() =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Drains all remaining result sets and resets the client for the next request.
     ///
     /// Any unread rows and result sets are consumed so the TDS stream is left in
@@ -8965,7 +9041,7 @@ impl TdsClient {
         // trailing token stream above can surface INFO/warning messages (e.g. a
         // PRINT after the last result set), and the caller drains them via
         // `take_info_messages()` after this returns (see the ODBC
-        // `drain_and_release` path). Clearing them here would discard them.
+        // `abandon_and_release` path). Clearing them here would discard them.
         // The sp_prepexec @handle, if any, was captured during the drain above
         // (see push_return_value) and survives this clear.
         self.current_metadata = None;
@@ -9758,6 +9834,9 @@ mod tests {
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
+        /// Reported by `response_fully_received`, as if the response's final
+        /// packet had been framed.
+        response_complete: bool,
         receive_error: Option<crate::error::Error>,
         sync_header_available: bool,
         /// Returned by the next `try_receive_row_header`, as if the buffered
@@ -9793,6 +9872,7 @@ mod tests {
                 send_delay: None,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
+                response_complete: false,
                 receive_error: None,
                 sync_header_available: false,
                 sync_header_error: None,
@@ -10079,6 +10159,9 @@ mod tests {
         }
         fn connection_known_dead(&self) -> bool {
             self.known_dead
+        }
+        fn response_fully_received(&self) -> bool {
+            self.response_complete
         }
         fn mark_known_dead(&mut self) {
             self.known_dead = true;
@@ -18510,6 +18593,185 @@ mod tests {
         );
         assert!(!client.has_open_batch());
         assert!(!client.is_connection_dead());
+    }
+
+    /// AB#49495: an exhausted row set settles its RPC's RETURNSTATUS and DONE,
+    /// completing that set without consuming the next set's results.
+    #[tokio::test]
+    async fn prepared_batch_row_trailer_completes_its_set_without_reading_the_next() {
+        let status = || Tokens::ReturnStatus(crate::token::tokens::ReturnStatusToken { value: 0 });
+        let tokens = vec![
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            status(),
+            batch_done_proc(true, false),
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            status(),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((2, Vec::new())), Ok((5, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        let indices = |result: PreparedBatchResult| {
+            result
+                .rows
+                .iter()
+                .map(|row| row.row_index)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        let first = client.take_prepared_batch_results().unwrap();
+        assert!(!first.complete);
+        assert_eq!(indices(first), [2]);
+        assert_eq!(client.current_parameter_set(), Some(5));
+        assert!(client.has_open_batch());
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(
+            client
+                .take_prepared_batch_results()
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(client.complete_current_result().await.unwrap());
+        let last = client.take_prepared_batch_results().unwrap();
+        assert!(last.complete);
+        assert_eq!(indices(last), [5]);
+        assert!(!client.has_open_batch());
+    }
+
+    /// A token other than RETURNSTATUS or the RPC's DONE stays unread for
+    /// navigation, which completes the set when it reaches that DONE.
+    #[tokio::test]
+    async fn prepared_batch_row_trailer_parks_other_tokens_for_advance() {
+        let tokens = vec![
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            info_token(50000, 10, "after the rows"),
+            batch_done_proc(true, false),
+            empty_col_metadata(),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((0, Vec::new())), Ok((1, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(
+            client
+                .take_prepared_batch_results()
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(client.current_parameter_set(), Some(0));
+        assert!(client.info_messages().is_empty());
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        let first = client.take_prepared_batch_results().unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.rows[0].row_index, 0);
+        assert_eq!(client.info_messages()[0].message, "after the rows");
+    }
+
+    /// msodbcsql's statement close flushes a fully received response without
+    /// ATTENTION and reports none of the tail's messages or errors.
+    #[tokio::test]
+    async fn abandon_query_discards_a_received_tail_without_attention() {
+        let mut transport = TestTransport::with_tokens(vec![
+            info_token(50000, 10, "before close"),
+            empty_col_metadata(),
+            done_count(CurrentCommand::Select, 0, true),
+            info_token(50000, 10, "tail message"),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "tail error".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+        transport.response_complete = true;
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        assert_eq!(
+            client.execute("SELECT 1".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+
+        client.abandon_query(1).await.unwrap();
+
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let messages: Vec<_> = client
+            .info_messages()
+            .iter()
+            .map(|message| message.message.as_str())
+            .collect();
+        assert_eq!(messages, ["before close"]);
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+    }
+
+    /// A prepared batch abandoned by close reports no completions for the sets
+    /// it discarded.
+    #[tokio::test]
+    async fn abandon_query_discards_unreported_parameter_set_completions() {
+        let mut transport = TestTransport::with_tokens(vec![
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ]);
+        transport.response_complete = true;
+        let mut client = create_test_client_with_transport(transport);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((0, Vec::new())), Ok((1, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        client.abandon_query(1).await.unwrap();
+        assert!(!client.has_prepared_batch());
+        assert!(client.take_prepared_batch_results().is_none());
+        assert!(!client.has_open_batch());
     }
 
     #[tokio::test]

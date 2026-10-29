@@ -64,17 +64,40 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
 }
 
 fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
-    // DESC locks must not nest beneath STMT, including the exhausted fast path.
-    let snapshot = snapshot_bound_params(stmt);
-    // Free any stale diagnostics and observe cursor state.
-    let (cursor_open, bound_params) = {
+    let deferred_array_update = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLMoreResults: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        // Unwrapped here, after `free_errors`, so both write-back sites below
-        // get the params and header from one snapshot without a fallback.
+        stmt_state.deferred_array_update.take()
+    };
+    // A buffered fetch deferred the current set's completion; msodbcsql reads
+    // its DONE while moving past the result, before the next one.
+    if deferred_array_update.is_none() {
+        return advance_results(statement_handle, stmt);
+    }
+    let array_rc = super::execute::publish_deferred_parameter_array(stmt, deferred_array_update);
+    let rc = advance_results(statement_handle, stmt);
+    match (array_rc, rc) {
+        (SQL_ERROR, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA) => SQL_ERROR,
+        (SQL_SUCCESS_WITH_INFO, SQL_SUCCESS | SQL_NO_DATA) => SQL_SUCCESS_WITH_INFO,
+        _ => rc,
+    }
+}
+
+/// The body of `SQLMoreResults` after its diagnostics are cleared.
+fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    // DESC locks must not nest beneath STMT, including the exhausted fast path.
+    let snapshot = snapshot_bound_params(stmt);
+    // Observe cursor state.
+    let (cursor_open, bound_params) = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLMoreResults: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        // Unwrapped here, after the caller's `free_errors`, so both write-back
+        // sites below get the params and header from one snapshot without a fallback.
         let Ok(bound_params) = snapshot else {
             post_sql_error(
                 &mut stmt_state,

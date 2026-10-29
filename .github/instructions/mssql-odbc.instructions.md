@@ -189,17 +189,22 @@ on the `master` branch.
   interrupted call. Cancelling a parked DAE sequence still clears its
   diagnostics before unwinding. An idle `SQLCancel` uses the shared
   `SQLFreeStmt(SQL_CLOSE)` cleanup and replaces stale diagnostics, appending
-  `01S05` only if close succeeds. Keep its cancellation fence through the drain;
-  do not re-enter `begin_operation` while holding that fence (AB#49386). Once
-  active-operation cancellation is ruled out, wait for brief statement-lock
-  holders rather than skipping idle cleanup on contention.
+  `01S05` only if close succeeds. Keep its cancellation fence through the
+  abandon; do not re-enter `begin_operation` while holding that fence
+  (AB#49386). Once active-operation cancellation is ruled out, wait for brief
+  statement-lock holders rather than skipping idle cleanup on contention.
   Snapshot exhaustion before resetting cursor state: an exhausted response
-  with no pending parameter-array completion must not claim the client again,
-  because a DBC-scoped call may already own it.
-  For an owned pending response, idle `SQLCancel` must send ATTENTION and settle
-  within the connection's cancellation budget, not let remaining server work
-  run during a normal drain. Use row-aware cancellation so partially read rows
-  and PLP values remain synchronized; test a delayed tail with a side effect.
+  must not claim the client again, because a DBC-scoped call may already own it.
+  Every statement close — `SQLFreeStmt(SQL_CLOSE)`, `SQLCloseCursor`, idle
+  `SQLCancel`, `SQL_DROP`, and the connection-scoped sweeps — abandons an owned
+  pending response the way msodbcsql's `Cancel` → `ProcessTDSStream(TDS_TIMEOUT)`
+  does (AB#49495): send ATTENTION and settle within the connection's
+  cancellation budget, never let remaining server work run during a drain. Skip
+  ATTENTION only when the response's final packet has already arrived. The
+  abandoned tail's rows, messages, errors, and parameter-set completions are
+  not reported; a diagnostic the cursor already read and deferred still is.
+  Use row-aware cancellation so partially read rows and PLP values remain
+  synchronized; test a delayed tail with a side effect.
   Discarding encrypted results must not resolve keys: a key-store provider can
   stall independently of the wire cancellation budget.
 - **A success code is a promise about the caller's buffer, so never report
@@ -604,6 +609,8 @@ For ODBC hot paths:
     every rowset. The independently mutable warning setting still follows the
     connection setter's statement fan-out.
   - Parameter-array rowsets remain visible in parameter-set order through
-    fetch and `SQLMoreResults`; defer final processed/status reporting until
-    each set completes, and drain unread results on cursor close without
-    re-executing the batch.
+    fetch and `SQLMoreResults`. Publish each set's status and the processed
+    count at the call where msodbcsql reads its RPC DONE; hold a completion
+    found by reading ahead of a buffered unbound row until the next fetch,
+    `SQLGetData` of the last column, or `SQLMoreResults`. Closing abandons
+    later sets, and any held completion, without reporting or re-executing them.

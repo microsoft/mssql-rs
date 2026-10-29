@@ -2381,8 +2381,9 @@ TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
 }
 
 // -------------------------------------------------------------------
-// 30. SQLMoreResults skips unread rows, and closing before the final
-// result releases the connection without executing any parameter set twice.
+// 30. SQLMoreResults skips unread rows, and closing before the final result
+// abandons the rest of the batch without executing any parameter set twice.
+// Every set here completes before the close, so all three rows exist.
 // -------------------------------------------------------------------
 TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
     ExecDirect("CREATE TABLE #pa_out3 (id int)");

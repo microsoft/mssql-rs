@@ -317,7 +317,9 @@ Measured 2026-10-08 on both drivers unless noted.
   keeping the idle-close contract deterministic on both drivers.
   Idle cancellation now abandons an owned pending response via ATTENTION,
   using `SQL_ATTR_CONNECTION_TIMEOUT` (zero selects 120 seconds) for settlement.
-  It does not change the normal `SQLFreeStmt(SQL_CLOSE)` drain. The mock tests
+  Since AB#49495 every statement close shares that path, including
+  `SQLFreeStmt(SQL_CLOSE)` and `SQLCloseCursor`; `CursorPhase::IdleClose` and
+  the live `CloseAbandonsDelayedBatchTail` case cover it. The mock tests
   hold back a response tail and DONE_ATTN independently, cover partially read
   PLP data, and verify failed settlement retires the connection. The live
   `IdleCancelAbandonsDelayedBatchTail` case checks that a five-second WAITFOR
@@ -343,12 +345,14 @@ Measured 2026-10-08 on both drivers unless noted.
   `SQLGetDiagRec` returned `SQL_NO_DATA`. The live fixture now asserts this
   DM result rather than accepting either success code; direct-entry Rust
   tests continue to require `SQL_SUCCESS_WITH_INFO` / `01S05`.
-  `ClosingFetchedParameterArrayPublishesCompletion` checks live close-time
-  status/count outputs for two parameter sets. The Rust close/cancel test
-  specifically models an exhausted wire with still-unpublished array results
-  using scripted tokens: removing the parameter-array exception makes its
-  output assertions fail. This state is modeled explicitly, since the current
-  public `SQLMoreResults` path publishes completion as it exhausts the batch.
+  `FetchingParameterSetsPublishesTheirCompletion` checks that each set's
+  status and the processed count are published when fetching reaches its RPC
+  DONE. `ClosingParameterArrayKeepsReachedSetStatuses` (AB#49495) closes or
+  cancels after each set boundary with bound, unbound, and `SQLGetData`
+  access and asserts both drivers leave the same outputs; `ClosingParameterArrayAbandonsUnreachedSets` checks that close and
+  cancel stop delayed sets without reporting them. The Rust test
+  `parameter_array_completion_is_published_at_each_set_boundary` pins the same
+  boundaries with scripted tokens.
 
 ## Scenarios
 

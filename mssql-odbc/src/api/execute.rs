@@ -711,18 +711,32 @@ fn finish_parameter_array(
     rc
 }
 
-pub(super) struct ParameterArrayUpdate {
+#[derive(Debug)]
+pub(crate) struct ParameterArrayUpdate {
     has_more: bool,
     result: Option<PreparedBatchResult>,
     current_set: Option<usize>,
+}
+
+/// Publishes completions a buffered unbound fetch read ahead of msodbcsql,
+/// at the call where msodbcsql's `OnDone` would have read them.
+pub(super) fn publish_deferred_parameter_array(
+    stmt: &StmtHandle,
+    update: Option<Box<ParameterArrayUpdate>>,
+) -> SqlReturn {
+    apply_parameter_array_update(stmt, update.map(|update| *update))
 }
 
 pub(super) fn take_parameter_array_update(
     stmt: &StmtHandle,
     client: &mut mssql_tds::connection::tds_client::TdsClient,
 ) -> Result<Option<ParameterArrayUpdate>, SqlReturn> {
-    // The IPD pointers are read before the STMT lock (never nested), and only
-    // when a batch is pending, so the common path takes no descriptor lock.
+    // Only a row-preserving batch has completions to report, so other
+    // statements skip the STMT lock. The IPD pointers are read before the STMT
+    // lock (never nested), and only when a batch is pending.
+    if !client.has_prepared_batch() {
+        return Ok(None);
+    }
     let pending = match stmt.inner.lock() {
         Ok(stmt_state) => stmt_state.parameter_array.is_some(),
         Err(_) => return Err(SQL_ERROR),
@@ -787,17 +801,6 @@ pub(super) fn apply_parameter_array_update(
     rc
 }
 
-#[cfg(test)]
-fn update_parameter_array(
-    stmt: &StmtHandle,
-    client: &mut mssql_tds::connection::tds_client::TdsClient,
-) -> SqlReturn {
-    match take_parameter_array_update(stmt, client) {
-        Ok(update) => apply_parameter_array_update(stmt, update),
-        Err(rc) => rc,
-    }
-}
-
 fn report_parameter_array(
     stmt_state: &mut crate::handles::stmt::StmtState,
     result: PreparedBatchResult,
@@ -810,13 +813,15 @@ fn report_parameter_array(
     if let Some(count) = result.total_rows_affected() {
         batch.rows_affected = Some(batch.rows_affected.unwrap_or(0).saturating_add(count));
     }
-    batch.processed = current_set.map_or_else(
-        || {
-            params_processed(complete, batch.outputs.paramset_size, &result.rows)
-                .max(batch.processed)
-        },
-        |index| index.saturating_add(1),
-    );
+    // msodbcsql reports the first reached set when it sends the batch, then
+    // advances only as each set's DONE is read (OnDone), never to the set that
+    // is merely producing results.
+    let completed = params_processed(complete, batch.outputs.paramset_size, &result.rows);
+    batch.processed = if batch.processed == 0 && completed == 0 {
+        current_set.map_or(0, |index| index.saturating_add(1))
+    } else {
+        completed.max(batch.processed)
+    };
     let processed = batch.processed;
     batch.truncated_rows.sort_unstable();
     let mut had_fractional_truncation = false;
@@ -3875,20 +3880,7 @@ mod tests {
     /// bare `SQL_ERROR`.
     #[test]
     fn update_parameter_array_posts_hy000_on_a_poisoned_ipd() {
-        use crate::handles::dbc::DbcHandle;
-        use mssql_mock_tds::QueryResponse;
-
         let h = TestHandles::with_env_dbc_stmt();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let _mock_server =
-            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
-        let mut client = dbc
-            .inner
-            .lock()
-            .unwrap()
-            .wire
-            .clear_client_for_test()
-            .unwrap();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().parameter_array = Some(BatchClientResults {
             outputs: ParamArrayOutputs {
@@ -3907,12 +3899,41 @@ mod tests {
             panic!("poison the ipd lock");
         }));
 
-        assert_eq!(update_parameter_array(stmt, &mut client), SQL_ERROR);
+        let update = ParameterArrayUpdate {
+            has_more: false,
+            result: None,
+            current_set: None,
+        };
+        assert_eq!(apply_parameter_array_update(stmt, Some(update)), SQL_ERROR);
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             SQLSTATE_HY000
         );
-        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
+    }
+
+    /// Statements without a row-preserving batch have no completions to
+    /// publish, so reporting skips the statement lock even if stale array
+    /// state is present.
+    #[test]
+    fn update_parameter_array_ignores_a_client_without_a_prepared_batch() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().parameter_array = Some(BatchClientResults {
+            outputs: ParamArrayOutputs {
+                paramset_size: 2,
+                param_status_ptr: std::ptr::null_mut(),
+                params_processed_ptr: std::ptr::null_mut(),
+            },
+            client_side_failures: 0,
+            truncated_rows: Vec::new(),
+            rows_affected: None,
+            processed: 0,
+        });
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(Vec::new());
+        assert!(matches!(
+            take_parameter_array_update(stmt, &mut client),
+            Ok(None)
+        ));
     }
 
     #[test]
