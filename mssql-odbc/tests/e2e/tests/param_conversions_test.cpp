@@ -110,7 +110,7 @@ protected:
 // integer buffer arrives declared as the character type the application asked
 // for. SQL_VARIANT_PROPERTY reports what the server actually received, which the
 // round-tripped digits alone cannot show.
-TEST_F(CrossConversionLiveTest, IntegerParamDeclaresTheCharacterParameterType) {
+ODBC_TEST_F(CrossConversionLiveTest, IntegerParamDeclaresTheCharacterParameterType) {
     struct Case {
         SQLSMALLINT sql_type;
         const char* base_type;
@@ -137,7 +137,7 @@ TEST_F(CrossConversionLiveTest, IntegerParamDeclaresTheCharacterParameterType) {
 
 // Base 10, no padding, and a sign only when negative - the shape _ltoa_s and
 // BigintToChar produce in msodbcsql's ConvertToChar (sqlccnvt.cpp:1634).
-TEST_F(CrossConversionLiveTest, IntegerParamFormatsBaseTen) {
+ODBC_TEST_F(CrossConversionLiveTest, IntegerParamFormatsBaseTen) {
     struct Case {
         SQLBIGINT value;
         const char* expected;
@@ -166,7 +166,7 @@ TEST_F(CrossConversionLiveTest, IntegerParamFormatsBaseTen) {
 
 // SQL_C_UBIGINT is read unsigned, so a value past i64::MAX formats as itself
 // rather than wrapping negative.
-TEST_F(CrossConversionLiveTest, UnsignedBigintParamFormatsUnsigned) {
+ODBC_TEST_F(CrossConversionLiveTest, UnsignedBigintParamFormatsUnsigned) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     SQLUBIGINT value = 18446744073709551615ULL;
     SQLLEN ind = 0;
@@ -192,7 +192,7 @@ TEST_F(CrossConversionLiveTest, UnsignedBigintParamFormatsUnsigned) {
 // `stMaxLen = (*pstMaxLen >= stLen) ? *pstMaxLen : stLen`, widens the
 // declaration to fit, which matches none of the three. Only the assert
 // reproduces.
-TEST_F(CrossConversionLiveTest, IntegerParamTooWideForColumnSizeIs22001) {
+ODBC_TEST_F(CrossConversionLiveTest, IntegerParamTooWideForColumnSizeIs22001) {
     SKIP_IF_COMPARING_MSODBCSQL();
     for (SQLSMALLINT sql_type : {SQL_VARCHAR, SQL_WVARCHAR, SQL_CHAR, SQL_WCHAR}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -210,7 +210,7 @@ TEST_F(CrossConversionLiveTest, IntegerParamTooWideForColumnSizeIs22001) {
 // The sign counts against the declared length like any other character. Skipped
 // on the compare leg for the same reason as IntegerParamTooWideForColumnSizeIs22001:
 // retail msodbcsql silently truncates instead, turning -123 into "-12".
-TEST_F(CrossConversionLiveTest, NegativeSignCountsAgainstColumnSize) {
+ODBC_TEST_F(CrossConversionLiveTest, NegativeSignCountsAgainstColumnSize) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     SQLINTEGER value = -123;
@@ -225,7 +225,7 @@ TEST_F(CrossConversionLiveTest, NegativeSignCountsAgainstColumnSize) {
 // The other half of the sign rule, split out because both drivers agree on it:
 // one more character of room and the same value fits. Kept on the compare leg -
 // only the over-long case diverges.
-TEST_F(CrossConversionLiveTest, NegativeSignFitsWhenColumnSizeAllowsIt) {
+ODBC_TEST_F(CrossConversionLiveTest, NegativeSignFitsWhenColumnSizeAllowsIt) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     SQLINTEGER value = -123;
     SQLLEN ind = 0;
@@ -240,7 +240,7 @@ TEST_F(CrossConversionLiveTest, NegativeSignFitsWhenColumnSizeAllowsIt) {
 // ---------------------------------------------------------------------------
 
 // The integer ParameterType names the wire type here too.
-TEST_F(CrossConversionLiveTest, CharParamDeclaresTheIntegerParameterType) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamDeclaresTheIntegerParameterType) {
     struct Case {
         SQLSMALLINT sql_type;
         const char* base_type;
@@ -266,7 +266,7 @@ TEST_F(CrossConversionLiveTest, CharParamDeclaresTheIntegerParameterType) {
 
 // A leading sign is accepted and blanks are padding on both ends, matching
 // msodbcsql's CharToBigint (sqlccnvt.cpp:7758).
-TEST_F(CrossConversionLiveTest, CharParamParsesIntegerLiteral) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamParsesIntegerLiteral) {
     struct Case {
         const char* text;
         const char* expected;
@@ -294,7 +294,7 @@ TEST_F(CrossConversionLiveTest, CharParamParsesIntegerLiteral) {
 // Dropping a fraction on the way to the server is an error, not the 01S07
 // warning the fetch direction reports: msodbcsql's ParamToSQLType rewrites the
 // truncation to IDS_22_001 for any non-2.x application (sqlcfunc.cpp:3348).
-TEST_F(CrossConversionLiveTest, CharParamDroppedFractionIs22001) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamDroppedFractionIs22001) {
     for (const char* text : {"12.7", "-0.5", "0.001"}) {
         for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
             ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -309,7 +309,7 @@ TEST_F(CrossConversionLiveTest, CharParamDroppedFractionIs22001) {
 // Only a non-zero dropped digit is truncation - msodbcsql flags the same way,
 // `if (c != '0') Error = CVT_FRACT_TRUNC` (sqlccnvt.cpp:7823) - so a fraction
 // that loses nothing converts cleanly.
-TEST_F(CrossConversionLiveTest, CharParamZeroFractionConverts) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamZeroFractionConverts) {
     for (const char* text : {"12.", "12.0", "12.000"}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(BindText(SQL_C_CHAR, text, SQL_INTEGER), SQL_HANDLE_STMT, stmt_);
@@ -320,7 +320,7 @@ TEST_F(CrossConversionLiveTest, CharParamZeroFractionConverts) {
 
 // A magnitude the target cannot hold is 22003, including a negative into
 // tinyint, the one unsigned SQL Server integer.
-TEST_F(CrossConversionLiveTest, CharParamOutOfRangeIs22003) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamOutOfRangeIs22003) {
     struct Case {
         SQLSMALLINT sql_type;
         const char* text;
@@ -345,7 +345,7 @@ TEST_F(CrossConversionLiveTest, CharParamOutOfRangeIs22003) {
     }
 }
 
-TEST_F(CrossConversionLiveTest, ExponentUnderflowFollowsPlatformAndNumericTarget) {
+ODBC_TEST_F(CrossConversionLiveTest, ExponentUnderflowFollowsPlatformAndNumericTarget) {
     for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
         for (SQLSMALLINT sql_type : {SQL_INTEGER, SQL_DECIMAL}) {
             ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -373,7 +373,7 @@ TEST_F(CrossConversionLiveTest, ExponentUnderflowFollowsPlatformAndNumericTarget
 
 // Overflow outranks a dropped fraction: the narrowing runs before msodbcsql's
 // fraction rewrite can fire, so a value that does both reports 22003.
-TEST_F(CrossConversionLiveTest, CharParamOverflowOutranksFraction) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamOverflowOutranksFraction) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindText(SQL_C_CHAR, "999.5", SQL_TINYINT), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
@@ -382,7 +382,7 @@ TEST_F(CrossConversionLiveTest, CharParamOverflowOutranksFraction) {
 
 // ColumnSize describes a character declaration, so it has no say over an
 // integer target - the value is bounded by the target's range instead.
-TEST_F(CrossConversionLiveTest, ColumnSizeDoesNotBoundAnIntegerTarget) {
+ODBC_TEST_F(CrossConversionLiveTest, ColumnSizeDoesNotBoundAnIntegerTarget) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindText(SQL_C_CHAR, "1234567", SQL_INTEGER, 1), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("1234567", ExecuteAndReadBack());
@@ -391,7 +391,7 @@ TEST_F(CrossConversionLiveTest, ColumnSizeDoesNotBoundAnIntegerTarget) {
 // A numeric literal reaches the parser through the same indicator rules as any
 // other character buffer, SQL_NTS included - which is how an application most
 // often binds one.
-TEST_F(CrossConversionLiveTest, CharParamAcceptsNtsIndicator) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamAcceptsNtsIndicator) {
     for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
         std::vector<SQLCHAR> narrow = {'-', '4', '2', '\0'};
@@ -412,7 +412,7 @@ TEST_F(CrossConversionLiveTest, CharParamAcceptsNtsIndicator) {
 // still binds the invariant spelling: CharToBigint accepts ASCII digits and a
 // leading sign only, so a grouped or comma-decimal literal is rejected however
 // the thread locale is set.
-TEST_F(CrossConversionLiveTest, LocaleFormattedNumbersAreRejected) {
+ODBC_TEST_F(CrossConversionLiveTest, LocaleFormattedNumbersAreRejected) {
     // A non-breaking space is padding to no one: msodbcsql trims ' ' alone.
     for (const char* text : {"1,234", "1,5", "1 234", "1.234,5", "\xc2\xa0" "12"}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -432,7 +432,7 @@ TEST_F(CrossConversionLiveTest, LocaleFormattedNumbersAreRejected) {
 // this cannot see. A byte-level mock would assert the RPC carries varchar(max)
 // rather than a varchar(n) wide enough to hold 20 digits; today only the round
 // trip is observable, so a wrong-but-wide declaration would still pass.
-TEST_F(CrossConversionLiveTest, IntegerParamReachesMaxWhenColumnSizeIsUnbounded) {
+ODBC_TEST_F(CrossConversionLiveTest, IntegerParamReachesMaxWhenColumnSizeIsUnbounded) {
     for (SQLSMALLINT sql_type : {SQL_VARCHAR, SQL_WVARCHAR}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
         SQLBIGINT value = -9223372036854775807LL - 1;
@@ -449,7 +449,7 @@ TEST_F(CrossConversionLiveTest, IntegerParamReachesMaxWhenColumnSizeIsUnbounded)
 
 // Scientific notation is accepted, matching msodbcsql's split to CharToDouble
 // once it spots an e/E (sqlccnvt.cpp:5088).
-TEST_F(CrossConversionLiveTest, CharParamAcceptsScientificNotation) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamAcceptsScientificNotation) {
     struct Case {
         const char* text;
         const char* expected;
@@ -469,7 +469,7 @@ TEST_F(CrossConversionLiveTest, CharParamAcceptsScientificNotation) {
 // std_error branch of SQL_DIAG_SQLSTATE (sqlcerr.cpp:990) and resolves through
 // the driver-generated-error map (cli_common/src/clntcomn.cpp:1015,
 // IDS_22_005 -> L"2200522018"); a 3.x application takes the second half.
-TEST_F(CrossConversionLiveTest, CharParamInvalidLiteralIs22018) {
+ODBC_TEST_F(CrossConversionLiveTest, CharParamInvalidLiteralIs22018) {
     // Only blanks are padding, so other whitespace and interior blanks are
     // invalid rather than trimmed. The empty buffer runs first deliberately: it
     // is the case whose bound pointer would be null if BindText did not reserve.
@@ -499,7 +499,7 @@ TEST_F(CrossConversionLiveTest, CharParamInvalidLiteralIs22018) {
 // nothing, and a wide source reaches that parser through an extra transcode the
 // narrow one skips; which of the two produces the different exit is not
 // established, so the mechanism here is unverified and only the state is.
-TEST_F(CrossConversionLiveTest, BlankOnlyWideLiteralIs22018) {
+ODBC_TEST_F(CrossConversionLiveTest, BlankOnlyWideLiteralIs22018) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -513,7 +513,7 @@ TEST_F(CrossConversionLiveTest, BlankOnlyWideLiteralIs22018) {
 // fraction is reported rather than rounded away. The fetch direction shares that
 // parser and is asserted by WideDecimalColumnKeepsPrecisionForADoubleTarget in
 // get_data_test.cpp.
-TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
+ODBC_TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindText(SQL_C_CHAR, "1.234567890123456789012345678901234567890",
                            SQL_INTEGER),
@@ -541,7 +541,7 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
 // (An earlier comment here claimed msodbcsql rejects this with HY019 -- its
 // ValidatePutDataLength does have an IsFixedSqlType arm that raises IDS_HY_019,
 // but SQL_INTEGER does not reach it at runtime. Probed rather than inferred.)
-TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
+ODBC_TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
     for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
         ASSERT_SQL_OK(Prepare("SELECT ? + 1"), SQL_HANDLE_STMT, stmt_);
 
@@ -575,7 +575,7 @@ TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
 
 // Binary stays outside the character/integer composition, so neither direction
 // gains a binary pairing.
-TEST_F(CrossConversionLiveTest, BinaryPairingsStayRejectedAtBind) {
+ODBC_TEST_F(CrossConversionLiveTest, BinaryPairingsStayRejectedAtBind) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     SQLINTEGER value = 1;
@@ -741,7 +741,7 @@ const char* ScalarConversionLiveTest::kBaseTypeQuery =
 
 // Every scalar row declares the type the application named, not one derived
 // from the C buffer. Before AB#47500 each of these was HYC00 at bind.
-TEST_F(ScalarConversionLiveTest, ScalarParamsDeclareTheParameterType) {
+ODBC_TEST_F(ScalarConversionLiveTest, ScalarParamsDeclareTheParameterType) {
     ASSERT_SQL_OK(Prepare(kBaseTypeQuery), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_BIT, SQL_BIT, static_cast<SQLCHAR>(1)), SQL_HANDLE_STMT,
                   stmt_);
@@ -796,7 +796,7 @@ TEST_F(ScalarConversionLiveTest, ScalarParamsDeclareTheParameterType) {
     ResetParams();
 }
 
-TEST_F(ScalarConversionLiveTest, BitParamRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, BitParamRoundTrips) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(4), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_BIT, SQL_BIT, static_cast<SQLCHAR>(1)), SQL_HANDLE_STMT,
                   stmt_);
@@ -813,7 +813,7 @@ TEST_F(ScalarConversionLiveTest, BitParamRoundTrips) {
 // (sqlccnvt.cpp:5057), so it never rejects a value outside 0/1 - anything
 // non-zero reaches `bit` as 1. Asserted on both drivers rather than skipped,
 // because this is the parity claim.
-TEST_F(ScalarConversionLiveTest, ANonZeroBitByteIsOne) {
+ODBC_TEST_F(ScalarConversionLiveTest, ANonZeroBitByteIsOne) {
     for (SQLCHAR byte : {static_cast<SQLCHAR>(2), static_cast<SQLCHAR>(0xFF)}) {
         ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(4), ?)"), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(BindFixed(SQL_C_BIT, SQL_BIT, byte), SQL_HANDLE_STMT, stmt_);
@@ -822,7 +822,7 @@ TEST_F(ScalarConversionLiveTest, ANonZeroBitByteIsOne) {
     }
 }
 
-TEST_F(ScalarConversionLiveTest, FloatParamsRoundTrip) {
+ODBC_TEST_F(ScalarConversionLiveTest, FloatParamsRoundTrip) {
     EXPECT_EQ("1.5", [&] {
         EXPECT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
         EXPECT_SQL_OK(BindFixed(SQL_C_DOUBLE, SQL_DOUBLE, 1.5), SQL_HANDLE_STMT, stmt_);
@@ -844,7 +844,7 @@ TEST_F(ScalarConversionLiveTest, FloatParamsRoundTrip) {
 // (sqlccnvt.cpp:5327) and FLT_MAX promotes to one, so `+INF > FLT_MAX` holds
 // and the check fires before the narrowing cast. A NaN compares false against
 // all four bounds and passes.
-TEST_F(ScalarConversionLiveTest, ADoubleOutsideTheRealRangeIs22003) {
+ODBC_TEST_F(ScalarConversionLiveTest, ADoubleOutsideTheRealRangeIs22003) {
     const double inf = std::numeric_limits<double>::infinity();
     for (double v : {1e39, -1e39, 1e-40, -1e-40, inf, -inf}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -863,7 +863,7 @@ TEST_F(ScalarConversionLiveTest, ADoubleOutsideTheRealRangeIs22003) {
     EXPECT_NE(SQL_ERROR, SQLExecute(stmt_));
 }
 
-TEST_F(ScalarConversionLiveTest, GuidParamKeepsItsFieldLayout) {
+ODBC_TEST_F(ScalarConversionLiveTest, GuidParamKeepsItsFieldLayout) {
     SQLGUID guid = {0x01234567,
                     0x89AB,
                     0xCDEF,
@@ -882,7 +882,7 @@ TEST_F(ScalarConversionLiveTest, GuidParamKeepsItsFieldLayout) {
 // SQL_GUID to SQL_C_CHAR and reads this SQLGUID buffer as text, while this
 // driver follows the ODBC 3.x table to SQL_C_GUID -- registered deviation 2
 // (AB#47365), which this test is what makes observable.
-TEST_F(ScalarConversionLiveTest, DefaultCTypeGuidRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, DefaultCTypeGuidRoundTrips) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     SQLGUID guid = {0x01234567,
@@ -895,7 +895,7 @@ TEST_F(ScalarConversionLiveTest, DefaultCTypeGuidRoundTrips) {
 }
 
 // The declared scale reaches the server, and the value is rescaled to it.
-TEST_F(ScalarConversionLiveTest, DecimalParamUsesTheDeclaredPrecisionAndScale) {
+ODBC_TEST_F(ScalarConversionLiveTest, DecimalParamUsesTheDeclaredPrecisionAndScale) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1.5", 10, 3), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("1.500", ExecuteAndReadBack());
@@ -910,7 +910,7 @@ TEST_F(ScalarConversionLiveTest, DecimalParamUsesTheDeclaredPrecisionAndScale) {
 // (sqlccnvt.cpp:8389, :7995-8008), then flags excess scale (:8433-8437).
 // ParamToSQLType maps that warning to 22001 for ODBC 3.x character input
 // (sqlcfunc.cpp:3350-3370). Measured on Linux Driver 18.6.2.1 (18.06.0002).
-TEST_F(ScalarConversionLiveTest, DecimalFractionPastTheScaleIsDroppedOnlyWhenZero) {
+ODBC_TEST_F(ScalarConversionLiveTest, DecimalFractionPastTheScaleIsDroppedOnlyWhenZero) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1.50", 5, 1), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("1.5", ExecuteAndReadBack());
@@ -922,14 +922,14 @@ TEST_F(ScalarConversionLiveTest, DecimalFractionPastTheScaleIsDroppedOnlyWhenZer
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
 }
 
-TEST_F(ScalarConversionLiveTest, DecimalPastItsDeclaredPrecisionIs22003) {
+ODBC_TEST_F(ScalarConversionLiveTest, DecimalPastItsDeclaredPrecisionIs22003) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1000", 3, 0), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructUsesApdPrecisionAndScale) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructUsesApdPrecisionAndScale) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 8, 3, 5, 2, true, 12345), SQL_HANDLE_STMT,
                   stmt_);
@@ -942,14 +942,14 @@ TEST_F(ScalarConversionLiveTest, NumericStructUsesApdPrecisionAndScale) {
     EXPECT_EQ("-123.450", ExecuteAndReadBack());
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructNegativeApdScaleMultipliesTheMagnitude) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructNegativeApdScaleMultipliesTheMagnitude) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 6, 0, 5, -1, true, 123), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ("1230", ExecuteAndReadBack());
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructMatchingMetadataKeepsEmbeddedMetadata) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructMatchingMetadataKeepsEmbeddedMetadata) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 5, 2, 5, 2, true, 12345), SQL_HANDLE_STMT,
                   stmt_);
@@ -959,7 +959,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructMatchingMetadataKeepsEmbeddedMetad
 
 // The default APD metadata (38, 0) matches this target and preserves the
 // struct's embedded metadata before SQL Server converts the value to scale 0.
-TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesDefaultApdScale) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesDefaultApdScale) {
     SQL_NUMERIC_STRUCT value = {};
     value.precision = 5;
     value.scale = 3;
@@ -979,7 +979,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesDe
 // than the driver truncating. Measured on Windows Driver 18.6.2.1: 13.
 // Benefits-from-mock-tds: capture the RPC and assert the decimal TYPE_INFO
 // carries (3, 1) and the payload 125; today only the server's rounding shows.
-TEST_F(ScalarConversionLiveTest, NumericStructOnTheDefaultFastPathIsRoundedByTheServer) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructOnTheDefaultFastPathIsRoundedByTheServer) {
     SQL_NUMERIC_STRUCT value = {};
     value.precision = 3;
     value.scale = 1;
@@ -999,7 +999,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructOnTheDefaultFastPathIsRoundedByThe
 // own scale 3. Measured on Windows Driver 18.6.2.1: 12345.00.
 // Benefits-from-mock-tds: capture the RPC and assert TYPE_INFO (10, 2) with
 // payload 1234500, pinning that val[] was read at APD scale 0.
-TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathIgnoresTheEmbeddedScale) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathIgnoresTheEmbeddedScale) {
     SQL_NUMERIC_STRUCT value = {};
     value.precision = 5;
     value.scale = 3;
@@ -1023,7 +1023,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathIgnoresTheEmbeddedSc
 // Benefits-from-mock-tds: capture both RPCs and assert TYPE_INFO (10, 2) with
 // payload 1234500 on the first, then the fast path forwarding (38, 0) with
 // payload 12345 on the second.
-TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathReceivesTheApdMetadata) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathReceivesTheApdMetadata) {
     SQL_NUMERIC_STRUCT value = {};
     value.precision = 5;
     value.scale = 3;
@@ -1070,7 +1070,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructOffTheFastPathReceivesTheApdMetada
 // embedded metadata. The second bind embeds a deliberately wrong
 // precision/scale (15, 9) in the struct itself, which the correct slow path
 // must ignore in favor of the freshly-reset APD scale (0).
-TEST_F(ScalarConversionLiveTest, NumericRebindDoesNotInheritAPreviousBindsStaleApdScale) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericRebindDoesNotInheritAPreviousBindsStaleApdScale) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 10, 2, 10, 2, 1, 12345, 0, 10, 2),
                   SQL_HANDLE_STMT, stmt_);
@@ -1089,7 +1089,7 @@ TEST_F(ScalarConversionLiveTest, NumericRebindDoesNotInheritAPreviousBindsStaleA
     EXPECT_EQ("100.00", ExecuteAndReadBack());
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructPrecision38Boundaries) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructPrecision38Boundaries) {
     constexpr std::uint64_t kMaxLow = 0x098A223FFFFFFFFF;
     constexpr std::uint64_t kMaxHigh = 0x4B3B4CA85A86C47A;
     constexpr std::uint64_t kOverflowLow = 0x098A224000000000;
@@ -1108,21 +1108,21 @@ TEST_F(ScalarConversionLiveTest, NumericStructPrecision38Boundaries) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructAnyNonzeroSignIsPositive) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructAnyNonzeroSignIsPositive) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 8, 3, 5, 2, 2, 12345, 0),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("123.450", ExecuteAndReadBack());
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructSignedZeroAtMaximumScaleIsZero) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructSignedZeroAtMaximumScaleIsZero) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 38, 38, 38, 38, 0, 0, 0, 38, 38),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("0.00000000000000000000000000000000000000", ExecuteAndReadBack());
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructDropsOnlyFractionalDigits) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructDropsOnlyFractionalDigits) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 5, 1, 5, 3, true, 1500), SQL_HANDLE_STMT,
                   stmt_);
@@ -1138,7 +1138,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructDropsOnlyFractionalDigits) {
     EXPECT_EQ("1.5", GetColumnChar());
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructTruncatedNegativeFractionBecomesPositiveZero) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructTruncatedNegativeFractionBecomesPositiveZero) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 5, 1, 2, 2, false, 4), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
@@ -1147,7 +1147,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructTruncatedNegativeFractionBecomesPo
     EXPECT_EQ("0.0", GetColumnChar());
 }
 
-TEST_F(ScalarConversionLiveTest, NumericStructPastTargetPrecisionIs22003) {
+ODBC_TEST_F(ScalarConversionLiveTest, NumericStructPastTargetPrecisionIs22003) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 3, 0, 4, 0, true, 1000), SQL_HANDLE_STMT,
                   stmt_);
@@ -1155,7 +1155,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructPastTargetPrecisionIs22003) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
 }
 
-TEST_F(ScalarConversionLiveTest, UnparseableDecimalLiteralIs22018) {
+ODBC_TEST_F(ScalarConversionLiveTest, UnparseableDecimalLiteralIs22018) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "abc", 10, 2), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
@@ -1165,7 +1165,7 @@ TEST_F(ScalarConversionLiveTest, UnparseableDecimalLiteralIs22018) {
 // Every other decimal case binds SQL_C_CHAR, so this is the only end-to-end
 // cover for the wide arm of decimal_from_text - the two C types must reach the
 // same value and the same rescale.
-TEST_F(ScalarConversionLiveTest, AWideLiteralReachesTheDecimalTarget) {
+ODBC_TEST_F(ScalarConversionLiveTest, AWideLiteralReachesTheDecimalTarget) {
     std::vector<SQLWCHAR> wide;
     for (char c : std::string("-1.50")) {
         wide.push_back(static_cast<SQLWCHAR>(c));
@@ -1180,7 +1180,7 @@ TEST_F(ScalarConversionLiveTest, AWideLiteralReachesTheDecimalTarget) {
 
 // Rust uses an f64 approximation here; msodbcsql uses stringtonumeric
 // (sqlccnvt.cpp:7101). These samples compare outcomes, not the parsing mechanism.
-TEST_F(ScalarConversionLiveTest, AnExponentLiteralReachesTheDecimalTarget) {
+ODBC_TEST_F(ScalarConversionLiveTest, AnExponentLiteralReachesTheDecimalTarget) {
     struct Case {
         const char* text;
         const char* expected;
@@ -1194,7 +1194,7 @@ TEST_F(ScalarConversionLiveTest, AnExponentLiteralReachesTheDecimalTarget) {
     }
 }
 
-TEST_F(ScalarConversionLiveTest, DateParamRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, DateParamRoundTrips) {
     SQL_DATE_STRUCT date = {2024, 2, 29};
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 23)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_TYPE_DATE, SQL_TYPE_DATE, date), SQL_HANDLE_STMT, stmt_);
@@ -1211,7 +1211,7 @@ TEST_F(ScalarConversionLiveTest, DateParamRoundTrips) {
 
 // A character buffer declares the type the application named, exactly as the
 // struct rows above do - the literal chooses the value, never the declaration.
-TEST_F(ScalarConversionLiveTest, CharParamDeclaresTheTemporalParameterType) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharParamDeclaresTheTemporalParameterType) {
     struct Case {
         SQLSMALLINT sql_type;
         const char* text;
@@ -1233,7 +1233,7 @@ TEST_F(ScalarConversionLiveTest, CharParamDeclaresTheTemporalParameterType) {
 // The exact shape mssql-python sends: isoformat text with microsecond
 // precision, ColumnSize 16 and DecimalDigits 6. The declaration is still at
 // maximum scale, so seven digits come back.
-TEST_F(ScalarConversionLiveTest, CharTimeLiteralRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharTimeLiteralRoundTrips) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, "12:34:56.000000", 16, 6), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("12:34:56.0000000", ExecuteAndReadBack());
@@ -1246,13 +1246,13 @@ TEST_F(ScalarConversionLiveTest, CharTimeLiteralRoundTrips) {
 
 // The wide arm of datetime_from_text. Every other case here binds SQL_C_CHAR,
 // so without this the UTF-16 decode is unexercised end to end.
-TEST_F(ScalarConversionLiveTest, WideCharTimeLiteralRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, WideCharTimeLiteralRoundTrips) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindWide(SQL_TYPE_TIME, "12:34:56.000000", 16, 6), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("12:34:56.0000000", ExecuteAndReadBack());
 }
 
-TEST_F(ScalarConversionLiveTest, CharDateLiteralRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharDateLiteralRoundTrips) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 23)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-02-29"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-02-29", ExecuteAndReadBack());
@@ -1260,7 +1260,7 @@ TEST_F(ScalarConversionLiveTest, CharDateLiteralRoundTrips) {
 
 // The space separator is the form msodbcsql and this driver agree on, so it
 // runs on both legs of the parity run.
-TEST_F(ScalarConversionLiveTest, CharTimestampLiteralRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharTimestampLiteralRoundTrips) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20 12:34:56.123", 0, 3),
                   SQL_HANDLE_STMT, stmt_);
@@ -1274,7 +1274,7 @@ TEST_F(ScalarConversionLiveTest, CharTimestampLiteralRoundTrips) {
 // Pre-existing and deliberate: the parser is shared with fetch, and the same
 // permissiveness covers `HH:MM` without seconds and unpadded fields like
 // `2023-6-5`. AB#47246 preserves these existing accepted forms.
-TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
@@ -1285,7 +1285,7 @@ TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
 
 // The offset has to survive as an offset rather than being folded into the
 // wall clock and lost. Both drivers agree when the literal states one.
-TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralKeepsItsOffset) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralKeepsItsOffset) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56+05:30", 0, 0),
                   SQL_HANDLE_STMT, stmt_);
@@ -1302,7 +1302,7 @@ TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralKeepsItsOffset) {
 // leg, which is why it is skipped there rather than left to fail for anyone
 // not sitting in UTC - CI is, which is how the divergence stayed hidden.
 // Tracked in AB#48006.
-TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralWithoutAnOffsetDefaultsToUtc) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralWithoutAnOffsetDefaultsToUtc) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
@@ -1312,7 +1312,7 @@ TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralWithoutAnOffsetDefault
 }
 
 // A date-only literal supplies midnight rather than failing for want of a time.
-TEST_F(ScalarConversionLiveTest, CharDateOnlyLiteralFillsATimestampAtMidnight) {
+ODBC_TEST_F(ScalarConversionLiveTest, CharDateOnlyLiteralFillsATimestampAtMidnight) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-05-20 00:00:00.0000000", ExecuteAndReadBack());
@@ -1320,7 +1320,7 @@ TEST_F(ScalarConversionLiveTest, CharDateOnlyLiteralFillsATimestampAtMidnight) {
 
 // Benefits-from-mock-tds: capture temporal TYPE_INFO and encoded payloads
 // for narrow/wide parameters rather than only server-rendered values.
-TEST_F(ScalarConversionLiveTest, OdbcTemporalLiteralsRoundTrip) {
+ODBC_TEST_F(ScalarConversionLiveTest, OdbcTemporalLiteralsRoundTrip) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -1370,7 +1370,7 @@ TEST_F(ScalarConversionLiveTest, OdbcTemporalLiteralsRoundTrip) {
 
 // Benefits-from-mock-tds: verify malformed literals are rejected before
 // any temporal parameter payload is sent, not just the returned SQLSTATE.
-TEST_F(ScalarConversionLiveTest, MalformedOdbcTemporalLiteralsAre22018) {
+ODBC_TEST_F(ScalarConversionLiveTest, MalformedOdbcTemporalLiteralsAre22018) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -1414,7 +1414,7 @@ TEST_F(ScalarConversionLiveTest, MalformedOdbcTemporalLiteralsAre22018) {
     }
 }
 
-TEST_F(ScalarConversionLiveTest, UnparseableTemporalLiteralIs22018) {
+ODBC_TEST_F(ScalarConversionLiveTest, UnparseableTemporalLiteralIs22018) {
     for (const char* text : {"abc", "25:00:00", "2023-02-31", "2024-05-20 12:60:00"}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, text), SQL_HANDLE_STMT, stmt_);
@@ -1426,7 +1426,7 @@ TEST_F(ScalarConversionLiveTest, UnparseableTemporalLiteralIs22018) {
 
 // The wide arm's error path. Every other failure case binds SQL_C_CHAR, so
 // without this only the success side of the UTF-16 decode is covered.
-TEST_F(ScalarConversionLiveTest, WideCharUnparseableTemporalLiteralIs22018) {
+ODBC_TEST_F(ScalarConversionLiveTest, WideCharUnparseableTemporalLiteralIs22018) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindWide(SQL_TYPE_TIME, "not a time"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
@@ -1437,7 +1437,7 @@ TEST_F(ScalarConversionLiveTest, WideCharUnparseableTemporalLiteralIs22018) {
 // malformed struct: 22018. msodbcsql's `CVT_CAST_ERROR` is `IDS_22_005`
 // (`sqlcprot.h:956`), and its own regression table expects 22018 for
 // `1999-11-11` bound to a `time` target (`KatmaiDatetimeODBC.cpp`).
-TEST_F(ScalarConversionLiveTest, ADateOnlyLiteralAgainstATimeTargetIs22018) {
+ODBC_TEST_F(ScalarConversionLiveTest, ADateOnlyLiteralAgainstATimeTargetIs22018) {
     for (SQLSMALLINT sql_type : {SQL_TYPE_TIME, SQL_SS_TIME2}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(BindNarrow(sql_type, "2024-05-20", 0, 7), SQL_HANDLE_STMT, stmt_);
@@ -1450,7 +1450,7 @@ TEST_F(ScalarConversionLiveTest, ADateOnlyLiteralAgainstATimeTargetIs22018) {
 // msodbcsql fills the *current local date* and succeeds here (`ParseDateTime`,
 // `sqlccnvt.cpp:4776-4798`); that needs a platform-specific local-date helper.
 // AB#47247.
-TEST_F(ScalarConversionLiveTest, ATimeOnlyLiteralAgainstATimestampTargetIs22018) {
+ODBC_TEST_F(ScalarConversionLiveTest, ATimeOnlyLiteralAgainstATimestampTargetIs22018) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     for (SQLSMALLINT sql_type : {SQL_TYPE_TIMESTAMP, SQL_SS_TIMESTAMPOFFSET}) {
@@ -1469,7 +1469,7 @@ TEST_F(ScalarConversionLiveTest, ATimeOnlyLiteralAgainstATimestampTargetIs22018)
 // `1:01:01` and `18:01:0` are excluded: that table expects 22018 and this
 // driver accepts them - the unpadded-field permissiveness pinned by the
 // `the_permissive_shapes_stay_accepted` unit test.
-TEST_F(ScalarConversionLiveTest, MsodbcsqlBadTimeLiteralsAreRejectedAlike) {
+ODBC_TEST_F(ScalarConversionLiveTest, MsodbcsqlBadTimeLiteralsAreRejectedAlike) {
     for (const char* text : {"www:a9:3e",
                              "-11:01:21",
                              "24:00:00",
@@ -1491,7 +1491,7 @@ TEST_F(ScalarConversionLiveTest, MsodbcsqlBadTimeLiteralsAreRejectedAlike) {
 }
 
 // The same table's 22008 rows: a fraction the declared scale cannot carry.
-TEST_F(ScalarConversionLiveTest, MsodbcsqlOverPreciseTimeLiteralsAre22008) {
+ODBC_TEST_F(ScalarConversionLiveTest, MsodbcsqlOverPreciseTimeLiteralsAre22008) {
     for (const char* text : {"23:59:59.222", "23:59:59.0000001", "01:01:01.1"}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, text, 8, 0), SQL_HANDLE_STMT, stmt_);
@@ -1505,7 +1505,7 @@ TEST_F(ScalarConversionLiveTest, MsodbcsqlOverPreciseTimeLiteralsAre22008) {
 // silently. Pinned because the asymmetry with the `date` target, which reports
 // 22008 for a non-zero time, reads like a bug. Parity: msodbcsql's
 // SQL_TIME2_MAPPED arm has no date check (`sqlccnvt.cpp:4482-4497`).
-TEST_F(ScalarConversionLiveTest, ACharTimestampLiteralIntoATimeTargetDropsTheDate) {
+ODBC_TEST_F(ScalarConversionLiveTest, ACharTimestampLiteralIntoATimeTargetDropsTheDate) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, "2024-05-20 12:34:56", 16, 7), SQL_HANDLE_STMT,
                   stmt_);
@@ -1517,7 +1517,7 @@ TEST_F(ScalarConversionLiveTest, ACharTimestampLiteralIntoATimeTargetDropsTheDat
 // (`sqlccnvt.cpp:4820-4849`), calling ConvertOffsetToUTC on the TOSERVER
 // direction. Keeping the local wall clock would send a different instant than
 // the caller wrote, with no diagnostic.
-TEST_F(ScalarConversionLiveTest, AValidOffsetIsFoldedToUtcForNonOffsetTargets) {
+ODBC_TEST_F(ScalarConversionLiveTest, AValidOffsetIsFoldedToUtcForNonOffsetTargets) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20 12:34:56+05:30", 0, 7),
                   SQL_HANDLE_STMT, stmt_);
@@ -1541,7 +1541,7 @@ TEST_F(ScalarConversionLiveTest, AValidOffsetIsFoldedToUtcForNonOffsetTargets) {
 
 // The fold crosses a date boundary, which the discarded-offset reading could
 // never produce.
-TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanCrossADateBoundary) {
+ODBC_TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanCrossADateBoundary) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20 01:00:00+05:30", 0, 7),
                   SQL_HANDLE_STMT, stmt_);
@@ -1569,7 +1569,7 @@ TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanCrossADateBoundary) {
 // The fold runs *before* the target's own rules, so an offset that moves a
 // midnight literal off midnight leaves a time the `date` target cannot carry.
 // The zero-offset case shows the fold, not the literal, is responsible.
-TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanMakeADateTargetOverflow) {
+ODBC_TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanMakeADateTargetOverflow) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-05-20 00:00:00+05:30"), SQL_HANDLE_STMT,
                   stmt_);
@@ -1598,7 +1598,7 @@ TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanMakeADateTargetOverflow) {
 //
 // This covers only *invalid* offsets. A **valid** offset is folded into the
 // value instead - see AValidOffsetIsFoldedToUtcForNonOffsetTargets.
-TEST_F(ScalarConversionLiveTest, AnOutOfRangeOffsetLiteralIs22018ForEveryTarget) {
+ODBC_TEST_F(ScalarConversionLiveTest, AnOutOfRangeOffsetLiteralIs22018ForEveryTarget) {
     for (SQLSMALLINT sql_type : {SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_SS_TIME2,
                                  SQL_TYPE_TIMESTAMP, SQL_SS_TIMESTAMPOFFSET}) {
         for (const char* text : {"2024-05-20 00:00:00+14:30", "2024-05-20 00:00:00+15:00"}) {
@@ -1619,7 +1619,7 @@ TEST_F(ScalarConversionLiveTest, AnOutOfRangeOffsetLiteralIs22018ForEveryTarget)
 
 // A parsed literal is still bound by the target's own rules: the date target
 // drops nothing silently, and DecimalDigits still bounds the fraction.
-TEST_F(ScalarConversionLiveTest, ACharLiteralStillObeysTheTargetRules) {
+ODBC_TEST_F(ScalarConversionLiveTest, ACharLiteralStillObeysTheTargetRules) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-05-20 12:00:00"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
@@ -1641,7 +1641,7 @@ TEST_F(ScalarConversionLiveTest, ACharLiteralStillObeysTheTargetRules) {
 // The failure mssql-python actually hit: several parameters in one statement,
 // with the temporal one bound as text. A per-parameter test cannot catch a
 // binding that only fails alongside others.
-TEST_F(ScalarConversionLiveTest, ATemporalTextParamBindsAlongsideOtherParameters) {
+ODBC_TEST_F(ScalarConversionLiveTest, ATemporalTextParamBindsAlongsideOtherParameters) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CONCAT(CONVERT(VARCHAR(16), ?), '|', "
                           "CONVERT(VARCHAR(32), ?), '|', CONVERT(VARCHAR(16), ?)))"),
                   SQL_HANDLE_STMT, stmt_);
@@ -1671,7 +1671,7 @@ TEST_F(ScalarConversionLiveTest, ATemporalTextParamBindsAlongsideOtherParameters
 // ValidateDateStruct (sqlccnvt.cpp:8821) answers CVT_DT_ERROR = IDS_22_007_00.
 // The month-length and leap-year arms are the ones plain day arithmetic would
 // silently roll over into the next month.
-TEST_F(ScalarConversionLiveTest, ImpossibleDateIs22007) {
+ODBC_TEST_F(ScalarConversionLiveTest, ImpossibleDateIs22007) {
     struct Case {
         SQLSMALLINT year;
         SQLUSMALLINT month;
@@ -1693,7 +1693,7 @@ TEST_F(ScalarConversionLiveTest, ImpossibleDateIs22007) {
 
 // ValidateTimeStruct (sqlccnvt.cpp:8844) bounds each component separately and
 // answers CVT_TM_ERROR = IDS_22_007_01. 60 seconds is rejected: no leap second.
-TEST_F(ScalarConversionLiveTest, ImpossibleTimeIs22007) {
+ODBC_TEST_F(ScalarConversionLiveTest, ImpossibleTimeIs22007) {
     struct Case {
         SQLUSMALLINT hour;
         SQLUSMALLINT minute;
@@ -1718,7 +1718,7 @@ TEST_F(ScalarConversionLiveTest, ImpossibleTimeIs22007) {
 // Measured: TemporalParamsDeclareTheScaleFromDecimalDigits shows msodbcsql
 // reports SQL_DESC_SCALE 7 under every ColumnSize and DecimalDigits. This test
 // asserted three digits and was skipped on the compare leg until that ran.
-TEST_F(ScalarConversionLiveTest, TimeParamIsDeclaredAtMaximumScale) {
+ODBC_TEST_F(ScalarConversionLiveTest, TimeParamIsDeclaredAtMaximumScale) {
     SQL_SS_TIME2_STRUCT t2 = {13, 45, 30, 123000000};
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_SS_TIME2, SQL_SS_TIME2, t2, 0, 3), SQL_HANDLE_STMT, stmt_);
@@ -1729,7 +1729,7 @@ TEST_F(ScalarConversionLiveTest, TimeParamIsDeclaredAtMaximumScale) {
 // no fraction field at all, so the maximum-scale declaration renders zeros -
 // which is the part a unit test cannot see, since it is the declaration and not
 // the struct that decides the rendering.
-TEST_F(ScalarConversionLiveTest, PlainTimeStructRoundTripsThroughItsDeclaration) {
+ODBC_TEST_F(ScalarConversionLiveTest, PlainTimeStructRoundTripsThroughItsDeclaration) {
     SQL_TIME_STRUCT t = {13, 45, 30};
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_TYPE_TIME, SQL_TYPE_TIME, t), SQL_HANDLE_STMT, stmt_);
@@ -1743,7 +1743,7 @@ TEST_F(ScalarConversionLiveTest, PlainTimeStructRoundTripsThroughItsDeclaration)
 // what :00 and :30 cannot exercise, and its UTC-normalised instant lands
 // exactly on the minimum rather than one past it - where an off-by-one in the
 // range check would show.
-TEST_F(ScalarConversionLiveTest, TemporalBoundaryValuesRoundTrip) {
+ODBC_TEST_F(ScalarConversionLiveTest, TemporalBoundaryValuesRoundTrip) {
     SQL_SS_TIME2_STRUCT t2 = {23, 59, 59, 999999900};
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_SS_TIME2, SQL_SS_TIME2, t2, 0, 7), SQL_HANDLE_STMT, stmt_);
@@ -1785,7 +1785,7 @@ TEST_F(ScalarConversionLiveTest, TemporalBoundaryValuesRoundTrip) {
 //
 // Not established: whether any binding reaches :3350 with a temporal fSqlType by
 // another route. It would answer 22001 there.
-TEST_F(ScalarConversionLiveTest, ADroppedFractionIsAlways22008) {
+ODBC_TEST_F(ScalarConversionLiveTest, ADroppedFractionIsAlways22008) {
     SQL_TIMESTAMP_STRUCT ts = {2024, 6, 15, 1, 2, 3, 123400000};
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, ts, 0, 3),
@@ -1823,7 +1823,7 @@ TEST_F(ScalarConversionLiveTest, ADroppedFractionIsAlways22008) {
 // at bind with HYC00 and never reaches the truncation. msodbcsql accepts the
 // pairing and answers 22008, which is what the converter is already written to
 // return - so this only needs the matrix row, not a behaviour change.
-TEST_F(ScalarConversionLiveTest, ATimestampWithATimeCannotBecomeADate) {
+ODBC_TEST_F(ScalarConversionLiveTest, ATimestampWithATimeCannotBecomeADate) {
     GTEST_SKIP() << "SQL_C_TYPE_TIMESTAMP -> SQL_TYPE_DATE is not bindable yet - AB#47790";
 
     SQL_TIMESTAMP_STRUCT ts = {2024, 6, 15, 12, 0, 0, 0};
@@ -1857,7 +1857,7 @@ TEST_F(ScalarConversionLiveTest, ATimestampWithATimeCannotBecomeADate) {
 // The NULL rows are the half that is *not* yet measured: typed_null shares
 // datetime_metadata, so it declares 7 here too, but no msodbcsql measurement
 // covers a NULL temporal parameter. A failure on those rows is the answer.
-TEST_F(ScalarConversionLiveTest, TemporalParamsAreDeclaredAtMaximumScale) {
+ODBC_TEST_F(ScalarConversionLiveTest, TemporalParamsAreDeclaredAtMaximumScale) {
     struct Case {
         SQLSMALLINT c_type;
         SQLSMALLINT sql_type;
@@ -1915,7 +1915,7 @@ TEST_F(ScalarConversionLiveTest, TemporalParamsAreDeclaredAtMaximumScale) {
     }
 }
 
-TEST_F(ScalarConversionLiveTest, TimestampParamRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, TimestampParamRoundTrips) {
     SQL_TIMESTAMP_STRUCT ts = {2024, 6, 15, 12, 30, 45, 0};
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 120)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, ts, 0, 0),
@@ -1925,7 +1925,7 @@ TEST_F(ScalarConversionLiveTest, TimestampParamRoundTrips) {
 
 // The struct is local wall clock and the wire is UTC, so 12:30 at +05:30 must
 // reach the server as 07:00Z carrying a +05:30 offset.
-TEST_F(ScalarConversionLiveTest, TimestampOffsetIsSentAsUtc) {
+ODBC_TEST_F(ScalarConversionLiveTest, TimestampOffsetIsSentAsUtc) {
     SQL_SS_TIMESTAMPOFFSET_STRUCT dto = {2024, 6, 15, 12, 30, 0, 0, 5, 30};
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS DATETIMEOFFSET(0)), 121)"),
                   SQL_HANDLE_STMT, stmt_);
@@ -1937,7 +1937,7 @@ TEST_F(ScalarConversionLiveTest, TimestampOffsetIsSentAsUtc) {
 // IsValidTimezoneOffsetValue (dataconv.cpp:118) rejects components that disagree
 // in sign even when the total is legal, and bounds the total at +/-14:00.
 // Checking only the total would accept +5h -30m as +04:30.
-TEST_F(ScalarConversionLiveTest, InvalidTimezoneOffsetIs22007) {
+ODBC_TEST_F(ScalarConversionLiveTest, InvalidTimezoneOffsetIs22007) {
     struct Case {
         SQLSMALLINT tz_hour;
         SQLSMALLINT tz_minute;
@@ -1956,7 +1956,7 @@ TEST_F(ScalarConversionLiveTest, InvalidTimezoneOffsetIs22007) {
     }
 }
 
-TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
+ODBC_TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
     std::string xml = "<root><a>1</a></root>";
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(128), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_XML, xml), SQL_HANDLE_STMT, stmt_);
@@ -2007,7 +2007,7 @@ ODBC_TEST_F(ScalarConversionLiveTest, LargeXmlStreamsThroughDataAtExecution) {
 // inner base type and byte length from SqlString's own encoding instead of
 // assuming every string is NVARCHAR/UTF-16 (AB#47800). msodbcsql passes both
 // assertions too.
-TEST_F(ScalarConversionLiveTest, VariantParamWrapsItsInnerType) {
+ODBC_TEST_F(ScalarConversionLiveTest, VariantParamWrapsItsInnerType) {
     ASSERT_SQL_OK(Prepare(kBaseTypeQuery), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_VARIANT, "hello", 8), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("varchar", ExecuteAndReadBack());
@@ -2022,7 +2022,7 @@ TEST_F(ScalarConversionLiveTest, VariantParamWrapsItsInnerType) {
 // as "unstated" and declared at the non-max ceiling instead of meaning max the
 // way it does for a plain varchar. Narrow counterpart to
 // AWideVariantIsNeverAMaxType (AB#47800).
-TEST_F(ScalarConversionLiveTest, VariantWithNoColumnSizeIsNotAMaxType) {
+ODBC_TEST_F(ScalarConversionLiveTest, VariantWithNoColumnSizeIsNotAMaxType) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_VARIANT, "hello"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("hello", ExecuteAndReadBack());
@@ -2035,7 +2035,7 @@ TEST_F(ScalarConversionLiveTest, VariantWithNoColumnSizeIsNotAMaxType) {
 // ColumnSize 0 means "unstated" here, and anything past the wide ceiling is
 // clamped to it. Measured on retail 18.6.2.1 at representative sizes through
 // 100000: none lands on a max inner type.
-TEST_F(ScalarConversionLiveTest, AWideVariantIsNeverAMaxType) {
+ODBC_TEST_F(ScalarConversionLiveTest, AWideVariantIsNeverAMaxType) {
     for (SQLULEN size : {SQLULEN{0}, SQLULEN{3000}, SQLULEN{5000}, SQLULEN{8000}, SQLULEN{8001},
                          SQLULEN{100000}}) {
         ASSERT_SQL_OK(Prepare(kBaseTypeQuery), SQL_HANDLE_STMT, stmt_);
@@ -2051,7 +2051,7 @@ TEST_F(ScalarConversionLiveTest, AWideVariantIsNeverAMaxType) {
 // The same magnitude from SQL_C_DOUBLE is 22003
 // (`ADoubleOutsideTheRealRangeIs22003`), so the underflow rule keys off the
 // source width rather than the value.
-TEST_F(ScalarConversionLiveTest, ASubnormalSurvivesAFloatRoundTrip) {
+ODBC_TEST_F(ScalarConversionLiveTest, ASubnormalSurvivesAFloatRoundTrip) {
     const float kSubnormal = 1e-40f;
     ASSERT_TRUE(kSubnormal != 0.0f && kSubnormal < (std::numeric_limits<float>::min)());
 
@@ -2078,7 +2078,7 @@ TEST_F(ScalarConversionLiveTest, ASubnormalSurvivesAFloatRoundTrip) {
 // carries no base type through SQL_VARIANT_PROPERTY, but `SELECT ? AS v` still
 // takes the parameter's declared type for its output column, so SQLColAttribute
 // reports what the server was told.
-TEST_F(ScalarConversionLiveTest, DefaultCTypeNullBindsAndExecutes) {
+ODBC_TEST_F(ScalarConversionLiveTest, DefaultCTypeNullBindsAndExecutes) {
     struct Case {
         SQLSMALLINT sql_type;
         SQLULEN column_size;
@@ -2127,7 +2127,7 @@ TEST_F(ScalarConversionLiveTest, DefaultCTypeNullBindsAndExecutes) {
 // round-trip test for each type, so only the missing indicator differs.
 // NullIndicatorPointerMeansNullTerminated covers the character half, where
 // SQL_NTS does mean something.
-TEST_F(ScalarConversionLiveTest, ScalarParamsBindWithoutAnIndicatorPointer) {
+ODBC_TEST_F(ScalarConversionLiveTest, ScalarParamsBindWithoutAnIndicatorPointer) {
     auto bind = [&](SQLSMALLINT c_type, SQLSMALLINT sql_type, void* buf, SQLLEN buf_len,
                     SQLSMALLINT scale) {
         return SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c_type, sql_type, 0, scale, buf,
@@ -2200,7 +2200,7 @@ TEST_F(ScalarConversionLiveTest, ScalarParamsBindWithoutAnIndicatorPointer) {
 // zero length - the SQLPutData NULL/0 convention (sqlccmd.cpp:4497). Every
 // other shape answers HY090. Measured on retail 18.6.2.1; sqlcfunc.cpp:2549
 // reads as though any null buffer is NULL, which ADO build 172202 falsified.
-TEST_F(ScalarConversionLiveTest, ANullValueBufferFollowsTheZeroLengthRule) {
+ODBC_TEST_F(ScalarConversionLiveTest, ANullValueBufferFollowsTheZeroLengthRule) {
     struct Case {
         SQLSMALLINT c;
         SQLSMALLINT s;
@@ -2278,7 +2278,7 @@ protected:
 // msodbcsql picks a variant's inner type from the C type alone (CTypeToSqlType,
 // sqlcprot.h), so a binary buffer arrives as varbinary rather than as the
 // character default. The round-tripped bytes alone cannot show that.
-TEST_F(ExtendedTypeLiveTest, BinaryParamDeclaresVarbinaryInsideSqlVariant) {
+ODBC_TEST_F(ExtendedTypeLiveTest, BinaryParamDeclaresVarbinaryInsideSqlVariant) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(SQL_VARIANT_PROPERTY(?, 'BaseType') AS VARCHAR(32))"),
                   SQL_HANDLE_STMT, stmt_);
     SQLCHAR payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
@@ -2289,7 +2289,7 @@ TEST_F(ExtendedTypeLiveTest, BinaryParamDeclaresVarbinaryInsideSqlVariant) {
     EXPECT_EQ("varbinary", ExecuteAndReadBack());
 }
 
-TEST_F(ExtendedTypeLiveTest, BinaryParamRoundTripsThroughSqlVariant) {
+ODBC_TEST_F(ExtendedTypeLiveTest, BinaryParamRoundTripsThroughSqlVariant) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), CAST(? AS VARBINARY(8)), 2)"),
                   SQL_HANDLE_STMT, stmt_);
     SQLCHAR payload[] = {0x01, 0x02, 0xFF};
@@ -2311,7 +2311,7 @@ TEST_F(ExtendedTypeLiveTest, BinaryParamRoundTripsThroughSqlVariant) {
 // execute with `22001`, saving the round trip. Both legs are asserted so the
 // reference stays measured. Registered as deviation 21 in
 // `mssql-odbc/docs/parity-deviations.md`.
-TEST_F(ExtendedTypeLiveTest, BinaryVariantPayloadPastTheCeilingIsRefused) {
+ODBC_TEST_F(ExtendedTypeLiveTest, BinaryVariantPayloadPastTheCeilingIsRefused) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS VARBINARY(8000))"), SQL_HANDLE_STMT, stmt_);
     std::vector<SQLCHAR> payload(8001, 0xAB);
     indicator_ = static_cast<SQLLEN>(payload.size());
@@ -2488,7 +2488,7 @@ protected:
 // block by `datatypes::sql_udt::tests`, and the type byte, name block and PLP
 // framing together by `sqltypes::variant_tests::
 // a_udt_parameter_is_framed_as_plp_after_its_name_block`.
-TEST_F(UdtParamLiveTest, BinaryPayloadRoundTripsThroughAUdtParameter) {
+ODBC_TEST_F(UdtParamLiveTest, BinaryPayloadRoundTripsThroughAUdtParameter) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());
 
@@ -2503,7 +2503,7 @@ TEST_F(UdtParamLiveTest, BinaryPayloadRoundTripsThroughAUdtParameter) {
 
 // A NULL UDT still declares its type, so the server can resolve the parameter
 // even with no payload.
-TEST_F(UdtParamLiveTest, ANullUdtParameterIsAccepted) {
+ODBC_TEST_F(UdtParamLiveTest, ANullUdtParameterIsAccepted) {
     ASSERT_SQL_OK(Prepare("SELECT CASE WHEN ? IS NULL THEN 'null' ELSE 'notnull' END"),
                   SQL_HANDLE_STMT, stmt_);
     indicator_ = SQL_NULL_DATA;
@@ -2520,7 +2520,7 @@ TEST_F(UdtParamLiveTest, ANullUdtParameterIsAccepted) {
 // legs rather than skipping. Neither driver consults the server here:
 // msodbcsql fills the name only from SQLDescribeParam/auto-IPD
 // (`AutoFillIPD`), never at execute.
-TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());
 
@@ -2557,7 +2557,7 @@ TEST_F(UdtParamLiveTest, AUdtParameterWithoutATypeNameFails) {
 // msodbcsql answering something other than `22001`, this is a measured
 // divergence needing the `ODBC_TEST_TARGET` split and a registry entry, not a
 // changed expectation.
-TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
     // A multi-level path: a single-level hierarchyid serializes to one byte,
     // and `ColumnSize = 0` is SQL_SS_LENGTH_UNLIMITED, so there would be no
     // bounded value below it to test with.
@@ -2623,7 +2623,7 @@ TEST_F(UdtParamLiveTest, AUdtPayloadPastABoundedColumnSizeIsRefused) {
 // above - the `HY104` expected of the reference leg is not recorded against a
 // `SQL_DRIVER_VER` and tested build, and the same `--compare-with-msodbcsql`
 // run would close both.
-TEST_F(UdtParamLiveTest, AUdtColumnSizePastTheCeilingIsRefusedAtBind) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtColumnSizePastTheCeilingIsRefusedAtBind) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/2/");
     ASSERT_FALSE(payload.empty());
     indicator_ = static_cast<SQLLEN>(payload.size());
@@ -2653,7 +2653,7 @@ TEST_F(UdtParamLiveTest, AUdtColumnSizePastTheCeilingIsRefusedAtBind) {
 // reusing the previous statement's identity would send the wrong type. The
 // bind is what makes this reachable: it marks the record explicitly bound,
 // which stops the self-healing describe path from ever correcting it.
-TEST_F(UdtParamLiveTest, AnAutoFilledNameDoesNotSurviveARePrepare) {
+ODBC_TEST_F(UdtParamLiveTest, AnAutoFilledNameDoesNotSurviveARePrepare) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());
 
@@ -2676,7 +2676,7 @@ TEST_F(UdtParamLiveTest, AnAutoFilledNameDoesNotSurviveARePrepare) {
 
 // The other half of the same rule: a name the *application* set is a property
 // of the binding, so it must survive a re-prepare untouched.
-TEST_F(UdtParamLiveTest, AnApplicationSuppliedNameSurvivesARePrepare) {
+ODBC_TEST_F(UdtParamLiveTest, AnApplicationSuppliedNameSurvivesARePrepare) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());
 
@@ -2703,7 +2703,7 @@ TEST_F(UdtParamLiveTest, AnApplicationSuppliedNameSurvivesARePrepare) {
 // right while the new text's parameter is the same type - when it is not, the
 // payload fails to deserialize server-side rather than being silently
 // misread. Asserted on both legs so the reference stays measured.
-TEST_F(UdtParamLiveTest, SQLExecDirectReusesAnAutoFilledName) {
+ODBC_TEST_F(UdtParamLiveTest, SQLExecDirectReusesAnAutoFilledName) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());
 
@@ -2735,7 +2735,7 @@ TEST_F(UdtParamLiveTest, SQLExecDirectReusesAnAutoFilledName) {
 //
 // Describe must precede the bind: an explicitly bound record is left alone by
 // both drivers (msodbcsql's AutoFillIPD requires no parameters bound yet).
-TEST_F(UdtParamLiveTest, DescribeParamSuppliesAUdtNameTheApplicationOmitted) {
+ODBC_TEST_F(UdtParamLiveTest, DescribeParamSuppliesAUdtNameTheApplicationOmitted) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/5/");
     ASSERT_FALSE(payload.empty());
 
@@ -2765,7 +2765,7 @@ TEST_F(UdtParamLiveTest, DescribeParamSuppliesAUdtNameTheApplicationOmitted) {
 // alone - matching msodbcsql's AutoFillIPD, which requires no parameters bound
 // yet. SQLFreeStmt(SQL_RESET_PARAMS) truncates the IPD so the describe below
 // lands on a fresh record.
-TEST_F(UdtParamLiveTest, ResetThenDescribeRecoversTheUdtNameOnStatementReuse) {
+ODBC_TEST_F(UdtParamLiveTest, ResetThenDescribeRecoversTheUdtNameOnStatementReuse) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/7/");
     ASSERT_FALSE(payload.empty());
 
@@ -2799,7 +2799,7 @@ TEST_F(UdtParamLiveTest, ResetThenDescribeRecoversTheUdtNameOnStatementReuse) {
 // the IPD without clearing that cache. The cache-served describe therefore has
 // to replay the UDT identity too - dropping it left the record with no type
 // name and failed the execute on every run after the first.
-TEST_F(UdtParamLiveTest, ASecondResetDescribeCycleKeepsTheUdtNameFromTheCache) {
+ODBC_TEST_F(UdtParamLiveTest, ASecondResetDescribeCycleKeepsTheUdtNameFromTheCache) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/9/");
     ASSERT_FALSE(payload.empty());
 
@@ -2825,7 +2825,7 @@ TEST_F(UdtParamLiveTest, ASecondResetDescribeCycleKeepsTheUdtNameFromTheCache) {
 
 // A schema-qualified name resolves the same system type, exercising the
 // optional part of the header.
-TEST_F(UdtParamLiveTest, ASchemaQualifiedUdtNameResolves) {
+ODBC_TEST_F(UdtParamLiveTest, ASchemaQualifiedUdtNameResolves) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/2/");
     ASSERT_FALSE(payload.empty());
 
@@ -2846,7 +2846,7 @@ TEST_F(UdtParamLiveTest, ASchemaQualifiedUdtNameResolves) {
 // both, a driver that reused parameter 1's name for parameter 2 would still
 // pass. `geometry` has a different serialized form, so sending it under the
 // wrong type name fails at the server.
-TEST_F(UdtParamLiveTest, EachUdtParameterCarriesItsOwnName) {
+ODBC_TEST_F(UdtParamLiveTest, EachUdtParameterCarriesItsOwnName) {
     std::vector<SQLCHAR> first = SerializedHierarchyId("/1/");
     std::vector<SQLCHAR> second = SerializedGeometry("POINT (3 4)");
     ASSERT_FALSE(first.empty());
@@ -2880,7 +2880,7 @@ TEST_F(UdtParamLiveTest, EachUdtParameterCarriesItsOwnName) {
 
 // A UDT parameter used as a predicate rather than an inserted value, which is
 // how TCLargeUDT.cpp variation_10 exercises it.
-TEST_F(UdtParamLiveTest, AUdtParameterWorksInAWhereClause) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtParameterWorksInAWhereClause) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/1/");
     ASSERT_FALSE(payload.empty());
 
@@ -2897,7 +2897,7 @@ TEST_F(UdtParamLiveTest, AUdtParameterWorksInAWhereClause) {
 
 // Benefits-from-mock-tds: assert the UDT identity precedes an unknown-length
 // PLP opener and that each one-byte SQLPutData call becomes its own chunk.
-TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtParameterCanBeSuppliedAtExecution) {
     std::vector<SQLCHAR> payload = SerializedHierarchyId("/3/");
     ASSERT_FALSE(payload.empty());
 
@@ -3035,7 +3035,7 @@ ODBC_TEST_F(UdtParamLiveTest, LargeUdtStreamsThroughDataAtExecution) {
 // negative_variation_1); this driver answers HYC00 because its conversion
 // matrix is still an implementation-progress list. The flip is P9f (AB#48249),
 // so this asserts rejection without pinning the state on the msodbcsql leg.
-TEST_F(UdtParamLiveTest, AScalarCTypeAgainstAUdtIsRejected) {
+ODBC_TEST_F(UdtParamLiveTest, AScalarCTypeAgainstAUdtIsRejected) {
     SQLINTEGER value = 7;
     indicator_ = sizeof(value);
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
@@ -3046,7 +3046,7 @@ TEST_F(UdtParamLiveTest, AScalarCTypeAgainstAUdtIsRejected) {
 // The payload is opaque to the driver, so bytes that are not a valid instance
 // of the named type must be refused by the server rather than silently
 // accepted or mangled on the way out.
-TEST_F(UdtParamLiveTest, AMalformedUdtPayloadIsRejectedByTheServer) {
+ODBC_TEST_F(UdtParamLiveTest, AMalformedUdtPayloadIsRejectedByTheServer) {
     SQLCHAR garbage[] = {0xFF, 0xFE, 0xFD, 0xFC};
     indicator_ = sizeof(garbage);
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS hierarchyid).ToString()"), SQL_HANDLE_STMT, stmt_);
@@ -3059,7 +3059,7 @@ TEST_F(UdtParamLiveTest, AMalformedUdtPayloadIsRejectedByTheServer) {
 
 // A UDT parameter round-trips through a real column, not just an expression,
 // which is the shape msodbcsql's insert variations use.
-TEST_F(UdtParamLiveTest, AUdtParameterInsertsIntoAColumn) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtParameterInsertsIntoAColumn) {
     SqlTString drop = ODBCTestUtils::ToSqlTStr(
         std::string("IF OBJECT_ID('tempdb..#udt_param') IS NOT NULL DROP TABLE #udt_param"));
     ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS),
@@ -3091,7 +3091,7 @@ TEST_F(UdtParamLiveTest, AUdtParameterInsertsIntoAColumn) {
 // type and the driver's @params declaration is never consulted. That makes it
 // the one case where a wrong declaration would go unnoticed - and the one that
 // still needs the TYPE_INFO name to be right.
-TEST_F(UdtParamLiveTest, AUdtParameterReachesAStoredProcedure) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtParameterReachesAStoredProcedure) {
     SqlTString drop = ODBCTestUtils::ToSqlTStr(
         std::string("IF OBJECT_ID('tempdb..#udt_proc') IS NOT NULL DROP PROCEDURE #udt_proc"));
     ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS),
@@ -3119,7 +3119,7 @@ TEST_F(UdtParamLiveTest, AUdtParameterReachesAStoredProcedure) {
 // that a type name is present, sqlccmd.cpp:9977), so accepting it is parity;
 // what needed pinning is the write-back leg, which had never run against a
 // returned UDT.
-TEST_F(UdtParamLiveTest, AUdtOutputParameterIsWrittenBack) {
+ODBC_TEST_F(UdtParamLiveTest, AUdtOutputParameterIsWrittenBack) {
     SqlTString drop = ODBCTestUtils::ToSqlTStr(std::string(
         "IF OBJECT_ID('tempdb..#udt_out') IS NOT NULL DROP PROCEDURE #udt_out"));
     ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS),
@@ -3154,7 +3154,7 @@ TEST_F(UdtParamLiveTest, AUdtOutputParameterIsWrittenBack) {
 // (CTypeToSqlType, sqlcprot.h). Its own suites bind several C types against
 // SQL_SS_VARIANT and check what the server received; these are the pairings
 // this driver currently supports.
-TEST_F(ExtendedTypeLiveTest, VariantBaseTypeFollowsTheCTypeNotTheValue) {
+ODBC_TEST_F(ExtendedTypeLiveTest, VariantBaseTypeFollowsTheCTypeNotTheValue) {
     struct Case {
         SQLSMALLINT c_type;
         const char* base_type;
@@ -3186,7 +3186,7 @@ TEST_F(ExtendedTypeLiveTest, VariantBaseTypeFollowsTheCTypeNotTheValue) {
 // An explicit ColumnSize is honoured rather than always landing on the
 // non-max ceiling: msodbcsql binds binary variants with a stated size (16 for
 // a SQL_SS_TIME2_STRUCT in its datetime suite).
-TEST_F(ExtendedTypeLiveTest, BinaryVariantHonoursAnExplicitColumnSize) {
+ODBC_TEST_F(ExtendedTypeLiveTest, BinaryVariantHonoursAnExplicitColumnSize) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CAST(? AS VARBINARY(64)), 2)"),
                   SQL_HANDLE_STMT, stmt_);
     SQLCHAR payload[] = {0xAA, 0xBB, 0xCC, 0xDD};
@@ -3198,7 +3198,7 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantHonoursAnExplicitColumnSize) {
 }
 
 // A zero-length binary variant is a present value, not NULL.
-TEST_F(ExtendedTypeLiveTest, AnEmptyBinaryVariantIsNotNull) {
+ODBC_TEST_F(ExtendedTypeLiveTest, AnEmptyBinaryVariantIsNotNull) {
     ASSERT_SQL_OK(Prepare("SELECT CASE WHEN ? IS NULL THEN 'null' ELSE 'notnull' END"),
                   SQL_HANDLE_STMT, stmt_);
     SQLCHAR payload[] = {0x00};
@@ -3211,7 +3211,7 @@ TEST_F(ExtendedTypeLiveTest, AnEmptyBinaryVariantIsNotNull) {
 
 // A NULL binary variant still binds: the variant carries no payload and the
 // server sees SQL NULL.
-TEST_F(ExtendedTypeLiveTest, ANullBinaryVariantIsAccepted) {
+ODBC_TEST_F(ExtendedTypeLiveTest, ANullBinaryVariantIsAccepted) {
     ASSERT_SQL_OK(Prepare("SELECT CASE WHEN ? IS NULL THEN 'null' ELSE 'notnull' END"),
                   SQL_HANDLE_STMT, stmt_);
     indicator_ = SQL_NULL_DATA;
@@ -3223,7 +3223,7 @@ TEST_F(ExtendedTypeLiveTest, ANullBinaryVariantIsAccepted) {
 
 // A binary variant round-trips through a real sql_variant column, preserving
 // both the bytes and the base type the driver declared.
-TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
+ODBC_TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
     SqlTString drop = ODBCTestUtils::ToSqlTStr(
         std::string("IF OBJECT_ID('tempdb..#variant_param') IS NOT NULL DROP TABLE #variant_param"));
     ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS),
@@ -3288,7 +3288,7 @@ TEST_F(ExtendedTypeLiveTest, BinaryVariantRoundTripsThroughASqlVariantColumn) {
 // SKIP_IF_COMPARING_MSODBCSQL() means the reference leg never re-measures this
 // block, so AB#48249 should re-measure against the build it targets rather than
 // inherit a one-off observation.
-TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
+ODBC_TEST_F(CrossConversionLiveTest, UnimplementedMatrixCellsAreRefusedAtBind) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     struct Cell {
