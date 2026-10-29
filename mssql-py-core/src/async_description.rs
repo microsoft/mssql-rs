@@ -95,8 +95,8 @@ fn python_type<'py>(py: Python<'py>, metadata: &ColumnMetadata) -> PyResult<Boun
 
 fn vector_python_type(py: Python<'_>, base_type: Option<u8>) -> Bound<'_, PyType> {
     match base_type.and_then(|value| VectorBaseType::try_from(value).ok()) {
-        Some(VectorBaseType::Float32) => py.get_type::<PyList>(),
-        Some(VectorBaseType::Float16) | None => py.get_type::<PyString>(),
+        Some(VectorBaseType::Float32 | VectorBaseType::Float16) => py.get_type::<PyList>(),
+        None => py.get_type::<PyString>(),
     }
 }
 
@@ -227,7 +227,7 @@ mod tests {
             );
             assert!(
                 vector_python_type(py, Some(VectorBaseType::Float16 as u8))
-                    .is(py.get_type::<PyString>())
+                    .is(py.get_type::<PyList>())
             );
             assert!(vector_python_type(py, None).is(py.get_type::<PyString>()));
         });

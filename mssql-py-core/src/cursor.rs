@@ -769,15 +769,13 @@ impl PyCoreCursor {
             ColumnValues::Bytes(b) => PyBytes::new(py, b).into_any(),
             ColumnValues::Vector(v) => {
                 // Return Python list of floats for vectors
+                // Float16 elements are held widened to f32, so both base types convert the same way
                 match v.base_type() {
-                    VectorBaseType::Float32 => {
+                    VectorBaseType::Float32 | VectorBaseType::Float16 => {
                         if let Some(vals) = v.as_f32() {
                             let list = PyList::new(py, vals.iter().map(|f| *f as f64)).unwrap();
                             return Ok(list.into_any());
                         }
-                    }
-                    VectorBaseType::Float16 => {
-                        // Let it fall through to the string conversion below
                     }
                 }
                 // Fallback to string if conversion fails

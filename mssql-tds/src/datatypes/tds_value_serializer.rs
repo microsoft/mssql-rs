@@ -1930,6 +1930,25 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
+        // `base_type` and `data` are both public; reject mismatches before writing so the
+        // declared length can never disagree with the emitted element width.
+        let consistent = matches!(
+            (value.base_type, &value.data),
+            (
+                crate::datatypes::sqldatatypes::VectorBaseType::Float32,
+                VectorData::Float32(_)
+            ) | (
+                crate::datatypes::sqldatatypes::VectorBaseType::Float16,
+                VectorData::Float16(_)
+            )
+        );
+        if !consistent {
+            return Err(Error::UsageError(format!(
+                "Vector base type {:?} does not match its element data",
+                value.base_type
+            )));
+        }
+
         // Compute total payload size
         let dims = value.dimension_count();
         let total_size = value.total_size();
@@ -4163,6 +4182,30 @@ mod serializer_tests {
         assert_eq!(&p[10..14], &1.0f32.to_le_bytes());
         assert_eq!(&p[14..18], &2.0f32.to_le_bytes());
         assert_eq!(&p[18..22], &3.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn vector_mismatched_base_type_and_data_is_rejected() {
+        use crate::datatypes::sql_vector::{SqlVector, VectorData};
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        let cases = [
+            (VectorBaseType::Float32, VectorData::Float16(vec![1.0, 2.0])),
+            (VectorBaseType::Float16, VectorData::Float32(vec![1.0, 2.0])),
+        ];
+        for (base_type, data) in cases {
+            let mut mock = MockNetworkWriter::new(64);
+            let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+            let vector = SqlVector { base_type, data };
+            let result = block_on(TdsValueSerializer::serialize_value(
+                &mut w,
+                &ColumnValues::Vector(vector),
+                &vector_ctx(),
+            ));
+            assert!(
+                matches!(result, Err(crate::error::Error::UsageError(_))),
+                "{base_type:?}"
+            );
+        }
     }
 
     #[test]

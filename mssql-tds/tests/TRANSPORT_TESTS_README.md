@@ -42,7 +42,7 @@ The tests require the following environment variables (typically set in `.env` f
 # Required for all tests
 DB_USERNAME=your_username
 SQL_PASSWORD=your_password
-DB_DATABASE=UserDb         # Optional generally; common helpers default to master
+DB_DATABASE=UserDb         # Only read by the float16 helper; other tests always use master
 
 # TCP tests
 DB_HOST=localhost           # Server hostname or IP
