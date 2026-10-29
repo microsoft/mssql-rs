@@ -15,7 +15,26 @@
 # Requires: Administrator privileges (writes to HKLM).
 # Usage: .\run_e2e.ps1 [-Release] [-Retries N] [-Coverage] [-CoverageOutput PATH]
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
-#                      [-FilterTests REGEX]
+#                      [-FilterTests REGEX] [-MtProfile pr|nightly|weekly]
+#                      [-MtDumpDir PATH]
+#
+# -MtProfile selects how the ODBC_TEST_F concurrent variants run (ctest
+# registers them as a separate <name>_mt entry per converted executable), as in
+# run_e2e.sh --mt-profile:
+#   pr       (default) every ctest entry; concurrent variants, every mode, at the
+#            harness default of 2 threads x 1 iteration.
+#   nightly  only the <name>_mt entries, 8 x 20, every mode.
+#   weekly   only the <name>_mt entries, 16 x 50, every mode.
+# nightly and weekly ignore -Retries (an intermittent failure is what they look
+# for) and leave evidence in -MtDumpDir (default build\mt-dumps): a minidump from
+# the watchdog for a hang, and from the test process itself for a crash or
+# abort(). Crashes end the process there because these profiles set
+# GTEST_CATCH_EXCEPTIONS=0. With
+# -CompareWithMsodbcsql the msodbcsql leg runs at 2 x 1: it checks that the tests
+# suit the modes, not msodbcsql's thread safety. Unlike on unixODBC, /SharedStmt
+# stays in: the Windows Driver Manager serializes diagnostic calls with the
+# others on a handle. Already-set MSSQL_ODBC_MT_THREADS, MSSQL_ODBC_MT_ITERS and
+# MSSQL_ODBC_MT_SKIP_MODES ("none" skips nothing) override a profile.
 #
 # -Retries N reruns each failing test up to N extra times (ctest
 # --repeat until-pass:N+1). A test that passes on any attempt counts as a
@@ -62,7 +81,10 @@ param(
     # Optional ctest name-exclusion regex (ctest -E). Empty by default: the Windows
     # driver gaps tracked in AB#46973 (get_type_info_test, driver_connect_test) are
     # fixed, so the full suite runs on Windows. Pass -ExcludeTests '<regex>' to skip.
-    [string]$ExcludeTests = ''
+    [string]$ExcludeTests = '',
+    [ValidateSet('pr', 'nightly', 'weekly')]
+    [string]$MtProfile = 'pr',
+    [string]$MtDumpDir = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -295,9 +317,84 @@ function Restore-Registration {
     $script:Registered = $false
 }
 
+# ---------------------------------------------------------------------------
+# -MtProfile (see the header). Environment set here is restored on exit, like
+# the registry, so a dot-sourced or repeated run starts clean.
+# ---------------------------------------------------------------------------
+$script:MtStress = $MtProfile -ne 'pr'
+$script:MtEnvNames = @('MSSQL_ODBC_MT_THREADS', 'MSSQL_ODBC_MT_ITERS', 'MSSQL_ODBC_MT_SKIP_MODES',
+                       'MSSQL_ODBC_MT_DUMP_DIR', 'GTEST_CATCH_EXCEPTIONS')
+$script:MtSavedEnv = @{}
+$script:MsLegEnv = @{}
+
+function Set-MtProfile {
+    foreach ($name in $script:MtEnvNames) {
+        $script:MtSavedEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    if ($script:MtStress) {
+        $threads, $iters = if ($MtProfile -eq 'nightly') { 8, 20 } else { 16, 50 }
+        if (-not $env:MSSQL_ODBC_MT_THREADS) { $env:MSSQL_ODBC_MT_THREADS = "$threads" }
+        if (-not $env:MSSQL_ODBC_MT_ITERS) { $env:MSSQL_ODBC_MT_ITERS = "$iters" }
+        if (-not $script:MtDumpDir) { $script:MtDumpDir = Join-Path $ScriptDir 'build\mt-dumps' }
+        New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
+        $script:MtDumpDir = (Resolve-Path $script:MtDumpDir).Path
+        $env:MSSQL_ODBC_MT_DUMP_DIR = $script:MtDumpDir
+        # A crash ends the process (instead of becoming a test failure) and leaves
+        # a minidump in MSSQL_ODBC_MT_DUMP_DIR; see odbc_concurrent_test.h.
+        $env:GTEST_CATCH_EXCEPTIONS = '0'
+        $script:MsLegEnv = @{ MSSQL_ODBC_MT_THREADS = '2'; MSSQL_ODBC_MT_ITERS = '1' }
+        if ($Retries -gt 0) {
+            Write-Host "-MtProfile $MtProfile ignores -Retries ${Retries}: an intermittent failure is the signal."
+            $script:Retries = 0
+        }
+    }
+    $threadsShown = if ($env:MSSQL_ODBC_MT_THREADS) { $env:MSSQL_ODBC_MT_THREADS } else { '2' }
+    $itersShown = if ($env:MSSQL_ODBC_MT_ITERS) { $env:MSSQL_ODBC_MT_ITERS } else { '1' }
+    Write-Host "MT profile: $MtProfile (threads=$threadsShown iterations=$itersShown skip_modes='$($env:MSSQL_ODBC_MT_SKIP_MODES)')"
+    if ($script:MtStress) { Write-Host "MT dumps: $($script:MtDumpDir)" }
+}
+
+function Restore-MtProfile {
+    foreach ($name in $script:MtSavedEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $script:MtSavedEnv[$name], 'Process')
+    }
+}
+
+# A minidump names no binaries, so once the agent is gone it cannot be read
+# without the exact builds that produced it. When a stress run left dumps, copy
+# the Rust driver and every <name>_mt executable, each with its PDB, into
+# <dump dir>\symbols (msodbcsql's symbols come from the public symbol server).
+function Save-MtSymbols([string]$DriverDll) {
+    if (-not $script:MtStress -or -not (Test-Path $script:MtDumpDir)) { return }
+    if (-not (Get-ChildItem -Path $script:MtDumpDir -Filter '*.dmp' -File -ErrorAction SilentlyContinue)) { return }
+    $symbols = Join-Path $script:MtDumpDir 'symbols'
+    New-Item -ItemType Directory -Force -Path $symbols | Out-Null
+    $binaries = @()
+    if ($DriverDll) { $binaries += $DriverDll }
+    $buildDir = Join-Path $ScriptDir 'build'
+    if (Test-Path $buildDir) {
+        Push-Location $buildDir
+        try {
+            $entries = ctest -N -L mt -C Debug 2>$null | Select-String 'Test\s+#\d+:\s+(\S+)_mt\s*$'
+        } finally {
+            Pop-Location
+        }
+        foreach ($entry in $entries) {
+            $binaries += Join-Path $buildDir "Debug\$($entry.Matches[0].Groups[1].Value).exe"
+        }
+    }
+    foreach ($binary in $binaries) {
+        foreach ($file in @($binary, [IO.Path]::ChangeExtension($binary, '.pdb'))) {
+            if (Test-Path $file) { Copy-Item -Path $file -Destination $symbols -Force }
+        }
+    }
+    Write-Host "MT dumps: copied $((Get-ChildItem $symbols -File).Count) binaries and PDBs to $symbols"
+}
+
 # Run the (already-built) ctest suite, writing JUnit XML to $JunitName inside
-# the build dir. Returns ctest's exit code without aborting the script.
-function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName, [string]$RustDriverDll) {
+# the build dir. $LegEnv holds environment for this leg only. Returns ctest's
+# exit code without aborting the script.
+function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName, [string]$RustDriverDll, [hashtable]$LegEnv = @{}) {
     Write-Host ""
     Write-Host "=== Running e2e tests against $Label ==="
     Write-Host "ODBC_TEST_DRIVER=$DriverName"
@@ -305,8 +402,24 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
     $prevTarget = $env:ODBC_TEST_TARGET
     $prevDriver = $env:ODBC_TEST_DRIVER
     $prevDll = $env:MSSQL_ODBC_DLL
+    $prevLegEnv = @{}
+    foreach ($name in $LegEnv.Keys) {
+        $prevLegEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, $LegEnv[$name], 'Process')
+    }
+    if ($LegEnv.Count -gt 0) {
+        Write-Host "Leg environment: $(($LegEnv.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')"
+    }
     try {
         $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
+        if ($script:MtStress) {
+            # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
+            # this only bounds an entry whose many phases all progress slowly.
+            $ctestArgs += @('-L', 'mt', '--timeout', '3600')
+            # Set-MtProfile created it, but a dump directory inside build\ is gone
+            # if Remove-IncompatibleCMakeBuildTree deleted the tree since.
+            New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
+        }
         if ($FilterTests) {
             $ctestArgs += @('-R', $FilterTests)
         }
@@ -346,6 +459,9 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         $env:ODBC_TEST_TARGET = $prevTarget
         $env:ODBC_TEST_DRIVER = $prevDriver
         $env:MSSQL_ODBC_DLL = $prevDll
+        foreach ($name in $prevLegEnv.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $prevLegEnv[$name], 'Process')
+        }
         Pop-Location
     }
 }
@@ -629,6 +745,7 @@ function Remove-IncompatibleCMakeBuildTree([string]$BuildDir) {
 }
 
 try {
+    Set-MtProfile
     if ($Retries -gt 0) {
         Write-Host "Retries enabled: each failing test reruns up to $Retries time(s)."
     }
@@ -752,7 +869,7 @@ try {
     if ($MsodbcsqlDll) {
         Set-MsodbcsqlOverride $RefDriverPath
     }
-    $MsExit = Invoke-CtestRun "msodbcsql" "junit-msodbcsql.xml" $MsodbcsqlName
+    $MsExit = Invoke-CtestRun "msodbcsql" "junit-msodbcsql.xml" $MsodbcsqlName "" $script:MsLegEnv
     Assert-TestsExecuted $MsJunit "msodbcsql"
 
     $parity = Write-ParityReport $RustJunit $MsJunit
@@ -771,5 +888,8 @@ try {
     Write-Host "=== Both runs passed with full parity ==="
 }
 finally {
+    # Best effort: a failure here must not skip restoring the registry.
+    try { Save-MtSymbols $DriverPath } catch { Write-Warning "Could not save MT symbols: $_" }
+    Restore-MtProfile
     Restore-Registration
 }

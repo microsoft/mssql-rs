@@ -33,10 +33,13 @@ tests/e2e/
 ├── tests/
 │   ├── smoke_test.cpp          # Smoke tests (alloc, connect, query)
 │   └── alloc_env_test.cpp      # SQLAllocHandle(ENV) variations
+├── check/
+│   └── msodbcsql_types_check.cpp # Compile-time check of odbc_sql_server_types.h against msodbcsql.h
 ├── third_party/                # Reserved for git submodule (unused — using FetchContent)
 ├── run_e2e.sh                  # Build + test runner (Linux / macOS)
 ├── build_e2e.sh                # Build-only half for CI artifact reuse (Linux / macOS)
 ├── run_e2e.ps1                 # Build + test runner (Windows, requires admin)
+├── run_mt_test.sh, .gdb        # Launches <name>_mt entries, under gdb in stress runs (Linux / macOS)
 └── README.md                   # This file
 ```
 
@@ -199,12 +202,13 @@ measured divergence, or a documented gap tracked by a work item — and asks tha
 anything else assert on both legs. When the divergence is measured, asserting
 both legs records the measurement continuously.
 
-**Granularity:** ctest compares at the *test-binary* level — each `*_test`
-executable is a single ctest case and the parity table is keyed on that binary
-name, not on individual gtest cases. A gtest skip is not a failure, so a case
+**Granularity:** ctest compares at the *ctest-entry* level — each `*_test`
+executable is one ctest case, or two when it uses `ODBC_TEST_F` (`<name>` and
+`<name>_mt`, see step 4 of "Writing a New Test"), and the parity table is keyed
+on that entry name, not on individual gtest cases. A gtest skip is not a failure, so a case
 guarded by `SKIP_IF_COMPARING_MSODBCSQL()` leaves its binary passing on both
 legs: it shows up as `parity`, not `skipped`. The `skipped (not compared)`
-verdict only appears when an *entire* binary is skipped in one leg. Either way
+verdict only appears when an *entire* entry is skipped in one leg. Either way
 the divergent assertions never execute on the reference leg.
 
 CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
@@ -372,18 +376,19 @@ infrastructure works (`runtests.c`).
   affected. A `trap cleanup EXIT` ensures the temp directory is removed even on
   failure. With `--compare-with-msodbcsql`, the same file also gets a copy of
   the msodbcsql section from `--msodbcsql-ini`. Both registrations set
-  `Threading=1`, so unixODBC serializes calls on each handle as the Windows
+  `Threading=1`, so unixODBC locks each handle for a call as the Windows
   Driver Manager does, except `SQLCancel`, which it locks only at level 3. At
   the unixODBC default of 0, the `/SharedStmt` variants crash inside
-  `libodbc` with either driver. `Threading=1` does not eliminate the diagnostic-list
-  race fixed by [lurcher/unixODBC#244](https://github.com/lurcher/unixODBC/pull/244).
-  The `/SharedStmt` variants of
+  `libodbc` with either driver. Level 1 narrows but does not close that race in
+  released unixODBC ([#243](https://github.com/lurcher/unixODBC/issues/243),
+  fixed by [lurcher/unixODBC#244](https://github.com/lurcher/unixODBC/pull/244)
+  but not yet released). Until the pipelines test against a unixODBC build with
+  the fix (AB#49575), the stress profiles skip `/SharedStmt` on unixODBC, and
+  the `/SharedStmt` variants of
   `GetDataLiveTest.DefaultTargetStreamsAVarcharMaxAcrossChunks` and
-  `GetDataLiveTest.RunUniqueValuesSurviveEveryRetrievalPath` are temporarily
-  unregistered on non-Windows platforms; their other variants and all Windows
-  coverage remain enabled. Restore their default modes once a fixed unixODBC
-  release propagates through all supported OS package channels, or the
-  mssql-odbc pipelines build and use latest unixODBC code containing the fix.
+  `GetDataLiveTest.RunUniqueValuesSurviveEveryRetrievalPath` are unregistered
+  on non-Windows platforms; their other variants and all Windows coverage
+  remain enabled.
 
 - **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
   `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server (Rust)`, so an
@@ -536,8 +541,23 @@ Registering it anyway fails the variant with that advice rather than hanging.
 The rule and the `/SharedDbc` conditions are in
 `.github/instructions/mssql-odbc.instructions.md` §10.
 
+CMake registers such an executable as two ctest entries: `<name>` runs the
+single-threaded tests and `<name>_mt` (label `mt`) the concurrent variants, so
+a concurrency failure never hides a parity verdict. Nothing to add in
+`CMakeLists.txt`; reconfigure after converting a file. Both entries pass
+`--gtest_filter`, which overrides a `GTEST_FILTER` environment variable.
+
 ```bash
-# 8 threads x 20 iterations, only the multithreaded variants
+ctest --test-dir build -L mt                            # every concurrent variant, 2 x 1
+./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt, gdb stacks
+```
+
+```powershell
+.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 50, minidumps in build\mt-dumps
+```
+
+```bash
+# One executable by hand: 8 threads x 20 iterations, only the multithreaded variants
 MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
   ./build/get_data_test --gtest_filter='*/CrossThread:*/SharedEnv:*/SharedStmt:*/SharedDbc'
 ```
@@ -548,9 +568,10 @@ MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
 separately to a multithreaded variant's fixture `SetUp`, its run, and its
 `TearDown` (the single-threaded test has none, like `TEST_F`). On a hang the
 watchdog writes a minidump on Windows (to `MSSQL_ODBC_MT_DUMP_DIR`, default the
-working directory) or aborts for a core dump elsewhere. It leaves a process
+working directory) or aborts elsewhere. It leaves a process
 alone when a debugger is attached or when it cannot tell (detection covers
-Windows, Linux, and macOS). Which tests can use which mode, and why, is in
+Windows, Linux, and macOS). The profiles, the other `MSSQL_ODBC_MT_*`
+settings, and which tests can use which mode are in
 [multithreaded-testing-plan.md](../../docs/multithreaded-testing-plan.md).
 
 ## How It Works
