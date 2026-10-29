@@ -2626,6 +2626,78 @@ TEST_F(ParamArrayTest, SetErrorsAreReportedByTheCallThatReachesThem) {
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
 }
 
+// msodbcsql 18.6.2.1 presents a set that fails before its first row, with no
+// status array bound, as an error result: no columns and no cursor to fetch
+// or close, while SQLMoreResults still reaches the later sets.
+TEST_F(ParamArrayTest, FailedSetWithoutStatusArrayIsAnErrorResult) {
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLULEN processed = 0;
+    const auto expect_error_result = [&](const char* fetch_state) {
+        SQLSMALLINT columns = -1;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(0, columns);
+        EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, fetch_state);
+        EXPECT_EQ(SQL_ERROR, SQLCloseCursor(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+    };
+
+    // SQLMoreResults positions on the failed second set.
+    Prepare("SELECT 1 / (CAST(? AS int) - 2) AS q");
+    BindIntArray(values, indicators, 3, nullptr, &processed);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(-1);
+    EXPECT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    expect_error_result("24000");
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(1);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(3u, processed);
+
+    // SQLExecute positions on the failed first set. The Driver Manager treats
+    // a failed SQLExecute as leaving no cursor and answers SQLFetch with HY010
+    // without calling the driver.
+    Prepare("SELECT 1 / (CAST(? AS int) - 1) AS q");
+    BindIntArray(values, indicators, 3, nullptr, &processed);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    expect_error_result("HY010");
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(1);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, ScalarInt("SELECT 1"));
+}
+
+// msodbcsql 18.6.2.1 posts an error inside the rows SQLMoreResults discards
+// without failing the call, but an error from a later statement of the set,
+// after its row set ends, fails SQLMoreResults like any navigation error.
+TEST_F(ParamArrayTest, ErrorAfterTheRowSetFailsMoreResults) {
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    SQLUSMALLINT status[2] = {};
+    SQLULEN processed = 0;
+    Prepare("DECLARE @v int = ?; SELECT @v; IF @v = 1 RAISERROR ('tail error', 16, 1)");
+    BindIntArray(values, indicators, 2, status, &processed);
+
+    for (const bool fetch_first : {false, true}) {
+        SCOPED_TRACE(fetch_first ? "rows fetched" : "rows discarded");
+        status[0] = status[1] = SQL_PARAM_UNUSED;
+        ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+        if (fetch_first) {
+            FetchIntResult(1);
+        }
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLMoreResults(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+        EXPECT_EQ(SQL_PARAM_ERROR, status[0]);
+        FetchIntResult(2);
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        EXPECT_EQ(2u, processed);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, status[1]);
+    }
+}
+
 TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {
     Prepare("DECLARE @value int = ?; IF @value = 2 "
             "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");

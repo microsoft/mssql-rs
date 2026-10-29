@@ -935,6 +935,10 @@ fn fetch_scroll_operation(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        if stmt_state.error_result {
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+            return SQL_ERROR;
+        }
         if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
             error!("SQLFetchScroll: a fetch is already in progress on this statement");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);

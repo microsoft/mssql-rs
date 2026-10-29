@@ -212,6 +212,10 @@ fn sql_get_data_operation(
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
         return SQL_ERROR;
     }
+    if stmt_state.error_result {
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return SQL_ERROR;
+    }
 
     let col_index = usize::from(column_number);
     let metadata_len = stmt_state.column_metadata.len();

@@ -456,6 +456,9 @@ struct PreparedBatchReadState {
     remaining: std::vec::IntoIter<usize>,
     current: Option<PreparedBatchRowResult>,
     completed: Vec<PreparedBatchRowResult>,
+    /// The set whose unread rows the last advance discarded, with its error
+    /// count when the discard ended.
+    discarded: Option<(usize, usize)>,
 }
 
 impl PreparedBatchReadState {
@@ -2019,6 +2022,7 @@ impl TdsClient {
                 current: remaining.next().map(PreparedBatchReadState::next_row),
                 remaining,
                 completed: Vec::new(),
+                discarded: None,
             }));
             self.current_result_set_has_been_read_till_end = true;
             self.current_metadata = None;
@@ -2059,6 +2063,22 @@ impl TdsClient {
             .current
             .as_ref()
             .map(|row| row.row_index)
+    }
+
+    /// The set the last [`advance`](Self::advance) navigated away from when all
+    /// of its pending errors were read while discarding its unread rows.
+    /// msodbcsql's `SQLMoreResults` posts those without failing the call, but
+    /// fails on an error read after the discarded result ends. Call before
+    /// [`take_prepared_batch_results`](Self::take_prepared_batch_results).
+    pub fn quietly_discarded_parameter_set(&self) -> Option<usize> {
+        let batch = self.prepared_batch.as_ref()?;
+        let (set, errors) = batch.discarded?;
+        batch
+            .current
+            .iter()
+            .chain(batch.completed.iter())
+            .any(|row| row.row_index == set && !row.errors.is_empty() && row.errors.len() == errors)
+            .then_some(set)
     }
 
     /// Whether the current response is a row-preserving prepared batch whose
@@ -2173,8 +2193,20 @@ impl TdsClient {
     }
 
     async fn read_prepared_batch_result(&mut self) -> TdsResult<StatementResult> {
+        let leaving = self.current_parameter_set();
         if self.maybe_has_unread_rows() {
             self.drain_rows().await?;
+        }
+        if let Some(batch) = self.prepared_batch.as_mut() {
+            batch.discarded = leaving.map(|set| {
+                let errors = batch
+                    .current
+                    .iter()
+                    .chain(batch.completed.iter())
+                    .find(|row| row.row_index == set)
+                    .map_or(0, |row| row.errors.len());
+                (set, errors)
+            });
         }
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
@@ -10535,6 +10567,7 @@ mod tests {
             current: Some(PreparedBatchReadState::next_row(0)),
             remaining: Vec::new().into_iter(),
             completed: Vec::new(),
+            discarded: None,
         }));
         client.handle_row_done(done(), false).unwrap();
 
@@ -11072,6 +11105,7 @@ mod tests {
             current: Some(PreparedBatchReadState::next_row(0)),
             remaining: Vec::new().into_iter(),
             completed: Vec::new(),
+            discarded: None,
         }));
 
         let outcome = client

@@ -76,7 +76,9 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         return SQL_ERROR;
     };
     free_errors(&mut stmt_state);
-    if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
+    // msodbcsql has no cursor on a failed set's error result, but keeps the
+    // batch for SQLMoreResults, so closing it changes nothing.
+    if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) || stmt_state.error_result {
         error!("SQLCloseCursor: no cursor is open — SQLSTATE 24000");
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
         return SQL_ERROR;
@@ -483,8 +485,9 @@ mod tests {
 
     /// msodbcsql reports a parameter set that fails before its first row from
     /// the navigation that positions on it, and posts, without failing the
-    /// call, the error of a set `SQLMoreResults` discards (both measured on
-    /// 18.6.2.1). A status array downgrades a reported failure to a warning.
+    /// call, an error in the unread rows `SQLMoreResults` discards; an error
+    /// after those rows end fails it (all measured on 18.6.2.1). A status
+    /// array downgrades a reported failure to a warning.
     #[test]
     fn parameter_set_errors_fail_the_call_that_positions_on_them() {
         use crate::api::odbc_types::*;
@@ -575,6 +578,160 @@ mod tests {
             assert_eq!(array.outputs(), (2, [failed, succeeded]));
             assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
         }
+
+        // The first set's row set ends cleanly and a later statement in the set
+        // fails: the error is not in the discarded rest, so it fails the call.
+        for status in [true, false] {
+            let array = ScriptedArray::execute(
+                tds_client_from_int_rows_with_trailing_tokens(
+                    vec![vec![1]],
+                    vec![
+                        done_in_proc_more(),
+                        sql_error(50000, 16, "tail error"),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_in_batch_more(),
+                        col_metadata(int_columns(1)),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_no_more(),
+                    ],
+                ),
+                status,
+            );
+            assert_eq!(array.execute_rc, SQL_SUCCESS);
+            assert_eq!(
+                if status {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_ERROR
+                },
+                unsafe { crate::api::SQLMoreResults(array.h.stmt) },
+                "status array: {status}"
+            );
+            assert_eq!(array.last_diag_native(), Some(50000));
+            if status {
+                assert_eq!(array.outputs(), (2, [SQL_PARAM_ERROR, SQL_PARAM_SUCCESS]));
+            }
+        }
+    }
+
+    /// msodbcsql's error-result state, measured on 18.6.2.1 for a parameter
+    /// set that fails before its first row with no status array bound.
+    #[test]
+    fn a_failed_empty_set_without_status_array_is_an_error_result() {
+        use crate::api::odbc_types::*;
+        use crate::api::sqlstate::{
+            ERR_FUNCTION_SEQUENCE, ERR_INVALID_CURSOR_STATE, ERR_NOT_CURSOR_SPECIFICATION,
+        };
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_proc_in_batch_more, done_proc_no_more,
+            int_columns, return_status, sql_error, tds_client_from_int_rows_with_trailing_tokens,
+            tds_client_from_tokens,
+        };
+
+        fn assert_error_result(array: &ScriptedArray) {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(array.h.stmt) };
+            let last_diag =
+                |expected| assert_last_diag(&stmt.inner.lock().unwrap().diag_records, expected);
+            let mut columns: SqlSmallInt = -1;
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLNumResultCols(array.h.stmt, &mut columns)
+            });
+            assert_eq!(columns, 0);
+            let mut row_count: SqlLen = 0;
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLRowCount(array.h.stmt, &mut row_count)
+            });
+            assert_eq!(row_count, -1);
+            assert_eq!(SQL_ERROR, unsafe {
+                crate::api::SQLDescribeColW(
+                    array.h.stmt,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            });
+            last_diag(ERR_NOT_CURSOR_SPECIFICATION);
+            assert_eq!(SQL_ERROR, unsafe { crate::api::SQLFetch(array.h.stmt) });
+            last_diag(ERR_INVALID_CURSOR_STATE);
+            let mut value = 0i32;
+            let mut indicator: SqlLen = 0;
+            assert_eq!(SQL_ERROR, unsafe {
+                crate::api::SQLGetData(
+                    array.h.stmt,
+                    1,
+                    SQL_C_LONG,
+                    (&mut value as *mut i32).cast(),
+                    4,
+                    &mut indicator,
+                )
+            });
+            last_diag(ERR_FUNCTION_SEQUENCE);
+            assert_eq!(SQL_ERROR, unsafe {
+                crate::api::SQLCloseCursor(array.h.stmt)
+            });
+            last_diag(ERR_INVALID_CURSOR_STATE);
+        }
+
+        // Execute positions on the failed first set; SQLCloseCursor keeps the
+        // batch, so SQLMoreResults still reaches the second set.
+        let array = ScriptedArray::execute(
+            tds_client_from_tokens(vec![
+                col_metadata(int_columns(1)),
+                sql_error(8134, 16, "Divide by zero error encountered."),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_in_batch_more(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ]),
+            false,
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        assert_error_result(&array);
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLMoreResults(array.h.stmt)
+        });
+        assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        assert_eq!(*array.processed, 2);
+
+        // SQLMoreResults positions on the failed last set.
+        let array = ScriptedArray::execute(
+            tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![1]],
+                vec![
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_in_batch_more(),
+                    col_metadata(int_columns(1)),
+                    sql_error(8134, 16, "Divide by zero error encountered."),
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_no_more(),
+                ],
+            ),
+            false,
+        );
+        assert_eq!(array.execute_rc, SQL_SUCCESS);
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        assert_eq!(SQL_ERROR, unsafe {
+            crate::api::SQLMoreResults(array.h.stmt)
+        });
+        assert_eq!(array.last_diag_native(), Some(8134));
+        assert_error_result(&array);
+        assert_eq!(SQL_NO_DATA, unsafe {
+            crate::api::SQLMoreResults(array.h.stmt)
+        });
+        assert_eq!(*array.processed, 2);
     }
 
     /// msodbcsql's bound read-ahead stops at an ERROR token after the row, so

@@ -869,13 +869,16 @@ accept/store contract itself belongs to AB#46377 and is documented in
   status array and `SQL_ERROR` without one. A fetch that finds a set failing
   after its rows returns `SQL_NO_DATA` with a status array and `SQL_ERROR`
   without one. `SQLMoreResults` that discards the unread rest of a failed set
-  posts the error without failing the call. A successful set is never marked
+  posts an error read inside those rows without failing the call; an error
+  from a later statement of the set, after its row set ends, fails the call
+  like any navigation error. A successful set is never marked
   `SQL_PARAM_ERROR` merely for returning rows, and later results remain
   fetchable after a per-set error. Pending results keep the connection claimed
-  until they are navigated or closed. Known gap: after a set fails before its
-  first row with no status array bound, msodbcsql answers `24000` to
-  `SQLFetch` and `SQLCloseCursor` until the next `SQLMoreResults`; Rust reports
-  an empty result.
+  until they are navigated or closed. A set that fails before its first row
+  with no status array bound is an error result, not a cursor:
+  `SQLNumResultCols` reports zero columns, `SQLDescribeCol` returns `07005`,
+  `SQLFetch` and `SQLCloseCursor` return `24000` (the batch stays open), and
+  `SQLGetData` returns `HY010` until `SQLMoreResults` advances past it.
 - **Failure handling.** A set that fails to build client-side does not abort the
   batch - the request serializes as it streams, so earlier sets are already on
   the wire. The return code is decided once, from one rule, whether the set

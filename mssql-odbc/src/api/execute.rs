@@ -658,7 +658,6 @@ fn finish_parameter_array(
     mut batch: BatchClientResults,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
-    let positioned = client.current_parameter_set();
     // Like a scalar execute, wait for the first row or the end of an empty
     // first set. msodbcsql's SQLExecute reads an empty set through its DONE
     // (OnDone), reporting that set's status and any error now (measured on
@@ -709,7 +708,6 @@ fn finish_parameter_array(
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
-    stmt_state.positioned_parameter_set = positioned;
     let mut rc = report_parameter_array(
         &mut stmt_state,
         result,
@@ -726,11 +724,18 @@ fn finish_parameter_array(
     stmt_state.clear_exhaustion_state();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+    // A settled empty first set that failed with no status array is an error
+    // result with no columns, as msodbcsql presents it.
+    let error_result = cursor_open && settled.is_some() && rc == SQL_ERROR;
     if cursor_open {
         stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
         stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
         stmt_state.result_set_exhausted = settled.is_some();
         stmt_state.batch_exhausted = !has_more;
+        stmt_state.error_result = error_result;
+        if error_result {
+            stmt_state.clear_result_metadata();
+        }
         if has_more {
             stmt_state.parameter_array = Some(batch);
         }
@@ -748,6 +753,9 @@ fn finish_parameter_array(
         rc = SQL_ERROR;
     }
     drop(stmt_state);
+    if error_result && super::ird::populate_ird(stmt, &[]).is_err() {
+        return SQL_ERROR;
+    }
     rc
 }
 
