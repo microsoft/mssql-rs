@@ -314,10 +314,14 @@ impl<'a> StreamingBulkLoadWriter<'a> {
             ))
         })?;
 
-        if ctx.tds_type == TdsDataType::Vector as u8
-            && let ColumnValues::Vector(vector) = value
-        {
+        if let ColumnValues::Vector(vector) = value {
             let col_meta = &self.column_metadata[column_index];
+            if ctx.tds_type != TdsDataType::Vector as u8 {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector value cannot be written to non-vector column '{}'",
+                    col_meta.column_name
+                )));
+            }
             let base_type =
                 crate::datatypes::sqldatatypes::VectorBaseType::try_from(col_meta.scale)?;
             let actual_base_type = vector.base_type();
@@ -1190,6 +1194,13 @@ mod vector_tests {
         let column = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, TdsDataType::Vector as u8)
             .with_length(length, TypeLength::Variable(length))
             .with_scale(base_type as u8);
+        write_column(column, value).await
+    }
+
+    async fn write_column(
+        column: BulkCopyColumnMetadata,
+        value: ColumnValues,
+    ) -> (TdsResult<()>, Vec<u8>) {
         let mut mock = MockNetworkWriter::new(512);
         let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut mock, None, None);
         let mut writer = StreamingBulkLoadWriter::new(
@@ -1213,6 +1224,24 @@ mod vector_tests {
             write_vector_column(VectorBaseType::Float16, 2, ColumnValues::Vector(value)).await;
         result.unwrap();
         assert_eq!(bytes, [12, 0, 0xA9, 1, 2, 0, 1, 0, 0, 0, 0, 0x3C, 0, 0x40]);
+    }
+
+    #[tokio::test]
+    async fn vector_rejected_for_non_vector_column() {
+        for value in [
+            SqlVector::try_from_f16(vec![1.0, 2.0]).unwrap(),
+            SqlVector::try_from_f32(vec![1.0, 2.0]).unwrap(),
+        ] {
+            let column = BulkCopyColumnMetadata::new("v", SqlDbType::VarChar, 0xA7)
+                .with_length(8000, TypeLength::Variable(8000));
+            let (result, bytes) = write_column(column, ColumnValues::Vector(value)).await;
+            assert!(matches!(
+                result,
+                Err(Error::TypeConversionError(message))
+                    if message == "Vector value cannot be written to non-vector column 'v'"
+            ));
+            assert!(bytes.is_empty());
+        }
     }
 
     #[tokio::test]
