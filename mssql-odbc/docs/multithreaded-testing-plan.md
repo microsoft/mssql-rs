@@ -281,9 +281,13 @@ Measured 2026-10-08 on both drivers unless noted.
   `/SharedStmt` crashed inside `libodbc` in 7 of 10 runs at 2 x 1 (WSL,
   unixODBC 2.3.9) and in none of 60 at 1; level 1 narrows the window but
   Alpine CI still crashed there. Until the pipelines test against a unixODBC
-  build with the fix (AB#49575), the stress profiles skip `/SharedStmt` on
-  unixODBC, and PR runs keep it at 2 x 1 except for the two GetData streaming
-  tests that crashed most (unregistered on non-Windows by #758).
+  build with the fix (AB#49575), all Unix runner profiles, including PR,
+  skip `/SharedStmt` for both drivers. Windows keeps every mode, and Unix
+  keeps single-threaded tests, `/CrossThread`, `/SharedEnv`, and `/SharedDbc`.
+  This temporarily removes same-statement diagnostic-observer coverage;
+  `MSSQL_ODBC_MT_SKIP_MODES=none` opts back in for patched Driver Manager
+  validation. The two GetData streaming tests that crashed most also remain
+  unregistered on non-Windows by #758.
 - Every non-diagnostic call clears the handle's diagnostics, including an idle
   `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`. Cross-thread
   `SQLCancel` preserves the interrupted call's diagnostics.
@@ -427,7 +431,7 @@ ThreadSanitizer target (AB#49259).
 
 | Profile | Where | Driver | Threads x iterations | Modes run | Retries |
 |---|---|---|---|---|---|
-| PR | validation pipeline, every PR | both | 2 x 1 | all | 3 |
+| PR | validation pipeline, every PR | both | 2 x 1 | all; unixODBC skips `SharedStmt` | 3 |
 | Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
 | Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
 | Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
