@@ -2,8 +2,8 @@
 parameters:
   matrix: {}
   artifactName: 'Build_Linux'
-  poolName: 'RUST-1ES-POOL-WUS3'
-  poolImageOverride: 'imageOverride -equals RUST-1ES-UBUSLIM'
+  poolName: 'RUST-X64-WUS3'
+  poolImageOverride: 'imageOverride -equals RUST-AZL3'
 
 jobs:
   - job: Test_Matrix
@@ -26,7 +26,7 @@ jobs:
           buildType: 'current'
           artifactName: '${{ parameters.artifactName }}'
         displayName: 'Download Pipeline Artifacts'
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
           installDocker: true  

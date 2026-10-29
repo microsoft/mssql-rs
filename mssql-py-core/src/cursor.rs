@@ -724,10 +724,10 @@ impl PyCoreCursor {
     pub(crate) fn column_value_to_python<'py>(
         py: Python<'py>,
         col_val: &ColumnValues,
-    ) -> Bound<'py, PyAny> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         use pyo3::types::{PyBytes, PyList, PyModule};
 
-        match col_val {
+        Ok(match col_val {
             ColumnValues::Null => py.None().into_bound(py),
             ColumnValues::Bit(b) => (*b).into_pyobject(py).unwrap().to_owned().into_any(),
             ColumnValues::TinyInt(i) => (*i).into_pyobject(py).unwrap().to_owned().into_any(),
@@ -756,7 +756,7 @@ impl PyCoreCursor {
                     if kwargs.set_item("bytes", py_bytes).is_ok()
                         && let Ok(uuid_obj) = uuid_class.call((), Some(&kwargs))
                     {
-                        return uuid_obj.into_any();
+                        return Ok(uuid_obj.into_any());
                     }
                 }
                 // Fallback to string if UUID conversion fails
@@ -773,7 +773,7 @@ impl PyCoreCursor {
                     VectorBaseType::Float32 => {
                         if let Some(vals) = v.as_f32() {
                             let list = PyList::new(py, vals.iter().map(|f| *f as f64)).unwrap();
-                            return list.into_any();
+                            return Ok(list.into_any());
                         }
                     }
                     VectorBaseType::Float16 => {
@@ -795,7 +795,7 @@ impl PyCoreCursor {
                     && let Ok(decimal_class) = decimal_module.getattr("Decimal")
                     && let Ok(decimal_obj) = decimal_class.call1((decimal_str,))
                 {
-                    return decimal_obj.into_any();
+                    return Ok(decimal_obj.into_any());
                 }
                 // Fallback to string if Decimal conversion fails
                 decimal_str.into_pyobject(py).unwrap().to_owned().into_any()
@@ -834,7 +834,7 @@ impl PyCoreCursor {
                                 second,
                                 microsecond,
                             )) {
-                                return datetime_obj.into_any();
+                                return Ok(datetime_obj.into_any());
                             }
                         }
                     }
@@ -876,7 +876,7 @@ impl PyCoreCursor {
                             if let Ok(datetime_obj) =
                                 datetime_class.call1((year, month, day, hour, minute, 0, 0))
                             {
-                                return datetime_obj.into_any();
+                                return Ok(datetime_obj.into_any());
                             }
                         }
                     }
@@ -895,15 +895,15 @@ impl PyCoreCursor {
                 let money_val = lsb_in_i64 | ((m.msb_part as i64) << 32);
 
                 // Format as decimal string with 4 decimal places
-                let integer_part = money_val / 10000;
-                let fractional_part = (money_val % 10000).abs();
-                let decimal_str = format!("{}.{:04}", integer_part, fractional_part);
+                let sign = if money_val < 0 { "-" } else { "" };
+                let magnitude = money_val.unsigned_abs();
+                let decimal_str = format!("{sign}{}.{:04}", magnitude / 10000, magnitude % 10000);
 
                 if let Ok(decimal_module) = PyModule::import(py, "decimal")
                     && let Ok(decimal_class) = decimal_module.getattr("Decimal")
                     && let Ok(decimal_obj) = decimal_class.call1((decimal_str.as_str(),))
                 {
-                    return decimal_obj.into_any();
+                    return Ok(decimal_obj.into_any());
                 }
                 // Fallback to string if Decimal conversion fails
                 decimal_str.into_pyobject(py).unwrap().to_owned().into_any()
@@ -914,15 +914,15 @@ impl PyCoreCursor {
                 let money_val = m.int_val as i64;
 
                 // Format as decimal string with 4 decimal places
-                let integer_part = money_val / 10000;
-                let fractional_part = (money_val % 10000).abs();
-                let decimal_str = format!("{}.{:04}", integer_part, fractional_part);
+                let sign = if money_val < 0 { "-" } else { "" };
+                let magnitude = money_val.unsigned_abs();
+                let decimal_str = format!("{sign}{}.{:04}", magnitude / 10000, magnitude % 10000);
 
                 if let Ok(decimal_module) = PyModule::import(py, "decimal")
                     && let Ok(decimal_class) = decimal_module.getattr("Decimal")
                     && let Ok(decimal_obj) = decimal_class.call1((decimal_str.as_str(),))
                 {
-                    return decimal_obj.into_any();
+                    return Ok(decimal_obj.into_any());
                 }
                 // Fallback to string if Decimal conversion fails
                 decimal_str.into_pyobject(py).unwrap().to_owned().into_any()
@@ -938,7 +938,7 @@ impl PyCoreCursor {
                     // Add 1 to convert from 0-based days to 1-based ordinal
                     let ordinal = sql_date.get_days() + 1;
                     if let Ok(date_obj) = date_class.call_method1("fromordinal", (ordinal,)) {
-                        return date_obj.into_any();
+                        return Ok(date_obj.into_any());
                     }
                 }
                 // Fallback to string if date conversion fails
@@ -975,7 +975,7 @@ impl PyCoreCursor {
                     let microsecond = (remainder / 10) as u32;
 
                     if let Ok(time_obj) = time_class.call1((hour, minute, second, microsecond)) {
-                        return time_obj.into_any();
+                        return Ok(time_obj.into_any());
                     }
                 }
                 // Fallback to string if time conversion fails
@@ -1029,7 +1029,7 @@ impl PyCoreCursor {
                                 second,
                                 microsecond,
                             )) {
-                                return datetime_obj.into_any();
+                                return Ok(datetime_obj.into_any());
                             }
                         }
                     }
@@ -1042,68 +1042,40 @@ impl PyCoreCursor {
                     .into_any()
             }
             ColumnValues::DateTimeOffset(dto) => {
-                // Convert SqlDateTimeOffset to Python datetime.datetime object with timezone
-                // SqlDateTimeOffset: datetime2 (SqlDateTime2) + offset (i16, minutes from UTC)
-                if let Ok(datetime_module) = PyModule::import(py, "datetime")
-                    && let Ok(date_class) = datetime_module.getattr("date")
-                    && let Ok(datetime_class) = datetime_module.getattr("datetime")
-                    && let Ok(timezone_class) = datetime_module.getattr("timezone")
-                    && let Ok(timedelta_class) = datetime_module.getattr("timedelta")
-                {
-                    // Calculate ordinal: SqlDateTime2.days is 0-based from 0001-01-01
-                    // Python's fromordinal is 1-based (date(1,1,1) = ordinal 1)
-                    // So we need to add 1
-                    let ordinal = dto.datetime2.days + 1;
-
-                    // Get the date from ordinal
-                    if let Ok(date_obj) = date_class.call_method1("fromordinal", (ordinal,)) {
-                        // Extract year, month, day from the date
-                        if let (Ok(year), Ok(month), Ok(day)) = (
-                            date_obj.getattr("year").and_then(|v| v.extract::<i32>()),
-                            date_obj.getattr("month").and_then(|v| v.extract::<u8>()),
-                            date_obj.getattr("day").and_then(|v| v.extract::<u8>()),
-                        ) {
-                            // Convert time from 100-nanosecond units to time components
-                            let time_100ns = dto.datetime2.time.time_nanoseconds;
-
-                            let hour = (time_100ns / 36_000_000_000) as u8;
-                            let remainder = time_100ns % 36_000_000_000;
-
-                            let minute = (remainder / 600_000_000) as u8;
-                            let remainder = remainder % 600_000_000;
-
-                            let second = (remainder / 10_000_000) as u8;
-                            let remainder = remainder % 10_000_000;
-
-                            let microsecond = (remainder / 10) as u32;
-
-                            // Create timezone from offset (minutes from UTC)
-                            // Python's timezone expects a timedelta object
-                            // timedelta(days, seconds, microseconds)
-                            if let Ok(td_obj) =
-                                timedelta_class.call1((0, dto.offset as i32 * 60, 0))
-                                && let Ok(tz_obj) = timezone_class.call1((td_obj,))
-                                && let Ok(datetime_obj) = datetime_class.call1((
-                                    year,
-                                    month,
-                                    day,
-                                    hour,
-                                    minute,
-                                    second,
-                                    microsecond,
-                                    tz_obj,
-                                ))
-                            {
-                                return datetime_obj.into_any();
-                            }
-                        }
-                    }
-                }
-                // Fallback to string if datetimeoffset conversion fails
-                format!("{:?}", dto)
-                    .into_pyobject(py)
-                    .unwrap()
-                    .to_owned()
+                let datetime_module = PyModule::import(py, "datetime")?;
+                let date_class = datetime_module.getattr("date")?;
+                let datetime_class = datetime_module.getattr("datetime")?;
+                let timezone_class = datetime_module.getattr("timezone")?;
+                let timedelta_class = datetime_module.getattr("timedelta")?;
+                let ordinal = dto.datetime2.days.checked_add(1).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("DATETIMEOFFSET date is out of range")
+                })?;
+                let date_obj = date_class.call_method1("fromordinal", (ordinal,))?;
+                let year = date_obj.getattr("year")?.extract::<i32>()?;
+                let month = date_obj.getattr("month")?.extract::<u8>()?;
+                let day = date_obj.getattr("day")?.extract::<u8>()?;
+                let time_100ns = dto.datetime2.time.time_nanoseconds;
+                let hour = (time_100ns / 36_000_000_000) as u8;
+                let remainder = time_100ns % 36_000_000_000;
+                let minute = (remainder / 600_000_000) as u8;
+                let remainder = remainder % 600_000_000;
+                let second = (remainder / 10_000_000) as u8;
+                let microsecond = ((remainder % 10_000_000) / 10) as u32;
+                let offset = timedelta_class.call1((0, dto.offset as i32 * 60, 0))?;
+                let timezone = timezone_class.call1((offset,))?;
+                let utc = timezone_class.getattr("utc")?;
+                let utc_datetime = datetime_class.call1((
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
+                    second,
+                    microsecond,
+                    utc,
+                ))?;
+                utc_datetime
+                    .call_method1("astimezone", (timezone,))?
                     .into_any()
             }
             ColumnValues::Json(json) => {
@@ -1122,7 +1094,7 @@ impl PyCoreCursor {
                     .to_owned()
                     .into_any()
             }
-        }
+        })
     }
 
     /// Parse column mappings from Python list.
@@ -1516,4 +1488,53 @@ enum ColumnMapping {
     ByName { source: String, destination: String },
     /// Map by column ordinal (0-based)
     ByOrdinal { source: usize, destination: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use mssql_tds::datatypes::column_values::{
+        ColumnValues, SqlDateTime2, SqlDateTimeOffset, SqlTime,
+    };
+    use pyo3::exceptions::PyOverflowError;
+    use pyo3::prelude::*;
+
+    use super::PyCoreCursor;
+
+    #[test]
+    fn datetimeoffset_lower_bound_overflow_is_reported() {
+        let value = ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+            datetime2: SqlDateTime2 {
+                days: 0,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                },
+            },
+            offset: -840,
+        });
+
+        Python::attach(|py| {
+            let error = PyCoreCursor::column_value_to_python(py, &value).unwrap_err();
+            assert!(error.is_instance_of::<PyOverflowError>(py));
+        });
+    }
+
+    #[test]
+    fn datetimeoffset_upper_bound_overflow_is_reported() {
+        let value = ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+            datetime2: SqlDateTime2 {
+                days: 3_652_058,
+                time: SqlTime {
+                    time_nanoseconds: 863_999_999_990,
+                    scale: 7,
+                },
+            },
+            offset: 840,
+        });
+
+        Python::attach(|py| {
+            let error = PyCoreCursor::column_value_to_python(py, &value).unwrap_err();
+            assert!(error.is_instance_of::<PyOverflowError>(py));
+        });
+    }
 }

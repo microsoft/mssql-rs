@@ -10,16 +10,26 @@ parameters:
   matrix: {}
   artifactName: 'Odbc_Linux_x64'
   nameSuffix: ''
+  poolName: 'RUST-X64-WUS3'
+  poolImageOverride: 'imageOverride -equals RUST-AZL3'
+  # run_e2e.sh --mt-profile (pr, nightly, weekly). A runtime macro such as
+  # $(odbcMtProfile) works: it is only expanded into the container's environment.
+  mtProfile: 'pr'
+  # ctest until-pass retries; the stress profiles ignore it.
+  retries: 3
+  jobDisplayName: 'ODBC e2e Linux amd64'
+  timeoutInMinutes: 60
 
 jobs:
   - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
-    displayName: ODBC e2e Linux amd64
+    displayName: ${{ parameters.jobDisplayName }}
+    timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
     strategy:
       matrix: ${{ parameters.matrix }}
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: ${{ parameters.poolName }}
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - ${{ parameters.poolImageOverride }}
     steps:
       - template: generate-sql-password-template.yml
         parameters:
@@ -27,7 +37,7 @@ jobs:
       - task: DockerInstaller@0
         inputs:
           dockerVersion: '29.0.0'
-      - template: install-ubuntu-dependency.yaml
+      - template: install-host-dependency.yaml
         parameters:
           installAzCli: false
       - task: DownloadPipelineArtifact@2
@@ -108,7 +118,8 @@ jobs:
             -e "ODBC_TEST_UID=sa" \
             -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
             -e "ODBC_TEST_TRUST_CERT=Yes" \
-            -e "ODBC_E2E_RETRIES=3" \
+            -e "ODBC_E2E_RETRIES=${{ parameters.retries }}" \
+            -e "ODBC_E2E_MT_PROFILE=${{ parameters.mtProfile }}" \
             -e "RUST_BACKTRACE=full" \
             --network testnet \
             $(container) /workspace/scripts/dockerentry/$(entry)

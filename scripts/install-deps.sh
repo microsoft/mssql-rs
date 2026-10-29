@@ -1,7 +1,5 @@
 #!/bin/bash
 
-export DEBIAN_FRONTEND=noninteractive
-
 print_info() {
     arch
     echo "Current dir is $(pwd)"
@@ -13,107 +11,90 @@ print_info
 # Parse optional arch argument
 ARCH=$(arch)
 
-if [ "$ARCH" = "x86_64" ]; then
-    DEPS="jq \
-        unzip \
-        build-essential \
-        pkg-config \
-        libssl-dev \
-        libkrb5-dev \
-        python-is-python3 \
-        python3.10-venv \
-        pip \
-        python3-pip \
-        wget \
-        apt-transport-https \
-        software-properties-common"
-elif [ "$ARCH" = "aarch64" ]; then
-    DEPS="jq \
-        unzip \
-        build-essential \
-        pkg-config \
-        libssl-dev \
-        libkrb5-dev \
-        python-is-python3 \
-        python3.10-venv \
-        pip \
-        python3-pip \
-        wget \
-        apt-transport-https \
-        software-properties-common \
-        docker.io"
-else
+if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
     echo "Unknown arch: $ARCH"
     exit 1
 fi
 
-# pushd /tmp  
+# Azure Linux 3 only. The Ubuntu agents were retired because their git-lfs,
+# gss-ntlmssp and python3-pip CVEs are fixed on jammy only under Ubuntu Pro.
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+fi
 
-# wget -q https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb
+if ! command -v tdnf >/dev/null 2>&1; then
+    echo "ERROR: tdnf not found. This script targets Azure Linux 3 agents."
+    echo "       ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}"
+    exit 1
+fi
+echo "INFO: ID=${ID:-unknown} VERSION_ID=${VERSION_ID:-unknown}"
 
-# for i in {1..5}; do
-#     sudo dpkg -i packages-microsoft-prod.deb && break
-#     echo "dpkg install failed, retrying in $((5 * i)) seconds... (attempt $i/5)"
-#     sleep $((5 * i))
-# done
+DEPS="jq \
+    unzip \
+    build-essential \
+    pkg-config \
+    openssl-devel \
+    krb5-devel \
+    python3 \
+    python3-pip \
+    python3-devel \
+    wget \
+    ca-certificates"
 
-apt_update_ok=false
+# Docker is baked into the x64 images; only ARM has ever installed it here.
+# moby-engine is dockerd only, so the client has to come from moby-cli.
+if [ "$ARCH" = "aarch64" ]; then
+    DEPS="$DEPS moby-engine moby-cli"
+fi
+
+update_ok=false
 for i in {1..5}; do
-    sudo apt update && { apt_update_ok=true; break; }
-    echo "apt update failed, retrying in 5 seconds... (attempt $i/5)"
+    sudo tdnf -y makecache && { update_ok=true; break; }
+    echo "tdnf makecache failed, retrying... (attempt $i/5)"
     sleep $((30 * i))
 done
-if [ "$apt_update_ok" != true ]; then
-    echo "ERROR: apt update failed after 5 attempts"
+if [ "$update_ok" != true ]; then
+    echo "ERROR: tdnf makecache failed after 5 attempts"
     exit 1
 fi
 
 # Needed for msrustup download and essentials for building rust binaries.
 # Try installing dependencies up to 5 times if it fails
-apt_install_ok=false
+install_ok=false
 for i in {1..5}; do
-    sudo apt install $DEPS -y && { apt_install_ok=true; break; }
-    echo "apt install failed, retrying in 5 seconds... (attempt $i/5)"
+    sudo tdnf install $DEPS -y && { install_ok=true; break; }
+    echo "tdnf install failed, retrying... (attempt $i/5)"
     sleep $((30 * i))
 done
-if [ "$apt_install_ok" != true ]; then
-    echo "ERROR: apt install failed after 5 attempts"
+if [ "$install_ok" != true ]; then
+    echo "ERROR: tdnf install failed after 5 attempts"
     exit 1
+fi
+
+# Azure Linux ships only the suffixed names; parts of the build call `python`
+# and `pip` unsuffixed.
+if ! command -v pip >/dev/null 2>&1 && command -v pip3 >/dev/null 2>&1; then
+    sudo ln -sf "$(command -v pip3)" /usr/local/bin/pip
+fi
+if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    sudo ln -sf "$(command -v python3)" /usr/local/bin/python
 fi
 
 pip --version && pip install pipenv
 
-# Enable and start SSH service
-sudo apt install openssh-server -y
-sudo systemctl enable ssh
-sudo systemctl start ssh
-
-# Create a new user for SSH login
-# Check for openssl and install if not present
+# openssl is used by the build, not by any agent login path.
 if ! command -v openssl &> /dev/null
 then
     echo "OpenSSL not found, installing..."
-    sudo apt install openssl -y
+    sudo tdnf install openssl -y
 fi
 
 if [ "$ARCH" = "aarch64" ]; then
+    # Installing the package does not start dockerd, and install-dependencies.yml
+    # runs `docker ps` straight after this.
+    sudo systemctl enable --now docker
     echo "Changing permissions for docker.sock"
     sudo chmod 666 /var/run/docker.sock
-fi
-
-# Create a new user for SSH login
-SSH_USER="sshuser"
-SSH_PASS=$(openssl rand -base64 16)
-
-echo "======================== Generated SSH password for $SSH_USER: $SSH_PASS"
-
-if ! id "$SSH_USER" &>/dev/null; then
-    sudo useradd -m -s /bin/bash "$SSH_USER"
-    echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
-    sudo usermod -aG sudo "$SSH_USER"
-    echo "User $SSH_USER created with password for SSH login."
-else
-    echo "User $SSH_USER already exists."
 fi
 
 sudo groupadd docker

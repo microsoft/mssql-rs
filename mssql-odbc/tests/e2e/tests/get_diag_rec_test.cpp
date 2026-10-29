@@ -8,6 +8,9 @@
 //   4. SuccessClearsPriorRecords - successful call wipes prior diag
 //   5. TruncationReturnsSuccessWithInfo - short buffer -> SUCCESS_WITH_INFO
 //   6. RecordTwoReturnsNoData    - only one record posted -> N=2 -> SQL_NO_DATA
+//   7. ParameterizedThrow...     - a server error raised from bound values posts
+//                                  one STMT record with that number and message,
+//                                  nothing on the DBC, and clears on reuse
 //
 // Notes:
 //   - Some DMs (notably unixODBC) intercept HY024 for SQL_ATTR_ODBC_VERSION
@@ -15,6 +18,7 @@
 //     tests therefore only assert that *some* record is returned, not that
 //     it came from the driver.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <cstring>
@@ -172,4 +176,92 @@ TEST_F(GetDiagRecTest, FailingCallClearsPriorRecordsBeforePostingNewOne) {
                                   nullptr, nullptr,
                                   nullptr, 0, &text_len);
     EXPECT_EQ(SQL_NO_DATA, rc);
+}
+
+// ===================================================================
+// Tests that require a live SQL Server
+// ===================================================================
+
+class GetDiagRecLiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            GTEST_SKIP() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        Connect();
+    }
+};
+
+// THROW raised from bound parameter values: the statement holds exactly one
+// record carrying SQLSTATE 42000, the bound number as the native error, and the
+// bound message. The error must not leak onto the connection handle, and a
+// successful reuse of the same statement and bindings clears it.
+// Benefits-from-mock-tds: place the ERROR token mid-batch and control its
+// number, state, and class directly; SQL Server decides all three here, and
+// only a mock can prove nothing was posted on the DBC rather than observing it.
+ODBC_TEST_F(GetDiagRecLiveTest, ParameterizedThrowPostsOneStatementRecordAndClearsOnReuse) {
+    SQLINTEGER number = 50000 + Worker() * 1000 + Iteration() % 1000;
+    const std::string message = WorkerToken("diag-throw");
+    SQLCHAR message_buffer[64] = {};
+    ASSERT_LT(message.size(), sizeof(message_buffer));
+    std::memcpy(message_buffer, message.data(), message.size());
+    SQLLEN number_ind = 0;
+    SQLLEN message_ind = SQL_NTS;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &number, 0, &number_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_WVARCHAR, 200, 0,
+                                   message_buffer, sizeof(message_buffer), &message_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    const SqlTString throw_sql = ODBCTestUtils::ToSqlTStr(
+        "DECLARE @n int = ?; DECLARE @m nvarchar(200) = ?; THROW @n, @m, 1;");
+    ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(throw_sql.c_str()), SQL_NTS));
+
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_NUMBER, &count, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, count);
+
+    SQLTCHAR state[6] = {};
+    SQLINTEGER native = 0;
+    SQLTCHAR text[512] = {};
+    SQLSMALLINT text_len = 0;
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native, text,
+                            static_cast<SQLSMALLINT>(sizeof(text) / sizeof(text[0])), &text_len));
+    EXPECT_EQ("42000", ODBCTestUtils::ToNarrow(SqlTString(state)));
+    EXPECT_EQ(number, native);
+    const std::string diagnostic = ODBCTestUtils::ToNarrow(SqlTString(text));
+    EXPECT_NE(std::string::npos, diagnostic.find(message)) << diagnostic;
+
+    EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRec(SQL_HANDLE_DBC, dbc_, 1, state, &native, text,
+                                         static_cast<SQLSMALLINT>(sizeof(text) / sizeof(text[0])),
+                                         &text_len))
+        << "statement error leaked onto the connection handle";
+
+    const SqlTString select_sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS n, ? AS m");
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(select_sql.c_str()), SQL_NTS))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native, text,
+                                         static_cast<SQLSMALLINT>(sizeof(text) / sizeof(text[0])),
+                                         &text_len))
+        << "successful reuse kept the earlier record";
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER echoed_number = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &echoed_number, 0, nullptr), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(number, echoed_number);
+    SQLCHAR echoed_message[64] = {};
+    SQLLEN echoed_ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, echoed_message, sizeof(echoed_message),
+                             &echoed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(message, reinterpret_cast<const char*>(echoed_message));
+
+    SQLCloseCursor(stmt_);
+    SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
 }

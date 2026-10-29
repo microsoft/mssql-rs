@@ -17,8 +17,14 @@ use std::time::{Duration, Instant};
 
 use crate::error::Error;
 
-/// Default timeout for waiting on attention acknowledgment from the server.
-/// This matches the behavior of Microsoft.Data.SqlClient's `AttentionTimeoutSeconds = 5`.
+/// Default timeout budget for ATTENTION handling.
+///
+/// Interrupted token and row reads share this single five-second deadline across
+/// sending ATTENTION, completing the in-flight parser, and draining through the
+/// terminal acknowledgement. This follows Microsoft.Data.SqlClient and favors
+/// prompt, bounded cancellation: an unusually large or slow response may retire
+/// a connection that could eventually resynchronize rather than waiting for
+/// msodbcsql's longer (up to 120-second) drain budget.
 pub const ATTENTION_TIMEOUT_SECONDS: u64 = 5;
 
 /// Tracks timeout state for bulk copy operations.

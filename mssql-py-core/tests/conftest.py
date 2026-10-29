@@ -15,6 +15,11 @@ import pytest
 from pathlib import Path
 from dotenv import load_dotenv
 
+try:
+    import mssql_mock_tds
+except ImportError:
+    mssql_mock_tds = None
+
 
 # ---------------------------------------------------------------------------
 # Env helpers
@@ -131,6 +136,23 @@ def get_client_context():
 def client_context():
     """Pytest fixture that provides client context for database connections."""
     return get_client_context()
+
+
+@pytest.fixture
+def mock_client_context():
+    """Client context backed by an ephemeral mock TDS server."""
+    if mssql_mock_tds is None:
+        pytest.skip("mssql_mock_tds is not installed")
+
+    server = mssql_mock_tds.PyMockTdsServer(port=0, tls=True)
+    with server:
+        yield {
+            "server": server.sql_address,
+            "database": "master",
+            "access_token": "async-cursor-test-token",
+            "encryption": "Optional",
+            "trust_server_certificate": True,
+        }
 
 
 @pytest.fixture

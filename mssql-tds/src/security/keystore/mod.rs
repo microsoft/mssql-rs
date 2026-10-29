@@ -49,8 +49,9 @@ use crate::security::encryption::decrypt_cell;
 /// Unwraps encrypted column encryption keys (CEKs) using a column master key
 /// (CMK) held in an external key store.
 ///
-/// Implementations are registered by name in a
-/// [`ColumnEncryptionKeyStoreProviderRegistry`]; the name corresponds to the
+/// Implementations are registered by name with
+/// [`ClientContext::register_column_encryption_key_store_provider`](crate::connection::client_context::ClientContext::register_column_encryption_key_store_provider);
+/// the name corresponds to the
 /// `key_store_name` carried in the COLMETADATA CEK table.
 #[async_trait]
 pub trait ColumnEncryptionKeyStoreProvider: Send + Sync {

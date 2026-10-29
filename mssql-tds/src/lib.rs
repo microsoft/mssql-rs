@@ -20,11 +20,14 @@
 //! | `integrated-auth` | **yes** | Enables both `sspi` and `gssapi` |
 //! | `sspi` | via `integrated-auth` | Windows SSPI (Kerberos/NTLM) |
 //! | `gssapi` | via `integrated-auth` | Unix GSSAPI (Kerberos) via runtime `dlopen` |
+//! | `tls-schannel-direct-on-windows` | **yes** | Enables `tls-schannel-direct` |
+//! | `tls-schannel-direct` | via `tls-schannel-direct-on-windows` | Windows: TLS through the in-tree Schannel engine instead of `native-tls`. No effect on other targets. |
 //!
-//! Disable the default to drop platform-specific auth dependencies:
+//! Disable the defaults to drop platform-specific auth dependencies and use
+//! `native-tls` on every platform:
 //!
 //! ```toml
-//! mssql-tds = { version = "0.1", default-features = false }
+//! mssql-tds = { version = "0.3", default-features = false }
 //! ```
 //!
 //! # Quick start
@@ -73,12 +76,19 @@
 //! - [`error`] — Error definitions.
 //! - [`message`] — TDS message types (prelogin, login7, etc.).
 //! - [`query`] — Query metadata and column descriptors.
+//! - [`security`] — Integrated authentication (SSPI/GSSAPI) and Always Encrypted.
 //! - [`token`] — TDS token stream parsing (COLMETADATA, ROW, DONE, etc.).
 
 pub mod connection;
 pub mod connection_provider;
 /// Shared types: result aliases, encryption settings, and cancellation.
 pub mod core;
+
+// `EncodingType::encoding` and `lcid_to_encoding` hand out `&'static
+// encoding_rs::Encoding`, so a consumer needs the exact same `encoding_rs` build
+// to name the type. Re-exported so they inherit ours instead of guessing a
+// matching version.
+pub use encoding_rs;
 /// Cursor types and response structures for TDS cursor RPCs.
 pub mod cursor;
 pub mod datatypes;
@@ -92,6 +102,8 @@ pub mod security;
 pub(crate) mod sql_identifier;
 pub(crate) mod ssrp;
 pub mod token;
+#[doc(hidden)]
+pub mod trace_context;
 
 // Expose internal APIs for fuzzing
 #[cfg(fuzzing)]
@@ -107,3 +119,8 @@ pub mod test_client_support;
 // neither.
 #[cfg(test)]
 pub(crate) mod test_packet_support;
+
+// Compiles the README's code blocks under `cargo test --doc`.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

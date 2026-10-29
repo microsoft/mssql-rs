@@ -60,7 +60,7 @@ if (Test-Path $key) {
         $have = Normalize-Version $info.ProductVersion
         if ($have -and $have -eq $want) {
             Write-Host "Version check passed: registered driver matches the pinned $Version; skipping install."
-            exit 0
+            return
         } elseif ($have) {
             Write-Warning "Registered '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want); upgrading the pre-installed driver to the pinned version."
         } else {
@@ -106,13 +106,17 @@ if (-not (Test-Path $key)) {
 # fall through and attempt an upgrade, a persistent mismatch is a real failure
 # (the upgrade did not take) rather than an uncontrollable pre-existing driver.
 $dll = (Get-ItemProperty -Path $key -Name 'Driver' -ErrorAction SilentlyContinue).Driver
-if ($dll -and (Test-Path $dll)) {
-    $info = (Get-Item $dll).VersionInfo
-    $want = Normalize-Version $Version
-    $have = Normalize-Version $info.ProductVersion
-    Write-Host "Post-install '$name' -> $dll (ProductVersion=$($info.ProductVersion))"
-    if ($have -and $have -ne $want) {
-        throw "After install/upgrade, '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want); the upgrade did not take effect."
-    }
+if (-not $dll -or -not (Test-Path $dll)) {
+    throw "Install reported success but '$name' has no usable Driver DLL path."
+}
+$info = (Get-Item $dll).VersionInfo
+$want = Normalize-Version $Version
+$have = Normalize-Version $info.ProductVersion
+Write-Host "Post-install '$name' -> $dll (ProductVersion=$($info.ProductVersion))"
+if (-not $have) {
+    throw "Installed '$name' has no readable ProductVersion at $dll."
+}
+if ($have -ne $want) {
+    throw "After install/upgrade, '$name' is version $($info.ProductVersion) (normalized $have) but the pipeline pins $Version (normalized $want); the upgrade did not take effect."
 }
 Write-Host "Installed and registered '$name' ($Version)."

@@ -3,12 +3,12 @@
 
 <#
 .SYNOPSIS
-  SANDBOX / TEST-ONLY helper. Collects every built wheel into a single dist folder.
+  Collects every built wheel into a single dist folder for upload.
 
 .DESCRIPTION
   Installs twine, flattens all *.whl artifacts downloaded from the build jobs into
   <StagingDir>\dist, and emits that path as the `distDir` pipeline variable for the
-  upload step.
+  upload step. Shared by the sandbox and the official wheel-publish pipelines.
 
 .PARAMETER StagingDir
   Build staging directory (typically $(Build.StagingDirectory)).

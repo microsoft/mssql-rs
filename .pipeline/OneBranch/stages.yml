@@ -1,19 +1,39 @@
 #################################################################################
 #                        Shared Build Stages Template                           #
-# Builds Python wheels from PyO3 bindings (mssql-py-core) across 7 targets:  #
-#   Windows x64/ARM64, Linux x64/ARM64 (manylinux + musllinux),              #
-#   macOS universal2                                                          #
-# Then packages all wheels into a NuGet archive and publishes to Azure         #
-# Artifacts via OneBranch native nugetPublishing mechanism.                    #
+# Builds 44 Python wheels from PyO3 bindings (mssql-py-core) across 9 tags:    #
+#   Windows x64/ARM64; Linux x64/ARM64 for manylinux 2.28, manylinux 2.34,    #
+#   and musllinux 1.2; macOS universal2.                                      #
+# A ComputeWheelVersion job resolves the PEP 440 version once and every build  #
+# job stamps it into the wheel, then the Publish job twine-uploads the wheels  #
+# to the Azure Artifacts PyPI feed (pip-installable dev/nightly/release).     #
 #                                                                               #
-# Build jobs use custom 1ES pools (Rust, Docker, Python pre-installed).        #
-# Publish job uses managed OneBranch pool with ob_nugetPublishing_enabled.     #
+# When buildOdbcNative is true, the Windows/Linux x64+ARM64 and macOS jobs      #
+# also build the mssql-odbc native driver (glibc 2.28 + 2.34 and musl on       #
+# Linux) and inject it into their own wheels under                             #
+# mssql_py_core/libs/... (where Python is already available for the build), so  #
+# a single wheel carries both the PyO3 TDS core and the Rust ODBC driver. The   #
+# macOS job builds both arch slices as SEPARATE binaries (no lipo fusion),      #
+# matching mssql-python's libs/macos/{arm64,x86_64} layout for this driver.     #
+#                                                                               #
+# Build jobs and the wheel Publish job use custom 1ES pools (Rust, Docker,     #
+# Python pre-installed). The mssql-sqlcmd NuGet Publish job uses the managed   #
+# OneBranch pool with ob_nugetPublishing_enabled.                              #
 # Artifact publishing on custom pools requires explicit                        #
 # PublishPipelineArtifact@1 (governed template rewrites to                     #
 # 1ES.PublishPipelineArtifact@1).                                              #
 #################################################################################
 
 parameters:
+- name: linuxImage
+  type: string
+  default: RUST-AZL3
+  displayName: 'Agent image for x64 Linux jobs'
+
+- name: linuxArmImage
+  type: string
+  default: RUST-AZL3-ARM64
+  displayName: 'Agent image for ARM64 Linux jobs'
+
 - name: buildAllTargets
   type: boolean
   default: true
@@ -24,15 +44,35 @@ parameters:
   default: true
   displayName: 'Build Python wheels'
 
+- name: buildOdbcNative
+  type: boolean
+  default: false
+  displayName: 'Also build mssql-odbc native driver'
+
+- name: buildRustCrates
+  type: boolean
+  default: false
+  displayName: 'Create publishable Rust crate artifacts'
+
+- name: testPythonWheelInstalls
+  type: boolean
+  default: false
+  displayName: 'Clean-install every final Python wheel'
+
 - name: isOfficial
   type: boolean
   default: false
-  displayName: 'Official pipeline (clean release on manual trigger)'
+  displayName: 'Official pipeline (clean release versions)'
 
 - name: publishToFeed
   type: boolean
   default: false
-  displayName: 'Publish NuGet package to Azure Artifacts feed'
+  displayName: 'Publish wheels to the Azure Artifacts PyPI feed'
+
+- name: buildMssqlSqlcmd
+  type: boolean
+  default: false
+  displayName: 'Also build the mssql-sqlcmd NuGet package (published with the wheels)'
 
 stages:
 #############################################################################
@@ -41,25 +81,96 @@ stages:
 - stage: Build
   jobs:
   #########################################################################
+  # Compute wheel version once so every parallel build job stamps the
+  # identical PEP 440 version (no cross-job UTC-midnight skew).
+  #########################################################################
+  - job: ComputeWheelVersion
+    displayName: 'Compute wheel version'
+    pool:
+      type: windows
+    variables:
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+    - pwsh: >
+        .pipeline/scripts/compute-python-wheel-version.ps1
+        -BuildReason '$(Build.Reason)'
+        -BuildId '$(Build.BuildId)'
+        -IsOfficial '${{ parameters.isOfficial }}'
+      name: compute
+      displayName: 'Resolve wheel version (shared by all build jobs)'
+
+  #########################################################################
+  # Publishable Rust crates
+  #########################################################################
+  - ${{ if eq(parameters.buildRustCrates, true) }}:
+    - job: RustCrates
+      displayName: 'Package Rust crates'
+      pool:
+        type: windows
+        isCustom: true
+        name: RUST-X64-WUS3
+        demands:
+          - imageOverride -equals RUST-W22-SQL25
+      variables:
+        ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+      steps:
+      - template: /.pipeline/templates/cargo-authenticate-template.yml
+        parameters:
+          osType: Windows
+      - template: /.pipeline/templates/install-dependencies.yml
+        parameters:
+          osType: Windows
+          skipPythonSetup: true
+          skipRustupInstall: false
+          enableJsDeps: false
+      - pwsh: >
+          .pipeline/scripts/stamp-crate-versions.ps1
+          -BuildReason '$(Build.Reason)'
+          -BuildId '$(Build.BuildId)'
+          -IsOfficial '${{ parameters.isOfficial }}'
+        displayName: 'Stamp Rust crate versions'
+      - pwsh: >
+          .pipeline/scripts/package-rust-crates.ps1
+          -OutputDirectory '$(ob_outputDirectory)\rust-crates'
+          -TargetDirectory '$(Agent.TempDirectory)\rust-crate-target'
+          -Version '$(crateVersion)'
+        displayName: 'Create Rust crate artifacts'
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Rust crate artifacts'
+        inputs:
+          targetPath: '$(ob_outputDirectory)\rust-crates'
+          artifact: 'drop_Build_RustCrates'
+          publishLocation: 'pipeline'
+
+  #########################################################################
   # Windows x64
   #########################################################################
   - job: Windows_x64
     displayName: 'Windows x64'
+    dependsOn: ComputeWheelVersion
     pool:
       type: windows
       isCustom: true
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-Win22-Sql25-1P
+        - imageOverride -equals RUST-W22-SQL25
     variables:
     - ${{ if eq(parameters.isOfficial, true) }}:
       - group: 'ESRP Federated Creds (AME)'
+      - name: Codeql.Enabled
+        value: true
+      - name: Codeql.Language
+        value: cpp
+      - name: Codeql.BuildIdentifier
+        value: mssql_odbc_cpp
     - name: ob_outputDirectory
       value: '$(Build.ArtifactStagingDirectory)'
     - name: ob_artifactSuffix
       value: '_windows_x64'
     - name: CARGO_TARGET_DIR
       value: C:\cargo_target_dir
+    - name: pyCoreWheelVersion
+      value: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
     steps:
     - template: /.pipeline/templates/cargo-authenticate-template.yml
       parameters:
@@ -70,6 +181,26 @@ stages:
         skipPythonSetup: true
         skipRustupInstall: false
         enableJsDeps: false
+    - ${{ if eq(parameters.isOfficial, true) }}:
+      # Auto-injected CodeQL Initialize/Finalize tasks wrap this native build.
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $cmake = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.CMake.Project -find 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' | Select-Object -First 1
+            if (-not $cmake) { throw 'CMake not found on PATH or in Visual Studio.' }
+            $env:PATH = "$(Split-Path $cmake);$env:PATH"
+          }
+          cmake -S mssql-odbc\tests\e2e -B mssql-odbc\tests\e2e\build_codeql -G "Visual Studio 17 2022" -A x64 -DODBC_E2E_FORCE_UNICODE=ON
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
+          # Reused agents must compile again for each CodeQL database.
+          cmake --build mssql-odbc\tests\e2e\build_codeql --config Debug --clean-first
+          if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCODE" }
+          cmake -S mssql-odbc-bench -B mssql-odbc-bench\build_codeql -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Benchmark CMake configure failed with exit code $LASTEXITCODE" }
+          cmake --build mssql-odbc-bench\build_codeql --config Debug --clean-first
+          if ($LASTEXITCODE -ne 0) { throw "Benchmark CMake build failed with exit code $LASTEXITCODE" }
+        displayName: 'Build ODBC C++ targets for CodeQL'
     - ${{ if eq(parameters.buildPythonWheels, true) }}:
       - template: /.pipeline/templates/build-python-wheels-template.yml
         parameters:
@@ -77,6 +208,27 @@ stages:
           architecture: x64
           publishArtifacts: false
           signWindowsWheels: ${{ parameters.isOfficial }}
+          wheelVersion: $(pyCoreWheelVersion)
+    - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/build-odbc-windows-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Windows_x64'
+          publishArtifacts: false
+          signDriver: ${{ parameters.isOfficial }}
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $drivers = "$(Build.SourcesDirectory)\drivers\windows\x64"
+          New-Item -ItemType Directory -Force -Path $drivers | Out-Null
+          Copy-Item "$(Build.SourcesDirectory)\odbc-drop\build\mssqlodbc.dll" "$drivers\mssqlodbc.dll"
+          python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
+        displayName: 'Inject ODBC driver into wheels (Windows x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+        parameters:
+          osType: Windows
+          architecture: x64
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Windows x64 Artifacts'
       inputs:
@@ -90,10 +242,11 @@ stages:
   - ${{ if eq(parameters.buildAllTargets, true) }}:
     - job: Windows_ARM64
       displayName: 'Windows ARM64'
+      dependsOn: ComputeWheelVersion
       pool:
         type: windows
         isCustom: true
-        name: RUST-1ES-POOL-ARM-WUS3
+        name: RUST-ARM64-WUS3
         demands:
           - imageOverride -equals RUST-WINSRV-ARM
       variables:
@@ -105,6 +258,8 @@ stages:
         value: '_windows_arm64'
       - name: CARGO_TARGET_DIR
         value: C:\cargo_target_dir
+      - name: pyCoreWheelVersion
+        value: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       # Node.js workaround for ARM64 ADO tasks
       - pwsh: ./scripts/setup-nodejs-path.ps1
@@ -127,7 +282,33 @@ stages:
             architecture: arm64
             publishArtifacts: false
             signWindowsWheels: ${{ parameters.isOfficial }}
+            wheelVersion: $(pyCoreWheelVersion)
             # Python 3.10 excluded - limited ARM64 support
+            pythonVersions:
+            - '3.11'
+            - '3.12'
+            - '3.13'
+            - '3.14'
+      - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/build-odbc-windows-template.yml
+          parameters:
+            architecture: ARM64
+            artifactName: 'Odbc_Windows_ARM64'
+            publishArtifacts: false
+            signDriver: ${{ parameters.isOfficial }}
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $drivers = "$(Build.SourcesDirectory)\drivers\windows\arm64"
+            New-Item -ItemType Directory -Force -Path $drivers | Out-Null
+            Copy-Item "$(Build.SourcesDirectory)\odbc-drop\build\mssqlodbc.dll" "$drivers\mssqlodbc.dll"
+            python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
+          displayName: 'Inject ODBC driver into wheels (Windows ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+          parameters:
+            osType: Windows
+            architecture: arm64
             pythonVersions:
             - '3.11'
             - '3.12'
@@ -145,16 +326,18 @@ stages:
   #########################################################################
   - job: Linux_x64
     displayName: 'Linux x64'
+    dependsOn: ComputeWheelVersion
     pool:
       type: linux
       isCustom: true
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     variables:
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
       ob_artifactSuffix: '_linux_x64'
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      pyCoreWheelVersion: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
     steps:
     - template: /.pipeline/templates/cargo-authenticate-template.yml
       parameters:
@@ -165,7 +348,7 @@ stages:
       inputs:
         dockerVersion: '29.0.0'
       displayName: 'Install Docker'
-    - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+    - template: /.pipeline/templates/install-host-dependency.yaml
       parameters:
         installDocker: true
     - ${{ if eq(parameters.buildPythonWheels, true) }}:
@@ -174,11 +357,115 @@ stages:
           osType: Linux
           architecture: x64
           publishArtifacts: false
+          wheelVersion: $(pyCoreWheelVersion)
       - template: /.pipeline/templates/build-python-wheels-template.yml
         parameters:
           osType: Alpine
           architecture: x64
           publishArtifacts: false
+          wheelVersion: $(pyCoreWheelVersion)
+      # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
+      - script: |
+          set -e
+          mkdir -p "$(Build.SourcesDirectory)/wheels-228"
+          docker pull ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest
+          bash .pipeline/scripts/docker-cargo-run.sh --rm \
+            -v "$(Build.SourcesDirectory):/workspace" \
+            -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \
+            -e "WORKSPACE_DIR=/workspace" \
+            -e "OUTPUT_DIR=/workspace/target/wheels" \
+            -e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28" \
+            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest \
+            bash /workspace/scripts/build-python-wheels-in-container.sh
+        displayName: 'Build glibc-2.28 wheels (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        env:
+          CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+          CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+    - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
+        parameters:
+          image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest'
+          libc: glibc
+          displaySuffix: 'glibc Linux x64'
+      - script: |
+          set -e
+          mkdir -p "$(Build.SourcesDirectory)/drivers/linux/glibc/x86_64/lib"
+          cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/glibc/x86_64/lib/mssqlodbc.so"
+        displayName: 'Stage glibc driver (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
+        parameters:
+          image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest'
+          libc: musl
+          displaySuffix: 'musl Linux x64'
+      - script: |
+          set -e
+          mkdir -p "$(Build.SourcesDirectory)/drivers/linux/musl/x86_64/lib"
+          cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/musl/x86_64/lib/mssqlodbc.so"
+        displayName: 'Stage musl driver (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - script: |
+          set -e
+          command -v python3 >/dev/null 2>&1 || { sudo tdnf -y makecache && sudo tdnf install -y python3; }
+          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+          python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+            --wheels-dir "$(ob_outputDirectory)/wheels" \
+            --drivers-dir "$(Build.SourcesDirectory)/drivers"
+        displayName: 'Inject ODBC driver into wheels (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
+        parameters:
+          image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest'
+          libc: glibc
+          displaySuffix: 'glibc-2.28 Linux x64'
+          maxGlibcVersion: '2.28'
+      - script: |
+          set -e
+          mkdir -p "$(Build.SourcesDirectory)/drivers-228/linux/glibc/x86_64/lib"
+          cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers-228/linux/glibc/x86_64/lib/mssqlodbc.so"
+          sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
+          python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+            --wheels-dir "$(Build.SourcesDirectory)/wheels-228" \
+            --drivers-dir "$(Build.SourcesDirectory)/drivers-228"
+        displayName: 'Inject ODBC driver into glibc-2.28 wheels (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    - ${{ if eq(parameters.buildPythonWheels, true) }}:
+      - script: |
+          set -e
+          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+          docker run --rm \
+            -v "$(ob_outputDirectory)/wheels:/wheels" \
+            -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+            -e REPAIR_PLAT=manylinux_2_34 \
+            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest \
+            bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+        displayName: 'Repair glibc wheels into manylinux (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      # Built on the manylinux_2_28 image so they link libssl.so.1.1 and carry a
+      # glibc-2.28 floor; optionally injected with the matching ODBC driver, then
+      # repaired to manylinux_2_28. pip picks these on older distros and the 2.34
+      # wheels on modern ones.
+      - script: |
+          set -e
+          sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
+          docker run --rm \
+            -v "$(Build.SourcesDirectory)/wheels-228:/wheels" \
+            -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+            -e REPAIR_PLAT=manylinux_2_28 \
+            -e "REPAIR_EXCLUDE_LIBS=libssl.so.1.1 libcrypto.so.1.1" \
+            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest \
+            bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+          sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
+          cp "$(Build.SourcesDirectory)/wheels-228"/*.whl "$(ob_outputDirectory)/wheels/"
+        displayName: 'Repair glibc-2.28 wheels (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+        parameters:
+          osType: Linux
+          architecture: x64
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Linux x64 Artifacts'
       inputs:
@@ -192,16 +479,18 @@ stages:
   - ${{ if eq(parameters.buildAllTargets, true) }}:
     - job: Linux_ARM64
       displayName: 'Linux ARM64'
+      dependsOn: ComputeWheelVersion
       pool:
         type: linux
         isCustom: true
-        name: RUST-1ES-POOL-ARM-WUS3
+        name: RUST-ARM64-WUS3
         demands:
-          - imageOverride -equals RUST-UBUNTU-ARM64
+          - imageOverride -equals ${{ parameters.linuxArmImage }}
       variables:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         ob_artifactSuffix: '_linux_arm64'
         CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        pyCoreWheelVersion: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       - template: /.pipeline/templates/cargo-authenticate-template.yml
         parameters:
@@ -212,7 +501,7 @@ stages:
         inputs:
           dockerVersion: '29.0.0'
         displayName: 'Install Docker'
-      - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+      - template: /.pipeline/templates/install-host-dependency.yaml
         parameters:
           installDocker: true
       - ${{ if eq(parameters.buildPythonWheels, true) }}:
@@ -221,11 +510,111 @@ stages:
             osType: Linux
             architecture: arm64
             publishArtifacts: false
+            wheelVersion: $(pyCoreWheelVersion)
         - template: /.pipeline/templates/build-python-wheels-template.yml
           parameters:
             osType: Alpine
             architecture: arm64
             publishArtifacts: false
+            wheelVersion: $(pyCoreWheelVersion)
+        # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/wheels-228"
+            docker pull ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest
+            bash .pipeline/scripts/docker-cargo-run.sh --rm \
+              -v "$(Build.SourcesDirectory):/workspace" \
+              -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \
+              -e "WORKSPACE_DIR=/workspace" \
+              -e "OUTPUT_DIR=/workspace/target/wheels" \
+              -e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28" \
+              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest \
+              bash /workspace/scripts/build-python-wheels-in-container.sh
+          displayName: 'Build glibc-2.28 wheels (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+          env:
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+      - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
+          parameters:
+            image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest'
+            libc: glibc
+            displaySuffix: 'glibc Linux ARM64'
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/linux/glibc/arm64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/glibc/arm64/lib/mssqlodbc.so"
+          displayName: 'Stage glibc driver (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
+          parameters:
+            image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest'
+            libc: musl
+            displaySuffix: 'musl Linux ARM64'
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/linux/musl/arm64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/musl/arm64/lib/mssqlodbc.so"
+          displayName: 'Stage musl driver (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - script: |
+            set -e
+            command -v python3 >/dev/null 2>&1 || { sudo tdnf -y makecache && sudo tdnf install -y python3; }
+            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+            python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+              --wheels-dir "$(ob_outputDirectory)/wheels" \
+              --drivers-dir "$(Build.SourcesDirectory)/drivers"
+          displayName: 'Inject ODBC driver into wheels (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
+          parameters:
+            image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
+            libc: glibc
+            displaySuffix: 'glibc-2.28 Linux ARM64'
+            maxGlibcVersion: '2.28'
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers-228/linux/glibc/arm64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers-228/linux/glibc/arm64/lib/mssqlodbc.so"
+            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
+            python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+              --wheels-dir "$(Build.SourcesDirectory)/wheels-228" \
+              --drivers-dir "$(Build.SourcesDirectory)/drivers-228"
+          displayName: 'Inject ODBC driver into glibc-2.28 wheels (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if eq(parameters.buildPythonWheels, true) }}:
+        - script: |
+            set -e
+            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+            docker run --rm \
+              -v "$(ob_outputDirectory)/wheels:/wheels" \
+              -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+              -e REPAIR_PLAT=manylinux_2_34 \
+              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest \
+              bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+          displayName: 'Repair glibc wheels into manylinux (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - script: |
+            set -e
+            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
+            docker run --rm \
+              -v "$(Build.SourcesDirectory)/wheels-228:/wheels" \
+              -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+              -e REPAIR_PLAT=manylinux_2_28 \
+              -e "REPAIR_EXCLUDE_LIBS=libssl.so.1.1 libcrypto.so.1.1" \
+              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest \
+              bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
+            cp "$(Build.SourcesDirectory)/wheels-228"/*.whl "$(ob_outputDirectory)/wheels/"
+          displayName: 'Repair glibc-2.28 wheels (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+          parameters:
+            osType: Linux
+            architecture: arm64
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Linux ARM64 Artifacts'
         inputs:
@@ -242,15 +631,17 @@ stages:
   - ${{ if eq(parameters.buildAllTargets, true) }}:
     - job: MacOS_universal2
       displayName: 'macOS universal2'
+      dependsOn: ComputeWheelVersion
       pool:
         type: linux
         isCustom: true
         name: Azure Pipelines
-        vmImage: macOS-14
+        vmImage: macOS-15
       variables:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         ob_artifactSuffix: '_macos_universal2'
         CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+        pyCoreWheelVersion: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       - template: /.pipeline/templates/cargo-authenticate-template.yml
         parameters:
@@ -264,6 +655,42 @@ stages:
             osType: MacOS
             architecture: universal2
             publishArtifacts: false
+            wheelVersion: $(pyCoreWheelVersion)
+      - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/build-odbc-macos-template.yml
+          parameters:
+            architecture: x64
+            artifactName: 'Odbc_MacOS_x64'
+            publishArtifacts: false
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/macos/x86_64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.dylib" "$(Build.SourcesDirectory)/drivers/macos/x86_64/lib/mssqlodbc.dylib"
+          displayName: 'Stage macOS x64 driver'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - template: /.pipeline/templates/build-odbc-macos-template.yml
+          parameters:
+            architecture: ARM64
+            artifactName: 'Odbc_MacOS_ARM64'
+            publishArtifacts: false
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/macos/arm64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.dylib" "$(Build.SourcesDirectory)/drivers/macos/arm64/lib/mssqlodbc.dylib"
+          displayName: 'Stage macOS ARM64 driver'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - script: |
+            set -e
+            python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+              --wheels-dir "$(ob_outputDirectory)/wheels" \
+              --drivers-dir "$(Build.SourcesDirectory)/drivers"
+          displayName: 'Inject ODBC driver into macOS wheels'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+          parameters:
+            osType: MacOS
+            architecture: universal2
       - task: PublishPipelineArtifact@1
         displayName: 'Publish macOS Artifacts'
         inputs:
@@ -271,8 +698,22 @@ stages:
           artifact: 'drop_Build_MacOS_universal2_macos_universal2'
           publishLocation: 'pipeline'
 
+  #########################################################################
+  # mssql-sqlcmd: the static-library NuGet package native ODBC sqlcmd
+  # (msodbcsql) restores. The Publish stage below publishes it next to the
+  # wheels package, with the same -dev/-nightly versioning.
+  #########################################################################
+  - ${{ if eq(parameters.buildMssqlSqlcmd, true) }}:
+    - template: /.pipeline/OneBranch/mssql-sqlcmd-jobs.yml
+      parameters:
+        linuxImage: ${{ parameters.linuxImage }}
+        linuxArmImage: ${{ parameters.linuxArmImage }}
+        isOfficial: ${{ parameters.isOfficial }}
+
 #############################################################################
-# Publish Stage - Collect wheels, create NuGet package, publish to feed
+# Publish Stage - Collect wheels and twine-upload to the Azure Artifacts
+# PyPI feed (ODBC driver binaries, when built, are already injected into the
+# wheels by the Build stage — there is no separate native artifact here)
 #############################################################################
 - ${{ if eq(parameters.publishToFeed, true) }}:
   - stage: Publish
@@ -281,12 +722,16 @@ stages:
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
     - job: PackageAndPublish
-      displayName: 'Package wheels into NuGet and publish'
+      displayName: 'Publish wheels to PyPI feed'
       pool:
         type: windows
+        isCustom: true
+        name: RUST-X64-WUS3
+        demands:
+          - imageOverride -equals RUST-W22-SQL25
       variables:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-        ob_nugetPublishing_enabled: true
+        pyCoreWheelVersion: $[ stageDependencies.Build.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
       steps:
       - download: current
         displayName: 'Download all build artifacts'
@@ -313,88 +758,67 @@ stages:
         displayName: 'List collected wheels'
 
       - pwsh: |
-          $ErrorActionPreference = 'Stop'
+          $requireOdbc = "${{ parameters.buildOdbcNative }}" -eq "True"
 
-          # Extract version from mssql-py-core/Cargo.toml
-          $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
-          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
-            $version = $Matches[1]
-          } else {
-            Write-Error "Could not extract version from Cargo.toml"
-            exit 1
+          # Every build job stamped this version into the wheel (see
+          # ComputeWheelVersion); official builds stamp the committed version.
+          # Passed through env so pwsh never parses the macro as a subexpression.
+          $pythonVersion = $env:PY_CORE_WHEEL_VERSION
+          if ([string]::IsNullOrWhiteSpace($pythonVersion) -or $pythonVersion.StartsWith('$(')) {
+            throw "pyCoreWheelVersion was not resolved (got '$pythonVersion'); check the ComputeWheelVersion job."
           }
 
-          # Determine prerelease suffix based on Build.Reason and pipeline type
-          $buildReason = "$(Build.Reason)"
-          # Template expansion produces bare True/False which aren't valid PowerShell;
-          # string comparison converts to a proper $true/$false boolean.
-          $isOfficial = "${{ parameters.isOfficial }}" -eq "True"
-          $dateStamp = Get-Date -Format "yyyyMMdd"
-          $buildId = "$(Build.BuildId)"
-          $commitSha = "$(Build.SourceVersion)"
-          $shortSha = $commitSha.Substring(0, 8)
+          & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
+            -WheelsDir "$(Build.StagingDirectory)/wheels" `
+            -ExpectedName "mssql-python-rs" `
+            -ExpectedVersion $pythonVersion `
+            -RequireOdbc:$requireOdbc
+        displayName: 'Validate wheel metadata and ODBC payloads'
+        env:
+          PY_CORE_WHEEL_VERSION: $(pyCoreWheelVersion)
 
-          switch ($buildReason) {
-            'Schedule' {
-              # Nightly build: 0.1.0-nightly.20260217
-              $packageVersion = "$version-nightly.$dateStamp"
-              Write-Host "Nightly build detected"
-            }
-            'Manual' {
-              if ($isOfficial) {
-                # Official release: clean semver 0.1.0
-                $packageVersion = $version
-                Write-Host "Official release build detected"
-              } else {
-                # Non-official manual trigger: dev build
-                $packageVersion = "$version-dev.$dateStamp.$buildId"
-                Write-Host "Non-official manual build detected"
-              }
-            }
-            default {
-              # CI push (IndividualCI, BatchedCI, etc.): 0.1.0-dev.20260217.12345
-              $packageVersion = "$version-dev.$dateStamp.$buildId"
-              Write-Host "CI build detected (reason: $buildReason)"
-            }
-          }
-
-          Write-Host "Package version: $packageVersion"
-          Write-Host "Build reason: $buildReason | Official: $isOfficial"
-          Write-Host "##vso[task.setvariable variable=nugetVersion]$packageVersion"
-
-          # Create .nuspec
-          $nuspecContent = @"
-          <?xml version="1.0"?>
-          <package>
-            <metadata>
-              <id>mssql-py-core-wheels</id>
-              <version>$packageVersion</version>
-              <description>Python wheels for mssql-py-core across all platforms. Commit: $shortSha. Build: $(Build.BuildNumber)</description>
-              <authors>SqlClientDrivers</authors>
-            </metadata>
-            <files>
-              <file src="wheels\**\*.whl" target="wheels" />
-            </files>
-          </package>
-          "@
-
-          $nuspecPath = "$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec"
-          $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
-          Write-Host "Created nuspec at $nuspecPath"
-        displayName: 'Generate NuGet package metadata'
-
-      - task: NuGetCommand@2
-        displayName: 'Create NuGet package'
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.12'
         inputs:
-          command: pack
-          packagesToPack: '$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec'
-          packDestination: '$(ob_outputDirectory)/packages'
-          basePath: '$(Build.StagingDirectory)'
+          versionSpec: '3.12'
+          architecture: 'x64'
+          addToPath: true
 
-      - pwsh: |
-          Write-Host "=== NuGet package created ==="
-          Get-ChildItem "$(ob_outputDirectory)/packages" -Filter *.nupkg | ForEach-Object {
-            Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
-          }
-          Write-Host "OneBranch will auto-publish from $(ob_outputDirectory)/packages"
-        displayName: 'Verify NuGet package'
+      - pwsh: .pipeline/scripts/collect-wheels.ps1 -StagingDir '$(Build.StagingDirectory)' -SourceRoot '$(Build.StagingDirectory)/wheels'
+        displayName: 'Collect wheels for upload'
+
+      - task: TwineAuthenticate@1
+        displayName: 'Authenticate twine to feed'
+        inputs:
+          artifactFeed: '$(pythonArtifactFeed)'
+
+      - pwsh: .pipeline/scripts/twine-upload.ps1 -FeedName '$(pythonFeedName)' -ConfigFile '$(PYPIRC_PATH)' -DistDir '$(distDir)' -SimpleIndexUrl '$(pythonSimpleIndex)'
+        displayName: 'twine upload to feed'
+
+    # The mssql-sqlcmd package was packed by its Build job and is still a NuGet
+    # package, so it publishes through OneBranch's nugetPublishing, which only
+    # runs on the managed pool.
+    - ${{ if eq(parameters.buildMssqlSqlcmd, true) }}:
+      - job: PublishMssqlSqlcmd
+        displayName: 'Publish mssql-sqlcmd NuGet package'
+        pool:
+          type: windows
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          ob_nugetPublishing_enabled: true
+        steps:
+        - download: current
+          artifact: drop_Build_MssqlSqlcmd_Package
+          displayName: 'Download the mssql-sqlcmd package'
+
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $packages = @(Get-ChildItem "$(Pipeline.Workspace)/drop_Build_MssqlSqlcmd_Package" -Filter 'mssql-sqlcmd.*.nupkg')
+            if ($packages.Count -ne 1) {
+              throw "Expected one mssql-sqlcmd package, found $($packages.Count)"
+            }
+            $destination = "$(ob_outputDirectory)/packages"
+            New-Item -ItemType Directory -Force -Path $destination | Out-Null
+            Copy-Item $packages[0].FullName $destination
+            Write-Host "Publishing $($packages[0].Name); OneBranch publishes from $destination"
+          displayName: 'Stage the mssql-sqlcmd package'

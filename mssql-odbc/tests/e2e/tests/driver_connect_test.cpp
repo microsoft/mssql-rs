@@ -46,7 +46,9 @@ TEST_F(ODBCTest, DriverConnect_MissingServer) {
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
 
-// SQLDisconnect on a handle that was never connected returns error.
+// SQLDisconnect on a handle that was never connected returns 08003 — from the DM,
+// which answers this case itself and never calls the driver. The driver's own
+// answer for a DM-less caller is SQL_SUCCESS (see disconnect.rs unit tests).
 TEST_F(ODBCTest, Disconnect_NotConnected) {
     SQLHDBC hdbc = SQL_NULL_HDBC;
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
@@ -229,6 +231,44 @@ TEST_F(DriverConnectLiveTest, BadCredentials) {
                           SQL_DRIVER_NOPROMPT);
     EXPECT_SQL_ERROR(rc);
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "28000");
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+}
+
+// A failed connect leaves the handle allocated but not connected, and both this
+// driver and msodbcsql report SQL_ERROR / 08003 if it is then disconnected --
+// verified against both, so it is the ODBC-correct answer rather than a quirk.
+//
+// Recorded because it is a live hazard for wrappers: a destructor that
+// disconnects while unwinding from the connect failure, and that raises on the
+// disconnect result, throws a second time and aborts the process. The fix
+// belongs in the caller (suppress errors on the unwind path), not here -- this
+// test exists so nobody "fixes" the driver to return success and calls it
+// parity.
+TEST_F(DriverConnectLiveTest, DisconnectAfterFailedConnectReportsNotConnected) {
+    SQLHDBC hdbc = SQL_NULL_HDBC;
+    SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_ENV, env_);
+
+    auto& cfg = ODBCTestConfig::Instance();
+    std::string bad = "Driver={" + cfg.Driver() + "}"
+                      ";Server=" + cfg.Server() +
+                      ";UID=nonexistent_user_xyz;PWD=wrong_password_123" +
+                      ";TrustServerCertificate=Yes";
+    SqlTString connstr = ODBCTestUtils::ToSqlTStr(bad);
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+
+    rc = SQLDriverConnect(hdbc, nullptr,
+                          const_cast<SQLTCHAR*>(connstr.c_str()),
+                          static_cast<SQLSMALLINT>(connstr.size()),
+                          outStr, 1024, &outLen,
+                          SQL_DRIVER_NOPROMPT);
+    ASSERT_SQL_ERROR(rc);
+
+    rc = SQLDisconnect(hdbc);
+    EXPECT_SQL_ERROR(rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "08003");
 
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
@@ -511,6 +551,46 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
         EXPECT_TRUE(SQL_SUCCEEDED(r.rc)) << "rc=" << r.rc;
         EXPECT_FALSE(r.has01S00);
     }
+}
+
+// APP must reach the server in the TDS login packet, which APP_NAME() reports.
+// Regression coverage for AB#47534, where APP parsed cleanly but was dropped
+// before the login packet, so the server saw the driver's default name instead.
+TEST_F(DriverConnectLiveTest, AppKeywordReachesServerAppName) {
+    const std::string kAppName = "AppKeywordE2E";
+    SqlTString connstr =
+        ODBCTestUtils::ToSqlTStr("APP=" + kAppName + ";") +
+        ODBCTestUtils::BuildConnectionString();
+
+    SQLHDBC hdbc = SQL_NULL_HDBC;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc));
+
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+    SQLRETURN rc = SQLDriverConnect(hdbc, nullptr,
+                                    const_cast<SQLTCHAR*>(connstr.c_str()),
+                                    static_cast<SQLSMALLINT>(connstr.size()),
+                                    outStr, 1024, &outLen, SQL_DRIVER_NOPROMPT);
+    ASSERT_TRUE(SQL_SUCCEEDED(rc)) << "rc=" << rc;
+    EXPECT_FALSE(ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00"));
+
+    SQLHSTMT hstmt = SQL_NULL_HSTMT;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt));
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT APP_NAME()");
+    ASSERT_TRUE(SQL_SUCCEEDED(
+        SQLExecDirect(hstmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS)));
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLFetch(hstmt)));
+
+    SQLTCHAR buf[256] = {};
+    SQLLEN ind = 0;
+    ASSERT_TRUE(SQL_SUCCEEDED(
+        SQLGetData(hstmt, 1, SQL_C_TCHAR, buf, sizeof(buf), &ind)));
+    EXPECT_EQ(kAppName, ODBCTestUtils::ToNarrow(SqlTString(buf)));
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLDisconnect(hdbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
 
 // mssql-odbc rejects an invalid value on a validated connection-string key with

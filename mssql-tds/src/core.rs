@@ -7,6 +7,10 @@ use futures::FutureExt;
 use futures::future::Either;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// Alias for `Result<T, crate::error::Error>` used throughout the crate.
@@ -22,6 +26,13 @@ pub const TDS_8_ALPN_PROTOCOL: &str = "tds/8.0";
 #[derive(Debug)]
 pub struct CancelHandle {
     pub(crate) cancel_token: CancellationToken,
+    settlement: Option<Arc<CancellationSettlement>>,
+}
+
+#[derive(Debug)]
+struct CancellationSettlement {
+    timeout_secs: AtomicU32,
+    deadline: OnceLock<Instant>,
 }
 
 impl CancelHandle {
@@ -29,17 +40,76 @@ impl CancelHandle {
     pub fn new() -> Self {
         CancelHandle {
             cancel_token: CancellationToken::new(),
+            settlement: None,
         }
     }
 
     /// Trigger cancellation, notifying all child handles.
-    pub fn cancel(self) {
+    pub fn cancel(&self) {
+        if let Some(settings) = &self.settlement
+            && let Some(seconds) = self.cancel_timeout_secs()
+        {
+            settings
+                .deadline
+                .get_or_init(|| Instant::now() + Duration::from_secs(u64::from(seconds)));
+        }
         self.cancel_token.cancel();
+    }
+
+    /// Configure before deriving children; subsequent updates are shared with
+    /// those children. Zero restores the TDS default. Cleanup already in
+    /// progress keeps its original deadline.
+    /// Configured writes finish their current packet within this budget before
+    /// withdrawing the request; an unfinished packet retires the transport.
+    pub fn set_cancel_timeout_secs(&mut self, seconds: u32) {
+        match &self.settlement {
+            Some(settings) => settings.timeout_secs.store(seconds, Ordering::Relaxed),
+            None => {
+                self.settlement = Some(Arc::new(CancellationSettlement {
+                    timeout_secs: AtomicU32::new(seconds),
+                    deadline: OnceLock::new(),
+                }));
+            }
+        }
+    }
+
+    /// The configured cancellation budget, or None for the TDS default.
+    pub fn cancel_timeout_secs(&self) -> Option<u32> {
+        self.settlement
+            .as_ref()
+            .map(|settings| settings.timeout_secs.load(Ordering::Relaxed))
+            .filter(|seconds| *seconds != 0)
+    }
+
+    pub(crate) fn has_settlement_budget(&self) -> bool {
+        self.cancel_timeout_secs().is_some()
+            || self
+                .settlement
+                .as_ref()
+                .is_some_and(|settings| settings.deadline.get().is_some())
+    }
+
+    pub(crate) fn configured_settlement_deadline(&self) -> Option<Instant> {
+        self.settlement
+            .as_ref()
+            .and_then(|settings| settings.deadline.get().copied())
+            .or_else(|| {
+                self.cancel_timeout_secs()
+                    .map(|seconds| Instant::now() + Duration::from_secs(u64::from(seconds)))
+            })
+    }
+
+    pub(crate) fn settlement_deadline(&self, default: Duration) -> Instant {
+        self.configured_settlement_deadline()
+            .unwrap_or_else(|| Instant::now() + default)
     }
 
     /// Derive a child handle that is cancelled when this handle is.
     pub fn child_handle(&self) -> Self {
-        Self::from(self.cancel_token.child_token())
+        Self {
+            cancel_token: self.cancel_token.child_token(),
+            settlement: self.settlement.clone(),
+        }
     }
 
     pub(crate) fn run_until_cancelled<'a, F, ResultType>(
@@ -65,6 +135,7 @@ impl From<CancellationToken> for CancelHandle {
     fn from(value: CancellationToken) -> Self {
         CancelHandle {
             cancel_token: value,
+            settlement: None,
         }
     }
 }
@@ -150,6 +221,35 @@ impl Version {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_budget_is_shared_and_does_not_restart_after_signal() {
+        let mut handle = CancelHandle::new();
+        assert_eq!(handle.cancel_timeout_secs(), None);
+        handle.set_cancel_timeout_secs(120);
+        let child = handle.child_handle();
+        handle.set_cancel_timeout_secs(3);
+        assert_eq!(child.cancel_timeout_secs(), Some(3));
+        let start = Instant::now();
+        handle.cancel();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        handle.cancel();
+        assert_eq!(
+            child.settlement_deadline(Duration::from_secs(5)),
+            start + Duration::from_secs(3)
+        );
+        handle.set_cancel_timeout_secs(0);
+        assert_eq!(child.cancel_timeout_secs(), None);
+        assert!(child.has_settlement_budget());
+        assert_eq!(
+            child.configured_settlement_deadline(),
+            Some(start + Duration::from_secs(3))
+        );
+        assert_eq!(
+            child.settlement_deadline(Duration::from_secs(5)),
+            start + Duration::from_secs(3)
+        );
+    }
+
     #[test]
     fn sql_server_version_from_known_values() {
         assert_eq!(
@@ -195,6 +295,17 @@ mod tests {
     fn cancel_handle_default() {
         let handle = CancelHandle::default();
         assert!(!handle.cancel_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_can_be_repeated_and_propagates_to_late_children() {
+        let handle = CancelHandle::new();
+        let child = handle.child_handle();
+        handle.cancel();
+        handle.cancel();
+        assert!(child.cancel_token.is_cancelled());
+        assert!(handle.child_handle().cancel_token.is_cancelled());
+        assert!(!CancelHandle::new().cancel_token.is_cancelled());
     }
 
     #[tokio::test]

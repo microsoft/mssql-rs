@@ -1,14 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use mssql_tds::connection::tds_client::TdsClient;
-use tokio::runtime::Runtime;
+use tracing::error;
 
+use super::env::SharedRuntime;
+use super::wire::{ConnectionWire, LeaseReturn, WireLease};
 use super::{EnvHandle, HandleType, HasObjectType};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
+use crate::conversion::client_encoding::ClientEncoding;
 use crate::error::{DiagRecord, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
@@ -27,16 +31,22 @@ pub(crate) enum ConnectionState {
 /// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`.
 /// Holds a back-pointer to the parent environment and connection-level state.
 ///
-/// Thread-safety: The `inner` mutex protects mutable state, mirroring
-/// msodbcsql's connection-level critical section.
+/// Thread-safety: The `inner` mutex protects mutable state except the atomic
+/// connection timeout, read on every cancellable statement call.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
+    pub(crate) trace: Arc<mssql_tds::trace_context::ConnectionTrace>,
     pub(crate) object_type: HandleType,
     /// Back-pointer to the parent ENV handle. Stored as opaque pointer because
     /// the ENV owns the DBC's lifetime, not the other way around.
     pub(crate) parent_env: *mut c_void,
     /// Shared Tokio runtime from the parent ENV.
-    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<SharedRuntime>,
+    /// `SQL_ATTR_CONNECTION_TIMEOUT`, shared by internal metadata queries and
+    /// cancellation. Zero means unlimited for queries and 120 seconds for cancel.
+    /// Native: GetNetIOTimeOut/GetCancelTimeoutValue (sqlcprot.h:1605,1625);
+    /// broader connection-scoped timeout enforcement remains follow-up work.
+    connection_timeout: AtomicU32,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -44,37 +54,122 @@ pub(crate) struct DbcHandle {
 // We assert these are safe because `parent_env` is set once at construction
 // and never mutated. The parent ENV is guaranteed alive because the DM
 // ensures all DBCs are freed before calling SQLFreeEnv.
-// All mutable state is Mutex-protected.
+// Mutable state is Mutex-protected or atomic.
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
+
+/// Pre-connect values from the `SQL_COPT_SS_*` attributes that duplicate a
+/// connection-string keyword.
+///
+/// mssql-python applies `attrs_before` unfiltered at connect, so a caller can
+/// configure the same setting through either path. Measured against msodbcsql
+/// 18, the two paths do not rank the same way:
+///
+/// - The vendor attributes here **override** the keyword. `Encrypt=no` in the
+///   string plus `SQL_COPT_SS_ENCRYPT=1` connects encrypted, and the reverse
+///   pairing connects unencrypted; `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE=0`
+///   overrides `TrustServerCertificate=yes` hard enough to fail the handshake.
+/// - `SQL_ATTR_CURRENT_CATALOG` is the opposite: the `Database=` keyword wins
+///   and the attribute is only a fallback (see `driver_connect`).
+///
+/// So this is deliberately not a general "attributes beat keywords" rule -- it
+/// is per attribute, and each field here was confirmed by observing the
+/// resulting session in `sys.dm_exec_connections` rather than by reading a
+/// header.
+///
+/// Values are normalized on the way in, matching msodbcsql: setting encrypt,
+/// trust, or integrated security to an out-of-range `7` and reading it back
+/// post-connect returns `1`, so the driver stores the effective value rather
+/// than the caller's input. Multi-subnet failover instead rejects anything
+/// above `SQL_IS_ON` with `HY024`, as msodbcsql does. TNIR is not stored:
+/// off is a compatibility no-op, and on is unsupported.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct VendorConnOverrides {
+    /// `SQL_COPT_SS_ENCRYPT` (1223): `0` no, `1` yes, `2` strict.
+    pub(crate) encrypt: Option<u32>,
+    /// `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE` (1228): `0` or `1`.
+    pub(crate) trust_server_certificate: Option<u32>,
+    /// `SQL_COPT_SS_INTEGRATED_SECURITY` (1203): `0` or `1`.
+    pub(crate) integrated_security: Option<u32>,
+    /// `SQL_COPT_SS_MULTISUBNET_FAILOVER` (1248): `0` or `1`.
+    pub(crate) multi_subnet_failover: Option<u32>,
+}
 
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
     pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) client_encoding: ClientEncoding,
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
     pub(crate) statements: Vec<*mut c_void>,
-    /// The STMT handle that currently has an open cursor, if any.
-    /// Set when SQLExecDirect succeeds; cleared by SQLCloseCursor /
-    /// SQLFreeStmt(SQL_CLOSE). Used to enforce the non-MARS rule that only
-    /// one statement may hold an open cursor per connection at a time.
-    pub(crate) active_stmt: Option<*mut c_void>,
-    /// Active TDS connection, present only when `connection_state == Connected`.
-    pub(crate) client: Option<TdsClient>,
+    /// Explicitly-allocated DESC handles (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`),
+    /// owned by this connection independent of any one statement. A statement
+    /// references one by raw pointer in `StmtState::active_ard`/`active_apd`
+    /// once associated (`SQLSetStmtAttrW`); freeing an entry here
+    /// (`SQLFreeHandle(SQL_HANDLE_DESC)`) resets every statement referencing
+    /// it back to its own implicit descriptor first.
+    pub(crate) descriptors: Vec<*mut c_void>,
+    /// The TDS client and who owns it. Installed only while
+    /// `connection_state == Connected`.
+    pub(crate) wire: ConnectionWire,
     /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
     /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
     pub(crate) access_token: Option<String>,
     /// Login timeout in seconds set via `SQL_ATTR_LOGIN_TIMEOUT`. Applied to the
     /// TDS login deadline at connect time. `Some(0)` means wait indefinitely.
     pub(crate) login_timeout: Option<u32>,
-    /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
-    /// does not yet vary its behaviour on it.
+    /// Pre-connect overrides from the `SQL_COPT_SS_*` attribute forms of
+    /// connection-string keywords. `None` means "the caller did not set this
+    /// attribute", which is what lets the keyword stand.
+    pub(crate) vendor_overrides: VendorConnOverrides,
+    /// Effective vendor settings for the current connected session. Kept
+    /// separate from [`vendor_overrides`](Self::vendor_overrides) so a keyword
+    /// resolved by one connection is never reused as an explicit attribute on
+    /// the next connection attempt.
+    pub(crate) effective_vendor_settings: Option<VendorConnOverrides>,
+    /// Requested `SQL_ATTR_ACCESS_MODE`; a read-only database overrides it on get.
     pub(crate) access_mode: u32,
-    /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. Stored, not yet honored.
-    /// `0` is the ODBC default and means "no timeout".
-    pub(crate) connection_timeout: u32,
-    /// `SQL_ATTR_PACKET_SIZE` in bytes. Stored, not yet honored.
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`. When `true`, a value carrying a character
+    /// the narrow encoding it is sent in could not represent — substituted with
+    /// `?` on the way to the wire, matching msodbcsql — is reported as SQLSTATE
+    /// `01000` and turns the call's return into `SQL_SUCCESS_WITH_INFO`.
+    ///
+    /// That encoding is the one the parameter carries, which is the
+    /// connection's negotiated database collation; the driver does not know the
+    /// destination column here. So this observes the conversion *this driver*
+    /// performs, not the server's: a column collated differently from the
+    /// database can still lose characters server-side without this firing.
+    ///
+    /// Defaults to `false` (`SQL_WARN_NO`), as msodbcsql's does
+    /// (`sqlcconn.cpp:596`): the substitution is not an error, and warning
+    /// unconditionally would change the return code of every statement that
+    /// carries text a legacy code page cannot hold.
+    ///
+    /// Also reports retrieval loss on the native warning path. A converted
+    /// result that fits bypasses that path, even when this flag is set
+    /// (`sqlcdata.h:1210-1217`, measured on Windows msodbcsql 18.6.1.1).
+    /// msodbcsql consults this flag only on
+    /// retrieval (`sqlcdata.h:1297,1310`); retaining our input-parameter warning
+    /// is the remaining deviation in parity-deviations entry 23 (AB#47598).
+    pub(crate) warn_on_cp_error: bool,
+    /// `SQL_ATTR_PACKET_SIZE` in bytes: the app-set attribute (or default),
+    /// surviving `SQLDisconnect` so the next connect attempt on this handle
+    /// starts from it again. Never overwritten with a resolved or negotiated
+    /// value — see [`effective_packet_size`](Self::effective_packet_size).
+    /// `0` is a valid stored value (msodbcsql's "let the connection pick its
+    /// own default" sentinel, exempt from the usual clamp — see
+    /// `set_connect_attr::sql_set_connect_attr_w_impl`); it is resolved to the
+    /// `ClientContext` default at connect time rather than seeded verbatim.
     pub(crate) packet_size: u32,
+    /// The packet size actually resolved for the current connection (attribute
+    /// seed, then any `PacketSize=` override), kept separate from
+    /// [`packet_size`](Self::packet_size) for the same reason as
+    /// [`effective_vendor_settings`](Self::effective_vendor_settings): a
+    /// connection-string keyword must not outlive the connection it came from
+    /// and leak onto the handle's next connect attempt. `None` when
+    /// disconnected; `SQLGetConnectAttr`/`SQLGetInfo` fall back to
+    /// [`packet_size`](Self::packet_size) in that case.
+    pub(crate) effective_packet_size: Option<u32>,
     /// `SQL_ATTR_AUTOCOMMIT`. `true` is the ODBC-mandated default
     /// (msodbcsql `SQL_AUTOCOMMIT_DEFAULT`); `false` selects manual-commit, in
     /// which the driver keeps a transaction open until `SQLEndTran`.
@@ -84,17 +179,30 @@ pub(crate) struct DbcState {
     /// (`sqlcmisc.cpp:3426`). Applied as a `SET TRANSACTION ISOLATION LEVEL`
     /// batch when connected, otherwise deferred to connect time.
     pub(crate) txn_isolation: u32,
-    /// ODBC-side checkout state for a reset that still needs a carrying request.
+    /// The server's transaction isolation level is no longer known to match
+    /// [`txn_isolation`](Self::txn_isolation).
     ///
-    /// This is distinct from `TdsClient::reset_pending()`: this flag forces the
-    /// checkout isolation SET to execute, while the TDS flag records whether the
-    /// server has acknowledged the reset. It is cleared after the isolation
-    /// handler verifies that acknowledgement.
+    /// Set when a pool reset is armed: SQL Server's connection reset does not
+    /// restore the isolation level, and the previous borrower may have changed
+    /// it through raw T-SQL that this cache never saw. While set,
+    /// `SQL_ATTR_TXN_ISOLATION` must not take its same-value short circuit, or
+    /// the checkout SET would be skipped and the next borrower would silently
+    /// inherit the previous one's level. Cleared once an isolation SET reaches
+    /// the server, or at connect time when the session starts from a known
+    /// state.
     ///
-    /// While set, `SQL_ATTR_TXN_ISOLATION` must not take its same-value short
-    /// circuit: that checkout SET is the request the armed bit rides, so
-    /// short-circuiting would lose fail-at-checkout.
-    pub(crate) pending_reset_ack: bool,
+    /// This is not reset *acknowledgement* state: `TdsClient` verifies that
+    /// itself on the request that carries the RESETCONNECTION bit.
+    pub(crate) server_isolation_unknown: bool,
+    /// Monotonic count of pool resets armed on this connection.
+    ///
+    /// `set_txn_isolation` captures it before it sends and only clears
+    /// [`server_isolation_unknown`](Self::server_isolation_unknown) afterwards
+    /// if the count is unchanged. Without it a checkout SET already in flight
+    /// could clear an invalidation armed *after* it reached the server, and the
+    /// next same-value SET would short-circuit against a session the newer reset
+    /// had made unknown again.
+    pub(crate) reset_generation: u64,
     /// The application executed a statement in manual-commit mode, so the open
     /// transaction may hold uncommitted user work. Mirrors msodbcsql's
     /// `CONN_ST_LOCALTRANS_STARTED` (`sqlcprot.h:2298`) and is deliberately
@@ -102,6 +210,143 @@ pub(crate) struct DbcState {
     /// driver-begun *piggyback* transactions that carry no user work. Only this
     /// flag blocks `SQLDisconnect` (25000) and `SQL_ATTR_TXN_ISOLATION` (HY011).
     pub(crate) local_tran_started: bool,
+    /// `SQL_ATTR_CURRENT_CATALOG`. Before connecting this holds the requested
+    /// initial database (the connection string's `Database=` keyword wins if
+    /// both are given, matching msodbcsql); afterwards the live name comes from
+    /// the TDS client's ENVCHANGE tracking, so this is only the pre-connect
+    /// seed and the fallback answer for a disconnected `SQLGetConnectAttr`.
+    pub(crate) current_catalog: Option<String>,
+    /// Connection-level default for `SQL_ATTR_QUERY_TIMEOUT`, inherited by
+    /// statements allocated afterwards.
+    ///
+    /// `SQLSetConnectAttr` accepts statement options and both fans the value out
+    /// to the connection's existing statements and records it here for future
+    /// ones (msodbcsql `sqlcmisc.cpp:2879-2922`, `sqlcfunc.cpp:173`).
+    pub(crate) stmt_query_timeout: u32,
+    /// Non-secret identity of the current session, answering `SQLGetInfo`'s
+    /// `SQL_DATA_SOURCE_NAME` and `SQL_SERVER_NAME` without a round trip.
+    /// Populated on a successful connect, cleared on disconnect.
+    pub(crate) identity: ConnectionIdentity,
+    /// Monotonic count of sessions established on this handle, bumped each time
+    /// a connect succeeds.
+    ///
+    /// Lets an internal query that released the DBC lock for a round trip tell
+    /// whether the session it queried is still the one installed here. Without
+    /// it, a `SQLDisconnect` + `SQLDriverConnect` racing a lookup could have the
+    /// finishing lookup overwrite the new client with the old one and attach the
+    /// old session's answer to it.
+    pub(crate) session_generation: u64,
+    /// `SQL_USER_NAME`: the database principal `USER_NAME()` reported, keyed to
+    /// the session state it was read in — see [`CachedDatabaseUserName`].
+    /// Populated lazily on the first `SQLGetInfo(SQL_USER_NAME)` rather than at
+    /// connect, so an application that never asks never pays the round trip —
+    /// msodbcsql's model (`CONN_ST_REFRESH_UDT`, `sqlcinfo.cpp:1189`).
+    ///
+    /// Invalidated three ways: cleared outright when the session changes
+    /// (connect/disconnect), when `SQL_ATTR_CURRENT_CATALOG` switches database,
+    /// and when `SQL_ATTR_RESET_CONNECTION` recycles the connection — the last
+    /// because a reset undoes an `EXECUTE AS` while returning the session to
+    /// the same default database the entry was keyed to, which the key alone
+    /// cannot see. Otherwise caught by the key itself, which pairs the catalog
+    /// with the client's database-change count so a `USE` the driver did not
+    /// issue — including a `USE [X]` while already in `X` — still invalidates.
+    pub(crate) database_user_name: Option<CachedDatabaseUserName>,
+    /// Actual database updateability, shared by the access-mode attributes and
+    /// `SQL_DATA_SOURCE_READ_ONLY`. Invalidated by database and session changes.
+    pub(crate) database_read_only: Option<Box<CachedDatabaseReadOnly>>,
+    /// Alias type names (`sp_addtype`, `CREATE TYPE ... FROM`) for
+    /// `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME`, read lazily on the
+    /// first description of an alias-typed column. Cleared when the session
+    /// changes; otherwise invalidated by its key, as
+    /// [`database_user_name`](Self::database_user_name) is.
+    pub(crate) alias_types: Option<AliasTypeCache>,
+    /// Last-known database code page for `SQL_COLLATION_SEQ`, refreshed each
+    /// time an execution claims the client. Answers `SQLGetInfo` while a
+    /// data-at-execution sequence has moved the client onto a statement
+    /// (`SQL_NEED_DATA`), when the wire has no parked client but the DBC is
+    /// still connected. A plain code page, so the common path caches without
+    /// allocating. Cleared on disconnect.
+    pub(crate) last_collation_code_page: Option<u16>,
+    /// Legacy `CHARACTER_SET` name paired with
+    /// [`last_collation_code_page`](Self::last_collation_code_page), populated
+    /// only when the code page needs it to name `SQL_COLLATION_SEQ` (so modern
+    /// collation connections never allocate here). Cleared on disconnect.
+    pub(crate) last_char_set: Option<String>,
+}
+
+/// The connection identity that does not vary by database.
+///
+/// Deliberately holds no credential: the connection string is never retained,
+/// and neither the login name nor the password or access token is kept. The
+/// login is not here because no information type reports it — `SQL_USER_NAME`
+/// is the *database* user, which [`DbcState::database_user_name`] caches.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ConnectionIdentity {
+    /// Shared with TDS so a transparent reconnect updates the getter even
+    /// while a statement owns the client outside the DBC mutex.
+    pub(crate) client_connection_id: Option<Arc<mssql_tds::trace_context::ConnectionTrace>>,
+    /// `SQL_DATA_SOURCE_NAME`. Empty for a DSN-less connection, matching
+    /// msodbcsql18.
+    pub(crate) data_source_name: String,
+    /// `SQL_SERVER_NAME`. The instance name the server reported for itself at
+    /// login (`@@SERVERNAME`), falling back to the host that was dialled when
+    /// the login response carried no INFO token.
+    pub(crate) server_name: String,
+}
+
+/// A [`DbcState::database_user_name`] entry: the value `SQL_USER_NAME` reports
+/// for a catalog, and the catalog it is only valid for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedDatabaseUserName {
+    /// The database the lookup ran in, as the TDS client reported it. Compared
+    /// exactly: both sides are the server's own ENVCHANGE name, and a
+    /// case-sensitive instance can hold two databases differing only by case.
+    pub(crate) catalog: String,
+    /// [`TdsClient::database_change_count`] when the lookup ran, compared
+    /// alongside [`catalog`](Self::catalog).
+    ///
+    /// The name alone cannot see a `USE [X]` issued while already in `X`. That
+    /// still produces an `ENVCHANGE`, and paired with an `EXECUTE AS` it is the
+    /// only signal that the database principal changed while the database name
+    /// did not — msodbcsql refreshes there because it flags on any
+    /// `ENV_DATABASE` token without comparing names (`sqlctokn.cpp:2866-2882`).
+    /// It also covers a transparent reconnect, which replaces the session
+    /// without any ODBC-level clear running.
+    ///
+    /// Compared for equality only: the count is a change token, not a
+    /// watermark.
+    pub(crate) database_change_count: u64,
+    /// What `SQL_USER_NAME` reports for [`catalog`](Self::catalog) — usually
+    /// what `USER_NAME()` returned there (`dbo` for an owner, the contained
+    /// user's name, or `guest`), but **not always**. When the query ran and
+    /// produced no name — a NULL row, no row, or a read that failed after the
+    /// server accepted the batch — the previous answer is stored under the new
+    /// catalog instead, which is how msodbcsql behaves: `SQLGetData` leaves its
+    /// `DBUserName` buffer untouched for a NULL, and the refresh flag is
+    /// already cleared by then, so it reports the old value and stops asking.
+    /// Empty when there was no previous answer to keep.
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedDatabaseReadOnly {
+    pub(crate) catalog: String,
+    pub(crate) database_change_count: u64,
+    pub(crate) read_only: bool,
+}
+
+/// A [`DbcState::alias_types`] entry: `systypes` names keyed by the
+/// database-scoped `UserType` that `COLMETADATA` reports for a column, valid
+/// only for the session state they were read in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AliasTypeCache {
+    /// The database the names were read from, compared exactly like
+    /// [`CachedDatabaseUserName::catalog`].
+    pub(crate) catalog: String,
+    /// [`TdsClient::database_change_count`] when the names were read, compared
+    /// alongside [`catalog`](Self::catalog).
+    pub(crate) database_change_count: u64,
+    pub(crate) names: HashMap<u32, String>,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -112,8 +357,8 @@ impl std::fmt::Debug for DbcState {
             .field("diag_records", &self.diag_records)
             .field("connection_state", &self.connection_state)
             .field("statements", &self.statements)
-            .field("active_stmt", &self.active_stmt)
-            .field("client", &self.client)
+            .field("descriptors", &self.descriptors)
+            .field("wire", &self.wire)
             .field(
                 "access_token",
                 &self.access_token.as_ref().map(|_| "<REDACTED>"),
@@ -122,6 +367,11 @@ impl std::fmt::Debug for DbcState {
             .field("autocommit", &self.autocommit)
             .field("txn_isolation", &self.txn_isolation)
             .field("local_tran_started", &self.local_tran_started)
+            .field("current_catalog", &self.current_catalog)
+            .field("stmt_query_timeout", &self.stmt_query_timeout)
+            .field("identity", &self.identity)
+            .field("database_user_name", &self.database_user_name)
+            .field("alias_types", &self.alias_types)
             .finish()
     }
 }
@@ -136,26 +386,57 @@ impl HasDiagnostics for DbcState {
 }
 
 impl DbcHandle {
-    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn connection_timeout(&self) -> u32 {
+        self.connection_timeout.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_connection_timeout(&self, seconds: u32) {
+        self.connection_timeout.store(seconds, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cancel_timeout_secs(&self) -> u32 {
+        match self.connection_timeout() {
+            0 => 120,
+            seconds => seconds,
+        }
+    }
+
+    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
+            trace: Arc::default(),
             object_type: HandleType::Dbc,
             parent_env,
             runtime,
+            connection_timeout: AtomicU32::new(0),
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
+                client_encoding: ClientEncoding::system_default(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
-                active_stmt: None,
-                client: None,
+                descriptors: Vec::new(),
+                wire: ConnectionWire::default(),
                 access_token: None,
+                vendor_overrides: VendorConnOverrides::default(),
+                effective_vendor_settings: None,
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
-                connection_timeout: 0,
+                warn_on_cp_error: false,
                 packet_size: DEFAULT_PACKET_SIZE,
+                effective_packet_size: None,
                 autocommit: true,
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,
-                pending_reset_ack: false,
+                server_isolation_unknown: false,
+                reset_generation: 0,
+                current_catalog: None,
+                stmt_query_timeout: 0,
+                identity: ConnectionIdentity::default(),
+                session_generation: 0,
+                database_user_name: None,
+                database_read_only: None,
+                alias_types: None,
+                last_collation_code_page: None,
+                last_char_set: None,
             }),
         }
     }
@@ -172,10 +453,190 @@ impl DbcHandle {
         // and the ENV outlives this DBC per the DM contract.
         unsafe { &*(self.parent_env as *const EnvHandle) }
     }
+
+    /// Returns `false`, closing the lease's client, on a poisoned mutex or when
+    /// the lease's session was torn down while it was out.
+    pub(crate) fn return_lease(&self, lease: WireLease, how: LeaseReturn) -> bool {
+        self.return_lease_and_publish(lease, how, |_| ()).is_some()
+    }
+
+    /// Restores a lease and publishes its outcome before another operation can
+    /// claim the wire.
+    pub(crate) fn return_lease_and_publish<R>(
+        &self,
+        lease: WireLease,
+        how: LeaseReturn,
+        publish: impl FnOnce(&mut DbcState) -> R,
+    ) -> Option<R> {
+        self.return_lease_and_publish_inner(lease, how, || {}, publish)
+    }
+
+    fn return_lease_and_publish_inner<R>(
+        &self,
+        lease: WireLease,
+        how: LeaseReturn,
+        after_restore: impl FnOnce(),
+        publish: impl FnOnce(&mut DbcState) -> R,
+    ) -> Option<R> {
+        let Ok(mut state) = self.inner.lock() else {
+            error!(owner = ?lease.owner(), "dbc mutex poisoned returning a wire lease");
+            return None;
+        };
+        if !state.wire.restore(lease, how) {
+            return None;
+        }
+        after_restore();
+        Some(publish(&mut state))
+    }
 }
 
 impl HasObjectType for DbcHandle {
     fn object_type_mut(&mut self) -> &mut HandleType {
         &mut self.object_type
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::handles::handle_from_raw;
+    use crate::test_support::TestHandles;
+
+    use super::*;
+
+    #[test]
+    fn cancellation_timeout_uses_default_only_for_zero() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        for (configured, expected) in [(0, 120), (1, 1), (30, 30), (u32::MAX, u32::MAX)] {
+            dbc.set_connection_timeout(configured);
+            assert_eq!(dbc.connection_timeout(), configured);
+            assert_eq!(dbc.cancel_timeout_secs(), expected);
+        }
+    }
+
+    #[test]
+    fn debug_redacts_the_token_and_reports_the_attribute_state() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        state.access_token = Some("super-secret-jwt".into());
+        state.current_catalog = Some("reporting".into());
+        state.stmt_query_timeout = 30;
+
+        let rendered = format!("{:?}", *state);
+        assert!(!rendered.contains("super-secret-jwt"));
+        assert!(rendered.contains("<REDACTED>"));
+        assert!(rendered.contains("current_catalog: Some(\"reporting\")"));
+        assert!(rendered.contains("stmt_query_timeout: 30"));
+    }
+
+    #[test]
+    fn return_lease_reports_a_poisoned_mutex() {
+        use super::super::wire::{ClaimPolicy, WireOwner};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = dbc.inner.lock().unwrap();
+            panic!("poison the dbc lock");
+        });
+
+        assert!(!dbc.return_lease(lease, LeaseReturn::Release));
+        // Only so `TestHandles` can tear the DBC down.
+        dbc.inner.clear_poison();
+    }
+
+    #[test]
+    fn return_lease_reports_a_lease_from_a_torn_down_session() {
+        use super::super::wire::{ClaimPolicy, WireOwner};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        drop(dbc.inner.lock().unwrap().wire.uninstall());
+
+        assert!(!dbc.return_lease(lease, LeaseReturn::Release));
+        assert!(dbc.inner.lock().unwrap().wire.client().is_none());
+    }
+
+    #[test]
+    fn returning_a_lease_keeps_restoration_and_publication_atomic() {
+        use std::sync::mpsc;
+
+        use super::super::wire::{ClaimPolicy, WireOwner};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+
+        std::thread::scope(|scope| {
+            let (restored_tx, restored_rx) = mpsc::channel();
+            let (claim_tx, claim_rx) = mpsc::channel();
+            scope.spawn(move || {
+                restored_rx.recv().unwrap();
+                let claimed = dbc.inner.try_lock().is_ok_and(|mut state| {
+                    state
+                        .wire
+                        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                        .is_ok()
+                });
+                claim_tx.send(claimed).unwrap();
+            });
+
+            let published = dbc.return_lease_and_publish_inner(
+                lease,
+                LeaseReturn::Release,
+                || {
+                    restored_tx.send(()).unwrap();
+                    assert!(
+                        !claim_rx.recv().unwrap(),
+                        "another operation claimed the restored wire before publication"
+                    );
+                },
+                |state| {
+                    state.autocommit = false;
+                    true
+                },
+            );
+            assert_eq!(published, Some(true));
+        });
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.autocommit);
+        assert!(state.wire.client().is_some());
     }
 }

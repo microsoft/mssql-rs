@@ -29,7 +29,10 @@ async fn main() {
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(short, long)]
-    config_file_path: String,
+    config_file_path: Option<String>,
+    /// Override MSF for this connection (false opts out of parallel TCP).
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    multi_subnet_failover: Option<bool>,
 }
 
 /// Define commands for auto-completion
@@ -146,6 +149,7 @@ impl Session {
 }
 
 pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
     use mssql_tds::{
         connection::client_context::ClientContext,
         connection_provider::tds_connection_provider::TdsConnectionProvider,
@@ -159,6 +163,7 @@ pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
     rl.set_helper(Some(helper));
 
     let mut context = ClientContext::default();
+    context.multi_subnet_failover = args.multi_subnet_failover;
     context.user_name = "sa".to_string();
     context.password = std::fs::read_to_string("/tmp/password")?.trim().to_string();
     context.database = "master".to_string();
@@ -215,4 +220,25 @@ pub async fn main_cli() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msf_override_requires_a_boolean_and_preserves_omission() {
+        assert_eq!(
+            Args::try_parse_from(["mssql"])
+                .unwrap()
+                .multi_subnet_failover,
+            None
+        );
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let args = Args::try_parse_from(["mssql", "--multi-subnet-failover", value]).unwrap();
+            assert_eq!(args.multi_subnet_failover, Some(enabled));
+        }
+        assert!(Args::try_parse_from(["mssql", "--multi-subnet-failover"]).is_err());
+        assert!(Args::try_parse_from(["mssql", "--multi-subnet-failover", "yes"]).is_err());
+    }
 }

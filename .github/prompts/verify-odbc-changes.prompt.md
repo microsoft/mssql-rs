@@ -33,7 +33,7 @@ applyTo: "mssql-odbc/**"
 ### 5. Testing
 - [ ] Run mssql-odbc unit tests:
   ```bash
-  cargo nextest run -p mssql-odbc
+  cargo nextest run -p mssqlodbc
   ```
 - [ ] Run mssql-odbc end-to-end tests:
   ```bash

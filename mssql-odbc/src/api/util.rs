@@ -1,14 +1,84 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::slice;
+use crate::api::escape::CodeScan;
+use crate::api::odbc_types::{
+    SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlInteger, SqlReturn, SqlSmallInt, SqlWChar,
+};
+use crate::api::sqlstate::{WARN_STRING_TRUNCATION, post_diag};
+use crate::error::HasDiagnostics;
+use mssql_tds::datatypes::sql_string::EncodingType;
+use mssql_tds::encoding_rs::{CoderResult, WINDOWS_1252};
 
-use crate::api::odbc_types::{SQL_NTS, SqlSmallInt, SqlWChar};
+const CP1252_SCRATCH_UNITS: usize = 256;
+
+/// Resolve only when delivery can proceed: unknown LCIDs use the shared
+/// resolver's CP1252 fallback and warning, without a second generic decode.
+pub(crate) fn is_cp1252(encoding: &EncodingType) -> bool {
+    encoding.encoding() == Some(WINDOWS_1252)
+}
+
+/// CP1252 has exactly one UTF-16 unit per byte, so only the delivered prefix
+/// needs decoding. Scratch space is bounded independently of the value size.
+///
+/// # Safety
+/// Same destination and non-overlap contract as [`copy_with_nul`], in UTF-16 units.
+pub(crate) unsafe fn copy_cp1252_with_nul(
+    dst: *mut SqlWChar,
+    buf_len: usize,
+    bytes: &[u8],
+) -> bool {
+    if dst.is_null() {
+        return false;
+    }
+    if buf_len == 0 {
+        return !bytes.is_empty();
+    }
+    let copied = bytes.len().min(buf_len - 1);
+    let mut scratch = [0_u16; CP1252_SCRATCH_UNITS];
+    let mut decoder = WINDOWS_1252.new_decoder_without_bom_handling();
+    for (index, chunk) in bytes[..copied].chunks(scratch.len()).enumerate() {
+        let (result, read, written, errors) = decoder.decode_to_utf16(chunk, &mut scratch, false);
+        debug_assert_eq!(result, CoderResult::InputEmpty);
+        debug_assert_eq!((read, written, errors), (chunk.len(), chunk.len(), false));
+        // SAFETY: CP1252 writes one unit per byte. Byte copying permits an
+        // unaligned application pointer; the prefix leaves room for the NUL.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scratch.as_ptr().cast::<u8>(),
+                dst.add(index * scratch.len()).cast::<u8>(),
+                written * size_of::<SqlWChar>(),
+            );
+        }
+    }
+    unsafe { dst.add(copied).write_unaligned(0) };
+    copied < bytes.len()
+}
 
 /// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
 /// Shared by any RPC-backed result set (`SQLGetTypeInfo`, catalog functions)
 /// that clears it on the ODBC-mandated NOT NULL columns after execution.
 pub(crate) const COLMETA_NULLABLE_FLAG: u16 = 0x01;
+
+const UTF16_HIGH_SURROGATE_START: u16 = 0xD800;
+const UTF16_HIGH_SURROGATE_END: u16 = 0xDBFF;
+const UTF16_LOW_SURROGATE_START: u16 = 0xDC00;
+const UTF16_LOW_SURROGATE_END: u16 = 0xDFFF;
+
+#[inline]
+pub(crate) fn is_high_surrogate(unit: u16) -> bool {
+    (UTF16_HIGH_SURROGATE_START..=UTF16_HIGH_SURROGATE_END).contains(&unit)
+}
+
+#[inline]
+fn is_low_surrogate(unit: u16) -> bool {
+    (UTF16_LOW_SURROGATE_START..=UTF16_LOW_SURROGATE_END).contains(&unit)
+}
+
+#[inline]
+pub(crate) fn is_surrogate_pair(high: u16, low: u16) -> bool {
+    is_high_surrogate(high) && is_low_surrogate(low)
+}
 
 /// Write `value` to `ptr` if non-null. Every ODBC out-parameter pointer may
 /// legitimately be null (caller opting out of that value), so the
@@ -28,6 +98,39 @@ pub(crate) unsafe fn write_if_some<T: Copy>(ptr: *mut T, value: T) {
     if !ptr.is_null() {
         unsafe { ptr.write_unaligned(value) };
     }
+}
+
+/// Copies complete UTF-16LE code units without decoding or replacing surrogates.
+/// Capacity and truncation follow [`copy_with_nul`], in `SqlWChar` units.
+///
+/// # Safety
+/// - `dst`, if non-null, must be writable for `buf_len` `SqlWChar`s.
+/// - `dst` and `bytes` must not overlap.
+/// - `bytes` must contain an even number of bytes.
+pub(crate) unsafe fn copy_utf16le_with_nul(
+    dst: *mut SqlWChar,
+    buf_len: usize,
+    bytes: &[u8],
+) -> bool {
+    debug_assert!(bytes.len().is_multiple_of(2));
+    if dst.is_null() {
+        return false;
+    }
+    if buf_len == 0 {
+        return !bytes.is_empty();
+    }
+    let units = bytes.len() / 2;
+    let copied = units.min(buf_len - 1);
+    for (index, unit) in bytes.chunks_exact(2).take(copied).enumerate() {
+        // SAFETY: index and the terminator are within the caller's capacity;
+        // application buffers need not be aligned.
+        unsafe {
+            dst.add(index)
+                .write_unaligned(u16::from_le_bytes([unit[0], unit[1]]))
+        };
+    }
+    unsafe { dst.add(copied).write_unaligned(0) };
+    copied < units
 }
 
 /// Copies `src` into a caller buffer, NUL-terminating within the buffer.
@@ -76,24 +179,146 @@ pub(crate) unsafe fn copy_with_nul<T: Copy + Default>(
     copy_len < src.len()
 }
 
+/// UTF-16 variant of [`copy_with_nul`] that encodes directly into the caller's
+/// buffer instead of allocating an intermediate `Vec`.
+///
+/// # Safety
+/// - `dst`, if non-null, must be writable for `buf_len` `SqlWChar`s.
+pub(crate) unsafe fn copy_utf16_with_nul(dst: *mut SqlWChar, buf_len: usize, src: &str) -> bool {
+    if dst.is_null() {
+        return false;
+    }
+
+    let src_len = src.encode_utf16().count();
+    if buf_len == 0 {
+        return src_len != 0;
+    }
+
+    let copy_len = src_len.min(buf_len - 1);
+    for (index, unit) in src.encode_utf16().take(copy_len).enumerate() {
+        // SAFETY: `dst` is non-null and writable for `buf_len` units per the
+        // contract, and `index < copy_len <= buf_len - 1`.
+        unsafe { dst.add(index).write_unaligned(unit) };
+    }
+    // SAFETY: same contract; `copy_len <= buf_len - 1`, so the terminator lands
+    // within the buffer even when the value was truncated.
+    unsafe { dst.add(copy_len).write_unaligned(0) };
+    copy_len < src_len
+}
+
 /// Read a UTF-16 string from a raw pointer and an explicit or NUL-terminated length.
 ///
 /// # Safety
 /// - `ptr` must be readable for `length` `SQLWCHAR`s, or for all characters up to
 ///   and including the first NUL terminator when `length == SQL_NTS`.
 pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> String {
-    let slice = if length == SQL_NTS {
+    unsafe { read_utf16_long(ptr, SqlInteger::from(length)) }
+}
+
+/// [`read_utf16`] for entry points whose length argument is a `SQLINTEGER`
+/// rather than a `SQLSMALLINT`.
+///
+/// A length of zero reads nothing, so the pointer is never dereferenced — an
+/// application is entitled to pair a zero length with a placeholder pointer,
+/// and msodbcsql accepts that combination. A null pointer is likewise treated
+/// as an empty value rather than faulting: this is an FFI boundary, and a
+/// driver that aborts takes its host process down with it.
+///
+/// # Safety
+/// - `ptr` must be readable for `length` `SQLWCHAR`s, or up to and including the
+///   first NUL terminator when `length == SQL_NTS`.
+/// - `length` must be non-negative or exactly `SQL_NTS`; callers validate that
+///   first and report `HY090` otherwise.
+/// - The input need not be aligned for `SQLWCHAR`.
+pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let len = if length == SqlInteger::from(SQL_NTS) {
         let mut len = 0usize;
-        unsafe {
-            while *ptr.add(len) != 0 {
-                len += 1;
-            }
+        // SAFETY: the caller provides readable units through the terminator;
+        // application buffers need not be aligned.
+        while unsafe { ptr.add(len).read_unaligned() } != 0 {
+            len += 1;
         }
-        unsafe { slice::from_raw_parts(ptr, len) }
+        len
     } else {
-        unsafe { slice::from_raw_parts(ptr, length as usize) }
+        match usize::try_from(length) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(len) => len,
+        }
     };
-    String::from_utf16_lossy(slice)
+    let units = (0..len).map(|index| {
+        // SAFETY: each unit is within the caller's readable extent. Do not
+        // form a slice: even an empty slice requires an aligned pointer.
+        unsafe { ptr.add(index).read_unaligned() }
+    });
+    char::decode_utf16(units)
+        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+/// Read a character connection attribute, whose `StringLength` ODBC defines in
+/// **bytes** rather than characters (`SQLSetConnectAttr`, "Arguments").
+///
+/// The Driver Manager resolves `SQL_NTS` to a real byte count before the driver
+/// is called, so treating the value as a character count silently reads twice
+/// the intended number of `SQLWCHAR`s and appends garbage to the string. An odd
+/// count cannot describe whole `SQLWCHAR`s, so it rounds down.
+///
+/// # Safety
+/// - `ptr` must be readable for `byte_length` bytes, or up to and including the
+///   first NUL terminator when `byte_length == SQL_NTS`.
+/// - `byte_length` must be non-negative or exactly `SQL_NTS`.
+pub(crate) unsafe fn read_utf16_attr(ptr: *const SqlWChar, byte_length: SqlInteger) -> String {
+    if byte_length == SqlInteger::from(SQL_NTS) {
+        return unsafe { read_utf16_long(ptr, byte_length) };
+    }
+    unsafe {
+        read_utf16_long(
+            ptr,
+            byte_length / SqlInteger::try_from(size_of::<SqlWChar>()).unwrap_or(2),
+        )
+    }
+}
+
+/// Writes a string into a caller's character-attribute buffer following ODBC's
+/// convention for `SQLGetConnectAttr`-family output: `buffer_length` and
+/// `*string_length_ptr` are **byte** counts, the value is NUL-terminated inside
+/// the buffer, and `*string_length_ptr` always reports the full length the value
+/// needs — not the truncated length — so a caller can size a second call.
+///
+/// A null `value_ptr` is the documented length-query form and succeeds without
+/// writing. Truncation posts `01004` and returns `SQL_SUCCESS_WITH_INFO`,
+/// matching msodbcsql's `fCopyStrToBuffer` path (`sqlcmisc.cpp:3176`).
+///
+/// # Safety
+/// - `value_ptr`, if non-null, must be writable for `buffer_length` bytes.
+/// - `string_length_ptr`, if non-null, must be writable for one `SQLINTEGER`.
+pub(crate) unsafe fn write_wide_attr(
+    state: &mut impl HasDiagnostics,
+    value_ptr: *mut SqlWChar,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
+    value: &str,
+) -> SqlReturn {
+    let utf16: Vec<SqlWChar> = value.encode_utf16().collect();
+    let byte_len = utf16.len() * size_of::<SqlWChar>();
+    unsafe {
+        write_if_some(
+            string_length_ptr,
+            SqlInteger::try_from(byte_len).unwrap_or(SqlInteger::MAX),
+        );
+    }
+
+    // A negative buffer length is nonsensical for a write; treat it as no room
+    // rather than wrapping into a huge capacity.
+    let capacity = usize::try_from(buffer_length).unwrap_or(0) / size_of::<SqlWChar>();
+    if unsafe { copy_with_nul(value_ptr, capacity, &utf16) } {
+        post_diag(state, WARN_STRING_TRUNCATION);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+    SQL_SUCCESS
 }
 
 /// Rewrites ODBC `?` parameter markers to SQL Server named markers (`@P1`,
@@ -117,132 +342,24 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
 ///   through rather than starting a line comment. A shared consequence is that
 ///   `COUNT(*)--…` is *not* treated as a line comment (a `?` inside it is
 ///   counted), matching msodbcsql.
+///
+/// This is phase 2 of statement preparation. Phase 1,
+/// [`crate::api::escape::translate_escapes`], runs first on the execution path
+/// and shares the same [`CodeScan`] lexer, so the two cannot disagree about
+/// what is a comment. `SQLNativeSql` runs phase 1 only.
 pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
-    #[derive(PartialEq)]
-    enum State {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        Bracket,
-        LineComment,
-        BlockComment,
-    }
-
     let mut out = String::with_capacity(sql.len() + 8);
     let mut count: usize = 0;
-    let mut state = State::Normal;
-    // The two preceding characters, used to detect the `*)--` close of an ODBC
-    // canonical-extension escape
-    let mut prev1: Option<char> = None;
-    let mut prev2: Option<char> = None;
-    let mut chars = sql.chars().peekable();
+    let mut scan = CodeScan::new(sql);
 
-    while let Some(c) = chars.next() {
-        match state {
-            State::Normal => match c {
-                '?' => {
-                    count += 1;
-                    out.push_str("@P");
-                    out.push_str(&count.to_string());
-                }
-                '\'' => {
-                    state = State::SingleQuote;
-                    out.push(c);
-                }
-                '"' => {
-                    state = State::DoubleQuote;
-                    out.push(c);
-                }
-                '[' => {
-                    state = State::Bracket;
-                    out.push(c);
-                }
-                '-' if chars.peek() == Some(&'-') => {
-                    // A `--` is a line comment unless it opens (`--(*`) or closes
-                    // (`*)--`, detected via the two preceding chars) an ODBC vendor
-                    // canonical extension, which is passed through as normal text.
-                    let starts_canonical_extension = matches!(chars.clone().nth(1), Some('('))
-                        && matches!(chars.clone().nth(2), Some('*'));
-                    let ends_canonical_extension =
-                        matches!(prev2, Some('*')) && matches!(prev1, Some(')'));
-
-                    if !starts_canonical_extension && !ends_canonical_extension {
-                        out.push(c);
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                        state = State::LineComment;
-                    } else {
-                        out.push(c);
-                    }
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    out.push(c);
-                    if let Some(n) = chars.next() {
-                        out.push(n);
-                    }
-                    state = State::BlockComment;
-                }
-                _ => out.push(c),
-            },
-            State::SingleQuote => {
-                out.push(c);
-                if c == '\'' {
-                    // Doubled single quotes -> escaped quote, not the end of the literal
-                    if chars.peek() == Some(&'\'') {
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                    } else {
-                        // lone quote → end of literal
-                        state = State::Normal;
-                    }
-                }
-            }
-            State::DoubleQuote => {
-                out.push(c);
-                if c == '"' {
-                    if chars.peek() == Some(&'"') {
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                    } else {
-                        state = State::Normal;
-                    }
-                }
-            }
-            State::Bracket => {
-                out.push(c);
-                if c == ']' {
-                    if chars.peek() == Some(&']') {
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                    } else {
-                        state = State::Normal;
-                    }
-                }
-            }
-            State::LineComment => {
-                out.push(c);
-                if c == '\n' || c == '\r' {
-                    state = State::Normal;
-                }
-            }
-            State::BlockComment => {
-                // Non-nesting: the first `*/` closes the comment (msodbcsql parity).
-                out.push(c);
-                if c == '*' && chars.peek() == Some(&'/') {
-                    if let Some(n) = chars.next() {
-                        out.push(n);
-                    }
-                    state = State::Normal;
-                }
-            }
+    while let Some(step) = scan.next_step() {
+        if step.code && step.ch == '?' {
+            count += 1;
+            out.push_str("@P");
+            out.push_str(&count.to_string());
+        } else {
+            out.push_str(&sql[step.start..step.end]);
         }
-
-        prev2 = prev1;
-        prev1 = Some(c);
     }
 
     (out, count)
@@ -250,14 +367,438 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_with_nul, read_utf16, rewrite_param_markers, write_if_some};
-    use crate::api::odbc_types::{SQL_NTS, SqlWChar};
+    use super::{
+        copy_cp1252_with_nul, copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252,
+        is_high_surrogate, is_low_surrogate, is_surrogate_pair, read_utf16, read_utf16_attr,
+        read_utf16_long, rewrite_param_markers, write_if_some,
+    };
+    use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
+
+    #[test]
+    fn cp1252_eligibility_uses_the_resolved_encoding() {
+        use mssql_tds::datatypes::sql_string::EncodingType;
+        use mssql_tds::token::tokens::SqlCollation;
+        for (lcid, expected) in [
+            (0x0409, true),
+            (0x0407, true),
+            (0x0419, false),
+            (0x0411, false),
+        ] {
+            let encoding = EncodingType::LcidBased(SqlCollation {
+                info: lcid,
+                lcid_language_id: lcid as i32,
+                col_flags: 0,
+                sort_id: 0,
+            });
+            assert_eq!(is_cp1252(&encoding), expected);
+        }
+        for encoding in [
+            EncodingType::Utf8,
+            EncodingType::Utf16,
+            EncodingType::DelayedSet,
+        ] {
+            assert!(!is_cp1252(&encoding));
+        }
+    }
+
+    #[test]
+    fn surrogate_checks_match_utf16_decoding() {
+        for unit in 0..=u16::MAX {
+            let mut high_candidate = char::decode_utf16([unit, 0xDC00]);
+            let high =
+                matches!(high_candidate.next(), Some(Ok(_))) && high_candidate.next().is_none();
+            assert_eq!(is_high_surrogate(unit), high, "unit={unit:#06x}");
+            assert_eq!(is_surrogate_pair(unit, 0xDC00), high, "unit={unit:#06x}");
+
+            let mut low_candidate = char::decode_utf16([0xD800, unit]);
+            let low = matches!(low_candidate.next(), Some(Ok(_))) && low_candidate.next().is_none();
+            assert_eq!(is_low_surrogate(unit), low, "unit={unit:#06x}");
+            assert_eq!(is_surrogate_pair(0xD800, unit), low, "unit={unit:#06x}");
+        }
+    }
+
+    #[test]
+    fn cp1252_copy_all_bytes_across_scratch_boundaries() {
+        let bytes: Vec<u8> = (0..=255).cycle().take(1025).collect();
+        assert!(bytes.len() > super::CP1252_SCRATCH_UNITS * 2);
+        let expected: Vec<u16> = mssql_tds::encoding_rs::WINDOWS_1252
+            .decode_without_bom_handling(&bytes)
+            .0
+            .encode_utf16()
+            .collect();
+        assert_eq!(expected.len(), bytes.len());
+        assert_eq!(expected[0x80], 0x20AC);
+        assert_eq!(&expected[0x91..=0x94], &[0x2018, 0x2019, 0x201C, 0x201D]);
+        for unit in [0x81_u16, 0x8D, 0x8F, 0x90, 0x9D] {
+            assert_eq!(expected[usize::from(unit)], unit);
+        }
+        for capacity in [0, 1, 2, 255, 256, 257, 258, 1025, 1026, 1027] {
+            let mut actual = vec![0xAAAA; capacity + 1];
+            let truncated = unsafe { copy_cp1252_with_nul(actual.as_mut_ptr(), capacity, &bytes) };
+            let copied = bytes.len().min(capacity.saturating_sub(1));
+            assert_eq!(truncated, copied < bytes.len());
+            assert_eq!(&actual[..copied], &expected[..copied]);
+            if capacity > 0 {
+                assert_eq!(actual[copied], 0);
+            }
+            assert_eq!(actual[capacity], 0xAAAA);
+        }
+        assert!(!unsafe { copy_cp1252_with_nul(std::ptr::null_mut(), 0, &bytes) });
+    }
+
+    #[test]
+    fn utf16le_copy_preserves_every_single_code_unit() {
+        for unit in 0..=u16::MAX {
+            let mut out = [0xAAAA; 3];
+            assert!(!unsafe { copy_utf16le_with_nul(out.as_mut_ptr(), 2, &unit.to_le_bytes()) });
+            assert_eq!(out, [unit, 0, 0xAAAA], "unit={unit:#06x}");
+        }
+    }
+
+    #[test]
+    fn utf16le_copy_preserves_pairs_at_byte_offsets() {
+        let units = [
+            0, 0x7f, 0x80, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xffff,
+        ];
+        for first in units {
+            for second in units {
+                let pair = [first, second];
+                let mut bytes = vec![0xff];
+                bytes.extend(pair.into_iter().flat_map(u16::to_le_bytes));
+                let mut storage = crate::test_support::AlignedBuffer([0xAA_u8; 9]);
+                let out = &mut storage.0;
+                let destination = out.as_mut_ptr().wrapping_add(1).cast::<SqlWChar>();
+                assert!(!destination.is_aligned());
+                assert!(!unsafe { copy_utf16le_with_nul(destination, 3, &bytes[1..]) });
+                assert_eq!(&out[1..5], &bytes[1..]);
+                assert_eq!(&out[5..], &[0, 0, 0xAA, 0xAA]);
+                assert_eq!(out[0], 0xAA);
+            }
+        }
+    }
+
+    mod memory_safety {
+        use super::*;
+        use crate::api::odbc_types::SqlLen;
+        use crate::test_support::AlignedBuffer;
+        use std::mem::MaybeUninit;
+
+        #[test]
+        fn cp1252_copy_preserves_prefixes_and_unaligned_capacity() {
+            for bytes in [
+                &b""[..],
+                b"A",
+                b"\x80\x81\x91\x9D\0",
+                b"\xEF\xBB\xBFA",
+                b"\xFF\xFEA\0",
+                b"\xFE\xFFA\0",
+            ] {
+                let units: Vec<u16> = mssql_tds::encoding_rs::WINDOWS_1252
+                    .decode_without_bom_handling(bytes)
+                    .0
+                    .encode_utf16()
+                    .collect();
+                assert_eq!(units.len(), bytes.len());
+                for capacity in 0..=units.len() + 2 {
+                    for _ in 0..2 {
+                        let mut storage = AlignedBuffer([0xA5_u8; 19]);
+                        let dst = storage.0.as_mut_ptr().wrapping_add(1).cast::<u16>();
+                        assert!(!dst.is_aligned());
+                        let truncated = unsafe { copy_cp1252_with_nul(dst, capacity, bytes) };
+                        assert_eq!(truncated, units.len() > capacity.saturating_sub(1));
+                        let mut expected = [0xA5; 19];
+                        if capacity > 0 {
+                            for (i, unit) in units
+                                .iter()
+                                .copied()
+                                .take(capacity - 1)
+                                .chain(std::iter::once(0))
+                                .enumerate()
+                            {
+                                expected[1 + i * 2..3 + i * 2].copy_from_slice(&unit.to_ne_bytes());
+                            }
+                        }
+                        assert_eq!(storage.0, expected);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn wide_copies_respect_capacity_at_a_byte_offset() {
+            for text in ["", "a", "a\u{1f600}b"] {
+                let source: Vec<u16> = text.encode_utf16().collect();
+                let bytes: Vec<u8> = source.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+                for encoding in 0..3 {
+                    for capacity in 0..=source.len() + 2 {
+                        let mut storage = AlignedBuffer([0xA5u8; 17]);
+                        assert!(capacity * size_of::<u16>() < storage.0.len());
+                        for _ in 0..2 {
+                            let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<u16>();
+                            assert!(!ptr.is_aligned());
+                            // The displaced destination has room for every declared unit.
+                            let truncated = unsafe {
+                                match encoding {
+                                    0 => copy_with_nul(ptr, capacity, &source),
+                                    1 => copy_utf16_with_nul(ptr, capacity, text),
+                                    _ => copy_utf16le_with_nul(ptr, capacity, &bytes),
+                                }
+                            };
+                            assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
+                            let mut expected = [0xA5; 17];
+                            if capacity != 0 {
+                                for (i, unit) in source
+                                    .iter()
+                                    .copied()
+                                    .take(capacity - 1)
+                                    .chain(std::iter::once(0))
+                                    .enumerate()
+                                {
+                                    expected[1 + i * 2..1 + (i + 1) * 2]
+                                        .copy_from_slice(&unit.to_ne_bytes());
+                                }
+                            }
+                            assert_eq!(storage.0, expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn wide_copies_initialize_only_the_written_prefix() {
+            let text = "a\u{1f600}b";
+            let source: Vec<u16> = text.encode_utf16().collect();
+            let bytes: Vec<u8> = source.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            for encoding in 0..3 {
+                for capacity in [0usize, 1, 2, 5] {
+                    let mut storage = [MaybeUninit::<u16>::uninit(); 5];
+                    let ptr = storage.as_mut_ptr().cast::<u16>();
+                    // The output is writable but has no initialized value to read.
+                    let truncated = unsafe {
+                        match encoding {
+                            0 => copy_with_nul(ptr, capacity, &source),
+                            1 => copy_utf16_with_nul(ptr, capacity, text),
+                            _ => copy_utf16le_with_nul(ptr, capacity, &bytes),
+                        }
+                    };
+                    assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
+                    if capacity != 0 {
+                        let expected = source
+                            .iter()
+                            .copied()
+                            .take(capacity - 1)
+                            .chain(std::iter::once(0));
+                        for (actual, expected) in storage.iter().zip(expected) {
+                            // Only the copied prefix and its terminator are initialized.
+                            assert_eq!(unsafe { actual.assume_init() }, expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn scalar_out_parameter_writes_stay_inside_the_unaligned_slot() {
+            let mut storage = AlignedBuffer([0xA5u8; 24]);
+            for value in [SqlLen::MIN, 42, SqlLen::MAX] {
+                let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<SqlLen>();
+                assert!(!ptr.is_aligned());
+                // The slot is writable for one SqlLen, independently of its alignment.
+                unsafe { write_if_some(ptr, value) };
+                let mut expected = [0xA5; 24];
+                expected[1..1 + size_of::<SqlLen>()].copy_from_slice(&value.to_ne_bytes());
+                assert_eq!(storage.0, expected);
+            }
+        }
+
+        #[test]
+        fn utf16_reads_stop_at_the_initialized_extent() {
+            for offset in [0, 1] {
+                let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 8]);
+                let ptr = storage.0.as_mut_ptr().wrapping_add(offset).cast::<u16>();
+                assert_eq!(ptr.is_aligned(), offset == 0);
+                // Two initialized units, including the terminator; the tail is unreadable.
+                unsafe {
+                    ptr.write_unaligned(u16::from(b'a'));
+                    ptr.add(1).write_unaligned(0);
+                }
+                for _ in 0..2 {
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, SQL_NTS), "a");
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), "a");
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), "a");
+                        assert_eq!(read_utf16(ptr, 2), "a\0");
+                        assert_eq!(read_utf16_long(ptr, 2), "a\0");
+                        assert_eq!(read_utf16_attr(ptr, 4), "a\0");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn utf16_readers_accept_unaligned_initialized_input() {
+            for text in ["", "master", "a\u{1f600}b", "a\0b"] {
+                let units: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+                for offset in [0, 1] {
+                    let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
+                    for (index, byte) in
+                        units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate()
+                    {
+                        storage.0[offset + index].write(byte);
+                    }
+                    let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
+                    assert_eq!(ptr.is_aligned(), offset == 0);
+                    let count = SqlSmallInt::try_from(units.len() - 1).unwrap();
+                    let bytes = SqlInteger::from(count) * 2;
+                    let terminated = text.split('\0').next().unwrap();
+                    // The payload and terminator are initialized; the tail is not.
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, count), text);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(count)), text);
+                        assert_eq!(read_utf16_attr(ptr, bytes), text);
+                        assert_eq!(read_utf16_attr(ptr, bytes + 1), text);
+                        assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn unaligned_utf16_read_preserves_lossy_decoding() {
+            let cases: &[(&[u16], &str)] = &[
+                (
+                    &[0x61, 0xD83D, 0xDE00, 0xD800, 0x62, 0xDC00, 0, 0x63, 0],
+                    "a\u{1f600}\u{fffd}b\u{fffd}",
+                ),
+                (&[0xD800, 0x0061, 0xDC00, 0], "\u{fffd}a\u{fffd}"),
+            ];
+            for &(units, terminated) in cases {
+                for offset in [0, 1] {
+                    let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 33]);
+                    for (index, byte) in
+                        units.iter().flat_map(|unit| unit.to_ne_bytes()).enumerate()
+                    {
+                        storage.0[offset + index].write(byte);
+                    }
+                    let ptr = storage.0.as_ptr().wrapping_add(offset).cast::<SqlWChar>();
+                    assert_eq!(ptr.is_aligned(), offset == 0);
+                    for length in 0..units.len() {
+                        let expected = String::from_utf16_lossy(&units[..length]);
+                        let chars = SqlSmallInt::try_from(length).unwrap();
+                        let bytes = SqlInteger::try_from(length * 2).unwrap();
+                        // Every declared byte is initialized, including the odd trailing byte.
+                        unsafe {
+                            assert_eq!(read_utf16(ptr, chars), expected);
+                            assert_eq!(read_utf16_long(ptr, SqlInteger::from(chars)), expected);
+                            assert_eq!(read_utf16_attr(ptr, bytes), expected);
+                            assert_eq!(read_utf16_attr(ptr, bytes + 1), expected);
+                        }
+                    }
+                    unsafe {
+                        assert_eq!(read_utf16(ptr, SQL_NTS), terminated);
+                        assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                        assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), terminated);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn rewrite_no_markers_is_unchanged() {
         let (out, n) = rewrite_param_markers("SELECT 1");
         assert_eq!(out, "SELECT 1");
         assert_eq!(n, 0);
+    }
+
+    /// The `SQLINTEGER`-width reader must agree with the `SQLSMALLINT` one on
+    /// every form: explicit counts, `SQL_NTS`, and the empty string.
+    #[test]
+    fn read_utf16_long_matches_the_narrow_reader() {
+        let buf: Vec<SqlWChar> = "master\0".encode_utf16().collect();
+        let ptr = buf.as_ptr();
+        for len in 0..=6i16 {
+            assert_eq!(
+                unsafe { read_utf16_long(ptr, SqlInteger::from(len)) },
+                unsafe { read_utf16(ptr, len) },
+                "length {len}"
+            );
+        }
+        assert_eq!(
+            unsafe { read_utf16_long(ptr, SqlInteger::from(SQL_NTS)) },
+            "master"
+        );
+    }
+
+    #[test]
+    fn read_utf16_long_reads_past_an_embedded_nul_when_given_a_count() {
+        // An explicit count is authoritative: an embedded NUL does not end it.
+        let buf: Vec<SqlWChar> = vec![b'a' as u16, 0, b'b' as u16];
+        let read = unsafe { read_utf16_long(buf.as_ptr(), 3) };
+        assert_eq!(read.chars().count(), 3);
+        // Whereas SQL_NTS stops at the first NUL.
+        assert_eq!(
+            unsafe { read_utf16_long(buf.as_ptr(), SqlInteger::from(SQL_NTS)) },
+            "a"
+        );
+    }
+
+    #[test]
+    fn read_utf16_attr_treats_the_length_as_bytes() {
+        let buf: Vec<SqlWChar> = "masterdb".encode_utf16().collect();
+        // 12 bytes is six characters, not twelve.
+        assert_eq!(unsafe { read_utf16_attr(buf.as_ptr(), 12) }, "master");
+        // An odd count rounds down to whole units rather than over-reading.
+        assert_eq!(unsafe { read_utf16_attr(buf.as_ptr(), 13) }, "master");
+        assert_eq!(unsafe { read_utf16_attr(buf.as_ptr(), 0) }, "");
+    }
+
+    #[test]
+    fn read_utf16_attr_still_honors_sql_nts() {
+        let buf: Vec<SqlWChar> = "master".encode_utf16().chain(std::iter::once(0)).collect();
+        assert_eq!(
+            unsafe { read_utf16_attr(buf.as_ptr(), SqlInteger::from(SQL_NTS)) },
+            "master"
+        );
+    }
+
+    /// A zero length reads nothing, so the pointer must never be dereferenced —
+    /// not even to form an empty slice, which still requires alignment and so
+    /// aborts the process under Rust's UB checks. msodbcsql accepts a
+    /// placeholder pointer with a zero length, and an ODBC driver that aborts
+    /// takes its host process down with it.
+    #[test]
+    fn zero_length_never_dereferences_the_pointer() {
+        let hostile = std::ptr::without_provenance::<SqlWChar>(1);
+        assert_eq!(unsafe { read_utf16_long(hostile, 0) }, "");
+        assert_eq!(unsafe { read_utf16_attr(hostile, 0) }, "");
+        // An odd byte count below one whole SQLWCHAR is also nothing to read.
+        assert_eq!(unsafe { read_utf16_attr(hostile, 1) }, "");
+    }
+
+    /// A null pointer is an empty value rather than a fault, for the same
+    /// reason.
+    #[test]
+    fn null_pointer_reads_as_empty() {
+        let null = std::ptr::null::<SqlWChar>();
+        assert_eq!(unsafe { read_utf16_long(null, 4) }, "");
+        assert_eq!(
+            unsafe { read_utf16_long(null, SqlInteger::from(SQL_NTS)) },
+            ""
+        );
+        assert_eq!(unsafe { read_utf16_attr(null, 8) }, "");
+    }
+
+    /// A negative length that is not `SQL_NTS` is a caller error the entry
+    /// points reject with `HY090`; the reader must not turn it into a huge
+    /// slice on the way there.
+    #[test]
+    fn negative_length_reads_as_empty() {
+        let buf: Vec<SqlWChar> = "master".encode_utf16().collect();
+        assert_eq!(unsafe { read_utf16_long(buf.as_ptr(), -7) }, "");
     }
 
     #[test]
@@ -419,6 +960,27 @@ mod tests {
             let truncated = unsafe { copy_with_nul(std::ptr::null_mut(), buf_len, &src) };
             assert!(!truncated, "null dst must not report truncation");
         }
+    }
+
+    #[test]
+    fn copy_utf16_encodes_without_splitting_semantics() {
+        let mut buf = [0xDEAD; 5];
+        let truncated = unsafe { copy_utf16_with_nul(buf.as_mut_ptr(), buf.len(), "a😀b") };
+        assert!(!truncated);
+        assert_eq!(&buf, &[b'a' as u16, 0xD83D, 0xDE00, b'b' as u16, 0]);
+    }
+
+    #[test]
+    fn copy_utf16_matches_null_zero_and_truncation_rules() {
+        assert!(!unsafe { copy_utf16_with_nul(std::ptr::null_mut(), 0, "abc") });
+
+        let mut untouched = [0xDEAD];
+        assert!(unsafe { copy_utf16_with_nul(untouched.as_mut_ptr(), 0, "abc") });
+        assert_eq!(untouched, [0xDEAD]);
+
+        let mut truncated = [0xDEAD; 3];
+        assert!(unsafe { copy_utf16_with_nul(truncated.as_mut_ptr(), truncated.len(), "abc") });
+        assert_eq!(truncated, [b'a' as u16, b'b' as u16, 0]);
     }
 
     #[test]

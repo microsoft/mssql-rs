@@ -10,19 +10,23 @@
 
 use tracing::{debug, error};
 
+use crate::api::exec_common::snapshot_bound_params;
+use crate::api::output_params::write_back_output_params;
+
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
 use super::close_cursor::reset_cursor_state;
+use super::ird::populate_ird;
+use crate::api::exec_common::post_claim_error;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlReturn,
 };
-use crate::api::sqlstate::{
-    ERR_CONNECTION_BUSY, ERR_NO_ACTIVE_TDS_CLIENT, SQLSTATE_HY000, post_diag, post_tds_error,
-    post_tds_info_messages,
-};
+use crate::api::sqlstate::{SQLSTATE_HY000, post_tds_error, post_tds_info_messages};
 use crate::error::free_errors;
+use crate::error::post_sql_error;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+use crate::handles::wire::{ClaimPolicy, LeaseReturn, WireOwner};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Advances to the next result set on a statement.
@@ -30,12 +34,16 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_more_results(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLMoreResults called");
-    crate::ffi_entry!("SQLMoreResults", unsafe {
-        sql_more_results_impl(statement_handle)
-    })
+    crate::ffi_entry!(
+        "SQLMoreResults",
+        statement_handle,
+        debug!(?statement_handle, "SQLMoreResults called"),
+        unsafe { sql_more_results_impl(statement_handle) }
+    )
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLMoreResults: statement_handle is null");
@@ -47,21 +55,106 @@ unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = sql_more_results_operation(statement_handle, stmt);
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    // DESC locks must not nest beneath STMT, including the exhausted fast path.
+    let snapshot = snapshot_bound_params(stmt);
     // Free any stale diagnostics and observe cursor state.
-    let cursor_open = {
+    let (cursor_open, bound_params) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLMoreResults: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        // Unwrapped here, after `free_errors`, so both write-back sites below
+        // get the params and header from one snapshot without a fallback.
+        let Ok(bound_params) = snapshot else {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error snapshotting output parameter bindings",
+            );
+            return SQL_ERROR;
+        };
+        if let Some(e) = stmt_state.pending_fetch_error.take() {
+            // A prior fetch's read-ahead peek already discovered this result
+            // set ends in a SQL Server error (see AB#47508's
+            // release_busy_if_row_exhausted), but that call had already
+            // committed to delivering its own row successfully, so the
+            // diagnostic was deferred here instead of being lost under that
+            // call's own success return.
+            reset_cursor_state(&mut stmt_state);
+            post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            return SQL_ERROR;
+        }
+        if stmt_state.batch_exhausted && stmt_state.pending_row_counts.is_empty() {
+            // A prior fetch's read-ahead peek already confirmed the wire has
+            // nothing left anywhere in this batch — not just the current
+            // result set, which is all `result_set_exhausted` would prove
+            // (see AB#47508's release_busy_if_row_exhausted). The answer is
+            // already known and needs no connection access at all: report it
+            // even if a different statement has since claimed the
+            // connection. A drained DML batch uses this path too, after its
+            // application-visible counts have all been consumed.
+            // Matches msodbcsql, whose SQLMoreResults has no busy
+            // check of its own (`GetBatchCtxOrRecover` just falls through to
+            // `SQL_NO_DATA_FOUND` once the batch context is gone).
+            let output_rc = if let Some((values, status)) = stmt_state.pending_output_params.take()
+            {
+                // The values belong to this statement, not to the client that
+                // may already be executing a different statement.
+                unsafe {
+                    write_back_output_params(
+                        &mut stmt_state,
+                        bound_params.params.as_slice(),
+                        &bound_params.header,
+                        &values,
+                        status,
+                    )
+                }
+            } else {
+                SQL_SUCCESS
+            };
+            reset_cursor_state(&mut stmt_state);
+            debug!("SQLMoreResults: batch already known exhausted; returning SQL_NO_DATA");
+            return if output_rc == SQL_SUCCESS {
+                SQL_NO_DATA
+            } else {
+                output_rc
+            };
+        }
         // A pure-DML batch queued one row count per statement; step through them
         // in memory (no cursor or connection) before falling back to the wire.
         if let Some(next) = stmt_state.pending_row_counts.pop_front() {
+            // A queued count is still a result set, so the batch ordinal has to
+            // advance with it: msodbcsql reports 1, 2, 3 across a pure-DML batch
+            // exactly as it does across a batch of SELECTs.
+            stmt_state.begin_result_set(Vec::new());
             stmt_state.row_count = next;
             debug!("SQLMoreResults: advanced to next DML result set");
+            drop(stmt_state);
+            if populate_ird(stmt, &[]).is_err() {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
+            }
             return SQL_SUCCESS;
         }
-        stmt_state.has_state(STMT_STATE_CURSOR_OPEN)
+        (stmt_state.has_state(STMT_STATE_CURSOR_OPEN), bound_params)
     };
 
     if !cursor_open {
@@ -71,60 +164,76 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
 
     let dbc = stmt.parent_dbc();
 
-    // Take the client; keep active_stmt set so concurrent statements continue
-    // to see the connection as busy throughout the advance.
+    // Claiming also re-reserves a wire that AB#47508's early release left
+    // unreserved, so concurrent statements see it busy throughout the advance.
     let mut client = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLMoreResults: dbc mutex poisoned");
             return SQL_ERROR;
         };
-        if let Some(busy_stmt) = dbc_state.active_stmt
-            && busy_stmt != statement_handle
-        {
-            error!("SQLMoreResults: connection is busy with results for another statement");
-            drop(dbc_state);
-            if let Ok(mut ss) = stmt.inner.lock() {
-                post_diag(&mut ss, ERR_CONNECTION_BUSY);
+        match dbc_state.wire.claim(
+            WireOwner::Statement(statement_handle),
+            ClaimPolicy::IdleOrOwn,
+        ) {
+            Ok(lease) => lease,
+            Err(claim_error) => {
+                error!(?claim_error, "SQLMoreResults: connection is not available");
+                post_claim_error(dbc_state, stmt, claim_error);
+                return SQL_ERROR;
             }
-            return SQL_ERROR;
         }
-        let Some(client) = dbc_state.client.take() else {
-            error!("SQLMoreResults: no active TDS client");
-            drop(dbc_state);
-            if let Ok(mut ss) = stmt.inner.lock() {
-                post_diag(&mut ss, ERR_NO_ACTIVE_TDS_CLIENT);
-            }
-            return SQL_ERROR;
-        };
-        client
     };
 
-    match dbc.runtime.block_on(client.advance()) {
+    let result = dbc.runtime.block_on(async {
+        let result = client.advance().await?;
+        if matches!(result, StatementResult::Rows) {
+            client.peek_past_current_row().await?;
+        }
+        Ok(result)
+    });
+    let array_update = super::execute::take_parameter_array_update(stmt, &mut client);
+    match result {
         Ok(StatementResult::Rows) => {
             // Positioned on a new row-returning result set. Refresh metadata,
-            // clear row state, keep CURSOR_OPEN and active_stmt set.
+            // clear row state, keep CURSOR_OPEN and the wire reserved.
             let metadata = client.get_metadata().clone();
+            let row_count = client.last_rows_affected();
+            let info_messages = client.take_info_messages();
+            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+                return SQL_ERROR;
+            }
+            let array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
+            let ird_ok = populate_ird(stmt, &metadata).is_ok();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned advancing result set");
-                if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
-                }
                 return SQL_ERROR;
             };
-            stmt_state.column_metadata = metadata;
+            stmt_state.begin_result_set(metadata);
             stmt_state.reset_row_stream();
+            stmt_state.result_set_exhausted = false;
+            stmt_state.batch_exhausted = false;
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
-            stmt_state.row_count = client.last_rows_affected();
-            // Drain INFO only after the lock is held.
-            let info_messages = client.take_info_messages();
+            stmt_state.row_count = row_count;
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
-                // active_stmt remains set — cursor still open on this statement.
+            if !ird_ok {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
             }
             debug!("SQLMoreResults: advanced to next result set");
-            if has_server_info {
+            if array_rc != SQL_SUCCESS {
+                array_rc
+            } else if has_server_info {
                 SQL_SUCCESS_WITH_INFO
             } else {
                 SQL_SUCCESS
@@ -136,27 +245,49 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // (SQLFetch returns 24000), but it is a navigable result and may
             // carry diagnostic messages. The connection stays busy so a further
             // SQLMoreResults can advance past it. Matches msodbcsql.
+            let row_count = client.last_rows_affected();
+            let info_messages = client.take_info_messages();
+            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+                return SQL_ERROR;
+            }
+            let array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
+            let ird_ok = populate_ird(stmt, &[]).is_ok();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned on no-row result");
-                if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
-                }
                 return SQL_ERROR;
             };
-            stmt_state.column_metadata.clear();
+            stmt_state.begin_result_set(Vec::new());
             // Surface this no-row statement's own affected-row count for
             // SQLRowCount now that we are positioned on it.
-            stmt_state.row_count = client.last_rows_affected();
+            stmt_state.row_count = row_count;
             stmt_state.reset_row_stream();
-            let info_messages = client.take_info_messages();
+            // A stale `true` here (inherited from a previous result set this
+            // statement fetched to exhaustion) would make SQLFetch report
+            // SQL_NO_DATA instead of the 24000 this zero-column result must
+            // give — so this arm needs the same reset as the `Rows` arm even
+            // though there is nothing to fetch on this result itself.
+            stmt_state.result_set_exhausted = false;
+            stmt_state.batch_exhausted = false;
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
-                // active_stmt remains set — still positioned on this statement.
+            if !ird_ok {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
             }
             debug!("SQLMoreResults: advanced to a no-row statement result");
-            if has_server_info {
+            if array_rc != SQL_SUCCESS {
+                array_rc
+            } else if has_server_info {
                 SQL_SUCCESS_WITH_INFO
             } else {
                 SQL_SUCCESS
@@ -164,46 +295,62 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         }
         Ok(StatementResult::End) => {
             // Batch exhausted. Close cursor state and release the connection.
+            let info_messages = client.take_info_messages();
+            let return_values = client.get_return_values();
+            let return_status = client.get_return_status();
+            if !dbc.return_lease(client, LeaseReturn::Release) {
+                return SQL_ERROR;
+            }
+            let array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned at batch end");
-                if let Ok(mut ds) = dbc.inner.lock() {
-                    ds.client = Some(client);
-                    if ds.active_stmt == Some(statement_handle) {
-                        ds.active_stmt = None;
-                    }
-                }
                 return SQL_ERROR;
             };
             reset_cursor_state(&mut stmt_state);
-            // Drain INFO only after the lock is held.
-            let info_messages = client.take_info_messages();
             post_tds_info_messages(&mut stmt_state, &info_messages);
+            // ODBC makes output parameters and the return status readable only
+            // once every result set the procedure produced has been consumed,
+            // which is exactly here. Writing back earlier would let an
+            // application read a value the spec says is not available yet.
+            let output_rc = unsafe {
+                write_back_output_params(
+                    &mut stmt_state,
+                    bound_params.params.as_slice(),
+                    &bound_params.header,
+                    &return_values,
+                    return_status,
+                )
+            };
             drop(stmt_state);
-            // TODO: surface output-param availability here once output
-            // params land.
-            if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
-                if dbc_state.active_stmt == Some(statement_handle) {
-                    dbc_state.active_stmt = None;
-                }
-            }
             debug!("SQLMoreResults: no more result sets");
-            SQL_NO_DATA
+            if array_rc == SQL_ERROR || output_rc == SQL_ERROR {
+                SQL_ERROR
+            } else if output_rc != SQL_SUCCESS {
+                output_rc
+            } else if array_rc != SQL_SUCCESS {
+                array_rc
+            } else {
+                SQL_NO_DATA
+            }
         }
         Err(e) => {
             error!(%e, "SQLMoreResults: advance failed");
+            let info_messages = client.take_info_messages();
+            if !dbc.return_lease(client, LeaseReturn::Release) {
+                return SQL_ERROR;
+            }
+            let _array_rc = match array_update {
+                Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                Err(rc) => rc,
+            };
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
-                let info_messages = client.take_info_messages();
                 post_tds_info_messages(&mut stmt_state, &info_messages);
-            }
-            if let Ok(mut dbc_state) = dbc.inner.lock() {
-                dbc_state.client = Some(client);
-                if dbc_state.active_stmt == Some(statement_handle) {
-                    dbc_state.active_stmt = None;
-                }
             }
             SQL_ERROR
         }
@@ -220,6 +367,8 @@ mod tests {
     use crate::api::sqlstate::ERR_NO_ACTIVE_TDS_CLIENT;
     use crate::handles::dbc::DbcHandle;
     use crate::test_support::TestHandles;
+    use crate::test_support::assert_last_diag;
+    use mssql_tds::error::Error as TdsError;
     use mssql_tds::test_client_support::{
         ScriptedToken, col_metadata_empty, done_more, done_no_more, info, tds_client_from_tokens,
     };
@@ -242,8 +391,8 @@ mod tests {
         }
         {
             let mut ds = dbc.inner.lock().unwrap();
-            ds.client = Some(client);
-            ds.active_stmt = Some(h.stmt);
+            ds.wire.put_client_for_test(client);
+            ds.wire.set_owner_for_test(Some(h.stmt));
         }
         first
     }
@@ -259,6 +408,7 @@ mod tests {
                 col_metadata_empty(), // stmt1 row set
                 done_more(),          // terminates stmt1, more to come
                 col_metadata_empty(), // stmt2 row set
+                done_no_more(),
             ],
         );
         assert_eq!(first, StatementResult::Rows);
@@ -267,7 +417,209 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt)
+        );
+    }
+
+    #[test]
+    fn more_results_surfaces_an_error_before_the_first_row() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                info(50000, 10, "before error"),
+                sql_error(1222, 16, "Lock request time out period exceeded."),
+                done_no_more(),
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.native_error == 1222)
+            );
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.message.contains("before error"))
+            );
+            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert!(state.pending_fetch_error.is_none());
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.wire.client().is_some());
+        assert!(state.wire.statement_owner().is_none());
+        drop(state);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
+    fn more_results_reports_info_before_the_first_row() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                info(8153, 10, "Null value is eliminated by an aggregate."),
+                done_no_more(),
+            ],
+        );
+
+        assert_eq!(
+            unsafe { sql_more_results(handles.stmt) },
+            SQL_SUCCESS_WITH_INFO
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 8153)
+        );
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[test]
+    fn more_results_does_not_peek_beyond_an_empty_result() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        position_first_and_inject(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                done_more(),
+                col_metadata(int_columns(1)),
+                sql_error(1222, 16, "Lock request time out period exceeded."),
+                done_no_more(),
+            ],
+        );
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+    }
+
+    /// The first result set was fetched to exhaustion, which releases
+    /// `active_stmt` early (AB#47508) *without* closing the cursor. Advancing
+    /// past it with `SQLMoreResults` must (re-)claim `active_stmt` for this
+    /// statement rather than assume it is already set — otherwise the freshly
+    /// positioned second rowset is unreachable: the next `SQLFetch` hits
+    /// `fill_rowset`'s "already drained" guard (which only checks
+    /// `active_stmt`) and wrongly reports `SQL_NO_DATA` despite a real row
+    /// waiting on the wire.
+    #[test]
+    fn more_results_reclaims_active_stmt_after_an_early_release() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(), // stmt1 row set
+                done_more(),          // terminates stmt1, more to come
+                col_metadata_empty(), // stmt2 row set
+                done_no_more(),
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Simulate stmt1 having been fetched to exhaustion: active_stmt was
+        // already released, but the cursor (and client) are still there.
+        dbc.inner.lock().unwrap().wire.set_owner_for_test(None);
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt),
+            "must explicitly reclaim active_stmt, not just leave the released None"
+        );
+    }
+
+    /// AB#49225: advancing an early-released statement while a
+    /// connection-scoped operation holds the client is busy, not missing.
+    #[test]
+    fn more_results_reports_busy_while_a_connection_operation_holds_the_wire() {
+        use crate::api::sqlstate::ERR_CONNECTION_BUSY;
+        use crate::handles::wire::{ClaimPolicy, LeaseReturn, WireOwner};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_first_and_inject(&h, vec![col_metadata_empty(), done_more()]);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.wire.set_owner_for_test(None);
+            ds.wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_CONNECTION_BUSY,
+        );
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.owner(),
+            Some(WireOwner::Connection)
+        );
+        dbc.return_lease(lease, LeaseReturn::Release);
+    }
+
+    /// A statement whose first result set was fetched to exhaustion (marked
+    /// via a prior fetch's peek, AB#47508) must not have that stale flag leak
+    /// into the next result set `SQLMoreResults` positions on — otherwise a
+    /// perfectly fetchable second rowset would report `SQL_NO_DATA` on the
+    /// very first `SQLFetch`.
+    #[test]
+    fn more_results_clears_a_stale_exhausted_flag_on_the_next_rowset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(), // stmt1 row set
+                done_more(),          // terminates stmt1, more to come
+                col_metadata_empty(), // stmt2 row set
+                done_no_more(),
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().result_set_exhausted = true;
+        }
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
     /// SQLMoreResults surfaces a no-row statement result (message-bearing, zero
@@ -297,7 +649,138 @@ mod tests {
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_NO_DATA);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+    }
+
+    /// Same re-claim requirement as
+    /// `more_results_reclaims_active_stmt_after_an_early_release`, for the
+    /// no-row-result arm: it also only "left `active_stmt` as is" before this
+    /// fix, which broke the moment an earlier fetch had already released it.
+    #[test]
+    fn more_results_reclaims_active_stmt_advancing_to_a_norow_result() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),        // stmt1 row set
+                done_more(),                 // terminates stmt1
+                info(50000, 10, "raise me"), // stmt2 message
+                done_no_more(),              // stmt2 no-row result, last in batch
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().wire.set_owner_for_test(None);
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt),
+            "must explicitly reclaim active_stmt for the still-navigable batch"
+        );
+    }
+
+    /// A prior fetch's read-ahead peek can have discovered a trailing SQL
+    /// Server error instead of a clean end of set (see AB#47508's
+    /// `release_busy_if_row_exhausted`), deferred via `pending_fetch_error`
+    /// since that fetch call had already committed to delivering its own row
+    /// successfully. `SQLMoreResults` must drain and report it — not
+    /// silently treat the closed batch as `SQL_NO_DATA` — even when called
+    /// directly, with no intervening `SQLFetch` ever seeing it.
+    #[test]
+    fn more_results_surfaces_a_pending_fetch_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+            ss.result_set_exhausted = true;
+            ss.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(h.stmt));
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+
+        assert_eq!(ret, SQL_ERROR);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the deferred error must be posted, not silently dropped as SQL_NO_DATA"
+        );
+        assert!(
+            ss.pending_fetch_error.is_none(),
+            "must be taken so it cannot leak into a later call"
+        );
+        assert!(!ss.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    /// **The blocking regression this tick fixes**, reproducing the
+    /// reviewer's exact probe: statement A executes a single-statement,
+    /// single-result-set batch, fetches its only row to exhaustion (which
+    /// releases `active_stmt` early per AB#47508 and marks the whole batch
+    /// — not just the current result set — as known-done), and statement B
+    /// then claims the now-idle connection and executes its own query.
+    /// `SQLMoreResults(A)` at that point must report `SQL_NO_DATA` without
+    /// touching the connection at all — msodbcsql's `SQLMoreResults` has no
+    /// busy check of its own — not `SQL_ERROR`/`HY000` from falling through
+    /// to the ordinary busy-check path that only `SQLFetch` had a
+    /// `result_set_exhausted` short-circuit for.
+    #[test]
+    fn more_results_fast_path_reports_no_data_when_batch_already_exhausted() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let stmt_b = h.alloc_extra_stmt();
+        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut sa = stmt_a.inner.lock().unwrap();
+            sa.set_state(STMT_STATE_CURSOR_OPEN);
+            // As if A's own fetch already peeked past its lone row, found
+            // the wire fully done (single-statement batch, no MORE), and
+            // released the claim — exactly what release_busy_if_row_exhausted
+            // does when `release` is true.
+            sa.result_set_exhausted = true;
+            sa.batch_exhausted = true;
+        }
+
+        // B has since claimed the connection and is actively using it.
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(stmt_b));
+        // No client configured at all: if the fast path reached for the
+        // connection this would fail with a different SQLSTATE (busy / no
+        // active client) instead of SQL_NO_DATA.
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+
+        assert_eq!(
+            ret, SQL_NO_DATA,
+            "must match msodbcsql, whose SQLMoreResults has no busy check at all"
+        );
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(stmt_b),
+            "B's claim on the connection must be left completely untouched"
+        );
+        assert!(
+            !stmt_a
+                .inner
+                .lock()
+                .unwrap()
+                .has_state(STMT_STATE_CURSOR_OPEN)
+        );
     }
 
     /// SQLMoreResults on an open cursor whose connection has no active client
@@ -311,13 +794,17 @@ mod tests {
             ss.set_state(STMT_STATE_CURSOR_OPEN);
         }
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(h.stmt));
 
         let ret = unsafe { sql_more_results(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
-        assert_eq!(
-            stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            ERR_NO_ACTIVE_TDS_CLIENT.state
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_NO_ACTIVE_TDS_CLIENT,
         );
     }
 
@@ -341,7 +828,7 @@ mod tests {
             SQLSTATE_HY000
         );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
     }
 
     #[test]
@@ -355,6 +842,104 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let rc = unsafe { sql_more_results(h.stmt) };
         assert_eq!(rc, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn drained_dml_counts_defer_output_conversion_and_report_it_once() {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_PARAM_OUTPUT, SQL_VARCHAR};
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::int_columns;
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+
+        for (value, c_type, expected_rc, expected_state) in [
+            (ColumnValues::Int(73), SQL_C_SLONG, SQL_NO_DATA, None),
+            (
+                ColumnValues::Float(12.75),
+                SQL_C_SLONG,
+                SQL_SUCCESS_WITH_INFO,
+                Some(*b"01S07"),
+            ),
+            (
+                ColumnValues::String(SqlString::new(b"abcdefgh".to_vec(), EncodingType::Utf8)),
+                SQL_C_CHAR,
+                SQL_SUCCESS_WITH_INFO,
+                Some(*b"01004"),
+            ),
+            (
+                ColumnValues::String(SqlString::new(b"invalid".to_vec(), EncodingType::Utf8)),
+                SQL_C_SLONG,
+                SQL_ERROR,
+                Some(*b"22018"),
+            ),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut buffer = [0u8; 4];
+            let mut length = -1;
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_OUTPUT,
+                        c_type,
+                        SQL_VARCHAR,
+                        8,
+                        0,
+                        buffer.as_mut_ptr().cast(),
+                        4,
+                        &raw mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.batch_exhausted = true;
+                state.row_count = 2;
+                state.pending_row_counts = VecDeque::from([1]);
+                state.pending_output_params = Some((
+                    vec![ReturnValue {
+                        param_ordinal: 0,
+                        param_name: "@P1".to_owned(),
+                        value,
+                        column_metadata: Box::new(int_columns(1).remove(0)),
+                        status: ReturnValueStatus::OutputParam,
+                    }],
+                    None,
+                ));
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(buffer, [0; 4]);
+            assert_eq!(length, -1);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 1);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, expected_rc);
+            if expected_state.is_none() {
+                assert_eq!(i32::from_ne_bytes(buffer), 73);
+                assert_eq!(length, 4);
+            }
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(
+                    state.diag_records.len(),
+                    usize::from(expected_state.is_some())
+                );
+                if let Some(expected_state) = expected_state {
+                    assert_eq!(state.diag_records[0].sql_state, expected_state);
+                }
+                assert!(state.pending_output_params.is_none());
+            }
+            buffer.fill(0xff);
+            length = -2;
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert_eq!(buffer, [0xff; 4]);
+            assert_eq!(length, -2);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
     }
 
     #[test]
@@ -376,5 +961,32 @@ mod tests {
 
         // Queue drained and no cursor open -> end of batch.
         assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+    }
+
+    /// A queued DML count is a result set as far as the batch ordinal is
+    /// concerned. msodbcsql reports command 1, 2, 3 across a pure-DML batch
+    /// exactly as it does across three SELECTs, so stepping the queue without
+    /// advancing the ordinal would leave `SQL_SOPT_SS_CURRENT_COMMAND` stuck at
+    /// 1 while `SQLMoreResults` walked the batch.
+    #[test]
+    fn stepping_pending_dml_counts_advances_the_command_ordinal() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt.inner.lock().unwrap();
+            s.begin_batch(Vec::new());
+            s.pending_row_counts = VecDeque::from(vec![2, 1]);
+        }
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 1);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 2);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 3);
+
+        // End of batch holds the final ordinal rather than advancing past it.
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 3);
     }
 }

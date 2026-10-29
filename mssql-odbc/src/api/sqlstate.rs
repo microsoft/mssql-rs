@@ -4,6 +4,7 @@
 //! SQLSTATE constants and the SQL Server error-number → SQLSTATE map.
 
 use crate::error::{HasDiagnostics, post_sql_error};
+use crate::handles::wire::ClaimError;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::error::SqlInfoMessage;
 
@@ -11,6 +12,7 @@ pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
 pub(crate) const SQLSTATE_01S00: [u8; 5] = *b"01S00";
 pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
+pub(crate) const SQLSTATE_01S05: [u8; 5] = *b"01S05";
 pub(crate) const SQLSTATE_01S07: [u8; 5] = *b"01S07";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
@@ -24,12 +26,20 @@ pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
 /// Communication link failure — the connection to the server broke, so a
 /// connection pool must discard the connection rather than reuse it.
 pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
+pub(crate) const SQLSTATE_22001: [u8; 5] = *b"22001";
 pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
+pub(crate) const SQLSTATE_22007: [u8; 5] = *b"22007";
+pub(crate) const SQLSTATE_22008: [u8; 5] = *b"22008";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
+pub(crate) const SQLSTATE_22026: [u8; 5] = *b"22026";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_25000: [u8; 5] = *b"25000";
+/// Syntax error or access violation — the state a server error carries when it
+/// is the application's statement that is at fault.
+pub(crate) const SQLSTATE_42000: [u8; 5] = *b"42000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
+pub(crate) const SQLSTATE_HY001: [u8; 5] = *b"HY001";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
 pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
 pub(crate) const SQLSTATE_HY012: [u8; 5] = *b"HY012";
@@ -37,17 +47,28 @@ pub(crate) const SQLSTATE_HYC00: [u8; 5] = *b"HYC00";
 pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
+pub(crate) const SQLSTATE_HY016: [u8; 5] = *b"HY016";
+pub(crate) const SQLSTATE_HY017: [u8; 5] = *b"HY017";
+pub(crate) const SQLSTATE_HY020: [u8; 5] = *b"HY020";
+pub(crate) const SQLSTATE_HY021: [u8; 5] = *b"HY021";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
+pub(crate) const SQLSTATE_HY094: [u8; 5] = *b"HY094";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY106: [u8; 5] = *b"HY106";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY104: [u8; 5] = *b"HY104";
+pub(crate) const SQLSTATE_HY105: [u8; 5] = *b"HY105";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 // msodbcsql spells this IDS_S1_113; its `S1` prefix is the ODBC 2.x form of
 // `HY` (IDS_S1_C00 is HYC00), so the 3.x state is HY113.
 pub(crate) const SQLSTATE_HY113: [u8; 5] = *b"HY113";
+/// Timeout expired — `SQL_ATTR_QUERY_TIMEOUT` (or `SQL_ATTR_CONNECTION_TIMEOUT`)
+/// elapsed before the driver got a response. Distinct from `HY000` so an
+/// application can tell "my deadline passed" from "something else broke".
+pub(crate) const SQLSTATE_HYT00: [u8; 5] = *b"HYT00";
+pub(crate) const SQLSTATE_HY008: [u8; 5] = *b"HY008";
 
 // Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
 // message text. Bundling the two means a call site posts one value and can't
@@ -64,9 +85,32 @@ pub(crate) struct DiagMsg {
     pub(crate) text: &'static str,
 }
 
+impl From<crate::conversion::error::ConvError> for DiagMsg {
+    fn from(error: crate::conversion::error::ConvError) -> Self {
+        use crate::conversion::error::ConvError;
+
+        match error {
+            ConvError::OutOfRange => ERR_NUMERIC_OUT_OF_RANGE,
+            ConvError::DatetimeFieldOverflow => ERR_DATETIME_FIELD_OVERFLOW,
+            ConvError::InvalidDatetimeFormat => ERR_INVALID_DATETIME_FORMAT,
+            ConvError::Restricted => ERR_RESTRICTED_DATA_TYPE,
+            ConvError::InvalidCharacterValue => ERR_INVALID_CHARACTER_VALUE,
+            ConvError::Internal => ERR_INTERNAL_CONVERSION,
+            ConvError::NotHandledHere => Self {
+                state: SQLSTATE_HYC00,
+                text: "Column type conversion not yet implemented",
+            },
+        }
+    }
+}
+
 pub(crate) const ERR_INVALID_CURSOR_STATE: DiagMsg = DiagMsg {
     state: SQLSTATE_24000,
     text: "Invalid cursor state",
+};
+pub(crate) const ERR_OPERATION_CANCELED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY008,
+    text: "Operation canceled",
 };
 pub(crate) const ERR_CONNECTION_DOES_NOT_EXIST: DiagMsg = DiagMsg {
     state: SQLSTATE_08003,
@@ -80,9 +124,58 @@ pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
     state: SQLSTATE_HY000,
     text: "Connection is busy with results for another command",
 };
+
+/// All contention maps to the busy error applications retry on.
+pub(crate) fn claim_error_diag(error: ClaimError) -> DiagMsg {
+    match error {
+        ClaimError::Busy(_) => ERR_CONNECTION_BUSY,
+        ClaimError::NoClient => ERR_NO_ACTIVE_TDS_CLIENT,
+    }
+}
+
+pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "A statement on this connection is unusable and did not receive the attribute",
+};
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
+};
+/// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
+/// allocated a connection. Reached either by a caller that skipped the
+/// attribute entirely, or by a 2.x application whose `SQL_OV_ODBC2` this
+/// driver rejected (`HY024`) — the Driver Manager forwards that declaration
+/// rather than mapping it, then allocates the connection regardless. ODBC
+/// specifies `HY010` for allocating a connection before the version is set.
+///
+/// Note the text below reaches only a caller that loads this driver directly.
+/// It is posted on *this driver's* environment handle, which a Driver Manager
+/// application never holds — the application's `henv` is the DM's own. On the
+/// path this exists for, the DM substitutes its own diagnostic: unixODBC posts
+/// `IM005` ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
+/// `DriverManager/SQLConnect.c:1613-1616`), while the Windows DM propagates
+/// the `HY024` from the rejected `SQLSetEnvAttr` instead. `post_diag` only
+/// appends to `diag_records` and does not trace, so the refusal site in
+/// `alloc_handle.rs` logs this `text` verbatim — that log is the only place
+/// the reason survives for a Driver Manager user on either platform.
+pub(crate) const ERR_ODBC_VERSION_NOT_SET: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY010,
+    text: "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \
+           before allocating a connection; this driver does not support ODBC 2.x",
+};
+/// A fallible allocation failed. Used where the byte count comes from the
+/// application rather than a bounded internal computation -- e.g. buffering
+/// a data-at-execution value with no declared total (`SQL_DATA_AT_EXEC`) --
+/// so it fails as a diagnostic the caller can act on instead of hitting
+/// `Vec`'s default infallible allocation, which aborts the process this
+/// driver is loaded into.
+pub(crate) const ERR_MEMORY_ALLOCATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY001,
+    text: "Memory allocation error",
+};
+pub(crate) const ERR_PLP_TYPED_LIMIT: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "PLP typed conversion exceeds the materialization limit",
 };
 pub(crate) const ERR_FETCH_TYPE_OUT_OF_RANGE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY106,
@@ -95,6 +188,46 @@ pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_DESCRIPTOR_FIELD: DiagMsg = DiagMsg {
     state: SQLSTATE_HY091,
     text: "Invalid descriptor field identifier",
+};
+/// Writing a record field (or any header field besides
+/// `SQL_DESC_ROWS_PROCESSED_PTR` / `SQL_DESC_ARRAY_STATUS_PTR`) on an
+/// implementation row descriptor. Matches msodbcsql's `IDS_HY_016`
+/// (`sqlcdesc.cpp:1399-1405`) — IRD is populated by the driver, never by the
+/// application.
+pub(crate) const ERR_CANNOT_MODIFY_IRD: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY016,
+    text: "Cannot modify an implementation row descriptor",
+};
+/// `SQLFreeHandle(SQL_HANDLE_DESC, ...)` on an implicitly-allocated
+/// descriptor, or `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC, ...)`
+/// given an implicitly-allocated descriptor other than the statement's own
+/// ARD/APD (i.e. another statement's ARD/APD, or this statement's own
+/// IRD/IPD). Matches the ODBC reference's HY017 entries for both functions —
+/// implicit descriptors are owned by their statement and can never be freed
+/// or reassigned as if they were explicit handles.
+pub(crate) const ERR_INVALID_USE_OF_AUTO_DESC: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY017,
+    text: "Invalid use of an automatically allocated descriptor handle",
+};
+/// `SQL_DESC_TYPE` set to the verbose `SQL_DATETIME` marker before a valid
+/// `SQL_DESC_DATETIME_INTERVAL_CODE` identifies which date/time member is
+/// meant. Matches msodbcsql's `IDS_HY_021` (`sqlcdesc.cpp:1676`).
+pub(crate) const ERR_INCONSISTENT_DESCRIPTOR_INFO: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY021,
+    text: "Inconsistent descriptor information",
+};
+/// `SQL_C_NUMERIC` precision/scale outside the valid range (precision
+/// `1..=SQL_MAX_NUMERIC_LEN` digits, scale `<= precision`). Matches
+/// msodbcsql's `IDS_S1_094` (`sqlcdesc.cpp:11384-11394`).
+pub(crate) const ERR_INVALID_PRECISION_OR_SCALE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY094,
+    text: "Invalid precision or scale value",
+};
+/// `SQL_DESC_PARAMETER_TYPE` set to a value other than `SQL_PARAM_INPUT`,
+/// `SQL_PARAM_INPUT_OUTPUT`, or `SQL_PARAM_OUTPUT`.
+pub(crate) const ERR_INVALID_PARAMETER_TYPE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY105,
+    text: "Invalid parameter type",
 };
 pub(crate) const ERR_NOT_VARIANT_COLUMN: DiagMsg = DiagMsg {
     state: SQLSTATE_HY113,
@@ -112,6 +245,10 @@ pub(crate) const ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
     text: "Optional feature not implemented",
 };
+pub(crate) const ERR_TNIR_NOT_SUPPORTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "TransparentNetworkIPResolution is not supported; use MultiSubnetFailover instead",
+};
 pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY003,
     text: "Invalid application buffer type",
@@ -120,6 +257,10 @@ pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
 };
+pub(crate) const ERR_INTERNAL_CONVERSION: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "Internal error converting value",
+};
 // `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which this
 // driver does not support, so the state is terminal rather than "not yet"
 // (msodbcsql `sqlccmd.cpp` -> IDS_07_S01 on a non-canonical call statement).
@@ -127,9 +268,9 @@ pub(crate) const ERR_INVALID_USE_OF_DEFAULT_PARAM: DiagMsg = DiagMsg {
     state: SQLSTATE_07S01,
     text: "Invalid use of default parameter",
 };
-pub(crate) const ERR_DATA_AT_EXEC_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "Data-at-execution parameters not yet implemented",
+pub(crate) const ERR_DATA_AT_EXEC_NOT_STAGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "Data-at-execution parameter reached the materializing conversion path",
 };
 pub(crate) const ERR_PARAM_C_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
@@ -139,13 +280,17 @@ pub(crate) const ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
     text: "Parameter SQL type not yet implemented",
 };
-pub(crate) const ERR_INVALID_PARAM_COLUMN_SIZE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY104,
-    text: "Invalid parameter ColumnSize for the SQL type",
+pub(crate) const ERR_PARAM_CONVERSION_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "Parameter conversion not yet implemented",
 };
-pub(crate) const ERR_INVALID_PARAM_DECIMAL_DIGITS: DiagMsg = DiagMsg {
+// Covers both `ColumnSize` and `DecimalDigits`, as the ODBC 3.x `HY104` entry
+// does. msodbcsql splits the text (IDS_S1_104 for precision, IDS_S1_094 for
+// scale) but reports the one state either way
+// (`Sql/Ntdbms/sqlncli/cli_common/src/clntcomn.cpp`). S1094 is ODBC 2.x and is not used here.
+pub(crate) const ERR_INVALID_PARAM_PRECISION_OR_SCALE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY104,
-    text: "Invalid parameter DecimalDigits for the SQL type",
+    text: "Invalid precision or scale value",
 };
 /// A bound column delivered NULL but the application supplied no indicator to
 /// receive it, so the value cannot be reported at all.
@@ -161,11 +306,55 @@ pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
     state: SQLSTATE_22018,
     text: "Invalid character value for cast specification",
 };
+/// Date/time fields that name no real instant - month 13, 31 February, a
+/// year outside `0001`..`9999`, or an out-of-range time or UTC offset.
+pub(crate) const ERR_INVALID_DATETIME_FORMAT: DiagMsg = DiagMsg {
+    state: SQLSTATE_22007,
+    text: "Invalid datetime format",
+};
+/// Temporal arithmetic overflow or a fraction dropped by the target's declared scale.
+/// Retail 18.6.2.1
+/// answers this state for `time`, `datetime2` and `datetimeoffset` alike.
+///
+/// `ParamToSQLType` (`sqlcfunc.cpp:3350`) reads as a split - this state for the
+/// timestamp family, `22001` otherwise - but that gate is the legacy datetime
+/// arm and is not what these targets reach; see `convert_datetime_sql`. Do not
+/// re-derive the split from source.
+pub(crate) const ERR_DATETIME_FIELD_OVERFLOW: DiagMsg = DiagMsg {
+    state: SQLSTATE_22008,
+    text: "Datetime field overflow",
+};
+pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
+    state: SQLSTATE_22026,
+    text: "String data, length mismatch",
+};
+/// A `SQL_SS_UDT` parameter bound without `SQL_CA_SS_UDT_TYPE_NAME`. msodbcsql
+/// rejects the same binding before execute, also as `HY000`
+/// (`sqlccmd.cpp:9977`, `IDS_S1_000_95`). The SQLSTATE is the parity claim;
+/// this text is this driver's own and is not derived from the reference.
+pub(crate) const ERR_MISSING_UDT_TYPE_NAME: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "A UDT parameter requires SQL_CA_SS_UDT_TYPE_NAME to be set",
+};
+// A streamed parameter is either NULL or a sequence of value chunks; mixing the
+// two in one `SQL_NEED_DATA` window has no representation on the wire
+// (msodbcsql `sqlccmd.cpp` -> IDS_HY_020).
+pub(crate) const ERR_ATTEMPT_TO_CONCATENATE_NULL: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY020,
+    text: "Attempt to concatenate a null value",
+};
 pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01S07,
     text: "Fractional truncation",
 };
-pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
+/// Inbound truncation of a bound parameter. Distinct from
+/// [`WARN_STRING_TRUNCATION`], which is the benign `01004` the fetch
+/// direction posts when a caller's buffer is too small.
+pub(crate) const ERR_PARAM_STRING_TRUNCATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_22001,
+    text: "String data, right truncation",
+};
+pub(crate) const WARN_STRING_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,
     text: "String data, right truncation",
 };
@@ -198,6 +387,19 @@ pub(crate) const WARN_TRANSACTION_COMMITTED: DiagMsg = DiagMsg {
     state: SQLSTATE_01000,
     text: "The open transaction was committed because autocommit mode was enabled",
 };
+/// Client-side conversion lost a character: to the server collation for input
+/// parameters, or to the platform client code page for retrieved values.
+/// Server-side conversion loss is not observable through this diagnostic.
+///
+/// msodbcsql's `IDS_01_000_16` verbatim (`local.rc:29`, SQLSTATE `01000` via
+/// `clntcomn.cpp:1183`). Posted only when the application opted in with
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR`; see
+/// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error)
+/// for why the substitution itself is not an error (AB#47598).
+pub(crate) const WARN_CODE_PAGE_CONVERSION_LOSS: DiagMsg = DiagMsg {
+    state: SQLSTATE_01000,
+    text: "Warning: Code page translation caused loss of data",
+};
 /// `SQL_ATTR_TXN_ISOLATION` changed while a manual-commit transaction is open
 /// (msodbcsql `sqlcmisc.cpp:360`).
 pub(crate) const ERR_ATTRIBUTE_CANNOT_BE_SET_NOW: DiagMsg = DiagMsg {
@@ -207,6 +409,10 @@ pub(crate) const ERR_ATTRIBUTE_CANNOT_BE_SET_NOW: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
     state: SQLSTATE_01S00,
     text: "Invalid connection string attribute",
+};
+pub(crate) const WARN_CANCEL_TREATED_AS_CLOSE: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S05,
+    text: "Cancel treated as FreeStmt/Close",
 };
 pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
     state: SQLSTATE_HY090,
@@ -234,6 +440,70 @@ pub(crate) const WARN_CONNECTION_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
     state: SQLSTATE_01S02,
     text: "Connection timeout changed",
 };
+/// `SQL_DESC_ARRAY_SIZE` clamped to `i32::MAX`. Matches msodbcsql's
+/// `IDS_01_S02` for the same clamp (`sqlcdesc.cpp:4161-4167`).
+pub(crate) const WARN_ARRAY_SIZE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Array size changed",
+};
+
+/// The same clamp applied to `SQL_ATTR_QUERY_TIMEOUT`.
+///
+/// msodbcsql posts the generic `IDS_01_S02` here rather than one of the
+/// timeout-specific strings (`sqlcmisc.cpp:3993`), so the text matches it
+/// verbatim.
+pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Option value changed",
+};
+
+/// Posted when a requested `SQL_ATTR_PACKET_SIZE` falls outside the range
+/// `mssql-tds` accepts and is clamped. Matches msodbcsql's `IDS_01_S02_02`
+/// (`dll/res/local.rc:42`), which it posts from the same clamp
+/// (`sqlcmisc.cpp:1909-1917`).
+pub(crate) const WARN_PACKET_SIZE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Packet size changed",
+};
+
+/// Post a server-originated error under a caller-chosen SQLSTATE, keeping the
+/// native error number and the engine's message text.
+///
+/// `SQL_ATTR_CURRENT_CATALOG` needs this: msodbcsql overwrites whatever state
+/// the failed `USE` produced with `IDS_HY_024` (`sqlcmisc.cpp:1873-1875`), so a
+/// missing database surfaces as `HY024` + native 911 rather than the `08004`
+/// the error-number map would otherwise give.
+///
+/// The override applies **only** to errors the engine raised. A transport or
+/// protocol failure is not the server rejecting the value, so labelling a
+/// dropped connection mid-`USE` as `HY024` would send the caller hunting for a
+/// bad catalog name. Those take `HY000`, the general error state every other
+/// execution path ([`exec_common`](super::exec_common), [`fetch`](super::fetch))
+/// already uses for a failure that is not the engine's.
+pub(crate) fn post_tds_error_as(
+    state: &mut impl HasDiagnostics,
+    err: &TdsError,
+    forced_state: [u8; 5],
+) {
+    let TdsError::SqlServerError { diagnostics } = err else {
+        post_tds_error(state, err, SQLSTATE_HY000);
+        return;
+    };
+    if diagnostics.errors.is_empty() {
+        post_tds_error(state, err, SQLSTATE_HY000);
+        return;
+    }
+    for e in &diagnostics.errors {
+        let native = i32::try_from(e.number).unwrap_or(i32::MAX);
+        post_sql_error(
+            state,
+            forced_state,
+            native,
+            format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
+        );
+    }
+    post_tds_info_messages(state, &diagnostics.info_messages);
+}
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
 /// native error 0. For server-originated errors use [`post_tds_error`].
@@ -388,15 +658,47 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
         .map(|i| SERVER_ERROR_TO_SQL_STATE_MAP[i].1)
 }
 
+/// Highest TDS severity class that is purely informational — msodbcsql's
+/// `EX_MAXISEVERITY` (`tds.h:603`).
+const SEVERITY_MAX_INFO: i32 = 10;
+/// Upper boundary of msodbcsql's `42000` compatibility tier —
+/// `MAXUSEVERITY` (`tds.h:612`).
+const SEVERITY_MAX_USER: i32 = 18;
+
+/// SQLSTATE for a server message whose error number has no entry in
+/// [`SERVER_ERROR_TO_SQL_STATE_MAP`], derived from its TDS severity class.
+///
+/// msodbcsql tiers this fallback rather than using one fixed state
+/// (`PostSQLServerMessageEx`, `sqlcerr.cpp:1385-1401`): severity > 18 →
+/// `IDS_S1_000_01` (`HY000`), > 10 → `IDS_37_000` (`42000`), otherwise
+/// `IDS_01_000_00` (`01000`). The map's own header states the rule
+/// (`sqlcstr.cpp:120`: "Any SQLServer error not here will receive a 37000
+/// SQLState").
+///
+/// The middle tier is what makes an unmapped syntax error or a severity-16
+/// `RAISERROR` a *programming* error rather than a generic one — the
+/// distinction wrappers such as mssql-python use to pick an exception class.
+/// Growing the map instead would fix one error number at a time and violate
+/// its "entries are permanent" contract; the tier fixes every unmapped error.
+fn sqlstate_for_severity(class: i32) -> [u8; 5] {
+    if class > SEVERITY_MAX_USER {
+        SQLSTATE_HY000
+    } else if class > SEVERITY_MAX_INFO {
+        SQLSTATE_42000
+    } else {
+        SQLSTATE_01000
+    }
+}
+
 /// Post one ODBC diagnostic record per server error in `err`.
 ///
 /// For [`TdsError::SqlServerError`], iterates the server-reported errors in
 /// the order TDS delivered them and pushes one
 /// [`DiagRecord`](crate::error::DiagRecord) each. Each record's SQLSTATE
 /// comes from [`sqlstate_for_sql_error`]; any error number not in the map
-/// falls back to `default`. Native error and message are taken straight
-/// from the server-reported error. Any informational/warning messages the
-/// server sent alongside the errors are posted after the error records so a
+/// falls back to [`sqlstate_for_severity`]. Native error and message are taken
+/// straight from the server-reported error. Any informational/warning messages
+/// the server sent alongside the errors are posted after the error records so a
 /// failing call still surfaces the full server diagnostic set (matching
 /// msodbcsql).
 ///
@@ -404,9 +706,10 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
 /// timeout, …), pushes a single record with `default`, native error 0, and
 /// the error's `Display` text.
 ///
-/// `default` is the SQLSTATE that best describes the caller's context —
-/// typically `08001` for connect-time failures and `HY000` for general
-/// execution / fetch failures.
+/// `default` therefore describes the caller's context for failures the engine
+/// did *not* raise — typically `08001` for connect-time failures and `HY000`
+/// for general execution / fetch failures. A server error carries its own
+/// severity, so it never uses `default`.
 pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, default: [u8; 5]) {
     if let TdsError::SqlServerError { diagnostics } = err {
         if diagnostics.errors.is_empty() {
@@ -417,7 +720,8 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
             post_sql_error(state, default, 0, err.to_string());
         } else {
             for e in &diagnostics.errors {
-                let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
+                let sqlstate = sqlstate_for_sql_error(e.number)
+                    .unwrap_or_else(|| sqlstate_for_severity(e.class));
                 let native = i32::try_from(e.number).unwrap_or(i32::MAX);
                 post_sql_error(
                     state,
@@ -431,7 +735,23 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
         post_tds_info_messages(state, &diagnostics.info_messages);
         return;
     }
-    post_sql_error(state, default, 0, err.to_string());
+    // An unacknowledged connection reset is a property of the link, not of the
+    // statement that happened to carry the bit: `TdsClient` has already marked
+    // the connection dead, so every call site must report it as a communication
+    // failure regardless of the SQLSTATE its own context would suggest.
+    //
+    // A client-side deadline (`SQL_ATTR_QUERY_TIMEOUT` / `SQL_ATTR_CONNECTION_TIMEOUT`)
+    // elapsing is likewise independent of the caller's context: ODBC reserves
+    // `HYT00` specifically so an application can distinguish "my deadline
+    // passed" from a generic failure, matching msodbcsql.
+    let sqlstate = match err {
+        TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
+        TdsError::TimeoutError(_) => SQLSTATE_HYT00,
+        TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
+        TdsError::OperationCancelledError(_) => SQLSTATE_HY008,
+        _ => default,
+    };
+    post_sql_error(state, sqlstate, 0, err.to_string());
 }
 
 /// Post one ODBC diagnostic record per SQL Server INFO token.
@@ -444,7 +764,8 @@ pub(crate) fn post_tds_info_messages(
     messages: &[SqlInfoMessage],
 ) -> bool {
     for message in messages {
-        let sqlstate = sqlstate_for_sql_error(message.number).unwrap_or(SQLSTATE_01000);
+        let sqlstate = sqlstate_for_sql_error(message.number)
+            .unwrap_or_else(|| sqlstate_for_severity(message.class));
         let native = i32::try_from(message.number).unwrap_or(i32::MAX);
         post_sql_error(
             state,
@@ -553,7 +874,9 @@ mod tests {
 
     #[test]
     fn post_tds_error_posts_one_record_per_server_error_in_order() {
-        // 18456 → 28000 (mapped); 4060 → fallback (not in our map).
+        // 18456 → 28000 (mapped); 4060 → severity fallback (not in our map).
+        // `sql_error` builds class 14, so the fallback is the middle tier —
+        // `default` (08001 here) applies only to non-server failures.
         let mut s = FakeState::default();
         let err = TdsError::from_sql_errors(vec![
             sql_error(18456, "Login failed."),
@@ -563,8 +886,52 @@ mod tests {
         assert_eq!(s.records.len(), 2);
         assert_eq!(s.records[0].sql_state, *b"28000");
         assert_eq!(s.records[0].native_error, 18456);
-        assert_eq!(s.records[1].sql_state, SQLSTATE_08001); // fallback
+        assert_eq!(s.records[1].sql_state, SQLSTATE_42000);
         assert_eq!(s.records[1].native_error, 4060);
+    }
+
+    #[test]
+    fn severity_tiers_match_msodbcsql_boundaries() {
+        // sqlcerr.cpp:1385-1401 — > MAXUSEVERITY (18), > EX_MAXISEVERITY (10),
+        // else. Exercise both boundaries from either side.
+        assert_eq!(sqlstate_for_severity(0), SQLSTATE_01000);
+        assert_eq!(sqlstate_for_severity(10), SQLSTATE_01000);
+        assert_eq!(sqlstate_for_severity(11), SQLSTATE_42000);
+        assert_eq!(sqlstate_for_severity(16), SQLSTATE_42000);
+        assert_eq!(sqlstate_for_severity(18), SQLSTATE_42000);
+        assert_eq!(sqlstate_for_severity(19), SQLSTATE_HY000);
+        assert_eq!(sqlstate_for_severity(25), SQLSTATE_HY000);
+    }
+
+    #[test]
+    fn unmapped_server_error_takes_sqlstate_from_its_severity() {
+        // The three cases that drove AB#47532: an unmapped syntax error (102,
+        // severity 15), an unmapped conversion error (257, severity 16) and
+        // RAISERROR's generic 50000. None is in the map — nor in msodbcsql's —
+        // yet all must reach 42000 so wrappers classify them as programming
+        // errors rather than operational ones.
+        for (number, class) in [(102u32, 15), (257, 16), (50000, 16)] {
+            assert_eq!(sqlstate_for_sql_error(number), None, "error {number}");
+            let mut s = FakeState::default();
+            let mut e = sql_error(number, "boom");
+            e.class = class;
+            post_tds_error(&mut s, &TdsError::from_sql_errors(vec![e]), SQLSTATE_HY000);
+            assert_eq!(s.records.len(), 1);
+            assert_eq!(s.records[0].sql_state, SQLSTATE_42000, "error {number}");
+        }
+    }
+
+    #[test]
+    fn unmapped_fatal_server_error_stays_hy000() {
+        // Severity above MAXUSEVERITY is not something the application can fix
+        // by rewriting its statement, so it keeps the general error state.
+        let mut s = FakeState::default();
+        let mut e = sql_error(823, "I/O error");
+        e.class = 24;
+        post_tds_error(&mut s, &TdsError::from_sql_errors(vec![e]), SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(s.records[0].native_error, 823);
     }
 
     #[test]
@@ -635,6 +1002,43 @@ mod tests {
     }
 
     #[test]
+    fn encoded_value_overflow_maps_to_22001() {
+        let mut s = FakeState::default();
+        let err = TdsError::EncodedValueTooLong {
+            actual: 5,
+            maximum: 3,
+        };
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_22001);
+        assert_eq!(s.records[0].native_error, 0);
+    }
+
+    /// A client-side deadline elapsing (`SQL_ATTR_QUERY_TIMEOUT` /
+    /// `SQL_ATTR_CONNECTION_TIMEOUT`) must report `HYT00` regardless of the
+    /// caller's `default`, matching msodbcsql — see mssql-rs#439.
+    #[test]
+    fn post_tds_error_timeout_maps_to_hyt00_regardless_of_default() {
+        use mssql_tds::error::TimeoutErrorType;
+
+        let mut s = FakeState::default();
+        let err = TdsError::TimeoutError(TimeoutErrorType::String("deadline exceeded".into()));
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HYT00);
+        assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn post_tds_error_cancel_maps_to_hy008_regardless_of_default() {
+        let mut s = FakeState::default();
+        let err = TdsError::OperationCancelledError("Request was cancelled".to_string());
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HY008);
+    }
+
+    #[test]
     fn post_tds_error_empty_server_error_vec_falls_back() {
         let mut s = FakeState::default();
         let err = TdsError::from_sql_errors(vec![]);
@@ -642,6 +1046,88 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    /// Runs `post_tds_error_as` against a real [`DbcState`] — the only type the
+    /// driver instantiates it with — and returns what it posted.
+    fn post_as_on_dbc(err: &TdsError, forced: [u8; 5]) -> Vec<crate::error::DiagRecord> {
+        use crate::handles::dbc::DbcHandle;
+        use crate::handles::handle_from_raw;
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        post_tds_error_as(&mut *state, err, forced);
+        state.diag_records.clone()
+    }
+
+    #[test]
+    fn post_tds_error_as_overrides_the_error_number_mapping() {
+        // 911 maps to 08004 by error number, but the catalog path forces
+        // HY024 the way msodbcsql does (`sqlcmisc.cpp:1873-1875`). The native
+        // number and the engine's text must survive the override.
+        assert_eq!(sqlstate_for_sql_error(911), Some(*b"08004"));
+        let err = TdsError::from_sql_errors(vec![sql_error(
+            911,
+            "Database 'nope' does not exist. Make sure that the name is entered correctly.",
+        )]);
+        let records = post_as_on_dbc(&err, SQLSTATE_HY024);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[0].native_error, 911);
+        assert!(records[0].message.ends_with(
+            "Database 'nope' does not exist. Make sure that the name is entered correctly."
+        ));
+    }
+
+    #[test]
+    fn post_tds_error_as_forces_every_error_then_appends_info_messages() {
+        use mssql_tds::error::SqlServerDiagnostics;
+        let diagnostics = SqlServerDiagnostics::new(
+            vec![sql_error(911, "no such db"), sql_error(5701, "context")],
+            vec![SqlInfoMessage {
+                message: "Changed database context to 'master'.".into(),
+                state: 1,
+                class: 10,
+                number: 5701,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }],
+        );
+        let records = post_as_on_dbc(&TdsError::from_sql_diagnostics(diagnostics), SQLSTATE_HY024);
+        assert_eq!(records.len(), 3);
+        // Every server error takes the forced state, in order.
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[1].sql_state, SQLSTATE_HY024);
+        // Info messages keep their own 01000 state and are appended last.
+        assert_eq!(records[2].sql_state, *b"01000");
+        assert_eq!(records[2].native_error, 5701);
+    }
+
+    #[test]
+    fn post_tds_error_as_does_not_force_the_state_on_a_transport_failure() {
+        // A dropped connection mid-`USE` is not the engine rejecting the
+        // catalog name, so it must not inherit HY024 — a caller would go
+        // hunting for a bad database name that was never the problem.
+        let records = post_as_on_dbc(
+            &TdsError::ProtocolError("bad packet".into()),
+            SQLSTATE_HY024,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(records[0].native_error, 0);
+        assert!(records[0].message.contains("bad packet"));
+    }
+
+    #[test]
+    fn post_tds_error_as_falls_back_when_the_error_list_is_empty() {
+        // No engine error to force the state onto, so the general default wins.
+        let records = post_as_on_dbc(&TdsError::from_sql_errors(vec![]), SQLSTATE_HY024);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(records[0].native_error, 0);
     }
 
     #[test]

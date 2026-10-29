@@ -42,11 +42,22 @@ mod connectivity {
         secret.to_string()
     }
 
+    /// Acquires a token for the methods these tests connect with. Any other
+    /// method, and a credential that cannot produce a token, is reported as an
+    /// error through the token factory, so the test fails its connection with
+    /// the reason instead of panicking here.
     async fn generate_access_token_with_sts_and_resource(
         spn: String,
         sts: String,
         auth_method: &TdsAuthenticationMethod,
-    ) -> String {
+    ) -> TdsResult<String> {
+        fn token_error(error: azure_core::Error) -> mssql_tds::error::Error {
+            mssql_tds::error::Error::Security(
+                mssql_tds::security::SecurityError::AuthenticationDenied(format!(
+                    "the test could not acquire an access token: {error}"
+                )),
+            )
+        }
         let scopes = &[spn.as_ref()];
         // `CustomConfiguration` is `#[non_exhaustive]`, so it must be built by
         // mutating a default; the field-reassign lint does not fire on it.
@@ -57,33 +68,33 @@ mod connectivity {
             ..Default::default()
         };
         let token_response = match auth_method {
-            TdsAuthenticationMethod::Password => todo!(),
-            TdsAuthenticationMethod::SSPI => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryPassword => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryInteractive => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryServicePrincipal => todo!(),
             TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
                 let options = ManagedIdentityCredentialOptions {
                     client_options,
                     user_assigned_id: None,
                 };
-                let vm_credential = ManagedIdentityCredential::new(Some(options)).unwrap();
-                vm_credential.get_token(scopes, None).await
+                ManagedIdentityCredential::new(Some(options))
+                    .map_err(token_error)?
+                    .get_token(scopes, None)
+                    .await
             }
             TdsAuthenticationMethod::ActiveDirectoryDefault => {
-                let credential = DeveloperToolsCredential::new(None);
-                credential.unwrap().get_token(scopes, None).await
+                DeveloperToolsCredential::new(None)
+                    .map_err(token_error)?
+                    .get_token(scopes, None)
+                    .await
             }
-            TdsAuthenticationMethod::ActiveDirectoryMSI => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => todo!(),
-            TdsAuthenticationMethod::ActiveDirectoryIntegrated => todo!(),
-            TdsAuthenticationMethod::AccessToken => todo!(),
-        };
+            other => {
+                return Err(mssql_tds::error::Error::UsageError(format!(
+                    "the connectivity tests acquire no token for {other:?}"
+                )));
+            }
+        }
+        .map_err(token_error)?;
 
-        let secret = token_response.as_ref().unwrap().token.secret();
+        let secret = token_response.token.secret();
         debug_assert!(!secret.is_empty(), "empty access token");
-        secret.to_string()
+        Ok(secret.to_string())
     }
 
     pub fn create_context_with_accesstoken(access_token: String) -> ClientContext {
@@ -201,7 +212,7 @@ mod connectivity {
                 _spn.clone()
             };
             let token =
-                generate_access_token_with_sts_and_resource(spn, _sts_url, &auth_method).await;
+                generate_access_token_with_sts_and_resource(spn, _sts_url, &auth_method).await?;
             let utf16: Vec<u16> = token.encode_utf16().collect();
             let bytes: Vec<u8> = utf16.iter().flat_map(|u| u.to_le_bytes()).collect();
             Ok(bytes)

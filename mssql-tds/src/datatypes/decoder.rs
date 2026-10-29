@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use core::fmt;
+use std::borrow::Cow;
 use std::future::Future;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -197,6 +198,21 @@ pub(crate) const fn decimal_metadata_is_valid(precision: u8, scale: u8) -> bool 
     precision > 0 && precision <= MAX_DECIMAL_PRECISION && scale <= precision
 }
 
+#[inline]
+/// Expands a time value at TDS scale `0..=7` into 100-nanosecond ticks.
+const fn scale_time_value(value: u64, scale: u8) -> u64 {
+    match scale {
+        0 => value * 10_000_000,
+        1 => value * 1_000_000,
+        2 => value * 100_000,
+        3 => value * 10_000,
+        4 => value * 1_000,
+        5 => value * 100,
+        6 => value * 10,
+        _ => value,
+    }
+}
+
 /// Byte width of a `decimal`/`numeric` magnitude: four little-endian 32-bit words.
 pub(crate) const DECIMAL_MAGNITUDE_BYTES: usize = MAX_DECIMAL_INT_PARTS * 4;
 
@@ -279,6 +295,94 @@ pub(crate) struct GenericDecoder {
     string_decoder: StringDecoder,
 }
 
+/// Non-consuming-on-failure reader for values already buffered by the transport.
+struct BufferedSlice<'a> {
+    /// Received bytes available to the synchronous decoder.
+    bytes: &'a [u8],
+    /// Number of bytes tentatively consumed by this decode attempt.
+    position: usize,
+}
+
+impl<'a> BufferedSlice<'a> {
+    /// Starts reading at the beginning of `bytes`.
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    /// Reads a fixed-size byte array and advances only when it is complete.
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.position.checked_add(N)?;
+        let value = self.bytes.get(self.position..end)?.try_into().ok()?;
+        self.position = end;
+        Some(value)
+    }
+
+    /// Copies a complete variable-size value from the buffered bytes.
+    fn take_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
+        self.take_slice(len).map(<[u8]>::to_vec)
+    }
+
+    /// Borrows a complete variable-size value from the buffered bytes.
+    fn take_slice(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.position.checked_add(len)?;
+        let value = self.bytes.get(self.position..end)?;
+        self.position = end;
+        Some(value)
+    }
+
+    /// Reads one byte.
+    fn byte(&mut self) -> Option<u8> {
+        self.take().map(|[value]| value)
+    }
+
+    /// Reads a little-endian signed 16-bit integer.
+    fn i16(&mut self) -> Option<i16> {
+        self.take().map(i16::from_le_bytes)
+    }
+
+    /// Reads a little-endian unsigned 16-bit integer.
+    fn u16(&mut self) -> Option<u16> {
+        self.take().map(u16::from_le_bytes)
+    }
+
+    /// Reads a little-endian unsigned 24-bit integer.
+    fn u24(&mut self) -> Option<u32> {
+        let [b0, b1, b2] = self.take()?;
+        Some(u32::from_le_bytes([b0, b1, b2, 0]))
+    }
+
+    /// Reads a little-endian signed 32-bit integer.
+    fn i32(&mut self) -> Option<i32> {
+        self.take().map(i32::from_le_bytes)
+    }
+
+    /// Reads a little-endian unsigned 32-bit integer.
+    fn u32(&mut self) -> Option<u32> {
+        self.take().map(u32::from_le_bytes)
+    }
+
+    /// Reads a little-endian unsigned 40-bit integer.
+    fn u40(&mut self) -> Option<u64> {
+        let [b0, b1, b2, b3, b4] = self.take()?;
+        Some(u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]))
+    }
+
+    /// Reads a little-endian signed 64-bit integer.
+    fn i64(&mut self) -> Option<i64> {
+        self.take().map(i64::from_le_bytes)
+    }
+
+    /// Reads a little-endian 32-bit floating-point value.
+    fn f32(&mut self) -> Option<f32> {
+        self.take().map(f32::from_le_bytes)
+    }
+
+    /// Reads a little-endian 64-bit floating-point value.
+    fn f64(&mut self) -> Option<f64> {
+        self.take().map(f64::from_le_bytes)
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlpChunkReadLength {
@@ -297,7 +401,6 @@ pub(crate) struct PlpChunkStreamReader {
     chunk_remaining: usize,
     reached_end: bool,
     total_read: usize,
-    chunks_seen: u32,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -308,7 +411,6 @@ impl PlpChunkStreamReader {
             chunk_remaining: 0,
             reached_end: false,
             total_read: 0,
-            chunks_seen: 0,
         }
     }
 
@@ -339,6 +441,298 @@ impl PlpChunkStreamReader {
         };
 
         Ok(Some(Self::new(length)))
+    }
+
+    /// Attempts to parse the 8-byte PLP length/sentinel header from already-buffered `bytes`.
+    ///
+    /// Returns `Ok(None)` when fewer than 8 bytes are buffered (not ready). `Ok(Some((None,
+    /// 8)))` means the header itself was the SQL NULL sentinel — `8` is still the number of
+    /// header bytes consumed. `Ok(Some((Some(reader), 8)))` returns a fresh chunk reader
+    /// positioned to read the first chunk-length header next, with `8` bytes consumed for
+    /// the PLP length header. Returns `Err` for a declared length that is negative or exceeds
+    /// `MAX_PLP_SIZE`.
+    fn try_begin_buffered(bytes: &[u8]) -> TdsResult<Option<(Option<Self>, usize)>> {
+        let Some(header) = bytes.get(..8) else {
+            return Ok(None);
+        };
+        let raw_len_i64 = i64::from_le_bytes(header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP header".to_string())
+        })?);
+        let raw_len = raw_len_i64 as u64;
+        let raw_len_usize = raw_len as usize;
+        if raw_len_usize == GenericDecoder::SQL_PLP_NULL {
+            return Ok(Some((None, 8)));
+        }
+        let length = if raw_len_usize == GenericDecoder::SQL_PLP_UNKNOWNLEN
+            || raw_len_usize == GenericDecoder::SQL_PLP_MAXLEN
+        {
+            PlpChunkReadLength::Unknown
+        } else {
+            let declared_len = raw_len as usize;
+            if raw_len_i64 < 0 || declared_len > MAX_PLP_SIZE {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP length {declared_len} (raw i64: {raw_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
+                )));
+            }
+            PlpChunkReadLength::Known(raw_len)
+        };
+        Ok(Some((Some(Self::new(length)), 8)))
+    }
+
+    /// Attempts to decode an entire known-length, single-chunk PLP value (chunk header,
+    /// payload, zero terminator) directly from buffered `bytes` in one call, without leaving
+    /// resumable per-chunk cursor state behind.
+    ///
+    /// Only applies before any chunk has been started (`total_read == 0 && chunk_remaining ==
+    /// 0 && !reached_end`) and when the length is known. Returns `Ok(None)` for unknown-length
+    /// PLP, a reader that already began reading, `out` smaller than the declared length, a
+    /// buffered chunk header/payload/terminator that isn't fully present yet, or a chunk
+    /// length that doesn't match the declared length (caller must fall back to the general
+    /// chunked path via `try_read_buffered`). On success returns `Ok(Some((consumed,
+    /// payload_len)))`: `consumed` is the number of input `bytes` consumed (chunk header +
+    /// payload + terminator), `payload_len` is the number of bytes copied into `out` (equal
+    /// to the declared length). Marks the reader as having reached the end.
+    fn try_read_complete_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let PlpChunkReadLength::Known(known_len) = self.length else {
+            return Ok(None);
+        };
+        if self.reached_end || self.chunk_remaining != 0 || self.total_read != 0 {
+            return Ok(None);
+        }
+        let length = usize::try_from(known_len).map_err(|_| {
+            crate::error::Error::ProtocolError("PLP length does not fit usize".to_string())
+        })?;
+        if length > out.len() {
+            return Ok(None);
+        }
+        let Some(chunk_header) = bytes.get(..4) else {
+            return Ok(None);
+        };
+        let chunk_len = u32::from_le_bytes(chunk_header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP chunk header".to_string())
+        })?) as usize;
+        if length == 0 && chunk_len == 0 {
+            self.reached_end = true;
+            return Ok(Some((4, 0)));
+        }
+        if chunk_len != length {
+            return Ok(None);
+        }
+        let payload_end = 4usize.checked_add(length).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP length overflowed".to_string())
+        })?;
+        let terminator_end = payload_end.checked_add(4).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP terminator overflowed".to_string())
+        })?;
+        let Some(payload) = bytes.get(4..payload_end) else {
+            return Ok(None);
+        };
+        let Some(terminator) = bytes.get(payload_end..terminator_end) else {
+            return Ok(None);
+        };
+        if u32::from_le_bytes(terminator.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP terminator".to_string())
+        })?) != 0
+        {
+            return Ok(None);
+        }
+        out.get_mut(..length)
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(
+                    "Buffered PLP output range was unavailable".to_string(),
+                )
+            })?
+            .copy_from_slice(payload);
+        self.total_read = length;
+        self.reached_end = true;
+        Ok(Some((terminator_end, length)))
+    }
+
+    /// Validates a chunk-length header value just read from the wire/buffer and applies it to
+    /// reader state.
+    ///
+    /// A `chunk_len` of `0` is the terminator: sets `reached_end` and returns `Ok(false)`
+    /// (erroring if a known declared length wasn't fully consumed by then). A non-zero
+    /// `chunk_len` becomes the new `chunk_remaining` and returns `Ok(true)`. Returns `Err` if
+    /// the chunk exceeds the max chunk size, would overflow the accumulated total, exceeds
+    /// `MAX_PLP_SIZE`, or would exceed a known declared length.
+    fn accept_chunk_length(&mut self, chunk_len: usize) -> TdsResult<bool> {
+        if chunk_len == 0 {
+            self.reached_end = true;
+            if let PlpChunkReadLength::Known(known_len) = self.length
+                && self.total_read != known_len as usize
+            {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP stream ended before declared length was reached: total_read={}, declared_len={known_len}",
+                    self.total_read
+                )));
+            }
+            return Ok(false);
+        }
+
+        if chunk_len > GenericDecoder::MAX_PLP_CHUNK_SIZE {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP chunk size {chunk_len} exceeds maximum allowed chunk size of {} bytes",
+                GenericDecoder::MAX_PLP_CHUNK_SIZE
+            )));
+        }
+
+        let next_total = self.total_read.checked_add(chunk_len).ok_or_else(|| {
+            crate::error::Error::ProtocolError(format!(
+                "PLP chunk accumulation would overflow capacity: {} + {chunk_len}",
+                self.total_read
+            ))
+        })?;
+
+        if next_total > MAX_PLP_SIZE {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP accumulated size {next_total} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
+            )));
+        }
+
+        if let PlpChunkReadLength::Known(known_len) = self.length
+            && next_total > known_len as usize
+        {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "PLP chunk exceeds declared length: accumulated={next_total}, declared_len={known_len}"
+            )));
+        }
+
+        self.chunk_remaining = chunk_len;
+        Ok(true)
+    }
+
+    /// Ensures a chunk with remaining payload bytes is active at `*position`, reading a new
+    /// 4-byte chunk-length header from `bytes` if the current chunk is exhausted.
+    ///
+    /// Returns `Ok(None)` when the chunk-length header isn't fully buffered yet (`*position`
+    /// is left unchanged so the caller can retry once more bytes arrive). Returns
+    /// `Ok(Some(false))` when the terminator was just consumed and the stream has reached its
+    /// end (`*position` advanced past the 4-byte terminator). Returns `Ok(Some(true))` when a
+    /// chunk with remaining payload bytes is active — either it was already active, or a new
+    /// chunk header was just consumed and `*position` advanced past it.
+    fn try_ensure_active_buffered_chunk(
+        &mut self,
+        bytes: &[u8],
+        position: &mut usize,
+    ) -> TdsResult<Option<bool>> {
+        if self.reached_end {
+            return Ok(Some(false));
+        }
+        if self.chunk_remaining > 0 {
+            return Ok(Some(true));
+        }
+
+        let Some(end) = position.checked_add(4) else {
+            return Err(crate::error::Error::ProtocolError(
+                "Buffered PLP position overflowed".to_string(),
+            ));
+        };
+        let Some(header) = bytes.get(*position..end) else {
+            return Ok(None);
+        };
+        let chunk_len = u32::from_le_bytes(header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP chunk header".to_string())
+        })?) as usize;
+        *position = end;
+        self.accept_chunk_length(chunk_len).map(Some)
+    }
+
+    /// Core buffered-read loop shared by the dry-run probe and the real copy in
+    /// `try_read_buffered`; advances `self`'s chunk cursor (`chunk_remaining`, `total_read`,
+    /// `reached_end`) regardless of whether `out` is provided.
+    ///
+    /// `out_len` is the number of payload bytes the caller ultimately wants. `out` is `None`
+    /// for a dry run that only validates enough bytes are buffered to satisfy `out_len`
+    /// (still consuming chunk headers and advancing state) and `Some` to also copy payload
+    /// into the destination. Returns `Ok(None)` when a chunk-length header needed to make
+    /// progress isn't fully buffered yet. Returns `Ok(Some((consumed, written)))` where
+    /// `consumed` is the number of input `bytes` consumed and `written` is the number of
+    /// payload bytes produced (less than `out_len` if the stream reached its end first). When
+    /// `written == out_len` and the current chunk is exhausted but the stream hasn't ended,
+    /// also peeks ahead to confirm the next chunk's length header is buffered, so a
+    /// successful result never requires "un-consuming" state on a later call.
+    fn try_read_buffered_inner(
+        &mut self,
+        bytes: &[u8],
+        mut out: Option<&mut [u8]>,
+        out_len: usize,
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let mut position = 0;
+        if out_len == 0 {
+            return match self.try_ensure_active_buffered_chunk(bytes, &mut position)? {
+                Some(_) => Ok(Some((position, 0))),
+                None => Ok(None),
+            };
+        }
+
+        let mut written = 0;
+        while written < out_len {
+            let Some(active) = self.try_ensure_active_buffered_chunk(bytes, &mut position)? else {
+                return Ok(None);
+            };
+            if !active {
+                break;
+            }
+
+            let to_read = std::cmp::min(out_len - written, self.chunk_remaining);
+            let Some(end) = position.checked_add(to_read) else {
+                return Err(crate::error::Error::ProtocolError(
+                    "Buffered PLP position overflowed".to_string(),
+                ));
+            };
+            let Some(payload) = bytes.get(position..end) else {
+                return Ok(None);
+            };
+            if let Some(output) = out.as_deref_mut() {
+                let Some(target) = output.get_mut(written..written + to_read) else {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Buffered PLP output range was unavailable".to_string(),
+                    ));
+                };
+                target.copy_from_slice(payload);
+            }
+            position = end;
+            self.chunk_remaining -= to_read;
+            self.total_read += to_read;
+            written += to_read;
+        }
+
+        if written == out_len && self.chunk_remaining == 0 && !self.reached_end {
+            let Some(_) = self.try_ensure_active_buffered_chunk(bytes, &mut position)? else {
+                return Ok(None);
+            };
+        }
+
+        Ok(Some((position, written)))
+    }
+
+    /// Reads as much PLP payload as fits in `out` from already-buffered `bytes`, without
+    /// partially mutating `self` when the data isn't fully buffered.
+    ///
+    /// First dry-runs `try_read_buffered_inner` on a cloned reader to confirm every chunk
+    /// header needed to satisfy `out` is buffered; only if that succeeds does it re-run for
+    /// real on `self`, copying payload into `out`. Returns `Ok(None)` when the dry run
+    /// reports missing data (not ready; `self` left unchanged). Returns `Ok(Some((consumed,
+    /// written)))` — see `try_read_buffered_inner` for field semantics.
+    fn try_read_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let out_len = out.len();
+        let mut probe = self.clone();
+        if probe
+            .try_read_buffered_inner(bytes, None, out_len)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.try_read_buffered_inner(bytes, Some(out), out_len)
     }
 
     pub(crate) fn total_read(&self) -> usize {
@@ -372,58 +766,7 @@ impl PlpChunkStreamReader {
         }
 
         let chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
-        if chunk_len == 0 {
-            self.reached_end = true;
-            if let PlpChunkReadLength::Known(known_len) = self.length
-                && self.total_read != known_len as usize
-            {
-                return Err(crate::error::Error::ProtocolError(format!(
-                    "PLP stream ended before declared length was reached: total_read={}, declared_len={known_len}",
-                    self.total_read
-                )));
-            }
-            return Ok(false);
-        }
-
-        self.chunks_seen += 1;
-        if self.chunks_seen > GenericDecoder::MAX_PLP_CHUNKS {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "Too many PLP chunks: {} (max {})",
-                self.chunks_seen,
-                GenericDecoder::MAX_PLP_CHUNKS
-            )));
-        }
-
-        if chunk_len > GenericDecoder::MAX_PLP_CHUNK_SIZE {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "PLP chunk size {chunk_len} exceeds maximum allowed chunk size of {} bytes",
-                GenericDecoder::MAX_PLP_CHUNK_SIZE
-            )));
-        }
-
-        let next_total = self.total_read.checked_add(chunk_len).ok_or_else(|| {
-            crate::error::Error::ProtocolError(format!(
-                "PLP chunk accumulation would overflow capacity: {} + {chunk_len}",
-                self.total_read
-            ))
-        })?;
-
-        if next_total > MAX_PLP_SIZE {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "PLP accumulated size {next_total} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
-            )));
-        }
-
-        if let PlpChunkReadLength::Known(known_len) = self.length
-            && next_total > known_len as usize
-        {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "PLP chunk exceeds declared length: accumulated={next_total}, declared_len={known_len}"
-            )));
-        }
-
-        self.chunk_remaining = chunk_len;
-        Ok(true)
+        self.accept_chunk_length(chunk_len)
     }
 
     pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
@@ -547,6 +890,54 @@ impl PlpColumnStream {
         }))
     }
 
+    /// Validates `metadata` is a PLP-capable type, then attempts to parse the 8-byte PLP
+    /// header from already-buffered `bytes`.
+    ///
+    /// See [`PlpChunkStreamReader::try_begin_buffered`] for the exact semantics: `Ok(None)`
+    /// not ready (header not fully buffered), `Ok(Some((None, used)))` SQL NULL,
+    /// `Ok(Some((Some(stream), used)))` a stream ready for buffered reads, with `used` the
+    /// header bytes consumed either way. Returns `Err` when `metadata` isn't PLP-capable.
+    pub(crate) fn try_begin_buffered(
+        metadata: &ColumnMetadata,
+        bytes: &[u8],
+    ) -> TdsResult<Option<(Option<Self>, usize)>> {
+        let (plp_type, collation) = Self::type_from_metadata(metadata)?;
+        let Some((inner, used)) = PlpChunkStreamReader::try_begin_buffered(bytes)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            inner.map(|inner| Self {
+                plp_type,
+                collation,
+                inner,
+            }),
+            used,
+        )))
+    }
+
+    /// Delegates to [`PlpChunkStreamReader::try_read_complete_buffered`] — attempts to decode
+    /// this column's entire known-length, single-chunk PLP value from buffered `bytes` in one
+    /// call. See that method for the exact `Ok(None)` / `Ok(Some((consumed, payload_len)))`
+    /// semantics.
+    pub(crate) fn try_read_complete_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        self.inner.try_read_complete_buffered(bytes, out)
+    }
+
+    /// Delegates to [`PlpChunkStreamReader::try_read_buffered`] — reads as much payload as
+    /// fits in `out` from already-buffered `bytes`. Returns `Ok(None)` when a needed chunk
+    /// header isn't fully buffered yet (not ready), otherwise `Ok(Some((consumed, written)))`.
+    pub(crate) fn try_read_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        self.inner.try_read_buffered(bytes, out)
+    }
+
     /// The PLP-capable SQL Server type for this column.
     pub(crate) fn plp_type(&self) -> PartialLengthType {
         self.plp_type
@@ -606,16 +997,769 @@ impl PlpColumnStream {
 }
 
 impl GenericDecoder {
+    /// Decodes a complete buffered `sql_variant`, retaining its wire base type.
+    ///
+    /// Only fixed-width and character bases are handled synchronously. Other
+    /// valid shapes return `None` without consuming bytes and use the async path.
+    pub(crate) fn try_decode_buffered_variant(
+        &self,
+        bytes: &[u8],
+    ) -> TdsResult<Option<(Option<TdsDataType>, ColumnValues, usize)>> {
+        let mut outer = BufferedSlice::new(bytes);
+        let Some(length) = outer.u32() else {
+            return Ok(None);
+        };
+        if length == 0 {
+            return Ok(Some((None, ColumnValues::Null, outer.position)));
+        }
+        let Some(payload) = outer.take_slice(length as usize) else {
+            return Ok(None);
+        };
+        let mut reader = BufferedSlice::new(payload);
+        let Some(base_byte) = reader.byte() else {
+            return Ok(None);
+        };
+        let base = TdsDataType::try_from(base_byte)?;
+        let Some(property_bytes) = reader.byte() else {
+            return Ok(None);
+        };
+        let data_length = usize::try_from(length)
+            .ok()
+            .and_then(|length| length.checked_sub(2 + usize::from(property_bytes)))
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(format!(
+                    "SQL_VARIANT data length calculation underflow: length={length}, prop_bytes={property_bytes}"
+                ))
+            })?;
+
+        let value = match property_bytes {
+            0 => {
+                let Ok(fixed_type) = FixedLengthTypes::try_from(base) else {
+                    return Ok(None);
+                };
+                let metadata = ColumnMetadata {
+                    user_type: 0,
+                    flags: 0,
+                    type_info: TypeInfo {
+                        tds_type: base,
+                        length: data_length,
+                        type_info_variant: TypeInfoVariant::FixedLen(fixed_type),
+                    },
+                    data_type: base,
+                    column_name: String::new(),
+                    multi_part_name: None,
+                    crypto_metadata: None,
+                };
+                let Some((value, used)) =
+                    self.try_decode_buffered(&payload[reader.position..], &metadata)?
+                else {
+                    return Ok(None);
+                };
+                if used != data_length {
+                    return Ok(None);
+                }
+                reader.position += used;
+                value
+            }
+            7 if matches!(
+                base,
+                TdsDataType::BigVarChar
+                    | TdsDataType::BigChar
+                    | TdsDataType::NVarChar
+                    | TdsDataType::NChar
+            ) =>
+            {
+                let Some(collation_bytes) = reader.take::<5>() else {
+                    return Ok(None);
+                };
+                let Some(_max_length) = reader.u16() else {
+                    return Ok(None);
+                };
+                let Some(value_bytes) = reader.take_slice(data_length) else {
+                    return Ok(None);
+                };
+                let encoding = if matches!(base, TdsDataType::NVarChar | TdsDataType::NChar) {
+                    EncodingType::Utf16
+                } else {
+                    let collation: SqlCollation = collation_bytes.as_slice().try_into()?;
+                    if collation.utf8() {
+                        EncodingType::Utf8
+                    } else {
+                        EncodingType::LcidBased(collation)
+                    }
+                };
+                ColumnValues::String(SqlString::new(value_bytes.to_vec(), encoding))
+            }
+            _ => return Ok(None),
+        };
+        if reader.position != payload.len() {
+            return Ok(None);
+        }
+        Ok(Some((Some(base), value, outer.position)))
+    }
+
+    /// Decodes one complete non-PLP column from `bytes` without awaiting.
+    ///
+    /// `None` means the buffered bytes are incomplete or this type still
+    /// requires the async decoder. The caller must consume `used` bytes only
+    /// after receiving `Some`, so a miss is non-destructive.
+    ///
+    /// Each supported arm must remain wire-compatible with [`Self::decode_into`].
+    pub(crate) fn try_decode_buffered(
+        &self,
+        bytes: &[u8],
+        metadata: &ColumnMetadata,
+    ) -> TdsResult<Option<(ColumnValues, usize)>> {
+        if metadata.is_plp() || metadata.crypto_metadata.is_some() {
+            return Ok(None);
+        }
+
+        let mut reader = BufferedSlice::new(bytes);
+        let value = match metadata.data_type {
+            TdsDataType::Int1 => ColumnValues::TinyInt(match reader.byte() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Int2 => ColumnValues::SmallInt(match reader.i16() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Int4 => ColumnValues::Int(match reader.i32() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Int8 => ColumnValues::BigInt(match reader.i64() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Flt4 => ColumnValues::Real(match reader.f32() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Flt8 => ColumnValues::Float(match reader.f64() {
+                Some(value) => value,
+                None => return Ok(None),
+            }),
+            TdsDataType::Bit => ColumnValues::Bit(match reader.byte() {
+                Some(value) => value == 1,
+                None => return Ok(None),
+            }),
+            TdsDataType::IntN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    1 => ColumnValues::TinyInt(match reader.byte() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    2 => ColumnValues::SmallInt(match reader.i16() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    4 => ColumnValues::Int(match reader.i32() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    8 => ColumnValues::BigInt(match reader.i64() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    _ => {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid IntN length: {length}"
+                        )));
+                    }
+                }
+            }
+            TdsDataType::FltN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    4 => ColumnValues::Real(match reader.f32() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                    _ => ColumnValues::Float(match reader.f64() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    }),
+                }
+            }
+            TdsDataType::BitN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    _ => ColumnValues::Bit(match reader.byte() {
+                        Some(value) => value == 1,
+                        None => return Ok(None),
+                    }),
+                }
+            }
+            TdsDataType::Money4 => ColumnValues::SmallMoney(SqlSmallMoney {
+                int_val: match reader.i32() {
+                    Some(value) => value,
+                    None => return Ok(None),
+                },
+            }),
+            TdsDataType::Money => {
+                let Some(msb_part) = reader.i32() else {
+                    return Ok(None);
+                };
+                let Some(lsb_part) = reader.i32() else {
+                    return Ok(None);
+                };
+                ColumnValues::Money(SqlMoney { lsb_part, msb_part })
+            }
+            TdsDataType::MoneyN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    4 => ColumnValues::SmallMoney(SqlSmallMoney {
+                        int_val: match reader.i32() {
+                            Some(value) => value,
+                            None => return Ok(None),
+                        },
+                    }),
+                    8 => {
+                        let Some(msb_part) = reader.i32() else {
+                            return Ok(None);
+                        };
+                        let Some(lsb_part) = reader.i32() else {
+                            return Ok(None);
+                        };
+                        ColumnValues::Money(SqlMoney { lsb_part, msb_part })
+                    }
+                    _ => {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid MoneyN length: {length}"
+                        )));
+                    }
+                }
+            }
+            TdsDataType::DateTim4 => {
+                let Some(days) = reader.u16() else {
+                    return Ok(None);
+                };
+                let Some(time) = reader.u16() else {
+                    return Ok(None);
+                };
+                ColumnValues::SmallDateTime(SqlSmallDateTime { days, time })
+            }
+            TdsDataType::DateTime => {
+                let Some(days) = reader.i32() else {
+                    return Ok(None);
+                };
+                let Some(time) = reader.u32() else {
+                    return Ok(None);
+                };
+                ColumnValues::DateTime(SqlDateTime { days, time })
+            }
+            TdsDataType::DateTimeN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    4 => {
+                        let Some(days) = reader.u16() else {
+                            return Ok(None);
+                        };
+                        let Some(time) = reader.u16() else {
+                            return Ok(None);
+                        };
+                        ColumnValues::SmallDateTime(SqlSmallDateTime { days, time })
+                    }
+                    _ => {
+                        let Some(days) = reader.i32() else {
+                            return Ok(None);
+                        };
+                        let Some(time) = reader.u32() else {
+                            return Ok(None);
+                        };
+                        ColumnValues::DateTime(SqlDateTime { days, time })
+                    }
+                }
+            }
+            TdsDataType::DateN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                match length {
+                    0 => ColumnValues::Null,
+                    _ => ColumnValues::Date(SqlDate::unchecked_create(match reader.u24() {
+                        Some(value) => value,
+                        None => return Ok(None),
+                    })),
+                }
+            }
+            TdsDataType::TimeN | TdsDataType::DateTime2N | TdsDataType::DateTimeOffsetN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                if length == 0 {
+                    ColumnValues::Null
+                } else {
+                    let scale = metadata.get_scale().ok_or_else(|| {
+                        crate::error::Error::ImplementationError(format!(
+                            "{:?} type should have scale",
+                            metadata.data_type
+                        ))
+                    })?;
+                    let trailing = match metadata.data_type {
+                        TdsDataType::TimeN => 0,
+                        TdsDataType::DateTime2N => 3,
+                        TdsDataType::DateTimeOffsetN => 5,
+                        _ => {
+                            return Err(crate::error::Error::ImplementationError(
+                                "unexpected buffered time type".to_string(),
+                            ));
+                        }
+                    };
+                    let time_length = length.checked_sub(trailing).ok_or_else(|| {
+                        crate::error::Error::ProtocolError(format!(
+                            "Invalid {:?} length: {length}",
+                            metadata.data_type
+                        ))
+                    })?;
+                    let scaled = match time_length {
+                        3 => reader.u24().map(u64::from),
+                        4 => reader.u32().map(u64::from),
+                        _ => reader.u40(),
+                    };
+                    let Some(scaled) = scaled else {
+                        return Ok(None);
+                    };
+                    let time = SqlTime {
+                        time_nanoseconds: scale_time_value(scaled, scale),
+                        scale,
+                    };
+                    match metadata.data_type {
+                        TdsDataType::TimeN => ColumnValues::Time(time),
+                        TdsDataType::DateTime2N => {
+                            let Some(days) = reader.u24() else {
+                                return Ok(None);
+                            };
+                            ColumnValues::DateTime2(SqlDateTime2 { days, time })
+                        }
+                        TdsDataType::DateTimeOffsetN => {
+                            let Some(days) = reader.u24() else {
+                                return Ok(None);
+                            };
+                            let Some(offset) = reader.i16() else {
+                                return Ok(None);
+                            };
+                            ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                                datetime2: SqlDateTime2 { days, time },
+                                offset,
+                            })
+                        }
+                        _ => {
+                            return Err(crate::error::Error::ImplementationError(
+                                "unexpected buffered time type".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            TdsDataType::Guid => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                if length == 0 {
+                    ColumnValues::Null
+                } else {
+                    if length != 16 {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid GUID length: expected 16 bytes, got {length}"
+                        )));
+                    }
+                    let Some(bytes) = reader.take::<16>() else {
+                        return Ok(None);
+                    };
+                    ColumnValues::Uuid(uuid::Uuid::from_bytes_le(bytes))
+                }
+            }
+            TdsDataType::DecimalN | TdsDataType::NumericN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                let TypeInfoVariant::VarLenPrecisionScale(_, _, precision, scale) =
+                    metadata.type_info.type_info_variant
+                else {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid type info variant for Decimal/Numeric: expected VarLenPrecisionScale, got: {:?}",
+                        metadata.type_info.type_info_variant
+                    )));
+                };
+                if !decimal_metadata_is_valid(precision, scale) {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid decimal precision {precision} / scale {scale}"
+                    )));
+                }
+                if length == 0 {
+                    ColumnValues::Null
+                } else {
+                    let Some(sign) = reader.byte() else {
+                        return Ok(None);
+                    };
+                    let magnitude_len = usize::from(length - 1);
+                    let number_of_int_parts = magnitude_len.div_ceil(4);
+                    if number_of_int_parts > MAX_DECIMAL_INT_PARTS {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Decimal int parts {number_of_int_parts} exceeds maximum allowed {MAX_DECIMAL_INT_PARTS} (length was {length})"
+                        )));
+                    }
+                    let Some(source) = reader.take_slice(magnitude_len) else {
+                        return Ok(None);
+                    };
+                    let mut magnitude = [0u8; DECIMAL_MAGNITUDE_BYTES];
+                    magnitude[..magnitude_len].copy_from_slice(source);
+                    let value = DecimalParts::new(
+                        sign == 1,
+                        precision,
+                        scale,
+                        u128::from_le_bytes(magnitude),
+                    );
+                    if metadata.data_type == TdsDataType::DecimalN {
+                        ColumnValues::Decimal(value)
+                    } else {
+                        ColumnValues::Numeric(value)
+                    }
+                }
+            }
+            TdsDataType::NChar
+            | TdsDataType::NVarChar
+            | TdsDataType::BigChar
+            | TdsDataType::BigVarChar
+            | TdsDataType::Char
+            | TdsDataType::VarChar => {
+                let Some(length) = reader.u16() else {
+                    return Ok(None);
+                };
+                if length == u16::MAX {
+                    ColumnValues::Null
+                } else {
+                    let Some(bytes) = reader.take_bytes(usize::from(length)) else {
+                        return Ok(None);
+                    };
+                    ColumnValues::String(SqlString::new(bytes, get_encoding_type(metadata)))
+                }
+            }
+            TdsDataType::BigBinary | TdsDataType::BigVarBinary => {
+                let Some(length) = reader.u16() else {
+                    return Ok(None);
+                };
+                if length == u16::MAX {
+                    ColumnValues::Null
+                } else {
+                    let Some(bytes) = reader.take_bytes(usize::from(length)) else {
+                        return Ok(None);
+                    };
+                    ColumnValues::Bytes(bytes)
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some((value, reader.position)))
+    }
+
+    /// Decodes one complete non-PLP column directly into `writer`.
+    ///
+    /// Returns the consumed byte count, or `None` without writing when the
+    /// buffered value is incomplete or requires the async decoder.
+    pub(crate) fn try_decode_buffered_into<W: RowWriter + ?Sized>(
+        &self,
+        bytes: &[u8],
+        metadata: &ColumnMetadata,
+        col: usize,
+        writer: &mut W,
+    ) -> TdsResult<Option<usize>> {
+        if metadata.is_plp() || metadata.crypto_metadata.is_some() {
+            return Ok(None);
+        }
+
+        macro_rules! read {
+            ($reader:ident.$method:ident()) => {
+                match $reader.$method() {
+                    Some(value) => value,
+                    None => return Ok(None),
+                }
+            };
+        }
+
+        let mut reader = BufferedSlice::new(bytes);
+        match metadata.data_type {
+            TdsDataType::Int1 => writer.write_u8(col, read!(reader.byte())),
+            TdsDataType::Int2 => writer.write_i16(col, read!(reader.i16())),
+            TdsDataType::Int4 => writer.write_i32(col, read!(reader.i32())),
+            TdsDataType::Int8 => writer.write_i64(col, read!(reader.i64())),
+            TdsDataType::Flt4 => writer.write_f32(col, read!(reader.f32())),
+            TdsDataType::Flt8 => writer.write_f64(col, read!(reader.f64())),
+            TdsDataType::Bit => writer.write_bool(col, read!(reader.byte()) == 1),
+            TdsDataType::IntN => match read!(reader.byte()) {
+                0 => writer.write_null(col),
+                1 => writer.write_u8(col, read!(reader.byte())),
+                2 => writer.write_i16(col, read!(reader.i16())),
+                4 => writer.write_i32(col, read!(reader.i32())),
+                8 => writer.write_i64(col, read!(reader.i64())),
+                length => {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid IntN length: {length}"
+                    )));
+                }
+            },
+            TdsDataType::FltN => match read!(reader.byte()) {
+                0 => writer.write_null(col),
+                4 => writer.write_f32(col, read!(reader.f32())),
+                _ => writer.write_f64(col, read!(reader.f64())),
+            },
+            TdsDataType::BitN => match read!(reader.byte()) {
+                0 => writer.write_null(col),
+                _ => writer.write_bool(col, read!(reader.byte()) == 1),
+            },
+            TdsDataType::Money4 => writer.write_smallmoney(
+                col,
+                SqlSmallMoney {
+                    int_val: read!(reader.i32()),
+                },
+            ),
+            TdsDataType::Money => {
+                let msb_part = read!(reader.i32());
+                let lsb_part = read!(reader.i32());
+                writer.write_money(col, SqlMoney { lsb_part, msb_part });
+            }
+            TdsDataType::MoneyN => match read!(reader.byte()) {
+                0 => writer.write_null(col),
+                4 => writer.write_smallmoney(
+                    col,
+                    SqlSmallMoney {
+                        int_val: read!(reader.i32()),
+                    },
+                ),
+                8 => {
+                    let msb_part = read!(reader.i32());
+                    let lsb_part = read!(reader.i32());
+                    writer.write_money(col, SqlMoney { lsb_part, msb_part });
+                }
+                length => {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid MoneyN length: {length}"
+                    )));
+                }
+            },
+            TdsDataType::DateTim4 => {
+                let days = read!(reader.u16());
+                let time = read!(reader.u16());
+                writer.write_smalldatetime(col, SqlSmallDateTime { days, time });
+            }
+            TdsDataType::DateTime => {
+                let days = read!(reader.i32());
+                let time = read!(reader.u32());
+                writer.write_datetime(col, SqlDateTime { days, time });
+            }
+            TdsDataType::DateTimeN => match read!(reader.byte()) {
+                0 => writer.write_null(col),
+                4 => {
+                    let days = read!(reader.u16());
+                    let time = read!(reader.u16());
+                    writer.write_smalldatetime(col, SqlSmallDateTime { days, time });
+                }
+                _ => {
+                    let days = read!(reader.i32());
+                    let time = read!(reader.u32());
+                    writer.write_datetime(col, SqlDateTime { days, time });
+                }
+            },
+            TdsDataType::DateN => match read!(reader.byte()) {
+                0 => writer.write_null(col),
+                _ => writer.write_date(col, SqlDate::unchecked_create(read!(reader.u24()))),
+            },
+            TdsDataType::TimeN | TdsDataType::DateTime2N | TdsDataType::DateTimeOffsetN => {
+                let length = read!(reader.byte());
+                if length == 0 {
+                    writer.write_null(col);
+                } else {
+                    let scale = metadata.get_scale().ok_or_else(|| {
+                        crate::error::Error::ImplementationError(format!(
+                            "{:?} type should have scale",
+                            metadata.data_type
+                        ))
+                    })?;
+                    let trailing = match metadata.data_type {
+                        TdsDataType::TimeN => 0,
+                        TdsDataType::DateTime2N => 3,
+                        TdsDataType::DateTimeOffsetN => 5,
+                        _ => {
+                            return Err(crate::error::Error::ImplementationError(
+                                "unexpected buffered time type".to_string(),
+                            ));
+                        }
+                    };
+                    let time_length = length.checked_sub(trailing).ok_or_else(|| {
+                        crate::error::Error::ProtocolError(format!(
+                            "Invalid {:?} length: {length}",
+                            metadata.data_type
+                        ))
+                    })?;
+                    let scaled = match time_length {
+                        3 => read!(reader.u24()).into(),
+                        4 => read!(reader.u32()).into(),
+                        _ => read!(reader.u40()),
+                    };
+                    let time = SqlTime {
+                        time_nanoseconds: scale_time_value(scaled, scale),
+                        scale,
+                    };
+                    match metadata.data_type {
+                        TdsDataType::TimeN => writer.write_time(col, time),
+                        TdsDataType::DateTime2N => writer.write_datetime2(
+                            col,
+                            SqlDateTime2 {
+                                days: read!(reader.u24()),
+                                time,
+                            },
+                        ),
+                        TdsDataType::DateTimeOffsetN => writer.write_datetimeoffset(
+                            col,
+                            SqlDateTimeOffset {
+                                datetime2: SqlDateTime2 {
+                                    days: read!(reader.u24()),
+                                    time,
+                                },
+                                offset: read!(reader.i16()),
+                            },
+                        ),
+                        _ => {
+                            return Err(crate::error::Error::ImplementationError(
+                                "unexpected buffered time type".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            TdsDataType::Guid => {
+                let length = read!(reader.byte());
+                if length == 0 {
+                    writer.write_null(col);
+                } else {
+                    if length != 16 {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Invalid GUID length: expected 16 bytes, got {length}"
+                        )));
+                    }
+                    let Some(bytes) = reader.take::<16>() else {
+                        return Ok(None);
+                    };
+                    writer.write_uuid(col, uuid::Uuid::from_bytes_le(bytes));
+                }
+            }
+            TdsDataType::DecimalN | TdsDataType::NumericN => {
+                let length = read!(reader.byte());
+                let TypeInfoVariant::VarLenPrecisionScale(_, _, precision, scale) =
+                    metadata.type_info.type_info_variant
+                else {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid type info variant for Decimal/Numeric: expected VarLenPrecisionScale, got: {:?}",
+                        metadata.type_info.type_info_variant
+                    )));
+                };
+                if !decimal_metadata_is_valid(precision, scale) {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid decimal precision {precision} / scale {scale}"
+                    )));
+                }
+                if length == 0 {
+                    writer.write_null(col);
+                } else {
+                    let sign = read!(reader.byte());
+                    let magnitude_len = usize::from(length - 1);
+                    let number_of_int_parts = magnitude_len.div_ceil(4);
+                    if number_of_int_parts > MAX_DECIMAL_INT_PARTS {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Decimal int parts {number_of_int_parts} exceeds maximum allowed {MAX_DECIMAL_INT_PARTS} (length was {length})"
+                        )));
+                    }
+                    let Some(source) = reader.take_slice(magnitude_len) else {
+                        return Ok(None);
+                    };
+                    let mut magnitude = [0u8; DECIMAL_MAGNITUDE_BYTES];
+                    magnitude[..magnitude_len].copy_from_slice(source);
+                    let value = DecimalParts::new(
+                        sign == 1,
+                        precision,
+                        scale,
+                        u128::from_le_bytes(magnitude),
+                    );
+                    if metadata.data_type == TdsDataType::DecimalN {
+                        writer.write_decimal(col, value);
+                    } else {
+                        writer.write_numeric(col, value);
+                    }
+                }
+            }
+            TdsDataType::NChar
+            | TdsDataType::NVarChar
+            | TdsDataType::BigChar
+            | TdsDataType::BigVarChar
+            | TdsDataType::Char
+            | TdsDataType::VarChar => {
+                let length = read!(reader.u16());
+                if length == u16::MAX {
+                    writer.write_null(col);
+                } else {
+                    let Some(bytes) = reader.take_slice(usize::from(length)) else {
+                        return Ok(None);
+                    };
+                    writer.write_string(col, Cow::Borrowed(bytes), get_encoding_type(metadata));
+                }
+            }
+            TdsDataType::BigBinary | TdsDataType::BigVarBinary => {
+                let length = read!(reader.u16());
+                if length == u16::MAX {
+                    writer.write_null(col);
+                } else {
+                    let Some(bytes) = reader.take_slice(usize::from(length)) else {
+                        return Ok(None);
+                    };
+                    writer.write_bytes(col, Cow::Borrowed(bytes));
+                }
+            }
+            TdsDataType::SsVariant => {
+                let Some((base, value, used)) = self.try_decode_buffered_variant(bytes)? else {
+                    return Ok(None);
+                };
+                if let Some(base) = base {
+                    writer.write_variant_base_type(col, base);
+                }
+                write_column_value(writer, col, value);
+                return Ok(Some(used));
+            }
+            _ => {
+                let Some((value, used)) = self.try_decode_buffered(bytes, metadata)? else {
+                    return Ok(None);
+                };
+                write_column_value(writer, col, value);
+                return Ok(Some(used));
+            }
+        }
+        Ok(Some(reader.position))
+    }
+
     #[cfg(test)]
     const SHORTLEN_MAXVALUE: usize = 65535;
     const SQL_PLP_NULL: usize = 0xffffffffffffffff;
     const SQL_PLP_UNKNOWNLEN: usize = 0xfffffffffffffffe;
     #[cfg_attr(not(test), allow(dead_code))]
     const SQL_PLP_MAXLEN: usize = 0xfffffffffffffffd;
-    #[cfg(fuzzing)]
-    const MAX_PLP_CHUNKS: u32 = 1000;
-    #[cfg(not(fuzzing))]
-    const MAX_PLP_CHUNKS: u32 = 100000;
     #[cfg(fuzzing)]
     const MAX_PLP_CHUNK_SIZE: usize = 8 * 1024;
     #[cfg(not(fuzzing))]
@@ -892,30 +2036,8 @@ impl GenericDecoder {
             _ => read_sync_first!(reader, try_read_uint40, read_uint40),
         };
 
-        // The value from SQL Server is in scaled units based on the scale:
-        // Scale 0: seconds (need to multiply by 10^7)
-        // Scale 1: tenths of seconds (multiply by 10^6)
-        // Scale 2: hundredths (multiply by 10^5)
-        // Scale 3: milliseconds (multiply by 10^4)
-        // Scale 4: ten-thousandths (multiply by 10^3)
-        // Scale 5: hundred-thousandths (multiply by 10^2)
-        // Scale 6: microseconds (multiply by 10^1)
-        // Scale 7: 100-nanoseconds (multiply by 10^0 = no scaling)
-        // We need to convert to 100-nanosecond units for consistency
-        let time_nanoseconds = match scale {
-            0 => scaled_value * 10_000_000, // Seconds to 100ns
-            1 => scaled_value * 1_000_000,  // Tenths to 100ns
-            2 => scaled_value * 100_000,    // Hundredths to 100ns
-            3 => scaled_value * 10_000,     // Milliseconds to 100ns
-            4 => scaled_value * 1_000,      // Ten-thousandths to 100ns
-            5 => scaled_value * 100,        // Hundred-thousandths to 100ns
-            6 => scaled_value * 10,         // Microseconds to 100ns
-            7 => scaled_value,              // Already in 100ns
-            _ => scaled_value,              // Fallback
-        };
-
         Ok(SqlTime {
-            time_nanoseconds,
+            time_nanoseconds: scale_time_value(scaled_value, scale),
             scale,
         })
     }
@@ -1189,55 +2311,72 @@ impl GenericDecoder {
         T: TdsPacketReader + Send + Sync,
     {
         let mut plp_buffer = Vec::new();
-        let mut vector_capacity: usize = 0;
+        let mut total_len: usize = 0;
         let mut chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
-        let mut offset: usize = 0;
+        #[cfg(fuzzing)]
         let mut chunk_count = 0u32;
 
         while chunk_len > 0 {
-            chunk_count += 1;
-
             #[cfg(fuzzing)]
             {
+                chunk_count += 1;
                 eprintln!(
-                    "[ALLOC] read_plp_chunks_unknown_len: chunk #{chunk_count}, chunk_len={chunk_len}, total_capacity={vector_capacity}"
+                    "[ALLOC] read_plp_chunks_unknown_len: chunk #{chunk_count}, chunk_len={chunk_len}, total_len={total_len}"
                 );
             }
 
-            Self::check_plp_chunk(chunk_count, chunk_len)?;
+            Self::check_plp_chunk(chunk_len)?;
 
             // Use checked_add to prevent capacity overflow
-            vector_capacity = vector_capacity.checked_add(chunk_len).ok_or_else(|| {
+            total_len = total_len.checked_add(chunk_len).ok_or_else(|| {
                 crate::error::Error::ProtocolError(format!(
-                    "PLP chunk accumulation would overflow capacity: {vector_capacity} + {chunk_len}"
+                    "PLP chunk accumulation would overflow capacity: {total_len} + {chunk_len}"
                 ))
             })?;
             // Validate against MAX_PLP_SIZE after accumulation
-            if vector_capacity > MAX_PLP_SIZE {
+            if total_len > MAX_PLP_SIZE {
                 return Err(crate::error::Error::ProtocolError(format!(
-                    "PLP accumulated size {vector_capacity} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
+                    "PLP accumulated size {total_len} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
                 )));
             }
-            plp_buffer.resize(vector_capacity, 0);
 
-            offset += reader
-                .read_bytes(&mut plp_buffer[offset..offset + chunk_len])
+            // Read into the buffer's spare capacity rather than growing it with
+            // `resize`. Resizing to the exact new length once per chunk
+            // zero-fills every byte immediately before the read overwrites it,
+            // and SQL Server sends `varbinary(max)` in 8000-byte chunks, so a
+            // multi-gigabyte value repeats that hundreds of thousands of times.
+            plp_buffer.reserve(chunk_len);
+            let read = reader
+                .read_bytes_uninit(&mut plp_buffer.spare_capacity_mut()[..chunk_len])
                 .await?;
+            if read != chunk_len {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP chunk read returned {read} byte(s) but the chunk header declared {chunk_len}"
+                )));
+            }
+            let new_len = plp_buffer.len() + chunk_len;
+            // SAFETY: `read_bytes_uninit` returned `Ok(chunk_len)`, so by its
+            // documented contract it initialized the first `chunk_len` bytes of
+            // the spare capacity reserved above.
+            unsafe { plp_buffer.set_len(new_len) };
+
             chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
         }
 
         Ok(plp_buffer)
     }
 
-    /// Validates a PLP chunk header against the per-value chunk limits.
-    fn check_plp_chunk(chunk_count: u32, chunk_len: usize) -> TdsResult<()> {
-        if chunk_count > Self::MAX_PLP_CHUNKS {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "Too many PLP chunks: {chunk_count} (max {})",
-                Self::MAX_PLP_CHUNKS
-            )));
-        }
-
+    /// Validates a PLP chunk header against the per-chunk size limit.
+    ///
+    /// There is deliberately no cap on the *number* of chunks. Every PLP loop
+    /// consumes a strictly positive `chunk_len` per iteration and is bounded by
+    /// a total-byte check (`MAX_PLP_SIZE`, the wire-declared length, or the
+    /// destination slice), so the work a peer can induce is already
+    /// proportional to the bytes it actually sends. A chunk *count* limit adds
+    /// no protection and silently caps the value size a client can read: SQL
+    /// Server emits `varbinary(max)` in 8000-byte chunks, so a 100 000-chunk
+    /// cap rejected any LOB above ~763 MB even though the protocol allows 2 GB.
+    fn check_plp_chunk(chunk_len: usize) -> TdsResult<()> {
         // Limit individual chunk size
         if chunk_len > Self::MAX_PLP_CHUNK_SIZE {
             return Err(crate::error::Error::ProtocolError(format!(
@@ -1289,16 +2428,19 @@ impl GenericDecoder {
     {
         let mut chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
         let mut offset: usize = 0;
+        #[cfg(fuzzing)]
         let mut chunk_count = 0u32;
 
         while chunk_len > 0 {
-            chunk_count += 1;
             #[cfg(fuzzing)]
-            eprintln!(
-                "[ALLOC] read_plp_chunks_into_slice: chunk #{chunk_count}, chunk_len={chunk_len}, wire_declared_len={declared_len}, destination_len={}",
-                dest.len()
-            );
-            Self::check_plp_chunk(chunk_count, chunk_len)?;
+            {
+                chunk_count += 1;
+                eprintln!(
+                    "[ALLOC] read_plp_chunks_into_slice: chunk #{chunk_count}, chunk_len={chunk_len}, wire_declared_len={declared_len}, destination_len={}",
+                    dest.len()
+                );
+            }
+            Self::check_plp_chunk(chunk_len)?;
 
             let end_offset = offset.checked_add(chunk_len).ok_or_else(|| {
                 crate::error::Error::ProtocolError(format!(
@@ -1472,9 +2614,13 @@ impl GenericDecoder {
                             "BigBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
                         )));
                     }
-                    let mut bytes = vec![0u8; length as usize];
-                    reader.read_bytes(&mut bytes).await?;
-                    writer.write_bytes(col, bytes);
+                    if let Some(bytes) = reader.try_read_slice(length as usize) {
+                        writer.write_bytes(col, Cow::Borrowed(bytes));
+                    } else {
+                        let mut bytes = vec![0u8; length as usize];
+                        reader.read_bytes(&mut bytes).await?;
+                        writer.write_bytes(col, Cow::Owned(bytes));
+                    }
                 }
             }
             TdsDataType::BigVarBinary => {
@@ -1491,13 +2637,15 @@ impl GenericDecoder {
                                     reader, dest, length,
                                 )
                                 .await,
-                                |bytes| writer.write_bytes(col, bytes),
+                                |bytes| writer.write_bytes(col, Cow::Owned(bytes)),
                             );
                         }
                         PlpFraming::Unknown => {
                             writer.write_bytes(
                                 col,
-                                GenericDecoder::read_plp_chunks_unknown_len(reader).await?,
+                                Cow::Owned(
+                                    GenericDecoder::read_plp_chunks_unknown_len(reader).await?,
+                                ),
                             );
                         }
                     }
@@ -1512,9 +2660,13 @@ impl GenericDecoder {
                                 "BigVarBinary length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
                             )));
                         }
-                        let mut bytes = vec![0u8; length as usize];
-                        reader.read_bytes(&mut bytes).await?;
-                        writer.write_bytes(col, bytes);
+                        if let Some(bytes) = reader.try_read_slice(length as usize) {
+                            writer.write_bytes(col, Cow::Borrowed(bytes));
+                        } else {
+                            let mut bytes = vec![0u8; length as usize];
+                            reader.read_bytes(&mut bytes).await?;
+                            writer.write_bytes(col, Cow::Owned(bytes));
+                        }
                     }
                 }
             }
@@ -1911,20 +3063,16 @@ impl SqlTypeDecode for GenericDecoder {
                 }
             }?,
             TdsDataType::Image => {
+                // Only a zero text-pointer length means NULL. A present pointer
+                // with zero data bytes is empty, as in the TEXT/NTEXT branch.
                 let text_ptr_len = read_sync_first!(reader, try_read_byte, read_byte) as usize;
-
-                let length = if text_ptr_len > 0 {
+                if text_ptr_len == 0 {
+                    ColumnValues::Null
+                } else {
                     const TIMESTAMP_BYTE_COUNT: usize = 8;
                     reader.skip_bytes(text_ptr_len).await?;
                     reader.skip_bytes(TIMESTAMP_BYTE_COUNT).await?;
-                    read_sync_first!(reader, try_read_uint32, read_uint32) as usize
-                } else {
-                    0
-                };
-
-                if length == 0 {
-                    ColumnValues::Null
-                } else {
+                    let length = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
                     if length > MAX_ALLOC_SIZE {
                         return Err(crate::error::Error::ProtocolError(format!(
                             "Image length {length} exceeds maximum allowed size of {MAX_ALLOC_SIZE} bytes"
@@ -2020,12 +3168,12 @@ impl StringDecoder {
                         length,
                         |dest| GenericDecoder::read_plp_chunks_into_slice(reader, dest, length)
                             .await,
-                        |bytes| writer.write_string(col, SqlString::new(bytes, encoding_type)),
+                        |bytes| writer.write_string(col, Cow::Owned(bytes), encoding_type),
                     );
                 }
                 PlpFraming::Unknown => {
                     let bytes = GenericDecoder::read_plp_chunks_unknown_len(reader).await?;
-                    writer.write_string(col, SqlString::new(bytes, encoding_type));
+                    writer.write_string(col, Cow::Owned(bytes), encoding_type);
                 }
             }
         } else if Self::is_long_len_type(metadata.data_type) {
@@ -2047,22 +3195,24 @@ impl StringDecoder {
                 )));
             }
 
-            let sql_string = if length == 0 {
-                SqlString::new(Vec::new(), encoding_type)
+            let bytes = if length == 0 {
+                Vec::new()
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
-                SqlString::new(buffer, encoding_type)
+                buffer
             };
-            writer.write_string(col, sql_string);
+            writer.write_string(col, Cow::Owned(bytes), encoding_type);
         } else {
             let length = read_sync_first!(reader, try_read_uint16, read_uint16) as usize;
             if length == 0xFFFF {
                 writer.write_null(col);
+            } else if let Some(bytes) = reader.try_read_slice(length) {
+                writer.write_string(col, Cow::Borrowed(bytes), encoding_type);
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
-                writer.write_string(col, SqlString::new(buffer, encoding_type));
+                writer.write_string(col, Cow::Owned(buffer), encoding_type);
             }
         }
         Ok(())
@@ -2600,10 +3750,20 @@ mod test {
     use crate::datatypes::{
         column_values::ColumnValues,
         decoder::{
-            DecimalParts, GenericDecoder, MAX_ALLOC_SIZE, StringDecoder, validate_alloc_size,
+            DecimalParts, GenericDecoder, MAX_ALLOC_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
+            StringDecoder, validate_alloc_size,
         },
         sqldatatypes::TdsDataType,
     };
+
+    fn legacy_lob_wire(payload: &[u8]) -> Vec<u8> {
+        let mut wire = vec![16u8];
+        wire.extend_from_slice(&[0u8; 16]); // textptr
+        wire.extend_from_slice(&[0u8; 8]); // timestamp
+        wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        wire.extend_from_slice(payload);
+        wire
+    }
 
     #[test]
     fn test_f64_conversion() {
@@ -2635,6 +3795,73 @@ mod test {
         let parts = DecimalParts::new(true, 1, 0, magnitude);
 
         assert_eq!(expected, parts.to_f64());
+    }
+
+    #[test]
+    fn empty_buffered_plp_consumes_only_its_single_terminator() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(0));
+        let mut out = [];
+
+        assert_eq!(
+            stream
+                .try_read_complete_buffered(&[0; 8], &mut out)
+                .unwrap(),
+            Some((4, 0))
+        );
+        assert!(stream.reached_end());
+    }
+
+    #[test]
+    fn buffered_plp_chunks_continue_an_active_stream() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(10));
+        let mut first = Vec::from(10_u32.to_le_bytes());
+        first.extend(0_u8..10);
+        first.extend(0_u32.to_le_bytes());
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            stream.try_read_buffered(&first, &mut out).unwrap(),
+            Some((8, 4))
+        );
+        assert_eq!(out, [0, 1, 2, 3]);
+        assert_eq!(stream.total_read(), 4);
+        assert!(!stream.reached_end());
+
+        let remaining = &first[8..];
+        assert_eq!(
+            stream.try_read_buffered(remaining, &mut out).unwrap(),
+            Some((4, 4))
+        );
+        assert_eq!(out, [4, 5, 6, 7]);
+
+        assert_eq!(
+            stream.try_read_buffered(&remaining[4..], &mut out).unwrap(),
+            Some((6, 2))
+        );
+        assert_eq!(&out[..2], &[8, 9]);
+        assert_eq!(stream.total_read(), 10);
+        assert!(stream.reached_end());
+    }
+
+    #[test]
+    fn incomplete_buffered_plp_chunk_does_not_advance() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+        let mut bytes = Vec::from(4_u32.to_le_bytes());
+        bytes.extend([1, 2]);
+        let mut out = [0_u8; 4];
+
+        assert_eq!(stream.try_read_buffered(&bytes, &mut out).unwrap(), None);
+        assert_eq!(stream.total_read(), 0);
+        assert!(!stream.reached_end());
+
+        bytes.extend([3, 4]);
+        bytes.extend(0_u32.to_le_bytes());
+        assert_eq!(
+            stream.try_read_buffered(&bytes, &mut out).unwrap(),
+            Some((12, 4))
+        );
+        assert_eq!(out, [1, 2, 3, 4]);
+        assert!(stream.reached_end());
     }
 
     #[test]
@@ -3634,30 +4861,51 @@ mod test {
     mod decode_into_tests {
 
         use byteorder::{ByteOrder, LittleEndian};
+        use std::borrow::Cow;
 
         use crate::core::TdsResult;
-        use crate::datatypes::column_values::{ColumnValues, SqlDateTime, SqlSmallDateTime};
+        use crate::datatypes::column_values::{
+            ColumnValues, SqlDateTime, SqlMoney, SqlSmallDateTime, SqlTime,
+        };
         use crate::datatypes::decoder::{
-            GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
+            DecimalParts, GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
             PlpColumnStream, SqlTypeDecode,
         };
-        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
+        use crate::datatypes::sql_string::EncodingType;
         use crate::datatypes::sqldatatypes::{
             PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, VariableLengthTypes,
         };
         use crate::io::packet_reader::TdsPacketReader;
         use crate::query::metadata::ColumnMetadata;
+        use crate::token::tokens::SqlCollation;
 
         /// Byte-buffer backed mock implementing every `TdsPacketReader` method
         /// used by the decoder.
         pub(super) struct ByteReader {
             data: Vec<u8>,
             pos: usize,
+            // Set to model a value that straddles a packet, so the decoder has to
+            // take the owned arm even though the bytes are present here.
+            deny_slices: bool,
         }
 
         impl ByteReader {
             pub(super) fn new(data: Vec<u8>) -> Self {
-                Self { data, pos: 0 }
+                Self {
+                    data,
+                    pos: 0,
+                    deny_slices: false,
+                }
+            }
+
+            /// A reader that never hands out a borrow, forcing the owned path.
+            pub(super) fn new_unbuffered(data: Vec<u8>) -> Self {
+                Self {
+                    data,
+                    pos: 0,
+                    deny_slices: true,
+                }
             }
 
             fn take(&mut self, n: usize) -> TdsResult<&[u8]> {
@@ -3681,6 +4929,18 @@ mod test {
         }
 
         impl TdsPacketReader for ByteReader {
+            fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+                if self.deny_slices {
+                    return None;
+                }
+                let end = self.pos.checked_add(length)?;
+                if end > self.data.len() {
+                    return None;
+                }
+                let start = self.pos;
+                self.pos = end;
+                Some(&self.data[start..end])
+            }
             fn try_read_byte(&mut self) -> Option<u8> {
                 self.try_take().map(|[value]| value)
             }
@@ -3832,6 +5092,289 @@ mod test {
             }
         }
 
+        fn buffered_value(bytes: &[u8], metadata: &ColumnMetadata) -> (ColumnValues, usize) {
+            GenericDecoder::default()
+                .try_decode_buffered(bytes, metadata)
+                .unwrap()
+                .expect("complete buffered value")
+        }
+
+        #[test]
+        fn buffered_decode_intn_handles_null_value_and_partial_payload() {
+            let metadata = varlen_metadata(TdsDataType::IntN, 4);
+            assert_eq!(buffered_value(&[0], &metadata), (ColumnValues::Null, 1));
+            assert_eq!(
+                GenericDecoder::default()
+                    .try_decode_buffered(&[4, 0x78, 0x56], &metadata)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                buffered_value(&[4, 0x78, 0x56, 0x34, 0x12], &metadata),
+                (ColumnValues::Int(0x1234_5678), 5)
+            );
+        }
+
+        #[test]
+        fn buffered_decode_money_preserves_wire_word_order() {
+            let metadata = fixed_metadata(TdsDataType::Money, 8);
+            let mut bytes = 7_i32.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&11_i32.to_le_bytes());
+            assert_eq!(
+                buffered_value(&bytes, &metadata),
+                (
+                    ColumnValues::Money(SqlMoney {
+                        lsb_part: 11,
+                        msb_part: 7,
+                    }),
+                    8,
+                )
+            );
+        }
+
+        #[test]
+        fn buffered_decode_time_applies_fractional_scale() {
+            let metadata = ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::TimeN,
+                type_info: TypeInfo::var_len_scale(TdsDataType::TimeN, 4, 3).unwrap(),
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            };
+            let mut bytes = vec![4];
+            bytes.extend_from_slice(&1234_u32.to_le_bytes());
+            assert_eq!(
+                buffered_value(&bytes, &metadata),
+                (
+                    ColumnValues::Time(SqlTime {
+                        time_nanoseconds: 12_340_000,
+                        scale: 3,
+                    }),
+                    5,
+                )
+            );
+        }
+
+        #[test]
+        fn buffered_decode_guid_uses_tds_little_endian_layout() {
+            let metadata = varlen_metadata(TdsDataType::Guid, 16);
+            let expected = uuid::Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+            let mut bytes = vec![16];
+            bytes.extend_from_slice(&expected.to_bytes_le());
+            assert_eq!(
+                buffered_value(&bytes, &metadata),
+                (ColumnValues::Uuid(expected), 17)
+            );
+        }
+
+        #[test]
+        fn buffered_decode_nvarchar_waits_for_the_complete_payload() {
+            let metadata = ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::NVarChar,
+                type_info: TypeInfo::var_len_string(TdsDataType::NVarChar, 100, None).unwrap(),
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            };
+            let payload = "row_1"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let mut bytes = u16::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
+            bytes.extend_from_slice(&payload);
+            assert_eq!(
+                GenericDecoder::default()
+                    .try_decode_buffered(&bytes[..bytes.len() - 1], &metadata)
+                    .unwrap(),
+                None
+            );
+            let (value, used) = buffered_value(&bytes, &metadata);
+            let ColumnValues::String(value) = value else {
+                panic!("expected string");
+            };
+            assert_eq!(value.to_utf8_string(), "row_1");
+            assert_eq!(used, bytes.len());
+        }
+
+        #[test]
+        fn buffered_decoders_reject_invalid_or_incomplete_values() {
+            let decoder = GenericDecoder::default();
+            let plp = ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarBinary,
+                type_info: TypeInfo::partial_len(TdsDataType::BigVarBinary, usize::MAX, None)
+                    .unwrap(),
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            };
+            assert_eq!(decoder.try_decode_buffered(&[], &plp).unwrap(), None);
+            let mut writer = DefaultRowWriter::new(1);
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&[], &plp, 0, &mut writer)
+                    .unwrap(),
+                None
+            );
+
+            let invalid = [
+                (vec![3, 0, 0, 0], varlen_metadata(TdsDataType::IntN, 8)),
+                (
+                    vec![5, 0, 0, 0, 0, 0],
+                    varlen_metadata(TdsDataType::MoneyN, 8),
+                ),
+                (vec![15], varlen_metadata(TdsDataType::Guid, 16)),
+                (
+                    vec![4, 0, 0, 0, 0],
+                    scale_metadata(TdsDataType::DateTimeOffsetN, 10, 7),
+                ),
+            ];
+            for (bytes, metadata) in invalid {
+                assert!(decoder.try_decode_buffered(&bytes, &metadata).is_err());
+                let mut writer = DefaultRowWriter::new(1);
+                assert!(
+                    decoder
+                        .try_decode_buffered_into(&bytes, &metadata, 0, &mut writer)
+                        .is_err()
+                );
+            }
+
+            let incomplete = [
+                (vec![0; 7], fixed_metadata(TdsDataType::Int8, 8)),
+                (vec![0; 3], fixed_metadata(TdsDataType::Money, 8)),
+                (vec![0; 3], fixed_metadata(TdsDataType::DateTim4, 4)),
+                (vec![0; 7], fixed_metadata(TdsDataType::DateTime, 8)),
+                (vec![4, 0, 0], varlen_metadata(TdsDataType::IntN, 4)),
+                (vec![8, 0, 0, 0, 0], varlen_metadata(TdsDataType::MoneyN, 8)),
+                (vec![2, 0, b'a'], varlen_metadata(TdsDataType::NVarChar, 10)),
+                (
+                    vec![2, 0, 1],
+                    varlen_metadata(TdsDataType::BigVarBinary, 10),
+                ),
+            ];
+            for (bytes, metadata) in incomplete {
+                assert_eq!(
+                    decoder.try_decode_buffered(&bytes, &metadata).unwrap(),
+                    None
+                );
+                let mut writer = DefaultRowWriter::new(1);
+                assert_eq!(
+                    decoder
+                        .try_decode_buffered_into(&bytes, &metadata, 0, &mut writer)
+                        .unwrap(),
+                    None
+                );
+            }
+
+            let missing_scale = varlen_metadata(TdsDataType::TimeN, 5);
+            assert!(
+                decoder
+                    .try_decode_buffered(&[3, 1, 0, 0], &missing_scale)
+                    .is_err()
+            );
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(&[3, 1, 0, 0], &missing_scale, 0, &mut writer,)
+                    .is_err()
+            );
+
+            let invalid_decimal = varlen_metadata(TdsDataType::DecimalN, 9);
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(
+                        &[5, 1, 1, 0, 0, 0],
+                        &invalid_decimal,
+                        0,
+                        &mut writer,
+                    )
+                    .is_err()
+            );
+            let invalid_precision = precision_scale_metadata(TdsDataType::DecimalN, 9, 39, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(
+                        &[5, 1, 1, 0, 0, 0],
+                        &invalid_precision,
+                        0,
+                        &mut writer,
+                    )
+                    .is_err()
+            );
+            let oversized_decimal = precision_scale_metadata(TdsDataType::DecimalN, 21, 38, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(&[21, 1], &oversized_decimal, 0, &mut writer,)
+                    .is_err()
+            );
+
+            let variant = fixed_metadata(TdsDataType::SsVariant, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&[0; 3], &variant, 0, &mut writer)
+                    .unwrap(),
+                None
+            );
+            assert!(writer.take_row().is_empty());
+        }
+
+        #[test]
+        fn buffered_variant_into_preserves_base_type() {
+            let decoder = GenericDecoder::default();
+            let variant = fixed_metadata(TdsDataType::SsVariant, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            let wire = [6, 0, 0, 0, TdsDataType::Int4 as u8, 0, 42, 0, 0, 0];
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&wire, &variant, 0, &mut writer)
+                    .unwrap(),
+                Some(wire.len())
+            );
+            assert_eq!(writer.variant_base(0), Some(TdsDataType::Int4));
+            assert_eq!(writer.take_row(), vec![ColumnValues::Int(42)]);
+        }
+
+        #[tokio::test]
+        async fn buffered_decoders_cover_wide_nullable_values() {
+            let int = varlen_metadata(TdsDataType::IntN, 8);
+            let mut int_wire = vec![8];
+            int_wire.extend_from_slice(&i64::MIN.to_le_bytes());
+            assert_eq!(
+                assert_decode_equivalence(int_wire, &int).await,
+                ColumnValues::BigInt(i64::MIN)
+            );
+
+            let time = scale_metadata(TdsDataType::TimeN, 5, 7);
+            assert_eq!(
+                assert_decode_equivalence(vec![0], &time).await,
+                ColumnValues::Null
+            );
+
+            let numeric = precision_scale_metadata(TdsDataType::NumericN, 9, 18, 4);
+            let mut numeric_wire = vec![9, 1];
+            numeric_wire.extend_from_slice(&1_234_500_u64.to_le_bytes());
+            let buffered_numeric = GenericDecoder::default()
+                .try_decode_buffered(&numeric_wire, &numeric)
+                .unwrap();
+            assert!(matches!(
+                buffered_numeric,
+                Some((ColumnValues::Numeric(_), 10))
+            ));
+            assert!(matches!(
+                assert_decode_equivalence(numeric_wire, &numeric).await,
+                ColumnValues::Numeric(_)
+            ));
+        }
+
         /// Runs both decode() and decode_into() on the same bytes and asserts
         /// that decode_into via DefaultRowWriter produces the same ColumnValues
         /// as decode().
@@ -3844,9 +5387,10 @@ mod test {
             // Run decode()
             let mut reader1 = ByteReader::new(bytes.clone());
             let expected = decoder.decode(&mut reader1, metadata).await.unwrap();
+            let consumed = reader1.pos;
 
             // Run decode_into()
-            let mut reader2 = ByteReader::new(bytes);
+            let mut reader2 = ByteReader::new(bytes.clone());
             let mut writer = DefaultRowWriter::new(1);
             decoder
                 .decode_into(&mut reader2, metadata, 0, &mut writer)
@@ -3859,6 +5403,45 @@ mod test {
                 "decode_into mismatch for {:?}",
                 metadata.data_type
             );
+            assert_eq!(reader2.pos, consumed);
+
+            if let Some((value, used)) = decoder.try_decode_buffered(&bytes, metadata).unwrap() {
+                assert_eq!(value, expected, "buffered value mismatch");
+                assert_eq!(used, consumed, "buffered value consumed wrong width");
+                assert_eq!(
+                    decoder
+                        .try_decode_buffered(&bytes[..bytes.len() - 1], metadata)
+                        .unwrap(),
+                    None,
+                    "buffered value accepted one-byte-short input"
+                );
+            }
+
+            let mut buffered_writer = DefaultRowWriter::new(1);
+            if let Some(used) = decoder
+                .try_decode_buffered_into(&bytes, metadata, 0, &mut buffered_writer)
+                .unwrap()
+            {
+                assert_eq!(
+                    buffered_writer.take_row()[0],
+                    expected,
+                    "buffered writer mismatch"
+                );
+                assert_eq!(used, consumed, "buffered writer consumed wrong width");
+                let mut short_writer = DefaultRowWriter::new(1);
+                assert_eq!(
+                    decoder
+                        .try_decode_buffered_into(
+                            &bytes[..bytes.len() - 1],
+                            metadata,
+                            0,
+                            &mut short_writer,
+                        )
+                        .unwrap(),
+                    None,
+                    "buffered writer accepted one-byte-short input"
+                );
+            }
             expected
         }
 
@@ -3893,6 +5476,10 @@ mod test {
                 0xAB,
                 "the NULL variant consumed the following column's bytes"
             );
+            assert_eq!(
+                decoder.try_decode_buffered_variant(&[0, 0, 0, 0]).unwrap(),
+                Some((None, ColumnValues::Null, 4))
+            );
         }
 
         /// A non-NULL variant reports its base type alongside the value, which
@@ -3905,7 +5492,10 @@ mod test {
             let md = fixed_metadata(TdsDataType::SsVariant, 0);
             // 6-byte payload: base type INT4 (0x38), zero property bytes, then
             // the four value bytes. 0xAB trails to prove nothing overreads.
-            let mut reader = ByteReader::new(vec![6, 0, 0, 0, 0x38, 0x00, 42, 0, 0, 0, 0xAB]);
+            let wire = vec![6, 0, 0, 0, 0x38, 0x00, 42, 0, 0, 0];
+            let mut with_sentinel = wire.clone();
+            with_sentinel.push(0xAB);
+            let mut reader = ByteReader::new(with_sentinel);
             let decoder = GenericDecoder::default();
             let mut writer = DefaultRowWriter::new(1);
             decoder
@@ -3916,6 +5506,103 @@ mod test {
             assert_eq!(writer.variant_base(0), Some(TdsDataType::Int4));
             assert_eq!(writer.take_row()[0], ColumnValues::Int(42));
             assert_eq!(reader.read_byte().await.unwrap(), 0xAB);
+            assert_eq!(
+                decoder.try_decode_buffered_variant(&wire).unwrap(),
+                Some((Some(TdsDataType::Int4), ColumnValues::Int(42), wire.len()))
+            );
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_variant(&wire[..wire.len() - 1])
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn buffered_sql_variant_decodes_nvarchar_and_bigint() {
+            let text = "ODBCVARIANT"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let length = 2 + 7 + text.len();
+            let mut wire = (length as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&[TdsDataType::NVarChar as u8, 7, 0x09, 0x04, 0, 0, 0, 64, 0]);
+            wire.extend_from_slice(&text);
+            let decoder = GenericDecoder::default();
+            let (base, value, used) = decoder.try_decode_buffered_variant(&wire).unwrap().unwrap();
+            assert_eq!(base, Some(TdsDataType::NVarChar));
+            assert_eq!(used, wire.len());
+            let ColumnValues::String(value) = value else {
+                panic!("expected string variant");
+            };
+            assert_eq!(value.to_utf8_string(), "ODBCVARIANT");
+
+            let mut bigint = 10_u32.to_le_bytes().to_vec();
+            bigint.extend_from_slice(&[TdsDataType::Int8 as u8, 0]);
+            bigint.extend_from_slice(&i64::MIN.to_le_bytes());
+            assert_eq!(
+                decoder.try_decode_buffered_variant(&bigint).unwrap(),
+                Some((
+                    Some(TdsDataType::Int8),
+                    ColumnValues::BigInt(i64::MIN),
+                    bigint.len(),
+                ))
+            );
+        }
+
+        #[tokio::test]
+        async fn buffered_sql_variant_preserves_narrow_character_collations() {
+            let decoder = GenericDecoder::default();
+            let cases = [
+                (
+                    [0x09, 0x04, 0x00, 0x04, 0x00],
+                    "caf\u{e9}".as_bytes().to_vec(),
+                    "caf\u{e9}",
+                ),
+                (
+                    [0x09, 0x04, 0x00, 0x00, 0x00],
+                    vec![b'c', b'a', b'f', 0xE9],
+                    "caf\u{e9}",
+                ),
+            ];
+
+            for (collation_bytes, text, expected_text) in cases {
+                let collation = SqlCollation::try_from(collation_bytes.as_slice()).unwrap();
+                let expected_encoding = if collation.utf8() {
+                    EncodingType::Utf8
+                } else {
+                    EncodingType::LcidBased(collation)
+                };
+                let length = 2 + 7 + text.len();
+                let mut wire = (length as u32).to_le_bytes().to_vec();
+                wire.extend_from_slice(&[TdsDataType::BigVarChar as u8, 7]);
+                wire.extend_from_slice(&collation_bytes);
+                wire.extend_from_slice(&64_u16.to_le_bytes());
+                wire.extend_from_slice(&text);
+
+                let (buffered_base, buffered_value, used) =
+                    decoder.try_decode_buffered_variant(&wire).unwrap().unwrap();
+                let mut reader = ByteReader::new(wire.clone());
+                let (async_base, async_value) = decoder
+                    .read_sql_variant_with_base(&mut reader)
+                    .await
+                    .unwrap();
+
+                assert_eq!(buffered_base, Some(TdsDataType::BigVarChar));
+                assert_eq!(buffered_base, async_base);
+                assert_eq!(used, wire.len());
+                assert_eq!(reader.pos, wire.len());
+                let ColumnValues::String(buffered_text) = buffered_value else {
+                    panic!("expected buffered string variant");
+                };
+                let ColumnValues::String(async_text) = async_value else {
+                    panic!("expected async string variant");
+                };
+                assert_eq!(buffered_text.encoding_type(), &expected_encoding);
+                assert_eq!(async_text.encoding_type(), &expected_encoding);
+                assert_eq!(buffered_text, async_text);
+                assert_eq!(buffered_text.to_utf8_string(), expected_text);
+            }
         }
 
         #[tokio::test]
@@ -3988,6 +5675,179 @@ mod test {
                 writer.take_row()[0],
                 ColumnValues::Bytes(vec![0x01, 0x02, 0x03])
             );
+        }
+
+        /// Wraps a `DefaultRowWriter` and records, per string/binary write,
+        /// whether the value arrived still borrowed.
+        struct BorrowSpy(DefaultRowWriter, Vec<bool>);
+
+        impl RowWriter for BorrowSpy {
+            fn write_null(&mut self, col: usize) {
+                self.0.write_null(col);
+            }
+
+            crate::connection::transport::any_transport::forward_row_values!(
+                write_bool: bool,
+                write_u8: u8,
+                write_i16: i16,
+                write_i32: i32,
+                write_i64: i64,
+                write_f32: f32,
+                write_f64: f64,
+                write_decimal: DecimalParts,
+                write_numeric: DecimalParts,
+                write_date: crate::datatypes::column_values::SqlDate,
+                write_time: crate::datatypes::column_values::SqlTime,
+                write_datetime: crate::datatypes::column_values::SqlDateTime,
+                write_smalldatetime: crate::datatypes::column_values::SqlSmallDateTime,
+                write_datetime2: crate::datatypes::column_values::SqlDateTime2,
+                write_datetimeoffset: crate::datatypes::column_values::SqlDateTimeOffset,
+                write_money: crate::datatypes::column_values::SqlMoney,
+                write_smallmoney: crate::datatypes::column_values::SqlSmallMoney,
+                write_uuid: uuid::Uuid,
+                write_xml: crate::datatypes::column_values::SqlXml,
+                write_json: crate::datatypes::sql_json::SqlJson,
+                write_vector: crate::datatypes::sql_vector::SqlVector,
+            );
+
+            fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding: EncodingType) {
+                self.1.push(matches!(&bytes, Cow::Borrowed(_)));
+                self.0.write_string(col, bytes, encoding);
+            }
+
+            fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>) {
+                self.1.push(matches!(&bytes, Cow::Borrowed(_)));
+                self.0.write_bytes(col, bytes);
+            }
+
+            fn end_row(&mut self) {
+                self.0.end_row();
+            }
+        }
+
+        /// Decodes `wire` twice, once through a reader that hands out borrows and
+        /// once through one that never does, and asserts both produce the same
+        /// value. Also pins that the first arm actually *took* the borrowed path
+        /// and the second did not, so a change that silently stops borrowing
+        /// fails here rather than passing on value equality alone. Returns the
+        /// value so a caller can assert on the content too.
+        async fn borrowed_and_owned_agree(wire: Vec<u8>, md: &ColumnMetadata) -> ColumnValues {
+            let decoder = GenericDecoder::default();
+
+            let mut borrowed_writer = BorrowSpy(DefaultRowWriter::new(1), Vec::new());
+            let mut borrowed_reader = ByteReader::new(wire.clone());
+            decoder
+                .decode_into(&mut borrowed_reader, md, 0, &mut borrowed_writer)
+                .await
+                .unwrap();
+            let borrowed_flags = std::mem::take(&mut borrowed_writer.1);
+            let borrowed = borrowed_writer.0.take_row()[0].clone();
+
+            let mut owned_writer = BorrowSpy(DefaultRowWriter::new(1), Vec::new());
+            let mut owned_reader = ByteReader::new_unbuffered(wire);
+            decoder
+                .decode_into(&mut owned_reader, md, 0, &mut owned_writer)
+                .await
+                .unwrap();
+            let owned_flags = std::mem::take(&mut owned_writer.1);
+            let owned = owned_writer.0.take_row()[0].clone();
+
+            assert_eq!(borrowed, owned, "borrowed arm disagreed with the owned arm");
+
+            // A NULL writes no string or binary value at all, so both arms are
+            // empty and there is no borrow to assert on.
+            assert_eq!(
+                borrowed_flags.len(),
+                owned_flags.len(),
+                "the two arms took different numbers of string/binary writes"
+            );
+            assert!(
+                borrowed_flags.iter().all(|borrowed| *borrowed),
+                "a slice-offering reader still produced an owned value, so the \
+                 zero-copy path this PR exists for did not run: {borrowed_flags:?}"
+            );
+            assert!(
+                owned_flags.iter().all(|borrowed| !*borrowed),
+                "a reader that never hands out slices somehow produced a borrow: {owned_flags:?}"
+            );
+
+            borrowed
+        }
+
+        /// `varlen_metadata` carries no collation, so these use `NVarChar`,
+        /// whose UTF-16 encoding needs none. Wire form is a u16 byte count
+        /// followed by UTF-16LE code units.
+        fn nvarchar_wire(text: &str) -> Vec<u8> {
+            let payload: Vec<u8> = text
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            let mut wire = (payload.len() as u16).to_le_bytes().to_vec();
+            wire.extend_from_slice(&payload);
+            wire
+        }
+
+        #[tokio::test]
+        async fn short_string_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let value = borrowed_and_owned_agree(nvarchar_wire("abcdef"), &md).await;
+            match value {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "abcdef"),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn short_string_empty_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let value = borrowed_and_owned_agree(nvarchar_wire(""), &md).await;
+            match value {
+                ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), ""),
+                other => panic!("expected a string, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn short_string_null_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let value = borrowed_and_owned_agree(vec![0xFF, 0xFF], &md).await;
+            assert_eq!(value, ColumnValues::Null);
+        }
+
+        #[tokio::test]
+        async fn short_binary_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::BigVarBinary, 8);
+            let mut wire = vec![3, 0];
+            wire.extend_from_slice(&[0x01, 0x02, 0x03]);
+            let value = borrowed_and_owned_agree(wire, &md).await;
+            assert_eq!(value, ColumnValues::Bytes(vec![0x01, 0x02, 0x03]));
+        }
+
+        #[tokio::test]
+        async fn bigbinary_borrowed_matches_owned() {
+            let md = varlen_metadata(TdsDataType::BigBinary, 8);
+            let mut wire = vec![4, 0];
+            wire.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            let value = borrowed_and_owned_agree(wire, &md).await;
+            assert_eq!(value, ColumnValues::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        }
+
+        #[tokio::test]
+        async fn short_string_truncated_errors_on_both_arms() {
+            // Length says 6 code units, only 2 bytes follow. The borrowed arm must
+            // decline rather than read past the value, leaving the owned arm to error.
+            let md = varlen_metadata(TdsDataType::NVarChar, 100);
+            let wire = vec![12, 0, b'a', 0];
+            let decoder = GenericDecoder::default();
+
+            for mut reader in [
+                ByteReader::new(wire.clone()),
+                ByteReader::new_unbuffered(wire),
+            ] {
+                let mut writer = DefaultRowWriter::new(1);
+                let result = decoder.decode_into(&mut reader, &md, 0, &mut writer).await;
+                assert!(result.is_err(), "truncated value should not decode");
+            }
         }
 
         #[tokio::test]
@@ -4299,6 +6159,182 @@ mod test {
         }
 
         // -------------------------------------------------------------------
+        // PlpChunkStreamReader buffered-path tests — synchronous helpers used
+        // when a full row can be decoded straight from already-buffered bytes.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn try_begin_buffered_returns_none_for_a_short_header() {
+            assert!(
+                PlpChunkStreamReader::try_begin_buffered(&[0; 7])
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn try_begin_buffered_reports_a_null_plp_value() {
+            let header = 0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes();
+            let result = PlpChunkStreamReader::try_begin_buffered(&header).unwrap();
+            assert!(matches!(result, Some((None, 8))));
+        }
+
+        #[test]
+        fn try_begin_buffered_rejects_a_declared_length_over_the_maximum() {
+            let header = (MAX_PLP_SIZE as u64 + 1).to_le_bytes();
+            assert!(PlpChunkStreamReader::try_begin_buffered(&header).is_err());
+        }
+
+        #[test]
+        fn try_read_complete_buffered_ignores_unknown_length_streams() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Unknown);
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_skips_once_already_finished() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(0));
+            let mut out = [];
+            assert!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_an_output_buffer_too_small() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 2];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(0u32.to_le_bytes());
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_a_full_chunk_header() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[1, 2, 3], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_a_chunk_length_mismatch() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(5u32.to_le_bytes()); // declared 4, chunk says 5
+            bytes.extend([1, 2, 3, 4, 5]);
+            bytes.extend(0u32.to_le_bytes());
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_the_full_payload() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2]); // only 2 of 4 payload bytes present
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_the_full_terminator() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend([0, 0]); // only 2 of 4 terminator bytes present
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_a_non_zero_terminator() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(1u32.to_le_bytes()); // non-zero terminator
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_ensure_active_buffered_chunk_detects_position_overflow() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut position = usize::MAX - 2;
+            let err = stream
+                .try_ensure_active_buffered_chunk(&[], &mut position)
+                .unwrap_err();
+            assert!(matches!(err, crate::error::Error::ProtocolError(_)));
+        }
+
+        #[test]
+        fn try_read_buffered_inner_zero_output_reports_missing_header() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            assert_eq!(stream.try_read_buffered_inner(&[], None, 0).unwrap(), None);
+        }
+
+        #[test]
+        fn try_read_buffered_inner_rejects_an_inconsistent_output_length() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(0u32.to_le_bytes());
+            let mut out = [0u8; 2];
+            let err = stream
+                .try_read_buffered_inner(&bytes, Some(&mut out), 4)
+                .unwrap_err();
+            assert!(matches!(err, crate::error::Error::ProtocolError(_)));
+        }
+
+        #[test]
+        fn try_read_buffered_inner_reports_missing_trailing_header_after_exact_fill() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]); // no terminator/next-chunk header follows
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_buffered_inner(&bytes, Some(&mut out), 4)
+                    .unwrap(),
+                None
+            );
+        }
+
+        // -------------------------------------------------------------------
         // PlpColumnStream tests — type-aware wrapper over PlpChunkStreamReader
         // -------------------------------------------------------------------
 
@@ -4349,6 +6385,20 @@ mod test {
             let mut reader = ByteReader::new(buf);
             let result = PlpColumnStream::begin(&md, &mut reader).await.unwrap();
             assert!(result.is_none());
+        }
+
+        #[test]
+        fn plp_column_stream_try_begin_buffered_returns_none_for_a_short_header() {
+            let md = plp_metadata(
+                TdsDataType::BigVarBinary,
+                PartialLengthType::BigVarBinary,
+                None,
+            );
+            assert!(
+                PlpColumnStream::try_begin_buffered(&md, &[0; 4])
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[tokio::test]
@@ -4558,23 +6608,33 @@ mod test {
             );
         }
 
+        /// The chunk *count* cap that used to live here was removed: it was a
+        /// fuzz-only tripwire that leaked into production builds and silently
+        /// capped readable LOB size. Streaming many small chunks must now
+        /// succeed — the stream is bounded by bytes, not by chunk count.
+        #[cfg(not(fuzzing))]
         #[tokio::test]
-        async fn plp_chunk_stream_reader_chunk_count_limit_errors() {
-            let mut stream = PlpChunkStreamReader {
-                length: PlpChunkReadLength::Unknown,
-                chunk_remaining: 0,
-                reached_end: false,
-                total_read: 0,
-                chunks_seen: GenericDecoder::MAX_PLP_CHUNKS,
-            };
-            let mut reader = ByteReader::new(vec![1, 0, 0, 0]);
-            let mut out = [0u8; 1];
+        async fn plp_chunk_stream_reader_accepts_more_chunks_than_the_removed_count_cap() {
+            let mut reader = ByteReader::new(unknown_len_plp_wire(REMOVED_MAX_PLP_CHUNKS + 1));
+            let mut stream = PlpChunkStreamReader::begin(&mut reader)
+                .await
+                .expect("begin")
+                .expect("not null");
 
-            let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
-            assert!(
-                err.to_string().contains("Too many PLP chunks"),
-                "unexpected error: {err}"
-            );
+            let mut total = 0usize;
+            let mut out = [0u8; 1];
+            loop {
+                let read = stream.read_into(&mut reader, &mut out).await.expect(
+                    "streaming past the removed chunk-count cap must not fail: a chunk count \
+                     limit rejects large LOBs that the protocol allows",
+                );
+                if read == 0 {
+                    break;
+                }
+                total += read;
+            }
+
+            assert_eq!(total, REMOVED_MAX_PLP_CHUNKS + 1);
         }
 
         #[tokio::test]
@@ -4584,7 +6644,6 @@ mod test {
                 chunk_remaining: 0,
                 reached_end: false,
                 total_read: MAX_PLP_SIZE,
-                chunks_seen: 0,
             };
             let mut reader = ByteReader::new(vec![1, 0, 0, 0]);
             let mut out = [0u8; 1];
@@ -4612,6 +6671,74 @@ mod test {
                     .contains("exceeds maximum allowed chunk size"),
                 "unexpected error: {err}"
             );
+        }
+
+        /// The chunk-count cap that used to bound every PLP read. It was
+        /// introduced as a `#[cfg(fuzzing)]`-only tripwire, then hoisted into
+        /// production builds by a commit titled "Fix clippy warnings". SQL
+        /// Server emits `varbinary(max)` in 8000-byte chunks, so this cap
+        /// rejected any LOB above ~763 MB with "Too many PLP chunks" even
+        /// though TDS allows 2 GB. It is gone; these tests keep it gone.
+        #[cfg(not(fuzzing))]
+        const REMOVED_MAX_PLP_CHUNKS: usize = 100_000;
+
+        /// Builds an unknown-length PLP value made of `chunks` single-byte
+        /// chunks, terminated by the zero-length chunk.
+        #[cfg(not(fuzzing))]
+        fn unknown_len_plp_wire(chunks: usize) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(8 + chunks * 5 + 4);
+            buf.extend_from_slice(&0xFFFFFFFFFFFFFFFEu64.to_le_bytes());
+            for i in 0..chunks {
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                buf.push(i as u8);
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf
+        }
+
+        /// Unknown-length path: a value split into more chunks than the removed
+        /// cap allowed must decode, not error.
+        #[cfg(not(fuzzing))]
+        #[tokio::test]
+        async fn read_plp_bytes_accepts_more_chunks_than_the_removed_count_cap() {
+            let chunks = REMOVED_MAX_PLP_CHUNKS + 1;
+            let mut reader = ByteReader::new(unknown_len_plp_wire(chunks));
+
+            let value = GenericDecoder::read_plp_bytes(&mut reader)
+                .await
+                .expect(
+                    "a PLP value split into more chunks than the removed cap must decode: \
+                     rejecting it caps readable LOB size far below the 2 GB the protocol allows",
+                )
+                .expect("not null");
+
+            assert_eq!(value.len(), chunks);
+            assert_eq!(value[0], 0);
+            assert_eq!(value[chunks - 1], ((chunks - 1) % 256) as u8);
+        }
+
+        /// Known-length path (`read_plp_chunks_into_slice`) carried the same
+        /// cap and needs the same guarantee.
+        #[cfg(not(fuzzing))]
+        #[tokio::test]
+        async fn read_plp_bytes_accepts_many_chunks_for_a_known_length_value() {
+            let chunks = REMOVED_MAX_PLP_CHUNKS + 1;
+            let mut buf = Vec::with_capacity(8 + chunks * 5 + 4);
+            buf.extend_from_slice(&(chunks as u64).to_le_bytes());
+            for i in 0..chunks {
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                buf.push(i as u8);
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+
+            let mut reader = ByteReader::new(buf);
+            let value = GenericDecoder::read_plp_bytes(&mut reader)
+                .await
+                .expect("known-length PLP value with many chunks must decode")
+                .expect("not null");
+
+            assert_eq!(value.len(), chunks);
+            assert_eq!(value[chunks - 1], ((chunks - 1) % 256) as u8);
         }
 
         #[tokio::test]
@@ -4696,6 +6823,13 @@ mod test {
             let mut part = [0u8; 4];
             LittleEndian::write_i32(&mut part, 12345);
             buf.extend_from_slice(&part);
+            let buffered_decimal = GenericDecoder::default()
+                .try_decode_buffered(&buf, &md)
+                .unwrap();
+            assert!(matches!(
+                buffered_decimal,
+                Some((ColumnValues::Decimal(_), 6))
+            ));
             let val = assert_decode_equivalence(buf, &md).await;
             assert!(matches!(val, ColumnValues::Decimal(_)));
         }
@@ -4852,6 +6986,44 @@ mod test {
         }
 
         // ── Decimal error paths ────────────────────────────────────────
+
+        #[test]
+        fn buffered_decimal_into_waits_for_the_complete_value() {
+            let metadata = precision_scale_metadata(TdsDataType::DecimalN, 9, 18, 4);
+            let mut wire = vec![9, 1];
+            wire.extend_from_slice(&123_4500_u64.to_le_bytes());
+            let decoder = GenericDecoder::default();
+
+            let mut incomplete = DefaultRowWriter::new(1);
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&wire[..5], &metadata, 0, &mut incomplete)
+                    .unwrap(),
+                None
+            );
+            assert!(incomplete.take_row().is_empty());
+
+            let mut complete = DefaultRowWriter::new(1);
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&wire, &metadata, 0, &mut complete)
+                    .unwrap(),
+                Some(wire.len())
+            );
+            match &complete.take_row()[0] {
+                ColumnValues::Decimal(parts) => assert_eq!(parts.to_string(), "123.4500"),
+                other => panic!("expected Decimal, got {other:?}"),
+            }
+
+            let mut null = DefaultRowWriter::new(1);
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&[0], &metadata, 0, &mut null)
+                    .unwrap(),
+                Some(1)
+            );
+            assert_eq!(null.take_row(), vec![ColumnValues::Null]);
+        }
 
         #[tokio::test]
         async fn decimal_wrong_type_info_variant() {
@@ -5188,6 +7360,31 @@ mod test {
         // ── BigBinary empty ────────────────────────────────────────────
 
         #[tokio::test]
+        async fn ntext_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let md = varlen_metadata(TdsDataType::NText, 0x7FFFFFFF);
+            let value = assert_decode_equivalence(super::legacy_lob_wire(&[]), &md).await;
+            let ColumnValues::String(value) = value else {
+                panic!("empty NTEXT must decode as a string, got {value:?}");
+            };
+            assert!(value.to_utf8_string().is_empty());
+        }
+
+        #[tokio::test]
+        async fn text_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let mut md = varlen_metadata(TdsDataType::Text, 0x7FFFFFFF);
+            md.type_info.type_info_variant = TypeInfoVariant::VarLenString(
+                VariableLengthTypes::Text,
+                0x7FFFFFFF,
+                Some(SqlCollation::default()),
+            );
+            let value = assert_decode_equivalence(super::legacy_lob_wire(&[]), &md).await;
+            let ColumnValues::String(value) = value else {
+                panic!("empty TEXT must decode as a string, got {value:?}");
+            };
+            assert!(value.to_utf8_string().is_empty());
+        }
+
+        #[tokio::test]
         async fn bigbinary_empty() {
             let md = varlen_metadata(TdsDataType::BigBinary, 100);
             let val = assert_decode_equivalence(vec![0x00, 0x00], &md).await;
@@ -5235,11 +7432,14 @@ mod test {
         use crate::datatypes::decoder::{DecimalParts, GenericDecoder};
         use crate::datatypes::row_writer::{RowWriter, ValueKind};
         use crate::datatypes::sql_json::SqlJson;
-        use crate::datatypes::sql_string::{EncodingType, SqlString};
+        use crate::datatypes::sql_string::EncodingType;
         use crate::datatypes::sql_vector::SqlVector;
-        use crate::datatypes::sqldatatypes::{PartialLengthType, TdsDataType};
+        use crate::datatypes::sqldatatypes::{
+            PartialLengthType, TdsDataType, TypeInfoVariant, VariableLengthTypes,
+        };
         use crate::query::metadata::ColumnMetadata;
         use crate::token::tokens::SqlCollation;
+        use std::borrow::Cow;
         use uuid::Uuid;
 
         /// What a [`RecordingSink`] observed for one column.
@@ -5308,7 +7508,7 @@ mod test {
                 self.storage.resize(start + length, 0xAA);
                 let encoding = match kind {
                     ValueKind::Bytes => None,
-                    ValueKind::String(encoding) => Some(encoding.clone()),
+                    ValueKind::String(encoding) => Some(*encoding),
                 };
                 self.pending = Some((start, encoding));
                 let storage = &mut self.storage[start..];
@@ -5334,11 +7534,16 @@ mod test {
             fn write_null(&mut self, _col: usize) {
                 self.events.push(Event::Null);
             }
-            fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-                self.events.push(Event::OwnedBytes(val));
+            fn write_bytes(&mut self, _col: usize, bytes: Cow<'_, [u8]>) {
+                self.events.push(Event::OwnedBytes(bytes.into_owned()));
             }
-            fn write_string(&mut self, _col: usize, val: SqlString) {
-                self.events.push(Event::OwnedString(val.bytes));
+            fn write_string(
+                &mut self,
+                _col: usize,
+                bytes: Cow<'_, [u8]>,
+                _encoding_type: EncodingType,
+            ) {
+                self.events.push(Event::OwnedString(bytes.into_owned()));
             }
 
             fn write_bool(&mut self, _col: usize, _val: bool) {}
@@ -5514,6 +7719,35 @@ mod test {
             );
         }
 
+        /// AB#49220: a present text pointer with a zero data length is an empty
+        /// value, not NULL.
+        #[tokio::test]
+        async fn image_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(super::legacy_lob_wire(&[]), &md, true).await,
+                vec![Event::OwnedBytes(Vec::new())]
+            );
+        }
+
+        #[tokio::test]
+        async fn image_null_text_pointer_is_null() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(vec![0u8], &md, true).await,
+                vec![Event::Null]
+            );
+        }
+
+        #[tokio::test]
+        async fn image_with_payload_returns_its_bytes() {
+            let md = varlen_metadata(TdsDataType::Image, 0x7FFFFFFF);
+            assert_eq!(
+                decode_generic(super::legacy_lob_wire(&[1, 2, 3]), &md, true).await,
+                vec![Event::OwnedBytes(vec![1, 2, 3])]
+            );
+        }
+
         // ---------------------------------------------------------------
         // Strings — raw wire bytes are handed over without transcoding
         // ---------------------------------------------------------------
@@ -5565,14 +7799,32 @@ mod test {
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect();
-            let mut wire = vec![16u8];
-            wire.extend_from_slice(&[0u8; 16]); // textptr
-            wire.extend_from_slice(&[0u8; 8]); // timestamp
-            wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            wire.extend_from_slice(&payload);
             assert_eq!(
-                decode_string(wire, &md, true).await,
+                decode_string(super::legacy_lob_wire(&payload), &md, true).await,
                 vec![Event::OwnedString(payload)]
+            );
+        }
+
+        #[tokio::test]
+        async fn ntext_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let md = varlen_metadata(TdsDataType::NText, 0x7FFFFFFF);
+            assert_eq!(
+                decode_string(super::legacy_lob_wire(&[]), &md, true).await,
+                vec![Event::OwnedString(Vec::new())]
+            );
+        }
+
+        #[tokio::test]
+        async fn text_with_text_pointer_and_zero_length_is_empty_not_null() {
+            let mut md = varlen_metadata(TdsDataType::Text, 0x7FFFFFFF);
+            md.type_info.type_info_variant = TypeInfoVariant::VarLenString(
+                VariableLengthTypes::Text,
+                0x7FFFFFFF,
+                Some(SqlCollation::default()),
+            );
+            assert_eq!(
+                decode_string(super::legacy_lob_wire(&[]), &md, true).await,
+                vec![Event::OwnedString(Vec::new())]
             );
         }
 

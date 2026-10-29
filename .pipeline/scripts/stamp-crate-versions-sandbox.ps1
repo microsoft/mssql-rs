@@ -37,7 +37,17 @@ function Set-PackageVersion {
     $section = [regex]'(?ms)^\[package\].*?(?=^\[|\z)'
     $m = $section.Match($content)
     if (-not $m.Success) { Write-Error "No [package] section in $Path"; exit 1 }
-    $patched = [regex]::Replace($m.Value, '(?m)^(version\s*=\s*)"[^"]+"', "`${1}`"$Version`"", 1)
+    $versionPattern = [regex]'(?m)^(version\s*=\s*)"[^"]+"'
+    $versionMatches = $versionPattern.Matches($m.Value)
+    if ($versionMatches.Count -ne 1) {
+        Write-Error "Expected one package version in ${Path}, found $($versionMatches.Count)"
+        exit 1
+    }
+    $versionMatch = $versionMatches[0]
+    $replacement = $versionMatch.Groups[1].Value + "`"$Version`""
+    $patched = $m.Value.Substring(0, $versionMatch.Index) +
+        $replacement +
+        $m.Value.Substring($versionMatch.Index + $versionMatch.Length)
     $content = $content.Substring(0, $m.Index) + $patched + $content.Substring($m.Index + $m.Length)
     Set-Content $Path $content -NoNewline
     Write-Host "Stamped $Path -> version = `"$Version`""

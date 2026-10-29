@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::Once;
-
 pub mod api;
 mod auth;
 mod connection;
@@ -10,59 +8,89 @@ mod conversion;
 mod error;
 mod handles;
 mod params;
+mod tracing_init;
+
+// Internal parse/convert helpers re-exposed as safe wrappers for coverage-guided
+// fuzzing (see `fuzz/`). The `fuzzing` cfg is set only by cargo-fuzz, so the
+// shipped driver's FFI surface is unchanged.
+#[cfg(fuzzing)]
+pub mod fuzz_support;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 
-static INIT_TRACING: Once = Once::new();
+pub(crate) use tracing_init::init_tracing;
 
-const ENV_TRACE: &str = "MSSQL_TDS_TRACE";
-const ENV_TRACE_LEVEL: &str = "MSSQL_TDS_TRACE_LEVEL";
-const DEFAULT_TRACE_LEVEL: &str = "warn";
-
-pub(crate) fn init_tracing() {
-    INIT_TRACING.call_once(|| {
-        let enabled = std::env::var(ENV_TRACE)
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        if !enabled {
-            return;
-        }
-
-        let level = std::env::var(ENV_TRACE_LEVEL).unwrap_or_else(|_| DEFAULT_TRACE_LEVEL.into());
-        let filter = tracing_subscriber::EnvFilter::try_new(level.as_str()).unwrap_or_else(|err| {
-            eprintln!(
-                "[mssql-odbc] ERROR: Invalid {ENV_TRACE_LEVEL} value '{level}': {err}. Falling back to '{DEFAULT_TRACE_LEVEL}'."
-            );
-            tracing_subscriber::EnvFilter::new(DEFAULT_TRACE_LEVEL)
-        });
-
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(std::io::stderr)
-            .try_init();
-    });
-}
-
-/// Wraps an FFI entry-point body in `catch_unwind` so a Rust panic crossing
-/// the C ABI is converted into `SQL_ERROR` rather than unwinding into C
-/// (which is undefined behaviour). `$name` is the SQL function's display name
-/// used in the panic-caught error log and the trailing trace log.
-///
-/// Caller is responsible for `crate::init_tracing()` — already done at the
-/// export-layer call site in `api::exports`.
+/// Initializes tracing and wraps an FFI entry-point body in `catch_unwind` so
+/// a Rust panic crossing the C ABI is converted into `SQL_ERROR` rather than
+/// unwinding into C (which is undefined behaviour). `$name` is the SQL
+/// function's display name. The entry event runs after correlation is installed;
+/// the scope outlives panic conversion and the return event, even when the body
+/// frees the handle. A disabled sink never resolves the handle or enters TLS.
 macro_rules! ffi_entry {
-    ($name:literal, $body:expr $(,)?) => {{
-        let ret = match ::std::panic::catch_unwind(|| $body) {
+    ($name:literal, $handle:expr, $entry:expr, $body:expr $(,)?) => {{
+        if ::mssql_tds::trace_context::enabled() {
+            let body = || {
+                $entry;
+                $body
+            };
+            // SAFETY: forwarded from the enclosing ODBC API's handle contract.
+            unsafe {
+                $crate::traced_entry($name, $handle, body, |result| {
+                    $crate::ffi_entry!(@finish $name, result)
+                })
+            }
+        } else {
+            let result = ::std::panic::catch_unwind(|| {
+                $crate::init_tracing();
+                $entry;
+                $body
+            });
+            $crate::ffi_entry!(@finish $name, result)
+        }
+    }};
+    (@finish $name:literal, $result:expr) => {{
+        let ret = match $result {
             ::std::result::Result::Ok(rc) => rc,
             ::std::result::Result::Err(_) => {
                 ::tracing::error!(concat!($name, ": panic caught at FFI boundary"));
                 $crate::api::odbc_types::SQL_ERROR
             }
         };
-        ::tracing::trace!(?ret, concat!($name, " returning"));
+        if $crate::tracing_init::starts_execution($name) {
+            ::tracing::debug!(?ret, concat!($name, " returning"));
+        } else {
+            ::tracing::trace!(?ret, concat!($name, " returning"));
+        }
         ret
     }};
 }
 pub(crate) use ffi_entry;
+
+// Separating the guard's unwind cleanup from the disabled path avoids inflating
+// the few-nanosecond buffered/attribute APIs when no trace sink is installed.
+// Windows release SQLGetEnvAttr: 11.3 ns baseline, about 13 ns with this split,
+// versus 17.0 ns with the optional guard inside the common catch_unwind.
+///
+/// # Safety
+/// A live `handle` and its parent must remain allocated until `body` starts;
+/// the body may free them under its own ODBC lifetime contract.
+#[cold]
+unsafe fn traced_entry(
+    name: &'static str,
+    handle: api::odbc_types::SqlHandle,
+    body: impl FnOnce() -> api::odbc_types::SqlReturn,
+    finish: impl FnOnce(std::thread::Result<api::odbc_types::SqlReturn>) -> api::odbc_types::SqlReturn,
+) -> api::odbc_types::SqlReturn {
+    let mut scope = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        init_tracing();
+        if !handles::process_is_shutting_down() {
+            scope = Some(unsafe { tracing_init::context_for(handle, name) }.enter());
+        }
+        body()
+    }));
+    let ret = finish(result);
+    drop(scope);
+    ret
+}

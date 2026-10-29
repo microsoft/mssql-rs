@@ -326,7 +326,10 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.consume_cursor_open_response().await
     }
@@ -418,7 +421,10 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.consume_cursor_open_response().await
     }
@@ -471,7 +477,10 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         let metadata = self.next_rowset().await?;
         if metadata.is_none() {
@@ -562,9 +571,12 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -646,9 +658,12 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -722,9 +737,12 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -821,7 +839,10 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.drain_cursor_response().await?;
         let status = self.captured_cursor_status()?;
@@ -911,7 +932,10 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         // prepared_handle is plain INPUT (no ReturnValue), so the OUTPUT ordinals
         // match sp_cursoropen: 0=cursor, 1=scrollopt, 2=ccopt, 3=rowcount.
@@ -996,7 +1020,10 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.drain_cursor_response().await?;
         let status = self.captured_cursor_status()?;
@@ -1054,9 +1081,12 @@ impl CursorClient for TdsClient {
 
         let mut pw =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut pw).await?;
+        let serialize_result = rpc.serialize(&mut pw).await;
+        let message = pw.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -1140,7 +1170,7 @@ impl TdsClient {
         self.last_return_status = ReturnStatus::NotReceived;
         let metadata = self.next_rowset().await?;
         self.current_metadata = metadata;
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         self.current_result_set_has_been_read_till_end = true;
 

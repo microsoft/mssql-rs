@@ -1,14 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use async_trait::async_trait;
-
 use crate::{
     core::TdsResult, datatypes::sqltypes::SqlType, io::packet_writer::PacketWriter,
     message::parameters::rpc_parameters::RpcTypeMetadata, token::tokens::SqlCollation,
 };
 
-#[async_trait]
 pub(crate) trait SqlValueEncoder {
     async fn encode_sqlvalue(
         &self,
@@ -16,6 +13,7 @@ pub(crate) trait SqlValueEncoder {
         sql_value: &SqlType,
         db_collation: &SqlCollation,
         type_metadata: Option<RpcTypeMetadata>,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()>;
 }
 
@@ -27,7 +25,6 @@ impl GenericEncoder {
     }
 }
 
-#[async_trait]
 impl SqlValueEncoder for GenericEncoder {
     async fn encode_sqlvalue(
         &self,
@@ -35,9 +32,15 @@ impl SqlValueEncoder for GenericEncoder {
         sql_value: &SqlType,
         db_collation: &SqlCollation,
         type_metadata: Option<RpcTypeMetadata>,
+        narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()> {
         sql_value
-            .serialize(packet_writer, db_collation, type_metadata)
+            .serialize_with_narrow_string_byte_limit(
+                packet_writer,
+                db_collation,
+                type_metadata,
+                narrow_string_byte_limit,
+            )
             .await?;
         Ok(())
     }

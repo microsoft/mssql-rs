@@ -1,41 +1,35 @@
+<!--
+Rendered as the mssql-tds README on crates.io via `readme` in Cargo.toml.
+Changes appear with the next crate release. Keep content user-facing and links
+absolute. The docs.rs API reference is generated from Rust source separately.
+-->
+
 # mssql-tds
 
-Async Rust implementation of the TDS (Tabular Data Stream) protocol for SQL Server
-and Azure SQL Database.
-
-## What it does
-
-Low-level TDS client handling connection negotiation (prelogin, TLS, login7),
-query execution, result set streaming, bulk copy, RPC calls, and transaction
-management. Built on Tokio.
-
-## Feature flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `integrated-auth` | **yes** | Enables both `sspi` and `gssapi` |
-| `sspi` | via `integrated-auth` | Windows SSPI (Kerberos/NTLM) |
-| `gssapi` | via `integrated-auth` | Unix GSSAPI (Kerberos) via runtime `dlopen` |
-
-Disable the default to drop platform-specific auth dependencies:
-
-```toml
-mssql-tds = { version = "0.1", default-features = false }
-```
+Low-level, async TDS client for SQL Server and Azure SQL Database, built on
+Tokio. Supports query and result-set streaming, RPC, bulk copy, transactions,
+TLS, and integrated authentication.
 
 ## Quick start
 
+```toml
+[dependencies]
+mssql-tds = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Set `DB_USER` and `DB_PASSWORD` for your SQL Server, then:
+
 ```rust,no_run
 use mssql_tds::connection::client_context::ClientContext;
-use mssql_tds::connection::tds_client::ResultSetClient;
+use mssql_tds::connection::tds_client::ResultSet;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-use mssql_tds::core::TdsResult;
 
 #[tokio::main]
-async fn main() -> TdsResult<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = ClientContext::default();
-    context.user_name = std::env::var("DB_USER").unwrap_or("<user>".into());
-    context.password = std::env::var("DB_PASSWORD").unwrap_or("<password>".into());
+    context.user_name = std::env::var("DB_USER")?;
+    context.password = std::env::var("DB_PASSWORD")?;
     context.database = "master".into();
 
     let provider = TdsConnectionProvider {};
@@ -43,20 +37,21 @@ async fn main() -> TdsResult<()> {
         .create_client(context, "tcp:localhost,1433", None)
         .await?;
 
-    client
-        .execute("SELECT 1 AS value".into(), None, None)
-        .await?;
-
-    if let Some(rs) = client.get_current_resultset() {
-        while let Some(row) = rs.next_row().await? {
+    client.execute("SELECT 1 AS value".into(), ()).await?;
+    if client.on_rows() {
+        while let Some(row) = client.next_row().await? {
             println!("{row:?}");
         }
     }
-
     client.close_query().await?;
     Ok(())
 }
 ```
+
+The server certificate must be trusted and match the hostname.
+`execute` accepts `()` for defaults or `ExecuteOptions` for timeout,
+cancellation, and other per-command settings. Use `advance()` for subsequent
+results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
 ## Vectors
 
@@ -85,8 +80,44 @@ administrator. The general integration helper defaults
 `DB_DATABASE` to `master` when unset, but float16 tests reject that fallback.
 When selected without `VECTOR16_TEST=1` they return early with a diagnostic; with opt-in they fail on bad
 configuration. Tests never change database configuration or global flags.
-See [tests/TRANSPORT_TESTS_README.md](tests/TRANSPORT_TESTS_README.md#float16-vector-integration-tests)
+See the [transport test guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/tests/TRANSPORT_TESTS_README.md#float16-vector-integration-tests)
 for environment details and the `test(vector16)` nextest filter.
+
+## Connection policy and migration
+
+See the [connection behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
+for connection defaults, MultiSubnetFailover settings, transport limitations,
+migration, timeouts, and DNS caching.
+
+## Feature flags
+
+| Feature | Default | Purpose |
+|---|---|---|
+| `integrated-auth` | On | Enables `sspi` (Windows) and `gssapi` (Unix Kerberos). |
+| `tls-schannel-direct-on-windows` | On | Enables `tls-schannel-direct`: the in-tree Windows Schannel TLS engine. |
+
+Set `default-features = false` to omit integrated authentication and use
+`native-tls` on all platforms. Individual auth and TLS features can be enabled
+separately. Linux builds require OpenSSL development libraries; Unix integrated
+authentication loads GSSAPI at runtime.
+
+## Response lifecycle
+
+Drain a response with `close_query()` before reuse, or call
+`cancel_query(timeout_secs)` to abandon it and wait for cancellation
+acknowledgement. Zero uses the transport default; failed cancellation settlement
+retires the connection. Discarding rows during cancellation does not decode
+values or resolve Always Encrypted keys.
+
+## Runtime behavior
+
+Healthy commands do not allocate a session-recovery future; recovery boxes it
+only when needed. Connection setup boxes its action chain once per connection
+to reduce caller stack use without a thread handoff.
+
+String decoding follows column metadata, not BOM-shaped prefixes in values.
+The [behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
+documents encoding and stack-use details.
 
 ## License
 

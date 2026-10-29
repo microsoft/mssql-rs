@@ -3,6 +3,16 @@
 
 """Tests for driver name and version information."""
 
+
+def test_dbapi_module_globals():
+    """Test the module's declared DB-API contract."""
+    import mssql_py_core
+
+    assert mssql_py_core.apilevel == "2.0"
+    assert mssql_py_core.threadsafety == 1
+    assert mssql_py_core.paramstyle == "qmark"
+
+
 def test_driver_version_parameter():
     """Test that driver_version parameter is accepted and stored."""
     import mssql_py_core

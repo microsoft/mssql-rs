@@ -12,6 +12,16 @@
 trigger: none
 
 parameters:
+# Defaulted to the current images so nothing changes unless a run overrides them.
+- name: linuxImage
+  displayName: 'Agent image for x64 Linux jobs'
+  type: string
+  default: RUST-AZL3
+- name: linuxArmImage
+  displayName: 'Agent image for ARM64 Linux jobs'
+  type: string
+  default: RUST-AZL3-ARM64
+
 # STAGE 1 (Import) is gated on the queue-time Docker Hub credential variables
 # (DOCKERHUB_USERNAME + DOCKERHUB_PAT): the import stage runs ONLY when
 # DOCKERHUB_USERNAME is set, and is skipped entirely otherwise. The per-image
@@ -103,6 +113,13 @@ parameters:
 # To also publish images to GHCR, define a SECRET pipeline variable named
 # GHCR_TOKEN (a GitHub PAT with write:packages), settable at queue time. If
 # GHCR_TOKEN is not set, the GHCR publish steps are skipped entirely.
+# ghcrUsername must be a GitHub login (1-39 ASCII letters/digits, with single
+# internal hyphens and an optional managed-user _shortcode suffix).
+# ghcrOrg accepts any lowercase GitHub owner with the same syntax, optionally
+# followed by one lowercase repository component (1-100 characters): letters,
+# digits, separated by a dot, one/two underscores, or one/more hyphens.
+# Parameters are passed as environment data, never interpolated into Bash.
+# Invalid values fail before registry login when publishing is enabled.
 - name: ghcrUsername
   displayName: 'GitHub username for the PAT (required only when GHCR_TOKEN is set)'
   type: string
@@ -122,10 +139,13 @@ schedules:
   always: true
 
 variables:
+  # Container images are pulled, built from Dockerfiles and pushed; none of our
+  # own source is compiled here, so the org decorator's injection only adds job
+  # time.
+  Codeql.SkipTaskAutoInjection: true
   ACR_NAME: 'tdslibrs'
   ACR_REGISTRY: 'tdslibrs.azurecr.io'
   GHCR_REGISTRY: 'ghcr.io'
-  GHCR_NAMESPACE: 'ghcr.io/${{ parameters.ghcrOrg }}'
 
 # =============================================================================
 # STAGE 1 (Import): Sync base images from public registries (incl. Docker Hub) to ACR
@@ -147,9 +167,9 @@ stages:
     displayName: 'Import manylinux x64 & arm64'
     condition: eq('${{ parameters.syncManylinux }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -210,9 +230,9 @@ stages:
     displayName: 'Import musllinux x64 & arm64'
     condition: eq('${{ parameters.syncMusllinux }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -247,9 +267,9 @@ stages:
     displayName: 'Import Ubuntu 22.04 & 24.04'
     condition: eq('${{ parameters.syncUbuntu }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -302,13 +322,17 @@ stages:
       retryCountOnTaskFailure: 3
 
   # Alpine 3.18 & 3.19 (Docker Hub - rate limited)
+  # 3.19/3.20 are no longer in the CI test matrices (validation-stages.yml) but
+  # stay synced deliberately: kerberos-test/docker-compose-matrix.yml,
+  # run-all-distros.sh, and validate-local.sh still expose alpine319/alpine320
+  # profiles for local repro. Don't prune these as "dead".
   - job: Alpine1
     displayName: 'Import Alpine 3.18 & 3.19'
     condition: eq('${{ parameters.syncAlpine1 }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -365,9 +389,9 @@ stages:
     displayName: 'Import Alpine 3.20 & 3.21'
     condition: eq('${{ parameters.syncAlpine2 }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -424,9 +448,9 @@ stages:
     displayName: 'Import Alpine 3.22 & 3.23'
     condition: eq('${{ parameters.syncAlpine3 }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -483,9 +507,9 @@ stages:
     displayName: 'Import Debian & RHEL UBI'
     condition: eq('${{ parameters.syncDebianRHEL }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -629,9 +653,9 @@ stages:
     displayName: 'Import Oracle Linux 9'
     condition: eq('${{ parameters.syncOracle }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -664,9 +688,9 @@ stages:
     displayName: 'Import CentOS Stream 9'
     condition: eq('${{ parameters.syncCentOS }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -688,9 +712,9 @@ stages:
     displayName: 'Import openSUSE Leap 15.6'
     condition: eq('${{ parameters.syncSUSE }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
     - task: AzureCLI@2
@@ -735,9 +759,9 @@ stages:
     displayName: Build x64 Images
     condition: or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true'))
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: self
       displayName: Checkout repository
@@ -858,9 +882,9 @@ stages:
     timeoutInMinutes: 120
     condition: eq('${{ parameters.buildKerberosImages }}', 'true')
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: self
       displayName: Checkout repository
@@ -936,9 +960,9 @@ stages:
     # x64 failure.
     condition: and(succeeded(), or(eq('${{ parameters.buildPythonImages }}', 'true'), eq('${{ parameters.buildUbuntuImages }}', 'true')))
     pool:
-      name: RUST-1ES-POOL-ARM-WUS3
+      name: RUST-ARM64-WUS3
       demands:
-        - imageOverride -equals RUST-UBUNTU-ARM64
+        - imageOverride -equals ${{ parameters.linuxArmImage }}
     steps:
     - checkout: self
       displayName: Checkout repository
@@ -948,9 +972,9 @@ stages:
       inputs:
         dockerVersion: '29.0.0'
 
-    - template: templates/install-ubuntu-dependency.yaml
+    - template: templates/install-host-dependency.yaml
       parameters:
-        installAzCli: false
+        installAzCli: true
         installDocker: true
 
     - task: AzureCLI@2
@@ -1069,11 +1093,13 @@ stages:
     dependsOn:
     - BuildX64Images
     - BuildARM64Images
-    condition: eq('${{ parameters.buildUbuntuImages }}', 'true')
+    # Explicit succeeded(): without it a failed ARM64 build still publishes a
+    # manifest pairing fresh x64 images with stale arm64 ones.
+    condition: and(succeeded(), eq('${{ parameters.buildUbuntuImages }}', 'true'))
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
 
@@ -1132,9 +1158,9 @@ stages:
     - CreateMultiArchManifests
     condition: always()
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
 
@@ -1268,9 +1294,9 @@ stages:
     displayName: 'Mirror ACR -> GHCR'
     timeoutInMinutes: 60
     pool:
-      name: RUST-1ES-POOL-WUS3
+      name: RUST-X64-WUS3
       demands:
-        - imageOverride -equals RUST-1ES-UBUSLIM
+        - imageOverride -equals ${{ parameters.linuxImage }}
     steps:
     - checkout: none
 
@@ -1285,8 +1311,7 @@ stages:
         TOKEN="${GHCR_TOKEN:-}"
         # Treat empty, or an unexpanded "$(...)" macro (contains '$' or '('), as
         # "not set". A real GitHub PAT only contains [A-Za-z0-9_], so these
-        # patterns never match a valid token. Do NOT reference $(GHCR_TOKEN)
-        # here: the agent macro-expands it into the script body before bash runs.
+        # patterns never match a valid token.
         case "$TOKEN" in
           ''|*'$'*|*'('*)
             echo "GHCR_TOKEN not set (empty or unexpanded macro); skipping GHCR publish."
@@ -1299,12 +1324,30 @@ stages:
           echo "Set the 'GitHub username for the PAT' parameter and re-run."
           exit 1
         fi
+        export LC_ALL=C
+        if [[ ${#GHCR_USER_INPUT} -gt 39 || ! "$GHCR_USER_INPUT" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*(_[A-Za-z0-9]+)?$ ]]; then
+          echo "ERROR: ghcrUsername must be a GitHub login (1-39 letters/digits, single internal hyphens, optional _shortcode)."
+          exit 1
+        fi
+        OWNER="${GHCR_ORG_INPUT%%/*}"
+        if [[ ${#OWNER} -gt 39 || ! "$OWNER" =~ ^[a-z0-9]+(-[a-z0-9]+)*(_[a-z0-9]+)?$ ]]; then
+          echo "ERROR: ghcrOrg must start with a lowercase GitHub owner (1-39 letters/digits, single internal hyphens, optional _shortcode)."
+          exit 1
+        fi
+        if [[ "$GHCR_ORG_INPUT" == */* ]]; then
+          REPO="${GHCR_ORG_INPUT#*/}"
+          if [[ ${#REPO} -gt 100 || ! "$REPO" =~ ^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$ ]]; then
+            echo "ERROR: ghcrOrg must be owner or owner/repo with a lowercase container repository component (1-100 characters)."
+            exit 1
+          fi
+        fi
         echo "##vso[task.setvariable variable=GHCR_ENABLED]true"
-        echo "GHCR publish enabled for namespace: $(GHCR_NAMESPACE)"
+        echo "GHCR publish enabled for namespace: ghcr.io/${GHCR_ORG_INPUT}"
       displayName: 'Check for GHCR_TOKEN'
       env:
         GHCR_TOKEN: $(GHCR_TOKEN)
         GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
+        GHCR_ORG_INPUT: ${{ parameters.ghcrOrg }}
 
     - script: |
         set -euo pipefail
@@ -1356,11 +1399,11 @@ stages:
         echo "Images to mirror to GHCR:"
         sed 's/^/  /' "$(Pipeline.Workspace)/ghcr/images.txt"
       displayName: 'Define image list'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
 
     - task: AzureCLI@2
       displayName: 'Login to ACR (read source images)'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
       inputs:
         azureSubscription: 'Magnitude Test'
         scriptType: 'bash'
@@ -1372,12 +1415,13 @@ stages:
 
     - script: |
         set -euo pipefail
-        echo "$GHCR_TOKEN" | docker login $(GHCR_REGISTRY) -u "${{ parameters.ghcrUsername }}" --password-stdin
+        printf '%s' "$GHCR_TOKEN" | docker login $(GHCR_REGISTRY) -u "$GHCR_USER_INPUT" --password-stdin
         echo "Logged in to GHCR."
       displayName: 'Login to GHCR (PAT)'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
       env:
         GHCR_TOKEN: $(GHCR_TOKEN)
+        GHCR_USER_INPUT: ${{ parameters.ghcrUsername }}
 
     - script: |
         set -euo pipefail
@@ -1385,7 +1429,7 @@ stages:
         while read -r img; do
           [ -z "$img" ] && continue
           src="$(ACR_REGISTRY)/${img}"
-          dst="$(GHCR_NAMESPACE)/${img}"
+          dst="ghcr.io/${GHCR_ORG_INPUT}/${img}"
           echo "==> mirroring ${src} -> ${dst}"
           if docker buildx imagetools create -t "$dst" "$src"; then
             echo "    OK"
@@ -1400,16 +1444,23 @@ stages:
         fi
         echo "All images mirrored to GHCR."
       displayName: 'Mirror images ACR -> GHCR'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
       retryCountOnTaskFailure: 3
+      env:
+        GHCR_ORG_INPUT: ${{ parameters.ghcrOrg }}
 
     - script: |
+        set -euo pipefail
         echo "======================================================"
-        echo "Mirrored to GHCR namespace: $(GHCR_NAMESPACE)"
+        echo "Mirrored to GHCR namespace: ghcr.io/${GHCR_ORG_INPUT}"
         echo "======================================================"
-        sed 's#^#  $(GHCR_NAMESPACE)/#' "$(Pipeline.Workspace)/ghcr/images.txt"
+        while read -r img; do
+          printf '  ghcr.io/%s/%s\n' "$GHCR_ORG_INPUT" "$img"
+        done < "$(Pipeline.Workspace)/ghcr/images.txt"
         echo ""
         echo "NOTE: each GHCR package must be set to Public for anonymous pulls:"
-        echo "  https://github.com/orgs/$(echo '${{ parameters.ghcrOrg }}' | cut -d/ -f1)/packages"
+        echo "  https://github.com/orgs/${GHCR_ORG_INPUT%%/*}/packages"
       displayName: 'GHCR summary'
-      condition: eq(variables['GHCR_ENABLED'], 'true')
+      condition: and(succeeded(), eq(variables['GHCR_ENABLED'], 'true'))
+      env:
+        GHCR_ORG_INPUT: ${{ parameters.ghcrOrg }}

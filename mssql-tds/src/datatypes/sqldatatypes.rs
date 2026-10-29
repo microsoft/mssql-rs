@@ -330,7 +330,7 @@ impl VectorBaseType {
 
     /// Returns the maximum number of dimensions a single vector value of this
     /// base type can hold. Based on the TDS protocol, the maximum payload size
-    /// is constrained by [`VECTOR_MAX_SIZE`] (8000 bytes) which allows up to
+    /// is constrained by `VECTOR_MAX_SIZE` (8000 bytes) which allows up to
     /// 1998 elements for Float32 and 3996 elements for Float16 vectors.
     pub const fn max_dimensions(self) -> u16 {
         // (VECTOR_MAX_SIZE - VECTOR_HEADER_SIZE) / element_size_bytes
@@ -623,9 +623,10 @@ impl TypeInfo {
     ///
     /// `length` is the wire-declared length declarator. For streamed/`(max)`
     /// types this is typically `0xFFFF` (the PLP sentinel), matching what the
-    /// parser produces. XML schema info and UDT info are not exposed by this
-    /// constructor; they remain internal to the parser. Returns `Err` if
-    /// `tds_type` is not a partial-length type.
+    /// parser produces. XML schema info and UDT info cannot be supplied through
+    /// this constructor. Parsed UDT metadata is available through
+    /// [`Self::udt_info`]; XML schema info remains internal to the parser.
+    /// Returns `Err` if `tds_type` is not a partial-length type.
     pub fn partial_len(
         tds_type: TdsDataType,
         length: usize,
@@ -637,6 +638,20 @@ impl TypeInfo {
             length,
             type_info_variant: TypeInfoVariant::PartialLen(t, Some(length), collation, None, None),
         })
+    }
+
+    /// CLR UDT identity parsed from a result-set `COLMETADATA` token.
+    pub fn udt_info(&self) -> Option<&UdtInfoInColMetadata> {
+        match &self.type_info_variant {
+            TypeInfoVariant::PartialLen(
+                PartialLengthType::Udt,
+                _,
+                _,
+                _,
+                Some(UdtInfo::InColMetadata(info)),
+            ) => Some(info),
+            _ => None,
+        }
     }
 }
 
@@ -673,13 +688,55 @@ pub(crate) struct XmlInfo {
 
 /// UDT metadata received in COLMETADATA tokens.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields parsed from TDS wire protocol for completeness
-pub(crate) struct UdtInfoInColMetadata {
+pub struct UdtInfoInColMetadata {
     max_byte_size: u16,
     db_name: String,
     schema_name: String,
     type_name: String,
     assembly_qualified_name: UdtMetadata,
+}
+
+impl UdtInfoInColMetadata {
+    pub(crate) fn new(
+        max_byte_size: u16,
+        db_name: String,
+        schema_name: String,
+        type_name: String,
+        assembly_qualified_name: String,
+    ) -> Self {
+        Self {
+            max_byte_size,
+            db_name,
+            schema_name,
+            type_name,
+            assembly_qualified_name,
+        }
+    }
+
+    /// Maximum serialized size advertised by SQL Server.
+    pub fn max_byte_size(&self) -> u16 {
+        self.max_byte_size
+    }
+
+    /// Database containing the UDT definition.
+    pub fn db_name(&self) -> &str {
+        &self.db_name
+    }
+
+    /// Schema containing the UDT definition.
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    /// SQL Server UDT name.
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// CLR assembly-qualified type name.
+    pub fn assembly_qualified_name(&self) -> &str {
+        &self.assembly_qualified_name
+    }
 }
 
 type UdtMetadata = String;
@@ -800,10 +857,9 @@ where
                     2 => reader.read_uint16().await? as usize,
                     4 => reader.read_int32().await? as usize,
                     _ => {
-                        unreachable!(
-                            "Invalid tds length {:?} for type: {:?}",
-                            len_byte_count, data_type
-                        )
+                        return Err(Error::ProtocolError(format!(
+                            "Invalid TDS length byte count {len_byte_count} for type: {data_type:?}"
+                        )));
                     }
                 };
                 let precision = reader.read_byte().await?;
@@ -883,44 +939,37 @@ where
         };
 
         // At this point, it is possible that we have a data type which could be PLP
-        // Check if the data type matches the PLP types, and if so, convert it to PLP
+        // Check if the data type matches the PLP types, and if so, convert it to PLP.
+        // Only an unknown length from the earlier metadata (0xFFFF) makes it PLP.
         match data_type {
-            TdsDataType::BigVarChar | TdsDataType::BigVarBinary | TdsDataType::NVarChar => {
-                let plp_type = PartialLengthType::try_from(data_type);
-                // Only if the length from earlier metadata is unknown (0xFFFF), then
-                // we can convert it to a PLP type.
-                if type_info.length == 0xFFFF {
-                    let info = match type_info.type_info_variant {
-                        TypeInfoVariant::VarLenString(_, _, collation) => Ok(TypeInfo {
-                            tds_type: data_type,
-                            length: type_info.length,
-                            type_info_variant: TypeInfoVariant::PartialLen(
-                                plp_type.unwrap(),
-                                Some(type_info.length),
-                                collation,
-                                None,
-                                None,
-                            ),
-                        }),
-                        TypeInfoVariant::VarLen(_, _) => Ok(TypeInfo {
-                            tds_type: data_type,
-                            length: type_info.length,
-                            type_info_variant: TypeInfoVariant::PartialLen(
-                                plp_type.unwrap(),
-                                Some(type_info.length),
-                                None,
-                                None,
-                                None,
-                            ),
-                        }),
-                        _ => {
-                            unreachable!("Other PLP types apart from strings are not handled.");
-                        }
-                    };
-                    return info;
-                } else {
-                    return Ok(type_info);
-                }
+            TdsDataType::BigVarChar | TdsDataType::BigVarBinary | TdsDataType::NVarChar
+                if type_info.length == 0xFFFF =>
+            {
+                let plp_type = PartialLengthType::try_from(data_type).map_err(|_| {
+                    Error::ProtocolError(format!(
+                        "Data type {data_type:?} reported an unknown length (0xFFFF) but has no partial-length form"
+                    ))
+                })?;
+                let collation = match type_info.type_info_variant {
+                    TypeInfoVariant::VarLenString(_, _, collation) => collation,
+                    TypeInfoVariant::VarLen(_, _) => None,
+                    other => {
+                        return Err(Error::ProtocolError(format!(
+                            "Data type {data_type:?} reported an unknown length (0xFFFF) with unsupported type info {other:?}"
+                        )));
+                    }
+                };
+                return Ok(TypeInfo {
+                    tds_type: data_type,
+                    length: type_info.length,
+                    type_info_variant: TypeInfoVariant::PartialLen(
+                        plp_type,
+                        Some(type_info.length),
+                        collation,
+                        None,
+                        None,
+                    ),
+                });
             }
             _ => return Ok(type_info),
         }
@@ -953,13 +1002,13 @@ where
                         Some(len),
                         None,
                         None,
-                        Some(UdtInfo::InColMetadata(UdtInfoInColMetadata {
-                            max_byte_size: len as u16,
+                        Some(UdtInfo::InColMetadata(UdtInfoInColMetadata::new(
+                            len as u16,
                             db_name,
                             schema_name,
                             type_name,
                             assembly_qualified_name,
-                        })),
+                        ))),
                     ),
                 }
             }
@@ -1721,6 +1770,38 @@ mod tests {
                 None
             )
         ));
+    }
+
+    #[test]
+    fn test_type_info_udt_info() {
+        let ti = TypeInfo {
+            tds_type: TdsDataType::Udt,
+            length: 892,
+            type_info_variant: TypeInfoVariant::PartialLen(
+                PartialLengthType::Udt,
+                Some(892),
+                None,
+                None,
+                Some(UdtInfo::InColMetadata(UdtInfoInColMetadata::new(
+                    892,
+                    "tempdb".to_string(),
+                    "sys".to_string(),
+                    "hierarchyid".to_string(),
+                    "Microsoft.SqlServer.Types.SqlHierarchyId, Microsoft.SqlServer.Types"
+                        .to_string(),
+                ))),
+            ),
+        };
+
+        let info = ti.udt_info().unwrap();
+        assert_eq!(info.max_byte_size(), 892);
+        assert_eq!(info.db_name(), "tempdb");
+        assert_eq!(info.schema_name(), "sys");
+        assert_eq!(info.type_name(), "hierarchyid");
+        assert_eq!(
+            info.assembly_qualified_name(),
+            "Microsoft.SqlServer.Types.SqlHierarchyId, Microsoft.SqlServer.Types"
+        );
     }
 
     #[test]

@@ -162,6 +162,8 @@ pub enum Error {
         host: String,
         /// Target port.
         port: u16,
+        /// Database to log in to on the target, set by Enhanced Routing.
+        database: Option<String>,
     },
 
     /// Failed to establish a connection.
@@ -232,6 +234,15 @@ pub enum Error {
     /// Value could not be converted to the target SQL type.
     #[error("Type Conversion Error: {0}")]
     TypeConversionError(String),
+
+    /// A value's encoded bytes exceed the caller's declared limit.
+    #[error("Encoded value length {actual} bytes exceeds the maximum {maximum} bytes")]
+    EncodedValueTooLong {
+        /// Encoded byte length of the value.
+        actual: usize,
+        /// Maximum encoded byte length accepted by the caller.
+        maximum: usize,
+    },
 
     /// Connection was closed by server or transport.
     #[error("Connection closed: {0}")]
@@ -319,6 +330,14 @@ pub enum Error {
     /// Cryptographic failure in the Always Encrypted column-encryption data path.
     #[error("Column encryption error: {0}")]
     ColumnEncryptionError(String),
+
+    /// A request carried the RESETCONNECTION packet-header bit, but its response
+    /// never contained the `ResetConnection` ENVCHANGE. The session was
+    /// therefore never returned to its login defaults and must not be reused.
+    #[error(
+        "The connection reset was not acknowledged by the server, so the session was not returned to its login defaults"
+    )]
+    ConnectionResetNotAcknowledged,
 }
 
 /// Helper for `SqlServerError` display formatting.
@@ -457,6 +476,7 @@ mod tests {
         let error = Error::Redirection {
             host: "example.com".to_string(),
             port: 1433,
+            database: None,
         };
         assert!(error.to_string().contains("example.com"));
         assert!(error.to_string().contains("1433"));

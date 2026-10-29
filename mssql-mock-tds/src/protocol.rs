@@ -14,6 +14,9 @@ pub const PACKET_HEADER_SIZE: usize = 8;
 /// Maximum packet size
 pub const MAX_PACKET_SIZE: usize = 4096;
 
+const PLP_TYPE_LENGTH_MARKER: u16 = 0xFFFF;
+const MAX_BOUNDED_STRING_BYTES: u16 = 8000;
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("IO error: {0}")]
@@ -163,6 +166,10 @@ pub enum TokenType {
 
 /// FedAuth feature extension ID
 pub const FEATURE_EXT_FEDAUTH: u8 = 0x02;
+/// Data Classification feature extension ID
+pub const FEATURE_EXT_DATA_CLASSIFICATION: u8 = 0x09;
+/// Enhanced Routing feature extension ID
+pub const FEATURE_EXT_ENHANCED_ROUTING: u8 = 0x0F;
 pub const FEATURE_EXT_USER_AGENT: u8 = 0x10;
 /// FedAuth terminator
 pub const FEATURE_EXT_TERMINATOR: u8 = 0xFF;
@@ -176,10 +183,34 @@ pub struct Login7AuthInfo {
     pub access_token_bytes: Option<Vec<u8>>,
     /// FedAuth library type (0x01 = SecurityToken, 0x02 = MSAL)
     pub fedauth_library: u8,
+    /// MSAL workflow byte (MS-TDS 2.2.6.4: 0x01 password, 0x02 integrated,
+    /// 0x03 interactive/other) when the library is MSAL.
+    pub fedauth_workflow: Option<u8>,
     /// Server name from Login7 packet (the data source string sent by client)
     pub server_name: Option<String>,
     /// User Agent string from Login7 packet (if present)
     pub user_agent: Option<String>,
+    /// Data Classification version requested in Login7 feature `0x09` (if present)
+    pub data_classification_version: Option<u8>,
+    /// Database requested in the Login7 packet (if any)
+    pub database: Option<String>,
+    /// Every FeatureExt id the Login7 packet carried, in order
+    pub feature_ids: Vec<u8>,
+}
+
+/// Decodes the UTF-16LE string that the Login7 offset/length pair at `entry` points to.
+fn read_login7_string(data: &[u8], entry: usize) -> Option<String> {
+    let offset = u16::from_le_bytes([*data.get(entry)?, *data.get(entry + 1)?]) as usize;
+    let chars = u16::from_le_bytes([*data.get(entry + 2)?, *data.get(entry + 3)?]) as usize;
+    if chars == 0 {
+        return None;
+    }
+    let bytes = data.get(offset..offset + chars * 2)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    String::from_utf16(&units).ok()
 }
 
 /// Parse Login7 packet to extract FedAuth feature extension with access token
@@ -230,6 +261,9 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             auth_info.server_name = Some(server_name);
         }
     }
+
+    // ibDatabase/cchDatabase is the 9th offset-table entry.
+    auth_info.database = read_login7_string(data, 68);
 
     // Read OptionFlags3 at offset 27
     let option_flags3 = data[27];
@@ -303,6 +337,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
 
         let feat_len =
             u32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]) as usize;
+        auth_info.feature_ids.push(feature_id);
 
         if feature_id == FEATURE_EXT_FEDAUTH {
             auth_info.has_fedauth = true;
@@ -313,6 +348,10 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
                 if !feat_data.is_empty() {
                     let options = feat_data[0];
                     auth_info.fedauth_library = (options >> 1) & 0x03;
+
+                    if auth_info.fedauth_library == 0x02 {
+                        auth_info.fedauth_workflow = feat_data.get(1).copied();
+                    }
 
                     if auth_info.fedauth_library == 0x01 && feat_data.len() > 5 {
                         let token_len = u32::from_le_bytes([
@@ -330,6 +369,8 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
                     }
                 }
             }
+        } else if feature_id == FEATURE_EXT_DATA_CLASSIFICATION && feat_len >= 1 {
+            auth_info.data_classification_version = data.get(i + 5).copied();
         } else if feature_id == FEATURE_EXT_USER_AGENT && i + 5 + feat_len <= data.len() {
             let feat_data = &data[i + 5..i + 5 + feat_len];
             if feat_data.len().is_multiple_of(2) {
@@ -481,6 +522,29 @@ pub fn build_feature_ext_ack_fedauth() -> BytesMut {
     // Terminator
     token_data.put_u8(FEATURE_EXT_TERMINATOR);
 
+    token_data
+}
+
+/// Build a FeatureExtAck token enabling Data Classification at `version`.
+pub fn build_feature_ext_ack_data_classification(version: u8) -> BytesMut {
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::FeatureExtAck as u8);
+    token_data.put_u8(FEATURE_EXT_DATA_CLASSIFICATION);
+    token_data.put_u32_le(2);
+    token_data.put_u8(version);
+    token_data.put_u8(1); // IsEnabled
+    token_data.put_u8(FEATURE_EXT_TERMINATOR);
+    token_data
+}
+
+/// Build a FeatureExtAck token answering Enhanced Routing with `is_enabled`.
+pub fn build_feature_ext_ack_enhanced_routing(is_enabled: u8) -> BytesMut {
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::FeatureExtAck as u8);
+    token_data.put_u8(FEATURE_EXT_ENHANCED_ROUTING);
+    token_data.put_u32_le(1);
+    token_data.put_u8(is_enabled);
+    token_data.put_u8(FEATURE_EXT_TERMINATOR);
     token_data
 }
 
@@ -672,15 +736,18 @@ pub fn build_login_ack() -> BytesMut {
     token_data
 }
 
-/// Build a DONE token
-pub fn build_done_token(row_count: u64) -> BytesMut {
+/// Build a DONE token with explicit status flags (MS-TDS `DONE_STATUS`) and
+/// row count. The lower-level primitive behind [`build_done_token`] (which
+/// always passes `DONE_FINAL`) and [`build_attention_ack_packet`] (which needs
+/// `DONE_ATTN` instead).
+fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
     let mut token_data = BytesMut::new();
 
     // DONE token (0xFD)
     token_data.put_u8(TokenType::Done as u8);
 
-    // Status: DONE_FINAL (0x00) - little-endian
-    token_data.put_u16_le(0x0000);
+    // Status - little-endian
+    token_data.put_u16_le(status);
 
     // CurCmd: SELECT (0xC1) - little-endian
     token_data.put_u16_le(0x00C1);
@@ -689,6 +756,19 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data.put_u64_le(row_count);
 
     token_data
+}
+
+/// Build a DONE token
+pub fn build_done_token(row_count: u64) -> BytesMut {
+    build_done_token_with_status(0x0000, row_count) // DONE_FINAL
+}
+
+/// Build the full packet answering an `Attention` (0x06) request: a DONE
+/// token carrying the DONE_ATTN flag (0x0020), matching real SQL Server's
+/// acknowledgment that it stopped processing the cancelled request.
+pub fn build_attention_ack_packet() -> BytesMut {
+    let response = build_done_token_with_status(0x0020, 0); // DONE_ATTN
+    wrap_in_packet(PacketType::TabularResult, response)
 }
 
 /// Transaction Manager request types (MS-TDS SQLTransactionManagerRequest).
@@ -856,9 +936,74 @@ pub fn build_leading_error_tokens(error: &crate::query_response::LeadingError) -
     buf
 }
 
+/// Build a raw ERROR token (0xAA) followed by a DONE token carrying only the
+/// ERROR flag. Models a statement that fails outright — no MORE flag, no
+/// further result set — e.g. SQL Server error 1222 on a lock-timed-out
+/// `SELECT`. The returned bytes are raw tokens (no packet wrapper).
+pub fn build_terminal_error_tokens(error: &crate::query_response::TerminalError) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    buf.put_u8(TokenType::Error as u8);
+    let length_pos = buf.len();
+    buf.put_u16_le(0); // placeholder for token length
+
+    buf.put_u32_le(error.number);
+    buf.put_u8(1); // state
+    buf.put_u8(error.severity);
+
+    let message_utf16: Vec<u16> = error.message.encode_utf16().collect();
+    buf.put_u16_le(message_utf16.len() as u16);
+    for ch in message_utf16 {
+        buf.put_u16_le(ch);
+    }
+
+    buf.put_u8(0); // server name (empty)
+    buf.put_u8(0); // procedure name (empty)
+    buf.put_u32_le(1); // line number
+
+    let token_length = (buf.len() - length_pos - 2) as u16;
+    let mut length_bytes = &mut buf[length_pos..length_pos + 2];
+    length_bytes.put_u16_le(token_length);
+
+    // DONE with DONE_ERROR (0x02) only: the batch ends here, no MORE.
+    buf.put_u8(TokenType::Done as u8);
+    buf.put_u16_le(0x0002);
+    buf.put_u16_le(0x00C1); // CurCmd: SELECT
+    buf.put_u64_le(0); // row count
+
+    buf
+}
+
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
+    build_query_result_with_trailing_info(response, &[])
+}
+
+/// Build a query result whose `trailing_info` tokens follow the last row,
+/// before the terminal DONE — where SQL Server reports an aggregate warning.
+pub fn build_query_result_with_trailing_info(
+    response: &crate::query_response::QueryResponse,
+    trailing_info: &[crate::query_response::InfoMessage],
+) -> BytesMut {
+    build_query_result_with_extras(response, &[], trailing_info)
+}
+
+/// Build a query result with optional raw `data_classification` token bytes
+/// sent right after ColMetadata (where SQL Server sends `0xA3`) and
+/// `trailing_info` tokens after the last row.
+pub fn build_query_result_with_extras(
+    response: &crate::query_response::QueryResponse,
+    data_classification: &[u8],
+    trailing_info: &[crate::query_response::InfoMessage],
+) -> BytesMut {
     let mut result = BytesMut::new();
+
+    // A terminal error replaces the result set entirely: no ColMetadata, no
+    // rows, no trailing DONE — the error's own DONE ends the batch.
+    if let Some(terminal_error) = &response.terminal_error {
+        result.extend_from_slice(&build_terminal_error_tokens(terminal_error));
+        return wrap_in_packet(PacketType::TabularResult, result);
+    }
 
     // A statement-scoped error preceding the result set: emit the ERROR token
     // and its DONE (MORE) before the ColMetadata so the row set still streams.
@@ -875,11 +1020,28 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         result.put_u32_le(0); // UserType
         result.put_u16_le(0x0000); // Flags: not nullable, no special flags
         result.put_u8(col.data_type.tds_type_code());
-        if col.data_type == crate::query_response::SqlDataType::NVarChar {
+        if matches!(
+            col.data_type,
+            crate::query_response::SqlDataType::NVarChar
+                | crate::query_response::SqlDataType::NVarCharMax
+                | crate::query_response::SqlDataType::VarCharMax
+        ) {
             // Required to support string responses (e.g., @@USERAGENT).
             // TDS ColMetadata mandates a 5-byte collation suffix for variable-length types.
-            result.put_u16_le(8000); // NVARCHAR(4000) max byte capacity
-            result.put_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]); // SQL_Latin1_General_CP1_CI_AS
+            result.put_u16_le(
+                if matches!(
+                    col.data_type,
+                    crate::query_response::SqlDataType::NVarCharMax
+                        | crate::query_response::SqlDataType::VarCharMax
+                ) {
+                    PLP_TYPE_LENGTH_MARKER
+                } else {
+                    MAX_BOUNDED_STRING_BYTES
+                },
+            );
+            result.put_slice(&col.collation);
+        } else if col.data_type == crate::query_response::SqlDataType::VarBinaryMax {
+            result.put_u16_le(PLP_TYPE_LENGTH_MARKER);
         } else {
             result.put_u8(col.data_type.max_length());
         }
@@ -891,6 +1053,9 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
             result.put_u16_le(ch);
         }
     }
+
+    // DATACLASSIFICATION follows COLMETADATA when the query reads classified columns.
+    result.extend_from_slice(data_classification);
 
     // Inject Info tokens between ColMetadata and Rows (Fabric DW behavior)
     for info in &response.info_tokens {
@@ -905,9 +1070,14 @@ pub fn build_query_result(response: &crate::query_response::QueryResponse) -> By
         }
     }
 
+    // Trailing Info tokens: after the last row, before DONE — where SQL Server
+    // reports an aggregate warning such as 8153.
+    for info in trailing_info {
+        result.extend_from_slice(&build_info_token(info));
+    }
+
     // DONE token
     result.extend_from_slice(&build_done_token(response.rows.len() as u64));
-
     wrap_in_packet(PacketType::TabularResult, result)
 }
 
@@ -1040,6 +1210,7 @@ pub fn build_routing_envchange_token(redirect_host: &str, redirect_port: u16) ->
 ///
 /// This response is sent instead of a normal login response when the server
 /// wants to redirect the client to a different endpoint. The response contains:
+/// - LOGINACK token, which [MS-TDS] 2.2.7.9 requires before the route
 /// - Routing EnvChange token (tells client where to connect)
 /// - DONE token (indicates end of response)
 ///
@@ -1050,12 +1221,83 @@ pub fn build_routing_envchange_token(redirect_host: &str, redirect_port: u16) ->
 /// # Returns
 /// A BytesMut containing the complete TDS packet with routing response
 pub fn build_routing_response(redirect_host: &str, redirect_port: u16) -> BytesMut {
-    let mut response = BytesMut::new();
+    build_routing_login_response(redirect_host, redirect_port, &[None], true, None, false)
+}
 
-    // Add routing EnvChange token
-    response.extend_from_slice(&build_routing_envchange_token(redirect_host, redirect_port));
+/// EnvChange subtype for Enhanced Routing
+pub const ENVCHANGE_ENHANCED_ROUTING: u8 = 21; // 0x15
 
-    // Add DONE token
+/// Build an Enhanced Routing EnvChange token (MS-TDS 2.2.7.9, type 21) that
+/// routes the client to `database` on `redirect_host:redirect_port`.
+pub fn build_enhanced_routing_envchange_token(
+    redirect_host: &str,
+    redirect_port: u16,
+    database: &str,
+) -> BytesMut {
+    let mut routing_data = BytesMut::new();
+    routing_data.put_u8(0x00); // Protocol: TCP
+    routing_data.put_u16_le(redirect_port);
+    for value in [redirect_host, database] {
+        let utf16: Vec<u16> = value.encode_utf16().collect();
+        routing_data.put_u16_le(utf16.len() as u16);
+        for ch in utf16 {
+            routing_data.put_u16_le(ch);
+        }
+    }
+
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::EnvChange as u8);
+    // Subtype (1) + RoutingDataValueLength (2) + RoutingDataValue + empty old value (2)
+    token_data.put_u16_le((1 + 2 + routing_data.len() + 2) as u16);
+    token_data.put_u8(ENVCHANGE_ENHANCED_ROUTING);
+    token_data.put_u16_le(routing_data.len() as u16);
+    token_data.extend_from_slice(&routing_data);
+    token_data.put_u16_le(0);
+
+    debug!(
+        "Built enhanced routing EnvChange token: redirect to {}:{} database {}",
+        redirect_host, redirect_port, database
+    );
+
+    token_data
+}
+
+/// Build a login response that routes the client to `redirect_host:redirect_port`.
+///
+/// Each entry of `routes` becomes a routing EnvChange: Enhanced Routing
+/// (type 21) to that database, or plain routing (type 20) for `None`.
+/// [MS-TDS] 2.2.7.9 allows exactly one, after LOGINACK; clearing `login_ack`
+/// or passing more routes models a server that breaks those rules. `ack` is
+/// the FEATUREEXTACK `IsEnabled` byte for feature `0x0F` (`None` omits it),
+/// which servers may send before or after the routing token.
+pub fn build_routing_login_response(
+    redirect_host: &str,
+    redirect_port: u16,
+    routes: &[Option<&str>],
+    login_ack: bool,
+    ack: Option<u8>,
+    ack_before_routing: bool,
+) -> BytesMut {
+    let ack_token = ack.map(build_feature_ext_ack_enhanced_routing);
+    let mut response = if login_ack {
+        build_login_ack()
+    } else {
+        BytesMut::new()
+    };
+    if ack_before_routing && let Some(ref token) = ack_token {
+        response.extend_from_slice(token);
+    }
+    for route in routes {
+        response.extend_from_slice(&match route {
+            Some(database) => {
+                build_enhanced_routing_envchange_token(redirect_host, redirect_port, database)
+            }
+            None => build_routing_envchange_token(redirect_host, redirect_port),
+        });
+    }
+    if !ack_before_routing && let Some(ref token) = ack_token {
+        response.extend_from_slice(token);
+    }
     response.extend_from_slice(&build_done_token(0));
 
     wrap_in_packet(PacketType::TabularResult, response)
@@ -1100,6 +1342,63 @@ pub fn parse_sql_batch(data: &[u8]) -> Result<String, ProtocolError> {
 
     debug!("Parsed SQL: {}", sql.trim());
     Ok(sql.trim().to_string())
+}
+
+/// Header type for the TransactionDescriptor entry within ALL_HEADERS
+/// (MS-TDS 2.2.5.3.1).
+const HEADER_TYPE_TRANSACTION_DESCRIPTOR: u16 = 0x0002;
+
+/// Parses the ALL_HEADERS block that leads a `SqlBatch`/`RpcRequest` packet
+/// body and returns the TransactionDescriptor header's
+/// `(TransactionDescriptor, OutstandingRequestCount)`, if one is present.
+///
+/// `ConnectionProcessor` records the result of every call in
+/// [`ConnectionInfo::transaction_descriptor_headers`], so a test can assert a
+/// client honored MS-TDS 2.2.5.3.2 — "The TransactionDescriptor MUST be 0,
+/// and OutstandingRequestCount MUST be 1 if the connection is operating in
+/// autocommit mode" — without the mock server itself enforcing it.
+///
+/// [`ConnectionInfo::transaction_descriptor_headers`]: crate::server::ConnectionInfo::transaction_descriptor_headers
+pub fn parse_transaction_descriptor_header(data: &[u8]) -> Option<(u64, u32)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let all_headers_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if !(4..=data.len()).contains(&all_headers_len) {
+        return None;
+    }
+
+    // Walk the individual headers within [4, all_headers_len): each starts
+    // with its own 4-byte length (inclusive of itself) followed by a 2-byte
+    // HeaderType.
+    let mut offset = 4;
+    while offset + 6 <= all_headers_len {
+        let header_len = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        let header_type = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+
+        if header_len < 6 || offset + header_len > all_headers_len {
+            return None;
+        }
+
+        if header_type == HEADER_TYPE_TRANSACTION_DESCRIPTOR && header_len >= 18 {
+            let td_start = offset + 6;
+            let transaction_descriptor =
+                u64::from_le_bytes(data[td_start..td_start + 8].try_into().ok()?);
+            let count_start = td_start + 8;
+            let outstanding_request_count =
+                u32::from_le_bytes(data[count_start..count_start + 4].try_into().ok()?);
+            return Some((transaction_descriptor, outstanding_request_count));
+        }
+
+        offset += header_len;
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -1160,8 +1459,109 @@ mod tests {
         // First byte should be packet type (TabularResult = 0x04)
         assert_eq!(response[0], PacketType::TabularResult as u8);
 
-        // After header, should have EnvChange token (0xE3)
-        assert_eq!(response[PACKET_HEADER_SIZE], TokenType::EnvChange as u8);
+        // [MS-TDS] 2.2.7.9: LOGINACK, then the routing EnvChange.
+        assert_eq!(
+            response,
+            routing_packet(&[
+                &build_login_ack(),
+                &build_routing_envchange_token("sqlserver.database.windows.net", 1433),
+            ])
+        );
+    }
+
+    /// A login response packet carrying `tokens`, then DONE.
+    fn routing_packet(tokens: &[&BytesMut]) -> BytesMut {
+        let mut body = BytesMut::new();
+        for token in tokens {
+            body.extend_from_slice(token);
+        }
+        body.extend_from_slice(&build_done_token(0));
+        wrap_in_packet(PacketType::TabularResult, body)
+    }
+
+    #[test]
+    fn test_enhanced_routing_envchange_token() {
+        let token = build_enhanced_routing_envchange_token("srv", 1433, "db");
+        let routing_data = [
+            0x00, // TCP
+            0x99, 0x05, // port 1433
+            0x03, 0x00, b's', 0, b'r', 0, b'v', 0, // AlternateServer
+            0x02, 0x00, b'd', 0, b'b', 0, // AlternateDatabase
+        ];
+        let mut expected = vec![TokenType::EnvChange as u8];
+        expected.extend_from_slice(&((1 + 2 + routing_data.len() + 2) as u16).to_le_bytes());
+        expected.push(ENVCHANGE_ENHANCED_ROUTING);
+        expected.extend_from_slice(&(routing_data.len() as u16).to_le_bytes());
+        expected.extend_from_slice(&routing_data);
+        expected.extend_from_slice(&[0, 0]); // empty old value
+        assert_eq!(token.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_enhanced_routing_response_places_the_acknowledgement() {
+        let ack = build_feature_ext_ack_enhanced_routing(1);
+        assert_eq!(ack.as_ref(), [0xAE, 0x0F, 1, 0, 0, 0, 1, 0xFF]);
+        let routing = build_enhanced_routing_envchange_token("srv", 1433, "db");
+        let position = |response: &BytesMut, needle: &[u8]| {
+            response
+                .windows(needle.len())
+                .position(|window| window == needle)
+        };
+
+        let after = build_routing_login_response("srv", 1433, &[Some("db")], true, Some(1), false);
+        assert!(position(&after, &routing) < position(&after, &ack));
+        let before = build_routing_login_response("srv", 1433, &[Some("db")], true, Some(1), true);
+        assert!(position(&before, &ack) < position(&before, &routing));
+        let without = build_routing_login_response("srv", 1433, &[Some("db")], true, None, false);
+        assert!(position(&without, &routing).is_some());
+        assert_eq!(position(&without, &ack), None);
+    }
+
+    #[test]
+    fn test_routing_login_response_models_malformed_servers() {
+        let ack = build_feature_ext_ack_enhanced_routing(1);
+        let plain = build_routing_envchange_token("srv", 1433);
+        let enhanced = build_enhanced_routing_envchange_token("srv", 1433, "db");
+
+        assert_eq!(
+            build_routing_login_response("srv", 1433, &[Some("db")], false, Some(1), true),
+            routing_packet(&[&ack, &enhanced])
+        );
+        assert_eq!(
+            build_routing_login_response("srv", 1433, &[Some("db"), None], true, None, false),
+            routing_packet(&[&build_login_ack(), &enhanced, &plain])
+        );
+    }
+
+    #[test]
+    fn test_parse_login7_database_and_feature_ids() {
+        let database: Vec<u8> = "routed_db"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut payload = BytesMut::zeroed(94);
+        payload[27] = 0x10; // OptionFlags3 (FeatureExt bit)
+        payload[56] = 94; // FeatureExt table entry -> DWORD at offset 94
+        payload[68..70].copy_from_slice(&98u16.to_le_bytes()); // ibDatabase
+        payload[70..72].copy_from_slice(&9u16.to_le_bytes()); // cchDatabase
+        payload.put_u32_le(98 + database.len() as u32); // feature data follows the database
+        payload.put_slice(&database);
+        payload.put_u8(FEATURE_EXT_ENHANCED_ROUTING);
+        payload.put_u32_le(0);
+        payload.put_u8(FEATURE_EXT_DATA_CLASSIFICATION);
+        payload.put_u32_le(1);
+        payload.put_u8(2);
+        payload.put_u8(FEATURE_EXT_TERMINATOR);
+
+        let parsed = parse_login7_auth(&payload);
+        assert_eq!(parsed.database.as_deref(), Some("routed_db"));
+        assert_eq!(
+            parsed.feature_ids,
+            [
+                FEATURE_EXT_ENHANCED_ROUTING,
+                FEATURE_EXT_DATA_CLASSIFICATION
+            ]
+        );
     }
 
     #[test]
@@ -1199,6 +1599,27 @@ mod tests {
                 .user_agent
                 .expect("user agent should be parsed from the feature extension"),
             "TestAgent"
+        );
+    }
+
+    #[test]
+    fn test_parse_login7_data_classification_and_ack() {
+        let mut payload = BytesMut::zeroed(64);
+        payload[27] = 0x10; // OptionFlags3 (FeatureExt bit)
+        payload[56] = 60; // FeatureExt table entry -> offset 60
+        payload[60..64].copy_from_slice(&64u32.to_le_bytes());
+        payload.put_u8(FEATURE_EXT_DATA_CLASSIFICATION);
+        payload.put_u32_le(1);
+        payload.put_u8(2);
+        payload.put_u8(FEATURE_EXT_TERMINATOR);
+
+        assert_eq!(
+            parse_login7_auth(&payload).data_classification_version,
+            Some(2)
+        );
+        assert_eq!(
+            build_feature_ext_ack_data_classification(2).as_ref(),
+            [0xAE, 0x09, 2, 0, 0, 0, 2, 1, 0xFF]
         );
     }
 
@@ -1320,5 +1741,47 @@ mod tests {
             without_error[PACKET_HEADER_SIZE],
             TokenType::ColMetadata as u8
         );
+    }
+
+    /// Builds the ALL_HEADERS bytes a real client sends: a total-length DWORD
+    /// followed by a single TransactionDescriptor header
+    /// (length=18, type=0x0002, transaction_descriptor, outstanding_request_count).
+    fn all_headers_with_transaction_descriptor(
+        transaction_descriptor: u64,
+        outstanding_request_count: u32,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&22u32.to_le_bytes()); // ALL_HEADERS total length
+        data.extend_from_slice(&18u32.to_le_bytes()); // this header's length
+        data.extend_from_slice(&HEADER_TYPE_TRANSACTION_DESCRIPTOR.to_le_bytes());
+        data.extend_from_slice(&transaction_descriptor.to_le_bytes());
+        data.extend_from_slice(&outstanding_request_count.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_extracts_autocommit_values() {
+        let data = all_headers_with_transaction_descriptor(0, 1);
+        assert_eq!(parse_transaction_descriptor_header(&data), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_extracts_in_transaction_values() {
+        let data = all_headers_with_transaction_descriptor(42, 3);
+        assert_eq!(parse_transaction_descriptor_header(&data), Some((42, 3)));
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_none_without_all_headers() {
+        assert_eq!(parse_transaction_descriptor_header(&[]), None);
+        assert_eq!(parse_transaction_descriptor_header(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_parse_transaction_descriptor_header_none_when_length_exceeds_data() {
+        // Claims a 100-byte ALL_HEADERS block but supplies far fewer bytes.
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        assert_eq!(parse_transaction_descriptor_header(&data), None);
     }
 }

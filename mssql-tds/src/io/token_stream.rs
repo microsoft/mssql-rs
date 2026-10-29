@@ -2,18 +2,22 @@
 // Licensed under the MIT License.
 
 use crate::core::{CancelHandle, TdsResult};
+use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream, decrypt_encrypted_column};
 use crate::datatypes::row_writer::{DiscardRowWriter, RowWriter, write_column_value};
 use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
 use crate::token::parsers::TokenParser;
+use crate::token::parsers::done_parser::{DONE_PAYLOAD_LEN, buffered_done_token, read_done_token};
+use crate::token::parsers::returnstatus_parser::{RETURN_STATUS_PAYLOAD_LEN, read_return_status};
 use crate::token::parsers::{
-    ColInfoTokenParser, ColMetadataTokenParser, DoneInProcTokenParser, DoneProcTokenParser,
-    DoneTokenParser, EnvChangeTokenParser, ErrorTokenParser, FeatureExtAckTokenParser,
-    FedAuthInfoTokenParser, InfoTokenParser, LoginAckTokenParser, NbcRowTokenParser,
-    OrderTokenParser, ReturnStatusTokenParser, ReturnValueTokenParser, RowTokenParser,
-    SessionStateTokenParser, SspiTokenParser, TabNameTokenParser,
+    ColInfoTokenParser, ColMetadataTokenParser, DataClassificationTokenParser,
+    DoneInProcTokenParser, DoneProcTokenParser, DoneTokenParser, EnvChangeTokenParser,
+    ErrorTokenParser, FeatureExtAckTokenParser, FedAuthInfoTokenParser, InfoTokenParser,
+    LoginAckTokenParser, NbcRowTokenParser, OrderTokenParser, ReturnStatusTokenParser,
+    ReturnValueTokenParser, RowTokenParser, SessionStateTokenParser, SspiTokenParser,
+    TabNameTokenParser,
 };
 use crate::token::tokens::{ColMetadataToken, TokenType, Tokens};
 use async_trait::async_trait;
@@ -49,6 +53,8 @@ use tokio::time::timeout;
 pub(crate) enum ColumnPolicy {
     /// Decode every column into the writer, never pause (push sinks).
     DecodeAll,
+    /// Decode columns before `end`, then pause without consuming column `end`.
+    DecodePrefix(usize),
     /// Skip columns `< target`, decode `target`, then pause after it.
     DecodeOne(usize),
     /// Skip every remaining column, allocating nothing (drain the current row).
@@ -59,6 +65,7 @@ pub(crate) enum ColumnPolicy {
 #[cfg(fuzzing)]
 pub enum ColumnPolicy {
     DecodeAll,
+    DecodePrefix(usize),
     DecodeOne(usize),
     SkipAll,
 }
@@ -121,7 +128,7 @@ pub enum RowHeader {
 ///
 /// Passed back to [`TdsTokenStreamReader::resume_row_into`] to continue
 /// decoding the rest of the row from where it paused.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg(not(fuzzing))]
 pub(crate) struct RowPauseState {
     /// Index of the first column that has not yet been decoded.
@@ -135,7 +142,7 @@ pub(crate) struct RowPauseState {
     pub(crate) decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg(fuzzing)]
 #[allow(private_interfaces)]
 pub struct RowPauseState {
@@ -192,6 +199,37 @@ impl PlpPauseState {
 #[async_trait]
 #[cfg(not(fuzzing))]
 pub(crate) trait TdsTokenStreamReader {
+    /// Attempts to read a complete row header from bytes already buffered by the
+    /// transport. Returns `None` without consuming bytes when async I/O or an
+    /// unsupported synchronous parser is required.
+    fn try_receive_row_header(
+        &mut self,
+        _context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        Ok(None)
+    }
+
+    /// Attempts to decode `target` from bytes already buffered by the transport.
+    /// Returns `None` without consuming bytes when async I/O or an unsupported
+    /// synchronous decoder is required.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
+    fn try_read_buffered_column(
+        &mut self,
+        _pause_state: &RowPauseState,
+        _target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        Ok(None)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    /// Test hook that returns a buffered integer-row prefix and whether it is complete.
+    fn try_read_buffered_test_row(
+        &mut self,
+        _pause_state: &mut RowPauseState,
+    ) -> TdsResult<Option<(Vec<i32>, bool)>> {
+        Ok(None)
+    }
+
     async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -253,6 +291,29 @@ pub(crate) trait TdsTokenStreamReader {
 #[async_trait]
 #[cfg(fuzzing)]
 pub trait TdsTokenStreamReader {
+    fn try_receive_row_header(
+        &mut self,
+        _context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        Ok(None)
+    }
+
+    fn try_read_buffered_column(
+        &mut self,
+        _pause_state: &RowPauseState,
+        _target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        Ok(None)
+    }
+
+    /// Attempts to decode a buffered row prefix for dynamic test transports.
+    fn try_read_buffered_test_row(
+        &mut self,
+        _pause_state: &mut RowPauseState,
+    ) -> TdsResult<Option<(Vec<i32>, bool)>> {
+        Ok(None)
+    }
+
     async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -390,17 +451,18 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
     match parser {
         TokenParsers::EnvChange(parser) => parser.parse(reader, context).await,
         TokenParsers::LoginAck(parser) => parser.parse(reader, context).await,
-        TokenParsers::Done(parser) => parser.parse(reader, context).await,
-        TokenParsers::DoneInProc(parser) => parser.parse(reader, context).await,
-        TokenParsers::DoneProc(parser) => parser.parse(reader, context).await,
+        TokenParsers::Done(_) => read_done_token(reader).await.map(Tokens::Done),
+        TokenParsers::DoneInProc(_) => read_done_token(reader).await.map(Tokens::DoneInProc),
+        TokenParsers::DoneProc(_) => read_done_token(reader).await.map(Tokens::DoneProc),
         TokenParsers::Info(parser) => parser.parse(reader, context).await,
         TokenParsers::Error(parser) => parser.parse(reader, context).await,
         TokenParsers::FedAuthInfo(parser) => parser.parse(reader, context).await,
         TokenParsers::FeatureExtAck(parser) => parser.parse(reader, context).await,
         TokenParsers::ColMetadata(parser) => parser.parse(reader, context).await,
+        TokenParsers::DataClassification(parser) => parser.parse(reader, context).await,
         TokenParsers::Row(parser) => parser.parse(reader, context).await,
         TokenParsers::Order(parser) => parser.parse(reader, context).await,
-        TokenParsers::ReturnStatus(parser) => parser.parse(reader, context).await,
+        TokenParsers::ReturnStatus(_) => read_return_status(reader).await.map(Tokens::from),
         TokenParsers::NbcRow(parser) => parser.parse(reader, context).await,
         TokenParsers::ReturnValue(parser) => parser.parse(reader, context).await,
         TokenParsers::SessionState(parser) => parser.parse(reader, context).await,
@@ -410,6 +472,37 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
     }
 }
 
+/// Recognizes complete control tokens without consuming an incomplete token.
+pub(crate) fn buffered_control_token(bytes: &[u8]) -> Option<(Tokens, usize)> {
+    let (&kind, payload) = bytes.split_first()?;
+    let token = match kind {
+        kind if kind == TokenType::Done as u8 => Tokens::Done(buffered_done_token(payload)?),
+        kind if kind == TokenType::DoneProc as u8 => {
+            Tokens::DoneProc(buffered_done_token(payload)?)
+        }
+        kind if kind == TokenType::DoneInProc as u8 => {
+            Tokens::DoneInProc(buffered_done_token(payload)?)
+        }
+        kind if kind == TokenType::ReturnStatus as u8 => {
+            let value =
+                i32::from_le_bytes(payload.get(..RETURN_STATUS_PAYLOAD_LEN)?.try_into().ok()?);
+            return Some((
+                Tokens::ReturnStatus(crate::token::tokens::ReturnStatusToken { value }),
+                1 + RETURN_STATUS_PAYLOAD_LEN,
+            ));
+        }
+        _ => return None,
+    };
+    Some((token, 1 + DONE_PAYLOAD_LEN))
+}
+
+pub(crate) fn log_received_token(token_type: &TokenType, token_type_byte: u8) {
+    debug!(
+        "Received token type: {:?} ({})",
+        token_type, token_type_byte
+    );
+}
+
 pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
     reader: &mut R,
     registry: &impl TokenParserRegistry,
@@ -417,10 +510,7 @@ pub(crate) async fn receive_token_internal<R: TdsPacketReader + Send + Sync>(
 ) -> TdsResult<Tokens> {
     let token_type_byte = reader.read_byte().await?;
     let token_type: TokenType = token_type_byte.try_into()?;
-    debug!(
-        "Received token type: {:?} ({})",
-        token_type, token_type_byte
-    );
+    log_received_token(&token_type, token_type_byte);
     dispatch_token(reader, registry, token_type, context).await
 }
 
@@ -493,11 +583,19 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
     let decoder = GenericDecoder::default();
     let columns = &metadata.columns;
     for (col, meta) in columns.iter().enumerate().skip(start_col) {
+        if matches!(plan, ColumnPolicy::DecodePrefix(end) if col >= end) {
+            return Ok(RowReadResult::RowPaused(RowPauseState {
+                next_column_index: col,
+                metadata: Arc::clone(metadata),
+                nbc_null_bitmap: bitmap.cloned(),
+                decryptor: decryptor.cloned(),
+            }));
+        }
         let stop_here = matches!(plan, ColumnPolicy::DecodeOne(target) if target == col);
         let skip = match plan {
             ColumnPolicy::SkipAll => true,
             ColumnPolicy::DecodeOne(target) => col < target,
-            ColumnPolicy::DecodeAll => false,
+            ColumnPolicy::DecodeAll | ColumnPolicy::DecodePrefix(_) => false,
         };
 
         let is_null = bitmap.is_some_and(|bm| bm[col / 8] & (1 << (col % 8)) != 0);
@@ -557,7 +655,20 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
             }
         }
 
-        decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
+        // A packet-boundary continuation should not force the rest of a wide
+        // row through one asynchronous decoder future per resident column.
+        if !reader.buffered_slice().is_empty()
+            && let Some(consumed) =
+                decoder.try_decode_buffered_into(reader.buffered_slice(), meta, col, writer)?
+        {
+            reader.try_read_slice(consumed).ok_or_else(|| {
+                crate::error::Error::ProtocolError(
+                    "Buffered column bytes disappeared before consumption".to_string(),
+                )
+            })?;
+        } else {
+            decode_or_decrypt_column(&decoder, reader, meta, decryptor, col, writer).await?;
+        }
 
         if stop_here {
             return Ok(pause_after_column(col, metadata, bitmap, decryptor));
@@ -794,6 +905,11 @@ where
         }
     }
 
+    /// The fuzzing counterpart of the network transport's ATTENTION drain.
+    ///
+    /// No bound is needed here, unlike the network path: `FuzzReader` serves a
+    /// fixed in-memory buffer and returns EOF past its end, so this loop always
+    /// terminates. There is no socket for it to park on.
     async fn cancel_read_stream_and_wait(&mut self) -> TdsResult<()> {
         self.packet_reader.cancel_read_stream().await?;
         let dummy_context = ParserContext::None(());
@@ -1045,6 +1161,10 @@ impl Default for GenericTokenParserRegistry {
             TokenParsers::from(ColMetadataTokenParser),
         );
         internal_registry.insert(
+            TokenType::DataClassification,
+            TokenParsers::from(DataClassificationTokenParser),
+        );
+        internal_registry.insert(
             TokenType::Row,
             TokenParsers::from(RowTokenParser::default()),
         );
@@ -1095,6 +1215,7 @@ pub enum TokenParsers {
     FedAuthInfo(FedAuthInfoTokenParser),
     FeatureExtAck(FeatureExtAckTokenParser),
     ColMetadata(ColMetadataTokenParser),
+    DataClassification(DataClassificationTokenParser),
     Row(RowTokenParser<GenericDecoder>),
     Order(OrderTokenParser),
     ReturnStatus(ReturnStatusTokenParser),
@@ -1129,6 +1250,7 @@ impl_from_token_parser!(
     FedAuthInfoTokenParser => FedAuthInfo,
     FeatureExtAckTokenParser => FeatureExtAck,
     ColMetadataTokenParser => ColMetadata,
+    DataClassificationTokenParser => DataClassification,
     RowTokenParser<GenericDecoder> => Row,
     OrderTokenParser => Order,
     ReturnStatusTokenParser => ReturnStatus,
@@ -1327,6 +1449,9 @@ mod tests {
     struct TestByteReader {
         data: Vec<u8>,
         pos: usize,
+        buffered: bool,
+        buffered_limit: Option<usize>,
+        async_scalar_reads: usize,
         /// When set, the next `read_bytes` fills only this many bytes and
         /// reports that count, modelling a reader that does not fully fill.
         short_read: Option<usize>,
@@ -1337,12 +1462,20 @@ mod tests {
             Self {
                 data,
                 pos: 0,
+                buffered: false,
+                buffered_limit: None,
+                async_scalar_reads: 0,
                 short_read: None,
             }
         }
 
         fn with_short_read(mut self, filled: usize) -> Self {
             self.short_read = Some(filled);
+            self
+        }
+
+        fn with_buffered_reads(mut self) -> Self {
+            self.buffered = true;
             self
         }
 
@@ -1359,6 +1492,24 @@ mod tests {
     }
 
     impl TdsPacketReader for TestByteReader {
+        fn buffered_slice(&self) -> &[u8] {
+            if self.buffered {
+                self.data
+                    .get(self.pos..self.buffered_limit.unwrap_or(self.data.len()))
+                    .unwrap_or_default()
+            } else {
+                &[]
+            }
+        }
+
+        fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+            if self.buffered && length <= self.buffered_slice().len() {
+                self.take(length).ok()
+            } else {
+                None
+            }
+        }
+
         async fn read_byte(&mut self) -> TdsResult<u8> {
             Ok(self.take(1)?[0])
         }
@@ -1368,10 +1519,13 @@ mod tests {
         }
 
         async fn read_uint16(&mut self) -> TdsResult<u16> {
-            unimplemented!("unused in test")
+            self.async_scalar_reads += 1;
+            let raw = self.take(2)?;
+            Ok(u16::from_le_bytes([raw[0], raw[1]]))
         }
 
         async fn read_int32(&mut self) -> TdsResult<i32> {
+            self.async_scalar_reads += 1;
             let raw = self.take(4)?;
             Ok(i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
         }
@@ -1389,7 +1543,11 @@ mod tests {
         }
 
         async fn read_uint64(&mut self) -> TdsResult<u64> {
-            unimplemented!("unused in test")
+            self.async_scalar_reads += 1;
+            let raw = self.take(8)?;
+            Ok(u64::from_le_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]))
         }
 
         async fn read_float32(&mut self) -> TdsResult<f32> {
@@ -1561,6 +1719,160 @@ mod tests {
             columns: vec![int4_metadata("c1"), int4_metadata("c2")],
             cek_table: vec![],
         })
+    }
+
+    #[tokio::test]
+    async fn completion_tokens_preserve_values_at_every_buffer_boundary() {
+        use crate::token::tokens::{CurrentCommand, DoneStatus};
+
+        let registry = GenericTokenParserRegistry::default();
+        let flags = DoneStatus::COUNT | DoneStatus::RPC_IN_BATCH | DoneStatus::ERROR;
+        for kind in [
+            TokenType::Done,
+            TokenType::DoneProc,
+            TokenType::DoneInProc,
+            TokenType::ReturnStatus,
+        ]
+        .map(|kind| kind as u8)
+        {
+            let payload = if kind == TokenType::ReturnStatus as u8 {
+                i32::MIN.to_le_bytes().to_vec()
+            } else {
+                [
+                    flags.bits().to_le_bytes().as_slice(),
+                    u16::MAX.to_le_bytes().as_slice(),
+                    u64::MAX.to_le_bytes().as_slice(),
+                ]
+                .concat()
+            };
+            for prefix in 0..=payload.len() {
+                let mut data = vec![kind];
+                data.extend_from_slice(&payload);
+                data.push(0xa5);
+                let control = buffered_control_token(&data[..1 + prefix]);
+                assert_eq!(control.is_some(), prefix == payload.len());
+                let mut reader = TestByteReader::new(data).with_buffered_reads();
+                reader.buffered_limit = Some(1 + prefix);
+                let token =
+                    receive_token_internal(&mut reader, &registry, &ParserContext::default())
+                        .await
+                        .unwrap();
+                if let Some((control, consumed)) = control {
+                    assert_eq!(consumed, 1 + payload.len());
+                    assert_eq!(format!("{control:?}"), format!("{token:?}"));
+                }
+                match (TokenType::try_from(kind).unwrap(), token) {
+                    (TokenType::Done, Tokens::Done(done))
+                    | (TokenType::DoneProc, Tokens::DoneProc(done))
+                    | (TokenType::DoneInProc, Tokens::DoneInProc(done)) => {
+                        assert_eq!(done.status, flags);
+                        assert_eq!(done.cur_cmd, CurrentCommand::None);
+                        assert_eq!(done.row_count, u64::MAX);
+                    }
+                    (TokenType::ReturnStatus, Tokens::ReturnStatus(status)) => {
+                        assert_eq!(status.value, i32::MIN);
+                    }
+                    (_, token) => panic!("wrong completion variant: {token:?}"),
+                }
+                let fallback_reads = if kind == TokenType::ReturnStatus as u8 {
+                    1
+                } else {
+                    3
+                };
+                assert_eq!(
+                    reader.async_scalar_reads,
+                    if prefix == payload.len() {
+                        0
+                    } else {
+                        fallback_reads
+                    },
+                );
+                assert_eq!(reader.pos, 1 + payload.len());
+                assert_eq!(reader.read_byte().await.unwrap(), 0xa5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_completion_tokens_still_fail() {
+        let registry = GenericTokenParserRegistry::default();
+        assert!(buffered_control_token(&[TokenType::Error as u8; 32]).is_none());
+        assert!(buffered_control_token(&[TokenType::ColMetadata as u8; 32]).is_none());
+        for kind in [
+            TokenType::Done,
+            TokenType::DoneProc,
+            TokenType::DoneInProc,
+            TokenType::ReturnStatus,
+        ]
+        .map(|kind| kind as u8)
+        {
+            let length = if kind == TokenType::ReturnStatus as u8 {
+                4
+            } else {
+                12
+            };
+            for prefix in 0..length {
+                for buffered in [false, true] {
+                    let mut data = vec![kind];
+                    data.resize(1 + prefix, 0);
+                    let mut reader = TestByteReader::new(data);
+                    reader.buffered = buffered;
+                    assert!(
+                        receive_token_internal(&mut reader, &registry, &ParserContext::default())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn row_continuation_decodes_buffered_columns_without_async_scalar_reads() {
+        use crate::datatypes::row_writer::DefaultRowWriter;
+
+        for buffered in [false, true] {
+            let mut reader = TestByteReader::new(
+                [42_i32, -7_i32, 99_i32]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect(),
+            );
+            if buffered {
+                reader = reader.with_buffered_reads();
+            }
+            let mut writer = DefaultRowWriter::new(2);
+            let state = RowPauseState {
+                next_column_index: 0,
+                metadata: two_int4_metadata(),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            };
+            let RowReadResult::RowPaused(state) = resume_row_into_internal(
+                &mut reader,
+                state,
+                ColumnPolicy::DecodePrefix(1),
+                &mut writer,
+            )
+            .await
+            .unwrap() else {
+                panic!("expected prefix pause");
+            };
+            assert_eq!(state.next_column_index, 1);
+            assert_eq!(reader.pos, 4);
+            assert!(matches!(
+                resume_row_into_internal(&mut reader, state, ColumnPolicy::DecodeAll, &mut writer)
+                    .await
+                    .unwrap(),
+                RowReadResult::RowWritten
+            ));
+            assert_eq!(
+                writer.take_row(),
+                vec![ColumnValues::Int(42), ColumnValues::Int(-7)]
+            );
+            assert_eq!(reader.pos, 8);
+            assert_eq!(reader.async_scalar_reads, if buffered { 0 } else { 2 });
+        }
     }
 
     // The pause states below must borrow the ParserContext's metadata rather than
@@ -1989,7 +2301,7 @@ mod tests {
     #[test]
     fn test_parser_registry_count() {
         let registry = GenericTokenParserRegistry::default();
-        let expected_count = 15; // Number of token types registered in default()
+        let expected_count = 16; // Number of token types registered in default()
 
         let token_types = [
             TokenType::EnvChange,
@@ -2002,6 +2314,7 @@ mod tests {
             TokenType::FeatureExtAck,
             TokenType::FedAuthInfo,
             TokenType::ColMetadata,
+            TokenType::DataClassification,
             TokenType::Row,
             TokenType::Order,
             TokenType::ReturnStatus,
@@ -2014,5 +2327,64 @@ mod tests {
             .filter(|tt| registry.get_parser(tt).is_some())
             .count();
         assert_eq!(count, expected_count);
+    }
+
+    #[tokio::test]
+    async fn data_classification_token_is_recognized_but_rejected_until_negotiated() {
+        use crate::token::parsers::common::test_utils::MockReader;
+
+        let mut reader = MockReader::new(vec![
+            TokenType::DataClassification as u8,
+            0,
+            0, // sensitivity-label count
+            0,
+            0, // information-type count
+            0,
+            0, // result-set column count
+        ]);
+        let registry = GenericTokenParserRegistry::default();
+
+        let error = receive_token_internal(&mut reader, &registry, &ParserContext::default())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("DATACLASSIFICATION"), "{error}");
+        assert!(error.contains("not negotiated"), "{error}");
+        assert!(!error.contains("Unknown token type"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn data_classification_token_is_parsed_with_the_negotiated_version() {
+        use crate::token::data_classification::DataClassificationVersion;
+        use crate::token::parsers::common::test_utils::MockReader;
+
+        let mut reader = MockReader::new(vec![
+            TokenType::DataClassification as u8,
+            0,
+            0, // sensitivity-label count
+            0,
+            0, // information-type count
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF, // result-set rank: NotDefined (v2 only)
+            0,
+            0, // result-set column count
+            TokenType::Done as u8,
+        ])
+        .with_data_classification_version(DataClassificationVersion::Version2);
+        let registry = GenericTokenParserRegistry::default();
+
+        let token = receive_token_internal(&mut reader, &registry, &ParserContext::default())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&token, Tokens::DataClassification(metadata)
+                if metadata.version == DataClassificationVersion::Version2),
+            "{token:?}"
+        );
+        assert_eq!(reader.remaining(), 1, "the next token must be left unread");
     }
 }

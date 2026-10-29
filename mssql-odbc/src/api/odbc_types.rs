@@ -59,12 +59,42 @@ pub const SQL_OV_ODBC3_80: u32 = 380;
 // of the UTF-16-LE-encoded token.
 pub const SQL_COPT_SS_ACCESS_TOKEN: SqlInteger = 1256;
 
+// msodbcsql-specific attribute forms of connection-string keywords. These are
+// applied pre-connect and, unlike SQL_ATTR_CURRENT_CATALOG, override the
+// matching keyword (see `handles::dbc::VendorConnOverrides`).
+pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
+pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
+pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
+pub const SQL_COPT_SS_MULTISUBNET_FAILOVER: SqlInteger = 1248;
+pub const SQL_COPT_SS_TNIR: SqlInteger = 1249;
+
+/// Physical client connection GUID string. Get-only; requires a connection.
+pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
+
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` (`SQL_COPT_SS_BASE_EX + 3`). Takes
+/// [`SQL_WARN_NO`] / [`SQL_WARN_YES`]; see
+/// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).
+pub const SQL_COPT_SS_WARN_ON_CP_ERROR: SqlInteger = 1243;
+
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` values, as msodbcsql spells them.
+pub const SQL_WARN_NO: u64 = 0;
+/// See [`SQL_WARN_NO`].
+pub const SQL_WARN_YES: u64 = 1;
+
+// SQL_COPT_SS_ENCRYPT values. 0/1 are the historical off/on pair; 2 selects the
+// TDS 8.0 "strict" mode Driver 18 added. Measured: any other value is treated
+// as "on" rather than rejected.
+pub const SQL_EN_OFF: u64 = 0;
+pub const SQL_EN_ON: u64 = 1;
+pub const SQL_EN_STRICT: u64 = 2;
+
 // Standard ODBC connection attributes the Driver Manager commonly sets before
 // connecting. Accepted (currently ignored) so the DM handshake is not broken.
 pub const SQL_ATTR_ACCESS_MODE: SqlInteger = 101;
 pub const SQL_ATTR_AUTOCOMMIT: SqlInteger = 102;
 pub const SQL_ATTR_LOGIN_TIMEOUT: SqlInteger = 103;
 pub const SQL_ATTR_TXN_ISOLATION: SqlInteger = 108;
+pub const SQL_ATTR_CURRENT_CATALOG: SqlInteger = 109;
 pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
@@ -94,6 +124,7 @@ pub const SQL_CD_FALSE: u32 = 0;
 
 // `SQL_ATTR_ACCESS_MODE` values.
 pub const SQL_MODE_READ_WRITE: u32 = 0;
+pub const SQL_MODE_READ_ONLY: u32 = 1;
 
 // `SQL_ATTR_AUTOCOMMIT` values. The ODBC-mandated default is `SQL_AUTOCOMMIT_ON`
 // (msodbcsql `sqlcfunc.cpp:3462`); manual-commit is opt-in per connection.
@@ -179,19 +210,27 @@ pub const SQL_API_SQLGETFUNCTIONS: SqlUSmallInt = 44;
 pub const SQL_API_SQLGETINFO: SqlUSmallInt = 45;
 pub const SQL_API_SQLGETTYPEINFO: SqlUSmallInt = 47;
 pub const SQL_API_SQLDESCRIBEPARAM: SqlUSmallInt = 58;
+pub const SQL_API_SQLNATIVESQL: SqlUSmallInt = 62;
+pub const SQL_API_SQLNUMPARAMS: SqlUSmallInt = 63;
 pub const SQL_API_SQLBINDCOL: SqlUSmallInt = 4;
 pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
+pub const SQL_API_SQLPARAMDATA: SqlUSmallInt = 48;
+pub const SQL_API_SQLPUTDATA: SqlUSmallInt = 49;
 pub const SQL_API_SQLALLOCHANDLE: SqlUSmallInt = 1001;
 pub const SQL_API_SQLCLOSECURSOR: SqlUSmallInt = 1003;
 pub const SQL_API_SQLENDTRAN: SqlUSmallInt = 1005;
 pub const SQL_API_SQLFREEHANDLE: SqlUSmallInt = 1006;
 pub const SQL_API_SQLGETCONNECTATTR: SqlUSmallInt = 1007;
+pub const SQL_API_SQLGETDESCFIELD: SqlUSmallInt = 1008;
+pub const SQL_API_SQLGETDESCREC: SqlUSmallInt = 1009;
 pub const SQL_API_SQLGETDIAGFIELD: SqlUSmallInt = 1010;
 pub const SQL_API_SQLGETDIAGREC: SqlUSmallInt = 1011;
 pub const SQL_API_SQLGETENVATTR: SqlUSmallInt = 1012;
 pub const SQL_API_SQLGETSTMTATTR: SqlUSmallInt = 1014;
 pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
+pub const SQL_API_SQLSETDESCFIELD: SqlUSmallInt = 1017;
+pub const SQL_API_SQLSETDESCREC: SqlUSmallInt = 1018;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
 pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
 
@@ -208,31 +247,274 @@ pub const SQL_API_SQLPROCEDURES: SqlUSmallInt = 67;
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
 pub const SQL_ACTIVE_STATEMENTS: SqlUSmallInt = 1;
+pub const SQL_DATA_SOURCE_NAME: SqlUSmallInt = 2;
 pub const SQL_DRIVER_NAME: SqlUSmallInt = 6;
 pub const SQL_DRIVER_VER: SqlUSmallInt = 7;
+pub const SQL_FETCH_DIRECTION: SqlUSmallInt = 8;
 pub const SQL_ODBC_API_CONFORMANCE: SqlUSmallInt = 9;
 pub const SQL_ODBC_VER: SqlUSmallInt = 10;
+pub const SQL_SERVER_NAME: SqlUSmallInt = 13;
+pub const SQL_SEARCH_PATTERN_ESCAPE: SqlUSmallInt = 14;
 pub const SQL_ODBC_SQL_CONFORMANCE: SqlUSmallInt = 15;
+pub const SQL_DATABASE_NAME: SqlUSmallInt = 16;
 pub const SQL_DBMS_NAME: SqlUSmallInt = 17;
 pub const SQL_DBMS_VER: SqlUSmallInt = 18;
+pub const SQL_ACCESSIBLE_TABLES: SqlUSmallInt = 19;
+pub const SQL_ACCESSIBLE_PROCEDURES: SqlUSmallInt = 20;
+pub const SQL_PROCEDURES: SqlUSmallInt = 21;
+pub const SQL_CONCAT_NULL_BEHAVIOR: SqlUSmallInt = 22;
 pub const SQL_CURSOR_COMMIT_BEHAVIOR: SqlUSmallInt = 23;
 pub const SQL_CURSOR_ROLLBACK_BEHAVIOR: SqlUSmallInt = 24;
+pub const SQL_DATA_SOURCE_READ_ONLY: SqlUSmallInt = 25;
 pub const SQL_DEFAULT_TXN_ISOLATION: SqlUSmallInt = 26;
+pub const SQL_EXPRESSIONS_IN_ORDERBY: SqlUSmallInt = 27;
+pub const SQL_IDENTIFIER_CASE: SqlUSmallInt = 28;
 pub const SQL_IDENTIFIER_QUOTE_CHAR: SqlUSmallInt = 29;
+pub const SQL_MAX_COLUMN_NAME_LEN: SqlUSmallInt = 30;
+/// ODBC 2.x name `SQL_MAX_OWNER_NAME_LEN`.
+pub const SQL_MAX_SCHEMA_NAME_LEN: SqlUSmallInt = 32;
+pub const SQL_MAX_CATALOG_NAME_LEN: SqlUSmallInt = 34;
+pub const SQL_MAX_TABLE_NAME_LEN: SqlUSmallInt = 35;
+pub const SQL_MULT_RESULT_SETS: SqlUSmallInt = 36;
 pub const SQL_MULTIPLE_ACTIVE_TXN: SqlUSmallInt = 37;
+pub const SQL_OUTER_JOINS: SqlUSmallInt = 38;
+/// ODBC 2.x name `SQL_OWNER_TERM`.
+pub const SQL_SCHEMA_TERM: SqlUSmallInt = 39;
+pub const SQL_PROCEDURE_TERM: SqlUSmallInt = 40;
+/// ODBC 2.x name `SQL_QUALIFIER_NAME_SEPARATOR`.
+pub const SQL_CATALOG_NAME_SEPARATOR: SqlUSmallInt = 41;
+/// ODBC 2.x name `SQL_QUALIFIER_TERM`.
+pub const SQL_CATALOG_TERM: SqlUSmallInt = 42;
+pub const SQL_SCROLL_CONCURRENCY: SqlUSmallInt = 43;
+pub const SQL_SCROLL_OPTIONS: SqlUSmallInt = 44;
+pub const SQL_TABLE_TERM: SqlUSmallInt = 45;
 pub const SQL_TXN_CAPABLE: SqlUSmallInt = 46;
+pub const SQL_USER_NAME: SqlUSmallInt = 47;
+pub const SQL_CONVERT_FUNCTIONS: SqlUSmallInt = 48;
+pub const SQL_NUMERIC_FUNCTIONS: SqlUSmallInt = 49;
+pub const SQL_STRING_FUNCTIONS: SqlUSmallInt = 50;
+pub const SQL_SYSTEM_FUNCTIONS: SqlUSmallInt = 51;
+pub const SQL_TIMEDATE_FUNCTIONS: SqlUSmallInt = 52;
 pub const SQL_TXN_ISOLATION_OPTION: SqlUSmallInt = 72;
+pub const SQL_CORRELATION_NAME: SqlUSmallInt = 74;
 pub const SQL_DRIVER_ODBC_VER: SqlUSmallInt = 77;
+pub const SQL_POSITIONED_STATEMENTS: SqlUSmallInt = 80;
 pub const SQL_GETDATA_EXTENSIONS: SqlUSmallInt = 81;
+pub const SQL_BOOKMARK_PERSISTENCE: SqlUSmallInt = 82;
+pub const SQL_STATIC_SENSITIVITY: SqlUSmallInt = 83;
+pub const SQL_NULL_COLLATION: SqlUSmallInt = 85;
+pub const SQL_ALTER_TABLE: SqlUSmallInt = 86;
+pub const SQL_COLUMN_ALIAS: SqlUSmallInt = 87;
+pub const SQL_GROUP_BY: SqlUSmallInt = 88;
+pub const SQL_KEYWORDS: SqlUSmallInt = 89;
+pub const SQL_ORDER_BY_COLUMNS_IN_SELECT: SqlUSmallInt = 90;
+pub const SQL_SCHEMA_USAGE: SqlUSmallInt = 91;
+pub const SQL_OWNER_USAGE: SqlUSmallInt = SQL_SCHEMA_USAGE;
+pub const SQL_CATALOG_USAGE: SqlUSmallInt = 92;
+pub const SQL_QUALIFIER_USAGE: SqlUSmallInt = SQL_CATALOG_USAGE;
+pub const SQL_QUOTED_IDENTIFIER_CASE: SqlUSmallInt = 93;
+pub const SQL_SPECIAL_CHARACTERS: SqlUSmallInt = 94;
+pub const SQL_SUBQUERIES: SqlUSmallInt = 95;
+pub const SQL_UNION: SqlUSmallInt = 96;
+pub const SQL_MAX_COLUMNS_IN_GROUP_BY: SqlUSmallInt = 97;
+pub const SQL_MAX_COLUMNS_IN_INDEX: SqlUSmallInt = 98;
+pub const SQL_MAX_COLUMNS_IN_ORDER_BY: SqlUSmallInt = 99;
+pub const SQL_MAX_COLUMNS_IN_SELECT: SqlUSmallInt = 100;
+pub const SQL_MAX_COLUMNS_IN_TABLE: SqlUSmallInt = 101;
+pub const SQL_MAX_ROW_SIZE: SqlUSmallInt = 104;
+pub const SQL_MAX_STATEMENT_LEN: SqlUSmallInt = 105;
+pub const SQL_MAX_TABLES_IN_SELECT: SqlUSmallInt = 106;
+pub const SQL_MAX_USER_NAME_LEN: SqlUSmallInt = 107;
+pub const SQL_MAX_CHAR_LITERAL_LEN: SqlUSmallInt = 108;
+pub const SQL_TIMEDATE_ADD_INTERVALS: SqlUSmallInt = 109;
+pub const SQL_TIMEDATE_DIFF_INTERVALS: SqlUSmallInt = 110;
 pub const SQL_NEED_LONG_DATA_LEN: SqlUSmallInt = 111;
+pub const SQL_MAX_BINARY_LITERAL_LEN: SqlUSmallInt = 112;
+pub const SQL_LIKE_ESCAPE_CLAUSE: SqlUSmallInt = 113;
+pub const SQL_OJ_CAPABILITIES: SqlUSmallInt = 115;
+pub const SQL_SQL_CONFORMANCE: SqlUSmallInt = 118;
+pub const SQL_BATCH_ROW_COUNT: SqlUSmallInt = 120;
+pub const SQL_BATCH_SUPPORT: SqlUSmallInt = 121;
+pub const SQL_CREATE_ASSERTION: SqlUSmallInt = 127;
+pub const SQL_DYNAMIC_CURSOR_ATTRIBUTES1: SqlUSmallInt = 144;
+pub const SQL_DYNAMIC_CURSOR_ATTRIBUTES2: SqlUSmallInt = 145;
+pub const SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1: SqlUSmallInt = 146;
+pub const SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2: SqlUSmallInt = 147;
+pub const SQL_KEYSET_CURSOR_ATTRIBUTES1: SqlUSmallInt = 150;
+pub const SQL_KEYSET_CURSOR_ATTRIBUTES2: SqlUSmallInt = 151;
+pub const SQL_STATIC_CURSOR_ATTRIBUTES1: SqlUSmallInt = 167;
+pub const SQL_STATIC_CURSOR_ATTRIBUTES2: SqlUSmallInt = 168;
+pub const SQL_DDL_INDEX: SqlUSmallInt = 170;
 pub const SQL_DM_VER: SqlUSmallInt = 171;
 pub const SQL_ASYNC_DBC_FUNCTIONS: SqlUSmallInt = 10023;
 pub const SQL_ASYNC_NOTIFICATION: SqlUSmallInt = 10025;
+pub const SQL_PARAM_ARRAY_ROW_COUNTS: SqlUSmallInt = 153;
+pub const SQL_PARAM_ARRAY_SELECTS: SqlUSmallInt = 154;
+pub const SQL_XOPEN_CLI_YEAR: SqlUSmallInt = 10000;
+pub const SQL_CURSOR_SENSITIVITY: SqlUSmallInt = 10001;
+pub const SQL_DESCRIBE_PARAMETER: SqlUSmallInt = 10002;
+pub const SQL_CATALOG_NAME: SqlUSmallInt = 10003;
+pub const SQL_MAX_IDENTIFIER_LEN: SqlUSmallInt = 10005;
+pub const SQL_ASYNC_MODE: SqlUSmallInt = 10021;
+
+// AB#47996: remaining ODBC 3.x SQLGetInfo information types.
+pub const SQL_ROW_UPDATES: SqlUSmallInt = 11;
+pub const SQL_MAX_CURSOR_NAME_LEN: SqlUSmallInt = 31;
+pub const SQL_MAX_PROCEDURE_NAME_LEN: SqlUSmallInt = 33;
+pub const SQL_CONVERT_BIGINT: SqlUSmallInt = 53;
+pub const SQL_CONVERT_BINARY: SqlUSmallInt = 54;
+pub const SQL_CONVERT_BIT: SqlUSmallInt = 55;
+pub const SQL_CONVERT_CHAR: SqlUSmallInt = 56;
+pub const SQL_CONVERT_DATE: SqlUSmallInt = 57;
+pub const SQL_CONVERT_DECIMAL: SqlUSmallInt = 58;
+pub const SQL_CONVERT_DOUBLE: SqlUSmallInt = 59;
+pub const SQL_CONVERT_FLOAT: SqlUSmallInt = 60;
+pub const SQL_CONVERT_INTEGER: SqlUSmallInt = 61;
+pub const SQL_CONVERT_LONGVARCHAR: SqlUSmallInt = 62;
+pub const SQL_CONVERT_NUMERIC: SqlUSmallInt = 63;
+pub const SQL_CONVERT_REAL: SqlUSmallInt = 64;
+pub const SQL_CONVERT_SMALLINT: SqlUSmallInt = 65;
+pub const SQL_CONVERT_TIME: SqlUSmallInt = 66;
+pub const SQL_CONVERT_TIMESTAMP: SqlUSmallInt = 67;
+pub const SQL_CONVERT_TINYINT: SqlUSmallInt = 68;
+pub const SQL_CONVERT_VARBINARY: SqlUSmallInt = 69;
+pub const SQL_CONVERT_VARCHAR: SqlUSmallInt = 70;
+pub const SQL_CONVERT_LONGVARBINARY: SqlUSmallInt = 71;
+pub const SQL_INTEGRITY: SqlUSmallInt = 73;
+pub const SQL_NON_NULLABLE_COLUMNS: SqlUSmallInt = 75;
+pub const SQL_LOCK_TYPES: SqlUSmallInt = 78;
+pub const SQL_POS_OPERATIONS: SqlUSmallInt = 79;
+pub const SQL_FILE_USAGE: SqlUSmallInt = 84;
+pub const SQL_MAX_INDEX_SIZE: SqlUSmallInt = 102;
+pub const SQL_MAX_ROW_SIZE_INCLUDES_LONG: SqlUSmallInt = 103;
+pub const SQL_CATALOG_LOCATION: SqlUSmallInt = 114;
+pub const SQL_ACTIVE_ENVIRONMENTS: SqlUSmallInt = 116;
+pub const SQL_ALTER_DOMAIN: SqlUSmallInt = 117;
+pub const SQL_DATETIME_LITERALS: SqlUSmallInt = 119;
+pub const SQL_CONVERT_INTERVAL_DAY_TIME: SqlUSmallInt = 123;
+pub const SQL_CONVERT_INTERVAL_YEAR_MONTH: SqlUSmallInt = 124;
+pub const SQL_CREATE_CHARACTER_SET: SqlUSmallInt = 128;
+pub const SQL_CREATE_COLLATION: SqlUSmallInt = 129;
+pub const SQL_CREATE_DOMAIN: SqlUSmallInt = 130;
+pub const SQL_CREATE_SCHEMA: SqlUSmallInt = 131;
+pub const SQL_CREATE_TABLE: SqlUSmallInt = 132;
+pub const SQL_CREATE_TRANSLATION: SqlUSmallInt = 133;
+pub const SQL_DROP_ASSERTION: SqlUSmallInt = 136;
+pub const SQL_DROP_CHARACTER_SET: SqlUSmallInt = 137;
+pub const SQL_DROP_COLLATION: SqlUSmallInt = 138;
+pub const SQL_DROP_DOMAIN: SqlUSmallInt = 139;
+pub const SQL_DROP_SCHEMA: SqlUSmallInt = 140;
+pub const SQL_DROP_TABLE: SqlUSmallInt = 141;
+pub const SQL_DROP_TRANSLATION: SqlUSmallInt = 142;
+pub const SQL_DROP_VIEW: SqlUSmallInt = 143;
+pub const SQL_INDEX_KEYWORDS: SqlUSmallInt = 148;
+pub const SQL_INFO_SCHEMA_VIEWS: SqlUSmallInt = 149;
+pub const SQL_ODBC_INTERFACE_CONFORMANCE: SqlUSmallInt = 152;
+pub const SQL_STANDARD_CLI_CONFORMANCE: SqlUSmallInt = 166;
+pub const SQL_AGGREGATE_FUNCTIONS: SqlUSmallInt = 169;
+pub const SQL_INSERT_STATEMENT: SqlUSmallInt = 172;
+pub const SQL_CONVERT_GUID: SqlUSmallInt = 173;
+pub const SQL_COLLATION_SEQ: SqlUSmallInt = 10004;
+pub const SQL_MAX_ASYNC_CONCURRENT_STATEMENTS: SqlUSmallInt = 10022;
+// Wide conversion targets, `SQL_CREATE_VIEW`, and the SQL-92 capability masks
+// complete the ODBC 3.x conversion/supported-SQL surface (msodbcsql answers all
+// of these in `SQLGetInfoTable`).
+pub const SQL_CONVERT_WCHAR: SqlUSmallInt = 122;
+pub const SQL_CONVERT_WLONGVARCHAR: SqlUSmallInt = 125;
+pub const SQL_CONVERT_WVARCHAR: SqlUSmallInt = 126;
+pub const SQL_CREATE_VIEW: SqlUSmallInt = 134;
+pub const SQL_SQL92_DATETIME_FUNCTIONS: SqlUSmallInt = 155;
+pub const SQL_SQL92_FOREIGN_KEY_DELETE_RULE: SqlUSmallInt = 156;
+pub const SQL_SQL92_FOREIGN_KEY_UPDATE_RULE: SqlUSmallInt = 157;
+pub const SQL_SQL92_GRANT: SqlUSmallInt = 158;
+pub const SQL_SQL92_NUMERIC_VALUE_FUNCTIONS: SqlUSmallInt = 159;
+pub const SQL_SQL92_PREDICATES: SqlUSmallInt = 160;
+pub const SQL_SQL92_RELATIONAL_JOIN_OPERATORS: SqlUSmallInt = 161;
+pub const SQL_SQL92_REVOKE: SqlUSmallInt = 162;
+pub const SQL_SQL92_ROW_VALUE_CONSTRUCTOR: SqlUSmallInt = 163;
+pub const SQL_SQL92_STRING_FUNCTIONS: SqlUSmallInt = 164;
+pub const SQL_SQL92_VALUE_EXPRESSIONS: SqlUSmallInt = 165;
+// Driver-Manager-owned information types: the DM answers these before the call
+// reaches the driver, so the driver core returns HY096 as a backstop.
+pub const SQL_DRIVER_HDBC: SqlUSmallInt = 3;
+pub const SQL_DRIVER_HENV: SqlUSmallInt = 4;
+pub const SQL_DRIVER_HSTMT: SqlUSmallInt = 5;
+pub const SQL_DRIVER_HLIB: SqlUSmallInt = 76;
+pub const SQL_DRIVER_HDESC: SqlUSmallInt = 135;
+pub const SQL_DRIVER_AWARE_POOLING_SUPPORTED: SqlUSmallInt = 10024;
 
 // SQLGetInfo return values.
+pub const SQL_AM_NONE: u32 = 0;
+pub const SQL_BRC_EXPLICIT: u32 = 0x0000_0002;
+pub const SQL_BS_SELECT_EXPLICIT: u32 = 0x0000_0001;
+pub const SQL_BS_ROW_COUNT_EXPLICIT: u32 = 0x0000_0002;
+pub const SQL_BS_SELECT_PROC: u32 = 0x0000_0004;
+pub const SQL_BS_ROW_COUNT_PROC: u32 = 0x0000_0008;
+pub const SQL_CA1_NEXT: u32 = 0x0000_0001;
+pub const SQL_CA2_READ_ONLY_CONCURRENCY: u32 = 0x0000_0001;
+pub const SQL_CA2_MAX_ROWS_SELECT: u32 = 0x0000_0080;
+pub const SQL_CB_NULL: u16 = 0;
+pub const SQL_UNSPECIFIED: u32 = 0;
+pub const SQL_NC_LOW: u16 = 1;
+pub const SQL_SO_FORWARD_ONLY: u32 = 0x0000_0001;
+pub const SQL_CN_ANY: u16 = 2;
+pub const SQL_DI_CREATE_INDEX: u32 = 0x0000_0001;
+pub const SQL_DI_DROP_INDEX: u32 = 0x0000_0002;
+pub const SQL_GB_GROUP_BY_CONTAINS_SELECT: u16 = 2;
+pub const SQL_IC_MIXED: u16 = 4;
+pub const SQL_CU_DML_STATEMENTS: u32 = 0x0000_0001;
+pub const SQL_CU_PROCEDURE_INVOCATION: u32 = 0x0000_0002;
+pub const SQL_CU_TABLE_DEFINITION: u32 = 0x0000_0004;
+pub const SQL_OJ_LEFT: u32 = 0x0000_0001;
+pub const SQL_OJ_RIGHT: u32 = 0x0000_0002;
+pub const SQL_OJ_FULL: u32 = 0x0000_0004;
+pub const SQL_OJ_NESTED: u32 = 0x0000_0008;
+pub const SQL_OJ_NOT_ORDERED: u32 = 0x0000_0010;
+pub const SQL_OJ_INNER: u32 = 0x0000_0020;
+pub const SQL_OJ_ALL_COMPARISON_OPS: u32 = 0x0000_0040;
+pub const SQL_SU_DML_STATEMENTS: u32 = 0x0000_0001;
+pub const SQL_SU_PROCEDURE_INVOCATION: u32 = 0x0000_0002;
+pub const SQL_SU_TABLE_DEFINITION: u32 = 0x0000_0004;
+pub const SQL_SU_INDEX_DEFINITION: u32 = 0x0000_0008;
+pub const SQL_SU_PRIVILEGE_DEFINITION: u32 = 0x0000_0010;
+pub const SQL_SQ_COMPARISON: u32 = 0x0000_0001;
+pub const SQL_SQ_EXISTS: u32 = 0x0000_0002;
+pub const SQL_SQ_IN: u32 = 0x0000_0004;
+pub const SQL_SQ_QUANTIFIED: u32 = 0x0000_0008;
+pub const SQL_SQ_CORRELATED_SUBQUERIES: u32 = 0x0000_0010;
+pub const SQL_U_UNION: u32 = 0x0000_0001;
+pub const SQL_U_UNION_ALL: u32 = 0x0000_0002;
+pub const SQL_FD_FETCH_NEXT: u32 = 0x0000_0001;
+pub const SQL_SCCO_READ_ONLY: u32 = 0x0000_0001;
 pub const SQL_OAC_LEVEL2: u16 = 0x0002;
 pub const SQL_OSC_CORE: u16 = 0x0001;
 pub const SQL_CB_CLOSE: u16 = 1;
+/// `SQL_SQL_CONFORMANCE`: entry-level SQL-92, matching msodbcsql18.
+pub const SQL_SC_SQL92_ENTRY: u32 = 0x00000001;
+/// The scalar-function masks report the functions reachable through the ODBC
+/// `{fn ...}` escape. Every value below is **measured from msodbcsql18
+/// 18.6.2.1**, the build CI pins for the parity comparison, rather than derived
+/// from the ODBC headers — the same rule `attributes_plan.md` section 8
+/// established for statement attributes. SQL Server parses `{fn ...}` natively
+/// and this driver validates and forwards it, so the reachable set is
+/// msodbcsql's (AB#46384).
+pub const SQL_NUMERIC_FUNCTIONS_SUPPORTED: u32 = 0x00FF_FFFF;
+pub const SQL_STRING_FUNCTIONS_SUPPORTED: u32 = 0x004F_FFFF;
+pub const SQL_SYSTEM_FUNCTIONS_SUPPORTED: u32 = 0x0000_0007;
+pub const SQL_TIMEDATE_FUNCTIONS_SUPPORTED: u32 = 0x001F_FFFF;
+pub const SQL_CONVERT_FUNCTIONS_SUPPORTED: u32 = 0x0000_0003;
+/// `SQL_TIMEDATE_ADD_INTERVALS` / `SQL_TIMEDATE_DIFF_INTERVALS`: the
+/// `SQL_TSI_*` intervals `{fn TIMESTAMPADD}` / `{fn TIMESTAMPDIFF}` accept.
+pub const SQL_TIMEDATE_INTERVALS_SUPPORTED: u32 = 0x0000_01FF;
+/// `SQL_OJ_CAPABILITIES`: the `{oj ...}` forms the server accepts.
+pub const SQL_OJ_CAPABILITIES_SUPPORTED: u32 = SQL_OJ_LEFT
+    | SQL_OJ_RIGHT
+    | SQL_OJ_FULL
+    | SQL_OJ_NESTED
+    | SQL_OJ_NOT_ORDERED
+    | SQL_OJ_INNER
+    | SQL_OJ_ALL_COMPARISON_OPS;
+
 /// `SQL_TXN_CAPABLE`: DML and DDL are both transactable (msodbcsql `sqlcinfo.cpp:323`).
 pub const SQL_TC_ALL: u16 = 2;
 /// `SQL_TXN_ISOLATION_OPTION` bitmask — the five levels this driver accepts
@@ -246,6 +528,15 @@ pub const SQL_GD_ANY_COLUMN: u32 = 0x00000001;
 pub const SQL_GD_ANY_ORDER: u32 = 0x00000002;
 pub const SQL_ASYNC_DBC_NOT_CAPABLE: u32 = 0x00000000;
 pub const SQL_ASYNC_NOTIFICATION_NOT_CAPABLE: u32 = 0x00000000;
+/// `SQL_PARAM_ARRAY_ROW_COUNTS`: one rolled-up `SQLRowCount` for the whole
+/// array rather than one per set (`SQLGetInfo` never reports `SQL_PARC_BATCH`
+/// here — `SQLRowCount` already sums every set's affected rows).
+/// `sqlext.h`: `#define SQL_PARC_NO_BATCH 2`.
+pub const SQL_PARC_NO_BATCH: u32 = 2;
+/// Parameter-array SELECTs return one result set per parameter set.
+pub const SQL_PAS_BATCH: u32 = 1;
+/// Parameter-array SELECTs are not supported (`sqlext.h`).
+pub const SQL_PAS_NO_SELECT: u32 = 3;
 
 // ODBC-SQL-type identifiers.
 pub const SQL_UNKNOWN_TYPE: SqlSmallInt = 0;
@@ -313,6 +604,20 @@ pub const SQL_PARAM_TYPE_UNKNOWN: SqlSmallInt = 0;
 pub const SQL_PARAM_INPUT: SqlSmallInt = 1;
 pub const SQL_PARAM_INPUT_OUTPUT: SqlSmallInt = 2;
 pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
+pub const SQL_PARAM_INPUT_OUTPUT_STREAM: SqlSmallInt = 8;
+pub const SQL_PARAM_OUTPUT_STREAM: SqlSmallInt = 16;
+/// The `{? = call ...}` return-status parameter. ODBC 3.5+.
+pub const SQL_RETURN_VALUE: SqlSmallInt = 5;
+
+// Parameter-array operation and status values.
+pub const SQL_PARAM_PROCEED: SqlUSmallInt = 0;
+pub const SQL_PARAM_IGNORE: SqlUSmallInt = 1;
+pub const SQL_PARAM_SUCCESS: SqlUSmallInt = 0;
+pub const SQL_PARAM_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
+pub const SQL_PARAM_ERROR: SqlUSmallInt = 5;
+pub const SQL_PARAM_UNUSED: SqlUSmallInt = 7;
+
+pub const SQL_NO_ROWCOUNT_TOTAL: i64 = -1;
 
 // Values of NULLABLE field in descriptor
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
@@ -336,9 +641,16 @@ pub const SQL_DIAG_SUBCLASS_ORIGIN: SqlSmallInt = 9;
 pub const SQL_DIAG_CONNECTION_NAME: SqlSmallInt = 10;
 pub const SQL_DIAG_SERVER_NAME: SqlSmallInt = 11;
 pub const SQL_DIAG_DYNAMIC_FUNCTION_CODE: SqlSmallInt = 12;
+/// `sqlext.h`: `#define SQL_DIAG_ROW_NUMBER (-1248)`.
+pub const SQL_DIAG_ROW_NUMBER: SqlSmallInt = -1248;
 
 // Dynamic-function-code value: statement type is unknown/unclassified.
 pub const SQL_DIAG_UNKNOWN_STATEMENT: SqlInteger = 0;
+
+// SQL_DIAG_ROW_NUMBER sentinels: the record is not associated with any row
+// (`SQL_NO_ROW_NUMBER`), or the driver cannot say which row (`SQL_ROW_NUMBER_UNKNOWN`).
+pub const SQL_NO_ROW_NUMBER: SqlLen = -1;
+pub const SQL_ROW_NUMBER_UNKNOWN: SqlLen = -2;
 
 // Special length/indicator constants.
 pub const SQL_NULL_DATA: SqlLen = -1;
@@ -366,6 +678,11 @@ pub const SQL_SS_UDT: SqlSmallInt = -151;
 pub const SQL_SS_XML: SqlSmallInt = -152;
 pub const SQL_SS_TABLE: SqlSmallInt = -153;
 pub const SQL_SS_VECTOR: SqlSmallInt = -156;
+
+/// Start of the driver-specific SQL type id range (`odbc/sqlsrv.h`). It is -80,
+/// not -150: the SS ids above sit well below it, so msodbcsql maps the ones it
+/// surfaces to an internal id before testing this bound.
+pub const SQL_TYPE_DRIVER_START: SqlSmallInt = -80;
 
 // ---- Additional ODBC C type identifiers (SQLBindCol / SQLGetData) -----------
 // Signed/unsigned integer C types are the base numeric type id plus an offset,
@@ -408,15 +725,20 @@ pub const SQL_C_SS_VECTOR: SqlSmallInt = SQL_C_TYPES_EXTENDED + 2; // 0x4002
 // The 13 ODBC 3.x interval C types occupy a contiguous range, 101..=113, and the
 // matching `SQL_INTERVAL_*` SQL types share those values.
 pub const SQL_C_INTERVAL_YEAR: SqlSmallInt = 101;
+pub const SQL_C_INTERVAL_SECOND: SqlSmallInt = 106;
+pub const SQL_C_INTERVAL_DAY_TO_SECOND: SqlSmallInt = 110;
+pub const SQL_C_INTERVAL_HOUR_TO_SECOND: SqlSmallInt = 112;
 pub const SQL_C_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
 // The interval SQL types share the C type values above.
 pub const SQL_INTERVAL_YEAR: SqlSmallInt = 101;
 pub const SQL_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
 
-// SQLColAttribute field identifier for the underlying type of a `sql_variant`
-// column (msodbcsql: `SQL_CA_SS_BASE + 15`). Required by mssql-python's
-// sql_variant probe.
+// SQL Server-specific SQLColAttribute field identifiers.
 pub const SQL_CA_SS_VARIANT_TYPE: SqlUSmallInt = 1215;
+pub const SQL_CA_SS_UDT_CATALOG_NAME: SqlUSmallInt = 1218;
+pub const SQL_CA_SS_UDT_SCHEMA_NAME: SqlUSmallInt = 1219;
+pub const SQL_CA_SS_UDT_TYPE_NAME: SqlUSmallInt = 1220;
+pub const SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME: SqlUSmallInt = 1221;
 
 // ---- SQLColAttribute field identifiers --------------------------------------
 // The low-numbered ids are the ODBC 3.x descriptor fields that double as the
@@ -430,6 +752,7 @@ pub const SQL_DESC_AUTO_UNIQUE_VALUE: SqlUSmallInt = 11;
 pub const SQL_DESC_CASE_SENSITIVE: SqlUSmallInt = 12;
 pub const SQL_DESC_SEARCHABLE: SqlUSmallInt = 13;
 pub const SQL_DESC_TYPE_NAME: SqlUSmallInt = 14;
+pub const SQL_DESC_LOCAL_TYPE_NAME: SqlUSmallInt = 29;
 pub const SQL_DESC_TABLE_NAME: SqlUSmallInt = 15;
 pub const SQL_DESC_SCHEMA_NAME: SqlUSmallInt = 16;
 pub const SQL_DESC_CATALOG_NAME: SqlUSmallInt = 17;
@@ -440,13 +763,35 @@ pub const SQL_DESC_NUM_PREC_RADIX: SqlUSmallInt = 32;
 pub const SQL_DESC_COUNT: SqlUSmallInt = 1001;
 pub const SQL_DESC_TYPE: SqlUSmallInt = 1002;
 pub const SQL_DESC_LENGTH: SqlUSmallInt = 1003;
+pub const SQL_DESC_OCTET_LENGTH_PTR: SqlUSmallInt = 1004;
 pub const SQL_DESC_PRECISION: SqlUSmallInt = 1005;
 pub const SQL_DESC_SCALE: SqlUSmallInt = 1006;
 pub const SQL_DESC_NULLABLE: SqlUSmallInt = 1008;
 pub const SQL_DESC_DATETIME_INTERVAL_CODE: SqlUSmallInt = 1007;
+pub const SQL_DESC_INDICATOR_PTR: SqlUSmallInt = 1009;
+pub const SQL_DESC_DATA_PTR: SqlUSmallInt = 1010;
 pub const SQL_DESC_NAME: SqlUSmallInt = 1011;
 pub const SQL_DESC_UNNAMED: SqlUSmallInt = 1012;
 pub const SQL_DESC_OCTET_LENGTH: SqlUSmallInt = 1013;
+/// `SQL_DESC_ALLOC_AUTO` for the four implicit descriptors every statement
+/// owns; `SQL_DESC_ALLOC_USER` for one allocated by
+/// `SQLAllocHandle(SQL_HANDLE_DESC, ...)`. Always read-only through
+/// `SQLSetDescFieldW`.
+pub const SQL_DESC_ALLOC_TYPE: SqlUSmallInt = 1099;
+
+// ---- Descriptor header field identifiers (SQLGetDescField / SQLSetDescField,
+// RecNumber == 0) — the low-numbered block, distinct from the SQLColAttribute
+// ids above despite sharing the same numeric range in the ODBC header.
+pub const SQL_DESC_ARRAY_SIZE: SqlUSmallInt = 20;
+pub const SQL_DESC_ARRAY_STATUS_PTR: SqlUSmallInt = 21;
+pub const SQL_DESC_BIND_OFFSET_PTR: SqlUSmallInt = 24;
+pub const SQL_DESC_BIND_TYPE: SqlUSmallInt = 25;
+pub const SQL_DESC_PARAMETER_TYPE: SqlUSmallInt = 33;
+pub const SQL_DESC_ROWS_PROCESSED_PTR: SqlUSmallInt = 34;
+
+// ---- SQL_DESC_ALLOC_TYPE values ---------------------------------------------
+pub const SQL_DESC_ALLOC_AUTO: SqlSmallInt = 1;
+pub const SQL_DESC_ALLOC_USER: SqlSmallInt = 2;
 
 // ---- SQLColAttribute value constants ----------------------------------------
 pub const SQL_NULLABLE_UNKNOWN: SqlLen = 2;
@@ -466,26 +811,144 @@ pub const SQL_ATTR_READONLY: SqlLen = 0;
 pub const SQL_ATTR_READWRITE_UNKNOWN: SqlLen = 2;
 
 // ---- Statement attribute identifiers (SQLSetStmtAttr / SQLGetStmtAttr) ------
+pub const SQL_ATTR_CURSOR_SCROLLABLE: SqlInteger = -1;
+pub const SQL_ATTR_CURSOR_SENSITIVITY: SqlInteger = -2;
+pub const SQL_ATTR_QUERY_TIMEOUT: SqlInteger = 0;
+pub const SQL_ATTR_MAX_ROWS: SqlInteger = 1;
+pub const SQL_ATTR_NOSCAN: SqlInteger = 2;
+/// `SQL_ATTR_NOSCAN` values: scan for escape sequences (the ODBC default), or
+/// send the statement text through untouched.
+pub const SQL_NOSCAN_OFF: SqlULen = 0;
+pub const SQL_NOSCAN_ON: SqlULen = 1;
+pub const SQL_ATTR_MAX_LENGTH: SqlInteger = 3;
+pub const SQL_ATTR_ASYNC_ENABLE: SqlInteger = 4;
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;
 pub const SQL_ATTR_CURSOR_TYPE: SqlInteger = 6;
 pub const SQL_ATTR_CONCURRENCY: SqlInteger = 7;
+pub const SQL_ATTR_KEYSET_SIZE: SqlInteger = 8;
+/// ODBC 2.x `SQL_ROWSET_SIZE`. Despite the name overlap it is *not* an alias of
+/// [`SQL_ATTR_ROW_ARRAY_SIZE`]: msodbcsql keeps the two in separate slots, so
+/// setting one leaves the other untouched.
+pub const SQL_ROWSET_SIZE: SqlInteger = 9;
+pub const SQL_ATTR_SIMULATE_CURSOR: SqlInteger = 10;
+pub const SQL_ATTR_RETRIEVE_DATA: SqlInteger = 11;
+pub const SQL_ATTR_USE_BOOKMARKS: SqlInteger = 12;
+pub const SQL_ATTR_ROW_NUMBER: SqlInteger = 14;
+pub const SQL_ATTR_ENABLE_AUTO_IPD: SqlInteger = 15;
+pub const SQL_ATTR_FETCH_BOOKMARK_PTR: SqlInteger = 16;
+pub const SQL_ATTR_PARAM_BIND_OFFSET_PTR: SqlInteger = 17;
 pub const SQL_ATTR_PARAM_BIND_TYPE: SqlInteger = 18;
+pub const SQL_ATTR_PARAM_OPERATION_PTR: SqlInteger = 19;
 pub const SQL_ATTR_PARAM_STATUS_PTR: SqlInteger = 20;
 pub const SQL_ATTR_PARAMS_PROCESSED_PTR: SqlInteger = 21;
 pub const SQL_ATTR_PARAMSET_SIZE: SqlInteger = 22;
 pub const SQL_ATTR_ROW_BIND_OFFSET_PTR: SqlInteger = 23;
+pub const SQL_ATTR_ROW_OPERATION_PTR: SqlInteger = 24;
 pub const SQL_ATTR_ROW_STATUS_PTR: SqlInteger = 25;
 pub const SQL_ATTR_ROWS_FETCHED_PTR: SqlInteger = 26;
 pub const SQL_ATTR_ROW_ARRAY_SIZE: SqlInteger = 27;
+/// Shared between the connection and statement scopes; only the statement form
+/// is recognized here.
+pub const SQL_ATTR_METADATA_ID: SqlInteger = 10014;
 
 /// `SQL_ATTR_ROW_BIND_TYPE` value selecting column-wise (array-of-columns)
 /// binding — the mode mssql-python uses.
 pub const SQL_BIND_BY_COLUMN: SqlULen = 0;
+/// Default `SQL_DESC_ARRAY_SIZE` / `SQL_DESC_ROWSET_SIZE` for a freshly
+/// allocated ARD/APD.
+pub const SQL_ROWSET_SIZE_DEFAULT: SqlULen = 1;
 /// `SQL_ATTR_CURSOR_TYPE` value: forward-only (the only mode this driver
 /// supports).
 pub const SQL_CURSOR_FORWARD_ONLY: SqlULen = 0;
 /// `SQL_ATTR_CONCURRENCY` value: read-only.
 pub const SQL_CONCUR_READ_ONLY: SqlULen = 1;
+/// `SQL_ATTR_CURSOR_SCROLLABLE` value: the cursor cannot scroll. Implied by
+/// [`SQL_CURSOR_FORWARD_ONLY`] — msodbcsql keeps the two in step, flipping the
+/// cursor type when scrollability is requested and vice versa.
+pub const SQL_NONSCROLLABLE: SqlULen = 0;
+/// `SQL_ATTR_CURSOR_SENSITIVITY` value reported for this driver's cursor.
+/// A request for `SQL_UNSPECIFIED` (0) resolves to this, matching msodbcsql,
+/// which answers `1` after a caller sets `0`.
+pub const SQL_INSENSITIVE: SqlULen = 1;
+/// `SQL_ATTR_SIMULATE_CURSOR` value msodbcsql reports and accepts; any other
+/// request is substituted for it and reported with `01S02`.
+pub const SQL_SC_UNIQUE: SqlULen = 2;
+/// `SQL_ATTR_RETRIEVE_DATA` default: data is retrieved on fetch.
+pub const SQL_RD_ON: SqlULen = 1;
+/// Value msodbcsql substitutes for any non-zero `SQL_ATTR_MAX_LENGTH` request,
+/// reporting `01S02`. The cap is cosmetic on both drivers: a value longer than
+/// this is still returned whole.
+pub const MSODBCSQL_MAX_LENGTH: SqlULen = 8000;
+/// Largest `SQL_ATTR_QUERY_TIMEOUT` msodbcsql accepts; larger requests are
+/// clamped to it and reported with `01S02` (`MAX_QUERY_TIMEOUT`,
+/// msodbcsql `sqlcmisc.cpp:3988`).
+pub const MAX_QUERY_TIMEOUT: u32 = 0xfffe;
+/// Maximum length in characters of a SQL Server identifier, and so of a
+/// database name accepted by `SQL_ATTR_CURRENT_CATALOG` (msodbcsql
+/// `SYSNAMELEN`, `tds/tds.h:69`).
+pub const SYSNAMELEN: usize = 128;
+/// Catalog name that means "leave the database alone". msodbcsql's
+/// `DEFAULT_STRING` (`sqlsrv.h:2065`), short-circuited in `ChangeDatabase`
+/// (`sqlcconn.cpp:4991`) so a connection string's `Database=(Default)` and the
+/// equivalent attribute are both no-ops rather than a lookup of a database
+/// literally named `(Default)`.
+pub const DEFAULT_CATALOG: &str = "(Default)";
+
+// SQL Server vendor statement attributes (`SQL_SOPT_SS_*`, 1225-1238). These
+// share their numeric range with the `SQL_COPT_SS_*` connection attributes, so
+// the two are only distinguishable by the handle scope they arrive on.
+//
+// Every default and accepted-value set below was measured against msodbcsql 18
+// rather than read out of the headers, because the headers document what the
+// constants mean, not which the driver actually honors. See
+// `docs/attributes_plan.md` §S6.
+
+/// Logging of text pointers. Accepts `SQL_TL_OFF` / `SQL_TL_ON` only.
+pub const SQL_SOPT_SS_TEXTPTR_LOGGING: SqlInteger = 1225;
+/// Ordinal of the command being processed within a batch. Get-only.
+pub const SQL_SOPT_SS_CURRENT_COMMAND: SqlInteger = 1226;
+/// Exposure of the hidden key columns of a browse-mode result set.
+pub const SQL_SOPT_SS_HIDDEN_COLUMNS: SqlInteger = 1227;
+/// Suppression of the `FOR BROWSE` metadata query.
+pub const SQL_SOPT_SS_NOBROWSETABLE: SqlInteger = 1228;
+/// Client-locale conversion of date, time, and money output.
+pub const SQL_SOPT_SS_REGIONALIZE: SqlInteger = 1229;
+/// Cursor behavior bit mask (fast-forward-only, autofetch, firehose).
+pub const SQL_SOPT_SS_CURSOR_OPTIONS: SqlInteger = 1230;
+/// Whether `SET NOCOUNT` is in effect. Get-only.
+pub const SQL_SOPT_SS_NOCOUNT_STATUS: SqlInteger = 1231;
+/// Deferred preparation: skip the server round trip until execute.
+pub const SQL_SOPT_SS_DEFER_PREPARE: SqlInteger = 1232;
+/// Query-notification subscription timeout, in seconds.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT: SqlInteger = 1233;
+/// Query-notification message text. String-valued.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT: SqlInteger = 1234;
+/// Query-notification service/broker options. String-valued.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS: SqlInteger = 1235;
+/// Table-valued-parameter column focus for descriptor binding.
+pub const SQL_SOPT_SS_PARAM_FOCUS: SqlInteger = 1236;
+/// Scope of the name matching used by the catalog functions.
+pub const SQL_SOPT_SS_NAME_SCOPE: SqlInteger = 1237;
+/// Always Encrypted column-encryption mode.
+pub const SQL_SOPT_SS_COLUMN_ENCRYPTION: SqlInteger = 1238;
+
+/// `SQL_SOPT_SS_TEXTPTR_LOGGING` default: msodbcsql reports text-pointer
+/// logging on before any set, unlike most vendor options which default off.
+pub const SQL_TL_ON: SqlULen = 1;
+/// Largest `SQL_SOPT_SS_CURSOR_OPTIONS` value msodbcsql accepts. The option is
+/// a three-bit mask (fast-forward-only, autofetch, firehose autofetch), so
+/// every combination through 7 is valid and 8 is the first rejected value.
+pub const SQL_CO_MAX: SqlULen = 7;
+/// `SQL_SOPT_SS_NOCOUNT_STATUS` value msodbcsql reports. Measured constant:
+/// it answers 1 whether the session has `SET NOCOUNT ON` or `OFF`.
+pub const SQL_NC_ON: SqlULen = 1;
+/// `SQL_SOPT_SS_DEFER_PREPARE` default: deferred preparation is on.
+pub const SQL_DP_ON: SqlULen = 1;
+/// `SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT` default, in seconds (five days).
+pub const SQL_QN_TIMEOUT_DEFAULT: SqlULen = 432_000;
+/// Largest `SQL_SOPT_SS_NAME_SCOPE` value msodbcsql accepts (`TABLE`,
+/// `TABLE_TYPE`, `EXTENDED`, `SPARSE_COLUMN_SET`).
+pub const SQL_SS_NAME_SCOPE_MAX: SqlULen = 3;
 
 // Per-row status codes written into a `SQL_ATTR_ROW_STATUS_PTR` array.
 pub const SQL_ROW_SUCCESS: SqlUSmallInt = 0;
@@ -573,6 +1036,11 @@ pub struct SqlGuid {
     pub data3: SqlUSmallInt,
     pub data4: [u8; 8],
 }
+
+/// SQL Server's maximum `NUMERIC`/`DECIMAL` precision (`tds.h`'s
+/// `SQL_PREC_NUMERIC`), the upper bound `SQL_DESC_PRECISION` accepts when the
+/// concise type is `SQL_C_NUMERIC` / `SQL_NUMERIC`.
+pub const SQL_PREC_NUMERIC: SqlSmallInt = 38;
 
 /// ODBC `SQL_NUMERIC_STRUCT`. `val` holds a little-endian unsigned mantissa;
 /// `sign` is 1 for positive, 0 for negative.

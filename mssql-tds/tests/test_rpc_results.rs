@@ -6,7 +6,9 @@ mod common;
 
 mod rpc_results {
     use crate::common::{begin_connection, build_tcp_datasource, get_scalar_value, init_tracing};
-    use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
+    use mssql_tds::connection::tds_client::{
+        PreparedStatement, ResultSet, StatementId, StatementResult, TdsClient,
+    };
     use mssql_tds::datatypes::column_values::{ColumnValues, SqlDateTime2, SqlTime};
     use mssql_tds::datatypes::decoder::DecimalParts;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -204,6 +206,121 @@ mod rpc_results {
         } else {
             unreachable!("Expected a string value");
         }
+    }
+
+    #[tokio::test]
+    async fn test_sp_executesql_completion_tail_releases_batch() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        let parameter = RpcParameter::new(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        );
+
+        let result = connection
+            .execute_sp_executesql("SELECT @P1".to_string(), vec![parameter], ())
+            .await
+            .unwrap();
+        assert!(matches!(result, StatementResult::Rows));
+        assert!(matches!(
+            connection.next_row().await.unwrap().as_deref(),
+            Some([ColumnValues::Int(42)])
+        ));
+
+        assert!(!connection.peek_past_current_row().await.unwrap());
+        assert!(
+            connection.has_open_batch(),
+            "the RPC completion tail remains"
+        );
+        assert!(connection.complete_current_result().await.unwrap());
+        assert!(!connection.has_open_batch());
+
+        let result = connection
+            .execute("SELECT 7".to_string(), ())
+            .await
+            .unwrap();
+        assert!(matches!(result, StatementResult::Rows));
+        assert!(matches!(
+            get_scalar_value(&mut connection).await.unwrap(),
+            Some(ColumnValues::Int(7))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_prepared_completion_captures_handle_for_reuse() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        let mut statement = PreparedStatement::new("SELECT @P1");
+        let mut orphaned = None;
+        let make_parameter = || {
+            RpcParameter::new(
+                Some("@P1".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(42)),
+            )
+        };
+
+        for _ in 0..2 {
+            let result = connection
+                .execute_prepared(&mut statement, vec![make_parameter()], &mut orphaned, ())
+                .await
+                .unwrap();
+            assert!(matches!(result, StatementResult::Rows));
+            assert!(matches!(
+                connection.next_row().await.unwrap().as_deref(),
+                Some([ColumnValues::Int(42)])
+            ));
+            assert!(!connection.peek_past_current_row().await.unwrap());
+            assert!(connection.complete_current_result().await.unwrap());
+            assert!(!connection.has_open_batch());
+            assert!(statement.id().is_some());
+        }
+
+        connection
+            .unprepare(statement.id().unwrap(), ())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_prepared_completion_preserves_next_result_set() {
+        let mut connection = begin_connection(&build_tcp_datasource()).await;
+        let mut statement = PreparedStatement::new("SELECT @P1; SELECT @P1 + 1");
+        let mut orphaned = None;
+        let parameter = RpcParameter::new(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        );
+
+        let result = connection
+            .execute_prepared(&mut statement, vec![parameter], &mut orphaned, ())
+            .await
+            .unwrap();
+        assert!(matches!(result, StatementResult::Rows));
+        assert!(matches!(
+            connection.next_row().await.unwrap().as_deref(),
+            Some([ColumnValues::Int(42)])
+        ));
+
+        assert!(!connection.peek_past_current_row().await.unwrap());
+        assert!(!connection.complete_current_result().await.unwrap());
+        assert!(connection.has_open_batch());
+        assert!(matches!(
+            connection.advance().await.unwrap(),
+            StatementResult::Rows
+        ));
+        assert!(matches!(
+            connection.next_row().await.unwrap().as_deref(),
+            Some([ColumnValues::Int(43)])
+        ));
+        assert!(!connection.peek_past_current_row().await.unwrap());
+        assert!(connection.complete_current_result().await.unwrap());
+        assert!(!connection.has_open_batch());
+
+        connection
+            .unprepare(statement.id().unwrap(), ())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

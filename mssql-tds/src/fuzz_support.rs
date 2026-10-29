@@ -47,6 +47,70 @@ use std::time::Duration;
 
 const MAX_ALLOC: usize = 1024 * 1024; // 1MB
 
+/// Exercises the bounded `DATACLASSIFICATION` payload parser with an explicit version.
+///
+/// Panics (reported by the fuzzer as a crash) if a successful parse violates
+/// an invariant the parser is responsible for enforcing.
+pub async fn fuzz_data_classification(data: &[u8], version_selector: u8) -> TdsResult<()> {
+    use crate::token::data_classification::{
+        DataClassificationVersion, InformationTypeReference, SensitivityLabelReference,
+    };
+    use crate::token::parsers::data_classification_parser::DataClassificationTokenParser;
+
+    let version = if version_selector & 1 == 0 {
+        DataClassificationVersion::Version1
+    } else {
+        DataClassificationVersion::Version2
+    };
+    let metadata = DataClassificationTokenParser
+        .parse_with_version(&mut FuzzReader::new(data), version)
+        .await?;
+
+    assert_eq!(metadata.version, version);
+    let has_rank = version == DataClassificationVersion::Version2;
+    assert_eq!(
+        metadata.rank.is_some(),
+        has_rank,
+        "result-set rank presence"
+    );
+
+    let mut property_count = 0usize;
+    for column in &metadata.columns {
+        for property in &column.properties {
+            property_count += 1;
+            if let SensitivityLabelReference::Index(index) = property.sensitivity_label {
+                assert!(
+                    usize::from(index) < metadata.sensitivity_labels.len(),
+                    "label index {index} escaped validation"
+                );
+            }
+            if let InformationTypeReference::Index(index) = property.information_type {
+                assert!(
+                    usize::from(index) < metadata.information_types.len(),
+                    "information-type index {index} escaped validation"
+                );
+            }
+            assert_eq!(property.rank.is_some(), has_rank, "property rank presence");
+        }
+    }
+
+    // Each label and information type carries two length bytes, each column a
+    // property count, and each property its fixed-width fields.
+    let rank_bytes = if has_rank { 4 } else { 0 };
+    let minimum_bytes = 6
+        + rank_bytes
+        + 2 * metadata.sensitivity_labels.len()
+        + 2 * metadata.information_types.len()
+        + 2 * metadata.columns.len()
+        + (4 + rank_bytes) * property_count;
+    assert!(
+        minimum_bytes <= data.len(),
+        "parsed {minimum_bytes} bytes of structure from a {}-byte payload",
+        data.len()
+    );
+    Ok(())
+}
+
 /// Cursor-based reader over a byte slice for fuzz targets.
 ///
 /// Implements `TdsPacketReader` with best-of-both overflow protections:
@@ -115,6 +179,19 @@ impl TdsPacketReader for FuzzReader {
 
     fn try_read_float64(&mut self) -> Option<f64> {
         self.try_read_array().map(f64::from_le_bytes)
+    }
+
+    // Without this the corpus never reaches the decoder's borrowed arm, so the
+    // length arithmetic behind it would go unfuzzed. Position moves before the
+    // borrow is taken, matching `BufferState::try_read_slice`.
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        let end = self.position.checked_add(length)?;
+        if end > self.data.len() {
+            return None;
+        }
+        let start = self.position;
+        self.position = end;
+        Some(&self.data[start..end])
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {
@@ -478,6 +555,13 @@ impl NetworkWriter for MockWriter {
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
         NegotiatedEncryptionSetting::NoEncryption
     }
+
+    // The fuzz harness never carries a reset, so there is nothing to record.
+    fn note_reset_dispatched(&mut self) {}
+
+    fn take_reset_dispatched(&mut self) -> bool {
+        false
+    }
 }
 
 /// Concrete packet-reader used by the fuzz harness.
@@ -572,6 +656,13 @@ impl TdsPacketReader for FuzzPacketReader {
         match self {
             Self::Fuzz(r) => r.try_read_float64(),
             Self::Empty(r) => r.try_read_float64(),
+        }
+    }
+
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        match self {
+            Self::Fuzz(r) => r.try_read_slice(length),
+            Self::Empty(r) => r.try_read_slice(length),
         }
     }
 
@@ -799,6 +890,13 @@ impl NetworkWriter for MockTransport {
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
         self.encryption_setting
     }
+
+    // The fuzz harness never carries a reset, so there is nothing to record.
+    fn note_reset_dispatched(&mut self) {}
+
+    fn take_reset_dispatched(&mut self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -891,6 +989,10 @@ impl TdsTokenStreamReader for MockTransport {
 
 #[async_trait]
 impl TdsTransport for MockTransport {
+    fn as_writer_ref(&self) -> &dyn NetworkWriter {
+        self
+    }
+
     fn as_writer(&mut self) -> &mut dyn NetworkWriter {
         self
     }
@@ -909,6 +1011,7 @@ impl TdsTransport for MockTransport {
 
     async fn send_attention_with_timeout(
         &mut self,
+        _context: &crate::io::token_stream::ParserContext,
         _timeout: std::time::Duration,
     ) -> TdsResult<bool> {
         Ok(true)
@@ -958,6 +1061,12 @@ impl TdsPacketReader for MockTransport {
 
     fn try_read_float64(&mut self) -> Option<f64> {
         self.token_stream_reader.packet_reader.try_read_float64()
+    }
+
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        self.token_stream_reader
+            .packet_reader
+            .try_read_slice(length)
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {

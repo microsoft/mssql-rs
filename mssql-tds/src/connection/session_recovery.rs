@@ -13,7 +13,6 @@ pub(crate) struct RecoveryContext {
     /// Whether the server acknowledged session recovery in FEATUREEXTACK.
     pub session_recovery_negotiated: bool,
     /// Accumulated session state for reconnection.
-    /// Boxed to avoid ~16KB on the stack during construction (two 256-element arrays).
     pub session_state_table: Box<SessionStateTable>,
     /// Clone of the original connection configuration, needed for reconnection.
     /// Boxed to avoid inflating async future state machines (ClientContext is ~17KB).
@@ -211,6 +210,33 @@ pub(crate) struct SessionStateRecord {
     pub data: Vec<u8>,
 }
 
+/// One slot per session state id.
+///
+/// Heap-allocated because a by-value array of 256 records is ~8 KB, and
+/// building one (`std::array::from_fn`, `Box::new([..])`, `.clone()`) places it
+/// on the stack first. The table is created inside the connect call, which can
+/// run on a 128 KiB thread (musl's default) and overflowed when it did.
+pub(crate) type StateSlots = Box<[Option<SessionStateRecord>; STATE_SLOT_COUNT]>;
+
+pub(crate) const STATE_SLOT_COUNT: usize = 256;
+
+/// All-`None` slots, allocated directly on the heap.
+pub(crate) fn empty_state_slots() -> StateSlots {
+    collect_state_slots(std::iter::repeat_with(|| None))
+}
+
+fn clone_state_slots(slots: &StateSlots) -> StateSlots {
+    collect_state_slots(slots.iter().cloned())
+}
+
+fn collect_state_slots(slots: impl Iterator<Item = Option<SessionStateRecord>>) -> StateSlots {
+    slots
+        .take(STATE_SLOT_COUNT)
+        .collect::<Box<[_]>>()
+        .try_into()
+        .expect("iterator yields STATE_SLOT_COUNT slots")
+}
+
 /// Tracks session state received from the server for idle connection resiliency.
 ///
 /// The server sends SESSIONSTATE tokens (0xE4) containing state updates during
@@ -222,9 +248,9 @@ pub(crate) struct SessionStateRecord {
 #[derive(Debug)]
 pub(crate) struct SessionStateTable {
     /// Baseline session state captured from the initial FEATUREEXTACK response.
-    pub initial_state: [Option<SessionStateRecord>; 256],
+    pub initial_state: StateSlots,
     /// Delta state accumulated from SESSIONSTATE tokens during operation.
-    pub delta: [Option<SessionStateRecord>; 256],
+    pub delta: StateSlots,
     /// Database name at connection time.
     pub initial_database: String,
     /// Language at connection time.
@@ -236,13 +262,11 @@ pub(crate) struct SessionStateTable {
     pub master_recovery_disabled: bool,
 }
 
-// Manual Default because [Option<SessionStateRecord>; 256] doesn't implement
-// Default via derive (array size > 32 without const generics Default blanket).
 impl Default for SessionStateTable {
     fn default() -> Self {
         Self {
-            initial_state: std::array::from_fn(|_| None),
-            delta: std::array::from_fn(|_| None),
+            initial_state: empty_state_slots(),
+            delta: empty_state_slots(),
             initial_database: String::new(),
             initial_language: String::new(),
             initial_collation: SqlCollation::default(),
@@ -380,7 +404,7 @@ impl SessionStateTable {
     /// reset and repopulated from the payload rather than merged. The login
     /// baseline is untouched; both blocks serialize on the next reconnect.
     pub(crate) fn apply_feature_ack_to_delta(&mut self, data: &[u8]) {
-        self.delta = std::array::from_fn(|_| None);
+        self.delta.fill(None);
         match Self::parse_feature_ack(data) {
             Ok(entries) => {
                 for (state_id, value) in entries {
@@ -424,7 +448,7 @@ impl SessionStateTable {
     /// (connection reset acknowledgment) — all three reference drivers
     /// (ODBC, JDBC, SqlClient) reset state on this event.
     pub fn reset(&mut self) {
-        self.delta = std::array::from_fn(|_| None);
+        self.delta.fill(None);
         // master_recovery_disabled is NOT cleared — it persists across resets.
         // initial_state is NOT cleared — it represents the baseline snapshot.
     }
@@ -441,8 +465,8 @@ impl SessionStateTable {
         current_collation: Option<SqlCollation>,
     ) -> Box<SessionRecoveryData> {
         Box::new(SessionRecoveryData {
-            initial_state: self.initial_state.clone(),
-            delta: self.delta.clone(),
+            initial_state: clone_state_slots(&self.initial_state),
+            delta: clone_state_slots(&self.delta),
             initial_database: self.initial_database.clone(),
             initial_language: self.initial_language.clone(),
             initial_collation: self.initial_collation,
@@ -462,10 +486,10 @@ impl SessionStateTable {
 /// Created via [`SessionStateTable::snapshot()`] before initiating reconnection.
 /// Contains cloned copies so the original table can be safely dropped or mutated
 /// during the reconnect attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SessionRecoveryData {
-    pub initial_state: [Option<SessionStateRecord>; 256],
-    pub delta: [Option<SessionStateRecord>; 256],
+    pub initial_state: StateSlots,
+    pub delta: StateSlots,
     pub initial_database: String,
     pub initial_language: String,
     pub initial_collation: SqlCollation,
@@ -475,6 +499,22 @@ pub(crate) struct SessionRecoveryData {
     pub language: String,
     /// Current collation (may differ from initial).
     pub collation: SqlCollation,
+}
+
+// Not derived: `Box::clone` may build the array on the stack before writing it.
+impl Clone for SessionRecoveryData {
+    fn clone(&self) -> Self {
+        Self {
+            initial_state: clone_state_slots(&self.initial_state),
+            delta: clone_state_slots(&self.delta),
+            initial_database: self.initial_database.clone(),
+            initial_language: self.initial_language.clone(),
+            initial_collation: self.initial_collation,
+            database: self.database.clone(),
+            language: self.language.clone(),
+            collation: self.collation,
+        }
+    }
 }
 
 impl SessionRecoveryData {
@@ -492,7 +532,7 @@ impl SessionRecoveryData {
         // B_VARCHAR: initial_language
         len += 1 + 2 * self.initial_language.encode_utf16().count() as u32;
         // State entries
-        for entry in &self.initial_state {
+        for entry in self.initial_state.iter() {
             if let Some(record) = entry.as_ref() {
                 len += 1; // state_id
                 len += state_value_wire_length(record.data.len());
@@ -523,7 +563,7 @@ impl SessionRecoveryData {
             len += 1 + 2 * self.language.encode_utf16().count() as u32;
         }
         // Delta state entries
-        for entry in &self.delta {
+        for entry in self.delta.iter() {
             if let Some(record) = entry.as_ref() {
                 len += 1; // state_id
                 len += state_value_wire_length(record.data.len());
@@ -553,6 +593,49 @@ fn state_value_wire_length(data_len: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Both are built inside the connect/reconnect call, which may run on a
+    // 128 KiB thread; inline 256-slot arrays made each ~16 KB of stack.
+    #[test]
+    fn session_state_values_stay_small() {
+        assert!(std::mem::size_of::<SessionStateTable>() <= 512);
+        assert!(std::mem::size_of::<SessionRecoveryData>() <= 512);
+    }
+
+    // Catches a slot array being built on the stack and then boxed (e.g.
+    // `Box::new(std::array::from_fn(..))` or `Box::clone`), which
+    // `session_state_values_stay_small` cannot see. Unoptimized builds keep
+    // that temporary, so this is reliable in the default (debug) test profile.
+    #[test]
+    fn session_state_builds_on_small_stack() {
+        let mut table = SessionStateTable::new();
+        table.update_state(1, 1, true, vec![1]);
+        std::thread::Builder::new()
+            .stack_size(32 * 1024)
+            .spawn(move || {
+                let fresh = SessionStateTable::new();
+                let copy = (*table.snapshot(None, None, None)).clone();
+                table.reset();
+                assert!(fresh.delta.iter().all(Option::is_none));
+                assert!(copy.delta[1].is_some());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn snapshot_clone_preserves_every_slot() {
+        let mut table = SessionStateTable::new();
+        table.update_state(0, 1, true, vec![0x01]);
+        table.update_state(255, 2, false, vec![0x02]);
+        let snapshot = table.snapshot(None, None, None);
+        let copy = (*snapshot).clone();
+        assert_eq!(copy.delta.len(), STATE_SLOT_COUNT);
+        assert_eq!(copy.delta[0].as_ref().unwrap().data, vec![0x01]);
+        assert_eq!(copy.delta[255].as_ref().unwrap().sequence, 2);
+        assert!(copy.initial_state.iter().all(Option::is_none));
+    }
 
     #[test]
     fn new_table_is_recoverable() {

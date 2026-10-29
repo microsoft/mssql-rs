@@ -14,12 +14,32 @@ use std::ffi::c_void;
 use crate::api::alloc_handle::sql_alloc_handle;
 use crate::api::free_handle::sql_free_handle;
 use crate::api::odbc_types::{
-    SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NULL_HANDLE,
-    SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle,
+    SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
+    SQL_NULL_HANDLE, SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlReturn,
 };
 use crate::api::set_env_attr::sql_set_env_attr;
+use crate::api::sqlstate::DiagMsg;
+use crate::error::DiagRecord;
 use crate::handles::dbc::ConnectionState;
+use crate::handles::wire::{ClaimPolicy, WireLease, WireOwner};
 use crate::handles::{DbcHandle, handle_from_raw};
+
+/// Asserts the last record's SQLSTATE and message text (the driver prefixes the
+/// message, so the text is matched as a substring).
+pub(crate) fn assert_last_diag(records: &[DiagRecord], expected: DiagMsg) {
+    let d = records.last().expect("expected a diagnostic record");
+    assert_eq!(d.sql_state, expected.state, "SQLSTATE mismatch");
+    assert!(
+        d.message.contains(expected.text),
+        "message {:?} did not contain {:?}",
+        d.message,
+        expected.text
+    );
+}
+
+/// Known alignment for tests that deliberately displace application pointers.
+#[repr(align(8))]
+pub(crate) struct AlignedBuffer<T, const N: usize>(pub(crate) [T; N]);
 
 /// Rebuild an ODBC connection string from a template, expanding the credential
 /// placeholders `<PW>` → `PWD` and `<PASS>` → `PASSWORD`.
@@ -32,6 +52,30 @@ pub(crate) fn cs(s: &str) -> String {
     s.replace("<PASS>", "PASSWORD").replace("<PW>", "PWD")
 }
 
+/// Parks `client` on `dbc`'s wire and checks it out for `statement`, as an
+/// in-progress call holds it.
+pub(crate) fn lease_for_test(
+    dbc: &DbcHandle,
+    statement: SqlHandle,
+    client: mssql_tds::connection::tds_client::TdsClient,
+) -> WireLease {
+    let mut state = dbc.inner.lock().unwrap();
+    state.wire.put_client_for_test(client);
+    state.wire.take_lease_for_test(statement)
+}
+
+pub(crate) fn connection_lease_for_test(
+    dbc: &DbcHandle,
+    client: mssql_tds::connection::tds_client::TdsClient,
+) -> WireLease {
+    let mut state = dbc.inner.lock().unwrap();
+    state.wire.put_client_for_test(client);
+    state
+        .wire
+        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+        .expect("the fixture installed an idle client")
+}
+
 /// Owns a set of test ODBC handles and frees them on drop.
 ///
 /// `env` is always set; `dbc` and `stmt` are `SQL_NULL_HANDLE` unless the
@@ -42,22 +86,35 @@ pub(crate) struct TestHandles {
     pub(crate) dbc: SqlHandle,
     pub(crate) stmt: SqlHandle,
     extra_stmts: Vec<SqlHandle>,
+    extra_descs: Vec<SqlHandle>,
 }
 
 impl TestHandles {
-    /// Allocate an ENV handle and set `SQL_ATTR_ODBC_VERSION` to 3.80 so that
-    /// DBC allocation is permitted.
-    pub(crate) fn with_env() -> Self {
+    /// Allocate an ENV handle without selecting an ODBC version.
+    pub(crate) fn with_unset_env() -> Self {
         let mut env: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
             SQL_SUCCESS
         );
         assert!(!env.is_null());
+        Self {
+            env,
+            dbc: SQL_NULL_HANDLE,
+            stmt: SQL_NULL_HANDLE,
+            extra_stmts: Vec::new(),
+            extra_descs: Vec::new(),
+        }
+    }
+
+    /// Allocate an ENV handle and set `SQL_ATTR_ODBC_VERSION` to 3.80 so that
+    /// DBC allocation is permitted.
+    pub(crate) fn with_env() -> Self {
+        let h = Self::with_unset_env();
         assert_eq!(
             unsafe {
                 sql_set_env_attr(
-                    env,
+                    h.env,
                     SQL_ATTR_ODBC_VERSION,
                     SQL_OV_ODBC3_80 as usize as *mut c_void,
                     0,
@@ -65,30 +122,61 @@ impl TestHandles {
             },
             SQL_SUCCESS
         );
-        Self {
-            env,
-            dbc: SQL_NULL_HANDLE,
-            stmt: SQL_NULL_HANDLE,
-            extra_stmts: Vec::new(),
-        }
+        h
     }
 
     /// Allocate ENV + DBC.
     pub(crate) fn with_env_dbc() -> Self {
-        let mut h = Self::with_env();
+        Self::with_env_dbc_version(SQL_OV_ODBC3_80)
+    }
+
+    /// Allocate ENV + DBC after declaring a specific `SQL_ATTR_ODBC_VERSION`,
+    /// for tests that must cover more than the 3.80 default.
+    pub(crate) fn with_env_dbc_version(version: u32) -> Self {
+        let mut h = Self::with_unset_env();
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    h.env,
+                    SQL_ATTR_ODBC_VERSION,
+                    version as usize as *mut c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS,
+            "SQL_OV version {version} must be accepted"
+        );
         let mut dbc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_DBC, h.env, &mut dbc) },
             SQL_SUCCESS
         );
         assert!(!dbc.is_null());
+        // Conversion tests choose their encoding explicitly, independent of the
+        // host locale. Native defaults are exercised by the allocation/e2e tests.
+        unsafe { handle_from_raw::<DbcHandle>(dbc) }
+            .inner
+            .lock()
+            .unwrap()
+            .client_encoding = crate::conversion::client_encoding::ClientEncoding::UTF8;
         h.dbc = dbc;
         h
     }
 
     /// Allocate ENV + DBC + STMT.
     pub(crate) fn with_env_dbc_stmt() -> Self {
+        Self::with_env_dbc_stmt_encoding(crate::conversion::client_encoding::ClientEncoding::UTF8)
+    }
+
+    pub(crate) fn with_env_dbc_stmt_encoding(
+        encoding: crate::conversion::client_encoding::ClientEncoding,
+    ) -> Self {
         let mut h = Self::with_env_dbc();
+        unsafe { handle_from_raw::<DbcHandle>(h.dbc) }
+            .inner
+            .lock()
+            .unwrap()
+            .client_encoding = encoding;
         let mut stmt: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_STMT, h.dbc, &mut stmt) },
@@ -112,6 +200,66 @@ impl TestHandles {
         stmt
     }
 
+    /// Allocate an explicit descriptor (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`)
+    /// under the same DBC. The returned handle is tracked and freed on drop,
+    /// before the DBC. Marks the DBC connected first (idempotent) so tests get
+    /// a realistic connected-session baseline — not required by `alloc_desc`
+    /// itself, which doesn't gate on connection state.
+    pub(crate) fn alloc_explicit_desc(&mut self) -> SqlHandle {
+        self.mark_dbc_connected();
+        let mut desc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, self.dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+        assert!(!desc.is_null());
+        self.extra_descs.push(desc);
+        desc
+    }
+
+    /// Frees one statement previously returned by `alloc_extra_stmt` ahead of
+    /// `Drop`, and stops tracking it so `Drop` does not free it again.
+    pub(crate) fn free_extra_stmt(&mut self, stmt: SqlHandle) -> SqlReturn {
+        let ret = unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
+        self.extra_stmts.retain(|&s| s != stmt);
+        ret
+    }
+
+    /// Frees one explicit descriptor previously returned by
+    /// `alloc_explicit_desc` ahead of `Drop`, and stops tracking it so `Drop`
+    /// does not free it again.
+    pub(crate) fn free_explicit_desc(&mut self, desc: SqlHandle) -> SqlReturn {
+        let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        self.extra_descs.retain(|&d| d != desc);
+        ret
+    }
+
+    /// Allocates a second, independent connection under the same ENV, with
+    /// one explicit descriptor already allocated on it — for
+    /// cross-connection rejection tests. Both are freed by
+    /// [`OtherConnection`]'s own `Drop`, before this `TestHandles`'s ENV.
+    pub(crate) fn alloc_other_connection(&self) -> OtherConnection {
+        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, self.env, &mut dbc) },
+            SQL_SUCCESS
+        );
+        // Connects the DBC (though `alloc_desc` no longer requires it — see
+        // its doc comment) so this mirrors a realistic connected-session
+        // cross-connection scenario; same technique as `mark_dbc_connected`.
+        unsafe { handle_from_raw::<DbcHandle>(dbc) }
+            .inner
+            .lock()
+            .unwrap()
+            .connection_state = ConnectionState::Connected;
+        let mut desc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+        OtherConnection { dbc, desc }
+    }
+
     /// Force the DBC into the `Connected` state without establishing a real
     /// TDS client. Only valid for code paths that gate on `connection_state`
     /// but never touch the client — e.g. SQLPrepare's deferred prepare. Paths
@@ -124,6 +272,31 @@ impl TestHandles {
         };
         state.connection_state = ConnectionState::Connected;
     }
+
+    /// The implicit application row descriptor (ARD) owned by `self.stmt`.
+    pub(crate) fn ard(&self) -> SqlHandle {
+        self.stmt_ref().ard
+    }
+
+    /// The implicit application parameter descriptor (APD) owned by `self.stmt`.
+    pub(crate) fn apd(&self) -> SqlHandle {
+        self.stmt_ref().apd
+    }
+
+    /// The implicit implementation row descriptor (IRD) owned by `self.stmt`.
+    pub(crate) fn ird(&self) -> SqlHandle {
+        self.stmt_ref().ird
+    }
+
+    /// The implicit implementation parameter descriptor (IPD) owned by `self.stmt`.
+    pub(crate) fn ipd(&self) -> SqlHandle {
+        self.stmt_ref().ipd
+    }
+
+    fn stmt_ref(&self) -> &crate::handles::StmtHandle {
+        assert!(!self.stmt.is_null(), "descriptor accessors require a STMT");
+        unsafe { handle_from_raw::<crate::handles::StmtHandle>(self.stmt) }
+    }
 }
 
 impl Drop for TestHandles {
@@ -135,6 +308,9 @@ impl Drop for TestHandles {
             if !self.stmt.is_null() {
                 sql_free_handle(SQL_HANDLE_STMT, self.stmt);
             }
+            for desc in self.extra_descs.drain(..) {
+                sql_free_handle(SQL_HANDLE_DESC, desc);
+            }
             if !self.dbc.is_null() {
                 sql_free_handle(SQL_HANDLE_DBC, self.dbc);
             }
@@ -142,5 +318,228 @@ impl Drop for TestHandles {
                 sql_free_handle(SQL_HANDLE_ENV, self.env);
             }
         }
+    }
+}
+
+/// A second, independent connection (with one explicit descriptor already
+/// allocated on it) returned by [`TestHandles::alloc_other_connection`], for
+/// cross-connection rejection tests. Frees the descriptor, then the DBC, on
+/// drop.
+pub(crate) struct OtherConnection {
+    dbc: SqlHandle,
+    pub(crate) desc: SqlHandle,
+}
+
+impl Drop for OtherConnection {
+    fn drop(&mut self) {
+        unsafe {
+            sql_free_handle(SQL_HANDLE_DESC, self.desc);
+            sql_free_handle(SQL_HANDLE_DBC, self.dbc);
+        }
+    }
+}
+
+/// A running mock TDS server plus the real, connected `TdsClient` installed on
+/// a DBC by [`connect_mock_server`]. Dropping it shuts the server down.
+///
+/// The server runs on its own dedicated Tokio runtime/thread — never the
+/// DBC's own runtime — matching how a real SQL Server is a separate process
+/// that never competes with the driver for the runtime's worker thread. This
+/// is what lets a query-timeout regression test tell "the timeout bounded the
+/// wait" from "the server just answered quickly": the server can independently
+/// delay a response for seconds while the DBC-side call is timed.
+pub(crate) struct MockServer {
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    server_handle: Option<tokio::task::JoinHandle<()>>,
+    server_runtime: tokio::runtime::Runtime,
+    query_registry: std::sync::Arc<tokio::sync::Mutex<mssql_mock_tds::QueryRegistry>>,
+    connection_store: std::sync::Arc<tokio::sync::Mutex<mssql_mock_tds::ConnectionStore>>,
+}
+
+impl MockServer {
+    /// The number of logins the server has accepted, including the one
+    /// [`connect_mock_server`] made for the DBC.
+    pub(crate) fn connection_count(&self) -> usize {
+        self.server_runtime
+            .block_on(async { self.connection_store.lock().await.count() })
+    }
+
+    pub(crate) fn register_query(&self, query: &str, response: mssql_mock_tds::QueryResponse) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(query, response);
+        });
+    }
+
+    /// Registers a delay for the server's answer to the TDS Transaction
+    /// Manager `Begin` request — the implicit transaction begin an
+    /// autocommit-off connection issues before its first statement. Lets a
+    /// test prove `SQL_ATTR_QUERY_TIMEOUT` bounds that step specifically,
+    /// the same way [`connect_mock_server`]'s `response` bounds a query.
+    pub(crate) fn set_tm_begin_delay(&self, delay: std::time::Duration) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(
+                mssql_mock_tds::TM_BEGIN_DELAY_KEY,
+                mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+            );
+        });
+    }
+
+    /// Registers a delay for the server's answer to any RPC request that
+    /// matched no specific registration.
+    ///
+    /// The substring match `connect_mock_server`'s `query` relies on can only
+    /// address RPCs whose wire text the test chooses (`sp_prepexec`'s `@stmt`).
+    /// Catalog procedures, `sp_datatype_info_100` and
+    /// `sp_describe_undeclared_parameters` are named by the driver in lower
+    /// case, so this is how a test holds *those* responses back long enough to
+    /// prove `SQL_ATTR_QUERY_TIMEOUT` bounds the RPC itself.
+    pub(crate) fn set_rpc_delay(&self, delay: std::time::Duration) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(
+                mssql_mock_tds::RPC_DELAY_KEY,
+                mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+            );
+        });
+    }
+
+    /// Registers a delay for the server's answer to every later login, which
+    /// stalls a secondary connection's handshake while the DBC's own session
+    /// stays usable.
+    pub(crate) fn set_login_delay(&self, delay: std::time::Duration) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(
+                mssql_mock_tds::LOGIN_DELAY_KEY,
+                mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+            );
+        });
+    }
+}
+
+/// Arms `stmt` with a pending `sp_unprepare` that will actually reach the wire.
+///
+/// `flush_pending_unprepare` runs before every statement-scoped operation and
+/// is best-effort for non-cancellation errors: it logs a failure — including a
+/// timeout — and returns normally. That is why each call site re-checks the budget
+/// afterwards, and it is the only step whose timeout can be *survived*, so it
+/// is the one way a test can reach those "budget exhausted before the statement
+/// could be sent" arms deterministically rather than by racing a stopwatch.
+///
+/// `TdsClient::unprepare` skips the round trip when it holds no handle for the
+/// id, so the handle is registered on the live client and the id it issues is
+/// parked on the statement.
+pub(crate) fn arm_pending_unprepare(
+    dbc: &crate::handles::dbc::DbcHandle,
+    stmt: &crate::handles::StmtHandle,
+) {
+    let statement_id = {
+        let mut dbc_state = dbc.inner.lock().unwrap();
+        dbc_state
+            .wire
+            .client_mut_for_test()
+            .expect("connect_mock_server installs a live client")
+            .register_prepared_handle_for_test(1)
+    };
+    stmt.inner.lock().unwrap().pending_unprepare = Some(statement_id);
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.server_handle.take() {
+            let _ = self.server_runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(2), handle).await
+            });
+        }
+    }
+}
+
+/// Starts a mock TDS server registered to answer `query` with `response`,
+/// then connects a real `TdsClient` to it over a real TCP socket (via `dbc`'s
+/// own runtime) and installs it as `dbc`'s active, connected client — so a
+/// unit test can drive the real `SQLExecute` / `SQLExecDirectW` code path
+/// against a genuinely slow (or fast) server response instead of a scripted,
+/// instantaneous one.
+///
+/// Keep the returned [`MockServer`] alive for the duration of the test; it
+/// shuts the server down on drop.
+pub(crate) fn connect_mock_server(
+    dbc: &crate::handles::dbc::DbcHandle,
+    query: &str,
+    response: mssql_mock_tds::QueryResponse,
+) -> MockServer {
+    connect_mock_server_with_trailing_info(dbc, query, response, Vec::new())
+}
+
+/// [`connect_mock_server`], with info tokens emitted after the response's last
+/// row instead of before its first — where SQL Server puts an aggregate
+/// warning, and the only placement a driver's terminal read-ahead can observe.
+pub(crate) fn connect_mock_server_with_trailing_info(
+    dbc: &crate::handles::dbc::DbcHandle,
+    query: &str,
+    response: mssql_mock_tds::QueryResponse,
+    trailing_info: Vec<mssql_mock_tds::InfoMessage>,
+) -> MockServer {
+    use crate::handles::dbc::ConnectionState;
+    use mssql_mock_tds::MockTdsServer;
+    use mssql_tds::connection::client_context::ClientContext;
+    use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use std::time::Duration;
+
+    let server_runtime =
+        tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+    let (server_addr, shutdown_tx, server_handle, query_registry, connection_store) =
+        server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let registry = server.query_registry();
+            let connections = server.connection_store();
+            registry
+                .lock()
+                .await
+                .register_with_trailing_info(query, response, trailing_info);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle, registry, connections)
+        });
+
+    let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+    let mut context = ClientContext::default();
+    context.set_connection_trace(std::sync::Arc::clone(&dbc.trace));
+    context.user_name = "sa".to_string();
+    context.password = "unused-by-the-mock-server".to_string();
+    context.database = "master".to_string();
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let client = dbc
+        .runtime
+        .block_on(provider.create_client(context, &datasource, None))
+        .expect("mock client failed to connect");
+
+    {
+        let mut state = dbc.inner.lock().unwrap();
+        state.wire.put_client_for_test(client);
+        state.connection_state = ConnectionState::Connected;
+    }
+
+    MockServer {
+        shutdown_tx: Some(shutdown_tx),
+        server_handle: Some(server_handle),
+        server_runtime,
+        query_registry,
+        connection_store,
     }
 }

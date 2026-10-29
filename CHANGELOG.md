@@ -8,6 +8,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- Shared MultiSubnetFailover (MSF) startup configuration: explicit connection
+  setting > application default > `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT`
+  (`true`/`false`) > built-in on. Rust, native Python, and Node.js expose
+  startup setters; the CLI accepts `--multi-subnet-failover true|false`.
+  Defaults freeze on first use; late setters fail. Connection policy and its
+  source are traced and retained for recovery and secondary connections
+  (AB#49293).
+
+- `mssql-odbc`: `SQL_COPT_SS_MULTISUBNET_FAILOVER` accepts off/on before
+  connecting, overrides the matching keyword, and reports the connection's
+  effective policy. Out-of-range values are `HY024`; changes while connected
+  are `HY011` (AB#49293).
+
+- `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
+  into supported numeric and date/time C targets, with the existing
+  bound-fetch 1 MiB source-data cap (AB#47238).
+
+- `mssql-odbc`: input parameter binding (`SQLBindParameter` with
+  `SQL_PARAM_INPUT`) for the character and integer type families. Any other
+  `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
+  including when the bound value is `SQL_NULL_DATA`: a SQL type that cannot
+  carry a value cannot carry a typed NULL either, so an application never gets a
+  binding that works for `NULL` and fails on its first real value. `ColumnSize`
+  is validated against the `ParameterType` at bind time (`HY104`), matching
+  msodbcsql's `CheckSqlPrecScale`.
+
 - `mssql-tds`: `SqlType::Variant` for passing `sql_variant` values as RPC / `sp_executesql`
   parameters.
 
@@ -21,11 +47,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `mssql-odbc`: server informational/warning messages are surfaced as
   diagnostic records (`SQLGetDiagRec` / `SQLGetDiagField`), and successful calls
   that observed them return `SQL_SUCCESS_WITH_INFO`
-  (`SQLDriverConnect`, `SQLExecDirect`, `SQLFetch`, `SQLMoreResults`,
-  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`). INFO captured at end-of-rowset is
-  deferred to the next result-set boundary (`SQLMoreResults` advance or cursor
-  close) so it surfaces with a `SQL_SUCCESS_WITH_INFO` hint instead of being
-  posted under `SQL_NO_DATA`, which many applications never inspect.
+  (`SQLDriverConnect`, `SQLExecDirect`, `SQLExecute`,
+  `SQLFetch` / `SQLFetchScroll`, `SQLGetData`, `SQLMoreResults`,
+  `SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`, `SQLDescribeParam`,
+  `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`). A message consumed by a fetch's
+  terminal read-ahead is posted by the call that read it: a fetch or
+  terminal-column `SQLGetData` that delivered data returns
+  `SQL_SUCCESS_WITH_INFO`, and a zero-row fetch keeps `SQL_NO_DATA` while
+  leaving the record retrievable (AB#48821).
 
 - `mssql-odbc`: catalog functions — `SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
   `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`
@@ -42,9 +71,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   columns, allowing Polars DataFrames to load without first converting the
   DataFrame to a PyArrow table.
 
+- `mssql-tds`: DNS caching. LOGIN7 always advertises feature extension `0x0B`,
+  as msodbcsql does. When a server acknowledges it, the addresses that
+  connection resolved are kept in a process-wide cache and used only if a
+  later resolution of that host fails, so connections survive a DNS outage.
+  Verdicts take effect only after LOGINACK and a successful terminal DONE.
+  A FEATUREEXTACK without a positive DNS acknowledgement removes the host;
+  a rejected or incomplete response, or one with no FEATUREEXTACK at all,
+  leaves the cache unchanged (AB#49294).
+
+- `mssql-tds`: Enhanced Routing. LOGIN7 always advertises feature extension
+  `0x0F`, as msodbcsql does, and the client follows ENVCHANGE type 21 to the
+  routed server and logs in to the routed database. A type 21 route without
+  an Enhanced Routing acknowledgement of 1 fails the login, matching msodbcsql
+  (AB#49295).
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- Eligible TCP connections now default to immediate parallel MSF attempts,
+  without TNIR's first-address phase. Explicit non-TCP transports, failover
+  partners, and named instances requiring SSRP suppress an inherited on
+  default; Windows local targets without a protocol or port retain their
+  shared-memory-first path unless MSF is explicitly enabled for the connection.
+  Explicitly enabling incompatible MSF is an error. More than 64
+  resolved addresses is an error with MSF on, not a truncated race; MSF off
+  walks the full list sequentially. See parity decisions 34 and 35 (AB#49293).
+
+- Rust API migration: `ClientContext::multi_subnet_failover` is now
+  `Option<bool>`: use `None` to inherit, or `Some(false)` to opt out.
+  Python dictionary and JS object options preserve omission and explicit false.
+  Native Python `multi_subnet_failover=None` also inherits the default.
+
+- TNIR is deliberately unsupported. ODBC
+  `TransparentNetworkIPResolution=Disabled` / `SQL_COPT_SS_TNIR=OFF` and native
+  Python `False` / `"Disabled"` are compatibility no-ops, **not MSF opt-outs**.
+  Enabling TNIR returns `HYC00` in ODBC or an exception in native Python;
+  malformed values are rejected. Use `MultiSubnetFailover=No` or the equivalent
+  native option to select sequential connections (AB#49293).
+
+- `mssql-tds`: `Error::Redirection` has a new `database` field, set when the
+  server routes the connection with Enhanced Routing. Routing ENVCHANGEs are
+  now acted on after the whole login response is read rather than mid-stream.
+  A routing ENVCHANGE (type 20 or 21) must follow LOGINACK and be the only one
+  in the login response ([MS-TDS] 2.2.7.9); otherwise the login fails with a
+  protocol error instead of following a route, matching msodbcsql.
+  Both routing types now validate the token and routing-data lengths, empty
+  old value, TCP protocol, non-zero port, and bounded server name before
+  continuing to the next token. A malformed or truncated response after the
+  routing token fails the login instead of being skipped (AB#49294).
+
+- `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
+  now return success with indicator 0 and leave the value buffer unchanged,
+  matching msodbcsql18 for bound and unbound retrieval. Empty date/time
+  literals still return `22018`.
+
+- `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
+  fetch time from the current result column's SQL type, using the same mapping
+  as `SQLBindParameter`. Wide character columns resolve to `SQL_C_WCHAR` and
+  `uniqueidentifier` to `SQL_C_GUID`, where msodbcsql resolves both to its ANSI
+  `SQL_C_CHAR`.
+
+- `mssql-tds`: LOGIN7 now encodes Unicode field lengths as UTF-16 code units
+  and rejects oversized records instead of producing malformed packets. This
+  fixes login failures with non-ASCII usernames, passwords, database names,
+  hostnames, and application names across all bindings.
 
 - `mssql-tds`: `TdsClient::language()` now returns the language negotiated at
   login (from the server's `ENVCHANGE`) instead of always returning an empty
@@ -101,6 +193,127 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds`: a parallel TCP connect now aborts its remaining attempts when it is cancelled
+  or the login deadline expires. Before, those attempts kept their sockets
+  open until the OS connect timeout (AB#49293).
+
+- `mssql-odbc`: `SQLGetConnectAttr` now writes the four-byte width of an
+  integer attribute to `StringLengthPtr`, as msodbcsql does. Before, the
+  caller's variable was left unchanged (AB#49293).
+
+- `mssql-tds`: a route received over shared memory, the first transport tried
+  for a local named instance, is now followed over TCP like a route received
+  over any other transport. The connection previously failed with
+  `Error::Redirection`. A failed routed connection now returns the target's
+  error without retrying the gateway or falling back to SSRP, matching
+  msodbcsql. Retries before receiving a route are unchanged.
+
+- `mssql-tds`: the crates.io README quick start now uses the current
+  `execute(sql, ())` / `on_rows()` / `next_row()` API, both feature tables list
+  the `tls-schannel-direct` features, and the dependency snippet points at
+  `0.3`. The bulk copy docs now show `BulkLoadRow` and
+  `write_to_server_zerocopy` instead of the removed `BulkCopyRow` and
+  `write_to_server`. docs.rs now also builds the Windows target, and broken or
+  private intra-doc links no longer render as dead text. The `mssql-mock-tds`
+  README examples use the current `create_client` and `execute` signatures.
+
+- `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
+  zero payload length now decodes as empty instead of NULL (AB#49220). In the
+  legacy LOB wire format NULL is a zero *text-pointer* length; the decoder
+  treated any zero *data* length as NULL, so a present but empty value was
+  reported as NULL. `TEXT`/`NTEXT` already made this distinction, so only
+  `IMAGE` was affected. This changes what consumers see for an empty `IMAGE`:
+  `mssql-odbc` reports indicator `0` rather than `SQL_NULL_DATA` (matching
+  msodbcsql), `mssql-py-core` returns `b""` rather than `None`, and `mssql-js`
+  returns an empty `Buffer` rather than `null`. A genuine NULL is unchanged.
+
+- `mssql-odbc`: a statement that finds a shared, non-MARS connection in use now
+  always fails with `HY000` "Connection is busy with results for another
+  command", matching msodbcsql. Racing a cursor close or a connection-scoped
+  operation (`SQLEndTran`, autocommit/isolation/catalog changes, the
+  `SQL_USER_NAME` lookup) could instead report "No active TDS client", which
+  applications do not retry (AB#49225).
+
+- `mssql-tds` / `mssql-odbc`: a character with no representation in the narrow
+  encoding a value is sent in is now replaced with `?` instead of being
+  rewritten as markup. `encoding_rs` implements WHATWG form-submission
+  semantics, so `Encoding::encode` substitutes a decimal numeric character
+  reference — `U+65E5`
+  became the eight ASCII bytes `&#26085;` — and both narrow encoders only logged
+  a warning, so the server stored markup instead of text, one character counted
+  as eight against the column's declared length, and the application saw success.
+  The two Latin-1 fallbacks in the parameter serializer (no known collation, and
+  an LCID this crate does not map) already substituted `?` and keep doing so.
+
+  The single `?` matches msodbcsql, which converts with `WideCharToMultiByte` /
+  `iconv` and takes the code page's default character, and matches SQL Server's
+  own `CAST(N'…' AS varchar(n))`. One substitute byte per UTF-16 code unit, so
+  an astral character yields two, matching `WideCharToMultiByte` and SQL Server;
+  msodbcsql's glibc leg emits one byte instead, recorded as parity deviation 21.
+  As in msodbcsql, the substitution is not an error and is silent by default.
+
+  An application that needs to know can set the `SQL_COPT_SS_WARN_ON_CP_ERROR`
+  (1243) connection attribute to `SQL_WARN_YES`, which reports SQLSTATE `01000`
+  *"Warning: Code page translation caused loss of data"*. The call that carries
+  the diagnostic is the one that completes the parameter: `SQLExecute` /
+  `SQLExecDirect` return `SQL_SUCCESS_WITH_INFO` for a materialized value, while
+  a value streamed with `SQLPutData` leaves those returning `SQL_NEED_DATA` and
+  the warning arrives on the final `SQLParamData` — a diagnostic posted on the
+  `SQLPutData` that produced the loss would be cleared by the next call on the
+  handle. Values outside `SQL_WARN_NO` / `SQL_WARN_YES` are rejected with
+  `HY024`, as msodbcsql rejects them. It reports the conversion *this driver*
+  performs, using the collation the parameter carries (the connection's
+  negotiated database collation); the destination column is not known at that
+  point, so a column collated differently from the database can still lose
+  characters in the server's own conversion without this firing.
+
+  msodbcsql owns the attribute but consults it only on the retrieval direction
+  (output parameters and columns); this driver applies it to parameters, which
+  is where its own loss occurs — `SQL_C_CHAR` is UTF-8 here, so a fetch can
+  always represent whatever the server sent. Recorded as parity deviation 22,
+  alongside 21 for the best-fit mapping msodbcsql performs and this driver does
+  not.
+
+  Bulk copy shares the same encoder and substitutes on the same terms. Its
+  messages also carry the flag, so `TdsClient::take_code_page_conversion_loss`
+  reports a bulk substitution rather than silently answering `false`.
+
+  New `mssql_tds::datatypes::sql_string::NarrowEncoded` (returned by the now
+  loss-reporting `encode_narrow`) and `NARROW_SUBSTITUTE_BYTE` (the byte written
+  in place of an unrepresentable character; whether a substitution happened is
+  reported by `NarrowEncoded::had_loss` and the connection's loss flag, not by
+  inspecting the bytes, since a literal `?` is the same byte),
+  `TdsClient::take_code_page_conversion_loss` /
+  `note_code_page_conversion_loss`, and
+  `StreamingBulkLoadWriter::code_page_conversion_loss`.
+
+- `mssql-odbc`: NULL values returned through `SQLGetData`, bound columns, and
+  output parameters now leave character output buffers untouched instead of
+  writing a terminator. Applications should use the `SQL_NULL_DATA` indicator
+  to distinguish NULL from an empty string (#555).
+
+- `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced for the implemented
+  catalog functions (`SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
+  `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`),
+  `SQLGetTypeInfo` and `SQLDescribeParam`. These passed a hard-coded "no
+  timeout" to both their pre-execute steps and the RPC itself, so a configured
+  timeout bounded nothing — including the row reads on the result set they
+  open, because the budget is carried on the connection for the lifetime of the
+  batch. A blocked catalog query could therefore wait forever where msodbcsql
+  returns `HYT00`. msodbcsql runs these through `SQLExecDirectW`
+  (`sqlcdd.cpp:1866`, `:2239`) and `AutoFillIPD` (`sqlcdesc.cpp:9379`), all
+  applying the same statement timeout; the ODBC reference also documents
+  `HYT00` for every catalog function and `SQLGetTypeInfo`, naming this
+  attribute as its source. `0` (the ODBC default) still means unlimited.
+
+- `mssql-odbc`: the `APP` connection-string keyword is now sent as the TDS login
+  application name. It was recognized but ignored, so `APP_NAME()` reported the
+  default `TDSX Rust Client` value without warning that `APP` had been dropped.
+
+- `mssql-tds`: LOGIN7 record sizing now includes the optional change-password
+  value, preventing a caller-supplied value from making the declared packet
+  length shorter than the serialized payload.
+
 - `mssql-tds`: idle connection resiliency (transparent session recovery) now
   works end to end. The client-side gate that authorizes a reconnect is now set
   from the server's `FEATUREEXTACK` acknowledgment — previously it was only ever
@@ -129,3 +342,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   payload nor terminates a message — but was previously consumed as a
   zero-length packet. Empty end-of-message packets remain legal.
 
+- `mssql-odbc`: a data-at-execution (`SQLPutData`) character parameter whose C
+  type and declared SQL type disagreed on wideness — most commonly
+  `SQL_C_WCHAR` streamed against a narrow `SQL_VARCHAR`/`SQL_LONGVARCHAR`,
+  which is how mssql-python binds every ASCII string parameter once it exceeds
+  the ~4000-character inline threshold — was rejected outright with `HYC00`
+  ("Parameter conversion not yet implemented") instead of being bound.
+  `SQLPutData` cannot transcode a chunk in isolation, since a multi-byte
+  character can straddle two calls, so such a parameter's chunks are now
+  buffered instead of streamed untranscoded, and the complete value is
+  transcoded once, as a whole, when `SQLParamData` closes it.
+
+- `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced (AB#46385). Previously
+  it was stored and reported back but silently ignored by `SQLExecute` and
+  `SQLExecDirectW`, so a statement blocked server-side (e.g. behind another
+  session's row lock) had no client-side escape hatch and could wait
+  indefinitely even with a timeout configured. A non-zero value now bounds the
+  wait — including the implicit transaction begin and deferred `sp_unprepare`
+  that can run ahead of the statement itself — and on expiry the driver sends
+  `ATTENTION` and reports `HYT00`, matching msodbcsql. `0` (the ODBC default)
+  remains unlimited. Motivated by issue #439, though that report's own
+  reproduction never sets `SQL_ATTR_QUERY_TIMEOUT` and so is not itself
+  resolved by this change; see the issue for the still-open live-server
+  investigation.
+
+- `mssql-tds`: TCP connect no longer resolves the server hostname with the
+  blocking `std::net::ToSocketAddrs`. That call never yields to the async
+  runtime, so a slow or unresponsive resolver silently escaped the
+  `ConnectTimeout`/`LoginTimeout` deadline that wraps the rest of the connect
+  sequence — on `mssql-odbc`, whose `SQLDriverConnectW` drives this via
+  `block_on` on the calling thread, this could hang the caller (and, since
+  ODBC is a blocking API, the whole calling process) indefinitely instead of
+  failing within the configured timeout. Resolution now goes through
+  `tokio::net::lookup_host`, the same async primitive already used for SSRP
+  instance lookups, so it is a genuine, cancellable `.await` point instead of
+  a blocking one. `parallel_connect` (`MultiSubnetFailover`) now also folds
+  DNS resolution into the single overall deadline its `timeout_ms` already
+  documents, instead of only timing the connection race that follows it, and
+  idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
+  full connect (DNS through login) in the attempt's remaining budget instead
+  of only capping the post-resolution TCP connect step.

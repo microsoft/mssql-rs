@@ -26,11 +26,13 @@ cd ..
 if [ "$BUILD_TYPE" = "Debug" ] || [ "$BUILD_TYPE" = "Both" ]; then
   echo '==> Building debug...'
   cargo build --frozen
+  bash mssql-odbc/scripts/finalize-artifact.sh debug
 fi
 
 if [ "$BUILD_TYPE" = "Release" ] || [ "$BUILD_TYPE" = "Both" ]; then
   echo '==> Building release...'
   cargo build --frozen --release
+  bash mssql-odbc/scripts/finalize-artifact.sh release
 fi
 
 # Archive nextest (used by later test stages)
@@ -46,5 +48,6 @@ if [ "$IS_PR_BUILD" = "true" ]; then
   rustup toolchain install nightly --profile minimal
   echo '==> Checking fuzz targets compile...'
   RUSTFLAGS="--cfg fuzzing" cargo +nightly check --manifest-path mssql-tds/fuzz/Cargo.toml
+  RUSTFLAGS="--cfg fuzzing" cargo +nightly check --manifest-path mssql-odbc/fuzz/Cargo.toml
   echo '==> Fuzz build check passed.'
 fi

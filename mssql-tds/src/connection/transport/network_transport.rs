@@ -1,17 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::dns_cache::{self, Resolution};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
-use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
-use crate::connection::transport::request_timeout::await_within_request_timeout;
+use crate::connection::transport::parallel_connect::{
+    ParallelConnectConfig, parallel_connect_resolving,
+};
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
 };
+use crate::datatypes::column_values::ColumnValues;
+use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream};
 use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
@@ -20,25 +26,151 @@ use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
-    TdsTokenStreamReader, read_active_plp_bytes_internal, receive_row_header_internal,
-    receive_row_into_internal, receive_token_internal, resume_row_into_internal,
+    TdsTokenStreamReader, log_received_token, read_active_plp_bytes_internal,
+    receive_row_header_internal, receive_row_into_internal, receive_token_internal,
+    resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
-use crate::message::messages::{PacketStatusFlags, Request, ResetConnectionMode};
-use crate::token::tokens::{DoneStatus, Tokens};
+use crate::message::messages::{PacketStatusFlags, PacketType, Request, ResetConnectionMode};
+use crate::token::data_classification::DataClassificationVersion;
+use crate::token::tokens::{ColMetadataToken, DoneStatus, TokenType, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::cmp::min;
+use std::future::{Future, poll_fn};
 use std::io::Error;
 use std::io::ErrorKind;
-use std::net::ToSocketAddrs;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{self, TcpStream};
-use tokio::time::timeout;
-use tracing::{debug, error, event, info, trace};
+use tokio::time::{Instant, timeout, timeout_at};
+use tracing::{debug, error, event, info, trace, warn};
+
+/// Result of attempting to fully decode a buffered PLP column in one call.
+///
+/// Outer `None` means not enough bytes were buffered yet to complete the attempt (retry once
+/// more data arrives). `Some(None)` means the column is SQL NULL. `Some(Some((written,
+/// known_total, total_read)))` means the value was decoded: `written` is the payload bytes
+/// copied into the caller's output buffer this call, `known_total` is the value's declared
+/// length from the PLP header when the server sent a known length (`None` for unknown-length
+/// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
+type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
+
+const MAX_ATTENTION_SETTLEMENT_TOKENS: usize = 1024;
+
+/// Client-visible control tokens consumed while draining to DONE_ATTN.
+///
+/// The transport has to consume these tokens to realign the wire, but the
+/// client still needs them to update transaction, environment, and recovery
+/// state before the connection can be reused.
+#[derive(Debug, Default)]
+pub(crate) struct AttentionSettlement {
+    /// Ordered control tokens to replay through `TdsClient` state handling.
+    pub(crate) tokens: Vec<Tokens>,
+    /// The drain completed, but not all state could be retained safely.
+    pub(crate) overflowed: bool,
+}
+
+impl AttentionSettlement {
+    fn push(&mut self, token: Tokens) {
+        if self.tokens.len() < MAX_ATTENTION_SETTLEMENT_TOKENS {
+            self.tokens.push(token);
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    pub(crate) fn retained_token_count(&self) -> usize {
+        self.tokens.len()
+    }
+}
+
+/// Records why a pending parser read stopped before producing its result.
+///
+/// Keeping this separate from the parser future lets cleanup finish first while
+/// still returning the original cancellation or timeout to the caller.
+enum ReadInterruption {
+    /// The operation's cancellation token fired.
+    Cancelled,
+    /// The remaining request-timeout budget elapsed.
+    TimedOut(tokio::time::error::Elapsed),
+}
+
+/// Separates an ordinary read result from an interrupted read's settlement state.
+///
+/// On interruption the original parser is driven to a typed boundary rather
+/// than dropped mid-token, which preserves enough state to drain to DONE_ATTN.
+enum InterruptibleRead<T> {
+    /// The parser completed before cancellation or timeout won.
+    Completed(TdsResult<T>),
+    /// The caller-visible error plus any result reached while settling the parser.
+    Interrupted {
+        error: Box<crate::error::Error>,
+        boundary: Option<(Instant, TdsResult<T>)>,
+    },
+}
+
+impl ReadInterruption {
+    /// Converts the internal arbitration result into the error returned after cleanup.
+    fn into_error(self) -> crate::error::Error {
+        match self {
+            Self::Cancelled => OperationCancelledError("Request was cancelled".to_string()),
+            Self::TimedOut(elapsed) => TimeoutError(TimeoutErrorType::Elapsed(elapsed)),
+        }
+    }
+}
+
+/// Waits for a pinned parser while preserving it when cancellation or timeout wins.
+///
+/// Returning the interruption separately is necessary because callers must keep
+/// polling this same future to a safe boundary before they can drain ATTENTION.
+/// A non-cancelled read is polled once before constructing its timeout so
+/// buffered rows avoid both the timer setup and moving a large parser future
+/// into `Timeout`. This retains Tokio's zero-budget behavior: a ready read wins
+/// immediately, while a read that suspends observes the elapsed timer.
+async fn await_read_or_interrupt<F, T>(
+    mut read: Pin<&mut F>,
+    remaining_request_timeout: Option<Duration>,
+    cancel_handle: Option<&CancelHandle>,
+) -> Result<TdsResult<T>, ReadInterruption>
+where
+    F: Future<Output = TdsResult<T>>,
+{
+    if cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+        return Err(ReadInterruption::Cancelled);
+    }
+
+    let first = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+    if let Poll::Ready(result) = first {
+        return Ok(result);
+    }
+
+    let timed_read = async {
+        match remaining_request_timeout {
+            Some(remaining) => match timeout(remaining, read.as_mut()).await {
+                Ok(result) => Ok(result),
+                Err(elapsed) => Err(ReadInterruption::TimedOut(elapsed)),
+            },
+            None => Ok(read.await),
+        }
+    };
+
+    match cancel_handle {
+        Some(handle) => {
+            tokio::select! {
+                biased;
+                _ = handle.cancel_token.cancelled() => Err(ReadInterruption::Cancelled),
+                result = timed_read => result,
+            }
+        }
+        None => timed_read.await,
+    }
+}
 
 #[cfg(windows)]
 use crate::connection::transport::localdb::resolve_localdb_instance;
@@ -49,7 +181,8 @@ pub(crate) const PRE_NEGOTIATED_PACKET_SIZE: u32 = 4096;
 
 /// Creates a base stream for the specified transport context.
 /// This function handles the transport-specific connection logic (TCP, Named Pipe, Shared Memory)
-/// and returns a boxed Stream that can be used with any TDS version.
+/// and returns a boxed Stream that can be used with any TDS version, along with
+/// what a TCP host resolved to for the login's DNS caching verdict.
 ///
 /// # Arguments
 ///
@@ -66,10 +199,10 @@ async fn create_base_stream(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Option<Resolution>)> {
     match transport_context {
         TransportContext::Tcp { host, port, .. } => {
-            if multi_subnet_failover {
+            let (stream, resolution) = if multi_subnet_failover {
                 // Use parallel connection mode for MultiSubnetFailover
                 create_base_stream_parallel(
                     host,
@@ -78,7 +211,7 @@ async fn create_base_stream(
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
                 )
-                .await
+                .await?
             } else {
                 // Use sequential connection mode (original behavior)
                 create_base_stream_sequential(
@@ -89,8 +222,9 @@ async fn create_base_stream(
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
                 )
-                .await
-            }
+                .await?
+            };
+            Ok((stream, Some(resolution)))
         }
         #[cfg(windows)]
         TransportContext::NamedPipe { pipe_name } => {
@@ -107,7 +241,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(pipe_name).await?;
 
             info!("Connected to Named Pipe: {}", pipe_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
         #[cfg(not(windows))]
         TransportContext::NamedPipe { .. } => Err(crate::error::Error::from(std::io::Error::new(
@@ -150,7 +284,7 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
 
             info!("Connected to Shared Memory (LPC-over-NP): {}", pipe_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
         }
         #[cfg(not(windows))]
         TransportContext::SharedMemory { .. } => {
@@ -183,7 +317,31 @@ async fn create_base_stream(
             let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
 
             info!("Connected to LocalDB instance: {}", instance_name);
-            Ok(Box::new(pipe_client))
+            Ok((Box::new(pipe_client), None))
+        }
+    }
+}
+
+/// Stably sorts resolved addresses per `ipaddress_preference`, keeping the
+/// resolver's original relative order within each address family.
+fn sort_by_ip_preference(
+    socket_addresses: &mut [SocketAddr],
+    ipaddress_preference: IPAddressPreference,
+) {
+    match ipaddress_preference {
+        IPAddressPreference::UsePlatformDefault => {
+            // Do nothing. Use whatever the OS returns.
+            trace!("Using platform default IP address preference");
+        }
+        IPAddressPreference::IPv4First => {
+            // Sort IPv4 addresses first
+            socket_addresses.sort_by_key(|a| a.is_ipv6());
+            trace!("IPv4 addresses first");
+        }
+        IPAddressPreference::IPv6First => {
+            // Sort IPv6 addresses first
+            socket_addresses.sort_by_key(|b| std::cmp::Reverse(b.is_ipv6()));
+            trace!("IPv6 addresses first");
         }
     }
 }
@@ -197,43 +355,26 @@ async fn create_base_stream_sequential(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Resolution)> {
     info!(
         "Connecting to TCP transport (sequential): {}:{}",
         host, port
     );
 
-    // This will cause the DNS resolution of the addresses.
-    let mut socket_addresses = (host, port).to_socket_addrs()?;
+    // This will cause the DNS resolution of the addresses. `lookup_host` (unlike
+    // `std::net::ToSocketAddrs::to_socket_addrs`) awaits the resolution instead of
+    // blocking the calling thread, so a slow or stuck resolver stays subject to the
+    // `timeout()`/deadline machinery in the retry loop above this call instead of
+    // silently escaping it. A failed resolution falls back to the DNS cache.
+    let resolution = dns_cache::lookup_host(host, port).await?;
+    // Sorted as a copy, so the cache keeps the resolver's order.
+    let mut socket_addresses = resolution.addresses().to_vec();
 
-    let mut last_error = None;
-    let mut tcp_stream = None;
-
-    // Sort the address list based on the IP address preference
-    match ipaddress_preference {
-        IPAddressPreference::UsePlatformDefault => {
-            // Do nothing. Use whatever the OS returns.
-            trace!("Using platform default IP address preference");
-        }
-        IPAddressPreference::IPv4First => {
-            let mut addresses: Vec<_> = socket_addresses.collect();
-            // Sort IPv4 addresses first
-            addresses.sort_by_key(|a| a.is_ipv6());
-            socket_addresses = addresses.into_iter();
-            trace!("IPv4 addresses first");
-        }
-        IPAddressPreference::IPv6First => {
-            let mut addresses: Vec<_> = socket_addresses.collect();
-            // Sort IPv6 addresses first
-            addresses.sort_by_key(|b| std::cmp::Reverse(b.is_ipv6()));
-            socket_addresses = addresses.into_iter();
-            trace!("IPv6 addresses first");
-        }
-    }
+    sort_by_ip_preference(&mut socket_addresses, ipaddress_preference);
 
     info!("Socket addresses: {:?}", socket_addresses);
 
-    for socket_address in socket_addresses {
+    let stream = sequential_connect_with(&socket_addresses, connect_timeout_ms, |socket_address| {
         let socket = if socket_address.is_ipv6() {
             net::TcpSocket::new_v6()?
         } else {
@@ -250,45 +391,43 @@ async fn create_base_stream_sequential(
         socket2_socket.set_tcp_keepalive(&keep_alive_settings)?;
         socket2_socket.set_nodelay(true)?;
 
-        // Apply connection timeout to each connection attempt
-        let connect_future = socket.connect(socket_address);
-        tcp_stream = match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await
-        {
-            Ok(Ok(stream)) => {
-                info!("Connected to TCP transport: {}:{}", host, port);
-                Some(stream)
-            }
-            Ok(Err(e)) => {
-                last_error = Some(e);
-                None
-            }
+        Ok(socket.connect(socket_address))
+    })
+    .await?;
+    info!("Connected to TCP transport: {}:{}", host, port);
+    Ok((Box::new(stream), resolution))
+}
+
+async fn sequential_connect_with<C, F>(
+    addresses: &[SocketAddr],
+    connect_timeout_ms: u64,
+    connect: C,
+) -> std::io::Result<TcpStream>
+where
+    C: Fn(SocketAddr) -> std::io::Result<F>,
+    F: Future<Output = std::io::Result<TcpStream>>,
+{
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "No addresses provided for sequential connection",
+    );
+    for &address in addresses {
+        let connect_future = connect(address)?;
+        match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last_error = error,
             Err(_elapsed) => {
-                last_error = Some(std::io::Error::new(
+                last_error = std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
                         "Connection to {} timed out after {}ms",
-                        socket_address, connect_timeout_ms
+                        address, connect_timeout_ms
                     ),
-                ));
-                None
+                );
             }
-        };
-        if tcp_stream.is_some() {
-            break;
         }
     }
-
-    // We don't have a valid TCP stream, so we need to return the last error.
-    if let Some(stream) = tcp_stream {
-        Ok(Box::new(stream))
-    } else {
-        Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("Failed to connect to {host}:{port}"),
-            )
-        })))
-    }
+    Err(last_error)
 }
 
 /// Creates a TCP stream using parallel connection mode (MultiSubnetFailover).
@@ -300,7 +439,7 @@ async fn create_base_stream_parallel(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
-) -> TdsResult<Box<dyn Stream>> {
+) -> TdsResult<(Box<dyn Stream>, Resolution)> {
     info!(
         "Connecting to TCP transport (parallel/MultiSubnetFailover): {}:{}",
         host, port
@@ -312,14 +451,14 @@ async fn create_base_stream_parallel(
         keep_alive_interval_in_ms,
     };
 
-    let result = parallel_connect(host, port, &config).await?;
+    let (result, resolution) = parallel_connect_resolving(host, port, &config).await?;
 
     info!(
         "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
         result.connected_address, result.total_addresses, result.failed_attempts
     );
 
-    Ok(Box::new(result.stream))
+    Ok((Box::new(result.stream), resolution))
 }
 
 /// Creates a NetworkTransport configured for the specified TDS version.
@@ -372,7 +511,8 @@ async fn create_transport_for_version(
     }
 }
 
-/// Creates a network transport for the specified parameters.
+/// Creates a network transport for the specified parameters, along with what a
+/// TCP host resolved to, which the login's DNS caching verdict applies to.
 ///
 /// # Arguments
 ///
@@ -394,11 +534,11 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
-) -> TdsResult<NetworkTransport> {
+) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
     let encryption_mode = encryption_options.mode;
 
     // Step 1: Create the base stream (transport-specific)
-    let stream = create_base_stream(
+    let (stream, resolution) = create_base_stream(
         ipaddress_preference,
         transport_context,
         keep_alive_in_ms,
@@ -409,14 +549,15 @@ pub(crate) async fn create_transport(
     .await?;
 
     // Step 2: Apply TDS version-specific wrapping (uniform for all transports)
-    create_transport_for_version(
+    let transport = create_transport_for_version(
         stream,
         tds_version,
         transport_context,
         encryption_options,
         encryption_mode,
     )
-    .await
+    .await?;
+    Ok((transport, resolution))
 }
 
 /// SSL/TLS lifecycle callbacks for a transport.
@@ -502,10 +643,218 @@ impl Stream for Box<dyn Stream> {
     }
 }
 
+/// Cloneable access to one network stream with a lock held only for each poll.
+///
+/// A parser future mutably borrows `NetworkTransport`. The clone lets ATTENTION
+/// be written while that future remains alive, without concurrently polling the
+/// underlying stream or abandoning parser state.
+#[derive(Clone)]
+struct SharedStream {
+    inner: Arc<Mutex<Box<dyn Stream>>>,
+}
+
+impl SharedStream {
+    /// Wraps a transport stream so a pending parser and ATTENTION sender can share it.
+    fn new(stream: Box<dyn Stream>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(stream)),
+        }
+    }
+
+    /// Borrows the underlying stream for one synchronous operation or poll.
+    fn lock(&self) -> MutexGuard<'_, Box<dyn Stream>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Recovers exclusive stream ownership for TLS replacement.
+    ///
+    /// Extraction fails while another clone exists because that means an I/O
+    /// operation may still refer to the old stream.
+    fn into_inner(self) -> TdsResult<Box<dyn Stream>> {
+        Arc::try_unwrap(self.inner)
+            .map_err(|_| {
+                crate::error::Error::ImplementationError(
+                    "Cannot replace a network stream while an I/O operation still holds it"
+                        .to_string(),
+                )
+            })?
+            .into_inner()
+            .map_err(|error| {
+                crate::error::Error::ImplementationError(format!(
+                    "Cannot replace a poisoned network stream: {error}"
+                ))
+            })
+    }
+}
+
+impl AsyncRead for SharedStream {
+    /// Delegates one read poll, releasing the lock on `Pending` so ATTENTION can write.
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.lock()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SharedStream {
+    /// Serializes one write poll with reads on the same physical stream.
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut **self.lock()).poll_write(cx, buf)
+    }
+
+    /// Forwards flushing so the shared wrapper remains transparent to packet writes.
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.lock()).poll_flush(cx)
+    }
+
+    /// Forwards shutdown so closing the wrapper closes the physical stream.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.lock()).poll_shutdown(cx)
+    }
+}
+
+impl Stream for SharedStream {
+    /// Preserves the wrapped stream's TLS handshake transition.
+    fn tls_handshake_starting(&mut self) {
+        self.lock().tls_handshake_starting();
+    }
+
+    /// Preserves the wrapped stream's post-handshake transition.
+    fn tls_handshake_completed(&mut self) {
+        self.lock().tls_handshake_completed();
+    }
+
+    /// Delegates liveness probing to the physical stream.
+    fn is_connection_dead(&self) -> bool {
+        self.lock().is_connection_dead()
+    }
+
+    /// Exposes the physical stream's TLS channel binding for authentication.
+    fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        self.lock().channel_binding_token()
+    }
+}
+
+/// Writes the header-only TDS ATTENTION message through a cloned stream handle.
+///
+/// Keeping this independent of `NetworkTransport` allows it to run while the
+/// interrupted parser future still borrows the transport. It deliberately
+/// bypasses request reset bookkeeping: ATTENTION terminates a request already
+/// on the wire and must not consume a reset intended for the next request.
+async fn send_attention_packet(mut stream: SharedStream) -> TdsResult<()> {
+    let mut packet = Vec::with_capacity(PacketWriter::PACKET_HEADER_SIZE);
+    PacketWriter::build_header(
+        &mut packet,
+        PacketWriter::PACKET_HEADER_SIZE,
+        PacketType::Attention,
+        1,
+        true,
+        false,
+        ResetConnectionMode::None,
+    )?;
+    stream.write_all(&packet).await?;
+    Ok(())
+}
+
+/// Sends ATTENTION and drives the same parser future to its next typed boundary.
+///
+/// Both steps share one deadline so neither a blocked write nor an incomplete
+/// token can make cancellation hang indefinitely.
+async fn send_attention_and_complete_read<F, T>(
+    stream: SharedStream,
+    deadline: Instant,
+    read: Pin<&mut F>,
+) -> TdsResult<T>
+where
+    F: Future<Output = TdsResult<T>>,
+{
+    timeout_at(deadline, send_attention_packet(stream))
+        .await
+        .map_err(|_| {
+            TimeoutError(TimeoutErrorType::String(
+                "Timed out sending the attention packet".to_string(),
+            ))
+        })??;
+
+    timeout_at(deadline, read).await.map_err(|_| {
+        TimeoutError(TimeoutErrorType::String(
+            "Timed out finishing the in-flight token after attention".to_string(),
+        ))
+    })?
+}
+
+/// Runs a parser read and, when interrupted, preserves it through resynchronization.
+///
+/// The normal path stays allocation-free. Cancellation and timeout use a boxed
+/// cold path to send ATTENTION, finish the in-flight token, and return both the
+/// original error and the boundary result needed by the drain.
+async fn read_to_attention_boundary<F, T>(
+    mut read: Pin<&mut F>,
+    remaining_request_timeout: Option<Duration>,
+    cancel_handle: Option<&CancelHandle>,
+    attention_stream: Option<SharedStream>,
+    already_dead: bool,
+) -> InterruptibleRead<T>
+where
+    F: Future<Output = TdsResult<T>>,
+{
+    let interruption = match await_read_or_interrupt(
+        read.as_mut(),
+        remaining_request_timeout,
+        cancel_handle,
+    )
+    .await
+    {
+        Ok(result) => return InterruptibleRead::Completed(result),
+        Err(interruption) => interruption,
+    };
+    let error = Box::new(interruption.into_error());
+    let boundary = if already_dead {
+        None
+    } else {
+        attention_stream.map(|stream| {
+            let timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+            let deadline = cancel_handle.map_or_else(
+                || Instant::now() + timeout,
+                |handle| handle.settlement_deadline(timeout),
+            );
+            (deadline, stream)
+        })
+    };
+    let boundary = match boundary {
+        Some((deadline, stream)) => Some((
+            deadline,
+            // Keep cold-path settlement state out of every row-read future.
+            Box::pin(send_attention_and_complete_read(stream, deadline, read)).await,
+        )),
+        None => None,
+    };
+    InterruptibleRead::Interrupted { error, boundary }
+}
+
+/// Mutable row-decoding state used while discarding a cancelled response.
+///
+/// Metadata can change between queued result sets, and row tokens are not
+/// self-describing, so the drain must track the active shape until DONE_ATTN.
+struct AttentionDrainContext {
+    /// Metadata required to skip ROW and NBCROW payloads.
+    metadata: Option<Arc<ColMetadataToken>>,
+    /// Whether newly encountered metadata may contain encrypted-column fields.
+    column_encryption_supported: bool,
+}
+
 pub(crate) struct NetworkTransport {
     encryption: Option<NegotiatedEncryptionSetting>,
     packet_size: u32,
-    stream: Option<Box<dyn Stream>>,
+    stream: Option<SharedStream>,
     ssl_handler: SslHandler,
     encryption_setting: EncryptionSetting,
     tds_read_buffer: TdsReadBuffer,
@@ -516,6 +865,11 @@ pub(crate) struct NetworkTransport {
     /// Pending connection-reset request to apply to the next SQL Batch, RPC, or
     /// Transaction Manager request. Consumed by the packet writer.
     pending_reset: ResetConnectionMode,
+    /// Set once the packet writer has put a header carrying `pending_reset` on
+    /// the wire. `TdsClient` takes it to learn that the server now owes a
+    /// `ResetConnection` ENVCHANGE, which is what makes the acknowledgement
+    /// verifiable.
+    reset_dispatched: bool,
     /// Cached liveness status. Set to `true` once the connection is explicitly
     /// closed or an I/O operation observes it broken. Surfaced by
     /// `connection_known_dead()` as a cheap, socket-free liveness check.
@@ -524,6 +878,11 @@ pub(crate) struct NetworkTransport {
     /// NBCROW row of a result set instead of reallocating per row; see
     /// `read_nbc_bitmap`.
     nbc_bitmap_scratch: Option<Arc<[u8]>>,
+    column_encryption_supported: bool,
+    /// Data Classification version from login, used to parse `0xA3` tokens.
+    data_classification_version: Option<DataClassificationVersion>,
+    /// Tokens drained by the transport but still needed by client state handling.
+    attention_settlement: Option<Box<AttentionSettlement>>,
 }
 
 impl std::fmt::Debug for NetworkTransport {
@@ -545,6 +904,7 @@ impl NetworkReaderWriter for NetworkTransport {
 
     fn notify_session_setting_change(&mut self, setting: &SessionSettings) {
         self.packet_size = setting.packet_size;
+        self.data_classification_version = setting.data_classification_version();
         // Note: The read buffer's max_packet_size is updated in reset_reader(),
         // which is called before each command execution. This ensures the buffer
         // is properly sized when we start reading the server's response.
@@ -590,10 +950,21 @@ impl NetworkWriter for NetworkTransport {
 
     fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
         self.pending_reset = mode;
+        // A newly armed reset supersedes any earlier one, so the record of a
+        // previous dispatch must not be attributed to it.
+        self.reset_dispatched = false;
     }
 
     fn take_reset_mode(&mut self) -> ResetConnectionMode {
         std::mem::replace(&mut self.pending_reset, ResetConnectionMode::None)
+    }
+
+    fn note_reset_dispatched(&mut self) {
+        self.reset_dispatched = true;
+    }
+
+    fn take_reset_dispatched(&mut self) -> bool {
+        std::mem::replace(&mut self.reset_dispatched, false)
     }
 
     fn channel_binding_token(&self) -> Option<Vec<u8>> {
@@ -615,7 +986,7 @@ impl NetworkTransport {
     ) -> Self {
         Self {
             encryption: None,
-            stream: Some(stream),
+            stream: Some(SharedStream::new(stream)),
             ssl_handler,
             packet_size,
             encryption_setting,
@@ -623,8 +994,12 @@ impl NetworkTransport {
             use_tds74_tls_wrapping,
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
+            reset_dispatched: false,
             known_dead: false,
             nbc_bitmap_scratch: None,
+            column_encryption_supported: false,
+            data_classification_version: None,
+            attention_settlement: None,
         }
     }
 
@@ -636,9 +1011,20 @@ impl NetworkTransport {
         self.encryption = Some(encryption);
     }
 
+    /// Takes the last successful drain's control tokens for one-time client replay.
+    pub(crate) fn take_attention_settlement(&mut self) -> Option<AttentionSettlement> {
+        self.attention_settlement
+            .take()
+            .map(|settlement| *settlement)
+    }
+
     async fn enable_ssl_internal(&mut self) -> TdsResult<()> {
         // Take ownership of the stream temporarily
-        let base_stream = self.stream.take().expect("Stream already taken");
+        let base_stream = self
+            .stream
+            .take()
+            .expect("Stream already taken")
+            .into_inner()?;
 
         // For TDS 7.4, wrap the stream in TlsOverTdsStream before TLS handshake
         // This is required because TLS packets must be framed within TDS packets during the handshake
@@ -682,17 +1068,21 @@ impl NetworkTransport {
             .await?;
 
         // Put back the encrypted stream
-        self.stream = Some(encrypted_stream);
+        self.stream = Some(SharedStream::new(encrypted_stream));
         Ok(())
     }
 
     async fn disable_ssl_internal(&mut self) -> TdsResult<()> {
         // Take the current encrypted TLS stream
-        let encrypted_stream = self.stream.take().ok_or_else(|| {
-            crate::error::Error::ImplementationError(
-                "disable_ssl called but stream is not available".to_string(),
-            )
-        })?;
+        let encrypted_stream = self
+            .stream
+            .take()
+            .ok_or_else(|| {
+                crate::error::Error::ImplementationError(
+                    "disable_ssl called but stream is not available".to_string(),
+                )
+            })?
+            .into_inner()?;
 
         // Extract the underlying stream from the ExtractableStream wrapper.
         // We use mem::forget on the TLS stream to avoid sending TLS close_notify,
@@ -725,7 +1115,7 @@ impl NetworkTransport {
             })?;
 
         info!("Successfully disabled TLS, reverting to unencrypted stream");
-        self.stream = Some(base_stream);
+        self.stream = Some(SharedStream::new(base_stream));
         Ok(())
     }
 
@@ -742,8 +1132,125 @@ impl NetworkTransport {
         Ok(())
     }
 
+    /// How many consecutive payload-free end-of-message packets a bulk read
+    /// tolerates before giving up.
+    ///
+    /// One is legitimate: a read that begins exactly at a message boundary
+    /// consumes the empty packet terminating the *previous* message before its
+    /// own data arrives. A second in a row means the peer emitted two empty
+    /// messages back to back, so nothing advanced between iterations and the
+    /// loop would spin until the command timeout.
+    const MAX_CONSECUTIVE_EMPTY_MESSAGES: u32 = 1;
+
+    /// Error for a bulk read that kept receiving empty messages without
+    /// advancing.
+    #[cold]
+    fn stalled_on_empty_messages_error(outstanding: usize) -> crate::error::Error {
+        crate::error::Error::ProtocolError(format!(
+            "TDS read stalled: {outstanding} more byte(s) required but the peer sent {} \
+             consecutive payload-free end-of-message packets without advancing.",
+            Self::MAX_CONSECUTIVE_EMPTY_MESSAGES + 1
+        ))
+    }
+
+    /// Error for a bulk read that needed more bytes but got a packet carrying
+    /// none.
+    ///
+    /// Unreachable as the framing layer stands today, and deliberately kept.
+    /// [`get_new_tds_packet`](Self::get_new_tds_packet) rejects a payload-free
+    /// packet unless it is end-of-message, so every successful refill leaves
+    /// either payload in the buffer or `end_of_message` set. In all three bulk
+    /// loops `to_read == 0` means the buffer is empty, which means the refill
+    /// framed a payload-free packet, which therefore means the message ended —
+    /// and that case is handled by the two branches below this one.
+    ///
+    /// It stays as a guard on that invariant. If the framing layer ever
+    /// tolerates a payload-free non-EOM packet, the loop would re-enter the
+    /// refill with the same unmet demand and block on the socket forever, which
+    /// is the hang this whole rule exists to prevent. Failing loudly is the
+    /// right answer if that day comes; the alternative is a silent infinite
+    /// loop. It is also the one branch here with no scalar counterpart, so were
+    /// it reachable the two reader families would genuinely disagree — bulk
+    /// would error where scalar hangs.
+    #[cold]
+    fn no_progress_error(outstanding: usize) -> crate::error::Error {
+        crate::error::Error::ProtocolError(format!(
+            "TDS read made no progress: {outstanding} more byte(s) required but the packet \
+             carried no payload. The value extends past the end of the message."
+        ))
+    }
+
+    /// True when the request for `needed` bytes cannot possibly be satisfied.
+    ///
+    /// The terminating packet of the current message has already been framed,
+    /// so the buffer holds every byte the server is going to send until the
+    /// client issues a new request. If the caller wants more than what remains,
+    /// waiting is futile — the refill would block on a socket that stays silent.
+    fn message_cannot_satisfy(&self, needed: usize) -> bool {
+        self.tds_read_buffer.end_of_message
+            && needed > self.tds_read_buffer.get_remaining_byte_count()
+    }
+
+    /// True when a read that is already partway through a value cannot be
+    /// completed, because the message it is being read from has ended.
+    ///
+    /// `consumed_any` reports whether the caller has already copied bytes of
+    /// this value out of the buffer; bytes still sitting in the buffer count
+    /// too. Either way the value has started, so the remainder can only arrive
+    /// in the current message — and that message is over.
+    ///
+    /// A read that begins *exactly* at a boundary is deliberately not caught.
+    /// The transport cannot tell a caller starting the next message apart from
+    /// one over-reading the last, and both handshake and attention paths
+    /// legitimately do the former: the login exchange is multi-leg, and the
+    /// DONE carrying ATTN arrives in a message of its own. Distinguishing them
+    /// needs a layer that knows whether another message is expected, which the
+    /// transport is not. See the note in `refill_for`.
+    fn value_truncated_by_message_end(&self, consumed_any: bool, needed: usize) -> bool {
+        (consumed_any || self.tds_read_buffer.get_remaining_byte_count() > 0)
+            && self.message_cannot_satisfy(needed)
+    }
+
+    /// Error for a read that extends past the end of the current message.
+    #[cold]
+    fn past_end_of_message_error(outstanding: usize, available: usize) -> crate::error::Error {
+        crate::error::Error::ProtocolError(format!(
+            "TDS read extends past the end of the message: {outstanding} more byte(s) required \
+             but only {available} remain in the final packet of the message."
+        ))
+    }
+
+    /// Refills the read buffer for a scalar read that still needs `needed`
+    /// bytes, failing if the value is truncated by the end of the message.
+    ///
+    /// Every reader loops until the buffer holds enough bytes. When part of a
+    /// value sits in the final packet of a message the rest can never arrive —
+    /// the server sends nothing further until the client issues a new request —
+    /// so the loop would go back to the socket forever instead of failing.
+    ///
+    /// The bulk loops apply the identical rule through
+    /// [`Self::value_truncated_by_message_end`], so the two families agree on
+    /// every input. That agreement leans on the framing invariant described on
+    /// [`Self::no_progress_error`]: the extra branch the bulk loops carry, and
+    /// the scalar readers do not, cannot fire while framing rejects
+    /// payload-free non-EOM packets.
+    ///
+    /// Known gap: a read that begins exactly at a message boundary is still
+    /// allowed through, so it can block if the server has nothing more to send.
+    /// Catching that needs the caller to say whether another message is
+    /// expected — the handshake and attention paths cross boundaries here on
+    /// purpose — which is a layer above this one.
+    async fn refill_for(&mut self, needed: usize) -> TdsResult<()> {
+        if self.value_truncated_by_message_end(false, needed) {
+            return Err(Self::past_end_of_message_error(
+                needed,
+                self.tds_read_buffer.get_remaining_byte_count(),
+            ));
+        }
+        self.read_tds_packet().await
+    }
+
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
-        // let remaining_bytes = self.buffer_length - self.buffer_position;
         let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
         if remaining_bytes > 0 {
             // Move the remaining bytes to the beginning of the buffer.
@@ -758,6 +1265,40 @@ impl NetworkTransport {
                 .remove_header_from_packet(new_packet_size);
         }
         Ok(())
+    }
+
+    /// Non-blocking attempt to append one more complete TDS packet to the working buffer.
+    ///
+    /// Returns `Ok(true)` when a new packet was read and finalized synchronously (via
+    /// `try_get_new_tds_packet`'s no-op-waker poll). Returns `Ok(false)` when there is
+    /// nothing more to read right now: either the buffer already reached end-of-message, or
+    /// another maximum-sized packet cannot fit beside the unconsumed bytes, or the underlying
+    /// poll reported `Poll::Pending`. Callers must treat `Ok(false)` as "not ready", not as an
+    /// error or true end-of-data.
+    fn try_read_tds_packet(&mut self) -> TdsResult<bool> {
+        if self.tds_read_buffer.end_of_message {
+            return Ok(false);
+        }
+
+        let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
+        // The async reader consumes this remainder while refilling; the
+        // synchronous probe cannot, so defer before another packet could overflow.
+        if remaining_bytes.saturating_add(self.tds_read_buffer.max_packet_size)
+            > self.tds_read_buffer.working_buffer.len()
+        {
+            return Ok(false);
+        }
+        if remaining_bytes > 0 {
+            self.tds_read_buffer.shift_data_to_front();
+        } else {
+            self.tds_read_buffer.reset_to_length(0);
+        }
+        let Some(new_packet_size) = self.try_get_new_tds_packet()? else {
+            return Ok(false);
+        };
+        self.tds_read_buffer
+            .remove_header_from_packet(new_packet_size);
+        Ok(true)
     }
 
     /// Reads a complete TDS packet from the network into the working buffer.
@@ -842,138 +1383,89 @@ impl NetworkTransport {
     /// - Shared Memory: Same as Named Pipes (uses Named Pipes internally)
     ///
     /// The fix ensures all bytes from `read()` are accounted for, not just the first packet.
-    async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
-        let base_offset = self.tds_read_buffer.buffer_length;
-
-        // Check if we have pending bytes from a previous read that included multiple packets
-        let mut bytes_available = self.tds_read_buffer.pending_bytes;
+    fn move_pending_packet_bytes(&mut self, base_offset: usize) -> TdsResult<usize> {
+        let bytes_available = self.tds_read_buffer.pending_bytes;
         let pending_offset = self.tds_read_buffer.pending_bytes_offset;
 
         if bytes_available > 0 {
-            // Validate bounds before copy_within to avoid panic on malformed data.
-            // These values are derived from packet lengths on the wire, so we must
-            // guard against corrupted or malicious packets.
             let src_end = pending_offset.saturating_add(bytes_available);
             let dest_end = base_offset.saturating_add(bytes_available);
             let buffer_len = self.tds_read_buffer.working_buffer.len();
-
             if src_end > buffer_len || dest_end > buffer_len {
                 return Err(crate::error::Error::ProtocolError(format!(
                     "Invalid pending bytes range: src {}..{}, dest {}, buffer_len {}",
                     pending_offset, src_end, base_offset, buffer_len
                 )));
             }
-
-            // We have pending bytes - move them to base_offset
             self.tds_read_buffer
                 .working_buffer
                 .copy_within(pending_offset..src_end, base_offset);
             self.tds_read_buffer.pending_bytes = 0;
             self.tds_read_buffer.pending_bytes_offset = 0;
         }
+        Ok(bytes_available)
+    }
 
-        let stream = self.stream.as_mut().ok_or_else(|| {
-            crate::error::Error::ConnectionClosed(
-                "Cannot read TDS packet: connection has been closed".to_string(),
-            )
-        })?;
-
-        // Read more data if we don't have enough for the header
-        while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
-            let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    // A read failure means the socket is broken; record it so the
-                    // cached liveness check reports the connection as dead.
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet header".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
+    /// Finalizes the packet at `base_offset` once `bytes_available` covers the full size
+    /// declared by its length header.
+    ///
+    /// Returns `Ok(None)` when fewer than a header's worth of bytes are available yet, or the
+    /// header is present but `bytes_available` doesn't yet cover the declared `packet_size`
+    /// (caller must read more before retrying). Returns `Ok(Some(packet_size))` once the
+    /// packet is complete: sets `end_of_message` from the packet's status flags and records
+    /// any bytes beyond `packet_size` as pending for the next packet. Returns `Err` for a
+    /// malformed, oversized, or out-of-bounds length header.
+    fn complete_tds_packet_if_available(
+        &mut self,
+        base_offset: usize,
+        bytes_available: usize,
+    ) -> TdsResult<Option<usize>> {
+        if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+            return Ok(None);
         }
 
         let length_from_packet_header = BigEndian::read_u16(
             &self.tds_read_buffer.working_buffer[base_offset + 2..base_offset + 4],
         );
-
-        let packet_size_from_header: usize = length_from_packet_header as usize;
-
-        // Validate packet_size_from_header against protocol constraints.
-        // A malicious or corrupted server could send invalid lengths.
-        if packet_size_from_header < PacketWriter::PACKET_HEADER_SIZE {
+        let packet_size = usize::from(length_from_packet_header);
+        if packet_size < PacketWriter::PACKET_HEADER_SIZE {
             return Err(crate::error::Error::ProtocolError(format!(
                 "Invalid TDS packet length {}: must be at least {} bytes (header size)",
-                packet_size_from_header,
+                packet_size,
                 PacketWriter::PACKET_HEADER_SIZE
             )));
         }
+        if packet_size > self.tds_read_buffer.max_packet_size {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "TDS packet length {} exceeds negotiated max packet size {}",
+                packet_size, self.tds_read_buffer.max_packet_size
+            )));
+        }
+        let buffer_len = self.tds_read_buffer.working_buffer.len();
+        if base_offset.saturating_add(packet_size) > buffer_len {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "TDS packet length {} at offset {} exceeds buffer capacity {}",
+                packet_size, base_offset, buffer_len
+            )));
+        }
+        if bytes_available < packet_size {
+            return Ok(None);
+        }
 
-        // A payload-free packet that is not the end of its message is
-        // malformed: it neither carries payload nor terminates a message. An
-        // empty EOM packet is legal (it terminates a message), so only non-EOM
-        // ones are rejected.
         let is_end_of_message = self.tds_read_buffer.working_buffer[base_offset + 1]
             & PacketStatusFlags::Eom as u8
             != 0;
-        if packet_size_from_header == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
+        if packet_size == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
             return Err(crate::error::Error::ProtocolError(
                 "Received a payload-free TDS packet that is not end-of-message".to_string(),
             ));
         }
+        self.tds_read_buffer.end_of_message = is_end_of_message;
 
-        if packet_size_from_header > self.tds_read_buffer.max_packet_size {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} exceeds negotiated max packet size {}",
-                packet_size_from_header, self.tds_read_buffer.max_packet_size
-            )));
-        }
-
-        // Also ensure we won't exceed buffer capacity
-        let buffer_len = self.tds_read_buffer.working_buffer.len();
-        if base_offset.saturating_add(packet_size_from_header) > buffer_len {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} at offset {} exceeds buffer capacity {}",
-                packet_size_from_header, base_offset, buffer_len
-            )));
-        }
-
-        // Keep reading until we have the complete packet in memory.
-        while bytes_available < packet_size_from_header {
-            let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet payload".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
-        }
-
-        // Calculate how many extra bytes we read beyond this packet
-        let extra_bytes = bytes_available - packet_size_from_header;
-
+        let extra_bytes = bytes_available - packet_size;
         if extra_bytes > 0 {
-            // Track where the extra bytes are - they're right after this packet in the buffer
             self.tds_read_buffer.pending_bytes = extra_bytes;
-            self.tds_read_buffer.pending_bytes_offset = base_offset + packet_size_from_header;
+            self.tds_read_buffer.pending_bytes_offset = base_offset + packet_size;
         } else {
             self.tds_read_buffer.pending_bytes = 0;
             self.tds_read_buffer.pending_bytes_offset = 0;
@@ -982,109 +1474,483 @@ impl NetworkTransport {
         event!(
             tracing::Level::DEBUG,
             "Received packet of size: {:?}",
-            packet_size_from_header
+            packet_size
         );
-
         use pretty_hex::PrettyHex;
-
         event!(
             tracing::Level::DEBUG,
             "Packet content: {:?}",
-            &mut self.tds_read_buffer.working_buffer
-                [base_offset..base_offset + packet_size_from_header]
+            &mut self.tds_read_buffer.working_buffer[base_offset..base_offset + packet_size]
                 .hex_dump()
         );
-        Ok(packet_size_from_header)
+        Ok(Some(packet_size))
     }
 
-    /// Tells the server to stop sending tokens for the token stream being read and waits for
-    /// an acknowledgement.
-    async fn cancel_read_stream_and_wait(&mut self) -> TdsResult<()> {
-        self.cancel_read_stream().await?;
-        // Wait indefinitely for attention ACK
-        let _ = self.wait_for_attention_ack(None).await?;
-        Ok(())
+    /// Records an in-progress, not-yet-complete packet's read position so the next call to
+    /// `try_get_new_tds_packet` resumes appending at `base_offset` with `bytes_available`
+    /// bytes already collected, instead of restarting.
+    ///
+    /// Debug-asserts that no pending bytes were already parked, since a fresh partial read
+    /// must never overwrite an unconsumed parked range.
+    fn park_partial_packet(&mut self, base_offset: usize, bytes_available: usize) {
+        debug_assert_eq!(self.tds_read_buffer.pending_bytes, 0);
+        self.tds_read_buffer.pending_bytes = bytes_available;
+        self.tds_read_buffer.pending_bytes_offset = base_offset;
     }
 
-    /// Wait for attention acknowledgment from server with optional timeout.
+    /// Non-blocking probe for a complete TDS packet.
     ///
-    /// This helper reads tokens until it receives a DONE token with the ATTN flag set,
-    /// discarding any other tokens. If a timeout is specified and expires before
-    /// receiving the ACK, returns `Ok(false)`.
+    /// A no-op waker makes `Poll::Pending` terminal for this probe, so callers
+    /// must treat `Ok(None)` as "not ready" and ultimately fall back to
+    /// `get_new_tds_packet`, which registers a real waker. The `&mut self`
+    /// receiver prevents this poll from replacing a parked async reader's waker.
+    fn try_get_new_tds_packet(&mut self) -> TdsResult<Option<usize>> {
+        let base_offset = self.tds_read_buffer.buffer_length;
+        let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        loop {
+            if let Some(packet_size) =
+                self.complete_tds_packet_if_available(base_offset, bytes_available)?
+            {
+                return Ok(Some(packet_size));
+            }
+
+            let stream = self.stream.as_mut().ok_or_else(|| {
+                crate::error::Error::ConnectionClosed(
+                    "Cannot read TDS packet: connection has been closed".to_string(),
+                )
+            })?;
+            let mut read_buffer = ReadBuf::new(
+                &mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..],
+            );
+            match Pin::new(stream).poll_read(&mut context, &mut read_buffer) {
+                Poll::Pending => {
+                    self.park_partial_packet(base_offset, bytes_available);
+                    return Ok(None);
+                }
+                Poll::Ready(Err(error)) => {
+                    self.known_dead = true;
+                    return Err(error.into());
+                }
+                Poll::Ready(Ok(())) => {
+                    let bytes_read = read_buffer.filled().len();
+                    if bytes_read == 0 {
+                        self.known_dead = true;
+                        let section = if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+                            "header"
+                        } else {
+                            "payload"
+                        };
+                        return Err(crate::error::Error::ConnectionClosed(format!(
+                            "Connection closed by server while reading TDS packet {section}"
+                        )));
+                    }
+                    bytes_available += bytes_read;
+                }
+            }
+        }
+    }
+
+    async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
+        let base_offset = self.tds_read_buffer.buffer_length;
+        let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
+
+        loop {
+            if let Some(packet_size) =
+                self.complete_tds_packet_if_available(base_offset, bytes_available)?
+            {
+                return Ok(packet_size);
+            }
+
+            let stream = self.stream.as_mut().ok_or_else(|| {
+                crate::error::Error::ConnectionClosed(
+                    "Cannot read TDS packet: connection has been closed".to_string(),
+                )
+            })?;
+            let bytes_read = match stream
+                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
+                .await
+            {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    self.known_dead = true;
+                    return Err(error.into());
+                }
+            };
+            if bytes_read == 0 {
+                self.known_dead = true;
+                let section = if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+                    "header"
+                } else {
+                    "payload"
+                };
+                return Err(crate::error::Error::ConnectionClosed(format!(
+                    "Connection closed by server while reading TDS packet {section}"
+                )));
+            }
+            bytes_available += bytes_read;
+        }
+    }
+
+    /// Sends ATTENTION and drains to the acknowledgement, both under a single
+    /// `attention_timeout` deadline.
     ///
-    /// # Arguments
+    /// The send is bounded too. Writing the packet parks until the socket
+    /// accepts it, so a peer that has stopped reading stalls the send and the
+    /// acknowledgement deadline would never be armed. The drain gets whatever
+    /// the send left of the deadline.
     ///
-    /// * `attention_timeout` - Optional timeout. If `None`, waits indefinitely.
+    /// Anything other than an acknowledgement leaves the stream parked at an
+    /// unknown point, so every such outcome marks the connection known-dead
+    /// here. Callers can then ignore the return value and still not reuse a
+    /// connection with an ATTENTION outstanding on it.
     ///
     /// # Returns
     ///
     /// * `Ok(true)` - Attention acknowledged by server
-    /// * `Ok(false)` - Timeout expired waiting for ACK (only when timeout specified)
+    /// * `Ok(false)` - The bound elapsed, sending or waiting
+    /// * `Err(_)` - Error sending attention or reading the response
+    async fn send_attention_and_wait(
+        &mut self,
+        parser_context: &ParserContext,
+        attention_timeout: Duration,
+    ) -> TdsResult<bool> {
+        self.attention_settlement = None;
+        let deadline = Instant::now() + attention_timeout;
+        match timeout_at(deadline, self.cancel_read_stream()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.known_dead = true;
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                // A stalled write leaves a partial packet on the wire, so the
+                // stream can never be resynchronised.
+                warn!(
+                    timeout = ?attention_timeout,
+                    "Timed out sending the attention packet; marking the connection dead"
+                );
+                self.known_dead = true;
+                return Ok(false);
+            }
+        }
+
+        match self
+            .wait_for_attention_ack(parser_context, None, deadline)
+            .await
+        {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                warn!(
+                    timeout = ?attention_timeout,
+                    "Attention went unacknowledged within the bound; marking the connection dead"
+                );
+                self.known_dead = true;
+                Ok(false)
+            }
+            Err(e) => {
+                self.known_dead = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Wait for attention acknowledgment from server until `deadline`.
+    ///
+    /// Reads tokens until a DONE token with the ATTN flag arrives, discarding
+    /// everything else the server was still sending.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - Attention acknowledged by server
+    /// * `Ok(false)` - `deadline` passed before the acknowledgement
     /// * `Err(_)` - Error reading response
     async fn wait_for_attention_ack(
         &mut self,
-        attention_timeout: Option<Duration>,
+        parser_context: &ParserContext,
+        first_token: Option<Tokens>,
+        deadline: Instant,
     ) -> TdsResult<bool> {
-        let dummy_context = ParserContext::None(());
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
-        loop {
-            // Check timeout if specified
-            if let Some(timeout_duration) = attention_timeout
-                && start.elapsed() >= timeout_duration
-            {
-                debug!("Attention ACK timeout after {:?}", start.elapsed());
-                return Ok(false);
+        match timeout_at(
+            deadline,
+            self.drain_to_attention_ack(parser_context, first_token),
+        )
+        .await
+        {
+            Ok(Ok(settlement)) => {
+                self.attention_settlement = Some(Box::new(settlement));
+                debug!("Attention ACK received after {:?}", start.elapsed());
+                Ok(true)
             }
-
-            // Read next token, with timeout if specified
-            let token_result = if let Some(timeout_duration) = attention_timeout {
-                let remaining = timeout_duration.saturating_sub(start.elapsed());
-                match timeout(
-                    remaining,
-                    receive_token_internal(self, &*PARSER_REGISTRY, &dummy_context),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_elapsed) => {
-                        debug!(
-                            "Attention ACK timeout (elapsed) after {:?}",
-                            start.elapsed()
-                        );
-                        return Ok(false);
-                    }
-                }
-            } else {
-                // No timeout - wait indefinitely
-                receive_token_internal(self, &*PARSER_REGISTRY, &dummy_context).await
-            };
-
-            match token_result {
-                Ok(token) => {
-                    if let Tokens::Done(done_token) = token
-                        && done_token.status.contains(DoneStatus::ATTN)
-                    {
-                        debug!("Attention ACK received after {:?}", start.elapsed());
-                        return Ok(true);
-                    }
-                    // Discard other tokens and continue waiting
-                }
-                Err(e) => {
-                    if attention_timeout.is_none() {
-                        // When waiting indefinitely, errors just break the loop (original behavior)
-                        break;
-                    }
-                    // When using timeout, propagate errors
-                    debug!(
-                        "Error reading token while waiting for attention ACK: {:?}",
-                        e
-                    );
-                    return Err(e);
-                }
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => {
+                debug!("Attention ACK timeout after {:?}", start.elapsed());
+                Ok(false)
             }
         }
-        Ok(true)
+    }
+
+    /// Seeds drain decoding from the parser state active when interruption occurred.
+    fn attention_drain_context(&self, parser_context: &ParserContext) -> AttentionDrainContext {
+        match parser_context {
+            ParserContext::ColumnMetadata(metadata, _) => AttentionDrainContext {
+                metadata: Some(Arc::clone(metadata)),
+                column_encryption_supported: self.column_encryption_supported,
+            },
+            ParserContext::ColumnEncryption(enabled) => AttentionDrainContext {
+                metadata: None,
+                column_encryption_supported: *enabled,
+            },
+            ParserContext::None(()) => AttentionDrainContext {
+                // None is reserved for DONE-only responses. Any path that may
+                // encounter COLMETADATA must supply its encryption setting,
+                // which also refreshes this cache before later DONE-only reads.
+                metadata: None,
+                column_encryption_supported: self.column_encryption_supported,
+            },
+        }
+    }
+
+    /// Advances drain metadata and records client-visible control tokens.
+    ///
+    /// Returns true only for a final DONE-family ATTN. [MS-TDS: DONE] defines
+    /// `DONE_MORE` as non-final with subsequent data streams to follow; stopping
+    /// there would leave those streams unread rather than realign the connection.
+    ///
+    /// [MS-TDS: DONE]: https://learn.microsoft.com/openspecs/windows_protocols/ms-tds/3c06f110-98bd-4d5b-b836-b1ba66452cb7
+    fn apply_attention_token(
+        context: &mut AttentionDrainContext,
+        settlement: &mut AttentionSettlement,
+        token: Tokens,
+    ) -> bool {
+        match token {
+            Tokens::ColMetadata(metadata) => {
+                context.metadata = Some(Arc::new(metadata));
+                false
+            }
+            Tokens::Row(_) => false,
+            // Result-set metadata for a cancelled result; the client never
+            // replays it, so retaining it would only count toward the limit.
+            Tokens::DataClassification(_) => false,
+            Tokens::Done(done) => {
+                let acknowledged = done.status.contains(DoneStatus::ATTN) && !done.has_more();
+                context.metadata = None;
+                settlement.push(Tokens::Done(done));
+                acknowledged
+            }
+            Tokens::DoneProc(done) => {
+                let acknowledged = done.status.contains(DoneStatus::ATTN) && !done.has_more();
+                context.metadata = None;
+                settlement.push(Tokens::DoneProc(done));
+                acknowledged
+            }
+            Tokens::DoneInProc(done) => {
+                let acknowledged = done.status.contains(DoneStatus::ATTN) && !done.has_more();
+                context.metadata = None;
+                settlement.push(Tokens::DoneInProc(done));
+                acknowledged
+            }
+            token => {
+                settlement.push(token);
+                false
+            }
+        }
+    }
+
+    /// Finishes a partially decoded row without materializing its remaining columns.
+    ///
+    /// Reaching the row boundary is required before token-oriented ATTENTION
+    /// draining can resume safely.
+    async fn discard_paused_row(&mut self, pause_state: RowPauseState) -> TdsResult<()> {
+        let mut writer = crate::datatypes::row_writer::DiscardRowWriter;
+        match resume_row_into_internal(self, pause_state, ColumnPolicy::SkipAll, &mut writer)
+            .await?
+        {
+            RowReadResult::RowWritten => Ok(()),
+            RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
+                Err(crate::error::Error::ProtocolError(
+                    "Attention drain paused while discarding a row".to_string(),
+                ))
+            }
+            RowReadResult::Token(_) => Err(crate::error::Error::ProtocolError(
+                "Attention drain reached a control token inside a row".to_string(),
+            )),
+        }
+    }
+
+    /// Discards an owned paused PLP value and then the rest of its row.
+    ///
+    /// PLP chunk framing must be consumed before the drain can recognize later
+    /// row or DONE tokens.
+    async fn discard_paused_plp(&mut self, mut plp_state: PlpPauseState) -> TdsResult<()> {
+        let mut buffer = vec![0u8; 8192];
+        while !plp_state.reached_end() {
+            let read = read_active_plp_bytes_internal(self, &mut plp_state, &mut buffer).await?;
+            if read == 0 && !plp_state.reached_end() {
+                return Err(crate::error::Error::ProtocolError(
+                    "Attention drain made no progress while discarding a PLP value".to_string(),
+                ));
+            }
+        }
+        self.discard_paused_row(plp_state.row_pause_state).await
+    }
+
+    /// Discards a caller-owned active PLP value and completes its containing row.
+    ///
+    /// This variant is needed when cancellation interrupts incremental PLP
+    /// delivery and the pause state must remain available to the caller.
+    async fn discard_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
+        let mut buffer = vec![0u8; 8192];
+        while !plp_state.reached_end() {
+            let read = read_active_plp_bytes_internal(self, plp_state, &mut buffer).await?;
+            if read == 0 && !plp_state.reached_end() {
+                return Err(crate::error::Error::ProtocolError(
+                    "Attention drain made no progress while discarding an active PLP value"
+                        .to_string(),
+                ));
+            }
+        }
+        self.discard_paused_row(plp_state.row_pause_state.clone())
+            .await
+    }
+
+    /// Converts any completed row-parser outcome into an optional first control token.
+    ///
+    /// Paused row and PLP outcomes are finished here so every variant reaches
+    /// the token boundary expected by the acknowledgement drain.
+    async fn discard_interrupted_row_result(
+        &mut self,
+        result: RowReadResult,
+    ) -> TdsResult<Option<Tokens>> {
+        match result {
+            RowReadResult::RowWritten => Ok(None),
+            RowReadResult::Token(token) => Ok(Some(token)),
+            RowReadResult::RowPaused(pause_state) => {
+                self.discard_paused_row(pause_state).await?;
+                Ok(None)
+            }
+            RowReadResult::PlpPaused(plp_state) => {
+                self.discard_paused_plp(plp_state).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Settles a completed row-parser result, then drains to DONE_ATTN.
+    ///
+    /// The shared deadline prevents row completion from extending the
+    /// cancellation bound.
+    async fn wait_for_attention_after_row_result(
+        &mut self,
+        parser_context: &ParserContext,
+        result: RowReadResult,
+        deadline: Instant,
+    ) -> TdsResult<bool> {
+        let first_token =
+            match timeout_at(deadline, self.discard_interrupted_row_result(result)).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(false),
+            };
+        self.wait_for_attention_ack(parser_context, first_token, deadline)
+            .await
+    }
+
+    /// Finishes a positioned row header, then drains to DONE_ATTN.
+    ///
+    /// A header can leave the reader inside a row, so token draining cannot
+    /// start until that row has been discarded.
+    async fn wait_for_attention_after_row_header(
+        &mut self,
+        parser_context: &ParserContext,
+        header: RowHeader,
+        deadline: Instant,
+    ) -> TdsResult<bool> {
+        let first_token = match header {
+            RowHeader::Positioned(pause_state) => {
+                match timeout_at(deadline, self.discard_paused_row(pause_state)).await {
+                    Ok(result) => result?,
+                    Err(_) => return Ok(false),
+                }
+                None
+            }
+            RowHeader::Token(token) => Some(token),
+        };
+        self.wait_for_attention_ack(parser_context, first_token, deadline)
+            .await
+    }
+
+    /// Finishes an interrupted incremental PLP read, then drains to DONE_ATTN.
+    ///
+    /// The active PLP and the rest of its row must be consumed before control
+    /// tokens are parseable again.
+    async fn wait_for_attention_after_plp(
+        &mut self,
+        parser_context: &ParserContext,
+        plp_state: &mut PlpPauseState,
+        deadline: Instant,
+    ) -> TdsResult<bool> {
+        match timeout_at(deadline, self.discard_active_plp(plp_state)).await {
+            Ok(result) => result?,
+            Err(_) => return Ok(false),
+        }
+        self.wait_for_attention_ack(parser_context, None, deadline)
+            .await
+    }
+
+    /// Reads and discards complete rows and control tokens until DONE_ATTN.
+    ///
+    /// The caller preserves any parser future that was active when cancellation
+    /// won, so this starts at a proven token boundary. Current metadata seeds the
+    /// row parser, and later COLMETADATA tokens replace it for queued result sets.
+    async fn drain_to_attention_ack(
+        &mut self,
+        parser_context: &ParserContext,
+        first_token: Option<Tokens>,
+    ) -> TdsResult<AttentionSettlement> {
+        let mut context = self.attention_drain_context(parser_context);
+        let mut settlement = AttentionSettlement::default();
+
+        if let Some(token) = first_token
+            && Self::apply_attention_token(&mut context, &mut settlement, token)
+        {
+            return Ok(settlement);
+        }
+
+        loop {
+            if let Some(metadata) = context.metadata.as_ref().cloned() {
+                let parser_context = ParserContext::ColumnMetadata(metadata, None);
+                let mut writer = crate::datatypes::row_writer::DiscardRowWriter;
+                let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
+                let result = receive_row_into_internal(
+                    self,
+                    &*PARSER_REGISTRY,
+                    &parser_context,
+                    ColumnPolicy::SkipAll,
+                    &mut writer,
+                    &mut nbc_bitmap_scratch,
+                )
+                .await;
+                self.nbc_bitmap_scratch = nbc_bitmap_scratch;
+
+                if let Some(token) = self.discard_interrupted_row_result(result?).await?
+                    && Self::apply_attention_token(&mut context, &mut settlement, token)
+                {
+                    return Ok(settlement);
+                }
+                continue;
+            }
+
+            let parser_context =
+                ParserContext::ColumnEncryption(context.column_encryption_supported);
+            let token = receive_token_internal(self, &*PARSER_REGISTRY, &parser_context).await?;
+            if Self::apply_attention_token(&mut context, &mut settlement, token) {
+                return Ok(settlement);
+            }
+        }
     }
 }
 
@@ -1107,9 +1973,32 @@ impl TransportSslHandler for NetworkTransport {
 }
 
 impl TdsPacketReader for NetworkTransport {
+    #[inline]
+    fn buffered_slice(&self) -> &[u8] {
+        self.tds_read_buffer.get_buffered_slice()
+    }
+
+    fn negotiated_data_classification_version(&self) -> Option<DataClassificationVersion> {
+        self.data_classification_version
+    }
+
     fn reset_reader(&mut self) {
-        // Make sure that we have read all the data from the buffer.
-        assert!(self.tds_read_buffer.buffer_length == self.tds_read_buffer.buffer_position);
+        // Callers reset before starting a new message, so the buffer is
+        // expected to be fully consumed. Log a violation instead of asserting:
+        // `buffer_length` comes from the packet header the peer sent, so a
+        // malformed or truncated response must not be able to abort the
+        // process. Discarding the leftover bytes is what a reset means, so the
+        // outcome is the same either way.
+        let unread = self
+            .tds_read_buffer
+            .buffer_length
+            .saturating_sub(self.tds_read_buffer.buffer_position);
+        if unread > 0 {
+            warn!(
+                unread_bytes = unread,
+                "Discarding unread bytes while resetting the packet reader"
+            );
+        }
         self.tds_read_buffer
             .change_packet_size(NetworkReader::packet_size(self));
         self.tds_read_buffer.reset_to_length(0);
@@ -1128,6 +2017,11 @@ impl TdsPacketReader for NetworkTransport {
     #[inline(always)]
     fn try_read_uint16(&mut self) -> Option<u16> {
         self.tds_read_buffer.try_read_uint16()
+    }
+
+    #[inline(always)]
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        self.tds_read_buffer.try_read_slice(length)
     }
 
     #[inline(always)]
@@ -1170,24 +2064,24 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_byte() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(1).await?;
         }
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
         while !self.tds_read_buffer.do_we_have_enough_data(2) {
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
         let result = BigEndian::read_i16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
+        self.tds_read_buffer.consume_bytes(2)?;
         Ok(result)
     }
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
         while !self.tds_read_buffer.do_we_have_enough_data(4) {
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
         let result = BigEndian::read_i32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
+        self.tds_read_buffer.consume_bytes(4)?;
         Ok(result)
     }
 
@@ -1196,7 +2090,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint40() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(5).await?;
         }
     }
 
@@ -1205,7 +2099,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_float32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
     async fn read_float64(&mut self) -> TdsResult<f64> {
@@ -1213,7 +2107,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_float64() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
     }
     async fn read_int16(&mut self) -> TdsResult<i16> {
@@ -1221,7 +2115,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int16() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
@@ -1229,7 +2123,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint16() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
@@ -1237,7 +2131,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint24() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(3).await?;
         }
     }
 
@@ -1246,7 +2140,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
 
@@ -1255,7 +2149,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
     async fn read_int64(&mut self) -> TdsResult<i64> {
@@ -1263,15 +2157,15 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int64() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
     }
     async fn read_uint64(&mut self) -> TdsResult<u64> {
         while !self.tds_read_buffer.do_we_have_enough_data(8) {
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
         let result = LittleEndian::read_u64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
+        self.tds_read_buffer.consume_bytes(8)?;
         Ok(result)
     }
 
@@ -1279,7 +2173,14 @@ impl TdsPacketReader for NetworkTransport {
         let mut total_read = 0;
         let mut length_to_read = buffer.len();
         let mut offset = 0;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
+            if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
+                return Err(Self::past_end_of_message_error(
+                    length_to_read,
+                    self.tds_read_buffer.get_remaining_byte_count(),
+                ));
+            }
             if !self
                 .tds_read_buffer
                 .do_we_have_enough_data(min(self.tds_read_buffer.max_packet_size, length_to_read))
@@ -1294,18 +2195,35 @@ impl TdsPacketReader for NetworkTransport {
                 min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
             );
 
-            if to_read > 0 {
-                // Copy from self.working_buffer to buffer from self.buffer_position to offset.
-                buffer[offset..offset + to_read].copy_from_slice(
-                    &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
-                        ..self.tds_read_buffer.buffer_position + to_read],
-                );
-                offset += to_read;
-                length_to_read -= to_read;
-                total_read += to_read;
-
-                self.tds_read_buffer.consume_bytes(to_read);
+            if to_read == 0 {
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
+                }
+                if total_read > 0 {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                // Nothing of this value has been read yet, so the empty
+                // end-of-message packet belongs to the previous message rather
+                // than truncating this read. Refill and carry on, matching what
+                // the scalar readers do at the same boundary. Only so many in a
+                // row can be legitimate; past that nothing is advancing.
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
+                }
+                continue;
             }
+
+            // Copy from self.working_buffer to buffer from self.buffer_position to offset.
+            buffer[offset..offset + to_read].copy_from_slice(
+                &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
+                    ..self.tds_read_buffer.buffer_position + to_read],
+            );
+            offset += to_read;
+            length_to_read -= to_read;
+            total_read += to_read;
+
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(total_read)
     }
@@ -1317,7 +2235,14 @@ impl TdsPacketReader for NetworkTransport {
         let mut total_read = 0;
         let mut length_to_read = buffer.len();
         let mut offset = 0;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
+            if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
+                return Err(Self::past_end_of_message_error(
+                    length_to_read,
+                    self.tds_read_buffer.get_remaining_byte_count(),
+                ));
+            }
             if !self
                 .tds_read_buffer
                 .do_we_have_enough_data(min(self.tds_read_buffer.max_packet_size, length_to_read))
@@ -1330,24 +2255,35 @@ impl TdsPacketReader for NetworkTransport {
                 min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
             );
 
-            if to_read > 0 {
-                let source =
-                    &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
-                        ..self.tds_read_buffer.buffer_position + to_read];
-                // SAFETY: `source` and the destination are valid for `to_read`
-                // non-overlapping bytes. Writing initializes those destination elements.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        source.as_ptr(),
-                        buffer.as_mut_ptr().cast::<u8>().add(offset),
-                        to_read,
-                    );
+            if to_read == 0 {
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
                 }
-                offset += to_read;
-                length_to_read -= to_read;
-                total_read += to_read;
-                self.tds_read_buffer.consume_bytes(to_read);
+                if total_read > 0 {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
+                }
+                continue;
             }
+
+            let source = &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
+                ..self.tds_read_buffer.buffer_position + to_read];
+            // SAFETY: `source` and the destination are valid for `to_read`
+            // non-overlapping bytes. Writing initializes those destination elements.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    buffer.as_mut_ptr().cast::<u8>().add(offset),
+                    to_read,
+                );
+            }
+            offset += to_read;
+            length_to_read -= to_read;
+            total_read += to_read;
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(total_read)
     }
@@ -1410,7 +2346,15 @@ impl TdsPacketReader for NetworkTransport {
 
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
         let mut length_to_read = skip_count;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
+            let skipped_any = length_to_read < skip_count;
+            if self.value_truncated_by_message_end(skipped_any, length_to_read) {
+                return Err(Self::past_end_of_message_error(
+                    length_to_read,
+                    self.tds_read_buffer.get_remaining_byte_count(),
+                ));
+            }
             if !self.tds_read_buffer.do_we_have_enough_data(min(
                 self.tds_read_buffer.max_packet_size - 8,
                 length_to_read,
@@ -1425,15 +2369,29 @@ impl TdsPacketReader for NetworkTransport {
                 min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
             );
 
-            if to_read > 0 {
-                length_to_read -= to_read;
-                self.tds_read_buffer.consume_bytes(to_read);
+            if to_read == 0 {
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
+                }
+                if skipped_any {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
+                }
+                continue;
             }
+
+            length_to_read -= to_read;
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(())
     }
 
     async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+        // This standalone path has no outstanding parser borrow, so it can use
+        // the regular packet writer rather than a cloned SharedStream.
         let attention = AttentionRequest::new();
         let mut packet_writer = attention.create_packet_writer(self.as_writer(), None, None);
         attention.serialize(&mut packet_writer).await?;
@@ -1442,36 +2400,375 @@ impl TdsPacketReader for NetworkTransport {
 }
 
 impl NetworkTransport {
+    /// Parses a buffered ROW/NBCROW header without refilling the network buffer.
+    pub(crate) fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        let ParserContext::ColumnMetadata(metadata, decryptor) = context else {
+            return Err(crate::error::Error::ProtocolError(
+                "Expected ColumnMetadata in context for row decoding".to_string(),
+            ));
+        };
+        let buffered = self.tds_read_buffer.get_buffered_slice();
+        let Some(&token) = buffered.first() else {
+            return Ok(None);
+        };
+
+        if token == TokenType::Row as u8 {
+            self.tds_read_buffer.consume_bytes(1)?;
+            return Ok(Some(RowPauseState {
+                next_column_index: 0,
+                metadata: Arc::clone(metadata),
+                nbc_null_bitmap: None,
+                decryptor: decryptor.clone(),
+            }));
+        }
+
+        if token != TokenType::NbcRow as u8 {
+            return Ok(None);
+        }
+
+        let bitmap_len = metadata.columns.len().div_ceil(8);
+        let Some(bitmap_bytes) = buffered.get(1..1 + bitmap_len) else {
+            return Ok(None);
+        };
+        let bitmap = if let Some(mut cached) = self.nbc_bitmap_scratch.take()
+            && cached.len() == bitmap_len
+            && let Some(buffer) = Arc::get_mut(&mut cached)
+        {
+            buffer.copy_from_slice(bitmap_bytes);
+            self.nbc_bitmap_scratch = Some(Arc::clone(&cached));
+            cached
+        } else {
+            let bitmap: Arc<[u8]> = Arc::from(bitmap_bytes);
+            self.nbc_bitmap_scratch = Some(Arc::clone(&bitmap));
+            bitmap
+        };
+        self.tds_read_buffer.consume_bytes(1 + bitmap_len)?;
+        Ok(Some(RowPauseState {
+            next_column_index: 0,
+            metadata: Arc::clone(metadata),
+            nbc_null_bitmap: Some(bitmap),
+            decryptor: decryptor.clone(),
+        }))
+    }
+
+    /// Decodes the next ordinary buffered column without consuming on a miss.
+    pub(crate) fn try_read_buffered_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        if target != pause_state.next_column_index {
+            return Ok(None);
+        }
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        if pause_state
+            .nbc_null_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        {
+            return Ok(Some(ColumnValues::Null));
+        }
+        if pause_state.decryptor.is_some() {
+            return Ok(None);
+        }
+
+        let decoder = GenericDecoder::default();
+        let Some((value, used)) =
+            decoder.try_decode_buffered(self.tds_read_buffer.get_buffered_slice(), metadata)?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some(value))
+    }
+
+    /// Decodes the next buffered column and preserves its `sql_variant` base type.
+    pub(crate) fn try_read_buffered_column_with_base(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<(ColumnValues, Option<TdsDataType>)>> {
+        if target != pause_state.next_column_index {
+            return Ok(None);
+        }
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        if pause_state
+            .nbc_null_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        {
+            return Ok(Some((ColumnValues::Null, None)));
+        }
+        if metadata.data_type != TdsDataType::SsVariant {
+            return self
+                .try_read_buffered_column(pause_state, target)
+                .map(|value| value.map(|value| (value, None)));
+        }
+        if pause_state.decryptor.is_some() {
+            return Ok(None);
+        }
+        let decoder = GenericDecoder::default();
+        let Some((base, value, used)) =
+            decoder.try_decode_buffered_variant(self.tds_read_buffer.get_buffered_slice())?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some((value, base)))
+    }
+
+    /// Attempts to read `target`'s 8-byte PLP header from bytes already buffered in
+    /// `tds_read_buffer`, consuming those bytes only on success.
+    ///
+    /// Returns `Ok(None)` when `target` has no column metadata or the header isn't fully
+    /// buffered yet (not ready; retry once more bytes arrive). `Ok(Some(None))` means the
+    /// column is SQL NULL. `Ok(Some(Some(stream)))` returns a [`PlpColumnStream`] positioned
+    /// to read chunk payload via the buffered path.
+    pub(crate) fn try_begin_buffered_plp(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<Option<PlpColumnStream>>> {
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        let Some((stream, used)) = PlpColumnStream::try_begin_buffered(
+            metadata,
+            self.tds_read_buffer.get_buffered_slice(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some(stream))
+    }
+
+    /// Attempts to fully decode `target`'s known-length, single-chunk PLP column from bytes
+    /// already buffered in `tds_read_buffer`, in one call, without leaving a resumable
+    /// [`PlpColumnStream`] behind.
+    ///
+    /// See [`CompleteBufferedPlp`] for the exact outer/inner/tuple semantics of the result;
+    /// `Ok(None)` also covers `target` having no column metadata, and a known-length header
+    /// whose chunk isn't a single complete chunk (caller must fall back to
+    /// `try_begin_buffered_plp` + `try_read_buffered_plp`).
+    pub(crate) fn try_read_complete_buffered_plp_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CompleteBufferedPlp> {
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        let buffered = self.tds_read_buffer.get_buffered_slice();
+        let Some((stream, header_used)) = PlpColumnStream::try_begin_buffered(metadata, buffered)?
+        else {
+            return Ok(None);
+        };
+        let Some(mut stream) = stream else {
+            self.tds_read_buffer.consume_bytes(header_used)?;
+            return Ok(Some(None));
+        };
+        let Some(remaining) = buffered.get(header_used..) else {
+            return Ok(None);
+        };
+        let Some((payload_used, written)) = stream.try_read_complete_buffered(remaining, out)?
+        else {
+            return Ok(None);
+        };
+        let total_used = header_used.checked_add(payload_used).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP byte count overflowed".to_string())
+        })?;
+        let known_total = stream.known_len();
+        let total_read = stream.total_read();
+        self.tds_read_buffer.consume_bytes(total_used)?;
+        Ok(Some(Some((written, known_total, total_read))))
+    }
+
+    /// Continues reading payload for an in-progress buffered `plp_state`, pulling additional
+    /// TDS packets via `try_read_tds_packet` (non-blocking) whenever the currently buffered
+    /// bytes aren't enough.
+    ///
+    /// Returns `Ok(None)` once `try_read_tds_packet` reports no more data is available right
+    /// now (not ready). Returns `Ok(Some(written))` with the number of payload bytes copied
+    /// into `out` this call.
+    pub(crate) fn try_read_buffered_plp(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        out: &mut [u8],
+    ) -> TdsResult<Option<usize>> {
+        loop {
+            if let Some((used, written)) = plp_state
+                .plp_stream
+                .try_read_buffered(self.tds_read_buffer.get_buffered_slice(), out)?
+            {
+                self.tds_read_buffer.consume_bytes(used)?;
+                return Ok(Some(written));
+            }
+            if !self.try_read_tds_packet()? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Decodes consecutive buffered columns directly into `writer`.
+    ///
+    /// Returns `false` after preserving the partially advanced row state when
+    /// the next value needs async continuation.
+    #[cfg(test)]
+    pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        self.try_read_buffered_row_prefix_into(pause_state, usize::MAX, writer)
+    }
+
+    /// Decodes consecutive buffered columns before `end_column` into `writer`.
+    pub(crate) fn try_read_buffered_row_prefix_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        end_column: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        if pause_state.decryptor.is_some() {
+            return Ok(false);
+        }
+
+        let decoder = GenericDecoder::default();
+        let mut consumed = 0usize;
+        let outcome = {
+            let buffered = self.tds_read_buffer.get_buffered_slice();
+            let mut outcome = Ok(true);
+            while pause_state.next_column_index < end_column
+                && let Some(metadata) = pause_state
+                    .metadata
+                    .columns
+                    .get(pause_state.next_column_index)
+            {
+                let col = pause_state.next_column_index;
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[col / 8] & (1 << (col % 8)) != 0)
+                {
+                    writer.write_null(col);
+                    pause_state.next_column_index += 1;
+                    continue;
+                }
+
+                let Some(remaining) = buffered.get(consumed..) else {
+                    outcome = Err(crate::error::Error::ProtocolError(
+                        "Buffered row decoder consumed past the available data".to_string(),
+                    ));
+                    break;
+                };
+                match decoder.try_decode_buffered_into(remaining, metadata, col, writer) {
+                    Ok(Some(used)) => {
+                        let Some(next) = consumed.checked_add(used) else {
+                            outcome = Err(crate::error::Error::ProtocolError(
+                                "Buffered row decoder byte count overflowed".to_string(),
+                            ));
+                            break;
+                        };
+                        consumed = next;
+                        pause_state.next_column_index += 1;
+                    }
+                    Ok(None) => {
+                        outcome = Ok(false);
+                        break;
+                    }
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            outcome
+        };
+        self.tds_read_buffer.consume_bytes(consumed)?;
+        outcome.map(|complete| {
+            complete
+                && (pause_state.next_column_index >= end_column
+                    || pause_state.next_column_index >= pause_state.metadata.columns.len())
+        })
+    }
+
     pub(crate) async fn receive_token(
         &mut self,
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens> {
-        let cancellable_receive_token = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            receive_token_internal(self, &*PARSER_REGISTRY, context),
-        );
-        let token_result = match remaining_request_timeout.as_ref() {
-            Some(remaining_request_timeout) => {
-                match timeout(*remaining_request_timeout, cancellable_receive_token).await {
-                    Ok(result) => result,
-                    Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-                }
-            }
-            None => cancellable_receive_token.await,
+        if let ParserContext::ColumnEncryption(enabled) = context {
+            self.column_encryption_supported = *enabled;
+        }
+        self.attention_settlement = None;
+        // A ready read also wins over a zero timeout in await_read_or_interrupt.
+        // A pre-cancelled read must take its existing ATTENTION settlement path.
+        if !cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled())
+            && let Some((token, consumed)) = crate::io::token_stream::buffered_control_token(
+                self.tds_read_buffer.get_buffered_slice(),
+            )
+        {
+            let token_type_byte = self.tds_read_buffer.get_buffered_slice()[0];
+            log_received_token(&TokenType::try_from(token_type_byte)?, token_type_byte);
+            self.tds_read_buffer.consume_bytes(consumed)?;
+            return Ok(token);
+        }
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let outcome = {
+            let mut read = std::pin::pin!(receive_token_internal(self, &*PARSER_REGISTRY, context));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
+                cancel_handle,
+                attention_stream,
+                already_dead,
+            )
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
         };
 
-        match &token_result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await?;
+        match completed {
+            Ok(token) => match self
+                .wait_for_attention_ack(context, Some(token), deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted token read"
+                    );
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted token read"
+                );
+                self.known_dead = true;
+            }
         }
-        token_result
+        Err(*error)
     }
 
     pub(crate) async fn receive_row_into<W>(
@@ -1490,33 +2787,56 @@ impl NetworkTransport {
         // below must stay unconditional, and no `?` may be introduced between
         // these two points: an early return would drop the cached bitmap and
         // silently cost an allocation on every subsequent row.
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        let outcome = {
+            let mut read = std::pin::pin!(receive_row_into_internal(
+                self,
+                &*PARSER_REGISTRY,
+                context,
+                plan,
+                writer,
+                &mut nbc_bitmap_scratch,
+            ));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                receive_row_into_internal(
-                    self,
-                    &*PARSER_REGISTRY,
-                    context,
-                    plan,
-                    writer,
-                    &mut nbc_bitmap_scratch,
-                ),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await?;
+        match completed {
+            Ok(result) => match self
+                .wait_for_attention_after_row_result(context, result, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(?attention_error, "Failed to settle an interrupted row read");
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(?attention_error, "Failed to finish an interrupted row read");
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 
     pub(crate) async fn receive_row_header(
@@ -1527,31 +2847,60 @@ impl NetworkTransport {
     ) -> TdsResult<RowHeader> {
         // Same take/restore as `receive_row_into`: unconditional restore, no `?`
         // between the two points.
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        let outcome = {
+            let mut read = std::pin::pin!(receive_row_header_internal(
+                self,
+                &*PARSER_REGISTRY,
+                context,
+                &mut nbc_bitmap_scratch,
+            ));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                receive_row_header_internal(
-                    self,
-                    &*PARSER_REGISTRY,
-                    context,
-                    &mut nbc_bitmap_scratch,
-                ),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await?;
+        match completed {
+            Ok(header) => match self
+                .wait_for_attention_after_row_header(context, header, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted row header"
+                    );
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted row header"
+                );
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 
     pub(crate) async fn resume_row_into<W>(
@@ -1565,24 +2914,55 @@ impl NetworkTransport {
     where
         W: RowWriter + Send + ?Sized,
     {
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let drain_context = ParserContext::ColumnMetadata(Arc::clone(&pause_state.metadata), None);
+        let outcome = {
+            let mut read =
+                std::pin::pin!(resume_row_into_internal(self, pause_state, plan, writer));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                resume_row_into_internal(self, pause_state, plan, writer),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await?;
+        match completed {
+            Ok(result) => match self
+                .wait_for_attention_after_row_result(&drain_context, result, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted row continuation"
+                    );
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted row continuation"
+                );
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 
     pub(crate) async fn read_active_plp_bytes(
@@ -1592,29 +2972,69 @@ impl NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         out: &mut [u8],
     ) -> TdsResult<usize> {
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let drain_context =
+            ParserContext::ColumnMetadata(Arc::clone(&plp_state.row_pause_state.metadata), None);
+        let outcome = {
+            let mut read = std::pin::pin!(read_active_plp_bytes_internal(self, plp_state, out));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                read_active_plp_bytes_internal(self, plp_state, out),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await?;
+        match completed {
+            Ok(_) => match self
+                .wait_for_attention_after_plp(&drain_context, plp_state, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(?attention_error, "Failed to settle an interrupted PLP read");
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(?attention_error, "Failed to finish an interrupted PLP read");
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 }
 
 #[async_trait]
 impl TdsTokenStreamReader for NetworkTransport {
+    fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        NetworkTransport::try_receive_row_header(self, context)
+    }
+
+    fn try_read_buffered_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        NetworkTransport::try_read_buffered_column(self, pause_state, target)
+    }
+
     async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -1698,6 +3118,10 @@ impl TdsTokenStreamReader for NetworkTransport {
 
 #[async_trait]
 impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransport {
+    fn as_writer_ref(&self) -> &dyn NetworkWriter {
+        self
+    }
+
     fn as_writer(&mut self) -> &mut dyn NetworkWriter {
         self
     }
@@ -1731,17 +3155,21 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
     /// 2. Wait for DONE token with ATTN (0x0020) status flag
     /// 3. If no acknowledgment within timeout, return false
     ///
+    /// `attention_timeout` covers the whole flow, not just step 2. Writing the
+    /// packet parks until the socket accepts it, so a peer that has stopped
+    /// reading stalls the send and the acknowledgement deadline would never be
+    /// armed. Both steps therefore share one deadline, and the drain gets
+    /// whatever the send left of it.
+    ///
     /// This is used by bulk copy timeout handling to implement the 5-second
     /// attention ACK timeout per SqlClient behavior.
     async fn send_attention_with_timeout(
         &mut self,
+        context: &ParserContext,
         attention_timeout: Duration,
     ) -> TdsResult<bool> {
-        // Send attention packet
-        self.cancel_read_stream().await?;
-
-        // Wait for ACK with timeout using the shared helper
-        self.wait_for_attention_ack(Some(attention_timeout)).await
+        self.send_attention_and_wait(context, attention_timeout)
+            .await
     }
 
     fn is_connection_dead(&self) -> bool {
@@ -1762,16 +3190,75 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn sequential_connect_walks_every_address_without_a_parallel_limit() {
+        use std::cell::RefCell;
+        use std::net::SocketAddr;
+
+        for count in [0, 1, 2, 64, 65] {
+            let addresses: Vec<_> = (0..count)
+                .map(|port| SocketAddr::from(([192, 0, 2, 1], 1000 + port)))
+                .collect();
+            let attempts = RefCell::new(Vec::new());
+            let error = super::sequential_connect_with(&addresses, 1000, |address| {
+                attempts.borrow_mut().push(address);
+                Ok(async { Err(std::io::ErrorKind::ConnectionRefused.into()) })
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(*attempts.borrow(), addresses);
+            assert_eq!(
+                error.kind(),
+                if count == 0 {
+                    std::io::ErrorKind::NotConnected
+                } else {
+                    std::io::ErrorKind::ConnectionRefused
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_connect_can_succeed_after_sixty_four_failures() {
+        use std::cell::Cell;
+        use std::net::SocketAddr;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let mut addresses = vec![SocketAddr::from(([192, 0, 2, 1], 1433)); 64];
+        addresses.push(live);
+        let attempts = Cell::new(0);
+        let stream = super::sequential_connect_with(&addresses, 1000, |address| {
+            attempts.set(attempts.get() + 1);
+            Ok(async move {
+                if address == live {
+                    tokio::net::TcpStream::connect(address).await
+                } else {
+                    Err(std::io::ErrorKind::ConnectionRefused.into())
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.get(), 65);
+        assert_eq!(stream.peer_addr().unwrap(), live);
+    }
+
     use super::*; // Brings in NetworkTransport, SslHandler, StreamRecoverer, etc.
     use crate::connection::client_context::ClientContext;
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
     use crate::core::EncryptionOptions;
+    use crate::datatypes::row_writer::DefaultRowWriter;
+    use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::message::messages::PacketType;
+    use crate::query::metadata::ColumnMetadata;
     use crate::test_packet_support::{
-        TestPacketBuilder, create_network_transport_with_chunked_data,
-        create_network_transport_with_data, encode_utf16_le,
+        TestPacketBuilder, build_duplex_transport, create_network_transport_with_chunked_data,
+        create_network_transport_with_data, create_network_transport_with_live_peer,
+        create_network_transport_with_live_peer_capturing_writes, encode_utf16_le,
     };
+    use crate::token::tokens::ColMetadataToken;
     use bytes::Bytes;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -1782,6 +3269,237 @@ pub(crate) mod tests {
     // The choice of 8192 is large enough for sending data. This stream should have a buffer large enough for send.
     // The test would keep the payload lower than this size to make sure that the duplex stream can handle it.
     pub(crate) const MAX_BUFFER_SIZE: usize = 8192;
+
+    mod data_classification {
+        use super::*;
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::message::features::data_classification::DataClassificationFeature;
+        use crate::message::login::Feature;
+        use crate::token::data_classification::SensitivityRank;
+
+        /// One unclassified column; v2 adds a NotDefined result-set rank.
+        fn classification_token(version: DataClassificationVersion) -> Vec<u8> {
+            let mut bytes = vec![TokenType::DataClassification as u8, 0, 0, 0, 0];
+            if version == DataClassificationVersion::Version2 {
+                bytes.extend_from_slice(&(-1i32).to_le_bytes());
+            }
+            bytes.extend_from_slice(&[1, 0, 0, 0]);
+            bytes
+        }
+
+        fn transport_with(tokens: &[u8]) -> NetworkTransport {
+            let done = [TokenType::Done as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            create_network_transport_with_data(
+                &TestPacketBuilder::new(PacketType::TabularResult)
+                    .append_bytes(tokens)
+                    .append_bytes(&done)
+                    .build(),
+            )
+        }
+
+        fn negotiate(transport: &mut NetworkTransport, ack: &[u8]) {
+            negotiate_requesting(transport, DataClassificationVersion::Version2, ack);
+        }
+
+        fn negotiate_requesting(
+            transport: &mut NetworkTransport,
+            requested: DataClassificationVersion,
+            ack: &[u8],
+        ) {
+            let mut settings = create_test_negotiated_settings_internal().session_settings;
+            let mut feature = DataClassificationFeature::new(requested);
+            feature.set_acknowledged(true);
+            feature.deserialize(ack).unwrap();
+            settings.supported_features.push(Box::new(feature));
+            transport.notify_session_setting_change(&settings);
+        }
+
+        /// [MS-TDS] 2.2.7.5 sends ranks only when the request and the
+        /// acknowledgement are both V2, so either mixed pair carries the V1
+        /// layout. Parsing it as V2 would read the column count as a rank.
+        #[tokio::test]
+        async fn mixed_versions_parse_the_v1_layout() {
+            for (requested, ack_version) in [
+                (DataClassificationVersion::Version1, 0x02),
+                (DataClassificationVersion::Version2, 0x01),
+            ] {
+                let mut transport =
+                    transport_with(&classification_token(DataClassificationVersion::Version1));
+                negotiate_requesting(&mut transport, requested, &[ack_version, 0x01]);
+
+                let token = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                let Tokens::DataClassification(metadata) = token else {
+                    panic!("expected a DataClassification token, got {token:?}");
+                };
+                assert_eq!(metadata.version, DataClassificationVersion::Version1);
+                assert_eq!(metadata.rank, None);
+                assert_eq!(metadata.columns.len(), 1);
+
+                let next = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn login_negotiated_version_drives_0xa3_parsing() {
+            for (ack_version, version, rank) in [
+                (0x01, DataClassificationVersion::Version1, None),
+                (
+                    0x02,
+                    DataClassificationVersion::Version2,
+                    Some(SensitivityRank::NotDefined),
+                ),
+            ] {
+                let mut transport = transport_with(&classification_token(version));
+                negotiate(&mut transport, &[ack_version, 0x01]);
+
+                let token = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                let Tokens::DataClassification(metadata) = token else {
+                    panic!("expected a DataClassification token, got {token:?}");
+                };
+                assert_eq!(metadata.version, version);
+                assert_eq!(metadata.rank, rank);
+                assert_eq!(metadata.columns.len(), 1);
+                assert!(!metadata.columns[0].is_classified());
+
+                let next = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_0xa3_unless_the_server_enabled_the_feature() {
+            let version = DataClassificationVersion::Version2;
+            for ack in [None, Some([0x02, 0x00])] {
+                let mut transport = transport_with(&classification_token(version));
+                if let Some(ack) = ack {
+                    negotiate(&mut transport, &ack);
+                }
+
+                let error = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("not negotiated"), "{error}");
+            }
+        }
+
+        /// A reconnect or redirect performs a fresh login, whose settings
+        /// replace the cached version rather than adding to it.
+        #[tokio::test]
+        async fn a_new_login_replaces_the_cached_version() {
+            let mut transport = transport_with(&[]);
+            negotiate(&mut transport, &[0x02, 0x01]);
+            assert_eq!(
+                transport.negotiated_data_classification_version(),
+                Some(DataClassificationVersion::Version2)
+            );
+
+            transport.notify_session_setting_change(
+                &create_test_negotiated_settings_internal().session_settings,
+            );
+            assert_eq!(transport.negotiated_data_classification_version(), None);
+        }
+
+        /// A cancelled classified result set drains through DONE_ATTN without
+        /// retaining its DATACLASSIFICATION tokens for replay.
+        #[tokio::test(start_paused = true)]
+        async fn attention_drain_discards_classification_tokens() {
+            let version = DataClassificationVersion::Version2;
+            let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+                .continuation()
+                .append_bytes(&classification_token(version))
+                .append_bytes(&classification_token(version))
+                .build();
+            stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&stream);
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+            )
+            .await
+            .expect("the attention drain hung on a classification token");
+
+            assert!(
+                matches!(result, Err(OperationCancelledError(_))),
+                "{result:?}"
+            );
+            assert!(!is_known_dead(&transport));
+            let settlement = transport
+                .take_attention_settlement()
+                .expect("the acknowledgement must produce settlement state");
+            assert!(
+                settlement
+                    .tokens
+                    .iter()
+                    .all(|token| !matches!(token, Tokens::DataClassification(_))),
+                "{:?}",
+                settlement.tokens
+            );
+            assert_eq!(settlement.tokens.len(), 1, "only DONE_ATTN is retained");
+        }
+    }
+
+    fn int4_row_context(column_count: usize) -> ParserContext {
+        ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: u16::try_from(column_count).unwrap(),
+                columns: (0..column_count)
+                    .map(|index| ColumnMetadata {
+                        user_type: 0,
+                        flags: 0,
+                        type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                        data_type: TdsDataType::Int4,
+                        column_name: format!("value{index}"),
+                        multi_part_name: None,
+                        crypto_metadata: None,
+                    })
+                    .collect(),
+                cek_table: vec![],
+            }),
+            None,
+        )
+    }
+
+    fn plp_varbinary_metadata() -> Arc<ColMetadataToken> {
+        Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::partial_len(
+                    TdsDataType::BigVarBinary,
+                    usize::from(u16::MAX),
+                    None,
+                )
+                .unwrap(),
+                data_type: TdsDataType::BigVarBinary,
+                column_name: "payload".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: vec![],
+        })
+    }
+
+    fn plp_varbinary_row_context() -> ParserContext {
+        ParserContext::ColumnMetadata(plp_varbinary_metadata(), None)
+    }
 
     impl Stream for DuplexStream {
         fn tls_handshake_starting(&mut self) {
@@ -1813,6 +3531,182 @@ pub(crate) mod tests {
             ),
             server_side,
         )
+    }
+
+    /// A stream whose reads always fail, used to exercise the I/O-error arm of
+    /// `try_get_new_tds_packet` that a duplex stream's plain EOF can't reach.
+    struct ErroringStream;
+
+    impl AsyncRead for ErroringStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(Error::new(
+                ErrorKind::ConnectionReset,
+                "synthetic read failure",
+            )))
+        }
+    }
+
+    impl AsyncWrite for ErroringStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for ErroringStream {
+        fn tls_handshake_starting(&mut self) {}
+        fn tls_handshake_completed(&mut self) {}
+    }
+
+    struct HookTrackingStream {
+        inner: DuplexStream,
+        events: Arc<Mutex<[bool; 4]>>,
+    }
+
+    impl AsyncRead for HookTrackingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for HookTrackingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            this.events.lock().unwrap()[0] = true;
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            this.events.lock().unwrap()[1] = true;
+            Pin::new(&mut this.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Stream for HookTrackingStream {
+        fn tls_handshake_starting(&mut self) {
+            self.events.lock().unwrap()[2] = true;
+        }
+
+        fn tls_handshake_completed(&mut self) {
+            self.events.lock().unwrap()[3] = true;
+        }
+
+        fn channel_binding_token(&self) -> Option<Vec<u8>> {
+            Some(vec![1, 2, 3])
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_stream_forwards_hooks_and_requires_exclusive_extraction() {
+        let (inner, mut peer) = duplex(MAX_BUFFER_SIZE);
+        let events = Arc::new(Mutex::new([false; 4]));
+        let mut stream = SharedStream::new(Box::new(HookTrackingStream {
+            inner,
+            events: Arc::clone(&events),
+        }));
+
+        stream.write_all(b"x").await.unwrap();
+        let mut byte = [0_u8; 1];
+        peer.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, *b"x");
+
+        peer.write_all(b"y").await.unwrap();
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, *b"y");
+
+        stream.flush().await.unwrap();
+        assert_eq!(stream.channel_binding_token(), Some(vec![1, 2, 3]));
+        stream.tls_handshake_starting();
+        stream.tls_handshake_completed();
+        stream.shutdown().await.unwrap();
+        assert_eq!(*events.lock().unwrap(), [true; 4]);
+
+        let outstanding = stream.clone();
+        let error = stream
+            .into_inner()
+            .err()
+            .expect("a shared stream must not be extracted");
+        assert!(matches!(
+            error,
+            crate::error::Error::ImplementationError(message)
+                if message.contains("still holds it")
+        ));
+        drop(outstanding.into_inner().unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_new_tds_packet_surfaces_a_read_error_and_marks_the_connection_dead() {
+        let context = ClientContext::default();
+        let ssl_handler = SslHandler {
+            server_host_name: context.transport_context.get_server_name().clone(),
+            encryption_options: context.encryption_options.clone(),
+        };
+        let mut transport = NetworkTransport::new(
+            Box::new(ErroringStream),
+            ssl_handler,
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        );
+
+        let err = transport
+            .read_tds_packet()
+            .await
+            .expect_err("a failing stream must surface its read error");
+        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(transport.known_dead);
+    }
+
+    #[tokio::test]
+    async fn try_get_new_tds_packet_surfaces_a_read_error_and_marks_the_connection_dead() {
+        // Same as above, but through the synchronous, non-blocking
+        // `try_get_new_tds_packet` poll used by the buffered PLP read loop.
+        let context = ClientContext::default();
+        let ssl_handler = SslHandler {
+            server_host_name: context.transport_context.get_server_name().clone(),
+            encryption_options: context.encryption_options.clone(),
+        };
+        let mut transport = NetworkTransport::new(
+            Box::new(ErroringStream),
+            ssl_handler,
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        );
+
+        let err = transport
+            .try_read_tds_packet()
+            .expect_err("a failing stream must surface its read error");
+        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(transport.known_dead);
     }
 
     #[tokio::test]
@@ -2128,6 +4022,194 @@ pub(crate) mod tests {
 
         // No pending bytes
         assert_eq!(transport.tds_read_buffer.pending_bytes, 0);
+    }
+
+    fn tabular_packet(payload: &[u8], end_of_message: bool) -> Vec<u8> {
+        let packet_len = PacketWriter::PACKET_HEADER_SIZE + payload.len();
+        let mut packet = vec![0; packet_len];
+        packet[0] = PacketType::TabularResult as u8;
+        packet[1] = u8::from(end_of_message);
+        BigEndian::write_u16(&mut packet[2..4], u16::try_from(packet_len).unwrap());
+        packet[PacketWriter::PACKET_HEADER_SIZE..].copy_from_slice(payload);
+        packet
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_appends_an_available_packet() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        server
+            .write_all(&tabular_packet(b"second", true))
+            .await
+            .unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_returns_pending_without_losing_payload() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        assert!(!transport.try_read_tds_packet().unwrap());
+        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"first");
+    }
+
+    #[tokio::test]
+    async fn buffered_plp_probe_defers_before_exhausting_packet_buffer() {
+        const PACKET_SIZE: usize = 512;
+        const PACKET_PAYLOAD: usize = PACKET_SIZE - PacketWriter::PACKET_HEADER_SIZE;
+        const VALUE_LEN: usize = 1600;
+
+        let mut plp_wire = Vec::with_capacity(VALUE_LEN + 8);
+        plp_wire.extend_from_slice(&u32::try_from(VALUE_LEN).unwrap().to_le_bytes());
+        plp_wire.extend(std::iter::repeat_n(0xAB, VALUE_LEN));
+        plp_wire.extend_from_slice(&0_u32.to_le_bytes());
+
+        let chunks = plp_wire.chunks(PACKET_PAYLOAD);
+        let packet_count = chunks.len();
+        let mut packets = Vec::new();
+        for (index, chunk) in chunks.enumerate() {
+            packets.extend_from_slice(&tabular_packet(chunk, index + 1 == packet_count));
+        }
+
+        let context = ClientContext {
+            packet_size: u16::try_from(PACKET_SIZE).unwrap(),
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server.write_all(&packets).await.unwrap();
+
+        let metadata = ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: TypeInfo::partial_len(
+                TdsDataType::BigVarBinary,
+                usize::from(u16::MAX),
+                None,
+            )
+            .unwrap(),
+            data_type: TdsDataType::BigVarBinary,
+            column_name: "payload".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let (stream, _) =
+            PlpColumnStream::try_begin_buffered(&metadata, &(VALUE_LEN as u64).to_le_bytes())
+                .unwrap()
+                .unwrap();
+        let mut plp_state = PlpPauseState {
+            row_pause_state: RowPauseState {
+                next_column_index: 1,
+                metadata: Arc::new(ColMetadataToken {
+                    column_count: 1,
+                    columns: vec![metadata],
+                    cek_table: Vec::new(),
+                }),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            plp_stream: stream.unwrap(),
+        };
+        let mut out = vec![0; 1300];
+
+        assert!(matches!(
+            transport.try_read_buffered_plp(&mut plp_state, &mut out),
+            Ok(None)
+        ));
+        assert_eq!(
+            transport
+                .read_active_plp_bytes(&mut plp_state, None, None, &mut out)
+                .await
+                .unwrap(),
+            out.len()
+        );
+        assert!(out.iter().all(|byte| *byte == 0xAB));
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_preserves_a_fragmented_header() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        let second = tabular_packet(b"second", true);
+        server.write_all(&second[..4]).await.unwrap();
+        assert!(!transport.try_read_tds_packet().unwrap());
+        server.write_all(&second[4..]).await.unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_preserves_a_fragmented_payload() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        let second = tabular_packet(b"second", true);
+        server.write_all(&second[..10]).await.unwrap();
+        assert!(!transport.try_read_tds_packet().unwrap());
+        server.write_all(&second[10..]).await.unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_stops_at_end_of_message() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"only", true))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        assert!(!transport.try_read_tds_packet().unwrap());
+        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"only");
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.
@@ -2881,7 +4963,7 @@ pub(crate) mod tests {
     async fn test_read_value_spanning_packet_boundary() {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        let mut stream = first.continuation().append_bytes(&[0x11, 0x22]).build();
         stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
 
         let mut reader = create_network_transport_with_data(&stream);
@@ -2893,12 +4975,384 @@ pub(crate) mod tests {
     async fn test_read_value_spanning_packet_boundary_fragmented() {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        let mut stream = first.continuation().append_bytes(&[0x11, 0x22]).build();
         stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
 
         let mut reader = create_network_transport_with_chunked_data(&stream, 3);
 
         assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
+    }
+
+    #[tokio::test]
+    async fn buffered_cursor_reads_complete_row_header_and_column() {
+        let expected = 0x1234_5678_i32;
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&expected.to_le_bytes());
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        let pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .expect("complete buffered row header");
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 0).unwrap(),
+            Some(ColumnValues::Int(expected))
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_finishes_a_complete_row_without_continuation() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(expected.len()))
+            .unwrap()
+            .expect("complete buffered row header");
+        let mut writer = DefaultRowWriter::new(expected.len());
+
+        assert!(
+            reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_keeps_partial_column_for_async_continuation() {
+        let expected = [0x1234_5678_i32, -42_i32, 123_i32, -456_i32];
+        let second = expected[1].to_le_bytes();
+        let mut first_payload = vec![TokenType::Row as u8];
+        first_payload.extend_from_slice(&expected[0].to_le_bytes());
+        first_payload.extend_from_slice(&second[..2]);
+
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second_packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        let mut remaining = second[2..].to_vec();
+        remaining.extend(expected[2..].iter().flat_map(|value| value.to_le_bytes()));
+        remaining.push(TokenType::Done as u8);
+        stream.extend_from_slice(&second_packet.append_bytes(&remaining).build());
+        let mut reader = create_network_transport_with_data(&stream);
+        reader.read_tds_packet().await.unwrap();
+
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(expected.len()))
+            .unwrap()
+            .expect("complete buffered row header");
+        let mut writer = DefaultRowWriter::new(expected.len());
+
+        assert!(
+            !reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(pause_state.next_column_index, 1);
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            2,
+            "the partial second value must remain buffered"
+        );
+
+        let result = reader
+            .resume_row_into(
+                pause_state,
+                None,
+                None,
+                ColumnPolicy::DecodeAll,
+                &mut writer,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.buffered_slice(), &[TokenType::Done as u8]);
+    }
+
+    #[tokio::test]
+    async fn buffered_cursor_miss_preserves_bytes_for_async_continuation() {
+        let expected = 0x1234_5678_i32;
+        let value = expected.to_le_bytes();
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut first_payload = vec![TokenType::Row as u8];
+        first_payload.extend_from_slice(&value[..2]);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(&second.append_bytes(&value[2..]).build());
+        let mut reader = create_network_transport_with_data(&stream);
+        reader.read_tds_packet().await.unwrap();
+
+        let pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .expect("row header is wholly buffered");
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 2);
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            2,
+            "a miss must not consume the partial scalar"
+        );
+
+        let mut writer = DefaultRowWriter::new(1);
+        let result = reader
+            .resume_row_into(
+                pause_state,
+                None,
+                None,
+                ColumnPolicy::DecodeOne(0),
+                &mut writer,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        assert_eq!(writer.take_row(), vec![ColumnValues::Int(expected)]);
+    }
+
+    #[tokio::test]
+    async fn buffered_nbcrow_null_column_needs_no_payload_bytes() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [TokenType::NbcRow as u8, 0b0000_0001];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        let pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .expect("complete NBCROW header");
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 0).unwrap(),
+            Some(ColumnValues::Null)
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_cursor_rejects_invalid_context_and_preserves_non_rows() {
+        let mut empty_packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut empty = create_network_transport_with_data(&empty_packet.build());
+        empty.read_tds_packet().await.unwrap();
+        assert!(
+            empty
+                .try_receive_row_header(&int4_row_context(1))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [TokenType::Done as u8];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        assert!(
+            reader
+                .try_receive_row_header(&ParserContext::None(()))
+                .is_err()
+        );
+        assert!(
+            reader
+                .try_receive_row_header(&int4_row_context(1))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 1);
+
+        let pause_state = RowPauseState {
+            next_column_index: 1,
+            metadata: match int4_row_context(1) {
+                ParserContext::ColumnMetadata(metadata, _) => metadata,
+                _ => unreachable!(),
+            },
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 1).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_propagates_decoder_errors() {
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::var_len(TdsDataType::IntN, 8).unwrap(),
+                data_type: TdsDataType::IntN,
+                column_name: "value".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: Vec::new(),
+        });
+        let mut pause_state = RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut reader =
+            create_network_transport_with_data(&packet.append_bytes(&[3, 0, 0, 0]).build());
+        reader.read_tds_packet().await.unwrap();
+        let mut writer = DefaultRowWriter::new(1);
+
+        assert!(
+            reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_writes_nbcrow_nulls() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [TokenType::NbcRow as u8, 0b0000_0001];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .unwrap();
+        let mut writer = DefaultRowWriter::new(1);
+
+        assert!(
+            reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(writer.take_row(), vec![ColumnValues::Null]);
+    }
+
+    #[tokio::test]
+    async fn buffered_variant_column_honors_nbcrow_null_bitmap() {
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::var_len(TdsDataType::SsVariant, 8009).unwrap(),
+                data_type: TdsDataType::SsVariant,
+                column_name: "variant".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: Vec::new(),
+        });
+        let pause_state = RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: Some(Arc::from([1_u8])),
+            decryptor: None,
+        };
+        let mut reader = create_network_transport_with_data(&[]);
+
+        assert_eq!(
+            reader
+                .try_read_buffered_column_with_base(&pause_state, 0)
+                .unwrap(),
+            Some((ColumnValues::Null, None))
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_nbcrow_reuses_unaliased_bitmap_allocation() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [
+            TokenType::NbcRow as u8,
+            0b0000_0001,
+            0b0000_0010,
+            TokenType::NbcRow as u8,
+            0b0000_0100,
+            0b0000_1000,
+        ];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+        let context = int4_row_context(9);
+
+        let first = reader
+            .try_receive_row_header(&context)
+            .unwrap()
+            .expect("first NBCROW header");
+        let first_bitmap = first.nbc_null_bitmap.as_ref().expect("first bitmap");
+        assert_eq!(first_bitmap.as_ref(), &[0b0000_0001, 0b0000_0010]);
+        let first_allocation = first_bitmap.as_ptr();
+        drop(first);
+
+        let second = reader
+            .try_receive_row_header(&context)
+            .unwrap()
+            .expect("second NBCROW header");
+        let second_bitmap = second.nbc_null_bitmap.as_ref().expect("second bitmap");
+        assert_eq!(second_bitmap.as_ref(), &[0b0000_0100, 0b0000_1000]);
+        assert_eq!(
+            second_bitmap.as_ptr(),
+            first_allocation,
+            "the uniquely owned scratch bitmap should be refilled in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_nbcrow_bitmap_miss_preserves_header_for_async_continuation() {
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first
+            .continuation()
+            .append_bytes(&[TokenType::NbcRow as u8, 0])
+            .build();
+        stream.extend_from_slice(&second.append_bytes(&[0]).build());
+        let mut reader = create_network_transport_with_data(&stream);
+        reader.read_tds_packet().await.unwrap();
+        let context = int4_row_context(9);
+
+        assert!(reader.try_receive_row_header(&context).unwrap().is_none());
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            2,
+            "the token and partial bitmap must remain buffered"
+        );
+
+        let header = reader
+            .receive_row_header(&context, None, None)
+            .await
+            .unwrap();
+        let RowHeader::Positioned(pause_state) = header else {
+            panic!("expected an NBCROW position");
+        };
+        assert_eq!(
+            pause_state
+                .nbc_null_bitmap
+                .as_ref()
+                .expect("NBCROW bitmap")
+                .as_ref(),
+            &[0, 0]
+        );
     }
 
     #[tokio::test]
@@ -2942,9 +5396,15 @@ pub(crate) mod tests {
         ];
 
         let mut stream = Vec::new();
-        for payload in payloads {
+        let last_index = payloads.len() - 1;
+        for (index, payload) in payloads.iter().enumerate() {
             let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
-            stream.extend_from_slice(&packet.append_bytes(&payload).build());
+            // Every value below spans a packet boundary *inside one message*,
+            // so only the final packet carries EOM.
+            if index != last_index {
+                packet.continuation();
+            }
+            stream.extend_from_slice(&packet.append_bytes(payload).build());
         }
 
         let mut reader = create_network_transport_with_data(&stream);
@@ -2989,6 +5449,46 @@ pub(crate) mod tests {
         assert_eq!(reader.read_float64().await.unwrap(), expected_float64);
     }
 
+    #[tokio::test]
+    async fn test_slice_probe_hits_within_a_packet() {
+        let payload: Vec<u8> = (0..32u8).collect();
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let stream = packet.append_bytes(&payload).build();
+
+        let mut reader = create_network_transport_with_data(&stream);
+
+        // Nothing is buffered until the first awaiting read pulls a packet in.
+        assert_eq!(reader.try_read_slice(1), None);
+        assert_eq!(reader.read_byte().await.unwrap(), 0);
+
+        // The rest of the packet is now resident, so the probe serves it.
+        assert_eq!(reader.try_read_slice(31), Some(&payload[1..]));
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_slice_probe_falls_back_across_a_packet_boundary() {
+        // Ten bytes split five and five across two packets of one message, so a
+        // value crossing the split is never resident in one packet. That is the
+        // case the borrowed path declines.
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.append_bytes(&[0, 1, 2, 3, 4]).continuation().build();
+        stream.extend_from_slice(&second.append_bytes(&[5, 6, 7, 8, 9]).build());
+
+        let mut reader = create_network_transport_with_data(&stream);
+        assert_eq!(reader.read_byte().await.unwrap(), 0);
+
+        // Four bytes left in this packet, so a nine byte value misses.
+        assert_eq!(reader.try_read_slice(9), None);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 4);
+
+        // The miss must leave those four bytes for the awaiting read.
+        let mut owned = vec![0u8; 9];
+        reader.read_bytes(&mut owned).await.unwrap();
+        assert_eq!(owned, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
     /// A payload-free non-EOM packet is malformed: it neither carries payload
     /// nor terminates a message.
     #[tokio::test]
@@ -3008,6 +5508,10 @@ pub(crate) mod tests {
     /// The same packet *with* EOM set is legal — an empty end-of-message packet
     /// terminates a message — so it is consumed and the reader carries on to
     /// the payload of the next packet.
+    ///
+    /// The bulk loops must reach the same verdict on the same bytes: a read
+    /// that has not yet consumed anything is starting a new message, not
+    /// over-reading the last one.
     #[tokio::test]
     async fn test_payload_free_eom_packet_is_accepted() {
         let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
@@ -3015,7 +5519,1477 @@ pub(crate) mod tests {
         stream.extend_from_slice(&next.append_byte(0x7F).build());
 
         let mut reader = create_network_transport_with_data(&stream);
-
         assert_eq!(reader.read_byte().await.unwrap(), 0x7F);
+
+        let mut reader = create_network_transport_with_data(&stream);
+        let mut one = [0u8; 1];
+        assert_eq!(reader.read_bytes(&mut one).await.unwrap(), 1);
+        assert_eq!(one[0], 0x7F, "read_bytes must agree with read_byte");
+
+        let mut reader = create_network_transport_with_data(&stream);
+        reader
+            .skip_bytes(1)
+            .await
+            .expect("skip_bytes must agree with read_byte");
+    }
+
+    // ---------------------------------------------------------------------
+    // No-progress edge cases in the bulk read loops
+    //
+    // An empty end-of-message packet is legal framing but carries no payload.
+    // A bulk read still short of its target treats it as a refill that yielded
+    // nothing, and — before the no-progress check — went straight back to the
+    // socket. A real server has finished its message at that point and sends
+    // nothing more until the client issues a new request, so the read blocked
+    // forever.
+    //
+    // These use `create_network_transport_with_live_peer` so the connection
+    // stays open after the data is drained: with a dropped writer the reader
+    // would hit EOF and error out no matter how broken the loop is, which is
+    // exactly the masking these tests exist to avoid. Each is bounded by an
+    // outer timeout, so a regression shows up as an elapsed timeout.
+    // ---------------------------------------------------------------------
+
+    /// One payload byte, then an empty EOM packet, against a request for two
+    /// bytes. The second byte can never arrive.
+    #[tokio::test]
+    async fn read_bytes_past_end_of_message_errors_instead_of_hanging() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x11)
+            .build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let result = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("read_bytes hung: the refill loop consumed an empty EOM packet forever");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// `read_bytes_uninit` carries its own copy of the loop and needs the same
+    /// check.
+    #[tokio::test]
+    async fn read_bytes_uninit_past_end_of_message_errors_instead_of_hanging() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x22)
+            .build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        let result = timeout(
+            Duration::from_secs(5),
+            reader.read_bytes_uninit(&mut destination),
+        )
+        .await
+        .expect("read_bytes_uninit hung: the refill loop consumed an empty EOM packet forever");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// The scalar readers carry their own copies of the refill loop. A value
+    /// that is *partially* delivered at the end of a message can never be
+    /// completed, so it must error rather than park on a socket that will stay
+    /// silent until the client sends a new request. `read_uint32` stands in for
+    /// the whole family.
+    ///
+    /// This is the shape a drain hits after a mid-value error: the token-stream
+    /// reader is parked partway through a value, and before this check the
+    /// drain blocked here forever instead of surfacing the error.
+    #[tokio::test]
+    async fn read_uint32_spanning_end_of_message_errors_instead_of_hanging() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x01)
+            .append_byte(0x02)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.read_uint32())
+            .await
+            .expect("read_uint32 hung on a value truncated by the end of the message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Skipping a value that runs past the end of the message must terminate
+    /// too — this is the path taken when a column is discarded rather than
+    /// decoded.
+    #[tokio::test]
+    async fn skip_bytes_past_end_of_message_errors_instead_of_hanging() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x33)
+            .build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.skip_bytes(2))
+            .await
+            .expect("skip_bytes hung: the refill loop consumed an empty EOM packet forever");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Neither check must fire on legitimate traffic: a value split across
+    /// packets still reads through, and an empty EOM packet that arrives when
+    /// nothing is outstanding is simply consumed.
+    ///
+    /// The first packet is framed as a continuation — a multi-packet message
+    /// sets EOM only on its final packet — so this exercises the real shape of
+    /// a value that spans packets.
+    #[tokio::test]
+    async fn bulk_reads_still_span_packets_and_tolerate_a_trailing_empty_eom() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_bytes(&[0xA1, 0xA2])
+            .build();
+        stream.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&[0xA3, 0xA4])
+                .build(),
+        );
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 4];
+        let read = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("a value spanning two packets must not hang")
+            .expect("a value spanning two packets must read successfully");
+
+        assert_eq!(read, 4);
+        assert_eq!(destination, [0xA1, 0xA2, 0xA3, 0xA4]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Consecutive payload-free messages.
+    //
+    // A bulk read that has not yet consumed a byte tolerates an empty EOM
+    // packet, because a read starting exactly at a message boundary consumes
+    // the packet terminating the *previous* message. That `continue` re-enters
+    // the loop with nothing changed, so a peer that keeps sending empty
+    // messages spins the loop with no state advancing and no bytes delivered —
+    // bounded only by the command timeout.
+    //
+    // One in a row is legitimate; two is not. No server sends two empty
+    // messages back to back, and the attention acknowledgement carries a DONE
+    // token, so it is not payload-free either.
+    // ---------------------------------------------------------------------
+
+    /// Two empty messages in a row, then a peer that stays open and silent.
+    /// Without the cap this spins until the caller's timeout.
+    #[tokio::test]
+    async fn read_bytes_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let result = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("read_bytes spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// `read_bytes_uninit` carries its own copy of the loop and needs the same
+    /// cap.
+    #[tokio::test]
+    async fn read_bytes_uninit_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        let result = timeout(
+            Duration::from_secs(5),
+            reader.read_bytes_uninit(&mut destination),
+        )
+        .await
+        .expect("read_bytes_uninit spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Regression coverage for AB#47704: `create_base_stream_sequential` used
+    // to resolve DNS via the blocking `std::net::ToSocketAddrs`, which never
+    // yields to the executor. That silently defeated the `timeout()`/deadline
+    // wrapped around the whole connect attempt in `tds_connection_provider`,
+    // so a slow or stuck resolver could hang the caller (and, since ODBC's
+    // `SQLDriverConnectW` runs this via `block_on` on the caller's own
+    // thread, the whole synchronous process) with no internal bound. The fix
+    // switched to `tokio::net::lookup_host`, which awaits resolution instead.
+    // These tests pin the address-sorting logic that moved as part of that
+    // change (`sort_by_ip_preference`), since it has no prior direct coverage.
+    // ---------------------------------------------------------------------
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), port)
+    }
+
+    #[test]
+    fn sort_by_ip_preference_platform_default_leaves_order_untouched() {
+        let mut addrs = vec![
+            addr("2001:db8::1", 1433),
+            addr("192.0.2.1", 1433),
+            addr("2001:db8::2", 1433),
+        ];
+        let original = addrs.clone();
+
+        sort_by_ip_preference(&mut addrs, IPAddressPreference::UsePlatformDefault);
+
+        assert_eq!(addrs, original);
+    }
+
+    #[test]
+    fn sort_by_ip_preference_ipv4_first_orders_v4_before_v6() {
+        let mut addrs = vec![
+            addr("2001:db8::1", 1433),
+            addr("192.0.2.1", 1433),
+            addr("2001:db8::2", 1433),
+            addr("192.0.2.2", 1433),
+        ];
+
+        sort_by_ip_preference(&mut addrs, IPAddressPreference::IPv4First);
+
+        assert_eq!(
+            addrs,
+            vec![
+                addr("192.0.2.1", 1433),
+                addr("192.0.2.2", 1433),
+                addr("2001:db8::1", 1433),
+                addr("2001:db8::2", 1433),
+            ],
+            "IPv4 addresses must sort before IPv6, preserving relative order within each family"
+        );
+    }
+
+    #[test]
+    fn sort_by_ip_preference_ipv6_first_orders_v6_before_v4() {
+        let mut addrs = vec![
+            addr("192.0.2.1", 1433),
+            addr("2001:db8::1", 1433),
+            addr("192.0.2.2", 1433),
+            addr("2001:db8::2", 1433),
+        ];
+
+        sort_by_ip_preference(&mut addrs, IPAddressPreference::IPv6First);
+
+        assert_eq!(
+            addrs,
+            vec![
+                addr("2001:db8::1", 1433),
+                addr("2001:db8::2", 1433),
+                addr("192.0.2.1", 1433),
+                addr("192.0.2.2", 1433),
+            ],
+            "IPv6 addresses must sort before IPv4, preserving relative order within each family"
+        );
+    }
+
+    #[test]
+    fn sort_by_ip_preference_handles_single_family_lists() {
+        let mut v4_only = vec![addr("192.0.2.1", 1433), addr("192.0.2.2", 1433)];
+        let expected = v4_only.clone();
+        sort_by_ip_preference(&mut v4_only, IPAddressPreference::IPv6First);
+        assert_eq!(v4_only, expected, "no IPv6 entries to reorder against");
+    }
+
+    /// `tokio::net::lookup_host` must be used (not blocking `to_socket_addrs()`),
+    /// so a slow/stuck resolver stays bounded by an enclosing `timeout()`
+    /// instead of escaping it. Timing can't prove this — resolving `localhost`
+    /// completes in single-digit ms either way — so this asserts the
+    /// structural property instead: a concurrently spawned heartbeat must get
+    /// scheduled while resolution is in flight. `lookup_host` bridges to
+    /// `spawn_blocking` via a channel, so the awaiting task is guaranteed to
+    /// yield at least once; a blocking `to_socket_addrs()` call never yields,
+    /// so the heartbeat gets zero chances to run. Confirmed by mutation
+    /// testing (reverting to `to_socket_addrs()` makes this fail).
+    ///
+    /// Must stay on the default `current_thread` runtime: a `multi_thread`
+    /// flavor would let the heartbeat run on another worker even if
+    /// resolution blocked, so the assertion would pass without proving
+    /// anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_base_stream_sequential_resolution_yields_to_the_executor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let heartbeats_task = heartbeats.clone();
+        // A short sleep (rather than `yield_now()`) still catches the same
+        // scheduling gap — the first increment can't happen until the main
+        // task yields either way — without busy-spinning a core for the
+        // whole resolution.
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                heartbeats_task.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        // Port 0 is never listening, so the (fast, loopback) TCP connect
+        // fails quickly once resolution completes; the call overall still
+        // returns promptly either way.
+        let _ = create_base_stream_sequential(
+            IPAddressPreference::UsePlatformDefault,
+            "localhost",
+            0,
+            30_000,
+            1_000,
+            200,
+        )
+        .await;
+
+        heartbeat.abort();
+        assert!(
+            heartbeats.load(Ordering::SeqCst) > 0,
+            "the heartbeat task never ran while resolving 'localhost' — \
+             resolution is blocking the executor instead of awaiting it"
+        );
+    }
+
+    /// Connects to `host`, a name the resolver fails (`.invalid`), after a
+    /// login allowed DNS caching for it with a local listener's address, and
+    /// checks the connect hands that resolution on to its own login.
+    async fn connects_through_the_dns_cache(host: &str, multi_subnet_failover: bool) {
+        use crate::connection::dns_cache::{DnsCache, Resolution};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![address]), true);
+
+        let transport_context = TransportContext::Tcp {
+            host: host.to_string(),
+            port: address.port(),
+            instance_name: None,
+        };
+        let (_stream, resolution) = create_base_stream(
+            IPAddressPreference::IPv4First,
+            &transport_context,
+            30_000,
+            1_000,
+            multi_subnet_failover,
+            5_000,
+        )
+        .await
+        .expect("connects with the cached address");
+        assert!(
+            timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .is_ok()
+        );
+        assert_eq!(resolution, Some(Resolution::new(host, vec![address])));
+    }
+
+    #[tokio::test]
+    async fn sequential_connect_falls_back_to_the_dns_cache() {
+        connects_through_the_dns_cache("sequential.dns-cache.invalid", false).await;
+    }
+
+    #[tokio::test]
+    async fn multi_subnet_failover_connect_falls_back_to_the_dns_cache() {
+        connects_through_the_dns_cache("parallel.dns-cache.invalid", true).await;
+    }
+
+    /// `skip_bytes` spins the same way, and it runs on the discard path that
+    /// large-value reads use, so a stall there is just as unbounded.
+    #[tokio::test]
+    async fn skip_bytes_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.skip_bytes(2))
+            .await
+            .expect("skip_bytes spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Control: the cap must stay quiet on the legitimate case it tolerates —
+    /// a read that begins exactly at a message boundary, so the first packet it
+    /// sees is the empty one terminating the previous message.
+    #[tokio::test]
+    async fn bulk_reads_tolerate_a_single_leading_empty_message() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&[0xB1, 0xB2])
+                .build(),
+        );
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let read = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("a read starting at a message boundary must not hang")
+            .expect("a leading empty message must be consumed, not rejected");
+
+        assert_eq!(read, 2);
+        assert_eq!(destination, [0xB1, 0xB2]);
+    }
+
+    // ---------------------------------------------------------------------
+    // End-of-message tracking.
+    //
+    // The tests above all append an explicit empty EOM packet after the short
+    // value, which is what lets a purely reactive `to_read == 0` check notice
+    // the problem. Real servers never send that packet: they finish the message
+    // on the packet that carries the last payload byte and then go quiet.
+    //
+    // Without recording the EOM flag, a reader still short of its target walks
+    // back into the socket and blocks there forever, so the reactive check is
+    // never reached. These tests pin the realistic shape — a complete message
+    // with payload and no trailing packet.
+    // ---------------------------------------------------------------------
+
+    /// A single EOM packet carrying one byte, against a request for two. No
+    /// trailing packet follows, exactly as a real server would leave it.
+    #[tokio::test]
+    async fn read_bytes_past_end_of_message_without_a_trailing_packet_errors_instead_of_hanging() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x11)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let result = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("read_bytes hung: the reader re-entered the socket after end-of-message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Same shape through the uninitialised-buffer loop.
+    #[tokio::test]
+    async fn read_bytes_uninit_past_end_of_message_without_a_trailing_packet_errors() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x22)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        let result = timeout(
+            Duration::from_secs(5),
+            reader.read_bytes_uninit(&mut destination),
+        )
+        .await
+        .expect("read_bytes_uninit hung: the reader re-entered the socket after end-of-message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Same shape through the skip loop, taken when a column is discarded.
+    #[tokio::test]
+    async fn skip_bytes_past_end_of_message_without_a_trailing_packet_errors() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x33)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.skip_bytes(2))
+            .await
+            .expect("skip_bytes hung: the reader re-entered the socket after end-of-message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// A value that ends exactly on the message boundary must still succeed —
+    /// the check fires on demand exceeding what remains, not on EOM alone.
+    #[tokio::test]
+    async fn a_value_ending_exactly_at_end_of_message_reads_successfully() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_bytes(&[0xB1, 0xB2])
+            .build();
+        stream.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&[0xB3])
+                .build(),
+        );
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 3];
+        let read = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("a value ending at the message boundary must not hang")
+            .expect("a value ending at the message boundary must read successfully");
+
+        assert_eq!(read, 3);
+        assert_eq!(destination, [0xB1, 0xB2, 0xB3]);
+    }
+
+    /// `reset_reader` used to `assert!` that the buffer was fully consumed.
+    /// `buffer_length` is taken from the packet header the peer sent, so that
+    /// assertion put a peer-controlled value behind a process abort that stays
+    /// active in release builds. Resetting with bytes still unread now just
+    /// discards them, which is what a reset means.
+    #[tokio::test]
+    async fn reset_reader_discards_unread_bytes_instead_of_aborting() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&[0xC1, 0xC2, 0xC3, 0xC4])
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut first = [0u8; 1];
+        reader
+            .read_bytes(&mut first)
+            .await
+            .expect("the first byte must read");
+        assert_eq!(first, [0xC1]);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 3);
+
+        TdsPacketReader::reset_reader(&mut reader);
+
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            0,
+            "reset_reader must leave an empty buffer"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Attention acknowledgement (DONE_ATTN) after cancellation or timeout.
+    //
+    // Cancelling or timing out a read sends TDS ATTENTION and then drains the
+    // response until the server answers with a DONE carrying ATTN. Neither half
+    // used to be bounded, so a server that never answers — or one that has
+    // stopped reading, stalling the send — parked the caller inside its own
+    // cancellation forever, past any deadline the caller had set.
+    //
+    // Most of these use `create_network_transport_with_live_peer_capturing_writes`
+    // so the socket stays open and silent after the scripted bytes are drained.
+    // A helper that drops its writer would hand the drain an EOF and end it no
+    // matter how unbounded it is, which is exactly the masking these tests
+    // exist to avoid. The peer also reads, so the ATTENTION write only blocks
+    // in the one test that wants it to.
+    //
+    // Time is paused, so the bound elapses the moment the runtime goes idle: a
+    // regression that arms no timer leaves only the outer guard, which then
+    // fires and fails the test instead of running for real minutes. Every wait
+    // here is under such a guard, including the channel receives — an
+    // unguarded one would hang on the very regressions these tests target.
+    // ---------------------------------------------------------------------
+
+    /// A DONE-family token with `status`, framed as a message of its own.
+    fn done_token_message_with_type(token_type: TokenType, status: u16) -> Vec<u8> {
+        TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(token_type as u8)
+            .append_u16(status)
+            .append_u16(0) // CurCmd, unused by this path
+            .append_u64(0) // RowCount
+            .build()
+    }
+
+    /// A DONE token with `status`, framed as an attention acknowledgement.
+    fn done_token_message(status: u16) -> Vec<u8> {
+        done_token_message_with_type(TokenType::Done, status)
+    }
+
+    async fn transport_responding_after_attention(
+        first_packet: Vec<u8>,
+        completion_packet: Vec<u8>,
+    ) -> (NetworkTransport, tokio::task::JoinHandle<()>) {
+        let acknowledgement = done_token_message(DoneStatus::ATTN.bits());
+        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
+        peer.write_all(&first_packet).await.unwrap();
+        let transport = build_duplex_transport(client_side);
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&completion_packet).await.unwrap();
+            peer.write_all(&acknowledgement).await.unwrap();
+        });
+        (transport, peer_task)
+    }
+
+    async fn cancel_row_read_after_first_poll(
+        first_packet: Vec<u8>,
+        completion_packet: Vec<u8>,
+        context: &ParserContext,
+        plan: ColumnPolicy,
+    ) -> (TdsResult<RowReadResult>, NetworkTransport) {
+        let column_count = match context {
+            ParserContext::ColumnMetadata(metadata, _) => metadata.columns.len(),
+            _ => panic!("row cancellation requires column metadata"),
+        };
+        let (mut transport, peer_task) =
+            transport_responding_after_attention(first_packet, completion_packet).await;
+
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        let mut writer = DefaultRowWriter::new(column_count);
+        let result = {
+            let mut read = std::pin::pin!(transport.receive_row_into(
+                context,
+                None,
+                Some(&child),
+                plan,
+                &mut writer,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "the row read unexpectedly completed before cancellation"
+            );
+            parent.cancel();
+            timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the interrupted row did not settle")
+        };
+        peer_task.await.unwrap();
+        (result, transport)
+    }
+
+    /// Encodes one INT4 COLMETADATA token for queued-result drain tests.
+    fn int4_colmetadata_bytes(name: &str) -> Vec<u8> {
+        let mut bytes = vec![TokenType::ColMetadata as u8];
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.push(TdsDataType::Int4 as u8);
+        bytes.push(u8::try_from(name.chars().count()).unwrap());
+        bytes.extend_from_slice(&encode_utf16_le(name));
+        bytes
+    }
+
+    /// Frames a one-column ROW or NBCROW message used to test metadata-aware drains.
+    fn int4_row_message(token_type: u8, is_nbc: bool, value: i32) -> Vec<u8> {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        packet.append_byte(token_type);
+        if is_nbc {
+            packet.append_byte(0);
+        }
+        packet.append_i32(value).build()
+    }
+
+    /// Buffered reads must complete without constructing a Tokio timer.
+    #[test]
+    fn ready_read_does_not_require_a_time_driver() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime without the time driver");
+
+        runtime.block_on(async {
+            let mut read = std::pin::pin!(async { Ok::<_, crate::error::Error>(7) });
+            let result =
+                await_read_or_interrupt(read.as_mut(), Some(Duration::from_secs(30)), None).await;
+
+            assert!(matches!(result, Ok(Ok(7))));
+        });
+    }
+
+    /// A spent budget still times out once the eager read poll suspends.
+    #[tokio::test(start_paused = true)]
+    async fn suspended_read_observes_an_exhausted_timeout_budget() {
+        let mut read = std::pin::pin!(std::future::pending::<TdsResult<()>>());
+        let result = await_read_or_interrupt(read.as_mut(), Some(Duration::ZERO), None).await;
+
+        assert!(matches!(result, Err(ReadInterruption::TimedOut(_))));
+    }
+
+    /// A handle that is already cancelled, so the read it guards is abandoned
+    /// before a byte is consumed.
+    fn cancelled_handle() -> CancelHandle {
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        parent.cancel();
+        child
+    }
+
+    /// Reads the flag connection pools consult before handing a connection out
+    /// again.
+    fn is_known_dead(transport: &NetworkTransport) -> bool {
+        use crate::connection::transport::tds_transport::TdsTransport;
+        TdsTransport::connection_known_dead(transport)
+    }
+
+    /// Runs one cancelled read under the outer guard and reports how long the
+    /// cancellation cleanup took.
+    async fn time_one_cancelled_read(transport: &mut NetworkTransport) -> Duration {
+        let started = Instant::now();
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("cancellation hung waiting for a DONE_ATTN the server never sent");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must still see its cancellation, got {result:?}"
+        );
+        started.elapsed()
+    }
+
+    /// The bug: cancellation waits for a `DONE_ATTN` that never comes.
+    ///
+    /// The peer acknowledges nothing, so before the bound the drain parked on
+    /// the socket and the caller never got its cancellation back.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_does_not_wait_forever_for_an_attention_acknowledgement() {
+        let (mut transport, mut written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("cancellation hung waiting for a DONE_ATTN the server never sent");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must still see its cancellation, got {result:?}"
+        );
+
+        let sent = timeout(Duration::from_secs(600), written.recv())
+            .await
+            .expect("cancellation returned without ever putting ATTENTION on the wire")
+            .expect("the peer must observe a write");
+        assert_eq!(
+            sent[0],
+            PacketType::Attention as u8,
+            "cancellation must put an ATTENTION packet on the wire"
+        );
+    }
+
+    /// The bound has to cover the ATTENTION write, not just the drain that
+    /// follows it.
+    ///
+    /// The duplex is one byte wide and the peer end is held without ever being
+    /// read, so the client's ATTENTION packet fills that byte and the write
+    /// parks — a peer whose receive window has closed, in miniature. Timing
+    /// only the drain leaves the caller stuck here, before any deadline is
+    /// armed.
+    ///
+    /// The sizing lives in the test rather than in a shared helper: borrowed,
+    /// it could be widened for some other test's benefit, the write would then
+    /// succeed, the drain would time out instead, and both assertions below
+    /// would still hold — leaving a passing test that no longer covers the
+    /// send. The last assertion pins the mechanism for the same reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_attention_write_does_not_park_cancellation() {
+        /// A TDS header with no payload, which is all an ATTENTION packet is.
+        const ATTENTION_PACKET_LEN: usize = 8;
+
+        let (client_side, mut peer) = duplex(1);
+        let mut transport = build_duplex_transport(client_side);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("cancellation hung writing ATTENTION to a peer that had stopped reading");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must still see its cancellation, got {result:?}"
+        );
+        assert!(
+            is_known_dead(&transport),
+            "a half-written attention leaves the stream unresynchronisable"
+        );
+
+        let mut buffer = [0u8; ATTENTION_PACKET_LEN];
+        let delivered = timeout(Duration::from_secs(600), peer.read(&mut buffer))
+            .await
+            .expect("the write left nothing with the peer, so nothing stalled")
+            .expect("reading the peer end must not fail");
+        assert!(
+            delivered < ATTENTION_PACKET_LEN,
+            "the write must have stalled part-way; a completed one would have \
+             delivered all {ATTENTION_PACKET_LEN} bytes, so this test would be \
+             measuring the drain instead"
+        );
+    }
+
+    /// The bound belongs to the connection, not to each call.
+    ///
+    /// Nothing consulted the known-dead flag on the way in, so a caller that
+    /// re-entered `receive_token` after a cancellation — closing a cursor,
+    /// draining what is left of a batch — paid the full bound again every
+    /// time, and the advertised ceiling multiplied by however many reads
+    /// followed.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_cancellation_does_not_spend_the_bound_again() {
+        let bound = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+
+        let first = time_one_cancelled_read(&mut transport).await;
+        assert!(
+            first >= bound,
+            "the first cancellation waits out the whole bound for an \
+             acknowledgement that never comes, took {first:?}"
+        );
+        assert!(
+            is_known_dead(&transport),
+            "an unacknowledged attention must leave the connection dead"
+        );
+
+        let second = time_one_cancelled_read(&mut transport).await;
+        assert_eq!(
+            second,
+            Duration::ZERO,
+            "a connection already given up on has nothing left to acknowledge, \
+             so a later cancellation must return without waiting at all"
+        );
+    }
+
+    /// The same unbounded wait is reachable from a request timeout, which is
+    /// the shape a caller hits without ever holding a cancellation handle.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_does_not_wait_forever_for_an_attention_acknowledgement() {
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(
+                &ParserContext::None(()),
+                Some(Duration::from_millis(50)),
+                None,
+            ),
+        )
+        .await
+        .expect("the timeout path hung waiting for a DONE_ATTN the server never sent");
+
+        assert!(
+            matches!(result, Err(TimeoutError(_))),
+            "the caller must still see its timeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_timeout_bounds_attention_for_cancel_and_query_timeout() {
+        for seconds in [1, 7, 120] {
+            for cancelled in [false, true] {
+                let (mut transport, _written) =
+                    create_network_transport_with_live_peer_capturing_writes(&[]);
+                let mut handle = CancelHandle::new();
+                handle.set_cancel_timeout_secs(seconds);
+                if cancelled {
+                    handle.cancel();
+                }
+                let request_timeout = (!cancelled).then_some(Duration::from_millis(50));
+                let start = Instant::now();
+                let result = transport
+                    .receive_token(&ParserContext::None(()), request_timeout, Some(&handle))
+                    .await;
+                assert!(
+                    matches!(result, Err(OperationCancelledError(_))) && cancelled
+                        || matches!(result, Err(TimeoutError(_))) && !cancelled
+                );
+                assert_eq!(
+                    start.elapsed(),
+                    Duration::from_secs(u64::from(seconds)) + request_timeout.unwrap_or_default()
+                );
+                assert!(is_known_dead(&transport));
+            }
+        }
+    }
+
+    /// An unacknowledged ATTENTION leaves the TDS stream at an unknown point,
+    /// so the connection must become observably unusable rather than be handed
+    /// back to a pool.
+    #[tokio::test(start_paused = true)]
+    async fn an_unacknowledged_attention_marks_the_connection_dead() {
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+
+        let _ = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("cancellation hung waiting for a DONE_ATTN the server never sent");
+
+        assert!(
+            is_known_dead(&transport),
+            "a connection whose attention went unacknowledged must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_tokens_log_once_on_buffered_and_fallback_paths() {
+        use tracing::instrument::WithSubscriber;
+
+        for kind in [
+            TokenType::Done,
+            TokenType::DoneProc,
+            TokenType::DoneInProc,
+            TokenType::ReturnStatus,
+        ]
+        .map(|kind| kind as u8)
+        {
+            let mut payload = vec![kind];
+            payload.extend(if kind == TokenType::ReturnStatus as u8 {
+                vec![0; 4]
+            } else {
+                vec![0; 12]
+            });
+            for prefix in [0, 1, payload.len()] {
+                let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+                let wire = if prefix == 1 {
+                    let mut wire = packet
+                        .continuation()
+                        .append_bytes(&payload[..prefix])
+                        .build();
+                    let mut rest = TestPacketBuilder::new(PacketType::TabularResult);
+                    wire.extend(rest.append_bytes(&payload[prefix..]).build());
+                    wire
+                } else {
+                    packet.append_bytes(&payload).build()
+                };
+                let mut transport = create_network_transport_with_data(&wire);
+                if prefix != 0 {
+                    transport.read_tds_packet().await.unwrap();
+                }
+                let logs = tempfile::NamedTempFile::new().unwrap();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_env_filter("off,mssql_tds::io::token_stream=debug")
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(logs.reopen().unwrap())
+                    .finish();
+                transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .with_subscriber(subscriber)
+                    .await
+                    .unwrap();
+                let logs = std::fs::read_to_string(logs.path()).unwrap();
+                let expected = format!(
+                    "DEBUG mssql_tds::io::token_stream: Received token type: {:?} ({kind})",
+                    TokenType::try_from(kind).unwrap()
+                );
+                let received: Vec<_> = logs
+                    .lines()
+                    .filter(|line| line.contains("Received token type:"))
+                    .collect();
+                assert_eq!(
+                    received,
+                    vec![expected.as_str()],
+                    "buffered prefix: {prefix}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_control_token_is_ready_with_zero_timeout() {
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+        let message = done_token_message(DoneStatus::COUNT.bits());
+        let payload = &message[PacketWriter::PACKET_HEADER_SIZE..];
+        transport.tds_read_buffer.working_buffer[..payload.len()].copy_from_slice(payload);
+        transport.tds_read_buffer.buffer_position = 0;
+        transport.tds_read_buffer.buffer_length = payload.len();
+
+        let token = transport
+            .receive_token(&ParserContext::None(()), Some(Duration::ZERO), None)
+            .await
+            .unwrap();
+        assert!(matches!(token, Tokens::Done(_)));
+        assert!(transport.tds_read_buffer.get_buffered_slice().is_empty());
+        assert!(!is_known_dead(&transport));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_control_token_does_not_bypass_cancellation() {
+        let (mut transport, mut written) = create_network_transport_with_live_peer_capturing_writes(
+            &done_token_message(DoneStatus::ATTN.bits()),
+        );
+        let message = done_token_message(DoneStatus::COUNT.bits());
+        let payload = &message[PacketWriter::PACKET_HEADER_SIZE..];
+        transport.tds_read_buffer.working_buffer[..payload.len()].copy_from_slice(payload);
+        transport.tds_read_buffer.buffer_position = 0;
+        transport.tds_read_buffer.buffer_length = payload.len();
+
+        let result = transport
+            .receive_token(&ParserContext::None(()), None, Some(&cancelled_handle()))
+            .await;
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(written.try_recv().is_ok());
+        assert!(!is_known_dead(&transport));
+    }
+
+    /// The check must stay quiet on a healthy cancellation: a server that
+    /// acknowledges keeps its connection usable. Without this, bounding the
+    /// wait could just condemn every cancelled connection and still pass the
+    /// tests above.
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledged_attention_leaves_the_connection_usable() {
+        let (mut transport, _written) = create_network_transport_with_live_peer_capturing_writes(
+            &done_token_message(DoneStatus::ATTN.bits()),
+        );
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("an acknowledged cancellation must not hang");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must still see its cancellation, got {result:?}"
+        );
+        assert!(
+            !is_known_dead(&transport),
+            "an acknowledged attention leaves the connection reusable"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_final_done_family_tokens_can_acknowledge_attention() {
+        for (name, token_type) in [
+            ("DONE", TokenType::Done),
+            ("DONEPROC", TokenType::DoneProc),
+            ("DONEINPROC", TokenType::DoneInProc),
+        ] {
+            let response = done_token_message_with_type(token_type, DoneStatus::ATTN.bits());
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&response);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+            )
+            .await
+            .expect("a final DONE-family acknowledgement timed out");
+
+            assert!(matches!(result, Err(OperationCancelledError(_))));
+            assert!(
+                !is_known_dead(&transport),
+                "{name}_ATTN must leave the connection reusable"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn done_more_cannot_acknowledge_attention() {
+        for (name, token_type) in [
+            ("DONE", TokenType::Done),
+            ("DONEPROC", TokenType::DoneProc),
+            ("DONEINPROC", TokenType::DoneInProc),
+        ] {
+            let mut response = done_token_message_with_type(
+                token_type,
+                (DoneStatus::ATTN | DoneStatus::MORE).bits(),
+            );
+            response.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&response);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+            )
+            .await
+            .expect("the drain stopped at a DONE_MORE token");
+
+            assert!(matches!(result, Err(OperationCancelledError(_))));
+            assert!(!is_known_dead(&transport));
+            let settlement = transport
+                .take_attention_settlement()
+                .expect("the final acknowledgement must produce settlement state");
+            assert_eq!(
+                settlement.tokens.len(),
+                2,
+                "{name}_ATTN_MORE terminated the drain early"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_settlement_stops_retaining_tokens_at_its_limit() {
+        let mut settlement = AttentionSettlement::default();
+
+        for _ in 0..=MAX_ATTENTION_SETTLEMENT_TOKENS {
+            settlement.push(Tokens::TabName);
+        }
+
+        assert_eq!(settlement.tokens.len(), MAX_ATTENTION_SETTLEMENT_TOKENS);
+        assert!(settlement.overflowed);
+    }
+
+    /// The drain discards whatever the server was still sending and stops at
+    /// the acknowledgement — tokens queued behind the ATTENTION must not be
+    /// mistaken for it, and must not push the wait past its bound either.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_discards_trailing_tokens_before_the_acknowledgement() {
+        // A plain DONE for the cancelled statement, then the acknowledgement.
+        let mut stream = done_token_message(DoneStatus::FINAL.bits());
+        stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&stream);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("the drain hung instead of skipping past the trailing DONE");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must still see its cancellation, got {result:?}"
+        );
+        assert!(
+            !is_known_dead(&transport),
+            "the acknowledgement arrived, so the connection stays usable"
+        );
+    }
+
+    /// Verifies that queued ROW and NBCROW payloads are discarded with the
+    /// interrupted result set's metadata rather than parsed as control tokens.
+    #[tokio::test(start_paused = true)]
+    async fn queued_rows_are_drained_with_current_metadata() {
+        for (name, token_type, is_nbc) in [
+            ("ROW", TokenType::Row as u8, false),
+            ("NBCROW", TokenType::NbcRow as u8, true),
+        ] {
+            let mut stream = int4_row_message(token_type, is_nbc, 42);
+            stream.extend_from_slice(&int4_row_message(token_type, is_nbc, 43));
+            stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&stream);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&int4_row_context(1), None, Some(&cancelled_handle())),
+            )
+            .await
+            .expect("the attention drain hung on a queued row");
+
+            assert!(
+                matches!(result, Err(OperationCancelledError(_))),
+                "the caller must see its cancellation, got {result:?}"
+            );
+            assert!(
+                !is_known_dead(&transport),
+                "{name} was drained through DONE_ATTN, so the connection is reusable"
+            );
+        }
+    }
+
+    /// Verifies that COLMETADATA encountered during a drain supplies the shape
+    /// needed to discard rows from a later queued result set.
+    #[tokio::test(start_paused = true)]
+    async fn attention_drain_adopts_new_colmetadata() {
+        let mut response = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&int4_colmetadata_bytes("value"))
+            .append_byte(TokenType::Row as u8)
+            .append_i32(42)
+            .build();
+        response.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&response);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(
+                &ParserContext::ColumnEncryption(false),
+                None,
+                Some(&cancelled_handle()),
+            ),
+        )
+        .await
+        .expect("the attention drain hung after new column metadata");
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "the new metadata and its row were drained through DONE_ATTN"
+        );
+    }
+
+    /// Verifies that cancellation retains a parser paused inside ROW bytes long
+    /// enough to finish the row and reach DONE_ATTN.
+    #[tokio::test]
+    async fn cancellation_preserves_a_parser_paused_mid_row() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let second_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&42_i32.to_le_bytes()[2..])
+            .build();
+        let context = int4_row_context(1);
+        let (result, transport) = cancel_row_read_after_first_poll(
+            first_packet,
+            second_packet,
+            &context,
+            ColumnPolicy::DecodeAll,
+        )
+        .await;
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "finishing the in-flight row reached DONE_ATTN and preserved the connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attention_timeout_while_draining_after_a_partial_row_retires_the_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let completion_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&42_i32.to_le_bytes()[2..])
+            .build();
+        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let row_completed = Arc::new(AtomicBool::new(false));
+        let peer_row_completed = Arc::clone(&row_completed);
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&completion_packet).await.unwrap();
+            peer_row_completed.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+        });
+
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        let context = int4_row_context(1);
+        let mut writer = DefaultRowWriter::new(1);
+        let result = {
+            let mut read = std::pin::pin!(transport.receive_row_into(
+                &context,
+                None,
+                Some(&child),
+                ColumnPolicy::DecodeAll,
+                &mut writer,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(first_poll.is_pending());
+            parent.cancel();
+            timeout(Duration::from_secs(600), read)
+                .await
+                .expect("the shared ATTENTION deadline did not bound the drain")
+        };
+
+        peer_task.abort();
+        assert!(
+            row_completed.load(Ordering::Acquire),
+            "the peer must finish the interrupted row before withholding DONE_ATTN"
+        );
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            is_known_dead(&transport),
+            "a mid-drain timeout must retire the unsynchronized connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_columns_after_a_row_pause() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let second_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&42_i32.to_le_bytes()[2..])
+            .append_i32(43)
+            .build();
+        let context = int4_row_context(2);
+        let (result, transport) = cancel_row_read_after_first_poll(
+            first_packet,
+            second_packet,
+            &context,
+            ColumnPolicy::DecodeOne(0),
+        )
+        .await;
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "the remaining column was discarded before DONE_ATTN"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_a_paused_plp_before_the_acknowledgement() {
+        let payload = b"cancelled PLP payload";
+        let total_length = u64::try_from(payload.len()).unwrap().to_le_bytes();
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&total_length[..4])
+            .build();
+        let second_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&total_length[4..])
+            .append_u32(u32::try_from(payload.len()).unwrap())
+            .append_bytes(payload)
+            .append_u32(0)
+            .build();
+        let context = plp_varbinary_row_context();
+        let (result, transport) = cancel_row_read_after_first_poll(
+            first_packet,
+            second_packet,
+            &context,
+            ColumnPolicy::DecodeOne(0),
+        )
+        .await;
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "the PLP payload was discarded before DONE_ATTN"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_completes_an_interrupted_nbcrow_header() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::NbcRow as u8)
+            .build();
+        let completion_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0)
+            .append_i32(42)
+            .build();
+        let (mut transport, peer_task) =
+            transport_responding_after_attention(first_packet, completion_packet).await;
+        let context = int4_row_context(1);
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+
+        let result = {
+            let mut read =
+                std::pin::pin!(transport.receive_row_header(&context, None, Some(&child),));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "the NBCROW header unexpectedly completed before cancellation"
+            );
+            parent.cancel();
+            timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the interrupted row header did not settle")
+        };
+
+        peer_task.await.unwrap();
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "finishing the header and row reached DONE_ATTN"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_an_active_plp_before_the_acknowledgement() {
+        let payload = b"active PLP payload";
+        let metadata = plp_varbinary_metadata();
+        let (plp_stream, _) = PlpColumnStream::try_begin_buffered(
+            &metadata.columns[0],
+            &u64::try_from(payload.len()).unwrap().to_le_bytes(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut plp_state = PlpPauseState {
+            row_pause_state: RowPauseState {
+                next_column_index: 1,
+                metadata,
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            plp_stream: plp_stream.unwrap(),
+        };
+        let completion_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_u32(u32::try_from(payload.len()).unwrap())
+            .append_bytes(payload)
+            .append_u32(0)
+            .build();
+        let (mut transport, peer_task) =
+            transport_responding_after_attention(Vec::new(), completion_packet).await;
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        let mut out = [0_u8; 1];
+
+        let result = {
+            let mut read = std::pin::pin!(transport.read_active_plp_bytes(
+                &mut plp_state,
+                None,
+                Some(&child),
+                &mut out,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "the PLP read unexpectedly completed before cancellation"
+            );
+            parent.cancel();
+            timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the interrupted PLP read did not settle")
+        };
+
+        peer_task.await.unwrap();
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(plp_state.reached_end());
+        assert!(
+            !is_known_dead(&transport),
+            "draining the active PLP reached DONE_ATTN"
+        );
     }
 }

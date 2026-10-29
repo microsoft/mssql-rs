@@ -19,6 +19,7 @@
 //! - `error_parser` - ERROR token (error messages)
 //! - `fedauth_parser` - FEDAUTHINFO token (federated authentication)
 //! - `featureext_parser` - FEATUREEXTACK token (feature extension acknowledgment)
+//! - `data_classification_parser` - DATACLASSIFICATION token (sensitivity metadata)
 //! - `colmetadata_parser` - COLMETADATA token (column metadata)
 //! - `row_parser` - ROW token (data row)
 //! - `nbcrow_parser` - NBCROW token (null-bitmap compressed row)
@@ -50,6 +51,7 @@ pub(crate) mod common;
 // Individual parser modules
 pub(crate) mod col_info_parser;
 pub(crate) mod colmetadata_parser;
+pub(crate) mod data_classification_parser;
 pub(crate) mod done_parser;
 pub(crate) mod envchange_parser;
 pub(crate) mod error_parser;
@@ -72,6 +74,7 @@ pub(crate) use common::TokenParser;
 // Re-export all parser types
 pub(crate) use col_info_parser::ColInfoTokenParser;
 pub(crate) use colmetadata_parser::ColMetadataTokenParser;
+pub(crate) use data_classification_parser::DataClassificationTokenParser;
 pub(crate) use done_parser::{DoneInProcTokenParser, DoneProcTokenParser, DoneTokenParser};
 pub(crate) use envchange_parser::EnvChangeTokenParser;
 pub(crate) use error_parser::ErrorTokenParser;
@@ -103,6 +106,7 @@ mod tests {
     fn test_parser_module_structure() {
         // Ensure all parsers can be instantiated
         let _ = DoneTokenParser::default();
+        let _ = DataClassificationTokenParser;
         let _ = DoneInProcTokenParser::default();
         let _ = DoneProcTokenParser::default();
         let _ = EnvChangeTokenParser::default();

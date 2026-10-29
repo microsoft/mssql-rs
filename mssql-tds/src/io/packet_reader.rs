@@ -13,6 +13,13 @@ macro_rules! define_tds_packet_reader {
     ($visibility:vis) => {
         /// Low-level TDS packet reading operations.
         $visibility trait TdsPacketReader {
+            /// Bytes available for non-consuming column decoding. Readers without
+            /// a contiguous buffer retain the asynchronous decode path.
+            #[inline]
+            fn buffered_slice(&self) -> &[u8] {
+                &[]
+            }
+
             /// Returns a buffered byte, or `None` without consuming data if one is unavailable.
             #[inline]
             fn try_read_byte(&mut self) -> Option<u8> {
@@ -73,6 +80,27 @@ macro_rules! define_tds_packet_reader {
                 None
             }
 
+            /// Borrows and consumes `length` buffered bytes, or returns `None`
+            /// without consuming when the whole run is not already resident.
+            ///
+            /// The borrow ends at the next use of the reader, so a caller must
+            /// copy or hand the bytes off before reading again.
+            #[inline]
+            fn try_read_slice(&mut self, _length: usize) -> Option<&[u8]> {
+                None
+            }
+
+            /// Data Classification version negotiated for the connection this
+            /// reader serves. The `0xA3` payload has no length or version field,
+            /// so its parser needs this to know the layout. `None` makes the
+            /// parser reject the token as not negotiated.
+            #[allow(private_interfaces)]
+            fn negotiated_data_classification_version(
+                &self,
+            ) -> Option<crate::token::data_classification::DataClassificationVersion> {
+                None
+            }
+
             fn read_byte(&mut self) -> impl Future<Output = TdsResult<u8>> + Send;
             fn read_int16_big_endian(&mut self) -> impl Future<Output = TdsResult<i16>> + Send;
             fn read_int32_big_endian(&mut self) -> impl Future<Output = TdsResult<i32>> + Send;
@@ -93,6 +121,10 @@ macro_rules! define_tds_packet_reader {
                 buffer: &mut [u8],
             ) -> impl Future<Output = TdsResult<usize>> + Send;
             /// Fills a possibly-uninitialized byte buffer.
+            ///
+            /// On `Ok(n)`, the first `n` elements of `buffer` are initialized.
+            /// Callers rely on this to `set_len` an owned buffer, so an
+            /// implementation must not report bytes it did not write.
             fn read_bytes_uninit(
                 &mut self,
                 buffer: &mut [MaybeUninit<u8>],

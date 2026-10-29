@@ -23,6 +23,12 @@ pub mod datatypes;
 pub mod ffidatatypes;
 
 #[napi]
+pub fn set_default_multi_subnet_failover(enabled: bool) -> napi::Result<()> {
+    mssql_tds::connection::multi_subnet_failover::set_default_multi_subnet_failover(enabled)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+#[napi]
 pub async fn connect(context: JsClientContext) -> napi::Result<Connection> {
     // Initialize tracing if enabled
     init_tracing();

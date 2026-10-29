@@ -20,13 +20,25 @@
 #define SQL_OV_ODBC3_80 380UL
 #endif
 
+#ifndef SQL_COPT_SS_WARN_ON_CP_ERROR
+#define SQL_COPT_SS_WARN_ON_CP_ERROR 1243
+#endif
+
 #include <string>
 #include <vector>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
+#include <shared_mutex>
 
 /// SQLTCHAR-based string type for ODBC API calls.
 using SqlTString = std::basic_string<SQLTCHAR>;
+
+// Not an attribute in any scope. Both drivers must answer HY092/HYC00.
+// Shared here (rather than duplicated per test file) so every caller stays
+// in sync if this value ever has to change; measured against msodbcsql 18,
+// see docs/attributes_plan.md §8.
+constexpr SQLINTEGER kUnknownAttribute = 99999;
 
 // ---------------------------------------------------------------------------
 // Assertion helper macros
@@ -120,6 +132,12 @@ public:
 
     /// Convert SQLTCHAR string to narrow string (for logging).
     static std::string ToNarrow(const SqlTString& s);
+
+    /// Expected SQL_C_CHAR output, not parameter input: Windows ACP or the
+    /// supported Unix LC_CTYPE encoding (UTF-8 fallback for C/unknown locales).
+    /// Throws on invalid UTF-8 or a failed platform conversion.
+    static std::string Utf8ToNativeClient(const std::string& utf8,
+                                          bool* usedDefault = nullptr);
 };
 
 // ---------------------------------------------------------------------------
@@ -227,7 +245,26 @@ protected:
         return ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, dbc_);
     }
 
+    /// Lends handles owned by another fixture, before SetUp(). SetUp() then
+    /// adopts |env| instead of allocating one, and Connect() adopts |dbc|
+    /// (when non-null) instead of connecting; only the statement is new.
+    /// TearDown() never frees lent handles. Used by odbc_concurrent_test.h.
+    void LendHandles(SQLHENV env, SQLHDBC dbc) {
+        lent_env_ = env;
+        lent_dbc_ = dbc;
+    }
+
+    // Only idle cancellation uses this gate; running-command cancellation must
+    // remain concurrent with the executing call.
+    SQLRETURN CancelIdleStatement() {
+        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+        return SQLCancel(stmt_);
+    }
+    std::shared_mutex diagnostics_mutex_;
+
 private:
+    SQLHENV lent_env_ = SQL_NULL_HENV;
+    SQLHDBC lent_dbc_ = SQL_NULL_HDBC;
     std::vector<SQLHSTMT> extra_stmts_;
     std::chrono::steady_clock::time_point test_start_;
 };

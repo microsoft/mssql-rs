@@ -37,30 +37,37 @@ pub(crate) unsafe fn sql_connect_w(
     authentication: *const SqlWChar,
     name_length_3: SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        ?server_name,
-        name_length_1,
-        ?user_name,
-        name_length_2,
-        ?authentication,
-        name_length_3,
-        "SQLConnectW called",
-    );
-
-    crate::ffi_entry!("SQLConnectW", unsafe {
-        sql_connect_w_impl(
-            connection_handle,
-            server_name,
+    crate::ffi_entry!(
+        "SQLConnectW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            ?server_name,
             name_length_1,
-            user_name,
+            ?user_name,
             name_length_2,
-            authentication,
+            ?authentication,
             name_length_3,
-        )
-    })
+            "SQLConnectW called",
+        ),
+        unsafe {
+            sql_connect_w_impl(
+                connection_handle,
+                server_name,
+                name_length_1,
+                user_name,
+                name_length_2,
+                authentication,
+                name_length_3,
+            )
+        }
+    )
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`. Each
+/// non-null string pointer must be readable for its paired length in UTF-16
+/// code units, or through a NUL terminator when that length is `SQL_NTS`.
 unsafe fn sql_connect_w_impl(
     connection_handle: SqlHandle,
     server_name: *const SqlWChar,

@@ -400,6 +400,133 @@ mod tvp_tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn test_tvp_column_scale_controls_row_encoding() {
+        with_tvp_type(
+            "dbo.TvpItColumnScale",
+            "CREATE TYPE dbo.TvpItColumnScale AS TABLE (\
+             id INT, \
+             c_decimal DECIMAL(9,2), \
+             c_numeric NUMERIC(9,2), \
+             c_time TIME(3), \
+             c_datetime2 DATETIME2(3), \
+             c_datetimeoffset DATETIMEOFFSET(3))",
+            async |client| {
+                let mut decimal_column = TvpColumnDef::new(SqlType::Decimal(None));
+                decimal_column.precision = Some(9);
+                decimal_column.scale = Some(2);
+                let mut numeric_column = TvpColumnDef::new(SqlType::Numeric(None));
+                numeric_column.precision = Some(9);
+                numeric_column.scale = Some(2);
+                let mut time_column = TvpColumnDef::new(SqlType::Time(None));
+                time_column.scale = Some(3);
+                let mut datetime2_column = TvpColumnDef::new(SqlType::DateTime2(None));
+                datetime2_column.scale = Some(3);
+                let mut datetimeoffset_column = TvpColumnDef::new(SqlType::DateTimeOffset(None));
+                datetimeoffset_column.scale = Some(3);
+
+                let columns = vec![
+                    TvpColumnDef::new(SqlType::Int(None)),
+                    decimal_column,
+                    numeric_column,
+                    time_column,
+                    datetime2_column,
+                    datetimeoffset_column,
+                ];
+
+                let decimal = DecimalParts::from_string("123.4500", 9, 4).unwrap();
+                let numeric = DecimalParts::from_string("-67.890", 9, 3).unwrap();
+                let expected_decimal = DecimalParts::from_string("123.45", 9, 2).unwrap();
+                let expected_numeric = DecimalParts::from_string("-67.89", 9, 2).unwrap();
+                let time = SqlTime {
+                    time_nanoseconds: 123_450_000,
+                    scale: 7,
+                };
+                let datetime2 = SqlDateTime2 {
+                    days: 730_000,
+                    time: time.clone(),
+                };
+                let datetimeoffset = SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 730_001,
+                        time: time.clone(),
+                    },
+                    offset: -330,
+                };
+                let rows = vec![
+                    vec![
+                        SqlType::Int(Some(1)),
+                        SqlType::Decimal(Some(decimal)),
+                        SqlType::Numeric(Some(numeric)),
+                        SqlType::Time(Some(time.clone())),
+                        SqlType::DateTime2(Some(datetime2.clone())),
+                        SqlType::DateTimeOffset(Some(datetimeoffset.clone())),
+                    ],
+                    vec![
+                        SqlType::Int(Some(2)),
+                        SqlType::Decimal(None),
+                        SqlType::Numeric(None),
+                        SqlType::Time(None),
+                        SqlType::DateTime2(None),
+                        SqlType::DateTimeOffset(None),
+                    ],
+                ];
+
+                let table = TvpTableData::new(columns, rows);
+                let param = tvp_param(
+                    "@tvp",
+                    TvpTypeName::new(Some("dbo".to_string()), "TvpItColumnScale".to_string()),
+                    Some(table),
+                );
+                let result = exec_tvp_query(
+                    client,
+                    "SELECT id, c_decimal, c_numeric, c_time, c_datetime2, c_datetimeoffset \
+                     FROM @tvp ORDER BY id",
+                    vec![param],
+                )
+                .await;
+
+                assert_eq!(result.len(), 2);
+                assert_eq!(result[0][0], ColumnValues::Int(1));
+                assert_eq!(result[0][1], ColumnValues::Decimal(expected_decimal));
+                assert_eq!(result[0][2], ColumnValues::Numeric(expected_numeric));
+                match &result[0][3] {
+                    ColumnValues::Time(value) => {
+                        assert_eq!(value.scale, 3);
+                        assert_eq!(value.time_nanoseconds, time.time_nanoseconds);
+                    }
+                    other => panic!("c_time expected Time, got {other:?}"),
+                }
+                match &result[0][4] {
+                    ColumnValues::DateTime2(value) => {
+                        assert_eq!(value.time.scale, 3);
+                        assert_eq!(value.days, datetime2.days);
+                        assert_eq!(value.time.time_nanoseconds, datetime2.time.time_nanoseconds);
+                    }
+                    other => panic!("c_datetime2 expected DateTime2, got {other:?}"),
+                }
+                match &result[0][5] {
+                    ColumnValues::DateTimeOffset(value) => {
+                        assert_eq!(value.datetime2.time.scale, 3);
+                        assert_eq!(value.datetime2.days, datetimeoffset.datetime2.days);
+                        assert_eq!(
+                            value.datetime2.time.time_nanoseconds,
+                            datetimeoffset.datetime2.time.time_nanoseconds
+                        );
+                        assert_eq!(value.offset, datetimeoffset.offset);
+                    }
+                    other => panic!("c_datetimeoffset expected DateTimeOffset, got {other:?}"),
+                }
+
+                assert_eq!(result[1][0], ColumnValues::Int(2));
+                for (index, cell) in result[1][1..].iter().enumerate() {
+                    assert_null(cell, &format!("row 2 nullable column {}", index + 1));
+                }
+            },
+        )
+        .await;
+    }
+
     /// Mixed NULL and non-NULL cells across both fixed-length (int, bigint,
     /// bit, datetime2, uniqueidentifier, decimal) and variable-length
     /// (nvarchar, varbinary) columns. Also covers the empty-string-vs-NULL

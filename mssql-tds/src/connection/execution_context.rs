@@ -109,6 +109,14 @@ impl ExecutionContext {
                 if let EnvChangeContainer::String(string_change) = change_type {
                     info!("Database change detected: {}", string_change.new_value());
                     negotiated_settings.database = string_change.new_value().clone();
+                    // Counted on every token, not only when the name differs:
+                    // `USE [master]` while already in `master` still reports a
+                    // change, and it is the only signal a per-database cache
+                    // gets that the principal may have changed under an
+                    // `EXECUTE AS`. msodbcsql flags its own refresh the same
+                    // unconditional way (`sqlctokn.cpp:2866-2882`).
+                    negotiated_settings.database_change_count =
+                        negotiated_settings.database_change_count.wrapping_add(1);
                     Ok(())
                 } else {
                     Err(crate::error::Error::ProtocolError(format!(
@@ -199,10 +207,12 @@ impl ExecutionContext {
                     context: "capture_change_property".to_string(),
                 })
             }
-            EnvChangeTokenSubType::Routing => Err(crate::error::Error::UnimplementedFeature {
-                feature: "Routing environment change".to_string(),
-                context: "capture_change_property".to_string(),
-            }),
+            EnvChangeTokenSubType::Routing | EnvChangeTokenSubType::EnhancedRouting => {
+                Err(crate::error::Error::UnimplementedFeature {
+                    feature: "Routing environment change".to_string(),
+                    context: "capture_change_property".to_string(),
+                })
+            }
             EnvChangeTokenSubType::Unknown(value) => {
                 // Log unknown environment change subtypes but don't fail
                 info!("Unknown environment change subtype: {}", value);
@@ -337,8 +347,36 @@ mod tests {
             sub_type: EnvChangeTokenSubType::Database,
             change_type: EnvChangeContainer::from(("OldDB".to_string(), "NewDB".to_string())),
         };
+        let before = ns.database_change_count;
         ctx.capture_change_property(&change_token, &mut ns).unwrap();
         assert_eq!(ns.database, "NewDB");
+        assert_eq!(ns.database_change_count, before.wrapping_add(1));
+    }
+
+    /// `USE [X]` while already in `X` reports an `ENV_DATABASE` whose old and
+    /// new names are equal. The name alone therefore cannot tell a consumer
+    /// anything changed, which is why the count advances regardless — msodbcsql
+    /// flags its `USER_NAME()` refresh on any such token without comparing
+    /// names (`sqlctokn.cpp:2866-2882`), and combined with an `EXECUTE AS` this
+    /// is the only signal that the database principal moved.
+    #[test]
+    fn test_capture_database_change_counts_a_same_name_event() {
+        let mut ctx = ExecutionContext::new();
+        let mut ns = new_ns();
+        let change_token = EnvChangeToken {
+            sub_type: EnvChangeTokenSubType::Database,
+            change_type: EnvChangeContainer::from(("master".to_string(), "master".to_string())),
+        };
+        let before = ns.database_change_count;
+
+        ctx.capture_change_property(&change_token, &mut ns).unwrap();
+
+        assert_eq!(ns.database, "master", "the name is unchanged, as expected");
+        assert_eq!(
+            ns.database_change_count,
+            before.wrapping_add(1),
+            "a same-name database change must still be counted; the name cannot carry this"
+        );
     }
 
     #[test]
@@ -557,6 +595,7 @@ mod tests {
             EnvChangeTokenSubType::TransactionEnded,
             EnvChangeTokenSubType::UserInstanceName,
             EnvChangeTokenSubType::Routing,
+            EnvChangeTokenSubType::EnhancedRouting,
         ];
         for sub_type in unimplemented_subtypes {
             let token = EnvChangeToken {

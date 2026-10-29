@@ -3,15 +3,21 @@
 
 //! Implementation of SQLAllocHandle — the ODBC handle allocation entry point.
 
+use std::sync::Arc;
+
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
-    SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
+    SQL_DESC_ALLOC_USER, SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV,
+    SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn,
+    SqlSmallInt,
 };
+use crate::api::sqlstate::{ERR_ODBC_VERSION_NOT_SET, post_diag};
 use crate::error::free_errors;
+use crate::handles::desc::DescKind;
 use crate::handles::{
-    DbcHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw, handle_to_raw,
+    DbcHandle, DescHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw,
+    handle_to_raw,
 };
 
 /// Implementation of [`SQLAllocHandle`](super::exports::SQLAllocHandle).
@@ -23,39 +29,36 @@ pub(crate) unsafe fn sql_alloc_handle(
     input_handle: SqlHandle,
     output_handle: *mut SqlHandle,
 ) -> SqlReturn {
-    debug!(
-        handle_type,
-        ?input_handle,
-        ?output_handle,
-        "SQLAllocHandle called"
-    );
-
-    crate::ffi_entry!("SQLAllocHandle", {
-        if output_handle.is_null() {
-            error!("SQLAllocHandle: output_handle is null");
-            return SQL_INVALID_HANDLE;
-        }
-
-        // Per ODBC spec, initialize output to null before attempting allocation.
-        unsafe { output_handle.write(SQL_NULL_HANDLE) };
-
-        match handle_type {
-            SQL_HANDLE_ENV => unsafe { alloc_env(input_handle, output_handle) },
-            SQL_HANDLE_DBC => unsafe { alloc_dbc(input_handle, output_handle) },
-            SQL_HANDLE_STMT => unsafe { alloc_stmt(input_handle, output_handle) },
-            SQL_HANDLE_DESC => {
-                error!(
-                    handle_type,
-                    "SQLAllocHandle: handle type not yet implemented"
-                );
-                SQL_ERROR
+    crate::ffi_entry!(
+        "SQLAllocHandle",
+        input_handle,
+        debug!(
+            handle_type,
+            ?input_handle,
+            ?output_handle,
+            "SQLAllocHandle called"
+        ),
+        {
+            if output_handle.is_null() {
+                error!("SQLAllocHandle: output_handle is null");
+                return SQL_INVALID_HANDLE;
             }
-            _ => {
-                error!(handle_type, "SQLAllocHandle: unknown handle type");
-                SQL_INVALID_HANDLE
+
+            // Per ODBC spec, initialize output to null before attempting allocation.
+            unsafe { output_handle.write(SQL_NULL_HANDLE) };
+
+            match handle_type {
+                SQL_HANDLE_ENV => unsafe { alloc_env(input_handle, output_handle) },
+                SQL_HANDLE_DBC => unsafe { alloc_dbc(input_handle, output_handle) },
+                SQL_HANDLE_STMT => unsafe { alloc_stmt(input_handle, output_handle) },
+                SQL_HANDLE_DESC => unsafe { alloc_desc(input_handle, output_handle) },
+                _ => {
+                    error!(handle_type, "SQLAllocHandle: unknown handle type");
+                    SQL_INVALID_HANDLE
+                }
             }
         }
-    })
+    )
 }
 
 /// Allocates an environment handle.
@@ -74,7 +77,8 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
 
     let env = match EnvHandle::new() {
         Ok(e) => Box::new(e),
-        Err(_) => {
+        Err(e) => {
+            error!(%e, "SQLAllocHandle(ENV): environment initialization failed");
             return SQL_ERROR;
         }
     };
@@ -82,7 +86,7 @@ unsafe fn alloc_env(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
 
     unsafe { output_handle.write(raw) };
 
-    debug!(?raw, "Allocated ENV handle");
+    debug!(henv = ?raw, "Allocated ENV handle");
     SQL_SUCCESS
 }
 
@@ -117,20 +121,38 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
     };
     free_errors(&mut env_state);
 
-    // DM enforces SQL_ATTR_ODBC_VERSION is set before SQLAllocConnect (HY010).
-    // We assert this in debug builds only.
-    debug_assert!(
-        env_state.odbc_version != OdbcVersion::Unset,
-        "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
-    );
+    // The version can legitimately still be `Unset` here, and it must not be
+    // treated as an internal invariant. A 2.x application declares
+    // `SQL_OV_ODBC2`, the Driver Manager stores it and answers the
+    // application, then forwards it to this driver — the DM does not map 2.x
+    // onto 3.x on the driver's behalf. This driver rejects it with `HY024`,
+    // so nothing is recorded, and the DM then allocates the connection anyway.
+    //
+    // Refuse here rather than proceeding. Continuing would hand a 2.x
+    // application the 3.x contract it did not ask for — `COLUMN_SIZE` where it
+    // expects `PRECISION`, `91`/`92`/`93` where it expects `9`/`10`/`11` — and
+    // it would read those as if they were its own. This is a deliberate
+    // divergence: msodbcsql serves such an application (`SQLAllocConnect`
+    // asserts in debug builds only, `odbc/sqlcconn.cpp:527`), because it
+    // accepts the 2.x declaration in the first place. Registry entry 14.
+    if env_state.odbc_version == OdbcVersion::Unset {
+        // Log the diagnostic's own text, not a paraphrase: on the Driver
+        // Manager path the application never sees it (the DM substitutes
+        // IM005), so tracing is the only place the reason survives.
+        error!("SQLAllocHandle(DBC): {}", ERR_ODBC_VERSION_NOT_SET.text);
+        post_diag(&mut env_state, ERR_ODBC_VERSION_NOT_SET);
+        return SQL_ERROR;
+    }
 
-    let dbc = Box::new(DbcHandle::new(input_handle, env.runtime.clone()));
+    let dbc = Box::new(DbcHandle::new(input_handle, Arc::clone(&env.runtime)));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
 
     unsafe { output_handle.write(raw) };
 
-    debug!(?raw, ?input_handle, "Allocated DBC handle");
+    let _trace_scope = mssql_tds::trace_context::enabled()
+        .then(|| unsafe { crate::tracing_init::context_for(raw, "SQLAllocHandle") }.enter());
+    debug!(hdbc = ?raw, created_by_henv = ?input_handle, "Allocated DBC handle");
     SQL_SUCCESS
 }
 
@@ -164,13 +186,85 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
     };
     free_errors(&mut dbc_state);
 
-    let stmt = Box::new(StmtHandle::new(input_handle));
+    let mut stmt = Box::new(StmtHandle::new(input_handle, dbc_state.stmt_query_timeout));
+    let Ok(stmt_state) = stmt.inner.get_mut() else {
+        error!("SQLAllocHandle(STMT): new statement mutex poisoned");
+        return SQL_ERROR;
+    };
+    stmt_state.text_output = crate::conversion::fetch_convert::TextOutput {
+        encoding: dbc_state.client_encoding,
+        warn_on_loss: dbc_state.warn_on_cp_error,
+    };
     let raw = handle_to_raw(stmt);
     dbc_state.statements.push(raw);
 
     unsafe { output_handle.write(raw) };
 
-    debug!(?raw, ?input_handle, "Allocated STMT handle");
+    let _trace_scope = mssql_tds::trace_context::enabled()
+        .then(|| unsafe { crate::tracing_init::context_for(raw, "SQLAllocHandle") }.enter());
+    debug!(hstmt = ?raw, created_by_hdbc = ?input_handle, "Allocated STMT handle");
+    SQL_SUCCESS
+}
+
+/// Allocates an explicit descriptor handle under a parent connection.
+///
+/// Mirrors msodbcsql's `AllocDesc` (`sqlcdesc.cpp:5841-5908`):
+/// 1. Validate that input_handle is a valid DBC handle.
+/// 2. Heap-allocate a `DescHandle` tagged `DescKind::Ad` /
+///    `SQL_DESC_ALLOC_USER` with a back-pointer to the parent DBC.
+/// 3. Acquire the DBC lock and register the descriptor in its descriptor list.
+/// 4. Write the opaque pointer to `*output_handle`.
+///
+/// Descriptors allocated this way are owned by the connection, not by any one
+/// statement: `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC)`
+/// associates one with any statement on the same connection, and it can
+/// outlive that association or be shared by more than one statement at once.
+///
+/// The ODBC connection state-transition table gates `SQLAllocHandle` for
+/// `SQL_HANDLE_DESC` the same as `SQL_HANDLE_STMT` (C4/C5/C6 only, `08003`
+/// from C2), and marks that `08003` "(DM)" — generated by the Driver Manager,
+/// not the driver. This function does not duplicate that check: msodbcsql's
+/// own `AllocDesc` (cited above) has no connection-state check either, and
+/// neither does this crate's own `alloc_stmt` for the structurally identical
+/// `SQL_HANDLE_STMT` case. A disconnected DBC that reaches this function
+/// anyway (bypassing the DM's gate) still can't leave `SQLFreeHandle(DBC)`'s
+/// `descriptors.is_empty()` invariant broken: that invariant is just the
+/// ordinary "free every child handle before the parent" contract, which
+/// holds regardless of connection state.
+///
+/// # Safety
+/// `output_handle` must be a valid, aligned, writable pointer (validated by caller).
+/// `input_handle` must be a live `DbcHandle` created by `alloc_dbc`.
+unsafe fn alloc_desc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> SqlReturn {
+    if input_handle.is_null() {
+        error!("SQLAllocHandle(DESC): input_handle (DBC) must not be null");
+        return SQL_INVALID_HANDLE;
+    }
+
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(input_handle) };
+    debug_assert_eq!(
+        dbc.object_type,
+        HandleType::Dbc,
+        "SQLAllocHandle(DESC): input_handle is not a DBC handle"
+    );
+
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("SQLAllocHandle(DESC): dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    free_errors(&mut dbc_state);
+
+    let desc = Box::new(DescHandle::new(
+        DescKind::Ad,
+        SQL_DESC_ALLOC_USER,
+        input_handle,
+    ));
+    let raw = handle_to_raw(desc);
+    dbc_state.descriptors.push(raw);
+
+    unsafe { output_handle.write(raw) };
+
+    debug!(hdesc = ?raw, created_by_hdbc = ?input_handle, "Allocated DESC handle");
     SQL_SUCCESS
 }
 
@@ -180,9 +274,10 @@ mod tests {
 
     use super::*;
     use crate::api::free_handle::sql_free_handle;
-    use crate::api::odbc_types::{SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3_80};
+    use crate::api::odbc_types::{SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
     use crate::api::set_env_attr::sql_set_env_attr;
-    use crate::handles::{HandleType, free_handle};
+    use crate::handles::{HandleType, free_handle, handle_from_raw};
+    use crate::test_support::TestHandles;
 
     /// Helper: alloc env and set ODBC version so DBC allocation is permitted.
     fn alloc_env_v3_80() -> SqlHandle {
@@ -199,6 +294,43 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         env
+    }
+
+    /// A 2.x application's `SQL_OV_ODBC2` is rejected by `SQLSetEnvAttr`, so
+    /// nothing is recorded on the environment — and the Driver Manager still
+    /// asks the driver for a connection. Refuse it with `HY010` rather than
+    /// serving a 3.x contract the application never asked for. Anchors
+    /// `SetEnvAttrTest.Odbc2ApplicationIsRefused` in the e2e suite.
+    #[test]
+    fn alloc_dbc_is_refused_when_no_odbc_version_was_recorded() {
+        let h = TestHandles::with_unset_env();
+        let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+        assert_eq!(
+            env.inner.lock().unwrap().odbc_version,
+            OdbcVersion::Unset,
+            "precondition: no version recorded"
+        );
+
+        let mut dbc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, h.env, &mut dbc) },
+            SQL_ERROR
+        );
+        assert!(dbc.is_null(), "no connection handle may be handed back");
+        assert_eq!(
+            env.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HY010"
+        );
+    }
+
+    /// The refusal above must be keyed on the declared version, not on the
+    /// environment being fresh: both supported versions still allocate.
+    #[test]
+    fn alloc_dbc_succeeds_for_every_supported_odbc_version() {
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            assert!(!h.dbc.is_null(), "{version} must allocate a connection");
+        }
     }
 
     #[test]
@@ -277,6 +409,10 @@ mod tests {
         let dbc = unsafe { &*(dbc_handle as *const DbcHandle) };
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.connection_state, ConnectionState::Disconnected);
+        assert_eq!(
+            state.client_encoding,
+            crate::conversion::client_encoding::ClientEncoding::system_default()
+        );
         drop(state);
 
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc_handle) };
@@ -324,6 +460,21 @@ mod tests {
         let mut dbc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
         assert_eq!(ret, SQL_SUCCESS);
+        (env, dbc)
+    }
+
+    // --- Helper: alloc ENV + DBC, marked connected ---
+    // Establishes a Connected state without a real TDS client (same
+    // technique as `test_support::TestHandles::mark_dbc_connected`), for
+    // tests that want a realistic connected-session baseline. Not required
+    // for DESC allocation itself: `alloc_desc` (see its doc comment) doesn't
+    // gate on connection state, matching msodbcsql's own `AllocDesc`.
+    fn alloc_env_dbc_connected() -> (SqlHandle, SqlHandle) {
+        use crate::handles::dbc::ConnectionState;
+
+        let (env, dbc) = alloc_env_dbc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
         (env, dbc)
     }
 
@@ -400,6 +551,104 @@ mod tests {
         drop(state);
 
         unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn alloc_desc_returns_success_with_valid_dbc() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(!desc.is_null());
+
+        let d = unsafe { &*(desc as *const DescHandle) };
+        assert_eq!(d.object_type, HandleType::Desc);
+        assert!(d.is_explicit());
+        assert_eq!(d.parent_dbc, dbc);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn alloc_desc_with_null_dbc_returns_invalid_handle() {
+        let mut desc: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, SQL_NULL_HANDLE, &mut desc) };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
+        assert!(desc.is_null());
+    }
+
+    /// `SQLAllocHandle(SQL_HANDLE_DESC, ...)` on a disconnected DBC succeeds:
+    /// the ODBC connection state-transition table's `08003` for this case is
+    /// marked "(DM)" — generated by the Driver Manager, not the driver — and
+    /// msodbcsql's own `AllocDesc` has no connection-state check, matching
+    /// this crate's `alloc_stmt` for the structurally identical
+    /// `SQL_HANDLE_STMT` case (see `alloc_desc`'s doc comment).
+    #[test]
+    fn alloc_desc_on_disconnected_dbc_succeeds() {
+        let (env, dbc) = alloc_env_dbc();
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(!desc.is_null());
+
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        assert_eq!(dbc_ref.inner.lock().unwrap().descriptors.len(), 1);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn alloc_desc_registers_in_parent_dbc() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        assert!(dbc_ref.inner.lock().unwrap().descriptors.is_empty());
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+
+        let state = dbc_ref.inner.lock().unwrap();
+        assert_eq!(state.descriptors.len(), 1);
+        assert_eq!(state.descriptors[0], desc);
+        drop(state);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn alloc_multiple_descs_on_same_dbc() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let mut desc1: SqlHandle = ptr::null_mut();
+        let mut desc2: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc1) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc2) },
+            SQL_SUCCESS
+        );
+        assert_ne!(desc1, desc2);
+
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        assert_eq!(dbc_ref.inner.lock().unwrap().descriptors.len(), 2);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc2) };
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc1) };
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }

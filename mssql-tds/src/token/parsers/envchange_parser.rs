@@ -28,13 +28,83 @@ pub struct EnvChangeTokenParser {
     // fields omitted
 }
 
+/// msodbcsql `MAX_ALTERNATE_SERVER_LENGTH_IN_CHAR` (`tds.h`).
+const MAX_ALTERNATE_SERVER_CHARS: usize = 1024;
+/// [MS-TDS] 2.2.7.9: AlternateDatabase must not exceed 128 characters.
+const MAX_ALTERNATE_DATABASE_CHARS: usize = 128;
+
+fn malformed_routing(detail: &str) -> crate::error::Error {
+    crate::error::Error::ProtocolError(format!("Malformed Routing ENVCHANGE: {detail}"))
+}
+
+/// Splits a non-empty US_VARCHAR of at most `max_chars` UTF-16 code units off
+/// the front of `data`.
+fn split_us_varchar<'a>(
+    data: &'a [u8],
+    field: &str,
+    max_chars: usize,
+) -> TdsResult<(String, &'a [u8])> {
+    let (length, rest) = data
+        .split_first_chunk::<2>()
+        .ok_or_else(|| malformed_routing(&format!("truncated {field} length")))?;
+    let chars = usize::from(u16::from_le_bytes(*length));
+    if chars == 0 || chars > max_chars {
+        return Err(malformed_routing(&format!(
+            "{field} length {chars} is outside 1..={max_chars}"
+        )));
+    }
+    let (value, rest) = rest
+        .split_at_checked(chars * 2)
+        .ok_or_else(|| malformed_routing(&format!("truncated {field}")))?;
+    let units: Vec<u16> = value
+        .chunks_exact(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .collect();
+    let value = String::from_utf16(&units)
+        .map_err(|_| malformed_routing(&format!("{field} is not valid UTF-16")))?;
+    Ok((value, rest))
+}
+
+/// msodbcsql applies the same bounds to both routing types (`Parse.cpp`).
+fn parse_routing_data(data: &[u8], enhanced: bool) -> TdsResult<RoutingInfo> {
+    let (&[protocol, port_low, port_high], rest) = data
+        .split_first_chunk::<3>()
+        .ok_or_else(|| malformed_routing("truncated protocol and port"))?;
+    let (server, rest) = split_us_varchar(rest, "alternate server", MAX_ALTERNATE_SERVER_CHARS)?;
+    let (database, rest) = if enhanced {
+        let (database, rest) =
+            split_us_varchar(rest, "alternate database", MAX_ALTERNATE_DATABASE_CHARS)?;
+        (Some(database), rest)
+    } else {
+        (None, rest)
+    };
+    if !rest.is_empty() {
+        return Err(malformed_routing("trailing routing data"));
+    }
+    if protocol != 0 {
+        return Err(malformed_routing(&format!(
+            "protocol {protocol} is not TCP"
+        )));
+    }
+    let port = u16::from_le_bytes([port_low, port_high]);
+    if port == 0 {
+        return Err(malformed_routing("port 0"));
+    }
+    Ok(RoutingInfo {
+        protocol,
+        port,
+        server,
+        database,
+    })
+}
+
 #[async_trait]
 impl<T> TokenParser<T> for EnvChangeTokenParser
 where
     T: TdsPacketReader + Send + Sync,
 {
     async fn parse(&self, reader: &mut T, _context: &ParserContext) -> TdsResult<Tokens> {
-        let _token_length = reader.read_uint16().await?;
+        let token_length = reader.read_uint16().await?;
         let sub_type = reader.read_byte().await?;
         let token_sub_type: EnvChangeTokenSubType = sub_type.try_into()?;
         event!(
@@ -209,32 +279,33 @@ where
                     context: "EnvChange token parsing not yet implemented".to_string(),
                 });
             }
-            EnvChangeTokenSubType::Routing => {
-                let _length = reader.read_uint16().await?;
-                let protocol = reader.read_byte().await?;
-                let port = reader.read_uint16().await?;
-                let server = reader.read_varchar_u16_length().await?;
-                let routing_info = Some(RoutingInfo {
-                    protocol,
-                    port,
-                    server: server.unwrap_or_default(),
-                });
-
-                let mut old_routing_info: Option<RoutingInfo> = None;
-
-                let old_length = reader.read_uint16().await?;
-                if old_length > 0 {
-                    let old_protocol = reader.read_byte().await?;
-                    let old_port = reader.read_uint16().await?;
-                    let old_server = reader.read_varchar_u16_length().await?;
-
-                    old_routing_info = Some(RoutingInfo {
-                        protocol: old_protocol,
-                        port: old_port,
-                        server: old_server.unwrap_or_default(),
-                    });
+            EnvChangeTokenSubType::Routing | EnvChangeTokenSubType::EnhancedRouting => {
+                if token_length < 5 {
+                    return Err(malformed_routing("truncated routing length fields"));
                 }
-                EnvChangeContainer::from((old_routing_info, routing_info))
+                // Read exactly the declared routing data so a malformed value cannot
+                // desynchronize the token stream.
+                let routing_data_length = reader.read_uint16().await?;
+                // Type, RoutingDataValueLength, RoutingDataValue and the empty OLDVALUE.
+                let expected_token_length = 1 + 2 + usize::from(routing_data_length) + 2;
+                if usize::from(token_length) != expected_token_length {
+                    return Err(malformed_routing(&format!(
+                        "token length {token_length} does not match routing data length \
+                         {routing_data_length}"
+                    )));
+                }
+                let mut routing_data = vec![0u8; usize::from(routing_data_length)];
+                if reader.read_bytes(&mut routing_data).await? != routing_data.len() {
+                    return Err(malformed_routing("truncated routing data"));
+                }
+                if reader.read_uint16().await? != 0 {
+                    return Err(malformed_routing("non-empty old value"));
+                }
+                let routing_info = parse_routing_data(
+                    &routing_data,
+                    token_sub_type == EnvChangeTokenSubType::EnhancedRouting,
+                )?;
+                EnvChangeContainer::from((None, Some(routing_info)))
             }
             EnvChangeTokenSubType::Unknown(_value) => {
                 // For unknown environment change subtypes, try to read as generic string change
@@ -778,93 +849,249 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_routing() {
-        let mut body = Vec::new();
-        // New routing info
-        let mut buf = [0u8; 2];
-        LittleEndian::write_u16(&mut buf, 10); // length (protocol + port + server)
-        body.extend_from_slice(&buf);
-        body.push(0x01); // protocol
-        LittleEndian::write_u16(&mut buf, 1433); // port
-        body.extend_from_slice(&buf);
-        body.extend_from_slice(&encode_varchar_u16("newserver"));
+    fn routing_data(protocol: u8, port: u16, server: &str, database: Option<&str>) -> Vec<u8> {
+        let mut data = vec![protocol];
+        data.extend_from_slice(&port.to_le_bytes());
+        data.extend_from_slice(&encode_varchar_u16(server));
+        if let Some(database) = database {
+            data.extend_from_slice(&encode_varchar_u16(database));
+        }
+        data
+    }
 
-        // Old routing info (empty)
-        LittleEndian::write_u16(&mut buf, 0); // length
-        body.extend_from_slice(&buf);
+    fn routing_body(routing_data: &[u8]) -> Vec<u8> {
+        let mut body = (routing_data.len() as u16).to_le_bytes().to_vec();
+        body.extend_from_slice(routing_data);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body
+    }
 
-        let data = build_envchange_token(EnvChangeTokenSubType::Routing.as_u8(), body);
-
+    /// Parses `data` and reports how many bytes the parser left unread.
+    async fn parse_envchange(data: Vec<u8>) -> (TdsResult<Tokens>, usize) {
         let mut reader = MockReader::new(data);
-        let parser = EnvChangeTokenParser::default();
-        let context = ParserContext::default();
-        let result = parser.parse(&mut reader, &context).await.unwrap();
+        let result = EnvChangeTokenParser::default()
+            .parse(&mut reader, &ParserContext::default())
+            .await;
+        (result, reader.remaining())
+    }
 
-        match result {
-            Tokens::EnvChange(token) => {
-                assert_eq!(token.sub_type, EnvChangeTokenSubType::Routing);
-                match token.change_type {
-                    EnvChangeContainer::RoutingType(value_pair) => {
-                        assert!(value_pair.new_value().is_some());
-                        let new_routing = value_pair.new_value().as_ref().unwrap();
-                        assert_eq!(new_routing.protocol, 0x01);
-                        assert_eq!(new_routing.port, 1433);
-                        assert_eq!(new_routing.server, "newserver");
-                        assert!(value_pair.old_value().is_none());
-                    }
-                    _ => panic!("Expected RoutingType container"),
-                }
-            }
-            _ => panic!("Expected EnvChange token"),
+    #[tokio::test]
+    async fn test_parse_routing_types() {
+        for (sub_type, database) in [
+            (EnvChangeTokenSubType::Routing, None),
+            (EnvChangeTokenSubType::EnhancedRouting, Some("sales")),
+        ] {
+            let mut data = build_envchange_token(
+                sub_type.as_u8(),
+                routing_body(&routing_data(0, 11000, "replica.sql.net", database)),
+            );
+            data.push(0xFD);
+
+            let (result, remaining) = parse_envchange(data).await;
+            assert_eq!(remaining, 1, "must not consume the following DONE");
+            let Ok(Tokens::EnvChange(token)) = result else {
+                panic!("Expected EnvChange token, got {result:?}");
+            };
+            assert_eq!(token.sub_type, sub_type);
+            let EnvChangeContainer::RoutingType(value_pair) = token.change_type else {
+                panic!("Expected RoutingType container");
+            };
+            assert_eq!(value_pair.old_value(), &None);
+            assert_eq!(
+                value_pair.new_value().as_deref(),
+                Some(&RoutingInfo {
+                    protocol: 0,
+                    port: 11000,
+                    server: "replica.sql.net".to_string(),
+                    database: database.map(str::to_string),
+                })
+            );
         }
     }
 
     #[tokio::test]
-    async fn test_parse_routing_with_old_value() {
-        let mut body = Vec::new();
-        // New routing info
-        let mut buf = [0u8; 2];
-        LittleEndian::write_u16(&mut buf, 10);
-        body.extend_from_slice(&buf);
-        body.push(0x02);
-        LittleEndian::write_u16(&mut buf, 1434);
-        body.extend_from_slice(&buf);
-        body.extend_from_slice(&encode_varchar_u16("newserver"));
+    async fn test_parse_routing_accepts_limit_lengths() {
+        let server = "s".repeat(MAX_ALTERNATE_SERVER_CHARS);
+        let database = "d".repeat(MAX_ALTERNATE_DATABASE_CHARS);
+        for (sub_type, database) in [
+            (EnvChangeTokenSubType::Routing, None),
+            (
+                EnvChangeTokenSubType::EnhancedRouting,
+                Some(database.as_str()),
+            ),
+        ] {
+            let data = build_envchange_token(
+                sub_type.as_u8(),
+                routing_body(&routing_data(0, 1433, &server, database)),
+            );
+            let (result, remaining) = parse_envchange(data).await;
+            assert!(result.is_ok(), "{sub_type:?}: {result:?}");
+            assert_eq!(remaining, 0);
+        }
+    }
 
-        // Old routing info
-        LittleEndian::write_u16(&mut buf, 10);
-        body.extend_from_slice(&buf);
-        body.push(0x01);
-        LittleEndian::write_u16(&mut buf, 1433);
-        body.extend_from_slice(&buf);
-        body.extend_from_slice(&encode_varchar_u16("oldserver"));
+    #[tokio::test]
+    async fn test_parse_routing_rejects_malformed_payloads() {
+        let server_too_long = "s".repeat(MAX_ALTERNATE_SERVER_CHARS + 1);
+        for (sub_type, database) in [
+            (EnvChangeTokenSubType::Routing, None),
+            (EnvChangeTokenSubType::EnhancedRouting, Some("sales")),
+        ] {
+            let valid = routing_data(0, 11000, "replica.sql.net", database);
+            let mut trailing = valid.clone();
+            trailing.push(0);
+            let mut invalid_utf16 = routing_data(0, 11000, "s", database);
+            invalid_utf16[5..7].copy_from_slice(&0xD800u16.to_le_bytes());
+            let mut server_overrun = valid.clone();
+            server_overrun[3..5].copy_from_slice(&1024u16.to_le_bytes());
+            let mut old_value = routing_body(&valid);
+            let old_value_length = old_value.len() - 2;
+            old_value[old_value_length] = 1;
 
-        let data = build_envchange_token(EnvChangeTokenSubType::Routing.as_u8(), body);
+            let cases = [
+                (
+                    "protocol 1 is not TCP",
+                    routing_body(&routing_data(1, 11000, "replica.sql.net", database)),
+                ),
+                (
+                    "port 0",
+                    routing_body(&routing_data(0, 0, "replica.sql.net", database)),
+                ),
+                (
+                    "alternate server length 0",
+                    routing_body(&routing_data(0, 11000, "", database)),
+                ),
+                (
+                    "alternate server length 1025",
+                    routing_body(&routing_data(0, 11000, &server_too_long, database)),
+                ),
+                (
+                    "alternate server is not valid UTF-16",
+                    routing_body(&invalid_utf16),
+                ),
+                ("trailing routing data", routing_body(&trailing)),
+                ("truncated alternate server", routing_body(&server_overrun)),
+                (
+                    "truncated alternate server length",
+                    routing_body(&[0, 1, 0, 1]),
+                ),
+                ("truncated protocol and port", routing_body(&[0, 1])),
+                ("non-empty old value", old_value),
+            ];
+            for (expected, body) in cases {
+                let mut data = build_envchange_token(sub_type.as_u8(), body);
+                data.push(0xFD);
+                let (result, remaining) = parse_envchange(data).await;
+                assert!(
+                    matches!(result, Err(crate::error::Error::ProtocolError(ref message)) if message.contains(expected)),
+                    "{sub_type:?} / {expected}: {result:?}"
+                );
+                assert_eq!(remaining, 1, "must not consume the following DONE");
+            }
+        }
+    }
 
-        let mut reader = MockReader::new(data);
-        let parser = EnvChangeTokenParser::default();
-        let context = ParserContext::default();
-        let result = parser.parse(&mut reader, &context).await.unwrap();
-
-        match result {
-            Tokens::EnvChange(token) => match token.change_type {
-                EnvChangeContainer::RoutingType(value_pair) => {
-                    assert!(value_pair.new_value().is_some());
-                    let new_routing = value_pair.new_value().as_ref().unwrap();
-                    assert_eq!(new_routing.protocol, 0x02);
-                    assert_eq!(new_routing.port, 1434);
-                    assert_eq!(new_routing.server, "newserver");
-
-                    assert!(value_pair.old_value().is_some());
-                    let old_routing = value_pair.old_value().as_ref().unwrap();
-                    assert_eq!(old_routing.protocol, 0x01);
-                    assert_eq!(old_routing.port, 1433);
-                    assert_eq!(old_routing.server, "oldserver");
+    #[tokio::test]
+    async fn test_parse_enhanced_routing_rejects_malformed_database() {
+        let valid = routing_data(0, 11000, "replica.sql.net", Some("sales"));
+        let database_too_long = "d".repeat(MAX_ALTERNATE_DATABASE_CHARS + 1);
+        let cases = [
+            (
+                "alternate database length 0",
+                routing_body(&routing_data(0, 11000, "replica.sql.net", Some(""))),
+            ),
+            (
+                "alternate database length 129",
+                routing_body(&routing_data(
+                    0,
+                    11000,
+                    "replica.sql.net",
+                    Some(&database_too_long),
+                )),
+            ),
+            (
+                "truncated alternate database",
+                routing_body(&valid[..valid.len() - 2]),
+            ),
+            (
+                "truncated alternate database length",
+                routing_body(&routing_data(0, 11000, "replica.sql.net", None)),
+            ),
+        ];
+        for (expected, body) in cases {
+            let data = build_envchange_token(EnvChangeTokenSubType::EnhancedRouting.as_u8(), body);
+            match parse_envchange(data).await.0 {
+                Err(crate::error::Error::ProtocolError(message)) => {
+                    assert!(message.contains(expected), "{expected}: {message}")
                 }
-                _ => panic!("Expected RoutingType container"),
-            },
-            _ => panic!("Expected EnvChange token"),
+                Err(other) => panic!("{expected}: expected a protocol error, got {other:?}"),
+                Ok(_) => panic!("{expected}: malformed payload was accepted"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_routing_rejects_length_mismatches() {
+        for (sub_type, database) in [
+            (EnvChangeTokenSubType::Routing, None),
+            (EnvChangeTokenSubType::EnhancedRouting, Some("sales")),
+        ] {
+            let valid = build_envchange_token(
+                sub_type.as_u8(),
+                routing_body(&routing_data(0, 11000, "replica.sql.net", database)),
+            );
+            for offset in [0, 3] {
+                for delta in [-1, 1] {
+                    let mut data = valid.clone();
+                    let declared = u16::from_le_bytes([data[offset], data[offset + 1]])
+                        .checked_add_signed(delta)
+                        .unwrap();
+                    data[offset..offset + 2].copy_from_slice(&declared.to_le_bytes());
+                    let result = parse_envchange(data).await.0;
+                    assert!(
+                        matches!(result, Err(crate::error::Error::ProtocolError(ref message)) if message.contains("token length")),
+                        "{sub_type:?} / offset {offset} / delta {delta}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_routing_rejects_short_length_fields() {
+        for sub_type in [
+            EnvChangeTokenSubType::Routing,
+            EnvChangeTokenSubType::EnhancedRouting,
+        ] {
+            for token_length in 0u16..5 {
+                let mut data = token_length.to_le_bytes().to_vec();
+                data.extend_from_slice(&[sub_type.as_u8(), 0xFD]);
+                let (result, remaining) = parse_envchange(data).await;
+                assert!(
+                    matches!(result, Err(crate::error::Error::ProtocolError(_))),
+                    "{sub_type:?} / token length {token_length}: {result:?}"
+                );
+                assert_eq!(remaining, 1, "must not consume the following DONE");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_routing_rejects_truncated_data() {
+        for (sub_type, database) in [
+            (EnvChangeTokenSubType::Routing, None),
+            (EnvChangeTokenSubType::EnhancedRouting, Some("sales")),
+        ] {
+            let mut data = build_envchange_token(
+                sub_type.as_u8(),
+                routing_body(&routing_data(0, 11000, "replica.sql.net", database)),
+            );
+            data.truncate(data.len() - 4);
+            let result = parse_envchange(data).await.0;
+            assert!(
+                matches!(result, Err(crate::error::Error::ProtocolError(ref message)) if message.contains("truncated routing data")),
+                "{sub_type:?}: {result:?}"
+            );
         }
     }
 

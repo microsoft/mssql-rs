@@ -287,10 +287,9 @@ def test_cursor_bulkcopy_varbinary_to_image(client_context):
 @pytest.mark.integration
 def test_cursor_bulkcopy_image_empty_bytes(client_context):
     """Test cursor bulkcopy with empty byte arrays to IMAGE columns.
-    
-    Note: SQL Server stores 0-length IMAGE data but returns it as NULL when reading.
-    This is expected behavior for legacy IMAGE types. DATALENGTH() returns 0 for
-    such values, but the actual data column returns NULL.
+
+    A zero-length IMAGE value is stored and read back as empty, not NULL:
+    DATALENGTH() returns 0 rather than NULL (AB#49220).
     """
     conn = mssql_py_core.PyCoreConnection(client_context)
     cursor = conn.cursor()
@@ -307,7 +306,7 @@ def test_cursor_bulkcopy_image_empty_bytes(client_context):
     bytes10 = bytes(range(10))
     
     data = [
-        (1, empty_bytes),  # Empty byte array - SQL Server stores but returns NULL
+        (1, empty_bytes),
         (2, bytes10),
     ]
 
@@ -322,14 +321,12 @@ def test_cursor_bulkcopy_image_empty_bytes(client_context):
     assert result["batch_count"] == 1
 
     # Verify data was inserted correctly
-    # Note: SQL Server returns NULL for 0-length IMAGE data, but DATALENGTH returns 0
     cursor.execute(f"SELECT id, data, DATALENGTH(data) FROM {table_name} ORDER BY id")
     rows = cursor.fetchall()
     assert len(rows) == 2
     assert rows[0][0] == 1
-    # SQL Server behavior: empty IMAGE data is returned as NULL
-    assert rows[0][1] is None
-    assert rows[0][2] == 0  # DATALENGTH still returns 0 for the stored empty data
+    assert rows[0][1] == b""
+    assert rows[0][2] == 0
     assert rows[1][0] == 2 and rows[1][1] == bytes10
     assert rows[1][2] == 10
 

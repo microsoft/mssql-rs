@@ -1,0 +1,5 @@
+# Microsoft ODBC Driver 18 version used as the dedicated-lab reference.
+#
+# Linux installs the exact Debian package <version>-1. Windows uses the pinned
+# MSI URL and SHA-256 in .pipeline/scripts/install-msodbcsql.ps1.
+18.6.2.1

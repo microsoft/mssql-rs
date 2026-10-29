@@ -11,9 +11,8 @@
 #
 # Required env:
 #   INSTANCE_ID                    Unique id (e.g. "shared", "shared_musl").
-#   SQL_PASSWORD                   SA password (derived from build context
-#                                  by derive-sql-password.sh; matches the
-#                                  test job's derived value).
+#   SQL_PASSWORD                   Imported initialization secret.
+#   SQL_CREDENTIAL_GENERATION      Nonsecret initialization generation ID.
 #   SQL_IMAGE_TAG                  e.g. "2025-latest".
 #   BUILD_ARTIFACTSTAGINGDIRECTORY ADO-provided staging dir for artifacts.
 #
@@ -23,7 +22,7 @@
 #
 # Side effects:
 #   * Writes ${BUILD_ARTIFACTSTAGINGDIRECTORY}/sql-endpoint-${INSTANCE_ID}/endpoint.txt
-#     containing "HOST PORT" on a single line.
+#     containing "HOST PORT DEADLINE_EPOCH GENERATION" on a single line.
 #   * Also emits output variables sqlHost / sqlPort / sqlInstanceId for
 #     diagnostics — they are not consumed by the test jobs.
 #
@@ -40,6 +39,12 @@ set -euo pipefail
 : "${SQL_PASSWORD:?SQL_PASSWORD is required}"
 : "${SQL_IMAGE_TAG:?SQL_IMAGE_TAG is required}"
 : "${BUILD_ARTIFACTSTAGINGDIRECTORY:?BUILD_ARTIFACTSTAGINGDIRECTORY is required}"
+
+if [[ ! "${SQL_PASSWORD}" =~ ^Aa1![0-9a-f]{48}$ ]] \
+    || [[ ! "${SQL_CREDENTIAL_GENERATION:-}" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "ERROR: shared SQL credential output is missing or invalid." >&2
+    exit 1
+fi
 
 SQL_HOST_PORT="${SQL_HOST_PORT:-1433}"
 READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:-180}"
@@ -67,12 +72,18 @@ docker network rm "${NETWORK_NAME}" >/dev/null 2>&1 || true
 # 2. Resolve the agent's primary private IPv4 first — we need it both for
 #    the endpoint sentinel and as an extra SAN on the SQL Server's cert
 #    so that ARM test clients can verify the chain when connecting by IP.
-SQL_HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# `|| true` is required, not defensive. The Azure Linux image ships net-tools,
+# whose hostname(1) has no -I flag (that is the Debian hostname package) and
+# exits 3 on it. Under `set -euo pipefail` that killed the script here, before
+# the ip(8) fallback below could run.
+SQL_HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 if [ -z "${SQL_HOST_IP}" ]; then
-    SQL_HOST_IP="$(ip -4 -o addr show scope global | awk 'NR==1 {split($4,a,"/"); print a[1]}')"
+    SQL_HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR==1 {split($4,a,"/"); print a[1]}' || true)"
 fi
 if [ -z "${SQL_HOST_IP}" ]; then
     echo "ERROR: could not resolve a private IPv4 for this agent." >&2
+    echo "       hostname: $(command -v hostname || echo MISSING)" >&2
+    echo "       ip:       $(command -v ip || echo MISSING)" >&2
     exit 1
 fi
 echo "Advertising SQL host endpoint ${SQL_HOST_IP}:${SQL_HOST_PORT}"
@@ -135,7 +146,7 @@ fi
 ENDPOINT_DIR="${BUILD_ARTIFACTSTAGINGDIRECTORY}/sql-endpoint-${INSTANCE_ID}"
 mkdir -p "${ENDPOINT_DIR}"
 deadline_epoch=$(( $(date +%s) + MAX_LIFETIME_MINUTES * 60 ))
-printf '%s %s %s\n' "${SQL_HOST_IP}" "${SQL_HOST_PORT}" "${deadline_epoch}" \
+printf '%s %s %s %s\n' "${SQL_HOST_IP}" "${SQL_HOST_PORT}" "${deadline_epoch}" "${SQL_CREDENTIAL_GENERATION}" \
     > "${ENDPOINT_DIR}/endpoint.txt"
 # mssql.crt and mssql.pem are identical (generate_cert.sh produces .crt and
 # copies it to .pem). Different distro dockerentry scripts reference one or

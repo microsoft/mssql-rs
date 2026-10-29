@@ -5,12 +5,11 @@
 //!
 //! The [`TlsEngine`] trait separates *which* TLS implementation runs the
 //! handshake from the surrounding TDS plumbing (prelogin framing,
-//! connection-state callbacks, certificate-pinning hooks). Today there is
-//! exactly one implementation: [`native_tls_engine::NativeTlsEngine`].
-//! A subsequent PR in this stack will add a Windows-only Schannel-direct
-//! engine and route to it on `cfg(windows)` from [`default_engine`].
-//!
-//! This module is purely a refactor — no behavior changes.
+//! connection-state callbacks, certificate-pinning hooks). There are two
+//! implementations: [`native_tls_engine::NativeTlsEngine`], and on Windows the
+//! Schannel-direct engine in `win_tls`. [`default_engine`] picks Schannel-direct
+//! on Windows when the `tls-schannel-direct` feature is enabled (the default)
+//! and native-tls everywhere else.
 
 pub(crate) mod native_tls_engine;
 

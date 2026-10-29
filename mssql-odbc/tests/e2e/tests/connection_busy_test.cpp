@@ -1,0 +1,830 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// connection_busy_test.cpp  –  E2E tests for the wire-state connection-busy
+// gate (AB#47508).
+//
+// msodbcsql releases a connection once the wire has drained a statement's
+// result set — even while the ODBC-level cursor itself stays open — rather
+// than holding it for the cursor's whole lifetime. A fully-bound fetch of the
+// last row, or an SQLGetData reaching the last column, both count: either one
+// lets the driver peek one token past the row and discover the batch is
+// done. This suite locks in that same wire-state behavior for mssql-odbc.
+//
+// A and B are two HSTMTs on one HDBC throughout, matching the review's full
+// 12-row parity table (see microsoft/mssql-rs#399 for the table and its
+// history): rows 1, 1b, 2, 3, 4, 4b are the ones whose verdict this PR's fix
+// actually changes; rows 3b, 5, 6, 7, 8, 9 keep their verdict unchanged from
+// `main` and are included for completeness/regression coverage. None of
+// these need SKIP_IF_COMPARING_MSODBCSQL(): every assertion here also holds
+// for msodbcsql 18, confirmed empirically during review by running this same
+// probe shape against both drivers.
+//
+// Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
+
+#include "connection_busy_fixture.h"
+#include "odbc_concurrent_test.h"
+
+#include <string>
+
+// Benefits-from-mock-tds: cancel.rs pins cursor reset and drain errors; this
+// checks connection reuse and the Driver Manager's suppression of 01S05.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelReleasesConnectionLikeFreeStmtClose) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    Log("SQL_DRIVER_VER=" + std::string(reinterpret_cast<const char*>(version)));
+    const auto token = 1000 + Worker() * 100 + Iteration();
+    const auto query = "SELECT " + std::to_string(token) +
+                      " + n FROM (VALUES (1), (2), (3)) AS v(n) ORDER BY n";
+    SQLHSTMT other = AllocStmt();
+    for (bool cancel : {false, true}) {
+        for (int fetched : {0, 1, 3}) {
+            SCOPED_TRACE(::testing::Message() << "cancel=" << cancel << ", fetched=" << fetched);
+            ASSERT_SQL_OK(Run(stmt_, query), SQL_HANDLE_STMT, stmt_);
+            for (int row = 0; row < fetched; ++row) {
+                ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+            if (fetched < 3) {
+                ASSERT_EQ(SQL_ERROR, Run(other, "SELECT 42"));
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, other, "HY000");
+            } else {
+                ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            }
+            ASSERT_SQL_OK(cancel ? CancelIdleStatement() : SQLFreeStmt(stmt_, SQL_CLOSE),
+                          SQL_HANDLE_STMT, stmt_);
+            {
+                // These errors live in the DM's list, whose next-call cleanup
+                // occurs before unixODBC takes its statement lock.
+                std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+                SQLSMALLINT columns = -1;
+                EXPECT_EQ(SQL_ERROR, SQLNumResultCols(stmt_, &columns));
+                EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+                SQLULEN timeout = 0;
+                ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, &timeout, 0, nullptr),
+                              SQL_HANDLE_STMT, stmt_);
+            }
+            ASSERT_SQL_OK(Run(other, "SELECT " + std::to_string(token)),
+                          SQL_HANDLE_STMT, other);
+            ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+            SQLINTEGER value = 0;
+            ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                          SQL_HANDLE_STMT, other);
+            EXPECT_EQ(token, value);
+            ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+        }
+    }
+}
+
+// Benefits-from-mock-tds: verify reuse of the server prepare handle as well as
+// the observable preservation of the plan and application bindings.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelPreservesPreparedStatementAndBindings) {
+    SQLINTEGER parameter = 1000 + Worker() * 100 + Iteration();
+    SQLLEN indicator = 0;
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? FROM (VALUES (1), (2), (3)) AS v(n)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &indicator), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(parameter, value);
+        ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+        ++parameter;
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: cancel.rs pins ATTENTION and its acknowledgement;
+// this additionally proves cancellation prevents the delayed server-side write.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsDelayedBatchTail) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #idle_cancel_tail(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(Run(stmt_,
+        "SELECT REPLICATE('x',4000) FROM (VALUES(1),(2),(3)) AS v(n); "
+        "WAITFOR DELAY '00:00:05'; INSERT #idle_cancel_tail VALUES(1)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+    const auto cancelling = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_tail"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_tail"), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: CursorPhase::IdlePlp pins ATTENTION settlement;
+// this verifies partial MAX-value cancellation against the live server.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsPartiallyReadPlp) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #idle_cancel_plp(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    const auto token = WorkerToken("plp");
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(Run(stmt_, "SELECT REPLICATE(CAST('" + token +
+        "' AS varchar(max)),16000); WAITFOR DELAY '00:00:05'; "
+        "INSERT #idle_cancel_plp VALUES(1)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    std::vector<char> prefix(token.size() + 1);
+    SQLLEN length = 0;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_CHAR, prefix.data(),
+                         static_cast<SQLLEN>(prefix.size()), &length));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(token, std::string(prefix.data()));
+    EXPECT_TRUE(length == SQL_NO_TOTAL || length > static_cast<SQLLEN>(token.size()));
+    ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+
+    const auto cancelling = std::chrono::steady_clock::now();
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_plp"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_plp"), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: close_cursor.rs pins unpublished completion after
+// wire exhaustion; this checks the application's parameter-array outputs.
+ODBC_TEST_F(ConnectionBusyLiveTest, ClosingFetchedParameterArrayPublishesCompletion) {
+    SQLINTEGER values[] = {1000 + Worker() * 100 + Iteration(), 2000 + Worker() * 100 + Iteration()};
+    SQLLEN indicators[] = {0, 0};
+    SQLUSMALLINT statuses[] = {SQL_PARAM_UNUSED, SQL_PARAM_UNUSED};
+    SQLULEN processed = 0;
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? AS n"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                reinterpret_cast<SQLPOINTER>(2), 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, statuses, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                  0, 0, values, sizeof(values[0]), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        for (int set = 0; set < 2; ++set) {
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            SQLINTEGER value = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(values[set], value);
+            ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            if (set == 0) {
+                ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2u, processed);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, statuses[0]);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, statuses[1]);
+    }
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}
+
+// A first execution of a prepared statement uses sp_prepexec. Its output
+// handle trails the row result on the wire, but it is part of the same RPC
+// response and must not keep the connection claimed after the only row and
+// all its columns have been consumed.
+TEST_F(ConnectionBusyLiveTest, PreparedNullParameterBoundFetchReleasesConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ?"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER parameter = 0;
+    SQLLEN parameter_ind = SQL_NULL_DATA;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    SQLLEN value_ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &value_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NULL_DATA, value_ind);
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+TEST_F(ConnectionBusyLiveTest, PreparedParametersGetDataThroughLastColumnReleaseConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER first_parameter = 1;
+    SQLINTEGER second_parameter = 2;
+    SQLLEN first_ind = 0;
+    SQLLEN second_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &first_parameter, &first_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindInt(stmt_, 2, &second_parameter, &second_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER first = 0;
+    SQLINTEGER second = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &first, sizeof(first), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SLONG, &second, sizeof(second), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, first);
+    EXPECT_EQ(2, second);
+
+    EXPECT_SQL_OK(Run(b, "SELECT 3"), SQL_HANDLE_STMT, b);
+}
+
+// fetchall-style consumers issue one final SQLFetch to receive SQL_NO_DATA.
+// That completion must drain the trailing RPC tokens and release the claim.
+TEST_F(ConnectionBusyLiveTest, PreparedParameterFetchToNoDataReleasesConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ?"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER parameter = -42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-42, value);
+    ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+TEST_F(ConnectionBusyLiveTest, PreparedParameterMultiRowReleasesAfterLastRow) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ?, v.n FROM (VALUES (1), (2)) AS v(n) ORDER BY v.n"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    SQLINTEGER row_number = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &row_number, sizeof(row_number), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(42, value);
+    EXPECT_EQ(1, row_number);
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, row_number);
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+TEST_F(ConnectionBusyLiveTest, PreparedParameterZeroRowReleasesConnectionBeforeFetch) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? WHERE 1 = 0"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+
+        SQLSMALLINT columns = 0;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(1, columns);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+
+        ASSERT_SQL_OK(SQLFetch(b), SQL_HANDLE_STMT, b);
+        SQLINTEGER value = 0;
+        ASSERT_SQL_OK(SQLGetData(b, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                      SQL_HANDLE_STMT, b);
+        EXPECT_EQ(2, value);
+        ASSERT_SQL_OK(SQLCloseCursor(b), SQL_HANDLE_STMT, b);
+    }
+}
+
+TEST_F(ConnectionBusyLiveTest, ExecDirectZeroRowReleasesConnectionBeforeFetch) {
+    SQLHSTMT other_stmt = AllocStmt();
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+
+    for (bool parameterized : {false, true}) {
+        SCOPED_TRACE(parameterized);
+        if (parameterized) {
+            ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(Run(stmt_, parameterized ? "SELECT ? WHERE 1 = 0" : "SELECT 1 WHERE 1 = 0"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(Run(other_stmt, "SELECT 2"), SQL_HANDLE_STMT, other_stmt);
+
+        SQLSMALLINT columns = 0;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(1, columns);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+
+        ASSERT_SQL_OK(SQLFetch(other_stmt), SQL_HANDLE_STMT, other_stmt);
+        SQLINTEGER value = 0;
+        ASSERT_SQL_OK(SQLGetData(other_stmt, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                      SQL_HANDLE_STMT, other_stmt);
+        EXPECT_EQ(2, value);
+        ASSERT_SQL_OK(SQLCloseCursor(other_stmt), SQL_HANDLE_STMT, other_stmt);
+    }
+}
+
+TEST_F(ConnectionBusyLiveTest, EmptyFirstResultKeepsConnectionBusyForLaterResults) {
+    SQLHSTMT other_stmt = AllocStmt();
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+
+    for (int mode = 0; mode < 3; ++mode) {
+        SCOPED_TRACE(mode);
+        if (mode != 0) {
+            ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+        }
+        if (mode == 2) {
+            ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? WHERE 1 = 0; SELECT 42"), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        } else {
+            ASSERT_SQL_OK(Run(stmt_, mode == 0 ? "SELECT 1 WHERE 1 = 0; SELECT 42"
+                                              : "SELECT ? WHERE 1 = 0; SELECT 42"),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+
+        EXPECT_EQ(SQL_ERROR, Run(other_stmt, "SELECT 2"));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, other_stmt, "HY000");
+        ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        EXPECT_EQ(SQL_ERROR, Run(other_stmt, "SELECT 2"));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, other_stmt, "HY000");
+
+        ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER value = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(42, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        ASSERT_SQL_OK(Run(other_stmt, "SELECT 2"), SQL_HANDLE_STMT, other_stmt);
+        ASSERT_SQL_OK(SQLCloseCursor(other_stmt), SQL_HANDLE_STMT, other_stmt);
+    }
+}
+
+// SQLExecDirect with bound parameters uses sp_executesql rather than the
+// prepared sp_prepexec path. Its RPC completion tokens must obey the same
+// release rule after the single row is consumed.
+TEST_F(ConnectionBusyLiveTest, ExecDirectParameterBoundFetchReleasesConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Run(stmt_, "SELECT ?"), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(42, value);
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+TEST_F(ConnectionBusyLiveTest, PreparedParameterCloseWithoutFetchReleasesConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ?"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+TEST_F(ConnectionBusyLiveTest, ExecDirectParameterCloseWithoutFetchReleasesConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Run(stmt_, "SELECT ?"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+// Mirrors msodbcsql MARSODBC TCTestAPIs variation 2: a parameterized direct
+// query with two rowsets must retain the second rowset for SQLMoreResults.
+TEST_F(ConnectionBusyLiveTest, ExecDirectParametersPreserveSecondResultSet) {
+    SQLHSTMT b = AllocStmt();
+
+    SQLINTEGER first_parameter = 41;
+    SQLINTEGER second_parameter = 42;
+    SQLLEN first_ind = 0;
+    SQLLEN second_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &first_parameter, &first_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindInt(stmt_, 2, &second_parameter, &second_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Run(stmt_, "SELECT ?; SELECT ?"), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(41, value);
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 20"));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(42, value);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+
+    EXPECT_SQL_OK(Run(b, "SELECT 20"), SQL_HANDLE_STMT, b);
+}
+
+// Mirrors msodbcsql PrepareEx variation 49, with parameters added to keep the
+// sp_prepexec completion tail in the scenario. Re-execution also proves that
+// the handle captured after the first RPC remains usable by sp_execute.
+TEST_F(ConnectionBusyLiveTest, PreparedParametersPreserveMultipleResultsAcrossReuse) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ?; SELECT ?"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER first_parameter = 41;
+    SQLINTEGER second_parameter = 42;
+    SQLLEN first_ind = 0;
+    SQLLEN second_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &first_parameter, &first_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindInt(stmt_, 2, &second_parameter, &second_ind), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(41, value);
+        ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(42, value);
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    }
+
+    EXPECT_SQL_OK(Run(b, "SELECT 20"), SQL_HANDLE_STMT, b);
+}
+
+// Cursor wrappers may free an executed statement directly rather than fetching
+// or calling SQLCloseCursor first. Freeing it must drain the rowset and the
+// sp_prepexec tail before a second statement uses the connection.
+TEST_F(ConnectionBusyLiveTest, FreeUnfetchedPreparedParameterStatementReleasesConnection) {
+    SQLHSTMT a = AllocStmt();
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(a, "SELECT ?"), SQL_HANDLE_STMT, a);
+    SQLINTEGER parameter = 1;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(a, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, a);
+    ASSERT_SQL_OK(SQLExecute(a), SQL_HANDLE_STMT, a);
+    FreeStmt(a);
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+// Row 1: a fully-bound single-column fetch of A's only row must release the
+// connection immediately — the peek past that row finds the terminating
+// DONE — so B can execute on the same connection without seeing HY000
+// "Connection is busy". A's cursor itself stays open; only the
+// connection-level claim is released.
+TEST_F(ConnectionBusyLiveTest, BoundColumnFetchOfOnlyRowReleasesConnectionForOtherStatement) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, value);
+
+    EXPECT_TRUE(SQL_SUCCEEDED(Run(b, "SELECT 2")))
+        << "B must not see the connection as busy once A's only row is delivered: "
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, b);
+}
+
+// Row 1b: same as above, but with an explicit second SQLFetch(A) — which
+// takes the StmtState::result_set_exhausted fast path and returns
+// SQL_NO_DATA without touching the connection — inserted before B executes.
+// Confirms the fast path leaves the already-released claim released rather
+// than reclaiming it.
+TEST_F(ConnectionBusyLiveTest, ExplicitNoDataFetchStillLeavesConnectionReleased) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+// Row 2: the SQLGetData path releases the connection the same way the bound
+// path does, once every column of the row has been read — GetData on the
+// *last* column peeks past the row, same trigger as SQLFetch's bound-column
+// fill loop.
+TEST_F(ConnectionBusyLiveTest, GetDataThroughLastColumnReleasesConnectionForOtherStatement) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1 AS c1, 2 AS c2"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER c1 = 0, c2 = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &c1, sizeof(c1), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SLONG, &c2, sizeof(c2), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, c1);
+    EXPECT_EQ(2, c2);
+
+    EXPECT_TRUE(SQL_SUCCEEDED(Run(b, "SELECT 2")))
+        << "B must not see the connection as busy once A's last column is read via SQLGetData: "
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, b);
+}
+
+// Row 3: closing A's already-exhausted-but-open cursor (SQLCloseCursor) while
+// B is mid-fetch on the same connection must not touch B's live client.
+// Before AB#47508's fix, drain_and_release took dbc_state.client
+// unconditionally, so this could steal and corrupt whichever statement had
+// since claimed the connection (main: "B broken").
+TEST_F(ConnectionBusyLiveTest, ClosingExhaustedCursorDoesNotDisturbAnotherStatementsLiveFetch) {
+    SQLHSTMT b = AllocStmt();
+
+    // A: exhaust via SQLGetData (row 2's precondition), releasing the connection.
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1 AS c1, 2 AS c2"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER c1 = 0, c2 = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &c1, sizeof(c1), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SLONG, &c2, sizeof(c2), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // B claims the now-idle connection and reads its first row.
+    ASSERT_SQL_OK(Run(b, "SELECT 10 UNION ALL SELECT 20"), SQL_HANDLE_STMT, b);
+    ASSERT_SQL_OK(SQLFetch(b), SQL_HANDLE_STMT, b);
+    SQLINTEGER first = 0;
+    ASSERT_SQL_OK(SQLGetData(b, 1, SQL_C_SLONG, &first, sizeof(first), nullptr),
+                  SQL_HANDLE_STMT, b);
+    EXPECT_EQ(10, first);
+
+    // A already released its claim, so closing its cursor now must be a
+    // no-op on the wire — it must not steal B's client mid-stream.
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // B's stream must be untouched: its second row is still readable.
+    ASSERT_SQL_OK(SQLFetch(b), SQL_HANDLE_STMT, b);
+    SQLINTEGER second = 0;
+    ASSERT_SQL_OK(SQLGetData(b, 1, SQL_C_SLONG, &second, sizeof(second), nullptr),
+                  SQL_HANDLE_STMT, b);
+    EXPECT_EQ(20, second);
+}
+
+// Row 4: SQLMoreResults on a statement whose result set — and whole batch —
+// is already known exhausted (StmtState::batch_exhausted) must report
+// SQL_NO_DATA without touching the connection at all, matching msodbcsql
+// (whose SQLMoreResults has no busy check of its own). Before this fix
+// (AB#47508 item 11) this fell through to the ordinary busy check and
+// returned SQL_ERROR/HY000 instead once B had claimed the connection.
+TEST_F(ConnectionBusyLiveTest, MoreResultsOnAlreadyExhaustedStatementReturnsNoDataWithoutTouchingConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    // A: exhaust via SQLGetData (row 2's precondition), releasing the connection.
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1 AS c1, 2 AS c2"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER c1 = 0, c2 = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &c1, sizeof(c1), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SLONG, &c2, sizeof(c2), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // B claims the now-idle connection and starts its own fetch.
+    ASSERT_SQL_OK(Run(b, "SELECT 20"), SQL_HANDLE_STMT, b);
+    ASSERT_SQL_OK(SQLFetch(b), SQL_HANDLE_STMT, b);
+
+    // A's SQLMoreResults must answer from its own already-known state,
+    // rather than contending with B for the connection.
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+
+    // B's in-progress fetch must be completely undisturbed.
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLGetData(b, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, b);
+    EXPECT_EQ(20, value);
+}
+
+// Row 4b: same as above, reached via the bound-column fetch path (row 1b's
+// precondition) instead of SQLGetData, to also cover the SQLFetch-driven
+// release path into SQLMoreResults's fast path.
+TEST_F(ConnectionBusyLiveTest, MoreResultsAfterBoundFetchExhaustionReturnsNoDataWithoutTouchingConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    // A: exhaust via a bound-column fetch plus an explicit NO_DATA fetch
+    // (row 1b's precondition), releasing the connection.
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value_a = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value_a, sizeof(value_a), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    // B claims the now-idle connection and starts its own fetch.
+    ASSERT_SQL_OK(Run(b, "SELECT 20"), SQL_HANDLE_STMT, b);
+    ASSERT_SQL_OK(SQLFetch(b), SQL_HANDLE_STMT, b);
+
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+
+    SQLINTEGER value_b = 0;
+    ASSERT_SQL_OK(SQLGetData(b, 1, SQL_C_SLONG, &value_b, sizeof(value_b), nullptr),
+                  SQL_HANDLE_STMT, b);
+    EXPECT_EQ(20, value_b);
+}
+
+// Row 3b: SQLGetData on the *first* of two rows in a result set must NOT
+// release the connection — the peek finds a second row still pending, so
+// the connection correctly stays busy. Same trigger as row 2, but with a
+// result set that isn't actually exhausted yet: distinguishes "every column
+// of the current row was read" from "the whole result set is done" (only
+// the latter releases). Matches msodbcsql exactly.
+TEST_F(ConnectionBusyLiveTest, GetDataOfFirstRowLeavesConnectionBusyWhenAnotherRowIsStillPending) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 10 UNION ALL SELECT 20"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(10, value);
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"))
+        << "a pending second row in A's result set must keep the connection busy";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+}
+
+// Row 5: a further result set pending in the same batch must keep the
+// connection busy for B, while A's own SQLMoreResults still genuinely
+// advances and reads the next result set. Unaffected by this PR's fix
+// (identical on main and msodbcsql); included for completeness.
+TEST_F(ConnectionBusyLiveTest, PendingSecondResultSetKeepsConnectionBusyAndAdvancesCorrectly) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1; SELECT 2"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, value);
+
+    // A further result set is still pending in the batch — B must see busy.
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 20"));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+
+    // A can still genuinely advance to, and read, its own second result set.
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, value);
+}
+
+// Row 6: binding only a prefix of the row's columns and never reading the
+// rest via SQLGetData is a deliberate scope limit (documented in
+// exec_common.rs / README.md) — peeking early would discard the still
+// legally-retrievable unbound column, so the connection correctly stays
+// busy here. Parity with msodbcsql, not a gap.
+TEST_F(ConnectionBusyLiveTest, PrefixBoundFetchLeavesConnectionBusy) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1 AS c1, 2 AS c2"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER c1 = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &c1, sizeof(c1), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, c1);
+    // c2 is never bound or read via SQLGetData.
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"))
+        << "an unread trailing column must keep the connection busy";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+}
+
+// Row 7: same shape as row 6 (an unread trailing column), but with a large
+// nvarchar(max) column — the SQLGetData PLP/streaming completion path is
+// not wired to the new peek in this PR, so an unread streamed column also
+// keeps the connection busy. Parity with msodbcsql, not a gap.
+TEST_F(ConnectionBusyLiveTest, UnreadTrailingNvarcharMaxColumnLeavesConnectionBusy) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(
+        Run(stmt_, "SELECT 1 AS c1, CAST(REPLICATE('x', 10000) AS nvarchar(max)) AS c2"),
+        SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER c1 = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &c1, sizeof(c1), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, c1);
+    // c2 (nvarchar(max)) is never bound or read via SQLGetData.
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"))
+        << "an unread nvarchar(max) column must keep the connection busy";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+}
+
+// Row 8: a leading PRINT before a zero-row SELECT surfaces its message on
+// the SQLExecDirect call itself — the driver reads past PRINT's INFO/DONE
+// tokens on the way to the SELECT's own COLMETADATA (the first row-bearing
+// stopping point), so the message is already captured by the time that same
+// execute call returns. Unaffected by this PR's fix; included for
+// completeness.
+TEST_F(ConnectionBusyLiveTest, LeadingPrintMessageSurfacesOnExecDirect) {
+    SQLRETURN rc = Run(stmt_, "PRINT 'row8 leading print'; SELECT 1 WHERE 1 = 0");
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    std::string msg = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    EXPECT_NE(std::string::npos, msg.find("row8 leading print"));
+}
+
+// Row 9: the same PRINT reordered *after* a zero-row SELECT surfaces its
+// message on the SQLMoreResults call that advances past the SELECT — the
+// PRINT statement hasn't been read off the wire yet at execute time (the
+// driver stops at the SELECT's own COLMETADATA), so its message can only be
+// captured once SQLMoreResults reaches it. Unaffected by this PR's fix;
+// included for completeness.
+TEST_F(ConnectionBusyLiveTest, TrailingPrintMessageSurfacesOnMoreResults) {
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1 WHERE 1 = 0; PRINT 'row9 trailing print'"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // The zero-row SELECT's cursor is open but empty.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    SQLRETURN rc = SQLMoreResults(stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    std::string msg = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    EXPECT_NE(std::string::npos, msg.find("row9 trailing print"));
+}
+
+// A statement suspended in SQL_NEED_DATA holds the connection between calls, so
+// another statement is busy until the data-at-execution sequence completes.
+// Benefits-from-mock-tds: assert B's batch never reaches the wire while A's
+// streamed RPC is open, rather than only that B is told the connection is busy.
+ODBC_TEST_F(ConnectionBusyLiveTest, DataAtExecutionSequenceKeepsConnectionBusy) {
+    SQLHSTMT b = AllocStmt();
+    SQLCHAR token = 0;
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 0, 0,
+                                   &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, Run(stmt_, "SELECT ?"));
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 1"));
+    EXPECT_TRUE(IsBusy(SQL_HANDLE_STMT, b)) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, b);
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>("x"), 1), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 1"));
+    EXPECT_TRUE(IsBusy(SQL_HANDLE_STMT, b)) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, b);
+
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(Run(b, "SELECT 1"), SQL_HANDLE_STMT, b);
+}

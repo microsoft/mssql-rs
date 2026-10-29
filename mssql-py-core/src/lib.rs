@@ -9,8 +9,14 @@ use mssql_tds::connection::client_context::DriverVersion;
 mod arrow_bulkcopy;
 mod async_connection;
 mod async_cursor;
+mod async_description;
+mod async_errors;
+mod async_execute;
+mod async_fetch;
+mod async_parameters;
 mod async_runtime;
 mod async_session;
+mod async_tracing;
 mod bulkcopy;
 mod connection;
 mod cursor;
@@ -33,6 +39,13 @@ pub(crate) static RAW_DRIVER_VERSION: OnceLock<String> = OnceLock::new();
 
 /// Module-level runtime details, set once by the host Python package.
 pub(crate) static RUNTIME_DETAILS: OnceLock<String> = OnceLock::new();
+
+/// Configure this native runtime before its first connection.
+#[pyfunction]
+fn set_default_multi_subnet_failover(enabled: bool) -> PyResult<()> {
+    mssql_tds::connection::multi_subnet_failover::set_default_multi_subnet_failover(enabled)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
 
 /// Returns the driver version, falling back to the mssql-tds crate version.
 pub(crate) fn get_driver_version() -> DriverVersion {
@@ -90,9 +103,22 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     m.add_class::<connection::PyCoreConnection>()?;
+    m.add_function(wrap_pyfunction!(set_default_multi_subnet_failover, m)?)?;
     m.add_class::<cursor::PyCoreCursor>()?;
     m.add_class::<async_connection::PyAsyncConnection>()?;
     m.add_class::<async_cursor::PyAsyncCursor>()?;
+    m.add_class::<async_parameters::PyTableValuedParameter>()?;
+    async_errors::add_exceptions(m)?;
+    // SQL Server-specific TDS type tokens accepted by setinputsizes().
+    m.add("SQL_MONEY", 60)?;
+    m.add("SQL_SMALLMONEY", 122)?;
+    m.add("SQL_XML", 241)?;
+    m.add("SQL_JSON", 244)?;
+    m.add("SQL_VECTOR", 245)?;
+    m.add("apilevel", "2.0")?;
+    m.add("threadsafety", 1)?;
+    // DB-API allows one declared style; named pyformat markers are an extension.
+    m.add("paramstyle", "qmark")?;
 
     // Test-only hook to drive PythonEntraIdTokenFactory::create_token from
     // Python tests. Underscore-prefixed to mark as internal/test-only.
@@ -100,5 +126,16 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         python_entra_token_factory::invoke_entra_id_token_factory,
         m
     )?)?;
+    #[cfg(debug_assertions)]
+    {
+        m.add_function(wrap_pyfunction!(
+            async_fetch::_arm_fetch_publication_pause,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            async_fetch::_release_fetch_publication_pause,
+            m
+        )?)?;
+    }
     Ok(())
 }

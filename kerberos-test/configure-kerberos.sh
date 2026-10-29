@@ -33,10 +33,33 @@ NC='\033[0m'
 
 echo "Configuring Kerberos authentication..."
 
-# Create test user in AD (if not exists)
+# Create test user in AD (if not exists).
+#
+# The samba-dc healthcheck (`samba-tool domain info`) can report healthy
+# slightly before the AD database is ready to accept writes, so a
+# `user create` issued right after startup can fail transiently. Retry with
+# verification instead of swallowing the exit code, otherwise a genuine
+# failure here is masked as "already exists" and only surfaces later as a
+# confusing `kinit: Client not found` error in the test-run step.
 echo -e "${YELLOW}Creating test user in AD...${NC}"
-docker exec samba-dc samba-tool user create testuser "$TEST_USER_PASSWORD" \
-    --given-name="Test" --surname="User" 2>/dev/null || echo "User already exists"
+USER_READY=false
+for attempt in $(seq 1 10); do
+    if docker exec samba-dc samba-tool user list 2>/dev/null | grep -qix testuser; then
+        USER_READY=true
+        break
+    fi
+    if docker exec samba-dc samba-tool user create testuser "$TEST_USER_PASSWORD" \
+        --given-name="Test" --surname="User" 2>/dev/null; then
+        USER_READY=true
+        break
+    fi
+    echo "  Attempt $attempt/10: testuser not ready yet, retrying in 3s..."
+    sleep 3
+done
+if [ "$USER_READY" != true ]; then
+    echo "ERROR: Failed to create or verify testuser in AD after 10 attempts"
+    exit 1
+fi
 echo -e "${GREEN}✓ Test user ready${NC}"
 
 # Add MSSQLSvc SPNs to SQL$ computer account

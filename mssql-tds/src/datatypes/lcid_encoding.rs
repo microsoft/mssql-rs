@@ -238,6 +238,90 @@ pub fn lcid_to_encoding(lcid: u32) -> Result<&'static Encoding, Error> {
     }
 }
 
+/// Maps a Windows LCID to its ANSI code page, mirroring the server's
+/// `x_rgLocaleMap` (`Sql/Common/include/LocaleMap.h`). Used to resolve a
+/// Windows (sort-ID 0) collation's code page for `SQL_COLLATION_SEQ` the way
+/// msodbcsql's `CodePageFromTDSCollation` does — a broader set than
+/// [`lcid_to_encoding`], which covers only encodings this crate can decode.
+/// `None` for an LCID the server's locale map does not list.
+pub(crate) fn lcid_to_code_page(lcid: u32) -> Option<u16> {
+    let code_page = match lcid {
+        0x0401 => 1256,
+        0x0404 => 950,
+        0x0405 => 1250,
+        0x0406 => 1252,
+        0x0408 => 1253,
+        0x0409 => 1252,
+        0x040A => 1252,
+        0x040B => 1252,
+        0x040C => 1252,
+        0x040D => 1255,
+        0x040E => 1250,
+        0x040F => 1252,
+        0x0411 => 932,
+        0x0412 => 949,
+        0x0414 => 1252,
+        0x0415 => 1250,
+        0x0417 => 1252,
+        0x0418 => 1250,
+        0x0419 => 1251,
+        0x041A => 1250,
+        0x041B => 1250,
+        0x041C => 1250,
+        0x041E => 874,
+        0x041F => 1254,
+        0x0420 => 1256,
+        0x0422 => 1251,
+        0x0424 => 1250,
+        0x0425 => 1257,
+        0x0426 => 1257,
+        0x0427 => 1257,
+        0x0429 => 1256,
+        0x042A => 1258,
+        0x042C => 1254,
+        0x042E => 1252,
+        0x042F => 1251,
+        0x043B => 1252,
+        0x043F => 1251,
+        0x0442 => 1250,
+        0x0443 => 1254,
+        0x0444 => 1251,
+        0x0452 => 1252,
+        0x0462 => 1252,
+        0x046D => 1251,
+        0x047A => 1252,
+        0x047C => 1252,
+        0x047E => 1252,
+        0x0480 => 1256,
+        0x0483 => 1252,
+        0x0485 => 1251,
+        0x048C => 1256,
+        0x0804 => 936,
+        0x081A => 1250,
+        0x0827 => 1257,
+        0x082C => 1251,
+        0x083B => 1252,
+        0x085F => 1252,
+        0x0C04 => 950,
+        0x0C0A => 1252,
+        0x0C1A => 1251,
+        0x1404 => 950,
+        0x141A => 1250,
+        0x201A => 1251,
+        0x1_0407 => 1252,
+        0x1_040E => 1250,
+        0x1_0411 => 932,
+        0x1_0412 => 949,
+        0x1_0437 => 1252,
+        0x2_0804 => 936,
+        0x2_1404 => 950,
+        0x3_0404 => 950,
+        0x4_0411 => 932,
+        _ => return None,
+    };
+    Some(code_page)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +407,21 @@ mod tests {
         // Unsupported LCID should return error
         assert!(lcid_to_encoding(0xFFFF).is_err());
         assert!(lcid_to_encoding(0x0000).is_err());
+    }
+
+    #[test]
+    fn lcid_to_code_page_covers_the_full_locale_map() {
+        // Entries the narrow encoding table also carries.
+        assert_eq!(lcid_to_code_page(0x0409), Some(1252));
+        assert_eq!(lcid_to_code_page(0x0419), Some(1251));
+        assert_eq!(lcid_to_code_page(0x0411), Some(932));
+        // Entries only the server locale map carries (absent from encoding table).
+        assert_eq!(lcid_to_code_page(0x0452), Some(1252)); // Welsh
+        assert_eq!(lcid_to_code_page(0x042E), Some(1252)); // Upper Sorbian
+        // A full-text extended LCID, reachable after the 20-bit mask.
+        assert_eq!(lcid_to_code_page(0x1_0407), Some(1252));
+        // LCIDs the locale map does not list.
+        assert_eq!(lcid_to_code_page(0x0000), None);
+        assert_eq!(lcid_to_code_page(0x000F_FFFF), None);
     }
 }

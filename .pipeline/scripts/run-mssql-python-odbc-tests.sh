@@ -6,10 +6,10 @@
 # bundled Microsoft ODBC Driver 18 binary has been replaced by the Rust
 # mssql-odbc driver (see swap-mssql-python-odbc-driver.sh).
 #
-# The Rust driver is still under construction, so this suite is expected to fail
-# and to hard-crash the interpreter (segfault / abort) on some files. Each test
-# file therefore gets its own pytest process wrapped in `timeout`, so a crash or
-# a hang costs one file instead of the whole run:
+# A test file can hard-crash the interpreter (segfault / abort) against a
+# driver still under active development, so each test file gets its own pytest
+# process wrapped in `timeout`: a crash or a hang costs one file, not the whole
+# run.
 #
 #   - A crash kills only that file's process; the loop moves to the next file.
 #   - `timeout` bounds every file, so a wedged driver call can never stall the job.
@@ -32,17 +32,20 @@
 #   TEST_RESULTS_DIR         JUnit XML output directory (default: $MSSQL_PYTHON_DIR/test-results).
 #   PYTEST_FILE_TIMEOUT      Per-file wall-clock budget (default: 10m).
 #   PYTEST_TOTAL_BUDGET      Wall-clock budget for the whole loop (default: 110m).
+#   PYTEST_MARK_EXPR         pytest `-m` expression. When set (even to ""), it replaces
+#                            the `-m "not stress"` in upstream pytest.ini's addopts;
+#                            "" selects every test. Unset keeps the pytest.ini default.
+#   PYTEST_DESELECT          Whitespace-separated pytest node IDs, each passed as
+#                            `--deselect` to every file's run (default: none).
 #
 # Exit codes:
 #   0  every file passed.
 #   1  tests ran but the run was not clean - failures, crashes, timeouts, or
-#      files skipped because the time budget ran out. This is the expected
-#      baseline while the Rust driver is under development, so the calling step
-#      reports it as a warning (yellow) rather than failing the job.
+#      files skipped because the time budget ran out.
 #   2  the harness itself could not run the tests (broken venv, missing
-#      interpreter, or a run in which no file executed a single test) - the
-#      calling step turns this into a real pipeline error, since it says
-#      nothing about the driver.
+#      interpreter, or a run in which no file executed a single test).
+# Non-PR CI treats exit 1 as advisory (SucceededWithIssues); PRs and exit 2 still
+# fail the job. Local callers receive the original nonzero exit code.
 
 # No `set -e`: a failing or crashing test file must not abort the loop.
 set -uo pipefail
@@ -51,6 +54,20 @@ MSSQL_PYTHON_DIR="${MSSQL_PYTHON_DIR:-/workspace}"
 RESULTS_DIR="${TEST_RESULTS_DIR:-$MSSQL_PYTHON_DIR/test-results}"
 PYTEST_FILE_TIMEOUT="${PYTEST_FILE_TIMEOUT:-10m}"
 PYTEST_TOTAL_BUDGET="${PYTEST_TOTAL_BUDGET:-110m}"
+
+declare -a MARK_ARGS=()
+if [ -n "${PYTEST_MARK_EXPR+set}" ]; then
+    MARK_ARGS=(-m "$PYTEST_MARK_EXPR")
+fi
+
+declare -a DESELECT_ARGS=()
+declare -a DESELECT_IDS=()
+# -d '' reads past newlines, so IDs may be separated by any whitespace. read
+# returns 1 at end of input, which is expected here.
+read -r -d '' -a DESELECT_IDS <<< "${PYTEST_DESELECT:-}" || true
+for node_id in "${DESELECT_IDS[@]}"; do
+    DESELECT_ARGS+=(--deselect "$node_id")
+done
 
 cd "$MSSQL_PYTHON_DIR" || exit 2
 mkdir -p "$RESULTS_DIR"
@@ -133,6 +150,11 @@ fi
 
 echo "Running ${#TEST_FILES[@]} mssql-python test files against the mssql-odbc driver"
 echo "Per-file timeout: $PYTEST_FILE_TIMEOUT (${FILE_BUDGET_S}s) | total budget: $PYTEST_TOTAL_BUDGET (${TOTAL_BUDGET_S}s)"
+echo "Marker expression: ${PYTEST_MARK_EXPR-<pytest.ini default>}"
+if [ "${#DESELECT_IDS[@]}" -gt 0 ]; then
+    echo "Deselected tests:"
+    printf '  %s\n' "${DESELECT_IDS[@]}"
+fi
 
 declare -a SUMMARY=()
 passed=0 failed=0 crashed=0 timedout=0 empty=0 skipped=0
@@ -175,6 +197,8 @@ for idx in "${!TEST_FILES[@]}"; do
     # SIGKILL 60s after SIGTERM in case the driver wedges in an uninterruptible call.
     timeout --kill-after=60s "${slice}s" \
         python -m pytest "$test_file" -v \
+        "${MARK_ARGS[@]}" \
+        "${DESELECT_ARGS[@]}" \
         --junitxml="$report" \
         --capture=tee-sys \
         --cache-clear
@@ -185,10 +209,11 @@ for idx in "${!TEST_FILES[@]}"; do
     case "$rc" in
         0)   status="PASSED";              kind="ok";      passed=$((passed + 1)) ;;
         1)   status="FAILED";              kind="error";   failed=$((failed + 1)) ;;
-        2)   status="INTERRUPTED";         kind="error";   failed=$((failed + 1)) ;;
-        3)   status="INTERNAL ERROR";      kind="error";   failed=$((failed + 1)) ;;
-        4)   status="USAGE ERROR";         kind="error";   failed=$((failed + 1)) ;;
-        # Every test in the file was deselected by pytest.ini's `-m "not stress"`.
+        # Driver import failures during collection also produce pytest exit 2.
+        2)   status="COLLECTION ERROR / INTERRUPTED"; kind="error"; failed=$((failed + 1)) ;;
+        3)   status="INTERNAL ERROR";      kind="error";   harness_error=$((harness_error + 1)) ;;
+        4)   status="USAGE ERROR";         kind="error";   harness_error=$((harness_error + 1)) ;;
+        # Every test in the file was deselected by the active marker expression.
         5)   status="NO TESTS COLLECTED";  kind="skipped"; empty=$((empty + 1)) ;;
         # `timeout` could not run the command at all - a broken venv or missing
         # interpreter, not a driver defect. Do not report it as a crash.
@@ -234,12 +259,10 @@ echo "==============================================================="
 echo "files: ${#TEST_FILES[@]} | passed: $passed | failed: $failed | crashed: $crashed | timed out: $timedout | no tests: $empty | skipped: $skipped | harness errors: $harness_error"
 echo "==============================================================="
 
-# The two failure modes need distinct exit codes: a broken environment must be a
-# loud, actionable red, while driver test failures are the expected baseline
-# while mssql-odbc is under development. Collapsing both into exit 1 under the
-# step's error handling makes them indistinguishable.
+# The two failure modes need distinct exit codes so the pipeline can distinguish
+# a broken environment from a driver test failure.
 #   2 -> harness could not run the tests (environment defect)
-#   1 -> tests ran and did not fully pass (driver defect, advisory)
+#   1 -> tests ran and did not fully pass (driver defect)
 #   0 -> everything passed
 # Files skipped because the aggregate budget ran out count as "not clean" too:
 # the result set is incomplete, which must not read as a clean pass.
@@ -258,6 +281,6 @@ if [ "$((passed + failed + crashed + timedout))" -eq 0 ]; then
 fi
 
 if [ "$failed" -gt 0 ] || [ "$crashed" -gt 0 ] || [ "$timedout" -gt 0 ] || [ "$skipped" -gt 0 ]; then
-    echo "##[warning]mssql-python suite did not complete cleanly against the mssql-odbc driver (expected while the driver is in development)"
+    echo "##[error]mssql-python suite did not complete cleanly against the mssql-odbc driver"
     exit 1
 fi

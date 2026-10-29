@@ -1,0 +1,2964 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Local release gates; does not execute publishing, tagging, or ADO jobs."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import io
+import itertools
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tomllib
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+
+import pytest
+import yaml
+
+from test_verify_python_wheels import write_wheel_matrix
+
+_ROOT = Path(__file__).parents[1]
+_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
+_PYPI_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "PyPIRelease.yml"
+_SQLCMD_RELEASE_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialMssqlSqlcmdRelease.yml"
+_BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
+_WHEEL_INSTALL_TEMPLATE = (
+    _ROOT / ".pipeline" / "templates" / "test-python-wheel-installs-template.yml"
+)
+_METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
+_VERIFY_WHEELS_SCRIPT = _ROOT / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
+_SQLCMD_PACK_SCRIPT = _ROOT / ".pipeline" / "scripts" / "pack-mssql-sqlcmd.ps1"
+_SWITCHES = (
+    "publishToFeed",
+    "publishMssqlTds",
+    "publishMssqlMockTds",
+    "validateCratesOnly",
+    "tagRelease",
+)
+
+
+def evaluate(expression, parameters, succeeded=True):
+    """Evaluate only the boolean expression subset used by this pipeline."""
+    expression = re.sub(r"\band\(", "all_(", expression)
+    expression = re.sub(r"\bor\(", "any_(", expression)
+
+    def visit(node):
+        if isinstance(node, ast.Name):
+            return {"true": True, "false": False}[node.id.lower()]
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            assert node.value.id == "parameters"
+            return parameters[node.attr]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            args = [visit(arg) for arg in node.args]
+            return {
+                "eq": lambda a, b: a == b,
+                "ne": lambda a, b: a != b,
+                "all_": lambda *values: all(values),
+                "any_": lambda *values: any(values),
+                "succeeded": lambda: succeeded,
+            }[node.func.id](*args)
+        raise AssertionError(f"Unsupported pipeline expression: {expression}")
+
+    return visit(ast.parse(expression.strip(), mode="eval").body)
+
+
+def _literal(value):
+    """ADO renders booleans lowercase; everything else keeps its casing."""
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def expand(value, parameters):
+    if isinstance(value, str):
+        return re.sub(
+            r"\$\{\{(.+?)\}\}",
+            lambda match: _literal(evaluate(match[1], parameters)),
+            value,
+        )
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            expanded = expand(item, parameters)
+            if isinstance(expanded, list):
+                result.extend(expanded)
+            elif expanded:
+                result.append(expanded)
+        return result
+    if isinstance(value, dict):
+        if value.get("template") == "/.pipeline/templates/validate-release-crates.yml@self":
+            template = _ROOT / value["template"].removeprefix("/").removesuffix("@self")
+            return expand(yaml.safe_load(template.read_text(encoding="utf-8"))["steps"], parameters)
+        result = {}
+        matched = False
+        for key, item in value.items():
+            if key.startswith("${{"):
+                clause = key[3:-2].strip()
+                enabled = not matched if clause == "else" else evaluate(
+                    clause.removeprefix("if "), parameters
+                )
+                matched |= enabled
+                if enabled:
+                    expanded = expand(item, parameters)
+                    if isinstance(expanded, list):
+                        assert len(value) == 1
+                        return expanded
+                    result.update(expanded)
+            else:
+                result[key] = expand(item, parameters)
+        return result
+    return value
+
+
+def _stage_flags(**overrides):
+    """Seed from stages.yml's declared defaults so a new parameter cannot break callers."""
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags.update(overrides)
+    return flags
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("RUST-AZL3", "RUST-AZL3"),
+        ("MixedCase", "MixedCase"),
+        ("True", "True"),
+        (True, "true"),
+        (False, "false"),
+    ],
+)
+def test_expand_parameter_literals(value, expected):
+    source = {
+        "value": "${{ parameters.value }}",
+        "embedded": ["prefix-${{ parameters.value }}-suffix"],
+    }
+    assert expand(source, {"value": value}) == {
+        "value": expected,
+        "embedded": [f"prefix-{expected}-suffix"],
+    }
+
+
+def test_release_defaults_are_safe():
+    pipeline = yaml.safe_load(_PIPELINE.read_text(encoding="utf-8"))
+    assert {p["name"]: p["default"] for p in pipeline["parameters"]} == dict.fromkeys(
+        _SWITCHES, False
+    )
+    assert pipeline["trigger"] == "none"
+    assert pipeline["pr"] == "none"
+    assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
+
+
+@pytest.mark.parametrize("is_official", [False, True])
+@pytest.mark.parametrize("build_products", [False, True])
+def test_cpp_codeql_build_is_official_only(is_official, build_products):
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags.update(
+        isOfficial=is_official,
+        buildPythonWheels=build_products,
+        buildOdbcNative=build_products,
+    )
+    jobs = expand(source, flags)["stages"][0]["jobs"]
+    job = next(job for job in jobs if job["job"] == "Windows_x64")
+    codeql = {
+        variable["name"]: variable["value"]
+        for variable in job["variables"]
+        if variable.get("name", "").startswith("Codeql.")
+    }
+    assert codeql == ({
+        "Codeql.Enabled": True,
+        "Codeql.Language": "cpp",
+        "Codeql.BuildIdentifier": "mssql_odbc_cpp",
+    } if is_official else {})
+    steps = [
+        step for step in job["steps"]
+        if step.get("displayName") == "Build ODBC C++ targets for CodeQL"
+    ]
+    assert len(steps) == int(is_official)
+    for other in jobs:
+        if other["job"] != "Windows_x64":
+            assert "Codeql." not in str(other)
+    if is_official:
+        step = steps[0]
+        assert "condition" not in step
+        assert not step.get("continueOnError", False)
+        assert '-G "Visual Studio 17 2022"' in step["pwsh"]
+        assert "-A x64 -DODBC_E2E_FORCE_UNICODE=ON" in step["pwsh"]
+        assert "CMAKE_BUILD_TYPE" not in step["pwsh"]
+        for project in (r"mssql-odbc\tests\e2e", "mssql-odbc-bench"):
+            assert f"-S {project} -B {project}\\build_codeql" in step["pwsh"]
+            assert f"--build {project}\\build_codeql --config Debug --clean-first" in step["pwsh"]
+        assert "ctest" not in step["pwsh"]
+        assert "run_e2e" not in step["pwsh"]
+        assert "Build.ArtifactStagingDirectory" not in step["pwsh"]
+
+    official = yaml.safe_load(
+        (_BUILD_STAGES.parent / "OfficialPythonWheelsBuild.yml").read_text(encoding="utf-8")
+    )
+    assert official["trigger"]["branches"]["include"] == ["stable"]
+    assert official["extends"]["parameters"]["stages"][0]["parameters"]["isOfficial"] is True
+
+
+@pytest.mark.parametrize(
+    ("configure_exit", "build_exit", "cmake_source"),
+    [(0, 0, "path"), (1, 0, "path"), (0, 1, "path"), (0, 0, "vs"), (0, 0, "missing")],
+)
+@pytest.mark.parametrize("failure_project", [r"mssql-odbc\tests\e2e", "mssql-odbc-bench"])
+def test_cpp_codeql_build_propagates_cmake_failures(
+    configure_exit, build_exit, cmake_source, failure_project
+):
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = {parameter["name"]: parameter["default"] for parameter in source["parameters"]}
+    flags["isOfficial"] = True
+    job = next(
+        job for job in expand(source, flags)["stages"][0]["jobs"]
+        if job["job"] == "Windows_x64"
+    )
+    script = next(
+        step["pwsh"] for step in job["steps"]
+        if step.get("displayName") == "Build ODBC C++ targets for CodeQL"
+    )
+    stub = rf"""
+    function cmake {{
+        if ('{cmake_source}' -eq 'vs' -and $env:PATH -cne "C:\Mock VS\CMake\bin;$originalPath") {{
+            throw 'Discovered CMake directory was not prepended to PATH.'
+        }}
+        Write-Output "cmake $args"
+        $global:LASTEXITCODE = 0
+        if ($args[0] -eq '-S' -and $args[1] -eq '{failure_project}') {{
+            $global:LASTEXITCODE = {configure_exit}
+        }} elseif ($args[0] -eq '--build' -and $args[1] -eq '{failure_project}\build_codeql') {{
+            $global:LASTEXITCODE = {build_exit}
+        }}
+    }}
+    """
+    if cmake_source != "path":
+        stub += rf"""
+        $originalPath = $env:PATH
+        ${{env:ProgramFiles(x86)}} = 'C:\Mock Program Files'
+        function Get-Command {{
+            param($Name, $ErrorAction)
+            if ($Name -ne 'cmake') {{ throw "Unexpected lookup: $Name" }}
+        }}
+        Set-Item 'Function:\global:C:\Mock Program Files\Microsoft Visual Studio\Installer\vswhere.exe' {{
+            Write-Host 'vswhere called'
+            if ('{cmake_source}' -eq 'vs') {{ 'C:\Mock VS\CMake\bin\cmake.exe' }}
+        }}
+        """
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode == 0) == (
+        configure_exit == build_exit == 0 and cmake_source != "missing"
+    ), result.stderr
+    calls = [line for line in result.stdout.splitlines() if line.startswith("cmake ")]
+    expected_calls = 4
+    if cmake_source == "missing":
+        expected_calls = 0
+    elif configure_exit or build_exit:
+        expected_calls = (0 if failure_project == r"mssql-odbc\tests\e2e" else 2)
+        expected_calls += 1 if configure_exit else 2
+    assert len(calls) == expected_calls
+    assert ("vswhere called" in result.stdout) == (cmake_source != "path")
+    if cmake_source == "missing":
+        assert "CMake not found on PATH or in Visual Studio." in result.stderr
+        assert "cmake -S" not in result.stdout
+
+
+@pytest.mark.parametrize("publish", [False, True])
+def test_pypi_release_switch_graph(publish: bool) -> None:
+    source = yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8"))
+    assert source["parameters"] == [
+        {
+            "name": "publishToPyPI",
+            "displayName": (
+                "Publish selected official wheels to PyPI via ESRP. " "Leave false for a dry run."
+            ),
+            "type": "boolean",
+            "default": False,
+        }
+    ]
+    assert source["trigger"] == "none"
+    assert source["pr"] == "none"
+
+    pipeline = expand(source, {"publishToPyPI": publish})
+    job = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]
+    steps = job["steps"]
+    names = [step.get("displayName") for step in steps]
+    assert names.count("Require successful Official Build") == 1
+    assert names.index("Require successful Official Build") < names.index(
+        "Download all artifacts from Official Build"
+    )
+    assert names.count("Verify and stage official wheels") == 1
+    assert ("Require stable branch for publish" in names) == publish
+    assert ("ESRP Release mssql-python-rs wheels to PyPI" in names) == publish
+    assert ("Release summary" in names) == publish
+    assert ("Queue mssql-python dependency update" in names) == publish
+    assert any(step.get("download") == "officialBuild" for step in steps)
+    assert any(step.get("checkout") == "self" for step in steps)
+    stage_step = next(
+        step for step in steps if step.get("displayName") == "Verify and stage official wheels"
+    )
+    assert "-RequireOdbc" in stage_step["pwsh"]
+    if not publish:
+        assert not any(step.get("task", "").startswith("EsrpRelease@") for step in steps)
+    else:
+        esrp = next(step for step in steps if step.get("task", "").startswith("EsrpRelease@"))
+        assert esrp["inputs"]["FolderLocation"] == "$(Agent.TempDirectory)/pypi-publish"
+        assert names.index("ESRP Release mssql-python-rs wheels to PyPI") < names.index(
+            "Queue mssql-python dependency update"
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "result", "succeeds"),
+    [
+        ("completed", "succeeded", True),
+        ("completed", "failed", False),
+        ("completed", "partiallySucceeded", False),
+        ("completed", "canceled", False),
+        ("inProgress", "", False),
+        ("notStarted", "", False),
+    ],
+)
+def test_pypi_release_requires_successful_official_build(
+    status: str, result: str, succeeds: bool
+) -> None:
+    pipeline = expand(
+        yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8")),
+        {"publishToPyPI": False},
+    )
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    script = next(
+        step["pwsh"]
+        for step in steps
+        if step.get("displayName") == "Require successful Official Build"
+    )
+    stub = r"""
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers)
+        if ($Method -cne 'Get') { throw "Unexpected method: $Method" }
+        if ($Uri -cne 'https://dev.azure.com/test/project-id/_apis/build/builds/123?api-version=7.1') {
+            throw "Unexpected URI: $Uri"
+        }
+        if ($Headers.Authorization -cne 'Bearer test-token') {
+            throw "Unexpected authorization header"
+        }
+        [pscustomobject]@{
+            status = $env:MOCK_BUILD_STATUS
+            result = $env:MOCK_BUILD_RESULT
+        }
+    }
+    """
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_RUN_ID": "123",
+            "SYSTEM_ACCESSTOKEN": "test-token",
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/test/",
+            "SYSTEM_TEAMPROJECTID": "project-id",
+            "MOCK_BUILD_STATUS": status,
+            "MOCK_BUILD_RESULT": result,
+        },
+    )
+
+    assert (completed.returncode == 0) == succeeds
+    if succeeds:
+        assert "Selected Official Build 123 is completed and succeeded." in completed.stdout
+    else:
+        assert (
+            f"Official Build 123 is not eligible for release: status='{status}', "
+            f"result='{result}'."
+        ) in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("release_branch", "build_branch", "succeeds"),
+    [
+        ("refs/heads/stable", "refs/heads/stable", True),
+        ("refs/heads/main", "refs/heads/stable", False),
+        ("refs/heads/stable", "refs/heads/main", False),
+        ("refs/heads/stable", "refs/heads/STABLE", False),
+        ("refs/heads/STABLE", "refs/heads/stable", False),
+    ],
+)
+def test_pypi_publish_requires_both_stable_branches(
+    release_branch: str, build_branch: str, succeeds: bool
+) -> None:
+    pipeline = expand(
+        yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8")),
+        {"publishToPyPI": True},
+    )
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    script = next(
+        step["pwsh"]
+        for step in steps
+        if step.get("displayName") == "Require stable branch for publish"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "RELEASE_SOURCE_BRANCH": release_branch,
+            "OFFICIAL_BUILD_SOURCE_BRANCH": build_branch,
+        },
+    )
+
+    assert (result.returncode == 0) == succeeds
+
+
+def _sqlcmd_release_job(publish: bool) -> dict:
+    pipeline = expand(
+        yaml.safe_load(_SQLCMD_RELEASE_PIPELINE.read_text(encoding="utf-8")),
+        {"publishNuGet": publish},
+    )
+    stages = pipeline["extends"]["parameters"]["stages"]
+    assert len(stages) == 1 and len(stages[0]["jobs"]) == 1
+    return stages[0]["jobs"][0]
+
+
+def _sqlcmd_release_step(publish: bool, name: str) -> dict:
+    return next(
+        step for step in _sqlcmd_release_job(publish)["steps"] if step.get("displayName") == name
+    )
+
+
+@pytest.mark.parametrize("publish", [False, True])
+def test_sqlcmd_release_gates_precede_download(publish: bool) -> None:
+    source = yaml.safe_load(_SQLCMD_RELEASE_PIPELINE.read_text(encoding="utf-8"))
+    assert source["parameters"] == [
+        {
+            "name": "publishNuGet",
+            "displayName": "Publish the mssql-sqlcmd NuGet package to Azure Artifacts",
+            "type": "boolean",
+            "default": False,
+        }
+    ]
+    assert source["trigger"] == "none"
+    assert source["pr"] == "none"
+
+    job = _sqlcmd_release_job(publish)
+    assert job["variables"]["ob_nugetPublishing_enabled"] == _literal(publish)
+    steps = job["steps"]
+    names = [step.get("displayName") for step in steps]
+    downloads = [i for i, step in enumerate(steps) if step.get("download") == "officialBuild"]
+    assert len(downloads) == 1
+
+    assert names.count("Require a successful Official Build") == 1
+    assert names.index("Require a successful Official Build") < downloads[0]
+    assert steps[names.index("Require a successful Official Build")]["env"] == {
+        "OFFICIAL_BUILD_RUN_ID": "$(resources.pipeline.officialBuild.runID)",
+        "SYSTEM_ACCESSTOKEN": "$(System.AccessToken)",
+        "SYSTEM_COLLECTIONURI": "$(System.CollectionUri)",
+        "SYSTEM_TEAMPROJECTID": "$(System.TeamProjectId)",
+    }
+
+    assert names.count("Require the stable branch for publish") == int(publish)
+    assert ("Stage the mssql-sqlcmd package for publishing" in names) == publish
+    if publish:
+        stable = names.index("Require the stable branch for publish")
+        assert stable < downloads[0]
+        assert steps[stable]["env"] == {
+            "RELEASE_SOURCE_BRANCH": "$(Build.SourceBranch)",
+            "OFFICIAL_BUILD_SOURCE_BRANCH": "$(resources.pipeline.officialBuild.sourceBranch)",
+        }
+
+
+@pytest.mark.parametrize(
+    ("run_id", "status", "result", "succeeds"),
+    [
+        ("123", "completed", "succeeded", True),
+        ("123", "completed", "failed", False),
+        ("123", "completed", "partiallySucceeded", False),
+        ("123", "completed", "canceled", False),
+        ("123", "completed", "Succeeded", False),
+        ("123", "inProgress", "", False),
+        ("123", "notStarted", "", False),
+        ("not-a-number", "completed", "succeeded", False),
+        ("", "completed", "succeeded", False),
+    ],
+)
+def test_sqlcmd_release_requires_successful_official_build(
+    run_id: str, status: str, result: str, succeeds: bool
+) -> None:
+    script = _sqlcmd_release_step(False, "Require a successful Official Build")["pwsh"]
+    stub = r"""
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers)
+        Write-Host 'Builds API called'
+        if ($Method -cne 'Get') { throw "Unexpected method: $Method" }
+        if ($Uri -cne 'https://dev.azure.com/test/project-id/_apis/build/builds/123?api-version=7.1') {
+            throw "Unexpected URI: $Uri"
+        }
+        if ($Headers.Authorization -cne 'Bearer test-token') {
+            throw "Unexpected authorization header"
+        }
+        [pscustomobject]@{
+            status = $env:MOCK_BUILD_STATUS
+            result = $env:MOCK_BUILD_RESULT
+        }
+    }
+    """
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_RUN_ID": run_id,
+            "SYSTEM_ACCESSTOKEN": "test-token",
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/test/",
+            "SYSTEM_TEAMPROJECTID": "project-id",
+            "MOCK_BUILD_STATUS": status,
+            "MOCK_BUILD_RESULT": result,
+        },
+    )
+
+    assert (completed.returncode == 0) == succeeds, completed.stderr
+    if succeeds:
+        assert "Selected Official Build 123 is completed and succeeded." in completed.stdout
+    elif run_id != "123":
+        assert f"Invalid Official Build run ID: {run_id}" in completed.stderr
+        assert "Builds API called" not in completed.stdout
+    else:
+        assert (
+            f"Official Build 123 is not eligible for release: status='{status}', "
+            f"result='{result}'."
+        ) in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("release_branch", "build_branch", "error"),
+    [
+        ("refs/heads/stable", "refs/heads/stable", None),
+        ("refs/heads/main", "refs/heads/stable", "allowed only from refs/heads/stable"),
+        ("refs/heads/STABLE", "refs/heads/stable", "allowed only from refs/heads/stable"),
+        ("refs/heads/stable", "refs/heads/main", "an Official Build produced from"),
+        ("refs/heads/stable", "refs/heads/STABLE", "an Official Build produced from"),
+        ("refs/heads/stable", "", "an Official Build produced from"),
+    ],
+)
+def test_sqlcmd_publish_requires_both_stable_branches(
+    release_branch: str, build_branch: str, error: str | None
+) -> None:
+    script = _sqlcmd_release_step(True, "Require the stable branch for publish")["pwsh"]
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "RELEASE_SOURCE_BRANCH": release_branch,
+            "OFFICIAL_BUILD_SOURCE_BRANCH": build_branch,
+        },
+    )
+
+    assert (result.returncode == 0) == (error is None), result.stderr
+    if error:
+        assert error in result.stderr
+
+
+_SQLCMD_PACKAGE_ENTRIES = (
+    "include/mssql_sqlcmd.h",
+    "runtimes/win-x64/native/mssql_sqlcmd.lib",
+    "runtimes/win-x86/native/mssql_sqlcmd.lib",
+    "runtimes/win-arm64/native/mssql_sqlcmd.lib",
+    "runtimes/linux-x64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-arm64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-musl-x64/native/libmssql_sqlcmd.a",
+    "runtimes/linux-musl-arm64/native/libmssql_sqlcmd.a",
+    "runtimes/osx-x64/native/libmssql_sqlcmd.a",
+    "runtimes/osx-arm64/native/libmssql_sqlcmd.a",
+) + tuple(
+    f"runtimes/{rid}/native/native-static-libs.txt"
+    for rid in (
+        "win-x64",
+        "win-x86",
+        "win-arm64",
+        "linux-x64",
+        "linux-arm64",
+        "linux-musl-x64",
+        "linux-musl-arm64",
+        "osx-x64",
+        "osx-arm64",
+    )
+)
+
+# Stands in for the feed's flat-container index. MOCK_FEED is a comma-separated
+# list of published versions, an HTTP status code to fail with, or
+# "noresponse" for a failure with no HTTP response at all.
+_SQLCMD_FEED_STUB = r"""
+function Invoke-RestMethod {
+    param($Uri, $Headers)
+    Write-Host 'Feed queried'
+    if ($Uri -cne 'https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/nuget/v3/flat2/mssql-sqlcmd/index.json') {
+        throw "Unexpected URI: $Uri"
+    }
+    if ($Headers.Authorization -cne 'Bearer test-token') {
+        throw 'Unexpected authorization header'
+    }
+    if ($env:MOCK_FEED -eq 'noresponse') {
+        throw [System.Net.Http.HttpRequestException]::new('No such host is known.')
+    }
+    if ($env:MOCK_FEED -match '^\d+$') {
+        $status = [System.Net.HttpStatusCode][int]$env:MOCK_FEED
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new(
+            "Response status code does not indicate success: $([int]$status).",
+            [System.Net.Http.HttpResponseMessage]::new($status))
+    }
+    [pscustomobject]@{ versions = @($env:MOCK_FEED -split ',' | Where-Object { $_ }) }
+}
+"""
+
+
+def run_sqlcmd_package_validation(
+    tmp_path: Path, packages: dict[str, tuple[str, ...]], feed: str
+) -> subprocess.CompletedProcess[str]:
+    drop = tmp_path / "workspace" / "officialBuild" / "drop_Build_MssqlSqlcmd_Package"
+    drop.mkdir(parents=True)
+    for name, entries in packages.items():
+        with zipfile.ZipFile(drop / name, "w") as archive:
+            for entry in entries:
+                archive.writestr(entry, b"content")
+
+    script = (
+        _sqlcmd_release_step(False, "Validate the mssql-sqlcmd package")["pwsh"]
+        .replace("$(Pipeline.Workspace)", str(tmp_path / "workspace"))
+        .replace("$(resources.pipeline.officialBuild.runID)", "123")
+        .replace("$(resources.pipeline.officialBuild.sourceCommit)", "abc123")
+    )
+    assert not re.search(r"\$\([A-Za-z][\w.]*\)", script), "an unexpanded pipeline macro"
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", _SQLCMD_FEED_STUB + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "SYSTEM_ACCESSTOKEN": "test-token", "MOCK_FEED": feed},
+    )
+
+
+@pytest.mark.parametrize("feed", ["404", "0.0.9,0.0.10"])
+def test_sqlcmd_release_validation_accepts_a_complete_unpublished_version(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Package: mssql-sqlcmd.0.1.0.nupkg from build 123 (abc123)" in result.stdout
+    assert "Feed queried" in result.stdout
+    assert "mssql-sqlcmd 0.1.0 is not on the feed yet." in result.stdout
+    assert "##vso[task.setvariable variable=packageVersion]0.1.0" in result.stdout
+    path = re.search(r"##vso\[task\.setvariable variable=packagePath\](.+)", result.stdout)
+    assert path and Path(path[1].strip()).name == "mssql-sqlcmd.0.1.0.nupkg"
+
+
+@pytest.mark.parametrize("feed", ["0.0.9,0.1.0", "0.1.0"])
+def test_sqlcmd_release_validation_rejects_a_published_version(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode != 0
+    assert "mssql-sqlcmd 0.1.0 is already on mssql-rs_Public" in result.stderr
+    assert "##vso[task.setvariable" not in result.stdout
+
+
+@pytest.mark.parametrize("version", ["0.1.0-dev.20261005.1", "0.1.0-nightly.20261005"])
+def test_sqlcmd_release_validation_rejects_a_prerelease(tmp_path: Path, version: str) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {f"mssql-sqlcmd.{version}.nupkg": _SQLCMD_PACKAGE_ENTRIES}, "404"
+    )
+
+    assert result.returncode != 0
+    assert f"mssql-sqlcmd {version} is a prerelease" in result.stderr
+    assert "Feed queried" not in result.stdout
+
+
+@pytest.mark.parametrize("missing", _SQLCMD_PACKAGE_ENTRIES)
+def test_sqlcmd_release_validation_requires_every_runtime(
+    tmp_path: Path, missing: str
+) -> None:
+    entries = tuple(entry for entry in _SQLCMD_PACKAGE_ENTRIES if entry != missing)
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": entries}, "404"
+    )
+
+    assert result.returncode != 0
+    assert f"The package is missing: {missing}" in result.stderr
+    assert "Feed queried" not in result.stdout
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_sqlcmd_release_validation_requires_exactly_one_package(
+    tmp_path: Path, count: int
+) -> None:
+    packages = {
+        f"mssql-sqlcmd.0.1.{patch}.nupkg": _SQLCMD_PACKAGE_ENTRIES for patch in range(count)
+    }
+    result = run_sqlcmd_package_validation(tmp_path, packages, "404")
+
+    assert result.returncode != 0
+    assert "Expected one mssql-sqlcmd package" in result.stderr
+    assert f"found {count}" in result.stderr
+
+
+@pytest.mark.parametrize("feed", ["500", "401", "noresponse"])
+def test_sqlcmd_release_validation_fails_when_the_feed_cannot_be_read(
+    tmp_path: Path, feed: str
+) -> None:
+    result = run_sqlcmd_package_validation(
+        tmp_path, {"mssql-sqlcmd.0.1.0.nupkg": _SQLCMD_PACKAGE_ENTRIES}, feed
+    )
+
+    assert result.returncode != 0
+    assert "Feed queried" in result.stdout
+    assert "is not on the feed yet" not in result.stdout
+    assert "##vso[task.setvariable" not in result.stdout
+
+
+_SQLCMD_RIDS = (
+    "win-x64",
+    "win-x86",
+    "win-arm64",
+    "linux-x64",
+    "linux-arm64",
+    "linux-musl-x64",
+    "linux-musl-arm64",
+    "osx-x64",
+    "osx-arm64",
+)
+
+
+def _sqlcmd_library(rid: str) -> str:
+    return "mssql_sqlcmd.lib" if rid.startswith("win-") else "libmssql_sqlcmd.a"
+
+
+def write_sqlcmd_artifacts(
+    root: Path,
+    rids: tuple[str, ...] = _SQLCMD_RIDS,
+    versions: tuple[str, ...] = ("0.1.0",),
+    skip: str | None = None,
+) -> None:
+    """Lay out downloaded build artifacts as the package job receives them: one
+    drop per build job, each with runtimes/<rid>/native, and the version the
+    Windows build records."""
+    for rid in rids:
+        drop = "Windows" if rid.startswith("win-") else rid.replace("-", "_")
+        native = root / f"drop_Build_MssqlSqlcmd_{drop}" / "runtimes" / rid / "native"
+        native.mkdir(parents=True, exist_ok=True)
+        for name in (_sqlcmd_library(rid), "native-static-libs.txt"):
+            if f"{rid}/{name}" != skip:
+                (native / name).write_text(f"{rid} {name}\n", encoding="utf-8")
+    for index, version in enumerate(versions):
+        drop = root / f"drop_Build_MssqlSqlcmd_Windows{index or ''}"
+        drop.mkdir(parents=True, exist_ok=True)
+        (drop / "mssql-sqlcmd-version.txt").write_text(f"{version}\n", encoding="ascii")
+
+
+def run_sqlcmd_pack(tmp_path: Path, *arguments: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+    staging = tmp_path / "staging"
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(_SQLCMD_PACK_SCRIPT),
+            "-ArtifactsDirectory",
+            str(tmp_path / "artifacts"),
+            "-StagingDirectory",
+            str(staging),
+            *arguments,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, staging
+
+
+def _packed_version(result: subprocess.CompletedProcess[str]) -> str:
+    match = re.search(r"##vso\[task\.setvariable variable=mssqlSqlcmdVersion\](\S+)", result.stdout)
+    assert match, result.stdout + result.stderr
+    return match[1]
+
+
+def test_sqlcmd_pack_stages_every_runtime_and_writes_the_nuspec(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts")
+    result, staging = run_sqlcmd_pack(
+        tmp_path, "-IsOfficial", "True", "-BuildId", "7", "-SourceVersion", "abc123"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _packed_version(result) == "0.1.0"
+    for rid in _SQLCMD_RIDS:
+        native = staging / "runtimes" / rid / "native"
+        assert (native / _sqlcmd_library(rid)).read_text(encoding="utf-8").startswith(rid)
+        assert (native / "native-static-libs.txt").is_file()
+    assert (staging / "include" / "mssql_sqlcmd.h").read_bytes() == (
+        _ROOT / "mssql-sqlcmd" / "include" / "mssql_sqlcmd.h"
+    ).read_bytes()
+    assert (staging / "README.md").is_file() and (staging / "LICENSE.txt").is_file()
+
+    nuspec = ET.parse(staging / "mssql-sqlcmd.nuspec").getroot()
+    ns = {"n": "http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"}
+    assert nuspec.findtext("n:metadata/n:id", namespaces=ns) == "mssql-sqlcmd"
+    assert nuspec.findtext("n:metadata/n:version", namespaces=ns) == "0.1.0"
+    assert nuspec.find("n:metadata/n:repository", ns).get("commit") == "abc123"
+    nuspec_path = re.search(r"variable=mssqlSqlcmdNuspec\](.+)", result.stdout)
+    assert nuspec_path and Path(nuspec_path[1].strip()) == staging / "mssql-sqlcmd.nuspec"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "pattern"),
+    [
+        (("-IsOfficial", "True", "-BuildReason", "Manual"), r"0\.1\.0"),
+        # An official build is never suffixed, whatever started it.
+        (("-IsOfficial", "True", "-BuildReason", "Schedule"), r"0\.1\.0"),
+        (("-IsOfficial", "False", "-BuildReason", "Schedule"), r"0\.1\.0-nightly\.\d{8}"),
+        (("-IsOfficial", "False", "-BuildReason", "IndividualCI", "-BuildId", "42"), r"0\.1\.0-dev\.\d{8}\.42"),
+        (("-IsOfficial", "False", "-BuildReason", "Manual", "-BuildId", "43"), r"0\.1\.0-dev\.\d{8}\.43"),
+        (("-BuildId", "44",), r"0\.1\.0-dev\.\d{8}\.44"),
+    ],
+)
+def test_sqlcmd_pack_versions_official_nightly_and_dev_builds(
+    tmp_path: Path, arguments: tuple[str, ...], pattern: str
+) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts")
+    result, _ = run_sqlcmd_pack(tmp_path, *arguments)
+
+    assert result.returncode == 0, result.stderr
+    assert re.fullmatch(pattern, _packed_version(result))
+
+
+def test_sqlcmd_pack_accepts_matching_recorded_versions(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", versions=("0.2.0", "0.2.0"))
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode == 0, result.stderr
+    assert _packed_version(result) == "0.2.0"
+
+
+def test_sqlcmd_pack_rejects_conflicting_recorded_versions(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", versions=("0.1.0", "0.2.0"))
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode != 0
+    assert "The artifacts record different mssql-sqlcmd versions: 0.1.0, 0.2.0" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="needs cargo for the fallback")
+def test_sqlcmd_pack_falls_back_to_cargo_metadata(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", versions=())
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    crate = (_ROOT / "mssql-sqlcmd" / "Cargo.toml").read_text(encoding="utf-8")
+    expected = re.search(r'^version = "([^"]+)"', crate, re.MULTILINE)[1]
+    assert result.returncode == 0, result.stderr
+    assert _packed_version(result) == expected
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [f"{rid}/{_sqlcmd_library(rid)}" for rid in _SQLCMD_RIDS]
+    + [f"{rid}/native-static-libs.txt" for rid in ("win-x64", "linux-musl-arm64", "osx-x64")],
+)
+def test_sqlcmd_pack_requires_every_runtime(tmp_path: Path, missing: str) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts", skip=missing)
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode != 0
+    assert f"Missing from the build artifacts: {missing}" in result.stderr
+    assert "variable=mssqlSqlcmdVersion" not in result.stdout
+
+
+def test_sqlcmd_pack_rejects_a_runtime_from_two_artifacts(tmp_path: Path) -> None:
+    write_sqlcmd_artifacts(tmp_path / "artifacts")
+    duplicate = tmp_path / "artifacts" / "drop_Extra" / "runtimes" / "linux-x64" / "native"
+    duplicate.mkdir(parents=True)
+    (duplicate / "libmssql_sqlcmd.a").write_text("other\n", encoding="utf-8")
+    result, _ = run_sqlcmd_pack(tmp_path, "-IsOfficial", "True")
+
+    assert result.returncode != 0
+    assert "Runtime linux-x64 was staged by more than one artifact" in result.stderr
+
+
+# Stands in for cargo: metadata reports FAKE_TARGET_DIR the way cargo resolves
+# [build] target-dir, and rustc writes a "fresh" archive there. The Unix build
+# script has its own test, .pipeline/scripts/test_build_mssql_sqlcmd_native.py,
+# which the Linux validation job runs.
+_FAKE_CARGO = """\
+import json, os, sys
+args = sys.argv[1:]
+target_dir = os.environ["FAKE_TARGET_DIR"]
+if args and args[0] == "metadata":
+    packages = [{"name": "mssql-sqlcmd", "version": "0.1.0"}]
+    print(json.dumps({"packages": packages, "target_directory": target_dir}, separators=(",", ":")))
+elif args and args[0] == "rustc":
+    target = args[args.index("--target") + 1]
+    release = os.path.join(target_dir, target, "release")
+    os.makedirs(release, exist_ok=True)
+    name = "mssql_sqlcmd.lib" if "windows" in target else "libmssql_sqlcmd.a"
+    with open(os.path.join(release, name), "w") as archive:
+        archive.write("fresh\\n")
+    print("note: native-static-libs: -lfake", file=sys.stderr)
+"""
+
+
+def _sqlcmd_native_build_fixture(tmp_path: Path, script: str) -> tuple[Path, dict[str, str]]:
+    """A repository holding only the build script, with a stale archive in the
+    default target/ and cargo configured to build elsewhere."""
+    repo = tmp_path / "repo"
+    scripts = repo / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(_ROOT / ".pipeline" / "scripts" / script, scripts / script)
+
+    for target, name in (
+        ("x86_64-pc-windows-msvc", "mssql_sqlcmd.lib"),
+        ("x86_64-unknown-linux-gnu", "libmssql_sqlcmd.a"),
+    ):
+        stale = repo / "target" / target / "release"
+        stale.mkdir(parents=True)
+        (stale / name).write_text("stale\n", encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "fake_cargo.py").write_text(_FAKE_CARGO, encoding="utf-8")
+    for tool, body in (("cargo", '"$(dirname "$0")/fake_cargo.py"'), ("rustup", None)):
+        if sys.platform == "win32":
+            run = f'@"{sys.executable}" "%~dp0fake_cargo.py" %*' if body else "@exit /b 0"
+            (bin_dir / f"{tool}.cmd").write_text(run + "\r\n", encoding="ascii")
+        else:
+            run = f'exec "{sys.executable}" {body} "$@"' if body else "exit 0"
+            stub = bin_dir / tool
+            stub.write_text(f"#!/usr/bin/env bash\n{run}\n", newline="\n")
+            stub.chmod(0o755)
+
+    env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+    env["FAKE_TARGET_DIR"] = str(tmp_path / "configured-target")
+    return repo, env
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs pwsh")
+def test_sqlcmd_windows_build_stages_from_cargos_target_directory(tmp_path: Path) -> None:
+    repo, env = _sqlcmd_native_build_fixture(tmp_path, "build-mssql-sqlcmd-native.ps1")
+    out = tmp_path / "out"
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(repo / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.ps1"),
+            "-OutputDirectory",
+            str(out),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for rid in ("win-x64", "win-x86", "win-arm64"):
+        native = out / "runtimes" / rid / "native"
+        assert (native / "mssql_sqlcmd.lib").read_text(encoding="utf-8") == "fresh\n"
+        assert (native / "native-static-libs.txt").read_text(encoding="ascii").strip() == "-lfake"
+    assert (out / "mssql-sqlcmd-version.txt").read_text(encoding="ascii").strip() == "0.1.0"
+
+
+def test_sqlcmd_pack_takes_required_runtimes_as_one_comma_separated_argument(
+    tmp_path: Path,
+) -> None:
+    # `pwsh -File` passes a list as a single string.
+    write_sqlcmd_artifacts(tmp_path / "artifacts", rids=("win-x64", "linux-x64"))
+    result, staging = run_sqlcmd_pack(
+        tmp_path, "-IsOfficial", "True", "-RequiredRids", "win-x64, linux-x64"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert sorted(p.name for p in (staging / "runtimes").iterdir()) == ["linux-x64", "win-x64"]
+
+
+def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    git(remote, "init", "-b", "stable")
+    commit_metadata(remote, "0.1.10")
+    pyproject = remote / "mssql-py-core" / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "mssql-python-rs"\nversion = "0.1.0"\n', encoding="utf-8"
+    )
+    git(remote, "add", ".")
+    git(
+        remote,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Selected Python release",
+    )
+    selected = git(remote, "rev-parse", "HEAD")
+    pyproject.write_text(
+        '[project]\nname = "mssql-python-rs"\nversion = "9.9.9"\n', encoding="utf-8"
+    )
+    git(remote, "add", ".")
+    git(
+        remote,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Advance branch tip",
+    )
+
+    workspace = tmp_path / "workspace"
+    checkout = workspace / "s" / "mssql-rs"
+    checkout.parent.mkdir(parents=True)
+    git(checkout.parent, "clone", str(remote), str(checkout))
+    scripts = checkout / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    for filename in ("get-python-release-metadata.ps1", "verify-python-wheels.ps1"):
+        shutil.copy2(_ROOT / ".pipeline" / "scripts" / filename, scripts)
+    wheels = workspace / "officialBuild" / "drop" / "wheels"
+    wheels.mkdir(parents=True)
+    originals = write_wheel_matrix(wheels)
+    if duplicate:
+        duplicate_dir = workspace / "officialBuild" / "duplicate" / "wheels"
+        duplicate_dir.mkdir(parents=True)
+        shutil.copy2(originals[0], duplicate_dir / originals[0].name)
+
+    pipeline = expand(
+        yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8")),
+        {"publishToPyPI": False},
+    )
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    script = next(
+        step["pwsh"]
+        for step in steps
+        if step.get("displayName") == "Verify and stage official wheels"
+    )
+    agent_temp = tmp_path / "agent-temp"
+    agent_temp.mkdir()
+    script = script.replace("$(Pipeline.Workspace)", str(workspace)).replace(
+        "$(Agent.TempDirectory)", str(agent_temp)
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_SOURCE_COMMIT": selected,
+            "OFFICIAL_BUILD_SOURCE_BRANCH": "refs/heads/stable",
+            "OFFICIAL_BUILD_RUN_ID": "123",
+        },
+    )
+    return result, originals, agent_temp / "pypi-publish", selected
+
+
+def test_pypi_release_stages_selected_commit_wheels_unchanged(tmp_path: Path) -> None:
+    result, originals, staging, selected = prepare_pypi_release(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert f"Selected source commit: {selected}" in result.stdout
+    assert "Staged 9 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
+    staged = sorted(staging.glob("*.whl"))
+    assert [wheel.name for wheel in staged] == sorted(wheel.name for wheel in originals)
+    for wheel in originals:
+        assert (staging / wheel.name).read_bytes() == wheel.read_bytes()
+
+
+def test_pypi_release_rejects_duplicate_wheel_names(tmp_path: Path) -> None:
+    result, _, staging, _ = prepare_pypi_release(tmp_path, duplicate=True)
+
+    assert result.returncode != 0
+    assert "Duplicate wheel filenames in Official Build artifacts" in result.stderr
+    assert not list(staging.glob("*.whl"))
+
+
+def test_crate_templates_resolve_in_self_repository():
+    # StageList steps are expanded inside GovernedTemplates, so relative paths
+    # without @self can resolve against the wrong repository.
+    templates = re.findall(
+        r"^\s*-\s*template:\s*(.*validate-release-crates.*)$",
+        _PIPELINE.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
+
+
+@pytest.mark.parametrize(
+    ("job_name", "os_type", "architecture", "python_versions"),
+    [
+        (
+            "Windows_x64",
+            "Windows",
+            "x64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        ("Windows_ARM64", "Windows", "arm64", ["3.11", "3.12", "3.13", "3.14"]),
+        (
+            "Linux_x64",
+            "Linux",
+            "x64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        (
+            "Linux_ARM64",
+            "Linux",
+            "arm64",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+        (
+            "MacOS_universal2",
+            "MacOS",
+            "universal2",
+            ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        ),
+    ],
+)
+def test_python_wheel_install_gate_precedes_artifact_publication(
+    job_name: str,
+    os_type: str,
+    architecture: str,
+    python_versions: list[str],
+) -> None:
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    install_template = yaml.safe_load(
+        _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+    )
+    default_versions = next(
+        parameter["default"]
+        for parameter in install_template["parameters"]
+        if parameter["name"] == "pythonVersions"
+    )
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=True,
+        isOfficial=True,
+        publishToFeed=False,
+    )
+    pipeline = expand(source, flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    steps = job["steps"]
+    install_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("template")
+        == "/.pipeline/templates/test-python-wheel-installs-template.yml"
+    ]
+
+    assert len(install_steps) == 1
+    install_index, install_step = install_steps[0]
+    publish_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("task") == "PublishPipelineArtifact@1"
+    )
+    parameters = install_step["parameters"]
+    assert parameters["osType"] == os_type
+    assert parameters["architecture"] == architecture
+    assert parameters.get("pythonVersions", default_versions) == python_versions
+    assert install_index < publish_index
+
+    # The gate only proves anything if it runs after every step that mutates the
+    # wheel it installs - ODBC injection and (on Linux) the glibc/glibc-2.28
+    # auditwheel repair - otherwise it can pass while install-testing a wheel
+    # with no driver in it.
+    transform_indices = [
+        index
+        for index, step in enumerate(steps)
+        if "Inject ODBC driver into" in str(step.get("displayName", ""))
+        or "Repair glibc" in str(step.get("displayName", ""))
+    ]
+    assert transform_indices, "expected a wheel-transforming step in this job"
+    assert max(transform_indices) < install_index
+
+
+def _wheel_requires_python_floor() -> str:
+    """The minimum Python version the released wheel declares support for,
+    read from verify-python-wheels.ps1's Requires-Python assertion - the
+    canonical source the release gate enforces. Since the wheel is a single
+    stable-ABI (cp310-abi3) build, there is no per-version tag list to track
+    anymore; the floor is the one canonical constraint left to drift-check
+    the install-test matrix against."""
+    ps1 = _VERIFY_WHEELS_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"-ne\s+'>=(3\.\d+)'", ps1)
+    assert match, "could not find the Requires-Python floor in verify-python-wheels.ps1"
+    return match[1]
+
+
+def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
+    """Guards the same class of drift the Linux fix in 9ed77aa7 closed: unlike
+    the Linux script, Windows/macOS install coverage is driven by this
+    template's own `pythonVersions` default (and the Windows ARM64 override in
+    stages.yml), neither of which was cross-checked against the canonical
+    Requires-Python floor in verify-python-wheels.ps1."""
+    floor = _wheel_requires_python_floor()
+
+    install_template = yaml.safe_load(
+        _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+    )
+    default_versions = next(
+        parameter["default"]
+        for parameter in install_template["parameters"]
+        if parameter["name"] == "pythonVersions"
+    )
+    assert min(default_versions, key=lambda v: tuple(map(int, v.split(".")))) == floor
+
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=True,
+        isOfficial=True,
+        publishToFeed=False,
+    )
+    pipeline = expand(source, flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    arm64_job = next(job for job in build["jobs"] if job.get("job") == "Windows_ARM64")
+
+    # win_arm64 excludes the floor version today (limited hosted-agent
+    # support for it, per the comment in stages.yml), nothing else.
+    expected_arm64_versions = set(default_versions) - {floor}
+    for template_name in (
+        "build-python-wheels-template.yml",
+        "test-python-wheel-installs-template.yml",
+    ):
+        step = next(
+            step
+            for step in arm64_job["steps"]
+            if step.get("template") == f"/.pipeline/templates/{template_name}"
+        )
+        assert set(step["parameters"]["pythonVersions"]) == expected_arm64_versions
+
+
+def test_macos_wheel_install_gate_verifies_both_architectures() -> None:
+    template = _WHEEL_INSTALL_TEMPLATE.read_text(encoding="utf-8")
+
+    assert 'extensions=("$extract_dir"/mssql_py_core/mssql_py_core*.so)' in template
+    assert 'lipo "${extensions[0]}" -verify_arch x86_64 arm64' in template
+    assert (
+        'lipo "$extract_dir/mssql_py_core/libs/macos/x86_64/lib/'
+        'mssqlodbc.dylib" -verify_arch x86_64' in template
+    )
+    assert (
+        'lipo "$extract_dir/mssql_py_core/libs/macos/arm64/lib/'
+        'mssqlodbc.dylib" -verify_arch arm64' in template
+    )
+    assert template.count("--verify-driver-exports") == 2
+
+
+@pytest.mark.parametrize("architecture", ("x64", "ARM64"))
+@pytest.mark.parametrize("build_odbc", (False, True))
+def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc: bool) -> None:
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=build_odbc,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=False,
+        publishToFeed=True,
+    )
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job["job"] == f"Linux_{architecture}")
+    names = [step.get("displayName") for step in job["steps"]]
+    repair = f"Repair glibc wheels into manylinux (Linux {architecture})"
+    injection = f"Inject ODBC driver into wheels (Linux {architecture})"
+    build_228 = f"Build glibc-2.28 wheels (Linux {architecture})"
+    repair_228 = f"Repair glibc-2.28 wheels (Linux {architecture})"
+    injection_228 = (
+        f"Inject ODBC driver into glibc-2.28 wheels (Linux {architecture})"
+    )
+
+    assert names.count(repair) == 1
+    assert names.count(build_228) == 1
+    assert names.count(repair_228) == 1
+    assert (injection in names) == build_odbc
+    assert (injection_228 in names) == build_odbc
+    if build_odbc:
+        assert names.index(injection) < names.index(repair)
+        assert names.index(build_228) < names.index(injection_228)
+        assert names.index(injection_228) < names.index(repair_228)
+    else:
+        assert names.index(build_228) < names.index(repair_228)
+
+
+@pytest.mark.parametrize(
+    ("build_reason", "is_official", "expected_suffix"),
+    [
+        ("Schedule", False, ".dev{date}"),
+        ("IndividualCI", False, ".dev{date}12345"),
+        ("Manual", False, ".dev{date}12345"),
+        ("Manual", True, ""),
+    ],
+)
+def test_wheel_versions_follow_pep440(
+    build_reason: str, is_official: bool, expected_suffix: str
+) -> None:
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=is_official,
+        publishToFeed=True,
+    )
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job["job"] == "ComputeWheelVersion")
+    step = next(step for step in job["steps"] if step.get("name") == "compute")
+    script = step["pwsh"]
+    for key, value in {"Build.Reason": build_reason, "Build.BuildId": "12345"}.items():
+        script = script.replace(f"$({key})", value)
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    match = re.search(
+        r"##vso\[task.setvariable variable=pyCoreWheelVersion;isOutput=true\](.*)",
+        result.stdout,
+    )
+    assert match is not None, result.stdout
+    # Never empty: ADO leaves an empty $(pyCoreWheelVersion) macro unexpanded.
+    emitted = match.group(1).strip()
+    from datetime import datetime, timezone
+
+    date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    pyproject = (_ROOT / "mssql-py-core" / "pyproject.toml").read_text(encoding="utf-8")
+    base = re.search(r'(?ms)^\[project\].*?^version\s*=\s*"([^"]+)"', pyproject).group(1)
+    assert emitted == base + expected_suffix.format(date=date)
+
+
+@pytest.mark.parametrize("build_sqlcmd", (False, True))
+def test_publish_stage_splits_twine_wheels_from_sqlcmd_nuget(build_sqlcmd: bool) -> None:
+    flags = _stage_flags(publishToFeed=True, buildMssqlSqlcmd=build_sqlcmd)
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
+    jobs = {job["job"]: job for job in publish["jobs"]}
+    assert set(jobs) == {"PackageAndPublish"} | ({"PublishMssqlSqlcmd"} if build_sqlcmd else set())
+
+    wheels = jobs["PackageAndPublish"]
+    names = [step.get("displayName") for step in wheels["steps"]]
+    assert "ob_nugetPublishing_enabled" not in wheels["variables"]
+    assert not any(step.get("task") == "NuGetCommand@2" for step in wheels["steps"])
+    assert names.index("Validate wheel metadata and ODBC payloads") < names.index(
+        "twine upload to feed"
+    )
+    assert "compute.pyCoreWheelVersion" in wheels["variables"]["pyCoreWheelVersion"]
+
+    if build_sqlcmd:
+        sqlcmd = jobs["PublishMssqlSqlcmd"]
+        assert sqlcmd["variables"]["ob_nugetPublishing_enabled"] is True
+        assert "isCustom" not in sqlcmd["pool"]
+        assert sqlcmd["steps"][0]["artifact"] == "drop_Build_MssqlSqlcmd_Package"
+
+
+def test_publish_validation_reads_wheel_version_from_env() -> None:
+    flags = _stage_flags(publishToFeed=True)
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
+    step = next(
+        step
+        for step in publish["jobs"][0]["steps"]
+        if step.get("displayName") == "Validate wheel metadata and ODBC payloads"
+    )
+    # Inside a pwsh string, "$(pyCoreWheelVersion)" is a subexpression, not text.
+    assert "$(pyCoreWheelVersion)" not in step["pwsh"]
+    assert step["env"]["PY_CORE_WHEEL_VERSION"] == "$(pyCoreWheelVersion)"
+
+
+_STAMP_PYPROJECT = """[build-system]
+requires = ["maturin>=1.0,<2.0"]
+
+[project]
+name = "mssql-python-rs"
+version = "0.3.0"
+requires-python = ">=3.10"
+
+[project.urls]
+Source = "https://github.com/microsoft/mssql-rs"
+
+[tool.example]
+version = "9.9.9"
+"""
+_STAMP_CARGO = """[package]
+name = "mssql-py-core"
+version = "0.1.10"
+
+[dependencies]
+pyo3 = { version = "0.29.0" }
+
+[dependencies.foo]
+version = "2.0"
+"""
+
+
+def _run_stamp(tmp_path: Path, runner: str, version: str, pyproject: str = _STAMP_PYPROJECT):
+    package = tmp_path / "mssql-py-core"
+    package.mkdir(exist_ok=True)
+    (package / "pyproject.toml").write_text(pyproject, encoding="utf-8", newline="\n")
+    (package / "Cargo.toml").write_text(_STAMP_CARGO, encoding="utf-8", newline="\n")
+    if runner == "pwsh":
+        command = [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File",
+            str(_ROOT / ".pipeline" / "scripts" / "stamp-python-wheel-version.ps1"),
+            "-Version", version,
+        ]
+    else:
+        if shutil.which("bash") is None:
+            pytest.skip("bash is not available")
+        # Run from a wrapper file next to the manifests: WSL bash on Windows neither
+        # maps Windows paths nor inherits env, and re-parses `bash -c` arguments.
+        shutil.copy2(
+            _ROOT / ".pipeline" / "scripts" / "stamp-python-wheel-version.sh",
+            tmp_path / "stamp.sh",
+        )
+        (tmp_path / "run.sh").write_text(
+            f"WHEEL_VERSION={shlex.quote(version)} bash stamp.sh\n", encoding="utf-8", newline="\n"
+        )
+        command = ["bash", "run.sh"]
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    return (
+        result,
+        (package / "pyproject.toml").read_text(encoding="utf-8"),
+        (package / "Cargo.toml").read_text(encoding="utf-8"),
+    )
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+def test_stamp_rewrites_only_project_version(tmp_path: Path, runner: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, "0.3.0.dev2026101912345")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pyproject == _STAMP_PYPROJECT.replace(
+        'version = "0.3.0"', 'version = "0.3.0.dev2026101912345"'
+    )
+    assert 'version = "9.9.9"' in pyproject
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+def test_stamp_with_committed_version_is_a_no_op(tmp_path: Path, runner: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, "0.3.0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pyproject == _STAMP_PYPROJECT
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+@pytest.mark.parametrize("version", ("$(pyCoreWheelVersion)", "", "0.3.0-dev.1"))
+def test_stamp_rejects_values_that_are_not_pep440(tmp_path: Path, runner: str, version: str) -> None:
+    result, pyproject, cargo = _run_stamp(tmp_path, runner, version)
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "not a PEP 440 version" in output
+    assert f"'{version}'" in output.replace("\n", "")
+    assert pyproject == _STAMP_PYPROJECT
+    assert cargo == _STAMP_CARGO
+
+
+@pytest.mark.parametrize("runner", ("pwsh", "bash"))
+@pytest.mark.parametrize(
+    "pyproject",
+    (
+        _STAMP_PYPROJECT.replace('version = "0.3.0"\n', ""),
+        _STAMP_PYPROJECT.replace('version = "0.3.0"\n', 'version = "0.3.0"\nversion = "0.4.0"\n'),
+    ),
+    ids=("missing", "duplicate"),
+)
+def test_stamp_requires_exactly_one_project_version(
+    tmp_path: Path, runner: str, pyproject: str
+) -> None:
+    result, after, _ = _run_stamp(tmp_path, runner, "0.3.0.dev1", pyproject)
+    assert result.returncode != 0
+    assert "Expected one version line in [project]" in result.stdout + result.stderr
+    assert after == pyproject
+
+
+_TWINE_UPLOAD = _ROOT / ".pipeline" / "scripts" / "twine-upload.ps1"
+_WHEELS = (
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-win_amd64.whl",
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-manylinux_2_34_x86_64.whl",
+    "mssql_python_rs-1.0.0.dev1-cp310-abi3-macosx_15_0_universal2.whl",
+)
+
+
+def _run_twine_upload(tmp_path: Path, published: dict[str, str] | None, status: int = 200):
+    """Run twine-upload.ps1 against a local simple index and a stub twine.
+
+    published maps wheel filename -> sha256 on the fake feed; None means the
+    package page returns `status` with no body (404 = never published).
+    """
+    import http.server
+    import threading
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    for name in _WHEELS:
+        (dist / name).write_bytes(name.encode())
+
+    anchors = "".join(
+        f'<a href="https://feed.example/download/{name}#sha256={digest}">{name}</a>\n'
+        for name, digest in (published or {}).items()
+    )
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            ok = published is not None and self.path == "/simple/mssql-python-rs/"
+            self.send_response(200 if ok else status)
+            self.end_headers()
+            if ok:
+                self.wfile.write(f"<html><body>{anchors}</body></html>".encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "twine.log"
+    (bin_dir / "twine.cmd").write_text(f'@echo %* > "{log}"\r\n', encoding="utf-8")
+    posix_stub = bin_dir / "twine"
+    posix_stub.write_text(f'#!/bin/sh\necho "$@" > "{log}"\n', encoding="utf-8")
+    posix_stub.chmod(0o755)
+
+    env = os.environ | {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    try:
+        result = subprocess.run(
+            [
+                "pwsh", "-NoProfile", "-File", str(_TWINE_UPLOAD),
+                "-FeedName", "feed", "-ConfigFile", "pypirc", "-DistDir", str(dist),
+                "-SimpleIndexUrl", f"http://127.0.0.1:{server.server_port}/simple/",
+            ],
+            capture_output=True, text=True, env=env, check=False,
+        )
+    finally:
+        server.shutdown()
+    uploaded = sorted(
+        Path(arg).name for arg in log.read_text().split() if arg.endswith(".whl")
+    ) if log.exists() else None
+    return result, uploaded
+
+
+def _sha(name: str) -> str:
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def test_twine_upload_uploads_everything_when_package_is_new(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, None, status=404)
+    assert result.returncode == 0, result.stderr
+    assert uploaded == sorted(_WHEELS)
+
+
+def test_twine_upload_resumes_after_partial_upload(tmp_path: Path) -> None:
+    published = {name: _sha(name) for name in _WHEELS[:2]}
+    result, uploaded = _run_twine_upload(tmp_path, published)
+    assert result.returncode == 0, result.stderr
+    assert uploaded == [_WHEELS[2]]
+    assert "Uploading 1 of 3" in result.stdout
+
+
+def test_twine_upload_is_a_no_op_when_everything_is_published(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, {name: _sha(name) for name in _WHEELS})
+    assert result.returncode == 0, result.stderr
+    assert uploaded is None
+    assert "nothing to upload" in result.stdout
+
+
+def test_twine_upload_rejects_published_file_with_different_hash(tmp_path: Path) -> None:
+    published = {_WHEELS[0]: _sha(_WHEELS[0]), _WHEELS[1]: "0" * 64}
+    result, uploaded = _run_twine_upload(tmp_path, published)
+    assert result.returncode != 0
+    assert uploaded is None
+    assert "different SHA-256" in result.stdout + result.stderr
+
+
+def test_twine_upload_fails_closed_when_index_is_unreadable(tmp_path: Path) -> None:
+    result, uploaded = _run_twine_upload(tmp_path, None, status=500)
+    assert result.returncode != 0
+    assert uploaded is None
+    assert "HTTP 500" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("job_name", "image"),
+    [
+        (
+            "Linux_x64",
+            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_x86_64_rust:latest",
+        ),
+        (
+            "Linux_ARM64",
+            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_aarch64_rust:latest",
+        ),
+    ],
+)
+def test_manylinux_228_builds_use_isolated_cargo_targets(
+    job_name: str,
+    image: str,
+) -> None:
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=False,
+        publishToFeed=False,
+    )
+    pipeline = expand(
+        yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
+    )
+    build = next(
+        stage for stage in pipeline["stages"] if stage["stage"] == "Build"
+    )
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    wheel_step = next(
+        step
+        for step in job["steps"]
+        if step.get("displayName", "").startswith("Build glibc-2.28 wheels")
+    )
+    assert (
+        '-e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28"'
+        in wheel_step["script"]
+    )
+    assert f"docker pull {image}" in wheel_step["script"]
+    assert wheel_step["script"].index(f"docker pull {image}") < wheel_step["script"].index(
+        "docker-cargo-run.sh"
+    )
+
+
+@pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
+def test_manylinux_228_odbc_builds_enforce_glibc_ceiling(job_name: str) -> None:
+    flags = _stage_flags(
+        buildAllTargets=True,
+        buildPythonWheels=True,
+        buildOdbcNative=True,
+        buildRustCrates=False,
+        testPythonWheelInstalls=False,
+        isOfficial=False,
+        publishToFeed=False,
+    )
+    pipeline = expand(
+        yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
+    )
+    build = next(
+        stage for stage in pipeline["stages"] if stage["stage"] == "Build"
+    )
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    odbc_step = next(
+        step
+        for step in job["steps"]
+        if step.get("parameters", {}).get("displaySuffix", "").startswith(
+            "glibc-2.28"
+        )
+    )
+    assert odbc_step["parameters"]["maxGlibcVersion"] == "2.28"
+
+
+def test_wheel_image_odbc_builds_use_isolated_cargo_target() -> None:
+    template = (
+        _ROOT
+        / ".pipeline"
+        / "templates"
+        / "build-odbc-driver-in-wheel-image-template.yml"
+    )
+    odbc_template = yaml.safe_load(
+        template.read_text(encoding="utf-8")
+    )
+    script = odbc_template["steps"][0]["script"]
+    assert "-e CARGO_TARGET_DIR=/tmp/mssql-odbc-target" in script
+    assert "-e MAX_GLIBC_VERSION=${{ parameters.maxGlibcVersion }}" in script
+    parameters = {
+        parameter["name"]: parameter
+        for parameter in odbc_template["parameters"]
+    }
+    assert parameters["maxGlibcVersion"]["default"] == "2.34"
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None,
+    reason="bash is required to run the ODBC build script",
+)
+@pytest.mark.parametrize(
+    ("ceiling", "required", "succeeds"),
+    [
+        ("2.28", "2.28", True),
+        ("2.28", "2.29", False),
+        (None, "2.34", True),
+        (None, "2.35", False),
+    ],
+)
+def test_odbc_build_script_enforces_glibc_ceiling(
+    tmp_path: Path,
+    ceiling: str | None,
+    required: str,
+    succeeds: bool,
+) -> None:
+    script = tmp_path / "build-odbc-driver-only.sh"
+    shutil.copy2(_ROOT / "scripts" / script.name, script)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "cargo").write_text("#!/usr/bin/env bash\nexit 0\n", newline="\n")
+    (bin_dir / "readelf").write_text(
+        "#!/usr/bin/env bash\n" 'echo "Version needs section: Name: GLIBC_${FAKE_GLIBC_VERSION}"\n',
+        newline="\n",
+    )
+
+    odbc_dir = tmp_path / "workspace" / "mssql-odbc"
+    scripts_dir = odbc_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "finalize-artifact.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        'driver="$PWD/fake-driver.so"\n'
+        ': > "$driver"\n'
+        "printf '%s\n' \"$driver\"\n",
+        newline="\n",
+    )
+
+    ceiling_export = f"export MAX_GLIBC_VERSION={ceiling}; " if ceiling is not None else ""
+    command = (
+        'export PATH="$PWD/bin:$PATH"; '
+        'export WORKSPACE_DIR="$PWD/workspace"; '
+        'export ODBC_DROP_DIR="$PWD/odbc-drop"; '
+        f"export FAKE_GLIBC_VERSION={required}; "
+        f"{ceiling_export}"
+        "chmod +x ./bin/cargo ./bin/readelf; "
+        "exec sh ./build-odbc-driver-only.sh glibc"
+    )
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert (result.returncode == 0) is succeeds, result.stdout + result.stderr
+    if succeeds:
+        assert f"max required GLIBC: GLIBC_{required}" in result.stdout
+    else:
+        expected_ceiling = ceiling or "2.34"
+        assert (
+            f"ERROR: GLIBC_{required} exceeds the GLIBC_{expected_ceiling} floor" in result.stderr
+        )
+
+
+@pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=5)))
+def test_release_switch_graph(values):
+    flags = dict(zip(_SWITCHES, values))
+    pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
+    stages = {stage["stage"]: stage for stage in pipeline["extends"]["parameters"]["stages"]}
+    to_feed, core, mock, dry_run, tag = values
+    for stage in stages.values():
+        for job in stage["jobs"]:
+            custom = job["pool"].get("isCustom", False)
+            assert not any("target" in step for step in job["steps"])
+            assert sum("checkout" in step for step in job["steps"]) == int(custom)
+            if custom:
+                assert stage["stage"] == "ReleaseCrates"
+                assert job["pool"] == {
+                    "type": "windows", "isCustom": True,
+                    "name": "Azure Pipelines", "vmImage": "windows-2022",
+                }
+                assert "ESRP Federated" not in str(job)
+                assert not any(step.get("task") in ("EsrpRelease@12", "NuGetCommand@2")
+                               for step in job["steps"])
+            else:
+                assert "test-cratesio-package.ps1" not in str(job)
+            assert "continueOnError" not in job
+            assert all("continueOnError" not in step for step in job["steps"])
+
+    release = stages["Release"]
+    assert release["dependsOn"] == []
+    assert evaluate(release.get("condition", "succeeded()"), flags)
+    assert not evaluate(release.get("condition", "succeeded()"), flags, succeeded=False)
+    assert len(release["jobs"]) == 1
+    assert release["jobs"][0]["job"] == "PublishRelease"
+    assert "ob_nugetPublishing_enabled" not in release["jobs"][0]["variables"]
+    release_steps = release["jobs"][0]["steps"]
+    release_names = [step.get("displayName") for step in release_steps]
+    assert any(step.get("download") == "officialBuild" for step in release_steps)
+    assert "Validate official Python wheels" in release_names
+    for name in ("Collect wheels for upload", "Authenticate twine to feed", "twine upload release wheels"):
+        assert (name in release_names) == to_feed
+        if to_feed:
+            assert release_names.index("Validate official Python wheels") < release_names.index(name)
+    assert any(step.get("task") == "TwineAuthenticate@1" for step in release_steps) == to_feed
+    assert ".nuspec" not in str(release_steps)
+    assert ".nupkg" not in str(release_steps)
+    assert not any(step.get("task") == "NuGetCommand@2" for step in release_steps)
+    assert "nugetPublishing" not in pipeline["extends"]["parameters"]
+    for name, stage in stages.items():
+        if name != "Release":
+            assert "verify-python-wheels" not in str(stage)
+            assert "NuGetCommand@" not in str(stage)
+            assert not any(
+                step.get("download") == "officialBuild" and "artifact" not in step
+                for job in stage["jobs"] for step in job["steps"]
+            )
+
+    assert ("ReleaseCrates" in stages) == (core or mock or dry_run)
+    if "ReleaseCrates" in stages:
+        crates = stages["ReleaseCrates"]
+        # Explicitly empty: wheel validation or NuGet failure cannot block crates.
+        assert crates["dependsOn"] == []
+        jobs = {job["job"]: job for job in crates["jobs"]}
+        expected_jobs = {"ValidateCrates"}
+        if core or mock:
+            expected_jobs.add("RegistryPreflight")
+        if not dry_run:
+            if core:
+                expected_jobs.update(("PublishCore", "CoreAvailable"))
+            if mock:
+                expected_jobs.update(("PublishMock", "MockAvailable"))
+        assert set(jobs) == expected_jobs
+        steps = [step for job in jobs.values() for step in job["steps"]]
+        tasks = [step["displayName"] for step in steps if step.get("task") == "EsrpRelease@12"]
+        assert tasks == (
+            (["Publish mssql-tds to crates.io"] if core and not dry_run else [])
+            + (["Publish mssql-mock-tds to crates.io"] if mock and not dry_run else [])
+        )
+        names = [step.get("displayName") for step in steps]
+        for job in jobs.values():
+            downloads = [step for step in job["steps"] if "download" in step]
+            assert len(downloads) == 1
+            assert downloads[0]["download"] == "officialBuild"
+            assert downloads[0]["artifact"] == "drop_Build_RustCrates"
+            job_names = [step.get("displayName") for step in job["steps"]]
+            validation_index = job_names.index("Validate Rust crate release artifact")
+            assert validation_index == (2 if job["pool"].get("isCustom") else 1)
+            validation = job["steps"][validation_index]
+            assert "$(Pipeline.Workspace)/officialBuild/drop_Build_RustCrates" in validation["pwsh"]
+        if core or mock:
+            assert jobs["RegistryPreflight"]["dependsOn"] == "ValidateCrates"
+        assert ("Preflight mssql-tds version" in names) == core
+        assert ("Preflight mssql-mock-tds version" in names) == mock
+        assert ("Verify mssql-tds dependency is published" in names) == (mock and not core)
+        assert ("Wait for mssql-tds on crates.io" in names) == (core and not dry_run)
+        assert ("Verify mssql-mock-tds on crates.io" in names) == (mock and not dry_run)
+        if core and not dry_run:
+            assert jobs["PublishCore"]["dependsOn"] == "RegistryPreflight"
+            assert jobs["CoreAvailable"]["dependsOn"] == "PublishCore"
+        if mock and not dry_run:
+            assert jobs["PublishMock"]["dependsOn"] == ("CoreAvailable" if core else "RegistryPreflight")
+            assert jobs["MockAvailable"]["dependsOn"] == "PublishMock"
+        for job in jobs.values():
+            for step in job["steps"]:
+                if step.get("task") == "EsrpRelease@12":
+                    assert job["templateContext"] == {"type": "releaseJob", "isProduction": True}
+                    assert job["variables"][0] == {"group": "ESRP Federated Creds (AME)"}
+                    assert step["inputs"]["waitforreleasecompletion"] is True
+                    assert step["inputs"]["usemanagedidentity"] is True
+                    assert step["inputs"]["contenttype"] == "Rust"
+                    assert step["inputs"]["intent"] == "PackageDistribution"
+                    assert step["inputs"]["connectedservicename"] == (
+                        "ESRP Managed Identity federated auth - AME tenant-mssql-rs"
+                    )
+                    assert step["inputs"]["mainpublisher"] == "ESRPRELPACMAN"
+                    assert step["inputs"]["domaintenantid"] == "975f013f-7f24-47e8-a7d3-abc4752bf346"
+
+    assert ("Tag" in stages) == tag
+    if tag:
+        assert stages["Tag"]["dependsOn"] == "Release"
+        assert not evaluate(stages["Tag"].get("condition", "succeeded()"), flags, succeeded=False)
+        assert stages["Tag"]["displayName"] == "Tag mssql-py-core Release"
+        assert "mssqlTdsCrateVersion" not in str(stages["Tag"])
+
+    for name in ("Release", "Tag"):
+        if name not in stages:
+            continue
+        job = stages[name]["jobs"][0]
+        assert job["variables"]["ob_git_fetchDepth"] == 0
+        assert job["variables"]["ob_git_persistCredentials"] is True
+        metadata_steps = [
+            step for step in job["steps"]
+            if "get-python-release-metadata.ps1" in step.get("pwsh", "")
+        ]
+        assert len(metadata_steps) == 1
+        step = metadata_steps[0]
+        assert step["workingDirectory"] == "$(Build.SourcesDirectory)"
+        assert '-RepositoryDirectory "$(Build.SourcesDirectory)"' in step["pwsh"]
+        assert '-CommitSha "$(resources.pipeline.officialBuild.sourceCommit)"' in step["pwsh"]
+        assert '-SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)"' in step["pwsh"]
+        assert ("-IncludeWheelMetadata" in step["pwsh"]) == (name == "Release")
+        if name == "Release":
+            assert step["displayName"] == "Validate official Python wheels"
+            assert "condition" not in step
+            assert "verify-python-wheels.ps1" in step["pwsh"]
+            assert ".nuspec" not in step["pwsh"]
+            for variable in ("releaseVersion", "sourceCommit", "releaseDistributionName"):
+                assert step["pwsh"].index("verify-python-wheels.ps1") < step["pwsh"].index(
+                    f"task.setvariable variable={variable}"
+                )
+        if name == "Tag":
+            git_commands = re.findall(r"^\s*git .+$", step["pwsh"], re.MULTILINE)
+            assert len(git_commands) == 4
+            assert all('git -C "$(Build.SourcesDirectory)"' in line for line in git_commands)
+
+
+@pytest.mark.parametrize(("core", "failed_gate"), [
+    (core, gate)
+    for core in (False, True)
+    for gate in (
+        "PublishRelease", "ValidateCrates", "RegistryPreflight",
+        "PublishCore", "CoreAvailable", "PublishMock", "MockAvailable",
+    )
+    if core or gate not in ("PublishCore", "CoreAvailable")
+])
+@pytest.mark.parametrize("result", ["Failed", "Canceled", "Skipped"])
+def test_release_gate_failure_propagation(core, failed_gate, result):
+    flags = dict.fromkeys(_SWITCHES, True) | {
+        "publishMssqlTds": core, "validateCratesOnly": False,
+    }
+    pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
+    stages = {stage["stage"]: stage for stage in pipeline["extends"]["parameters"]["stages"]}
+    results = {}
+    for name in ("Release", "ReleaseCrates"):
+        assert stages[name]["dependsOn"] == []
+        for job in stages[name]["jobs"]:
+            # These jobs use the native succeeded() default, not always() or a
+            # flag-only condition that could run after a skipped/failed gate.
+            assert "condition" not in job
+            dependency = job.get("dependsOn")
+            if job["job"] == failed_gate:
+                results[job["job"]] = result
+            elif dependency and results[dependency] != "Succeeded":
+                results[job["job"]] = "Skipped"
+            else:
+                results[job["job"]] = "Succeeded"
+    if failed_gate == "PublishRelease":
+        assert results["MockAvailable"] == "Succeeded"
+    else:
+        assert results["PublishRelease"] == "Succeeded"
+        assert results["MockAvailable"] != "Succeeded"
+        if failed_gate not in ("PublishMock", "MockAvailable"):
+            assert results["PublishMock"] == "Skipped"
+        if core and failed_gate in ("ValidateCrates", "RegistryPreflight"):
+            assert results["PublishCore"] == "Skipped"
+    assert stages["Tag"]["dependsOn"] == "Release"
+
+
+@pytest.fixture
+def stamp_manifests(tmp_path):
+    for name in ("mssql-tds", "mssql-mock-tds"):
+        folder = tmp_path / name
+        folder.mkdir()
+        manifest = (
+            f'[package]\nname = "{name}"\nversion = "0.3.0" # source version\n'
+            '\n[dependencies.uuid]\nversion = "1.19.0"\n'
+        )
+        if name == "mssql-mock-tds":
+            manifest += (
+                '\n[dependencies]\n'
+                'mssql-tds = { path = "../mssql-tds", version = "0.3.0", default-features = false }\n'
+            )
+        (folder / "Cargo.toml").write_text(manifest, encoding="utf-8", newline="\n")
+    return tmp_path
+
+
+def run_crate_stamp(root, **overrides):
+    arguments = dict(RepositoryRoot=str(root), BuildReason="Manual", BuildId="123")
+    arguments.update(overrides)
+    env = dict(os.environ, STAMP_ARGUMENTS=json.dumps(arguments))
+    script = str(_ROOT / ".pipeline" / "scripts" / "stamp-crate-versions.ps1").replace("'", "''")
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+         "$parameters = ConvertFrom-Json -AsHashtable $env:STAMP_ARGUMENTS; "
+         # Freeze only the clock; all parsing, edits and output run in PowerShell.
+         "function Get-Date { param($Format) '20261015' }; "
+         f"& '{script}' @parameters"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+
+
+def assert_stamp_rejected(root, **arguments):
+    before = {path: path.read_bytes() for path in root.rglob("Cargo.toml")}
+    result = run_crate_stamp(root, **arguments)
+    assert result.returncode != 0
+    assert result.stdout == "", result.stdout
+    assert "##vso[" not in result.stderr
+    assert "##[error]" not in result.stderr
+    assert before == {path: path.read_bytes() for path in before}
+
+
+@pytest.mark.parametrize(("version", "reason", "official", "expected"), [
+    ("0.3.0", "Manual", "False", "0.3.0-dev.20261015.123"),
+    ("0.3.0", "PullRequest", "false", "0.3.0-dev.20261015.123"),
+    ("0.3.0", "IndividualCI", "False", "0.3.0-dev.20261015.123"),
+    ("0.3.0", "Schedule", "False", "0.3.0-nightly.20261015"),
+    ("0.3.0", "Schedule", "tRuE", "0.3.0"),
+    ("0.3.0-rc.1", "Manual", "False", "0.3.0-rc.1-dev.20261015.123"),
+    ("1.2.3-alpha.0.x-y+build.001", "Manual", "True", "1.2.3-alpha.0.x-y+build.001"),
+    ("18446744073709551615.0.0", "Manual", "True", "18446744073709551615.0.0"),
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_versions(stamp_manifests, version, reason, official, expected, what_if):
+    root = stamp_manifests
+    for path in root.rglob("Cargo.toml"):
+        path.write_text(path.read_text().replace("0.3.0", version), encoding="utf-8")
+    before = {path: path.read_bytes() for path in root.rglob("Cargo.toml")}
+    result = run_crate_stamp(root, BuildReason=reason, IsOfficial=official, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    assert f"Crate version: {expected}" in result.stdout
+    for path, original in before.items():
+        if what_if:
+            assert path.read_bytes() == original
+        else:
+            assert path.read_bytes() == original.replace(version.encode(), expected.encode())
+            manifest = tomllib.loads(path.read_text())
+            assert manifest["package"]["version"] == expected
+            assert manifest["dependencies"]["uuid"]["version"] == "1.19.0"
+            if path.parent.name == "mssql-mock-tds":
+                assert manifest["dependencies"]["mssql-tds"]["version"] == expected
+    if what_if:
+        assert "##vso[" not in result.stdout
+    else:
+        assert result.stdout.count("##vso[task.setvariable ") == 2
+        assert f"##vso[task.setvariable variable=crateVersion]{expected}\n" in result.stdout
+        assert f"##vso[task.setvariable variable=crateVersion;isOutput=true]{expected}\n" in result.stdout
+
+
+@pytest.mark.parametrize("version", [
+    "1.2", "v1.2.3", "01.2.3", "1.02.3", "1.2.03", "1.2.3-01",
+    "1.2.3-alpha.01", "1.2.3-", "1.2.3+", "1.2.3+meta..data",
+    "1.2.3-rc_1", "1.2.3 ", "١.2.3", "18446744073709551616.0.0",
+    "1.2.3\n##vso[task.setvariable variable=injected]yes",
+    "1.2.3\r##[error]injected", "1.2.3\n", "1.2.3\r", "1.2.3\x1b[2J",
+    "0.3.0-dev.20261015.123", "0.3.0-nightly.20261015",
+])
+def test_crate_stamp_rejects_invalid_source_versions(stamp_manifests, version):
+    # The second manifest must be validated even though the first supplies the version.
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_text(path.read_text().replace('"0.3.0"', f'"{version}"', 1), encoding="utf-8")
+    assert_stamp_rejected(stamp_manifests, IsOfficial="True")
+
+
+@pytest.mark.parametrize(("parameter", "value"), [
+    ("BuildId", "0"), ("BuildId", "0123"), ("BuildId", "-1"),
+    ("BuildId", "1.2"), ("BuildId", " 123"), ("BuildId", "١٢٣"),
+    ("BuildId", "$(Build.BuildId)"), ("BuildId", "123\n"),
+    ("BuildId", "123\n##vso[task.setvariable variable=injected]yes"),
+    ("BuildReason", "Manual\r\n##[error]injected"),
+    ("BuildReason", "Manual\x1b[2J"), ("BuildReason", "$(Build.Reason)"),
+    ("IsOfficial", "False\n##vso[task.setvariable variable=injected]yes"),
+    ("IsOfficial", " True"), ("IsOfficial", "1"),
+    ("RepositoryRoot", "path\n##vso[task.setvariable variable=injected]yes"),
+    ("RepositoryRoot", "path##[error]injected"),
+    ("Crates", []), ("Crates", ["mssql-tds", "mssql-tds"]),
+    ("Crates", ["mssql-tds", "MSSQL-TDS"]), ("Crates", ["../mssql-tds"]),
+    ("Crates", ["mssql-tds\n##[error]injected"]),
+])
+@pytest.mark.parametrize("official", ["True", "False"])
+def test_crate_stamp_rejects_scalar_inputs(stamp_manifests, parameter, value, official):
+    arguments = dict(IsOfficial=official)
+    arguments[parameter] = value
+    assert_stamp_rejected(stamp_manifests, **arguments)
+
+
+@pytest.mark.parametrize(("old", "new"), [
+    ('version = "0.3.0" # source version',
+     'version = "0.3.0"\nversion = "0.4.0"'),
+    ('version = "0.3.0" # source version',
+     'version = "0.3.0"\n  version = "0.4.0"'),
+    ('version = "0.3.0" # source version',
+     'version = "0.3.0"\n"version" = "0.4.0"'),
+    ('version = "0.3.0" # source version',
+     'version = "0.3.0"\n"ver\\u0073ion" = "0.4.0"'),
+    ('version = "0.3.0" # source version', "version = '0.3.0'"),
+    ('version = "0.3.0" # source version', 'version = """0.3.0"""'),
+    ('version = "0.3.0" # source version', 'version.workspace = true'),
+    ('version = "0.3.0" # source version', 'version = "0.3.0" trailing'),
+    ('[package]', '[package]\nversion = "0.3.0"\n[package]'),
+    ('[package]', '[package]\nversion = "0.3.0"\n["package"]'),
+    ('[dependencies.uuid]', '[package.version]\n[dependencies.uuid]'),
+    ('[dependencies.uuid]', '[package."version"]\n[dependencies.uuid]'),
+    ('[dependencies.uuid]', '[[package]]\nversion = "0.4.0"\n[dependencies.uuid]'),
+    ('version = "0.3.0", default-features', 'version = "not-semver", default-features'),
+    ('version = "0.3.0", default-features', 'version = "0.3.0", version = "0.4.0", default-features'),
+    ('version = "0.3.0", default-features', 'version = "0.3.0", version.workspace = true, default-features'),
+    ('version = "0.3.0", default-features', 'version = "0.3.0", "version" = "0.4.0", default-features'),
+    ('[dependencies]', '[dependencies.mssql-tds]\nversion = "0.3.0"\n[dependencies]'),
+    ('[dependencies]', '[dependencies]\nmssql-tds = "0.3.0"'),
+    ('[dependencies]', '[dependencies]\n"mssql-tds" = "0.3.0"'),
+    ('[dependencies]', '[dependencies]\n"mssql\\u002dtds" = "0.3.0"'),
+    ('[dependencies]', '[dev-dependencies]'),
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_ambiguous_later_manifest(stamp_manifests, old, new, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    original = path.read_text()
+    assert old in original
+    path.write_text(original.replace(old, new, 1), encoding="utf-8")
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_rejects_missing_later_manifest(stamp_manifests):
+    (stamp_manifests / "mssql-mock-tds" / "Cargo.toml").unlink()
+    assert_stamp_rejected(stamp_manifests)
+
+
+@pytest.mark.parametrize("header", ["[package]", "[dependencies]"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_duplicate_header_at_eof(stamp_manifests, header, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_bytes(path.read_bytes() + header.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_preserves_hyphenated_feature_name(stamp_manifests):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    feature = '\n[features]\nmssql-tds-test-util = ["mssql-tds/test-util"]\n'
+    path.write_bytes(path.read_bytes() + feature.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    manifest = tomllib.loads(path.read_text())
+    assert manifest["features"]["mssql-tds-test-util"] == ["mssql-tds/test-util"]
+    assert manifest["dependencies"]["mssql-tds"]["version"] == "0.3.0-dev.20261015.123"
+    assert manifest["package"]["version"] == "0.3.0-dev.20261015.123"
+
+
+@pytest.mark.parametrize(("old", "new"), [
+    ("[dependencies.uuid]", 'keywords = [\n "sql",\n "tds",\n]\n[dependencies.uuid]'),
+    ("[dependencies]", '[dependencies]\nunrelated = { version = "1", features = [\n "one",\n "two",\n] }\n'),
+    ("[dependencies.uuid]", '[features]\nmssql-tds = ["mssql-tds/test-util"]\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[dependencies.uuid_alias]\npackage = "uuid"\nversion = "1.19.0"\n[dependencies.uuid]'),
+    ("[dependencies]", "[ dependencies ] # mssql-tds is version-aligned"),
+    ("default-features = false", 'features = ["tls-schannel-direct-on-windows", "test-util"]'),
+    ('path = "../mssql-tds"', """path = '../somewhere, version = "9.9.9", other'"""),
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_supported_toml_values(stamp_manifests, old, new, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    original = path.read_text().replace(old, new, 1)
+    tomllib.loads(original)
+    path.write_bytes(original.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = original if what_if else original.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+    manifest = tomllib.loads(path.read_text())
+    assert manifest["dependencies"]["mssql-tds"]["version"] == (
+        "0.3.0" if what_if else "0.3.0-dev.20261015.123"
+    )
+    assert ("##vso[" in result.stdout) == (not what_if)
+
+
+@pytest.mark.parametrize(("old", "new"), [
+    ("[dependencies]", "[dependencies]\n[ dependencies ]"),
+    ("[dependencies]", "[dependencies]\n[\tdependencies\t]"),
+    ('path = "../mssql-tds", version = "0.3.0", default-features = false',
+     """path = '../somewhere, version = "0.3.0", other'"""),
+    ('default-features = false', 'features = ["one", "two"'),
+    ('default-features = false', 'features = ["one", "two]]'),
+    ('default-features = false', 'features = ["one"]], version = "0.3.0"'),
+    ('default-features = false', 'path = "duplicate"'),
+    ("[dependencies.uuid]", '[target.\'cfg(windows)\'.dependencies]\nmssql-tds = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[dev-dependencies.mssql-tds]\nversion = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[dev-dependencies]\n"mssql\\u002dtds" = { path = "../mssql-tds", version = "0.3.0" }\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[build-dependencies]\n"mssql\\u002dtds" = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[target . \'cfg(windows)\' . dependencies]\nmssql-tds = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[target . \'cfg(windows)\' . dev-dependencies]\n"mssql\\u002dtds" = "0.3.0"\n[dependencies.uuid]'),
+    ("[dependencies.uuid]", '[target . \'cfg(windows)\' . dependencies . mssql-tds]\nversion = "0.3.0"\n[dependencies.uuid]'),
+    ("[package]", 'package.version = "0.3.0"\n[package]'),
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_ambiguous_dependency_fields(stamp_manifests, old, new, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_bytes(path.read_text().replace(old, new, 1).encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_rejects_nonofficial_build_metadata(stamp_manifests):
+    path = stamp_manifests / "mssql-tds" / "Cargo.toml"
+    path.write_text(path.read_text().replace("0.3.0", "0.3.0+build.1"), encoding="utf-8")
+    assert_stamp_rejected(stamp_manifests)
+
+
+@pytest.mark.parametrize("section", ["package", "dependencies"])
+@pytest.mark.parametrize("line", [
+    """description = "SQL escaping of ''' sequences" """,
+    """description = 'SQL escaping of \"\"\" sequences' """,
+    """# avoid \"\"\" and ''' strings""",
+    """description = "escaped \\" quote and '''" # \"\"\"""",
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_allows_literal_triple_quotes(stamp_manifests, section, line, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    # Use a dependency inline table for values, but leave comments as comments.
+    if section == "dependencies" and not line.startswith("#"):
+        line = "unrelated = { path = " + line.split("=", 1)[1].split(" #", 1)[0] + " }"
+    content = path.read_text().replace(f"[{section}]", f"[{section}]\n{line}", 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("section", ["package", "dependencies"])
+@pytest.mark.parametrize("quote", ['"""', "'''"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_still_rejects_multiline_strings(stamp_manifests, section, quote, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    value = f"description = {quote}first\nsecond{quote}"
+    path.write_bytes(path.read_text().replace(f"[{section}]", f"[{section}]\n{value}", 1).encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("table", [
+    'dev-dependencies."mssql\\u002dtds"',
+    'build-dependencies."mssql\\u002dtds"',
+    """target . 'cfg(windows)' . dependencies . "mssql\\u002dtds" """,
+    """target . 'cfg(windows)' . dev-dependencies . "mssql\\u002dtds" """,
+    """target . 'cfg(windows)' . build-dependencies . "mssql\\u002dtds" """,
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_quoted_dependency_subtables(stamp_manifests, table, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + f'\n[{table}]\npath = "../mssql-tds"\nversion = "0.3.0"\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("kind", [
+    '"dependencies"', "'dependencies'",
+    '"dev-dependencies"', "'dev-dependencies'",
+    '"build-dependencies"', "'build-dependencies'",
+    '"dev\\u002ddependencies"',
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_quoted_target_table_kinds(stamp_manifests, kind, subtable, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    header = f"target . 'cfg(windows)' . {kind}"
+    if subtable:
+        extra = f'[{header}.mssql-tds]\npath = "../mssql-tds"\nversion = "0.3.0"\n'
+    else:
+        extra = f'[{header}]\nmssql-tds = {{ path = "../mssql-tds", version = "0.3.0" }}\n'
+    content = path.read_text() + "\n" + extra
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("selector", [
+    "'cfg(windows)'", '"cfg(windows)"', "x86_64-pc-windows-msvc",
+    """'cfg(any(windows, target_os = "]"))'""", '"cfg(target_os = \\"]\\")"',
+])
+def test_crate_stamp_preserves_target_selectors(stamp_manifests, selector):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + f'\n[target . {selector} . dev-dependencies]\nuuid = "1.19.0"\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
+
+
+@pytest.mark.parametrize("key", ['"package"', "'package'", '"pack\\u0061ge"'])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_quoted_root_package(stamp_manifests, key, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_bytes(f'{key}.version = "0.4.0"\n'.encode() + path.read_bytes())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("key", [
+    "dev-dependencies.mssql-tds",
+    '"dev-dependencies".mssql-tds',
+    '"dev\\u002ddependencies"."mssql\\u002dtds"',
+    "build-dependencies.mssql-tds",
+    'dependencies."mssql\\u002dtds"',
+])
+@pytest.mark.parametrize("context", ["root", "target"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_dotted_dependency_declarations(stamp_manifests, key, context, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    declaration = f'{key} = {{ path = "../mssql-tds", version = "0.3.0" }}\n'
+    content = path.read_text()
+    content = declaration + content if context == "root" else content + "\n[target.'cfg(windows)']\n" + declaration
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("context", ["root", "target"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_dotted_target_declarations(stamp_manifests, context, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    declaration = '\'cfg(windows)\'.dev-dependencies.mssql-tds = { path = "../mssql-tds", version = "0.3.0" }\n'
+    content = path.read_text()
+    content = "target." + declaration + content if context == "root" else content + "\n[target]\n" + declaration
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_preserves_dependency_named_metadata(stamp_manifests):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + '\n[package.metadata]\n"package".version = "example"\ndev-dependencies.mssql-tds = "example"\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
+
+
+def test_crate_stamp_preserves_empty_target_parents(stamp_manifests):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = (
+        'cargo-features = []\n' + path.read_text() +
+        "\n[target]\n# Dependency tables follow.\n[target.'cfg(windows)']\n\n"
+        "[target.'cfg(windows)'.dev-dependencies]\nuuid = \"1.19.0\"\n"
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    assert path.read_bytes() == content.replace("0.3.0", "0.3.0-dev.20261015.123").encode()
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_release_metadata_array(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + (
+        '\n[[package.metadata.release.pre-release-replacements]]\n'
+        'file = "README.md"\nsearch = "old"\nreplace = "new"\n'
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("table", [
+    "dependencies", "dev-dependencies", "build-dependencies", "target",
+    "target.'cfg(windows)'.dependencies",
+    "target.'cfg(windows)'.dev-dependencies.mssql-tds",
+    "package", "package.version", 'package."version"',
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_declaration_array_tables(stamp_manifests, table, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_bytes(path.read_bytes() + f"\n[[ {table} ]]\n".encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("selector", [
+    """'cfg(any(windows, target_os = "]"))'""",
+    '"cfg(target_os = \\"]\\")"',
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_extra_dependency_with_bracket_selector(
+    stamp_manifests, selector, subtable, what_if
+):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    header = f"target.{selector}.dev-dependencies"
+    if subtable:
+        extra = f'[{header}.mssql-tds]\npath = "../mssql-tds"\nversion = "0.3.0"\n'
+    else:
+        extra = f'[{header}]\nmssql-tds = {{ path = "../mssql-tds", version = "0.3.0" }}\n'
+    content = path.read_text() + "\n" + extra
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("dependency_path", [
+    "../checkout{local/mssql-tds",
+    "../checkout}local/mssql-tds",
+    "../checkout{local}/mssql-tds",
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_braces_in_dependency_path(
+    stamp_manifests, quote, dependency_path, what_if
+):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('"../mssql-tds"', f"{quote}{dependency_path}{quote}", 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+    assert tomllib.loads(path.read_text())["dependencies"]["mssql-tds"]["path"] == dependency_path
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_still_rejects_nested_dependency_tables(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('default-features = false', 'extra = { version = "0.3.0" }')
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_nested_arrays_before_package_extraction(stamp_manifests, duplicate, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    nested = 'metadata = { matrix = [\n    [1, 2],\n] }\nversion = "0.3.0"'
+    if duplicate:
+        nested = 'version = "0.3.0"\n' + nested
+    content = path.read_text().replace('version = "0.3.0" # source version', nested, 1)
+    if not duplicate:
+        tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("nested", ['[[1, 2]]', '[\n ["hidden"]\n]', '[\n [1, 2]\n]'])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_nested_dependency_arrays(stamp_manifests, nested, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace("[dependencies]", f"[dependencies]\nunrelated = {{ features = {nested} }}")
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_literal_backslash_path(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('"../mssql-tds"', "'..\\mssql-tds'", 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+    assert tomllib.loads(path.read_text())["dependencies"]["mssql-tds"]["path"] == "..\\mssql-tds"
+
+
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_still_rejects_basic_string_escapes(stamp_manifests, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace('"../mssql-tds"', '"..\\\\mssql-tds"', 1)
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("quote", ['"""', "'''"])
+@pytest.mark.parametrize("has_dependency", [False, True])
+@pytest.mark.parametrize("example_header", ["dependencies", "package", "target.'cfg(windows)'"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_multiline_metadata_before_header_detection(
+    stamp_manifests, quote, has_dependency, example_header, what_if
+):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text()
+    if not has_dependency:
+        content = content[:content.index("\n[dependencies]\n")]
+    content += (
+        f"\n[package.metadata]\nexample = {quote}\n[{example_header}]\n"
+        'mssql-tds = { path = "../mssql-tds", version = "0.3.0" }\n'
+        f"# {quote}\n[features]\n"
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("quote", ['"""', "'''"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_plain_multiline_metadata(stamp_manifests, quote, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text() + f"\n[package.metadata]\nexample = {quote}first\nsecond{quote}\n"
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("table", [
+    "dependencies", "dev-dependencies", "build-dependencies",
+    "target.'cfg(windows)'.dependencies",
+    "target . 'cfg(windows)' . dev-dependencies",
+    """target.'cfg(target_os = "]")'.build-dependencies""",
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_package_alias(stamp_manifests, table, subtable, quote, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    fields = f'package = {quote}mssql-tds{quote}, path = "../mssql-tds", version = "0.3.0"'
+    content = path.read_text()
+    if subtable:
+        content += f"\n[{table}.tds-alias]\n" + fields.replace(", ", "\n") + "\n"
+    elif table == "dependencies":
+        content = content.replace("[dependencies]", f"[dependencies]\ntds-alias = {{ {fields} }}")
+    else:
+        content += f"\n[{table}]\ntds-alias = {{ {fields} }}\n"
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("field", [
+    '"package" = "mssql-tds"',
+    '"pack\\u0061ge" = "mssql-tds"',
+    'package = "mssql\\u002dtds"',
+])
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_ambiguous_alias_identity(stamp_manifests, field, subtable, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text()
+    if subtable:
+        content += f'\n[dev-dependencies.tds-alias]\n{field}\nversion = "0.3.0"\n'
+    else:
+        content += f'\n[dev-dependencies]\ntds-alias = {{ {field}, version = "0.3.0" }}\n'
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+@pytest.mark.parametrize("subtable", [False, True])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_preserves_unrelated_alias_and_package_text(stamp_manifests, subtable, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text()
+    if subtable:
+        content += '\n[dev-dependencies.uuid_alias]\npackage = "uuid"\nversion = "1.19.0"\n'
+        content += """path = '../package = "mssql-tds"'\n"""
+    else:
+        content += """\n[dev-dependencies]\nuuid_alias = { package = "uuid", version = "1.19.0", path = '../package = "mssql-tds"' }\n"""
+    content += (
+        '# package = "mssql-tds"\n'
+        '\n[package.metadata]\npackage = "mssql-tds"\n'
+        """example = 'package = "mssql-tds"'\n"""
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    result = run_crate_stamp(stamp_manifests, WhatIf=what_if)
+    assert result.returncode == 0, result.stderr
+    expected = content if what_if else content.replace("0.3.0", "0.3.0-dev.20261015.123")
+    assert path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("package_field", [
+    'package = "uuid"', "package = 'uuid'", 'package = "mssql-tds"',
+    'package = "mssql\\u002dtds"', '"package" = "uuid"',
+    '"pack\\u0061ge" = "uuid"',
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_package_override_on_direct_key(stamp_manifests, package_field, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    content = path.read_text().replace(
+        'mssql-tds = { path = "../mssql-tds"',
+        f'mssql-tds = {{ {package_field}, path = "../uuid"',
+        1,
+    )
+    tomllib.loads(content)
+    path.write_bytes(content.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_preserves_crlf_and_indented_declarations(stamp_manifests):
+    for path in stamp_manifests.rglob("Cargo.toml"):
+        path.write_bytes(path.read_text().replace("version =", "\tversion =").replace("\n", "\r\n").encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    for path in stamp_manifests.rglob("Cargo.toml"):
+        assert b"\tversion =" in path.read_bytes()
+        assert b"\n" not in path.read_bytes().replace(b"\r\n", b"")
+        assert tomllib.loads(path.read_text())["package"]["version"] == "0.3.0-dev.20261015.123"
+
+
+def test_crate_stamp_supports_single_selected_crate(stamp_manifests):
+    other = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    before = other.read_bytes()
+    result = run_crate_stamp(stamp_manifests, Crates=["mssql-tds"])
+    assert result.returncode == 0, result.stderr
+    assert other.read_bytes() == before
+    assert tomllib.loads((stamp_manifests / "mssql-tds" / "Cargo.toml").read_text())[
+        "package"
+    ]["version"] == "0.3.0-dev.20261015.123"
+
+
+def test_crate_stamp_handles_literal_root_and_no_final_newline(stamp_manifests):
+    root = stamp_manifests / "checkout [local]"
+    root.mkdir()
+    for name in ("mssql-tds", "mssql-mock-tds"):
+        shutil.move(stamp_manifests / name, root / name)
+    for path in root.rglob("Cargo.toml"):
+        path.write_bytes(path.read_bytes().rstrip(b"\r\n"))
+    before = {path: path.read_bytes() for path in root.rglob("Cargo.toml")}
+    result = run_crate_stamp(root)
+    assert result.returncode == 0, result.stderr
+    for path, content in before.items():
+        assert path.read_bytes() == content.replace(b"0.3.0", b"0.3.0-dev.20261015.123")
+
+
+def run_cratesio_script(tmp_path, responses, arguments):
+    # Shadow HTTP and sleep only; execute the real PowerShell gate, never a
+    # Python reimplementation of its response handling.
+    data = json.dumps(responses).replace("'", "''")
+    script = str(_ROOT / ".pipeline" / "scripts" / "test-cratesio-package.ps1").replace("'", "''")
+    command = f"""
+    $ErrorActionPreference = 'Stop'
+    $global:Responses = @('{data}' | ConvertFrom-Json)
+    $global:RequestCount = 0
+    function Invoke-WebRequest {{
+        param($Uri, $Headers, [switch]$SkipHttpErrorCheck, $TimeoutSec)
+        Write-Host "REQUEST:$Uri"
+        if ($global:RequestCount -ge $global:Responses.Count) {{ throw 'Unexpected HTTP request' }}
+        $response = $global:Responses[$global:RequestCount++]
+        if ($response.error) {{ throw $response.error }}
+        return $response
+    }}
+    function Start-Sleep {{ param($Seconds) Write-Host "SLEEP:$Seconds" }}
+    & '{script}' {arguments}
+    """
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    )
+
+
+@pytest.mark.parametrize(("state", "responses", "success", "requests"), [
+    ("Absent", [404], True, 1),
+    ("Absent", [200], False, 1),
+    ("Absent", [401], False, 1),
+    ("Absent", [403], False, 1),
+    ("Absent", [429], False, 1),
+    ("Absent", [503], False, 1),
+    ("Absent", ["socket access forbidden"], False, 1),
+    ("Available", [200], True, 1),
+    ("Available", [404, 200], True, 2),
+    ("Available", [429, 503, 200], True, 3),
+    ("Available", ["temporary transport failure", 200], True, 2),
+    ("Available", [404, 404, 404], False, 3),
+    ("Available", [503, 503, 503], False, 3),
+    ("Available", ["socket access forbidden"] * 3, False, 3),
+    ("Available", [301], False, 1),
+    ("Available", [401], False, 1),
+    ("Available", [403], False, 1),
+])
+def test_cratesio_http_states(tmp_path, state, responses, success, requests):
+    responses = [
+        {"StatusCode": item} if isinstance(item, int) else {"error": item}
+        for item in responses
+    ]
+    result = run_cratesio_script(
+        tmp_path, responses,
+        f"-CrateName mssql-tds -Version 0.1.0 -ExpectedState {state} -MaxAttempts 3 -DelaySeconds 1",
+    )
+    assert (result.returncode == 0) == success, result.stderr
+    assert result.stdout.count("REQUEST:") == requests
+    if not success:
+        assert "is not published" not in result.stdout
+        assert "is available" not in result.stdout
+
+
+@pytest.mark.parametrize(("damage", "damaged_name"), [
+    (None, None),
+    ("hash", "mssql-tds"),
+    ("hash", "mssql-mock-tds"),
+    ("dependency", "mssql-mock-tds"),
+    ("missing", "mssql-tds"),
+    ("missing", "mssql-mock-tds"),
+    ("extra", None),
+    ("order", None),
+])
+def test_crate_artifact_revalidation(tmp_path, damage, damaged_name):
+    entries = []
+    for name in ("mssql-tds", "mssql-mock-tds"):
+        folder = tmp_path / name
+        folder.mkdir()
+        crate = folder / f"{name}-0.1.0.crate"
+        dependency = "9.9.9" if damage == "dependency" else "0.1.0"
+        manifest = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
+        if name == "mssql-mock-tds":
+            manifest += f'\n[dependencies.mssql-tds]\nversion = "{dependency}"\n'
+        with tarfile.open(crate, "w:gz") as archive:
+            content = manifest.encode("utf-8")
+            member = tarfile.TarInfo(f"{name}-0.1.0/Cargo.toml")
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+        entries.append({
+            "name": name, "version": "0.1.0", "file": f"{name}/{crate.name}",
+            "sha256": hashlib.sha256(crate.read_bytes()).hexdigest(),
+        })
+    if damage in ("hash", "missing"):
+        damaged_crate = tmp_path / damaged_name / f"{damaged_name}-0.1.0.crate"
+        if damage == "hash":
+            damaged_crate.write_bytes(b"replaced after preflight")
+        else:
+            damaged_crate.unlink()
+    elif damage == "extra":
+        (tmp_path / "extra.crate").write_bytes(b"unexpected")
+    elif damage == "order":
+        entries.reverse()
+    (tmp_path / "release-manifest.json").write_text(
+        json.dumps({"schemaVersion": 1, "crates": entries}), encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File",
+         str(_ROOT / ".pipeline" / "scripts" / "validate-crate-release-artifact.ps1"),
+         "-ArtifactDirectory", str(tmp_path)],
+        capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode == 0) == (damage is None), result.stderr
+    assert ("Rust crate release artifact is valid." in result.stdout) == (damage is None)
+
+
+def git(directory, *arguments):
+    return subprocess.run(
+        ["git", "-C", str(directory), *arguments],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def commit_metadata(directory, version, python=True):
+    source = directory / "mssql-py-core"
+    source.mkdir(exist_ok=True)
+    (source / "Cargo.toml").write_text(
+        f'[package]\nname = "mssql-py-core"\nversion = "{version}"\n',
+        encoding="utf-8",
+    )
+    if python:
+        (source / "pyproject.toml").write_text(
+            '[project]\nversion = "0.9.2"\nname = "mssql-python-rs"\n',
+            encoding="utf-8",
+        )
+    git(directory, "add", ".")
+    git(directory, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-m", "Synthetic release metadata")
+    return git(directory, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def source_repositories(tmp_path):
+    remote = tmp_path / "source"
+    remote.mkdir()
+    git(remote, "init", "-b", "main")
+    commit_metadata(remote, "9.9.9")
+    checkout = tmp_path / "checkout"
+    git(tmp_path, "clone", str(remote), str(checkout))
+    selected = commit_metadata(remote, "0.1.10")
+    commit_metadata(remote, "8.8.8")
+    return remote, checkout, selected
+
+
+@pytest.mark.parametrize("to_feed,wheels_present", [(False, False), (False, True), (True, True)])
+def test_wheel_validation_and_optional_feed_publish(
+    source_repositories, tmp_path, to_feed, wheels_present
+):
+    remote, checkout, _ = source_repositories
+    (remote / "mssql-py-core" / "pyproject.toml").write_text(
+        '[project]\nname = "mssql-python-rs"\nversion = "0.1.0"\n', encoding="utf-8"
+    )
+    selected = commit_metadata(remote, "0.1.10", python=False)
+    scripts = checkout / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    for filename in ("get-python-release-metadata.ps1", "verify-python-wheels.ps1"):
+        shutil.copy2(_ROOT / ".pipeline" / "scripts" / filename, scripts / filename)
+
+    artifact_wheels = tmp_path / "officialBuild" / "drop" / "wheels"
+    artifact_wheels.mkdir(parents=True)
+    if wheels_present:
+        write_wheel_matrix(artifact_wheels)
+    staging = tmp_path / "staging"
+    flags = dict.fromkeys(_SWITCHES, False) | {"publishToFeed": to_feed}
+    pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    step_names = [step.get("displayName") for step in steps]
+    for name in ("Collect wheels for upload", "Authenticate twine to feed", "twine upload release wheels"):
+        assert (name in step_names) == to_feed
+    variables = {
+        "Build.SourcesDirectory": str(checkout),
+        "Build.StagingDirectory": str(staging),
+        "Pipeline.Workspace": str(tmp_path),
+        "resources.pipeline.officialBuild.sourceCommit": selected,
+        "resources.pipeline.officialBuild.sourceBranch": "refs/heads/main",
+        "resources.pipeline.officialBuild.runID": "123",
+    }
+
+    def run_step(name):
+        script = next(step["pwsh"] for step in steps if step.get("displayName") == name)
+        for key, value in variables.items():
+            script = script.replace(f"$({key})", value)
+        return subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", script],
+            cwd=tmp_path, capture_output=True, text=True, check=False,
+        )
+
+    result = run_step("Validate official Python wheels")
+    assert not list(staging.glob("*.nuspec"))
+    assert not list(staging.glob("**/*.nupkg"))
+    if not wheels_present:
+        assert result.returncode != 0
+        assert "No wheels found to validate" in result.stderr
+        assert "task.setvariable" not in result.stdout
+        return
+
+    assert result.returncode == 0, result.stderr
+    assert "Validated 9 mssql-python-rs wheels" in result.stdout
+    variables.update(re.findall(r"##vso\[task.setvariable variable=(\w+)\](.*)", result.stdout))
+    assert variables["releaseVersion"] == "0.1.0"
+    assert variables["sourceCommit"] == selected
+    assert variables["releaseDistributionName"] == "mssql-python-rs"
+
+
+def read_metadata(checkout, commit, cwd, branch="refs/heads/main", wheels=True):
+    # Pass arguments separately; exercise the real helper from a non-repository CWD.
+    command = [
+        "pwsh", "-NoProfile", "-Command",
+        "& { param($script, $repo, $sha, $branch, $wheels) "
+        "& $script -RepositoryDirectory $repo -CommitSha $sha -SourceBranch $branch "
+        "-IncludeWheelMetadata:($wheels -eq 'true') | ConvertTo-Json -Compress }",
+        str(_METADATA), str(checkout), commit, branch, str(wheels).lower(),
+    ]
+    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+
+
+def test_metadata_uses_selected_commit_not_checkout_or_branch_tip(source_repositories, tmp_path):
+    _, checkout, selected = source_repositories
+    checkout_head = git(checkout, "rev-parse", "HEAD")
+    result = read_metadata(checkout, selected, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "SourceCommit": selected, "Version": "0.1.10",
+        "DistributionName": "mssql-python-rs", "PythonVersion": "0.9.2",
+    }
+    assert git(checkout, "rev-parse", "HEAD") == checkout_head
+
+
+def test_missing_branch_does_not_use_stale_fetch_head(source_repositories, tmp_path):
+    _, checkout, selected = source_repositories
+    assert read_metadata(checkout, selected, tmp_path).returncode == 0
+    result = read_metadata(checkout, selected, tmp_path, branch="refs/heads/missing")
+    assert result.returncode != 0
+    assert "Could not fetch selected build branch" in result.stderr
+    assert '"Version"' not in result.stdout
+
+
+def test_missing_commit_does_not_use_checkout(source_repositories, tmp_path):
+    _, checkout, _ = source_repositories
+    result = read_metadata(checkout, "0" * 40, tmp_path)
+    assert result.returncode != 0
+    assert "was not found after fetching" in result.stderr
+
+
+def test_metadata_rejects_commit_outside_selected_branch(source_repositories, tmp_path):
+    _, checkout, _ = source_repositories
+    git(checkout, "checkout", "--orphan", "unrelated")
+    git(checkout, "rm", "-rf", ".")
+    (checkout / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    git(checkout, "add", ".")
+    git(
+        checkout,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Unrelated commit",
+    )
+    unrelated = git(checkout, "rev-parse", "HEAD")
+
+    result = read_metadata(checkout, unrelated, tmp_path)
+
+    assert result.returncode != 0
+    assert "reachable from refs/heads/main" in result.stderr
+
+
+def test_missing_git_context_fails_explicitly(source_repositories, tmp_path):
+    _, _, selected = source_repositories
+    result = read_metadata(tmp_path, selected, tmp_path)
+    assert result.returncode != 0
+    assert "Could not fetch selected build branch" in result.stderr
+
+
+def test_tag_metadata_does_not_require_wheel_metadata(source_repositories, tmp_path):
+    remote, checkout, _ = source_repositories
+    (remote / "mssql-py-core" / "pyproject.toml").unlink()
+    selected = commit_metadata(remote, "0.2.0", python=False)
+    result = read_metadata(checkout, selected, tmp_path, wheels=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"SourceCommit": selected, "Version": "0.2.0"}
+    result = read_metadata(checkout, selected, tmp_path, wheels=True)
+    assert result.returncode != 0
+    assert "Could not read mssql-py-core/pyproject.toml" in result.stderr
+
+
+def test_missing_package_version_does_not_match_dependency(source_repositories, tmp_path):
+    remote, checkout, _ = source_repositories
+    cargo = remote / "mssql-py-core" / "Cargo.toml"
+    cargo.write_text(
+        '[package]\nname = "mssql-py-core"\n[dependencies.fake]\nversion = "1.2.3"\n',
+        encoding="utf-8",
+    )
+    git(remote, "add", ".")
+    git(remote, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-m", "Missing package version")
+    result = read_metadata(checkout, git(remote, "rev-parse", "HEAD"), tmp_path)
+    assert result.returncode != 0
+    assert "Could not extract [package].version" in result.stderr

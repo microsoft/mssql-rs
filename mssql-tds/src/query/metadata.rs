@@ -13,7 +13,8 @@ use std::fmt;
 /// Returned as part of the `COLMETADATA` TDS token; one instance per column.
 #[derive(Debug, Clone)]
 pub struct ColumnMetadata {
-    /// SQL Server user-type ordinal (0 for base types, non-zero for aliases/CLR types).
+    /// SQL Server user-type ordinal from COLMETADATA. Alias types use IDs
+    /// greater than `0xFF`; CLR UDTs carry their identity in `type_info`.
     pub user_type: u32,
     /// Bitmask of column property flags (nullable, identity, computed, etc.).
     pub flags: u16,

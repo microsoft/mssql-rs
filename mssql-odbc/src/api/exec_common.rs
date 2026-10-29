@@ -7,39 +7,342 @@
 //! execution paths stay in lockstep. None of these helpers hold a lock across
 //! network I/O.
 
-use tracing::error;
+use tracing::{debug, error};
 
 use std::collections::VecDeque;
+use std::sync::MutexGuard;
+use std::time::Duration;
 
-use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
-use mssql_tds::error::Error as TdsError;
-use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
-
-use super::sqlstate::*;
-use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn};
-use crate::conversion::param_convert::{ParamBuildError, bound_param_to_rpc};
-use crate::handles::dbc::ConnectionState;
-use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
+use mssql_tds::connection::tds_client::{
+    CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
 };
-use crate::handles::{DbcHandle, StmtHandle};
+use mssql_tds::core::CancelHandle;
+use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
+
+use super::ird::populate_ird;
+use super::sqlstate::*;
+use crate::api::odbc_types::{
+    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_NO_DATA,
+    SQL_SS_XML, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen,
+    SqlUSmallInt,
+};
+use crate::api::type_rules::parameter_column_size_is_valid;
+use crate::conversion::error::ConvOk;
+use crate::conversion::param_convert::{
+    DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
+    dae_length_limit, dae_plan, dae_streamed_declaration,
+};
+use crate::error::{HasDiagnostics, post_sql_error};
+use crate::handles::dbc::{ConnectionState, DbcState};
+use crate::handles::desc::DescHeader;
+use crate::handles::stmt::{
+    DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
+    STMT_STATE_EXEC_STARTED, StatementOperation, StmtState,
+};
+use crate::handles::wire::{ClaimError, ClaimPolicy, LeaseReturn, WireLease, WireOwner};
+use crate::handles::{
+    DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
+};
+use crate::params::{BoundParam, ParamArrayLayoutError, ParamSnapshot};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
 pub(super) fn clear_exec_started(stmt: &StmtHandle) {
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+    match stmt.inner.lock() {
+        Ok(mut stmt_state) => stmt_state.clear_state(STMT_STATE_EXEC_STARTED),
+        // Leaving EXEC_STARTED set makes the next SQLExecute/SQLPrepare on this
+        // statement fail with an unrelated-looking sequence error.
+        Err(_) => error!("clear_exec_started: stmt mutex poisoned; EXEC_STARTED left set"),
     }
 }
 
+/// Tears down an in-progress data-at-execution sequence and returns the
+/// connection to the idle pool.
+///
+/// The transport is mid-write when a DAE sequence is abandoned, so the parked
+/// request must be discarded via `cancel_streamed_write` before the client can
+/// serve another command. `prepared` and `pending_unprepare` are restored so the
+/// statement can simply be executed again, which is what the ODBC spec requires
+/// after `SQLCancel`.
+///
+/// `diag`, when supplied, is posted against the statement before the state is
+/// cleared.
+pub(super) fn unwind_dae(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: Option<DiagMsg>,
+) {
+    unwind_dae_inner(
+        dbc,
+        stmt,
+        statement_handle,
+        diag,
+        process_is_shutting_down(),
+    )
+}
+
+/// The body of [`unwind_dae`], with the loader's shutdown flag passed in rather
+/// than read, so the skip arm below — unreachable in a live process — is
+/// testable.
+fn unwind_dae_inner(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: Option<DiagMsg>,
+    process_is_shutting_down: bool,
+) {
+    let client = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("stmt mutex poisoned unwinding DAE sequence");
+            return;
+        };
+        if let Some(diag) = diag {
+            post_diag(&mut stmt_state, diag);
+        }
+        let client = stmt_state.take_dae();
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        client
+    };
+
+    finish_dae_unwind(dbc, statement_handle, client, process_is_shutting_down);
+}
+
+/// Completes an unwind whose DAE state was already taken under the STMT lock.
+pub(super) fn finish_dae_unwind(
+    dbc: &DbcHandle,
+    statement_handle: SqlHandle,
+    client: Option<WireLease>,
+    process_is_shutting_down: bool,
+) {
+    if let Some(mut client) = client {
+        // `cancel_streamed_write` writes the request's cancel and drains the
+        // response, so it needs the scheduler's worker to drive the socket.
+        // During `DLL_PROCESS_DETACH` that worker is already terminated and
+        // `block_on` would park this thread forever (AB#47510) — reachable
+        // because `SQLFreeHandle(SQL_HANDLE_STMT)` unwinds a parked DAE
+        // sequence before freeing. The half-written request dies with the
+        // connection the exiting process is about to drop, so only the client
+        // hand-back below still matters.
+        if process_is_shutting_down {
+            debug!("unwind_dae: process is exiting — skipping the cancel round-trip");
+        } else {
+            dbc.runtime.block_on(client.cancel_streamed_write());
+        }
+        return_client_idle(dbc, statement_handle, client);
+    }
+}
+
+fn finish_cancelled_dae_call(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cancelled_success = matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NEED_DATA);
+    let needs_data = match stmt.inner.lock() {
+        Ok(state) => state.needs_data(),
+        Err(_) => {
+            error!("finishing cancelled DAE call: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !needs_data {
+        return rc;
+    }
+    unwind_dae(
+        stmt.parent_dbc(),
+        stmt,
+        statement_handle,
+        cancelled_success.then_some(ERR_OPERATION_CANCELED),
+    );
+    if cancelled_success { SQL_ERROR } else { rc }
+}
+
+/// Ends a call registered with [`StmtHandle::begin_operation`].
+///
+/// SQLCancel can signal after the call's last cancellable read but before it
+/// returns. The signal latches the token the client still holds, so leaving it
+/// unsettled would cancel a later, unrelated call on this statement and fail
+/// the drain of SQLFreeStmt(SQL_CLOSE) or SQLEndTran. msodbcsql sends ATTN in
+/// that window too (`sqlcmisc.cpp`, `pBatchCtx->Cancel` while `csStmt` is
+/// held), so the pending response is abandoned here, before SQLCancel returns.
+pub(super) fn finish_operation(
+    mut operation: StatementOperation<'_>,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    match operation.finish_unless_cancelled() {
+        Ok(true) => rc,
+        Ok(false) => settle_late_cancellation(stmt, statement_handle, rc),
+        Err(rc) => rc,
+    }
+}
+
+fn settle_late_cancellation(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let cursor_open = match stmt.inner.lock() {
+        Ok(state) if state.needs_data() => {
+            drop(state);
+            return finish_cancelled_dae_call(stmt, statement_handle, rc);
+        }
+        Ok(state) => state.has_state(STMT_STATE_CURSOR_OPEN),
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    // A released claim means the complete response was already read, so
+    // nothing remains for the signal to abandon.
+    let owns_wire = match stmt.parent_dbc().inner.lock() {
+        Ok(state) => state.wire.statement_owner() == Some(statement_handle),
+        Err(_) => {
+            error!("settling cancellation: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if !cursor_open || !owns_wire {
+        return rc;
+    }
+    match stmt.inner.lock() {
+        Ok(mut state) => {
+            state.pending_fetch_error = None;
+            super::close_cursor::reset_cursor_state(&mut state);
+        }
+        Err(_) => {
+            error!("settling cancellation: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    }
+    let drained = !matches!(
+        super::close_cursor::drain_and_release(stmt, statement_handle),
+        super::close_cursor::DrainOutcome::Failed
+    );
+    if drained
+        && matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA)
+        && let Ok(mut state) = stmt.inner.lock()
+    {
+        post_diag(&mut state, ERR_OPERATION_CANCELED);
+    }
+    SQL_ERROR
+}
+
+/// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
+/// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
+/// the wire reserved, so the connection stays busy for the duration.
+///
+/// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
+/// and has no plan to restore when the sequence completes.
+/// A pre-DAE truncation is posted before `SQL_NEED_DATA`, matching
+/// `AddRPCUserParameters` and its caller in `sqlccmd.cpp`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn park_dae_client(
+    stmt: &StmtHandle,
+    client: WireLease,
+    prepared: Option<PreparedPlan>,
+    orphaned: Option<StatementId>,
+    mut dae_params: Vec<DaeParam>,
+    fractional_truncated: bool,
+    op: &str,
+) -> SqlReturn {
+    // The wire encoding of a narrow target comes from the database collation,
+    // which is only knowable with the connection in hand — `write_streamed_chunk`
+    // writes bytes verbatim, so the re-encoding has to happen before them
+    // (AB#47590).
+    let collation = client.get_collation();
+    set_dae_transcodes(&mut dae_params, collation, true);
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        // The client has nowhere to go: the statement that owns it is
+        // unreachable and the DBC still records it as busy.
+        error!("{op}: stmt mutex poisoned while parking DAE client");
+        return SQL_ERROR;
+    };
+    stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
+    SQL_NEED_DATA
+}
+
+/// Parks a sequence whose execute is deferred: at least one parameter buffers,
+/// so no RPC has been opened and the client sits idle on the statement until
+/// the last `SQLParamData` builds the complete parameter list and runs it.
+///
+/// The connection still counts as busy for the duration, exactly as the
+/// streaming sequence does, so an application cannot start another command on it
+/// mid-sequence.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn park_deferred_dae(
+    stmt: &StmtHandle,
+    client: WireLease,
+    prepared: Option<PreparedPlan>,
+    orphaned: Option<StatementId>,
+    mut dae_params: Vec<DaeParam>,
+    prebuilt: Vec<RpcParameter>,
+    sql: Option<String>,
+    timeout_secs: u32,
+    fractional_truncated: bool,
+    op: &str,
+) -> SqlReturn {
+    set_dae_transcodes(&mut dae_params, client.get_collation(), false);
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned while parking deferred DAE state");
+        return SQL_ERROR;
+    };
+    stmt_state.dae = Some(
+        DaeState::new(client, prepared, orphaned, dae_params).deferred(prebuilt, sql, timeout_secs),
+    );
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
+    SQL_NEED_DATA
+}
+
+fn set_dae_transcodes(
+    dae_params: &mut [DaeParam],
+    collation: mssql_tds::token::tokens::SqlCollation,
+    include_streamed: bool,
+) {
+    for param in dae_params {
+        let validates_encoded_input = param
+            .length_limit
+            .is_some_and(|limit| limit.requires_encoded_input());
+        if (include_streamed && !param.is_buffered()) || validates_encoded_input {
+            let mut transcode =
+                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+            if validates_encoded_input {
+                transcode = transcode.with_passthrough_validation();
+            }
+            if validates_encoded_input || !transcode.is_passthrough() {
+                param.transcode = Some(transcode);
+            }
+        }
+    }
+}
+
+/// Aborts a data-at-execution sequence with a diagnostic. Always `SQL_ERROR`.
+pub(super) fn abort_dae_with_diag(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: DiagMsg,
+) -> SqlReturn {
+    unwind_dae(dbc, stmt, statement_handle, Some(diag));
+    SQL_ERROR
+}
+
 /// Acquires the connection's TDS client for an execution, enforcing the
-/// connection-busy / not-connected invariants and claiming `active_stmt`.
+/// connection-busy / not-connected invariants and reserving the wire.
 pub(super) fn claim_connection(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     op: &str,
-) -> Result<TdsClient, SqlReturn> {
+) -> Result<WireLease, SqlReturn> {
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned");
         clear_exec_started(stmt);
@@ -56,51 +359,108 @@ pub(super) fn claim_connection(
         return Err(SQL_ERROR);
     }
 
-    if let Some(busy_stmt) = dbc_state.active_stmt
-        && busy_stmt != statement_handle
-    {
-        error!("{op}: connection is busy with results for another statement");
-        drop(dbc_state);
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
+    // Snapshot the collation before the client leaves the DBC: a
+    // data-at-execution sequence parks it on the statement, so `SQLGetInfo`
+    // needs this to answer `SQL_COLLATION_SEQ` until the client returns.
+    let cache = dbc_state
+        .wire
+        .client()
+        .map(super::get_info::collation_cache_inputs);
+    match dbc_state.wire.claim(
+        WireOwner::Statement(statement_handle),
+        ClaimPolicy::IdleOrOwn,
+    ) {
+        Ok(lease) => {
+            if let Some((code_page, char_set)) = cache {
+                dbc_state.last_collation_code_page = code_page;
+                dbc_state.last_char_set = char_set;
+            }
+            Ok(lease)
         }
-        clear_exec_started(stmt);
-        return Err(SQL_ERROR);
+        Err(claim_error) => {
+            error!(?claim_error, "{op}: connection is not available");
+            post_claim_error(dbc_state, stmt, claim_error);
+            clear_exec_started(stmt);
+            Err(SQL_ERROR)
+        }
     }
+}
 
-    // Claim the connection before releasing the lock so concurrent threads see
-    // active_stmt and get HY000 rather than "no active TDS client".
-    dbc_state.active_stmt = Some(statement_handle);
-    let Some(client) = dbc_state.client.take() else {
-        error!("{op}: no active TDS client");
-        dbc_state.active_stmt = None;
-        drop(dbc_state);
-        if let Ok(mut stmt_state) = stmt.inner.lock() {
-            post_diag(&mut stmt_state, ERR_NO_ACTIVE_TDS_CLIENT);
-        }
-        clear_exec_started(stmt);
-        return Err(SQL_ERROR);
-    };
+/// Publishes the processed count for a scalar (single parameter set) execute.
+///
+/// msodbcsql writes this whether or not parameter arrays are in play: the
+/// non-bulk branch sets `iRowEnd = 1` (`sqlccmd.cpp:3203`) and the row loop then
+/// writes `*pRowsProcessed = 1` (`:3212`), with four more explicit `= 1` sites
+/// (`sqlccmd.cpp:1688`, `:3493`, `:6700`, `deprecate.cpp:2114`) covering the
+/// paths that skip that loop. Written before the set is converted or sent, so a
+/// set that then fails is still counted.
+///
+/// Without this, `executemany(sql, [one_row])` - which sets `PARAMSET_SIZE = 1`
+/// and a processed pointer - reads back whatever was in its own buffer.
+pub(super) fn publish_scalar_processed(header: &ParamArrayHeader) {
+    let ptr = header.processed_ptr;
+    if !ptr.is_null() {
+        unsafe { ptr.write_unaligned(1) };
+    }
+}
 
-    Ok(client)
+/// Takes the DBC guard so it is released before the statement lock is taken.
+pub(super) fn post_claim_error(
+    dbc_state: MutexGuard<'_, DbcState>,
+    stmt: &StmtHandle,
+    claim_error: ClaimError,
+) {
+    drop(dbc_state);
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        post_diag(&mut stmt_state, claim_error_diag(claim_error));
+    }
 }
 
 /// Returns `client` to the DBC and releases the busy claim. Used on the
 /// DDL/DML success path and on error recovery.
-pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, client: TdsClient) {
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        if dbc_state.active_stmt == Some(statement_handle) {
-            dbc_state.active_stmt = None;
-        }
-    }
+pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, client: WireLease) {
+    debug_assert_eq!(client.owner(), WireOwner::Statement(statement_handle));
+    dbc.return_lease(client, LeaseReturn::Release);
 }
 
-/// Claims the TDS client only if the connection is live and **idle** (no
-/// statement currently holds it), marking `active_stmt` so the claim is visible
-/// to concurrent threads. Returns `None` — without side effects — when
-/// disconnected, busy, or the client is unavailable. Pairs with
-/// [`return_client_idle`].
+/// Drains the connection's "a value reached the wire with a substituted
+/// character" flag and decides whether it is worth a diagnostic.
+///
+/// Always drains, so a substitution can never leak into the next statement's
+/// verdict, then reports it only if the application opted in with
+/// `SQL_COPT_SS_WARN_ON_CP_ERROR` (AB#47598).
+///
+/// Takes the DBC lock, so it must be called **before** the STMT lock the caller
+/// posts under: `SQLFreeHandle(SQL_HANDLE_DESC)` locks DBC then STMT, and
+/// reversing that here would risk an ABBA deadlock against it. Hence the split
+/// with [`post_code_page_conversion_loss`], which does the posting.
+pub(super) fn take_code_page_conversion_loss(dbc: &DbcHandle, client: &mut TdsClient) -> bool {
+    let had_loss = client.take_code_page_conversion_loss();
+    had_loss
+        && dbc
+            .inner
+            .lock()
+            .is_ok_and(|dbc_state| dbc_state.warn_on_cp_error)
+}
+
+/// Posts the `01000` substitution warning when
+/// [`take_code_page_conversion_loss`] said to. Returns whether a record was
+/// posted, so the caller can fold it into its `SQL_SUCCESS_WITH_INFO` decision
+/// exactly as it folds server INFO.
+pub(super) fn post_code_page_conversion_loss(
+    state: &mut impl HasDiagnostics,
+    should_warn: bool,
+) -> bool {
+    if should_warn {
+        post_diag(state, WARN_CODE_PAGE_CONVERSION_LOSS);
+    }
+    should_warn
+}
+
+/// Claims the TDS client only if the connection is live and **idle**,
+/// reserving the wire so the claim is visible to concurrent threads. Returns
+/// `None` — without side effects — when disconnected, busy, or the client is
+/// unavailable. Pairs with [`return_client_idle`].
 ///
 /// Unlike [`claim_connection`], this posts no diagnostics and never sets
 /// `EXEC_STARTED`: it backs internal best-effort operations (e.g. releasing a
@@ -108,24 +468,206 @@ pub(super) fn return_client_idle(dbc: &DbcHandle, statement_handle: SqlHandle, c
 pub(super) fn try_claim_idle_client(
     dbc: &DbcHandle,
     statement_handle: SqlHandle,
-) -> Option<TdsClient> {
+) -> Option<WireLease> {
     let Ok(mut dbc_state) = dbc.inner.lock() else {
+        // Distinct from the ordinary `None` returns below: those are expected
+        // (disconnected or busy), this one means the lock is unusable.
+        error!(
+            ?statement_handle,
+            "try_claim_idle_client: dbc mutex poisoned"
+        );
         return None;
     };
-    if dbc_state.connection_state != ConnectionState::Connected || dbc_state.active_stmt.is_some() {
+    if dbc_state.connection_state != ConnectionState::Connected {
         return None;
     }
-    let client = dbc_state.client.take()?;
-    dbc_state.active_stmt = Some(statement_handle);
-    Some(client)
+    dbc_state
+        .wire
+        .claim(
+            WireOwner::Statement(statement_handle),
+            ClaimPolicy::IdleOnly,
+        )
+        .ok()
 }
 
-/// Returns `client` to the DBC but **keeps** the busy claim — used when a
-/// cursor is left open for `SQLFetch`.
-pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
+/// Peeks whether another row follows the one just fully consumed, and
+/// releases the DBC's busy claim once both the peek and
+/// `client.has_open_batch()` agree nothing remains for this statement to
+/// read — matching msodbcsql's wire-state busy gate rather than holding the
+/// connection for the statement's entire cursor lifetime (AB#47508). A row
+/// the peek finds is parked (see [`TdsClient::peek_past_current_row`]) so
+/// the next fetch consumes it without re-reading the wire. Also sets
+/// `StmtState::batch_exhausted` alongside the release, so `SQLMoreResults`
+/// can fast-path to `SQL_NO_DATA` the same way `SQLFetch` already does.
+///
+/// A peek failure that ends the batch (a SQL Server `ERROR` token) is
+/// stashed on `stmt` as `pending_fetch_error` rather than posted here: this
+/// call has already committed to its own success return for the row it
+/// delivered, so posting now would never reach the caller. The next call
+/// that would otherwise short-circuit past the wire believing there is
+/// nothing left (`SQLFetch`'s `result_set_exhausted` fast path,
+/// `SQLMoreResults`) drains and reports it instead. A failure that does
+/// *not* end the batch (a raw transport error) is left unposted entirely:
+/// `release` is false in that case, so nothing about this statement's state
+/// changes, and the caller's very next real operation on this connection
+/// takes the normal, non-fast-path route and organically rediscovers and
+/// reports the same failure through its own existing error handling —
+/// posting it here too would attach a diagnostic to this call's own
+/// still-successful return.
+///
+/// If an RPC row set ends on `DONEINPROC` with MORE, the TDS layer consumes
+/// only trailing RPC control tokens and parks the first non-tail token for
+/// `SQLMoreResults`. A failure while consuming that completion tail always
+/// ends the batch — [`TdsClient::complete_current_result`] abandons whatever
+/// is left rather than stranding it — so it takes the deferred-error route
+/// above, never the unposted one.
+///
+/// Info messages the peek consumed are drained and posted here, whether or not
+/// the claim is released: they arrived before this result set's DONE, so they
+/// belong to the call that read them. Leaving them on `client` would hand this
+/// result set's warning to whichever call reads next — `SQLMoreResults` posts
+/// only after advancing to the following result set — or drop it entirely if
+/// the application never calls `SQLMoreResults`. The return value tells
+/// row-delivering callers to promote an otherwise-clean success to
+/// `SQL_SUCCESS_WITH_INFO`; a zero-row fetch keeps `SQL_NO_DATA` while leaving
+/// the diagnostic available.
+///
+/// `post_preceding` runs under this call's statement lock, before any message
+/// the peek drains is posted. Everything the caller's own rows produced left
+/// the wire ahead of whatever the peek finds, and `SQLGetDiagRec` is ordinal,
+/// so it has to be recorded first; its return value reports whether it posted
+/// a server message. Callers with nothing pending pass `|_| false`.
+///
+/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is
+/// `false` when the statement lock was poisoned and the closure therefore
+/// never ran, so a caller that relies on it having posted can fall back rather
+/// than assume. A stale lease returns `SQL_ERROR` without publishing state.
+///
+/// # Caller obligation
+/// Only call this once every column of the row positioned when `client` was
+/// claimed has been read — like `next_row_cursor`, the peek discards
+/// anything left unread on that row.
+pub(super) fn release_busy_if_row_exhausted(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut client: WireLease,
+    post_preceding: impl FnOnce(&mut StmtState) -> bool,
+) -> Result<(bool, bool, bool), SqlReturn> {
+    debug_assert_eq!(client.owner(), WireOwner::Statement(statement_handle));
+    let peek_result = match client.try_peek_past_current_row() {
+        Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
+        Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
+        Err(error) => Err(error),
+    };
+
+    // `Ok(true)`: another row, already parked for the next fetch — never
+    // exhausted. `Ok(false)`: the current result set's own DONE token was
+    // reached cleanly — always exhausted, regardless of whether a further
+    // result set remains pending elsewhere in the batch (`SQLFetch` never
+    // auto-advances across result sets, so reporting `SQL_NO_DATA` for a
+    // fully-read one is correct on its own terms). `Err`: only exhausted if
+    // the wire itself has given up on the whole batch (see doc comment).
+    let result_set_exhausted = match &peek_result {
+        Ok(has_more) => !has_more,
+        Err(_) => !client.has_open_batch(),
+    };
+
+    // A row-returning RPC can end its visible row set with DONEINPROC MORE because
+    // RETURNVALUE, RETURNSTATUS, and a terminal DONE still follow. Consume
+    // those protocol-only tokens now. The first non-tail token is parked inside
+    // TdsClient, so SQLMoreResults still observes it in order. Plain batch DONE
+    // tokens return immediately without probing the next result.
+    let completion_result = if result_set_exhausted && peek_result.is_ok() {
+        Some(dbc.runtime.block_on(client.complete_current_result()))
+    } else {
+        None
+    };
+    let batch_done = match &completion_result {
+        Some(Ok(done)) => *done,
+        _ => !client.has_open_batch(),
+    };
+    let mut read_error = peek_result.err();
+    if let Some(Err(error)) = completion_result {
+        read_error = Some(error);
     }
+    let cancelled = matches!(read_error, Some(TdsError::OperationCancelledError(_)));
+    let release = cancelled || (result_set_exhausted && batch_done);
+
+    // Drained whether or not the claim is released. Everything the peek
+    // consumed came before this result set's DONE, so it belongs to the call
+    // that read it — msodbcsql posts a server message from `OnMessage` as the
+    // token is parsed (`sqlctokn.cpp:3217`) and clears the flag at the end of
+    // each fetch (`sqlccurs.cpp:2163`), so it never carries to a later call.
+    // Holding it on `client` for whoever reads next would hand this result
+    // set's warning to `SQLMoreResults`, which posts only after advancing to
+    // the following result set, and would drop it outright if the application
+    // never calls `SQLMoreResults` at all.
+    let drained_info = client.take_info_messages();
+    let pending_output_params = if release && !cancelled {
+        Some((client.get_return_values(), client.get_return_status()))
+    } else {
+        None
+    };
+
+    let how = if release {
+        LeaseReturn::Release
+    } else {
+        LeaseReturn::KeepReservation
+    };
+    if !dbc.return_lease(client, how) {
+        return Err(SQL_ERROR);
+    }
+
+    let mut has_server_info = false;
+    let mut preceding_ran = false;
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        if let Some(output_params) = pending_output_params {
+            stmt_state.pending_output_params = Some(output_params);
+        }
+        preceding_ran = true;
+        has_server_info = post_preceding(&mut stmt_state);
+        has_server_info |= post_tds_info_messages(&mut stmt_state, &drained_info);
+        if let Some(e) = read_error {
+            error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
+            if cancelled {
+                super::close_cursor::reset_cursor_state(&mut stmt_state);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            } else if batch_done {
+                stmt_state.pending_fetch_error = Some(e);
+            }
+        }
+        if result_set_exhausted && !cancelled {
+            stmt_state.result_set_exhausted = true;
+        }
+        if release && !cancelled {
+            stmt_state.batch_exhausted = true;
+        }
+    }
+    Ok((has_server_info, preceding_ran, cancelled))
+}
+
+/// The TDS read has settled or retired its transport and returned the client.
+/// Release the ODBC claim without deferring cancellation to a later call.
+pub(super) fn finish_cancelled_cursor(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    err: &TdsError,
+) -> SqlReturn {
+    let dbc = stmt.parent_dbc();
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("finishing cancelled cursor: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    dbc_state.wire.release_reservation(statement_handle);
+    drop(dbc_state);
+    let Ok(mut state) = stmt.inner.lock() else {
+        error!("finishing cancelled cursor: stmt mutex poisoned");
+        return SQL_ERROR;
+    };
+    super::close_cursor::reset_cursor_state(&mut state);
+    post_tds_error(&mut state, err, SQLSTATE_HY000);
+    SQL_ERROR
 }
 
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
@@ -135,7 +677,7 @@ pub(super) fn fail_with_tds(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: TdsClient,
+    mut client: WireLease,
     err: &TdsError,
 ) -> SqlReturn {
     let info_messages = client.take_info_messages();
@@ -152,7 +694,7 @@ pub(super) fn fail_with_tds(
 
 /// Releases a statement's pending orphaned prepared handle (from a re-prepare,
 /// rebind, or `SQLExecDirect` supersede) via `sp_unprepare`, using the already
-/// claimed `client`. Best-effort: any failure is logged and swallowed — a
+/// claimed `client`. Best-effort except for cancellation: other failures are logged — a
 /// leaked handle is freed when the connection closes, and must not fail the
 /// caller's execution.
 ///
@@ -160,83 +702,639 @@ pub(super) fn fail_with_tds(
 /// `unprepare`: a transparent reconnect already discarded it server-side, so an
 /// `sp_unprepare` would target a nonexistent handle on the new session.
 ///
+/// `timeout_secs` bounds the wait the same way `SQL_ATTR_QUERY_TIMEOUT` bounds
+/// the execute that follows — `0` means unlimited. Being best-effort, a
+/// timeout here is logged like any other failure rather than propagated: the
+/// caller's own budget (deducted by its elapsed wall-clock time) still gates
+/// the execute that follows.
+///
 /// No lock is held across the network I/O.
 pub(super) fn flush_pending_unprepare(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     client: &mut TdsClient,
     op: &str,
-) {
+    timeout_secs: u32,
+    cancel: &CancelHandle,
+) -> Result<(), TdsError> {
     let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
         Err(_) => {
             error!("{op}: stmt mutex poisoned taking pending unprepare");
-            return;
+            return Err(TdsError::ImplementationError(
+                "statement state is poisoned during orphan cleanup".to_string(),
+            ));
         }
     };
     let Some(handle) = pending else {
-        return;
+        return Ok(());
     };
     // `unprepare` recovers a dead connection first, then drops the handle only
     // if it still belongs to the (recovered) session — a superseded handle is
     // already gone server-side and is skipped without an RPC.
-    if let Err(e) = dbc.runtime.block_on(client.unprepare(handle, ())) {
+    if let Err(e) = dbc.runtime.block_on(
+        client.unprepare(
+            handle,
+            ExecuteOptions::new()
+                .timeout_secs(timeout_secs)
+                .cancel(cancel),
+        ),
+    ) {
+        if matches!(e, TdsError::OperationCancelledError(_)) {
+            // Unprepare retains an unsent handle, but forgets one whose send
+            // was attempted. Retrying this id is safe: absent handles are skipped.
+            if let Ok(mut state) = stmt.inner.lock() {
+                state.pending_unprepare = Some(handle);
+            } else {
+                error!("{op}: stmt mutex poisoned restoring cancelled orphan cleanup");
+            }
+            return Err(e);
+        }
         error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
+    }
+    Ok(())
+}
+
+/// Deducts elapsed wall-clock time from a `SQL_ATTR_QUERY_TIMEOUT` budget
+/// spent across multiple wire operations performed in sequence before the
+/// caller's own execute — e.g. releasing an orphaned prepared handle, then
+/// beginning an implicit transaction, then the real execute. Mirrors
+/// msodbcsql's `DropPrepHandle` / `CheckOptions`, which charge the same
+/// deducted timeout to each step (`sqlcfunc.cpp:787-828`, `sqlccmd.cpp:10572-10586`).
+///
+/// `0` means unlimited and passes through unchanged. A positive budget is
+/// reduced by `elapsed`, truncated *down* to whole seconds, like
+/// `mssql-tds`'s internal `deduct_timeout`. Elapsed time is measured across
+/// steps that may have done no I/O at all (e.g. an
+/// autocommit-on connection skips the transaction begin entirely), so its
+/// value is often a few microseconds of local bookkeeping (mutex locks,
+/// staging). Rounding that up would charge a full second against the budget
+/// for every step regardless of whether it touched the network, spuriously
+/// exhausting a small timeout (e.g. `1`) before any wire wait ever happened.
+/// Truncating instead only ever under-charges by less than one second, and
+/// elapsed time that genuinely meets or exceeds the budget still exhausts it.
+/// Returns `Err(())` once exhausted; the caller must fail with a timeout
+/// rather than send the next step unbounded.
+pub(super) fn deduct_query_timeout(timeout_secs: u32, elapsed: Duration) -> Result<u32, ()> {
+    if timeout_secs == 0 {
+        return Ok(0);
+    }
+    let elapsed_secs = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
+    match timeout_secs.checked_sub(elapsed_secs) {
+        Some(remaining) if remaining > 0 => Ok(remaining),
+        _ => Err(()),
+    }
+}
+
+/// Builds the [`TdsError`] reported when [`deduct_query_timeout`] finds the
+/// budget already exhausted ahead of the caller's own execute.
+pub(super) fn query_timeout_expired_error() -> TdsError {
+    TdsError::TimeoutError(TimeoutErrorType::String(
+        "SQL_ATTR_QUERY_TIMEOUT expired before the statement could be sent".to_string(),
+    ))
+}
+
+/// Result of [`build_named_params`]: the full RPC parameter list (with
+/// data-at-execution placeholders) and a description of those placeholders.
+pub(super) struct ParamsWithDae {
+    /// All `@P1..@Pn` parameters in original order.  DAE entries carry a
+    /// `data_at_exec()` flag and a `None` value; their data arrives later via
+    /// `SQLPutData`.
+    pub(super) params: Vec<RpcParameter>,
+    /// Every DAE entry, in original parameter order.
+    pub(super) dae_params: Vec<DaeParam>,
+    /// Whether a parameter before the first DAE marker lost fractional digits.
+    /// With no DAE marker, covers the full parameter list.
+    pub(super) fractional_truncated: bool,
+}
+
+pub(super) enum ParamRowBuildError {
+    Unbound {
+        parameter: usize,
+    },
+    Layout {
+        parameter: usize,
+    },
+    Conversion {
+        parameter: usize,
+        source: ParamBuildError,
+    },
+}
+
+impl ParamRowBuildError {
+    pub(super) fn diag(&self) -> DiagMsg {
+        match self {
+            Self::Unbound { .. } => ERR_UNBOUND_PARAMETER,
+            Self::Layout { .. } => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+            Self::Conversion { source, .. } => source.diag(),
+        }
+    }
+
+    pub(super) fn parameter(&self) -> usize {
+        match self {
+            Self::Unbound { parameter }
+            | Self::Layout { parameter }
+            | Self::Conversion { parameter, .. } => *parameter,
+        }
+    }
+}
+
+/// The byte total an application declared with `SQL_LEN_DATA_AT_EXEC(n)`, or
+/// `None` when it declared no total and the length is whatever gets streamed.
+///
+/// `SQL_LEN_DATA_AT_EXEC(0)` is "unspecified", not "must be empty": msodbcsql
+/// guards both of its length checks with `cbDAEDataTotal > 0`
+/// (`sqlccmd.cpp:4548` per-put, `sqlccmd.cpp:6010` at close) and treats a zero
+/// total the same as `NO_PARAM_LENGTH` (`sqlccmd.cpp:4160`). Folding it into
+/// `None` here keeps that behaviour instead of rejecting the first byte with
+/// `22026`.
+fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
+    if indicator == SQL_DATA_AT_EXEC {
+        return None;
+    }
+    match (SQL_LEN_DATA_AT_EXEC_OFFSET - indicator) as usize {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Snapshots every parameter position currently bound on `stmt`'s effective
+/// APD/IPD, in ordinal order.
+///
+/// Read once, immediately before an execute's main STMT-locked critical
+/// section — never while that lock is held (see
+/// ".github/instructions/mssql-odbc.instructions.md", "Locking rules": a
+/// STMT lock must never be held while acquiring a DESC lock) — since ODBC
+/// requires bindings to stay stable across one execute.
+/// `SQLBindParameter` and `SQLSetDescFieldW` write into these same descriptor
+/// records (AB#47437), so this is the one place `build_named_params` and the
+/// data-at-execution lookups need to look, regardless of which API produced
+/// the binding; the snapshot itself is what lets the rest of the execute path
+/// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
+/// reading `StmtState::bound_params` exactly as it did before AB#47437.
+///
+/// `Err(SQL_ERROR)` on a poisoned STMT/env/APD/IPD mutex: the caller posts a
+/// diagnostic against the statement and fails the execute outright, rather
+/// than silently snapshotting "every parameter unbound" — which used to let
+/// a zero-marker statement execute successfully despite the internal
+/// failure, and reported a misleading `07002` for one with markers.
+pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, SqlReturn> {
+    // Read before the STMT lock below, matching bind_param.rs's own
+    // parent-before-child lock ordering for the same lookup.
+    let odbc_version = {
+        let env = stmt.parent_dbc().parent_env();
+        let Ok(env_state) = env.inner.lock() else {
+            error!("snapshotting parameters: env mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        env_state.odbc_version
+    };
+
+    let (apd, ipd) = {
+        let Ok(stmt_state) = stmt.inner.lock() else {
+            error!("snapshotting parameters: stmt mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        (stmt_state.effective_apd(stmt), stmt.ipd)
+    };
+
+    // `apd` can be an explicit descriptor resolved under the STMT lock,
+    // already dropped by now — re-check liveness right before dereferencing
+    // to narrow (not fully close) the race against a concurrent
+    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor. `ipd` is
+    // always `stmt.ipd`, freed only with the statement itself.
+    if crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc) {
+        error!("snapshotting parameters: apd freed concurrently");
+        return Err(SQL_ERROR);
+    }
+    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let Ok(apd_state) = apd_desc.inner.lock() else {
+        error!("snapshotting parameters: apd mutex poisoned");
+        return Err(SQL_ERROR);
+    };
+    let ipd_desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
+    let Ok(ipd_state) = ipd_desc.inner.lock() else {
+        error!("snapshotting parameters: ipd mutex poisoned");
+        return Err(SQL_ERROR);
+    };
+    Ok(BoundParamSet {
+        params: BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
+        header: ParamArrayHeader::from_headers(&apd_state.header, &ipd_state.header),
+    })
+}
+
+/// The effective APD's records and the APD/IPD header fields, read under the
+/// same two descriptor locks.
+#[derive(Debug)]
+pub(crate) struct BoundParamSet {
+    pub(crate) params: Vec<Option<ParamSnapshot>>,
+    pub(crate) header: ParamArrayHeader,
+}
+
+/// A snapshot of the APD/IPD header fields behind the parameter-array
+/// attributes, for one execution or output write-back. Never written back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParamArrayHeader {
+    /// APD `SQL_DESC_ARRAY_SIZE` — `SQL_ATTR_PARAMSET_SIZE`.
+    pub(crate) array_size: SqlULen,
+    /// APD `SQL_DESC_BIND_TYPE` — `SQL_ATTR_PARAM_BIND_TYPE`.
+    pub(crate) bind_type: SqlULen,
+    /// APD `SQL_DESC_BIND_OFFSET_PTR` — `SQL_ATTR_PARAM_BIND_OFFSET_PTR`.
+    pub(crate) bind_offset_ptr: *const SqlLen,
+    /// APD `SQL_DESC_ARRAY_STATUS_PTR` — `SQL_ATTR_PARAM_OPERATION_PTR`.
+    pub(crate) operation_ptr: *const SqlUSmallInt,
+    /// IPD `SQL_DESC_ARRAY_STATUS_PTR` — `SQL_ATTR_PARAM_STATUS_PTR`.
+    pub(crate) status_ptr: *mut SqlUSmallInt,
+    /// IPD `SQL_DESC_ROWS_PROCESSED_PTR` — `SQL_ATTR_PARAMS_PROCESSED_PTR`.
+    pub(crate) processed_ptr: *mut SqlULen,
+}
+
+impl Default for ParamArrayHeader {
+    fn default() -> Self {
+        Self::from_headers(&DescHeader::default(), &DescHeader::default())
+    }
+}
+
+impl ParamArrayHeader {
+    fn from_headers(apd: &DescHeader, ipd: &DescHeader) -> Self {
+        Self {
+            array_size: apd.array_size,
+            bind_type: apd.bind_type,
+            bind_offset_ptr: apd.bind_offset_ptr.cast_const().cast(),
+            operation_ptr: apd.array_status_ptr.cast_const().cast(),
+            status_ptr: ipd.array_status_ptr.cast(),
+            processed_ptr: ipd.rows_processed_ptr.cast(),
+        }
+    }
+
+    /// The `SQLLEN` the bind-offset pointer points at, or 0 when unset. Read
+    /// at execute time, so the application can move every binding between
+    /// executions.
+    ///
+    /// # Safety
+    /// When set, the pointer must address a live `SQLLEN` for the duration of
+    /// the execution, per the `SQLSetStmtAttr`/`SQLSetDescField` contract.
+    /// ODBC does not require application pointers to be aligned.
+    pub(crate) unsafe fn bind_offset(&self) -> isize {
+        if self.bind_offset_ptr.is_null() {
+            return 0;
+        }
+        unsafe { self.bind_offset_ptr.read_unaligned() }
+    }
+}
+
+/// Builds the parameter list for a TDS RPC, where parameters bind by
+/// **position** rather than by name.
+///
+/// The `@P1..@Pn` names the sp_executesql path uses would be wrong here: the
+/// server matches an RPC's named parameters against the procedure's own
+/// parameter names, so `@P1` fails with "expects parameter '@a', which was not
+/// supplied". msodbcsql likewise sends canonical-call parameters positionally.
+///
+/// `skip` drops leading bindings that are not RPC parameters at all — the
+/// `{? = call ...}` return status is bound as parameter 1 but travels on the
+/// RETURNSTATUS token, not as an argument.
+///
+/// # Safety
+/// Same as [`build_named_params`].
+pub(super) unsafe fn build_positional_params(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    skip: usize,
+    bind_offset: isize,
+    op: &str,
+) -> Result<ParamsWithDae, SqlReturn> {
+    // Borrowed, not cloned: the builder only reads this tail, and cloning it
+    // would reallocate every UDT identity on each stored-procedure call.
+    let bound = stmt_state.bound_params.get(skip..).unwrap_or_default();
+    let built = unsafe {
+        build_named_params_for_row(
+            bound,
+            marker_count.saturating_sub(skip),
+            bind_offset,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            0,
+            false,
+        )
+    };
+    match built {
+        Ok(params) => Ok(params),
+        Err(error) => {
+            error!(
+                "{op}: parameter {} could not be built: {}",
+                error.parameter() + skip,
+                error.diag().text
+            );
+            post_diag(stmt_state, error.diag());
+            Err(SQL_ERROR)
+        }
     }
 }
 
 /// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
-/// parameters, reading application value buffers by reference. Posts the
-/// matching diagnostic and returns `Err(SQL_ERROR)` when a marker is unbound
-/// (`07002`) or a parameter cannot be built. Shared by `SQLExecute`
-/// and `SQLExecDirect`; `op` names the entry point for traceable diagnostics.
+/// parameters, reading application value buffers by reference. Shared by
+/// `SQLExecute` and `SQLExecDirect`; `op` names the entry point for traceable
+/// diagnostics.
+///
+/// Parameters with `SQL_DATA_AT_EXEC` or `SQL_LEN_DATA_AT_EXEC(n)` indicators
+/// become streaming placeholders instead of having their value buffer read
+/// eagerly, and are recorded in [`ParamsWithDae::dae_params`]; all others are
+/// converted immediately. Posts the matching diagnostic and returns
+/// `Err(SQL_ERROR)` when a marker is unbound (`07002`) or a parameter cannot be
+/// built.
 ///
 /// # Safety
 /// Each bound parameter's value/indicator pointers must still satisfy the
-/// `SQLBindParameter` contract; the buffers are read here.
+/// `SQLBindParameter` contract; the buffers are read here. When
+/// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, their readable extents begin at
+/// each bound base plus the pointed-to signed byte offset, which may be
+/// negative, so every allocation must cover that displaced range.
+/// `bind_offset` is that pointed-to value ([`ParamArrayHeader::bind_offset`]).
 pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
+    bind_offset: isize,
     op: &str,
-) -> Result<Vec<RpcParameter>, SqlReturn> {
-    let mut named_params = Vec::with_capacity(marker_count);
+) -> Result<ParamsWithDae, SqlReturn> {
+    match unsafe {
+        build_named_params_for_row(
+            &stmt_state.bound_params,
+            marker_count,
+            bind_offset,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            0,
+            true,
+        )
+    } {
+        Ok(params) => Ok(params),
+        Err(error) => {
+            error!(
+                "{op}: parameter {} could not be built: {}",
+                error.parameter(),
+                error.diag().text
+            );
+            post_diag(stmt_state, error.diag());
+            Err(SQL_ERROR)
+        }
+    }
+}
+
+/// Builds one row of an ODBC parameter array without retaining any other row.
+///
+/// # Safety
+/// Every pointer in `bound_params`, after applying `bind_offset` and the
+/// row-specific stride, must satisfy the original `SQLBindParameter` contract.
+pub(super) unsafe fn build_named_params_for_row(
+    bound_params: &[Option<ParamSnapshot>],
+    marker_count: usize,
+    bind_offset: isize,
+    param_bind_type: crate::api::odbc_types::SqlULen,
+    row: usize,
+    named: bool,
+) -> Result<ParamsWithDae, ParamRowBuildError> {
+    use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+    let mut params = Vec::with_capacity(marker_count + usize::from(!named));
+    let mut dae_params = Vec::new();
+    let mut fractional_truncated = false;
     for i in 0..marker_count {
-        let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
-            error!("{op}: parameter {} has no bound value", i + 1);
+        let Some(Some(snapshot)) = bound_params.get(i) else {
+            return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
+        };
+        let udt_names = snapshot.udt_names.as_deref();
+        let bound_param = snapshot
+            .param
+            .for_row(row, bind_offset, param_bind_type)
+            .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
+                ParamRowBuildError::Layout { parameter: i + 1 }
+            })?;
+        let name = named.then(|| parameter_name(i));
+        let dae_indicator =
+            unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
+
+        if let Some(indicator) = dae_indicator {
+            let plan = dae_plan(bound_param.c_type, bound_param.sql_type, udt_names).map_err(
+                |source| ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
+                },
+            )?;
+            let length_limit = dae_length_limit(
+                bound_param.c_type,
+                bound_param.sql_type,
+                bound_param.column_size,
+            )
+            .map_err(|source| ParamRowBuildError::Conversion {
+                parameter: i + 1,
+                source,
+            })?;
+            let buffered = plan.is_buffered();
+            // Nothing to declare for a buffered parameter yet: its bytes are
+            // not in, so its type and length are not known. The slot is filled
+            // to keep parameter positions lined up and is rebuilt by
+            // `rebuild_deferred_params` before anything reaches the wire.
+            let status = if crate::conversion::param_convert::is_output_direction(
+                bound_param.input_output_type,
+            ) {
+                StatusFlags::BY_REF_VALUE
+            } else {
+                StatusFlags::NONE
+            };
+            let rpc = match plan {
+                DaePlan::Stream(streamed) => {
+                    let param = RpcParameter::data_at_exec(name, status, streamed);
+                    // The body is PLP whatever `ColumnSize` says, but the
+                    // variable it lands in is declared from `ParameterType`,
+                    // matching the materialized path and msodbcsql (AB#47590).
+                    //
+                    // Only narrowed when the bound above can actually be
+                    // enforced. A streamed parameter never reaches a close-time
+                    // conversion, so an unenforced bound would have the client
+                    // declare `varchar(n)` and then stream past it, leaving the
+                    // overflow to the server instead of the `22001` the
+                    // declaration implies. Staying `max` keeps the value intact
+                    // until the bound is measurable on this path too
+                    // (AB#47590).
+                    let declaration = if length_limit.is_some() {
+                        dae_streamed_declaration(bound_param.sql_type, bound_param.column_size)
+                    } else {
+                        Ok(None)
+                    };
+                    match declaration {
+                        Ok(Some(declaration)) => param.with_streamed_declaration(declaration),
+                        Ok(None) => param,
+                        Err(source) => {
+                            return Err(ParamRowBuildError::Conversion {
+                                parameter: i + 1,
+                                source,
+                            });
+                        }
+                    }
+                }
+                DaePlan::Buffer => {
+                    RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax)
+                }
+            };
+            params.push(rpc);
+            dae_params.push(DaeParam::new(
+                i,
+                dae_expected_length(indicator),
+                buffered,
+                length_limit,
+                bound_param,
+                snapshot.udt_names.clone(),
+            ));
+        } else {
+            if bound_param.sql_type == SQL_SS_XML
+                && !parameter_column_size_is_valid(bound_param.sql_type, bound_param.column_size)
+            {
+                return Err(ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source: ParamBuildError::InvalidParameterSize(bound_param.column_size),
+                });
+            }
+            unsafe { crate::conversion::param_convert::stamp_numeric_apd(&bound_param) };
+            let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
+                .map_err(|source| ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
+                })?;
+            if outcome == ConvOk::Truncated && dae_params.is_empty() {
+                fractional_truncated = true;
+            }
+            params.push(param);
+        }
+    }
+
+    Ok(ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    })
+}
+
+fn parameter_name(index: usize) -> String {
+    format!("@P{}", index + 1)
+}
+
+pub(super) fn finish_execute_with_param_warning(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    client: WireLease,
+    op: &str,
+    fractional_truncated: bool,
+) -> SqlReturn {
+    let rc = finish_execute(dbc, stmt, statement_handle, client, op);
+    if !fractional_truncated || !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA) {
+        return rc;
+    }
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned posting parameter truncation");
+        return SQL_ERROR;
+    };
+    post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    SQL_SUCCESS_WITH_INFO
+}
+
+/// Rebuilds the RPC parameter list once every data-at-execution value has been
+/// collected, for a sequence that deferred its execute.
+///
+/// Only the data-at-execution slots are rebuilt, from the bytes
+/// [`buffered_dae_to_rpc`] converts; every other parameter is the one
+/// `build_named_params` already materialized at execute time and is kept
+/// verbatim. A buffered value therefore still goes through the same conversion
+/// the materialized path uses, so it is declared and bounded exactly like a
+/// value supplied in a single buffer (AB#47590).
+///
+/// Nothing here reads application memory. Re-reading it would be unsound rather
+/// than merely redundant: `bound_params` is an execute-time snapshot that
+/// `SQLFreeStmt(SQL_RESET_PARAMS)` leaves in place while releasing the bindings
+/// it describes, so an application that resets its parameters mid-sequence --
+/// which this driver explicitly supports -- would have freed buffers
+/// dereferenced here.
+pub(super) fn rebuild_deferred_params(
+    stmt_state: &mut StmtState,
+    prebuilt: Vec<RpcParameter>,
+    collected: &[(usize, Vec<u8>, bool)],
+    dae_params: &[DaeParam],
+    op: &str,
+) -> Result<(Vec<RpcParameter>, bool), SqlReturn> {
+    let mut params = prebuilt;
+    let mut fractional_truncated = false;
+
+    for (index, bytes, is_null) in collected {
+        let Some(dae) = dae_params.iter().find(|p| p.bound_index == *index) else {
+            error!(
+                "{op}: collected value for parameter {} has no binding",
+                index + 1
+            );
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
-        let name = format!("@P{}", i + 1);
-        match unsafe { bound_param_to_rpc(name, bound_param) } {
-            Ok(param) => named_params.push(param),
+        let Some(slot) = params.get_mut(*index) else {
+            error!(
+                "{op}: collected value for parameter {} has no slot",
+                index + 1
+            );
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+        let name = parameter_name(*index);
+        match buffered_dae_to_rpc(
+            name,
+            &dae.binding,
+            dae.udt_names.as_deref(),
+            bytes,
+            *is_null,
+        ) {
+            Ok((param, outcome)) => {
+                *slot = param;
+                fractional_truncated |= outcome == ConvOk::Truncated;
+            }
             Err(e) => {
-                if let ParamBuildError::InvalidLength(len) = e {
-                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
-                } else {
-                    error!("{op}: parameter {} rejected: {}", i + 1, e.diag().text);
-                }
+                error!(
+                    "{op}: parameter {} conversion failed: {}",
+                    index + 1,
+                    e.diag().text
+                );
                 post_diag(stmt_state, e.diag());
                 return Err(SQL_ERROR);
             }
         }
     }
-    Ok(named_params)
+
+    Ok((params, fractional_truncated))
+}
+
+fn no_row_execute_return(row_count: i64, has_server_info: bool) -> SqlReturn {
+    if has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else if row_count == 0 {
+        // msodbcsql's sqlccmd.cpp returns SQL_NO_DATA for an ODBC 3.x
+        // execution positioned on an RS_COUNT with zero affected rows.
+        SQL_NO_DATA
+    } else {
+        SQL_SUCCESS
+    }
 }
 
 /// Captures result metadata after a successful execution and finalizes the
 /// statement/connection state.
 ///
 /// - **Result set** (non-empty `COLMETADATA`): the cursor is left open for
-///   `SQLFetch`; the connection stays busy.
+///   `SQLFetch`; an empty result releases the connection if the batch is done.
 /// - **DDL/DML** (no `COLMETADATA`): the wire is drained via `close_query` and
-///   the connection returns to idle so the statement can re-execute.
+///   the connection returns to idle. Collected DML counts remain navigable;
+///   output parameters wait until `SQLMoreResults` consumes the final count.
+///   A zero first count returns `SQL_NO_DATA` without consuming that result.
 ///
 /// `EXEC_STARTED` is always cleared. No lock is held across the drain I/O.
 pub(super) fn finish_execute(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    mut client: TdsClient,
+    mut client: WireLease,
     op: &str,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
@@ -250,26 +1348,39 @@ pub(super) fn finish_execute(
         // 24000). Do NOT drain the wire — that would collapse the rest of the
         // batch. Matches msodbcsql.
         let info_messages = client.take_info_messages();
+        let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
+        let row_count = client.last_rows_affected();
+        if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+            return SQL_ERROR;
+        }
+        let ird_ok = populate_ird(stmt, &metadata).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned on no-row result");
-            return_client_busy(dbc, client);
             return SQL_ERROR;
         };
-        stmt_state.column_metadata = metadata; // empty (0 columns)
+        stmt_state.begin_batch(metadata); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
-        stmt_state.row_count = client.last_rows_affected();
+        stmt_state.row_count = row_count;
+        stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+            | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
-        return_client_busy(dbc, client);
-        return if has_server_info {
-            SQL_SUCCESS_WITH_INFO
-        } else {
-            SQL_SUCCESS
-        };
+        if !ird_ok {
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error refreshing result-set metadata",
+                );
+            }
+            return SQL_ERROR;
+        }
+        return no_row_execute_return(row_count, has_server_info);
     }
 
     if !has_result_set {
@@ -281,46 +1392,146 @@ pub(super) fn finish_execute(
             return fail_with_tds(dbc, stmt, statement_handle, client, &e);
         }
         let info_messages = client.take_info_messages();
+        let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
         // A pure-DML batch (UPDATE; DELETE; INSERT) yields one count per
         // statement. Report the first here; queue the rest for SQLMoreResults to
         // step through, matching msodbcsql's one result set per DML statement.
         let mut dml_counts: VecDeque<i64> = client.take_dml_result_counts().into();
+        let has_dml_counts = !dml_counts.is_empty();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
+        let bound_params = snapshot_bound_params(stmt);
+        // Draining the wire does not consume application-visible DML counts.
+        // Keep the return tokens until SQLMoreResults advances past the last
+        // count, even when the first count is the only one.
+        let return_values = client.get_return_values();
+        let return_status = client.get_return_status();
+        if !dbc.return_lease(client, LeaseReturn::Release) {
+            return SQL_ERROR;
+        }
+        let ird_ok = populate_ird(stmt, &metadata).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
-            return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
-        stmt_state.column_metadata = metadata; // empty
+        stmt_state.clear_exhaustion_state();
+        let output_rc = if has_dml_counts {
+            stmt_state.batch_exhausted = true;
+            stmt_state.pending_output_params = Some((return_values, return_status));
+            SQL_SUCCESS
+        } else if let Ok(bound_params) = bound_params {
+            // Fresh descriptor snapshot; execute-time input pointers may have
+            // been reset or rebound while the results were being consumed.
+            unsafe {
+                crate::api::output_params::write_back_output_params(
+                    &mut stmt_state,
+                    &bound_params.params,
+                    &bound_params.header,
+                    &return_values,
+                    return_status,
+                )
+            }
+        } else {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error snapshotting output parameter bindings",
+            );
+            SQL_ERROR
+        };
+        stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
-        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+        let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+            | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
         drop(stmt_state);
-        return_client_idle(dbc, statement_handle, client);
-        return if has_server_info {
-            SQL_SUCCESS_WITH_INFO
+        if !ird_ok {
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error refreshing result-set metadata",
+                );
+            }
+            return SQL_ERROR;
+        }
+        return if output_rc != SQL_SUCCESS {
+            output_rc
         } else {
-            SQL_SUCCESS
+            no_row_execute_return(first_count, has_server_info)
         };
     }
 
-    // Result-bearing query: leave the cursor open for SQLFetch.
+    // SQL Server can send COLMETADATA before the statement has produced its
+    // first row. Wait for that row, end-of-set, or an ERROR token so execution
+    // errors surface from SQLExecDirect/SQLExecute instead of a later SQLFetch.
+    // A row is only positioned and parked; SQLFetch still receives it normally.
+    let has_row = match dbc.runtime.block_on(client.peek_past_current_row()) {
+        Ok(has_row) => has_row,
+        Err(error) => {
+            error!(%error, "{op}: failed before the first result row");
+            return fail_with_tds(dbc, stmt, statement_handle, client, &error);
+        }
+    };
+    let row_count = client.last_rows_affected();
+    let batch_exhausted = if has_row {
+        false
+    } else {
+        match dbc.runtime.block_on(client.complete_current_result()) {
+            Ok(batch_done) => batch_done,
+            Err(error) => {
+                error!(%error, "{op}: failed to complete the empty result");
+                return fail_with_tds(dbc, stmt, statement_handle, client, &error);
+            }
+        }
+    };
+
+    // Result-bearing query: leave the cursor open for SQLFetch. This must stay
+    // below the peek: the peek drains any INFO token in the post-metadata
+    // window, and taking the messages first would leave them for a later fetch.
     let info_messages = client.take_info_messages();
+    let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
+    let pending_output_params =
+        batch_exhausted.then(|| (client.get_return_values(), client.get_return_status()));
+    let lease_return = if batch_exhausted {
+        LeaseReturn::Release
+    } else {
+        LeaseReturn::KeepReservation
+    };
+    if !dbc.return_lease(client, lease_return) {
+        return SQL_ERROR;
+    }
+    let ird_ok = populate_ird(stmt, &metadata).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
-        return_client_busy(dbc, client);
         return SQL_ERROR;
     };
-    stmt_state.column_metadata = metadata;
-    stmt_state.row_count = client.last_rows_affected();
+    stmt_state.begin_batch(metadata);
+    stmt_state.row_count = row_count;
     stmt_state.pending_row_counts.clear();
+    stmt_state.clear_exhaustion_state();
+    stmt_state.result_set_exhausted = !has_row;
+    stmt_state.batch_exhausted = batch_exhausted;
+    stmt_state.pending_output_params = pending_output_params;
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
+    let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages)
+        | post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     drop(stmt_state);
-    return_client_busy(dbc, client);
+    if !ird_ok {
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error refreshing result-set metadata",
+            );
+        }
+        return SQL_ERROR;
+    }
     if has_server_info {
         SQL_SUCCESS_WITH_INFO
     } else {
@@ -332,16 +1543,242 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_DEFAULT_PARAM, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+        SQL_C_CHAR, SQL_C_LONG, SQL_C_WCHAR, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS,
+        SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
+    use crate::test_support::{assert_last_diag, lease_for_test};
+    use mssql_tds::test_client_support::{
+        ScriptedToken, col_metadata, col_metadata_empty, done_in_proc_more, done_more,
+        done_no_more, done_proc_no_more, int_columns, sql_error, tds_client_from_tokens,
+    };
     use std::ffi::c_void;
 
     // The success path of `try_claim_idle_client` needs a real `TdsClient`,
     // which unit tests can't construct; these cover the guard branches (each
     // returns `None` without claiming `active_stmt`).
+
+    /// `SQL_LEN_DATA_AT_EXEC(0)` declares no total rather than an empty value,
+    /// matching msodbcsql's `cbDAEDataTotal > 0` guards. Treating it as
+    /// `Some(0)` would reject the first byte with `22026`.
+    #[test]
+    fn dae_expected_length_treats_zero_as_unspecified() {
+        assert_eq!(dae_expected_length(SQL_DATA_AT_EXEC), None);
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
+
+    #[test]
+    fn deferred_dae_configures_transcoding_for_encoded_length_limits() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        for (c_type, input) in [
+            (SQL_C_CHAR, &[0xC3, 0xA9][..]),
+            (SQL_C_WCHAR, &[0xE9, 0x00][..]),
+        ] {
+            let limit = dae_length_limit(c_type, SQL_VARCHAR, 1).unwrap().unwrap();
+            let mut params = vec![
+                DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                    .with_binding_types(c_type, SQL_VARCHAR)
+                    .with_length_limit(limit),
+            ];
+
+            set_dae_transcodes(&mut params, collation, false);
+
+            let transcode = params[0]
+                .transcode
+                .expect("deferred encoded-byte validation needs a transcoder");
+            let mut carry = Vec::new();
+            assert_eq!(transcode.push(&mut carry, input).bytes, [0xE9]);
+        }
+    }
+
+    #[test]
+    fn encoded_length_validation_repairs_malformed_utf8_before_measuring() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+            .unwrap()
+            .unwrap();
+        let mut params = vec![
+            DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit),
+        ];
+
+        set_dae_transcodes(&mut params, collation, false);
+
+        let transcode = params[0]
+            .transcode
+            .expect("encoded-byte validation needs a validating transcoder");
+        let mut carry = Vec::new();
+        assert_eq!(
+            transcode.push(&mut carry, &[0xFF]).bytes,
+            "\u{FFFD}".as_bytes()
+        );
+    }
+
+    #[test]
+    fn deduct_query_timeout_zero_is_unlimited() {
+        assert_eq!(deduct_query_timeout(0, Duration::from_secs(1_000)), Ok(0));
+    }
+
+    #[test]
+    fn deduct_query_timeout_truncates_sub_second_elapsed() {
+        // 1.9s truncates to 1s, so a 10s budget leaves 9s, not 8s.
+        assert_eq!(
+            deduct_query_timeout(10, Duration::from_millis(1_900)),
+            Ok(9)
+        );
+    }
+
+    #[test]
+    fn deduct_query_timeout_exhausted_at_or_past_budget_errs() {
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(5)), Err(()));
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(6)), Err(()));
+    }
+
+    /// The error `execute.rs`/`exec_direct.rs` report when a pre-execute
+    /// `deduct_query_timeout` call finds the budget already exhausted — a
+    /// `TimeoutError`, matching every other query-timeout expiry, so
+    /// `post_tds_error` maps it to `HYT00` (see `sqlstate.rs`'s
+    /// `post_tds_error_timeout_maps_to_hyt00_regardless_of_default`) the same
+    /// way whether the budget ran out before or during the wire call.
+    #[test]
+    fn query_timeout_expired_error_is_a_timeout_error() {
+        match query_timeout_expired_error() {
+            TdsError::TimeoutError(TimeoutErrorType::String(msg)) => {
+                assert!(
+                    msg.contains("SQL_ATTR_QUERY_TIMEOUT"),
+                    "message should name the attribute that expired: {msg}"
+                );
+            }
+            other => panic!("expected TimeoutError(String(_)), got: {other:?}"),
+        }
+    }
+
+    /// `SQLExecDirectW` calls `deduct_query_timeout` twice in sequence — once
+    /// after `flush_pending_unprepare`, once after `begin_transaction_if_manual`
+    /// — each time measuring the *cumulative* elapsed time since the call
+    /// began against the *original, fixed* budget (not the previous call's
+    /// return value). Composing them must charge each step's elapsed time
+    /// exactly once and must not floor away sub-second remainders
+    /// independently at each step: a 10s budget with a 3s unprepare and a 2s
+    /// implicit transaction begin must leave 5s (10 - (3+2)), not the 2s an
+    /// earlier version of this code produced by re-deducting from its own
+    /// shrinking result (`(10-3)-(3+2)=2`, double-charging the first step), or
+    /// the loss a per-step-floored version would suffer with sub-second steps
+    /// — both caught in mssql-rs#442 review by an independent reviewer tracing
+    /// the exact arithmetic; the numbers here are theirs.
+    #[test]
+    fn deduct_query_timeout_composed_twice_charges_each_step_once() {
+        let budget = 10;
+        let after_unprepare = deduct_query_timeout(budget, Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            after_unprepare, 7,
+            "remaining allowance handed to the next step"
+        );
+        let after_begin = deduct_query_timeout(budget, Duration::from_secs(3 + 2)).unwrap();
+        assert_eq!(
+            after_begin, 5,
+            "budget minus total elapsed, not double-charged"
+        );
+    }
+
+    /// Composing from a *fixed* original budget with *cumulative* elapsed
+    /// (what `SQLExecDirectW` now does) is stricter than composing from a
+    /// shrinking budget with each step's own elapsed measured in isolation:
+    /// the latter floors sub-second remainders away independently at every
+    /// step, so two 0.99s pre-execute steps against a 1s budget would each
+    /// charge nothing, letting the following execute start with a fresh 1s —
+    /// about 3x the configured timeout in wall-clock terms before any
+    /// network wait even begins. Deducting cumulatively from the original
+    /// budget catches this instead: composing across the same two steps
+    /// exhausts a 1s budget, matching msodbcsql's own millisecond-granularity
+    /// deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`) not losing
+    /// sub-second remainders.
+    #[test]
+    fn deduct_query_timeout_cumulative_composition_catches_accumulated_sub_second_cost() {
+        let budget = 1;
+        let step_1 = Duration::from_millis(990);
+        let step_2 = Duration::from_millis(990);
+
+        let per_step_reseeded =
+            deduct_query_timeout(deduct_query_timeout(budget, step_1).unwrap(), step_2);
+        assert_eq!(
+            per_step_reseeded,
+            Ok(1),
+            "per-step composition floors each sub-second cost away independently"
+        );
+
+        let cumulative_fixed_budget = deduct_query_timeout(budget, step_1)
+            .and_then(|_| deduct_query_timeout(budget, step_1 + step_2));
+        assert_eq!(
+            cumulative_fixed_budget,
+            Err(()),
+            "cumulative composition against the fixed budget must see the combined cost"
+        );
+    }
+
+    /// The substitution is reported only on request: `SQL_COPT_SS_WARN_ON_CP_ERROR`
+    /// defaults off, so an ordinary statement must not change its return code
+    /// just because a legacy code page could not hold one character (AB#47598).
+    /// The flag is drained either way, so a substitution can never be carried
+    /// into the next statement's verdict.
+    #[test]
+    fn code_page_conversion_loss_is_reported_only_when_the_attribute_is_on() {
+        for (attribute_on, loss, expect_warning) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().warn_on_cp_error = attribute_on;
+
+            let mut client = tds_client_from_tokens(vec![done_no_more()]);
+            if loss {
+                client.note_code_page_conversion_loss();
+            }
+
+            let should_warn = take_code_page_conversion_loss(dbc, &mut client);
+            assert_eq!(
+                should_warn, expect_warning,
+                "attribute {attribute_on}, loss {loss}"
+            );
+            assert!(
+                !client.take_code_page_conversion_loss(),
+                "the flag must be drained whatever the attribute says"
+            );
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut stmt_state = stmt.inner.lock().unwrap();
+            assert_eq!(
+                post_code_page_conversion_loss(&mut stmt_state, should_warn),
+                expect_warning
+            );
+            if expect_warning {
+                assert_eq!(
+                    stmt_state.diag_records[0].sql_state,
+                    WARN_CODE_PAGE_CONVERSION_LOSS.state
+                );
+            } else {
+                assert!(stmt_state.diag_records.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn try_claim_idle_client_none_when_disconnected() {
@@ -349,7 +1786,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         // Default state is not connected.
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
-        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
     }
 
     #[test]
@@ -359,25 +1796,1166 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         // A different statement already holds the connection.
         let other = 0x1234 as SqlHandle;
-        dbc.inner.lock().unwrap().active_stmt = Some(other);
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .set_owner_for_test(Some(other));
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         // The existing claim must be left untouched.
-        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(other)
+        );
+    }
+
+    #[test]
+    fn finish_execute_releases_empty_completed_result() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_tokens(vec![col_metadata(int_columns(1)), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        let client = lease_for_test(dbc, handles.stmt, client);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecDirectW"),
+            SQL_SUCCESS
+        );
+
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(stmt_state.result_set_exhausted);
+        assert!(stmt_state.batch_exhausted);
+        assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    #[test]
+    fn finish_execute_publishes_nothing_from_a_stale_lease() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_tokens(vec![col_metadata(int_columns(1)), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        let client = lease_for_test(dbc, handles.stmt, client);
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecDirectW"),
+            SQL_ERROR
+        );
+
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.has_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN));
+        assert!(!stmt_state.result_set_exhausted);
+        assert!(!stmt_state.batch_exhausted);
+    }
+
+    #[test]
+    fn finish_execute_completes_empty_rpc_result_and_retains_outputs() {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::more_results::sql_more_results;
+        use crate::api::odbc_types::{SQL_C_SLONG, SQL_PARAM_OUTPUT};
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{info, return_status, return_value};
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut buffers = [-1i32; 2];
+        let mut lengths = [-1; 2];
+        for (index, (buffer, length)) in buffers.iter_mut().zip(&mut lengths).enumerate() {
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        handles.stmt,
+                        u16::try_from(index + 1).unwrap(),
+                        SQL_PARAM_OUTPUT,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        std::ptr::from_mut(buffer).cast(),
+                        4,
+                        length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        stmt.inner.lock().unwrap().call_returns_status = true;
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata(int_columns(1)),
+            info(50000, 10, "completion warning"),
+            done_in_proc_more(),
+            return_status(17),
+            return_value(ReturnValue {
+                param_ordinal: 0,
+                param_name: "@P2".to_owned(),
+                value: ColumnValues::Int(73),
+                column_metadata: Box::new(int_columns(1).remove(0)),
+                status: ReturnValueStatus::OutputParam,
+            }),
+            done_proc_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        let client = lease_for_test(dbc, handles.stmt, client);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+            SQL_SUCCESS_WITH_INFO
+        );
+
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+        {
+            let stmt_state = stmt.inner.lock().unwrap();
+            assert!(stmt_state.result_set_exhausted);
+            assert!(stmt_state.batch_exhausted);
+            assert!(stmt_state.pending_output_params.is_some());
+            assert!(
+                stmt_state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.native_error == 50000)
+            );
+        }
+        assert_eq!(buffers, [-1, -1]);
+        assert_eq!(lengths, [-1, -1]);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert_eq!(buffers, [17, 73]);
+        assert_eq!(lengths, [4, 4]);
+        assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
+        buffers.fill(-2);
+        lengths.fill(-2);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        assert_eq!(buffers, [-2, -2]);
+        assert_eq!(lengths, [-2, -2]);
+    }
+
+    #[test]
+    fn finish_execute_poisoned_stmt_releases_only_completed_empty_result() {
+        for batch_done in [true, false] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let mut tokens = vec![col_metadata(int_columns(1))];
+            if batch_done {
+                tokens.push(done_no_more());
+            } else {
+                tokens.extend([done_more(), col_metadata(int_columns(1)), done_no_more()]);
+            }
+            let mut client = tds_client_from_tokens(tokens);
+            dbc.runtime
+                .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_owned(), ()))
+                .unwrap();
+            let client = lease_for_test(dbc, handles.stmt, client);
+            std::thread::scope(|scope| {
+                assert!(
+                    scope
+                        .spawn(|| {
+                            let _guard = stmt.inner.lock().unwrap();
+                            panic!("poison the stmt lock");
+                        })
+                        .join()
+                        .is_err()
+                );
+            });
+
+            assert_eq!(
+                finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+                SQL_ERROR
+            );
+            assert_eq!(
+                dbc.inner.lock().unwrap().wire.statement_owner(),
+                if batch_done { None } else { Some(handles.stmt) }
+            );
+            stmt.inner.clear_poison();
+            let mut client = dbc
+                .inner
+                .lock()
+                .unwrap()
+                .wire
+                .take_lease_for_test(handles.stmt);
+            dbc.runtime.block_on(client.close_query()).unwrap();
+            return_client_idle(dbc, handles.stmt, client);
+        }
+    }
+
+    #[test]
+    fn finish_execute_keeps_busy_for_empty_result_with_later_results() {
+        use crate::api::more_results::sql_more_results;
+
+        for terminator in [done_more(), done_in_proc_more()] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let mut client = tds_client_from_tokens(vec![
+                col_metadata(int_columns(1)),
+                terminator,
+                col_metadata(int_columns(2)),
+                done_no_more(),
+            ]);
+            dbc.runtime
+                .block_on(client.execute("SELECT 1 WHERE 1 = 0; SELECT 2, 3".to_string(), ()))
+                .unwrap();
+            let client = lease_for_test(dbc, handles.stmt, client);
+
+            assert_eq!(
+                finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+                SQL_SUCCESS
+            );
+
+            assert_eq!(
+                dbc.inner.lock().unwrap().wire.statement_owner(),
+                Some(handles.stmt)
+            );
+            {
+                let stmt_state = stmt.inner.lock().unwrap();
+                assert!(stmt_state.result_set_exhausted);
+                assert!(!stmt_state.batch_exhausted);
+                assert!(stmt_state.pending_output_params.is_none());
+            }
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+            assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+        }
+    }
+
+    #[test]
+    fn finish_execute_keeps_first_row_parked_and_connection_busy() {
+        use mssql_tds::test_client_support::tds_client_from_int_rows;
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client = tds_client_from_int_rows(vec![vec![42]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 42".to_string(), ()))
+            .unwrap();
+        let client = lease_for_test(dbc, handles.stmt, client);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(handles.stmt)
+        );
+        {
+            let stmt_state = stmt.inner.lock().unwrap();
+            assert!(!stmt_state.result_set_exhausted);
+            assert!(!stmt_state.batch_exhausted);
+        }
+        let mut client = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .wire
+            .take_lease_for_test(handles.stmt);
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        dbc.runtime.block_on(client.close_query()).unwrap();
+        return_client_idle(dbc, handles.stmt, client);
+    }
+
+    #[test]
+    fn finish_execute_reports_truncated_empty_rpc_tail() {
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        let mut client =
+            tds_client_from_tokens(vec![col_metadata(int_columns(1)), done_in_proc_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1 = 0".to_string(), ()))
+            .unwrap();
+        let client = lease_for_test(dbc, handles.stmt, client);
+
+        assert_eq!(
+            finish_execute(dbc, stmt, handles.stmt, client, "SQLExecute"),
+            SQL_ERROR
+        );
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.diag_records.is_empty());
+        assert!(stmt_state.pending_fetch_error.is_none());
+        assert!(!stmt_state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    #[test]
+    fn finish_execute_surfaces_an_error_before_the_first_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata(int_columns(1)),
+            sql_error(1222, 16, "Lock request time out period exceeded."),
+            done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT blocked".to_string(), ()))
+            .unwrap();
+
+        let client = lease_for_test(dbc, h.stmt, client);
+        let rc = finish_execute(dbc, stmt, h.stmt, client, "SQLExecDirectW");
+
+        assert_eq!(rc, SQL_ERROR);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(
+            stmt_state
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 1222)
+        );
+    }
+
+    /// The peek does not stop at rows and errors: `handle_row_read_token`'s
+    /// `Tokens::Info` arm captures and continues, so an INFO token sitting
+    /// between `COLMETADATA` and the first `ROW`/`DONE` is now drained during
+    /// execution rather than by the first `SQLFetch`. The success tail posts it,
+    /// which turns `SQL_SUCCESS` into `SQL_SUCCESS_WITH_INFO` for that window.
+    ///
+    /// This matches msodbcsql, whose parse loop covers the same window before
+    /// parking at the first row. It is pinned here because the behaviour is
+    /// otherwise invisible: moving the peek below `take_info_messages()` would
+    /// silently restore execute-time `SQL_SUCCESS` and defer the diagnostic
+    /// back to `SQLFetch`, and no other test would fail.
+    #[test]
+    fn finish_execute_reports_an_info_message_arriving_before_the_first_row() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata(int_columns(1)),
+            info(
+                8153,
+                10,
+                "Null value is eliminated by an aggregate or other SET operation.",
+            ),
+            done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT SUM(col) FROM t".to_string(), ()))
+            .unwrap();
+
+        let client = lease_for_test(dbc, h.stmt, client);
+        let rc = finish_execute(dbc, stmt, h.stmt, client, "SQLExecDirectW");
+
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(
+            stmt_state
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 8153),
+            "the warning must be posted under the execute that drained it"
+        );
+    }
+
+    #[test]
+    fn finish_execute_retains_outputs_until_drained_dml_counts_are_consumed() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::done_more_with_count;
+
+        for counts in [vec![], vec![0], vec![2, 1]] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut tokens: Vec<_> = counts.iter().copied().map(done_more_with_count).collect();
+            tokens.push(done_no_more());
+            let mut client = tds_client_from_tokens(tokens);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            // RPC execution can already have consumed the whole response before
+            // handing the drained client and its collected counts to ODBC.
+            dbc.runtime.block_on(client.close_query()).unwrap();
+            let client = lease_for_test(dbc, h.stmt, client);
+            assert_eq!(
+                finish_execute(dbc, stmt, h.stmt, client, "SQLExecute"),
+                if counts.first() == Some(&0) {
+                    SQL_NO_DATA
+                } else {
+                    SQL_SUCCESS
+                }
+            );
+            if counts.is_empty() {
+                let state = stmt.inner.lock().unwrap();
+                assert!(state.pending_output_params.is_none());
+                assert!(!state.batch_exhausted);
+            }
+            for (index, count) in counts.iter().enumerate() {
+                if index != 0 {
+                    assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+                }
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, i64::try_from(*count).unwrap());
+                assert!(state.pending_output_params.is_some());
+                assert!(state.batch_exhausted);
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        }
+    }
+
+    #[test]
+    fn finish_execute_zero_count_preserves_pending_results_and_parameter_warnings() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::done_more_with_count;
+
+        for fractional_truncated in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut client = tds_client_from_tokens(vec![
+                done_more_with_count(0),
+                done_more_with_count(2),
+                done_no_more(),
+            ]);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            let client = lease_for_test(dbc, h.stmt, client);
+            assert_eq!(
+                finish_execute_with_param_warning(
+                    dbc,
+                    stmt,
+                    h.stmt,
+                    client,
+                    "SQLExecute",
+                    fractional_truncated,
+                ),
+                if fractional_truncated {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_NO_DATA
+                }
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, 0);
+                assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+                assert_eq!(state.diag_records.len(), usize::from(fractional_truncated));
+                if fractional_truncated {
+                    assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+                }
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 2);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
+    }
+
+    #[test]
+    fn finish_execute_posts_numeric_fractional_truncation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1".to_string(), ()))
+            .unwrap();
+
+        let client = lease_for_test(dbc, h.stmt, client);
+        let rc = finish_execute_with_param_warning(dbc, stmt, h.stmt, client, "SQLExecute", true);
+
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+    }
+
+    #[test]
+    fn park_dae_client_posts_numeric_fractional_truncation() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let rc = park_dae_client(
+            stmt,
+            WireLease::detached_for_test(tds_client_from_tokens(Vec::new()), h.stmt),
+            None,
+            None,
+            Vec::new(),
+            true,
+            "SQLExecute",
+        );
+
+        assert_eq!(rc, SQL_NEED_DATA);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+    }
+
+    /// Builds a scripted client positioned on a row-returning result (empty
+    /// metadata; column data is irrelevant to `release_busy_if_row_exhausted`,
+    /// which only peeks past it), then injects it as the busy client owning
+    /// `h.stmt` — mirroring the state left by a fetch that has just consumed a
+    /// row's last column.
+    fn position_and_inject(h: &TestHandles, tokens: Vec<ScriptedToken>) {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_tokens(tokens);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        let mut ds = dbc.inner.lock().unwrap();
+        ds.wire.put_client_for_test(client);
+        ds.wire.set_owner_for_test(Some(h.stmt));
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_releases_when_wire_is_done() {
+        // The peek finds the terminating DONE: the wire is provably idle for
+        // this statement even though its cursor stays open, so the busy claim
+        // is released immediately (AB#47508) and the statement is marked so a
+        // later SQLFetch can report SQL_NO_DATA without touching the
+        // connection at all.
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        assert!(
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
+
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.result_set_exhausted);
+        assert!(
+            ss.batch_exhausted,
+            "the whole batch is done here (single-statement, no MORE), so \
+             SQLMoreResults must also be able to fast-path without touching \
+             the connection"
+        );
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_publishes_nothing_from_a_stale_lease() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = {
+            let mut state = dbc.inner.lock().unwrap();
+            let client = state.wire.take_lease_for_test(h.stmt);
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+            client
+        };
+        let preceding_ran = std::cell::Cell::new(false);
+
+        assert_eq!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+                preceding_ran.set(true);
+                true
+            }),
+            Err(SQL_ERROR)
+        );
+
+        assert!(!preceding_ran.get());
+        let dbc_state = dbc.inner.lock().unwrap();
+        assert!(dbc_state.wire.client().is_some());
+        drop(dbc_state);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(!stmt_state.result_set_exhausted);
+        assert!(!stmt_state.batch_exhausted);
+        assert!(stmt_state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_drains_a_protocol_only_rpc_tail() {
+        // A SELECT inside sp_executesql/sp_prepexec ends with DONE_MORE even
+        // when no application-visible result follows. The RPC's terminal DONE
+        // must be consumed before another statement can safely use the wire.
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                done_in_proc_more(),
+                done_proc_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        assert!(
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
+
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.result_set_exhausted);
+        assert!(ss.batch_exhausted);
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_defers_a_truncated_rpc_tail() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_in_proc_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+
+        assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.result_set_exhausted);
+        assert!(ss.batch_exhausted);
+        assert!(matches!(
+            ss.pending_fetch_error,
+            Some(TdsError::ConnectionClosed(_))
+        ));
+    }
+
+    /// The reviewer-flagged AB#47508 regression: `SELECT 1; SELECT 2;` as one
+    /// batch. The peek reaches result set 1's own terminating DONE — which
+    /// carries the MORE flag, since result set 2 is still to come — so
+    /// `result_set_exhausted` is correctly set (a further `SQLFetch` on this
+    /// statement, without an intervening `SQLMoreResults`, must report
+    /// `SQL_NO_DATA` per ODBC's per-result-set fetch semantics), but the busy
+    /// claim must NOT be released: `client.has_open_batch()` is still true,
+    /// so a different statement claiming the connection now would desync
+    /// whichever statement later reads result set 2's COLMETADATA/DONE via
+    /// `SQLMoreResults`.
+    #[test]
+    fn release_busy_if_row_exhausted_keeps_busy_when_a_further_result_set_is_pending() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                done_more(),
+                col_metadata_empty(),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt),
+            "a pending second result set must keep this statement's busy claim"
+        );
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.result_set_exhausted,
+            "result set 1 itself has no more rows, independent of result set 2 being pending"
+        );
+        assert!(
+            !ss.batch_exhausted,
+            "the batch is not done — SQLMoreResults must still genuinely \
+             advance to result set 2, not fast-path to SQL_NO_DATA"
+        );
+    }
+
+    /// An INFO token the peek reads on its way to the terminating DONE must be
+    /// attributed to the statement that produced it, not left to leak onto
+    /// whichever statement next touches the client (e.g. a different one that
+    /// claims the now-idle connection).
+    #[test]
+    fn release_busy_if_row_exhausted_attributes_a_peeked_info_message_to_this_statement() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                info(50000, 10, "trailing message"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0,
+            "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
+        );
+
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("trailing message")),
+            "the peeked INFO message must land on this statement's own diagnostics"
+        );
+    }
+
+    /// A trailing SQL Server `ERROR` token during the peek must not be
+    /// silently swallowed — it collapses the whole batch on the wire
+    /// (`handle_row_read_token`'s error arm forces `has_open_batch` false), so
+    /// the busy claim is released same as an ordinary exhausted result set.
+    /// But this call has already committed to a success return for the row
+    /// it delivered, so the diagnostic cannot be posted here — no return
+    /// code would tell the caller to look. It is deferred via
+    /// `pending_fetch_error` for the next call that would otherwise
+    /// silently short-circuit past the wire (`SQLFetch`'s fast path,
+    /// `SQLMoreResults`) to drain and report instead (AB#47508 follow-up).
+    #[test]
+    fn release_busy_if_row_exhausted_defers_a_trailing_sql_error() {
+        use mssql_tds::test_client_support::sql_error;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                sql_error(547, 16, "FOREIGN KEY constraint violation"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+
+        assert!(
+            dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
+            "the ERROR token ends the batch, so the busy claim must still be released"
+        );
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            !ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("FOREIGN KEY constraint violation")),
+            "posting it here would attach it to this call's own SQL_SUCCESS return, \
+             which the caller has no reason to inspect"
+        );
+        match &ss.pending_fetch_error {
+            Some(TdsError::SqlServerError { diagnostics }) => {
+                assert!(
+                    diagnostics
+                        .errors
+                        .iter()
+                        .any(|e| e.message.contains("FOREIGN KEY constraint violation")),
+                    "the deferred error must be the one the peek actually found"
+                );
+            }
+            other => panic!("expected a stashed SqlServerError, got {other:?}"),
+        }
+        assert!(ss.result_set_exhausted);
+    }
+
+    // The "peek finds another row and keeps the connection busy" branch is
+    // covered in `mssql_tds::connection::tds_client::tests` instead: it needs
+    // `TdsClient::row_already_positioned`, a private field the scripted
+    // transport in `test_client_support` cannot reach from outside the crate
+    // (see its module docs — there are no real row bytes to manufacture one
+    // through a fresh read either).
+
+    #[test]
+    fn release_busy_if_row_exhausted_swallows_peek_failure_and_stays_busy() {
+        // A transport failure during the peek must not be silently reported
+        // as "exhausted" — that would tell a later SQLFetch there is nothing
+        // left when the connection may in fact be broken. The failure isn't
+        // posted here either: `release` is false, so this statement's state
+        // is untouched, and its very next real operation on this connection
+        // takes the normal route and organically rediscovers the same
+        // failure through its own existing error handling — unlike the
+        // batch-ending-in-a-SQL-Server-ERROR case, nothing here has already
+        // committed to a success return that would hide a diagnostic.
+        let h = TestHandles::with_env_dbc_stmt();
+        // No tokens queued: the peek's `next_row_cursor` read fails immediately.
+        position_and_inject(&h, vec![col_metadata_empty()]);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt)
+        );
+        assert!(dbc.inner.lock().unwrap().wire.client().is_some());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(!ss.result_set_exhausted);
+        assert!(!ss.batch_exhausted);
+        assert!(
+            ss.diag_records.is_empty(),
+            "a non-exhausting failure must not be posted here — this call \
+             may have already returned success for the row it delivered, \
+             and the connection's next real user rediscovers the same \
+             failure fresh anyway"
+        );
+        assert!(ss.pending_fetch_error.is_none());
+    }
+
+    /// A fetch that exhausts the current result set with a further result set
+    /// still pending must still surface an info message the peek consumed on
+    /// the way: it arrived before this result set's DONE, so it belongs to
+    /// this call. msodbcsql posts a server message from `OnMessage` as the
+    /// token is parsed (`sqlctokn.cpp:3217`), independently of whether the
+    /// batch can release the connection. Deferring it to `SQLMoreResults`
+    /// would attach this result set's warning to the *next* one (that call
+    /// posts only after advancing), and lose it entirely for an application
+    /// that never calls `SQLMoreResults`.
+    #[test]
+    fn release_busy_if_row_exhausted_posts_info_messages_when_the_claim_is_not_released() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                info(50000, 10, "belongs to the first result set"),
+                done_more(),
+                col_metadata_empty(),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0,
+            "the caller must be told a server message was posted"
+        );
+
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(h.stmt),
+            "a pending second result set means the claim is not released"
+        );
+        assert!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .iter()
+                .any(|d| d.message.contains("belongs to the first result set")),
+            "the message must be posted under the call whose peek consumed it"
+        );
+        let dbc_state = dbc.inner.lock().unwrap();
+        assert!(
+            dbc_state.wire.client().unwrap().info_messages().is_empty(),
+            "must not also stay on the client, where SQLMoreResults would \
+             re-post it against the result set it advances to"
+        );
+    }
+
+    /// Once a zero-row fetch releases the claim, trailing INFO cannot remain
+    /// on the idle client where another statement could inherit it. The helper
+    /// posts it immediately; SQL_NO_DATA remains the fetch return while the
+    /// diagnostic is available from SQLGetDiagRec.
+    #[test]
+    fn release_busy_if_row_exhausted_posts_info_messages_for_zero_row_fetch() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                info(50000, 10, "leave me for the next call"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+                .unwrap()
+                .0
+        );
+
+        assert!(
+            dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
+            "the batch is genuinely done here, so the claim is still released"
+        );
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|m| m.message.contains("leave me for the next call")),
+            "the zero-row fetch must expose the drained message immediately"
+        );
+        drop(ss);
+        let dbc_state = dbc.inner.lock().unwrap();
+        assert!(
+            dbc_state.wire.client().unwrap().info_messages().is_empty(),
+            "must not stay resident on the client, where a different statement \
+             claiming the connection next could have it misattributed to its \
+             own diagnostics"
+        );
+    }
+
+    /// The closure runs under the statement lock, so a poisoned lock skips it
+    /// entirely. Reporting `preceding_ran == false` is what lets the caller
+    /// tell "nothing to post" apart from "never got the chance", instead of
+    /// assuming the closure ran and suppressing its own fallback.
+    #[test]
+    fn release_busy_if_row_exhausted_reports_a_skipped_preceding_closure() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+
+        // Poison the statement lock the helper needs.
+        assert!(
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _guard = stmt.inner.lock().unwrap();
+                        panic!("poison the stmt lock");
+                    })
+                    .join()
+            })
+            .is_err()
+        );
+
+        let ran = std::cell::Cell::new(false);
+        let (_, preceding_ran, _) =
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+                ran.set(true);
+                true
+            })
+            .unwrap();
+
+        assert!(!ran.get(), "the poisoned lock must skip the closure");
+        assert!(
+            !preceding_ran,
+            "a skipped closure must be reported, not assumed to have posted"
+        );
+    }
+
+    /// `SQLGetDiagRec` is ordinal, so records must come back in the order the
+    /// server sent them. Anything the caller's own rows produced left the wire
+    /// before this peek's messages do, so it has to be posted ahead of them
+    /// rather than appended after.
+    #[test]
+    fn release_busy_if_row_exhausted_posts_preceding_info_before_its_own() {
+        use mssql_tds::error::SqlInfoMessage;
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                info(50000, 10, "terminal message"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
+        let earlier = [SqlInfoMessage {
+            message: "row loop message".to_string(),
+            state: 1,
+            class: 10,
+            number: 50000,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        }];
+
+        assert!(
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
+                post_tds_info_messages(s, &earlier)
+            })
+            .unwrap()
+            .0
+        );
+
+        let ss = stmt.inner.lock().unwrap();
+        let order: Vec<&str> = ss
+            .diag_records
+            .iter()
+            .map(|d| {
+                if d.message.contains("row loop message") {
+                    "row"
+                } else if d.message.contains("terminal message") {
+                    "terminal"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["row", "terminal"],
+            "the row loop's message left the wire first and must be reported first"
+        );
     }
 
     /// Builds a `BoundParam` over the given char buffer and NTS indicator.
+    /// `bound_params` holds the per-ordinal snapshot; these tests only ever
+    /// describe the binding half of it.
+    fn snap(param: BoundParam) -> Option<ParamSnapshot> {
+        Some(param.into())
+    }
+
     fn char_param(buf: &mut [u8], ind: &mut SqlLen) -> BoundParam {
         BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
-            c_type_defaulted: false,
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: ind as *mut SqlLen,
+            octet_length_ptr: ind as *mut SqlLen,
         }
+    }
+
+    #[test]
+    fn oversized_xml_is_revalidated_when_the_indicator_stops_being_dae() {
+        let mut value = b"<x/>".to_vec();
+        let mut indicator = sql_len_data_at_exec(SqlLen::try_from(value.len()).unwrap());
+        let mut param = char_param(&mut value, &mut indicator);
+        param.sql_type = SQL_SS_XML;
+        param.column_size = 4001;
+        let bound = [snap(param)];
+
+        let Ok(streamed) = (unsafe {
+            build_named_params_for_row(
+                &bound,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }) else {
+            panic!("oversized XML should stream while the indicator is DAE");
+        };
+        assert_eq!(streamed.dae_params.len(), 1);
+
+        unsafe {
+            (&raw mut indicator).write(SqlLen::try_from(value.len()).unwrap());
+        }
+        let Err(error) = (unsafe {
+            build_named_params_for_row(
+                &bound,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }) else {
+            panic!("materialized oversized XML should fail");
+        };
+        assert!(matches!(
+            error,
+            ParamRowBuildError::Conversion {
+                source: ParamBuildError::InvalidParameterSize(4001),
+                ..
+            }
+        ));
+    }
+
+    /// The narrow race `snapshot_bound_params`'s liveness check guards
+    /// against: `effective_apd` resolves an explicit descriptor under the
+    /// STMT lock, which is dropped before the descriptor is actually locked
+    /// and read. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes
+    /// in that window, the stale pointer must fail cleanly (`Err`), not
+    /// dereference freed memory. Reassociating the APD and then freeing it
+    /// reproduces the state that window leaves behind — `active_apd` still
+    /// points at the freed handle, since only a *subsequent* `SQLBindCol`/
+    /// `SQLBindParameter`-family call re-resolves it via `free_desc`'s
+    /// association reset.
+    #[test]
+    fn snapshot_bound_params_fails_cleanly_on_a_freed_apd() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_apd = h.alloc_explicit_desc();
+        unsafe {
+            crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                h.stmt,
+                crate::api::odbc_types::SQL_ATTR_APP_PARAM_DESC,
+                explicit_apd as crate::api::odbc_types::SqlPointer,
+                0,
+            )
+        };
+        {
+            // Directly clears the tracked association without going through
+            // `free_desc`'s association-reset walk, so `active_apd` is left
+            // dangling exactly as it would be mid-race — `h.free_explicit_desc`
+            // goes through the real `SQLFreeHandle` path, which already resets
+            // the association and would defeat the point of this test.
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.active_apd = None;
+        }
+        unsafe {
+            crate::handles::free_handle::<DescHandle>(explicit_apd);
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.active_apd = Some(explicit_apd);
+        }
+        assert!(snapshot_bound_params(stmt).is_err());
     }
 
     #[test]
@@ -385,8 +2963,83 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
-        let params = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
-        assert!(params.is_empty());
+        let built = unsafe { build_named_params(&mut state, 0, 0, "test") }.unwrap();
+        assert!(built.params.is_empty());
+        assert!(built.dae_params.is_empty());
+    }
+
+    #[test]
+    fn output_only_indicators_never_stage_data_at_execution() {
+        use crate::api::odbc_types::{SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        for direction in [SQL_PARAM_OUTPUT, SQL_RETURN_VALUE] {
+            let mut buffer = vec![b'x'; 8];
+            let mut indicator = SQL_DATA_AT_EXEC;
+            let mut param = char_param(&mut buffer, &mut indicator);
+            param.input_output_type = direction;
+            param.column_size = 8;
+            state.bound_params = vec![snap(param)];
+            let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+            assert!(built.dae_params.is_empty());
+            assert_eq!(built.params.len(), 1);
+            assert!(
+                mssql_tds::test_client_support::rpc_parameter_status(&built.params[0])
+                    .contains(StatusFlags::BY_REF_VALUE)
+            );
+        }
+    }
+
+    #[test]
+    fn dae_parameter_direction_retains_output_flag_through_rebuild() {
+        use crate::api::odbc_types::{SQL_INTEGER, SQL_PARAM_INPUT_OUTPUT};
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+        use mssql_tds::test_client_support::rpc_parameter_status;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        for (direction, expected) in [
+            (SQL_PARAM_INPUT, StatusFlags::NONE),
+            (SQL_PARAM_INPUT_OUTPUT, StatusFlags::BY_REF_VALUE),
+        ] {
+            for (sql_type, plan) in [
+                (SQL_VARCHAR, DaePlan::Stream(StreamedSqlType::VarcharMax)),
+                (SQL_INTEGER, DaePlan::Buffer),
+            ] {
+                let mut buffer = *b"42";
+                let mut indicator = SQL_DATA_AT_EXEC;
+                let mut param = char_param(&mut buffer, &mut indicator);
+                param.input_output_type = direction;
+                param.sql_type = sql_type;
+                state.bound_params = vec![snap(param)];
+                let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+                assert_eq!(built.dae_params.len(), 1);
+                assert_eq!(built.dae_params[0].is_buffered(), plan.is_buffered());
+                assert_eq!(
+                    rpc_parameter_status(&built.params[0]).bits(),
+                    expected.bits(),
+                    "{direction}, {sql_type}"
+                );
+                if plan == DaePlan::Buffer {
+                    let (rebuilt, _) = rebuild_deferred_params(
+                        &mut state,
+                        built.params,
+                        &[(0, b"42".to_vec(), false)],
+                        &built.dae_params,
+                        "test",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        rpc_parameter_status(&rebuilt[0]).bits(),
+                        expected.bits(),
+                        "{direction}, rebuilt"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -402,13 +3055,14 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut buf1, &mut ind1)));
+            .push(snap(char_param(&mut buf1, &mut ind1)));
         state
             .bound_params
-            .push(Some(char_param(&mut buf2, &mut ind2)));
+            .push(snap(char_param(&mut buf2, &mut ind2)));
 
-        let params = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
-        assert_eq!(params.len(), 2);
+        let built = unsafe { build_named_params(&mut state, 2, 0, "test") }.unwrap();
+        assert_eq!(built.params.len(), 2);
+        assert!(built.dae_params.is_empty());
     }
 
     #[test]
@@ -417,8 +3071,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         // One marker expected, but nothing bound.
         let mut state = stmt.inner.lock().unwrap();
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
-        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        let ret = unsafe { build_named_params(&mut state, 1, 0, "test") };
+        assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
     }
 
@@ -436,10 +3090,698 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         state
             .bound_params
-            .push(Some(char_param(&mut buf, &mut ind)));
+            .push(snap(char_param(&mut buf, &mut ind)));
 
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
-        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        let ret = unsafe { build_named_params(&mut state, 1, 0, "test") };
+        assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
+    }
+
+    /// A data-at-execution marker between two ordinary binds keeps its ordinal
+    /// position: the `@P1..@Pn` list still carries one entry per marker in
+    /// order, and only the middle one is staged for streaming. Pins the
+    /// interleaving that `DataAtExecutionInterleavesWithBoundParams` can only
+    /// observe through the concatenated server result.
+    #[test]
+    fn build_named_params_keeps_streamed_marker_in_position() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut first: Vec<u8> = b"a\0".to_vec();
+        let mut first_ind: SqlLen = SQL_NTS as SqlLen;
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        let mut last: Vec<u8> = b"d\0".to_vec();
+        let mut last_ind: SqlLen = SQL_NTS as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .bound_params
+            .push(snap(char_param(&mut first, &mut first_ind)));
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state
+            .bound_params
+            .push(snap(char_param(&mut last, &mut last_ind)));
+
+        let dae = unsafe { build_named_params(&mut state, 3, 0, "test") }.unwrap();
+        assert_eq!(dae.params.len(), 3);
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 1);
+        assert_eq!(dae.dae_params[0].expected_len, None);
+    }
+
+    #[test]
+    fn build_named_params_ignores_truncation_after_first_dae_param() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        // 123.45 rescaled to scale 1 drops the trailing "5" (`Truncated`)
+        // without overflowing `decimal(5,1)`'s magnitude bound.
+        let mut numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 2,
+            sign: 1,
+            val: {
+                let mut v = [0u8; 16];
+                v[..2].copy_from_slice(&12345u16.to_le_bytes());
+                v
+            },
+        };
+        let mut numeric_ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_NUMERIC,
+            sql_type: SQL_DECIMAL,
+            column_size: 5,
+            decimal_digits: 1,
+            app_precision: 38,
+            app_scale: 2,
+            parameter_value_ptr: (&mut numeric as *mut SqlNumericStruct).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut numeric_ind as *mut SqlLen,
+            octet_length_ptr: &mut numeric_ind as *mut SqlLen,
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 2, 0, "test") }.unwrap();
+        assert_eq!(built.dae_params.len(), 1);
+        assert!(!built.fractional_truncated);
+    }
+
+    fn buffered_decimal_param(bound_index: usize) -> DaeParam {
+        use crate::api::odbc_types::SQL_DECIMAL;
+
+        let mut param = DaeParam::unbounded(bound_index, std::ptr::null_mut(), None);
+        param.set_buffered(true);
+        param.binding.c_type = SQL_C_CHAR;
+        param.binding.sql_type = SQL_DECIMAL;
+        param.binding.column_size = 5;
+        param.binding.decimal_digits = 1;
+        param
+    }
+
+    fn deferred_slot() -> RpcParameter {
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+        RpcParameter::data_at_exec(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        )
+    }
+
+    #[test]
+    fn rebuild_deferred_params_reports_fractional_truncation() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        assert!(matches!(
+            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL, None),
+            Err(ParamBuildError::UnsupportedCType(SQL_C_NUMERIC))
+        ));
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = buffered_decimal_param(0);
+        param.binding.c_type = SQL_C_NUMERIC;
+        param.binding.column_size = 10;
+        param.binding.app_scale = 3;
+        let numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 0,
+            sign: 1,
+            val: {
+                let mut value = [0; 16];
+                value[..2].copy_from_slice(&1551u16.to_le_bytes());
+                value
+            },
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const numeric).cast::<u8>(),
+                std::mem::size_of::<SqlNumericStruct>(),
+            )
+        }
+        .to_vec();
+        let dae_params = vec![param];
+        let collected = vec![(0, bytes, false)];
+
+        let (params, fractional_truncated) = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &collected,
+            &dae_params,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(params.len(), 1);
+        assert!(fractional_truncated);
+        assert!(state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_rejects_missing_binding_and_slot() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let missing_binding = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, Vec::new(), false)],
+            &[],
+            "test",
+        );
+        assert_eq!(missing_binding.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+
+        state.diag_records.clear();
+        let missing_slot = rebuild_deferred_params(
+            &mut state,
+            Vec::new(),
+            &[(0, Vec::new(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+        assert_eq!(missing_slot.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+    }
+
+    #[test]
+    fn rebuild_deferred_params_posts_conversion_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let result = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, b"not-a-number".to_vec(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+
+        assert_eq!(result.unwrap_err(), SQL_ERROR);
+        assert!(!state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_keeps_oversized_dae_xml_unlimited() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+            .with_binding_types(SQL_C_CHAR, SQL_SS_XML);
+        param.binding.column_size = 4001;
+        let dae_params = [param];
+
+        for (bytes, is_null) in [(b"<x/>".to_vec(), false), (Vec::new(), true)] {
+            let result = rebuild_deferred_params(
+                &mut state,
+                vec![deferred_slot()],
+                &[(0, bytes, is_null)],
+                &dae_params,
+                "test",
+            );
+            assert!(
+                result.is_ok(),
+                "internal deferral must not change DAE XML validity"
+            );
+            assert!(state.diag_records.is_empty());
+        }
+    }
+
+    /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
+    /// `SQLParamData` enforces; `SQL_DATA_AT_EXEC` promises nothing.
+    #[test]
+    fn build_named_params_records_declared_length() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut ind: SqlLen = sql_len_data_at_exec(7);
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+            octet_length_ptr: &mut ind as *mut SqlLen,
+        }));
+
+        let dae = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 0);
+        assert_eq!(dae.dae_params[0].expected_len, Some(7));
+    }
+
+    /// A streamed parameter is only declared at a narrowed length when the
+    /// bound that length implies is one `SQLPutData` can actually enforce.
+    ///
+    /// The two decisions are made independently, so nothing but this guard stops
+    /// them disagreeing. Where they would, the cost is real: a streamed value
+    /// never reaches the close-time conversion that bounds a buffered one, so a
+    /// narrowed declaration with no bound behind it has the client promise the
+    /// server a length and then stream past it.
+    #[test]
+    fn build_named_params_only_narrows_a_declaration_it_can_enforce() {
+        for (c_type, sql_type, expect_narrowed) in [
+            // Same unit on both sides: measurable, so narrowing is honoured.
+            (SQL_C_CHAR, SQL_VARCHAR, true),
+            // A wideness mismatch is measurable too - the unit is the
+            // declaration's and the count is of the source.
+            (crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR, true),
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_WVARCHAR, true),
+            // Cross-family is not: a binary byte is not a character, so the
+            // declaration stays `max` rather than claiming a bound.
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_VARBINARY, false),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+            let mut state = stmt.inner.lock().unwrap();
+            state.bound_params.push(snap(BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type,
+                sql_type,
+                column_size: 10,
+                decimal_digits: 0,
+                app_precision: 0,
+                app_scale: 0,
+                parameter_value_ptr: std::ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+                octet_length_ptr: &mut ind as *mut SqlLen,
+            }));
+
+            let dae = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+            let bounded = dae.dae_params[0].length_limit.is_some();
+            assert_eq!(
+                bounded, expect_narrowed,
+                "{c_type} -> {sql_type}: the bound decides whether narrowing is honest"
+            );
+            // The declaration is only narrowed when the bound backs it, so the
+            // two travel together rather than being decided apart.
+            let narrowed = format!("{:?}", dae.params[0]).contains("streamed_declaration: Some");
+            assert_eq!(
+                narrowed, expect_narrowed,
+                "{c_type} -> {sql_type}: declaration narrowing must follow the bound"
+            );
+        }
+    }
+
+    /// Without an indicator pointer there is nothing to carry a
+    /// data-at-execution request, so the binding is an ordinary value even
+    /// though its buffer is empty.
+    #[test]
+    fn build_named_params_without_indicator_is_never_streamed() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut buf: Vec<u8> = b"abc".to_vec();
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
+            buffer_length: buf.len() as SqlLen,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+        assert_eq!(built.params.len(), 1);
+        assert!(built.dae_params.is_empty());
+    }
+
+    /// `SQLBindParameter` accepts a data-at-execution indicator on any C type,
+    /// so a type `SQLPutData` cannot stream is only caught here, at execute
+    /// time.
+    #[test]
+    fn build_named_params_unstreamable_dae_c_type_posts_hyc00() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut value: i32 = 0;
+        let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+            octet_length_ptr: &mut ind as *mut SqlLen,
+        }));
+
+        let ret = unsafe { build_named_params(&mut state, 1, 0, "test") };
+        assert!(ret.is_err());
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
+        );
+    }
+
+    /// The bind offset displaces the indicator pointer as well as the value
+    /// pointer, so a data-at-execution marker can sit in a slot only the
+    /// offset reaches. The offset therefore has to be applied before the
+    /// marker is read, not just before the value is converted.
+    ///
+    /// Applying it later makes the two reads of the indicator disagree: the
+    /// check sees row 0 and routes the parameter down the ordinary path, then
+    /// the conversion sees row 1's marker and rejects it as unstaged with
+    /// `HY000`. Confirmed by reproducing that ordering, which turns the
+    /// `HYC00` below into `HY000`.
+    ///
+    /// Discriminating because row 0 holds an ordinary length: with no offset
+    /// this same binding converts cleanly, as its companion test shows.
+    #[test]
+    fn build_named_params_reads_the_dae_indicator_through_the_bind_offset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Two rows of a parameter array. Row 0 is an ordinary bound value;
+        // only row 1 carries the data-at-execution marker.
+        let mut values: [i32; 4] = [7; 4];
+        let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
+        let offset: SqlLen = size_of::<SqlLen>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: inds.as_mut_ptr(),
+            octet_length_ptr: inds.as_mut_ptr(),
+        }));
+
+        // `SQL_C_LONG` is not streamable, so reaching the DAE branch is
+        // reported as `HYC00`. That rejection is the observable proof the
+        // offset indicator was the one consulted.
+        let ret = unsafe { build_named_params(&mut state, 1, offset, "test") };
+        assert!(ret.is_err(), "the offset indicator marks this param as DAE");
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
+        );
+    }
+
+    #[test]
+    fn bind_offset_preserves_a_misaligned_dae_indicator_and_shifted_token() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut value = [0u8; 8];
+        let mut indicator_storage: [SqlLen; 2] = [0; 2];
+        let shifted_indicator = unsafe {
+            indicator_storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(1)
+                .cast::<SqlLen>()
+        };
+        assert_ne!(
+            shifted_indicator as usize % std::mem::align_of::<SqlLen>(),
+            0,
+            "test pointer must be misaligned"
+        );
+        unsafe { shifted_indicator.write_unaligned(SQL_DATA_AT_EXEC) };
+        let offset: SqlLen = 1;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: value.as_mut_ptr().cast(),
+            buffer_length: value.len() as SqlLen,
+            strlen_or_ind_ptr: indicator_storage.as_mut_ptr(),
+            octet_length_ptr: indicator_storage.as_mut_ptr(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, offset, "test") }
+            .expect("the shifted DAE marker is streamable");
+        assert_eq!(built.dae_params.len(), 1);
+        assert_eq!(built.dae_params.first().unwrap().value_ptr, unsafe {
+            value.as_mut_ptr().add(1).cast()
+        });
+    }
+
+    /// Execution writes the APD precision and scale into the bound row's
+    /// `SQL_NUMERIC_STRUCT`, through the bind offset, like msodbcsql
+    /// (`sqlcfunc.cpp:3165-3176`); the unshifted struct is left alone.
+    #[test]
+    fn build_named_params_writes_apd_metadata_into_the_offset_numeric_struct() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let embedded = SqlNumericStruct {
+            precision: 5,
+            scale: 3,
+            sign: 1,
+            val: 12345u128.to_le_bytes(),
+        };
+        let mut values = [embedded; 2];
+        let offset = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_NUMERIC,
+            sql_type: SQL_DECIMAL,
+            column_size: 10,
+            decimal_digits: 2,
+            app_precision: 38,
+            app_scale: 0,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        }));
+
+        unsafe { build_named_params(&mut state, 1, offset, "test") }.unwrap();
+        drop(state);
+        assert_eq!((values[0].precision, values[0].scale), (5, 3));
+        assert_eq!((values[1].precision, values[1].scale), (38, 0));
+    }
+
+    /// The companion to the test above: with no offset set, the same binding
+    /// reads row 0's ordinary length and converts normally. Without this, a
+    /// driver that treated *every* parameter as data-at-execution would still
+    /// pass the offset test.
+    #[test]
+    fn build_named_params_without_a_bind_offset_reads_the_unshifted_indicator() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut values: [i32; 4] = [7; 4];
+        let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: inds.as_mut_ptr(),
+            octet_length_ptr: inds.as_mut_ptr(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, 0, "test") }
+            .expect("row 0 is an ordinary length, not a DAE marker");
+        assert!(
+            built.dae_params.is_empty(),
+            "nothing should be staged for streaming"
+        );
+    }
+
+    /// The offset is read through the pointer each time, not captured.
+    #[test]
+    fn param_bind_offset_is_read_through_the_stored_pointer() {
+        let mut header = ParamArrayHeader::default();
+        assert_eq!(unsafe { header.bind_offset() }, 0, "unset is no offset");
+
+        let mut offset: SqlLen = 24;
+        let slot = &raw mut offset;
+        header.bind_offset_ptr = slot;
+        assert_eq!(unsafe { header.bind_offset() }, 24);
+
+        unsafe { slot.write(-8) };
+        assert_eq!(unsafe { header.bind_offset() }, -8);
+    }
+
+    #[test]
+    fn param_bind_offset_accepts_a_misaligned_application_pointer() {
+        let mut header = ParamArrayHeader::default();
+        let mut storage: [SqlLen; 2] = [0; 2];
+        let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<SqlLen>() };
+        assert_ne!(
+            slot as usize % std::mem::align_of::<SqlLen>(),
+            0,
+            "test pointer must be misaligned"
+        );
+        unsafe { slot.write_unaligned(24) };
+        header.bind_offset_ptr = slot;
+
+        assert_eq!(unsafe { header.bind_offset() }, 24);
+    }
+
+    #[test]
+    fn a_parked_data_at_execution_sequence_keeps_other_statements_busy() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_extra_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let lease = lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new()));
+        assert_eq!(
+            park_dae_client(stmt, lease, None, None, Vec::new(), false, "test"),
+            SQL_NEED_DATA
+        );
+
+        let other_stmt = unsafe { handle_from_raw::<StmtHandle>(other) };
+        assert!(matches!(
+            claim_connection(dbc, other_stmt, other, "SQLExecDirectW"),
+            Err(SQL_ERROR)
+        ));
+        assert_last_diag(
+            &other_stmt.inner.lock().unwrap().diag_records,
+            ERR_CONNECTION_BUSY,
+        );
+
+        unwind_dae_inner(dbc, stmt, h.stmt, None, true);
+        let lease = claim_connection(dbc, other_stmt, other, "SQLExecDirectW")
+            .expect("the wire is released when the sequence ends");
+        return_client_idle(dbc, other, lease);
+    }
+
+    /// State consistency for the AB#47510 guard on the data-at-execution
+    /// unwind. `SQLFreeHandle(SQL_HANDLE_STMT)` unwinds a parked DAE sequence
+    /// before freeing, so a host freeing handles from an `onexit` handler
+    /// reaches it after the loader has terminated the runtime's worker.
+    ///
+    /// This pins what the skip arm still owes: the sequence is unwound, the
+    /// client is handed back, and the connection is released — without which
+    /// the DBC records the freed statement as busy forever. It does **not** pin
+    /// the skip itself, unlike the `drain_and_release` and
+    /// `rollback_before_disconnect` pairs: `cancel_streamed_write` returns `()`
+    /// and has no observable effect on a scripted client, so a skipped cancel
+    /// and an attempted one are indistinguishable here. The skip is covered end
+    /// to end instead, by the `mssql-python` swap job.
+    #[test]
+    fn unwind_dae_leaves_the_connection_usable_while_the_process_is_exiting() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Park a client mid-DAE with no tokens queued behind it: a real cancel
+        // would have nothing to read and would fail rather than quietly pass.
+        // Routed through `park_dae_client` rather than building `DaeState` by
+        // hand, so the setup is the same one the execute path produces.
+        assert_eq!(
+            park_dae_client(
+                stmt,
+                lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new())),
+                None,
+                None,
+                Vec::new(),
+                false,
+                "test",
+            ),
+            crate::api::odbc_types::SQL_NEED_DATA
+        );
+
+        unwind_dae_inner(dbc, stmt, h.stmt, None, true);
+
+        assert!(
+            !stmt.inner.lock().unwrap().needs_data(),
+            "the parked sequence must still be unwound"
+        );
+        let ds = dbc.inner.lock().unwrap();
+        assert!(
+            ds.wire.client().is_some(),
+            "the client must be handed back even when the cancel is skipped"
+        );
+        assert_eq!(
+            ds.wire.statement_owner(),
+            None,
+            "the connection must be released, or it stays busy forever"
+        );
     }
 }

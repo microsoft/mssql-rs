@@ -31,6 +31,16 @@ trigger: none
 pr: none
 
 parameters:
+- name: linuxImage
+  displayName: 'Agent image for x64 Linux jobs'
+  type: string
+  default: RUST-AZL3
+
+- name: linuxArmImage
+  displayName: 'Agent image for ARM64 Linux jobs'
+  type: string
+  default: RUST-AZL3-ARM64
+
 # Publishing is opt-in for safety. When false (the default) the corresponding
 # stage still BUILDS everything but logs a clear DRY RUN message instead of
 # uploading to the feed.
@@ -110,9 +120,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         steps:
@@ -144,9 +154,9 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-1ES-UBUSLIM
+            - imageOverride -equals ${{ parameters.linuxImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_x64'
@@ -162,7 +172,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
@@ -195,9 +205,9 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: RUST-ARM64-WUS3
           demands:
-            - imageOverride -equals RUST-UBUNTU-ARM64
+            - imageOverride -equals ${{ parameters.linuxArmImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_arm64'
@@ -213,7 +223,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
@@ -248,9 +258,9 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-1ES-UBUSLIM
+            - imageOverride -equals ${{ parameters.linuxImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_musl_x64'
@@ -266,7 +276,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
@@ -301,9 +311,9 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: RUST-ARM64-WUS3
           demands:
-            - imageOverride -equals RUST-UBUNTU-ARM64
+            - imageOverride -equals ${{ parameters.linuxArmImage }}
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_musl_arm64'
@@ -319,7 +329,7 @@ extends:
           inputs:
             dockerVersion: '29.0.0'
           displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
+        - template: /.pipeline/templates/install-host-dependency.yaml@self
           parameters:
             installDocker: true
         - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
@@ -353,9 +363,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_windows_x64'
@@ -400,7 +410,7 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: RUST-ARM64-WUS3
           demands:
             - imageOverride -equals RUST-WINSRV-ARM
         variables:
@@ -522,9 +532,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         steps:
@@ -576,9 +586,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           CARGO_TARGET_DIR: C:\cargo_target_dir
@@ -597,7 +607,7 @@ extends:
             enableJsDeps: false
         - pwsh: .pipeline/scripts/stamp-crate-versions-sandbox.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
           displayName: 'Stamp crate versions (sandbox, package-only)'
-        - pwsh: .pipeline/scripts/pin-mssql-tds-dep-version.ps1 -Version '$(crateVersion)'
+        - pwsh: .pipeline/scripts/pin-mssql-tds-dep-version.ps1 -Version '$(crateVersion)' -IndexUrl '$(cargoSparseIndex)'
           displayName: 'Pin mssql-tds dependency version'
         - ${{ if eq(parameters.publishCrate, true) }}:
           - pwsh: .pipeline/scripts/cargo-publish-mock.ps1 -Registry '$(cargoRegistry)' -SparseIndexBaseUrl '$(cargoSparseIndex)' -TdsVersion '$(crateVersion)'

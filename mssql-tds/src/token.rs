@@ -3,6 +3,7 @@
 
 //! TDS token types, parsers, and related data structures.
 
+pub(crate) mod data_classification;
 pub(crate) mod fed_auth_info;
 pub(crate) mod login_ack;
 pub(crate) mod parsers;

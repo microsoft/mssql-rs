@@ -24,6 +24,7 @@ pub(crate) enum TokenType {
     AltRow = 0xD3,
     ColMetadata = 0x81,
     ColInfo = 0xA5,
+    DataClassification = 0xA3,
     Done = 0xFD,
     DoneProc = 0xFE,
     DoneInProc = 0xFF,
@@ -53,6 +54,7 @@ impl TryFrom<u8> for TokenType {
             0xD3 => Ok(TokenType::AltRow),
             0x81 => Ok(TokenType::ColMetadata),
             0xA5 => Ok(TokenType::ColInfo),
+            0xA3 => Ok(TokenType::DataClassification),
             0xFD => Ok(TokenType::Done),
             0xFE => Ok(TokenType::DoneProc),
             0xFF => Ok(TokenType::DoneInProc),
@@ -99,6 +101,8 @@ pub(crate) enum Tokens {
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
+    #[allow(dead_code)] // Metadata is read once it is attached to result sets.
+    DataClassification(crate::token::data_classification::DataClassificationMetadata),
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
@@ -124,6 +128,8 @@ pub enum Tokens {
     Sspi(SspiToken),
     Row(RowToken),
     ColMetadata(ColMetadataToken),
+    /// Parsed `DATACLASSIFICATION` (0xA3) metadata.
+    DataClassification(crate::token::data_classification::DataClassificationMetadata),
     Order(OrderToken),
     ReturnStatus(ReturnStatusToken),
     ReturnValue(ReturnValueToken),
@@ -170,6 +176,7 @@ impl Token for Tokens {
             Tokens::Sspi(token) => token.token_type(),
             Tokens::Row(token) => token.token_type(),
             Tokens::ColMetadata(token) => token.token_type(),
+            Tokens::DataClassification(_) => TokenType::DataClassification,
             Tokens::Order(token) => token.token_type(),
             Tokens::ReturnStatus(token) => token.token_type(),
             Tokens::ReturnValue(token) => token.token_type(),
@@ -185,7 +192,10 @@ pub(crate) enum EnvChangeContainer {
     String(EnvChangeTokenValuePairs<String>),
     SqlCollation(EnvChangeTokenValuePairs<Option<SqlCollation>>),
     UInt32(EnvChangeTokenValuePairs<u32>),
-    RoutingType(EnvChangeTokenValuePairs<Option<RoutingInfo>>),
+    /// Boxed: routing arrives at most once per login, and inline it would be the
+    /// largest token, growing every future that holds one
+    /// (`row_fetch_futures_stay_small`).
+    RoutingType(EnvChangeTokenValuePairs<Option<Box<RoutingInfo>>>),
     BytesType(EnvChangeTokenValuePairs<Vec<u8>>),
     UInt64(EnvChangeTokenValuePairs<u64>),
 }
@@ -212,8 +222,9 @@ impl From<(u32, u32)> for EnvChangeContainer {
 
 impl From<(Option<RoutingInfo>, Option<RoutingInfo>)> for EnvChangeContainer {
     fn from(value: (Option<RoutingInfo>, Option<RoutingInfo>)) -> Self {
-        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::<Option<RoutingInfo>>::new(
-            value.0, value.1,
+        EnvChangeContainer::RoutingType(EnvChangeTokenValuePairs::new(
+            value.0.map(Box::new),
+            value.1.map(Box::new),
         ))
     }
 }
@@ -505,8 +516,9 @@ mod sql_collation_tests {
     }
 }
 
-/// Static lookup table for code pages by SortID
-#[allow(dead_code)]
+/// SQL sort-ID code pages from msodbcsql's `Sql/Common/include/tdssort.h`.
+/// Includes IDs 122 and 210..=217 emitted by SQL Server 2022 but absent from
+/// that header; verified with COLLATIONPROPERTY's TDSCollation and CodePage.
 pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     None,       // 0
     None,       // 1
@@ -588,11 +600,11 @@ pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     None,       // 77
     None,       // 78
     None,       // 79
-    None,       // 80
-    None,       // 81
-    None,       // 82
-    None,       // 83
-    None,       // 84
+    Some(1250), // 80
+    Some(1250), // 81
+    Some(1250), // 82
+    Some(1250), // 83
+    Some(1250), // 84
     Some(1250), // 85
     Some(1250), // 86
     Some(1250), // 87
@@ -606,79 +618,79 @@ pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     Some(1250), // 95
     Some(1250), // 96
     Some(1250), // 97
-    Some(1250), // 98
-    Some(1250), // 99
-    Some(1250), // 100
-    Some(1250), // 101
-    Some(1250), // 102
-    Some(1250), // 103
-    None,       // 104
-    None,       // 105
-    None,       // 106
-    None,       // 107
-    None,       // 108
-    Some(1251), // 109
-    Some(1251), // 110
-    Some(1251), // 111
-    Some(1251), // 112
-    Some(1251), // 113
-    None,       // 114
+    None,       // 98
+    None,       // 99
+    None,       // 100
+    None,       // 101
+    None,       // 102
+    None,       // 103
+    Some(1251), // 104
+    Some(1251), // 105
+    Some(1251), // 106
+    Some(1251), // 107
+    Some(1251), // 108
+    None,       // 109
+    None,       // 110
+    None,       // 111
+    Some(1253), // 112
+    Some(1253), // 113
+    Some(1253), // 114
     None,       // 115
     None,       // 116
-    Some(1253), // 117
-    Some(1253), // 118
-    Some(1253), // 119
-    None,       // 120
-    None,       // 121
-    None,       // 122
+    None,       // 117
+    None,       // 118
+    None,       // 119
+    Some(1253), // 120
+    Some(1253), // 121
+    Some(1253), // 122
     None,       // 123
-    None,       // 124
+    Some(1253), // 124
     None,       // 125
-    Some(1253), // 126
-    Some(1253), // 127
-    Some(1253), // 128
-    None,       // 129
-    Some(1253), // 130
+    None,       // 126
+    None,       // 127
+    Some(1254), // 128
+    Some(1254), // 129
+    Some(1254), // 130
     None,       // 131
     None,       // 132
     None,       // 133
     None,       // 134
-    Some(1254), // 135
-    Some(1254), // 136
-    Some(1254), // 137
-    None,       // 138
+    None,       // 135
+    Some(1255), // 136
+    Some(1255), // 137
+    Some(1255), // 138
     None,       // 139
     None,       // 140
     None,       // 141
     None,       // 142
     None,       // 143
-    Some(1255), // 144
-    Some(1255), // 145
-    Some(1255), // 146
+    Some(1256), // 144
+    Some(1256), // 145
+    Some(1256), // 146
     None,       // 147
     None,       // 148
     None,       // 149
     None,       // 150
     None,       // 151
-    None,       // 152
-    Some(1256), // 153
-    Some(1256), // 154
-    Some(1256), // 155
-    None,       // 156
-    None,       // 157
-    None,       // 158
-    None,       // 159
-    None,       // 160
+    Some(1257), // 152
+    Some(1257), // 153
+    Some(1257), // 154
+    Some(1257), // 155
+    Some(1257), // 156
+    Some(1257), // 157
+    Some(1257), // 158
+    Some(1257), // 159
+    Some(1257), // 160
     None,       // 161
-    Some(1257), // 162
-    Some(1257), // 163
-    Some(1257), // 164
-    Some(1257), // 165
-    Some(1257), // 166
-    Some(1257), // 167
-    Some(1257), // 168
-    Some(1257), // 169
-    Some(1257), // 170
+    None,       // 162
+    None,       // 163
+    None,       // 164
+    None,       // 165
+    None,       // 166
+    None,       // 167
+    None,       // 168
+    None,       // 169
+    None,       // 170
     None,       // 171
     None,       // 172
     None,       // 173
@@ -691,51 +703,51 @@ pub(crate) static CODE_PAGE_FROM_SORT_ID: [Option<u16>; 256] = [
     None,       // 180
     None,       // 181
     None,       // 182
-    None,       // 183
-    None,       // 184
-    None,       // 185
-    None,       // 186
+    Some(1252), // 183
+    Some(1252), // 184
+    Some(1252), // 185
+    Some(1252), // 186
     None,       // 187
     None,       // 188
     None,       // 189
     None,       // 190
     None,       // 191
-    None,       // 192
-    None,       // 193
-    Some(1252), // 194
-    Some(1252), // 195
-    Some(1252), // 196
-    Some(1252), // 197
-    None,       // 198
-    None,       // 199
-    None,       // 200
-    None,       // 201
-    None,       // 202
-    Some(932),  // 203
-    Some(932),  // 204
-    Some(949),  // 205
-    Some(949),  // 206
-    Some(950),  // 207
-    Some(950),  // 208
-    Some(936),  // 209
-    Some(936),  // 210
-    Some(932),  // 211
-    Some(949),  // 212
-    Some(950),  // 213
-    Some(936),  // 214
-    Some(874),  // 215
-    Some(874),  // 216
-    Some(874),  // 217
+    Some(932),  // 192
+    Some(932),  // 193
+    Some(949),  // 194
+    Some(949),  // 195
+    Some(950),  // 196
+    Some(950),  // 197
+    Some(936),  // 198
+    Some(936),  // 199
+    Some(932),  // 200
+    Some(949),  // 201
+    Some(950),  // 202
+    Some(936),  // 203
+    Some(874),  // 204
+    Some(874),  // 205
+    Some(874),  // 206
+    None,       // 207
+    None,       // 208
+    None,       // 209
+    Some(1252), // 210
+    Some(1252), // 211
+    Some(1252), // 212
+    Some(1252), // 213
+    Some(1252), // 214
+    Some(1252), // 215
+    Some(1252), // 216
+    Some(1252), // 217
     None,       // 218
     None,       // 219
     None,       // 220
-    Some(1252), // 221
-    Some(1252), // 222
-    Some(1252), // 223
-    Some(1252), // 224
-    Some(1252), // 225
-    Some(1252), // 226
-    Some(1252), // 227
+    None,       // 221
+    None,       // 222
+    None,       // 223
+    None,       // 224
+    None,       // 225
+    None,       // 226
+    None,       // 227
     None,       // 228
     None,       // 229
     None,       // 230
@@ -1073,6 +1085,9 @@ bitflags::bitflags! {
         /// Attention.
         const ATTN = 0x0020;
 
+        /// This DONE terminates one RPC inside a batched RPC request.
+        const RPC_IN_BATCH = 0x0080;
+
         /// Server Error.
         const SERVER_ERROR = 0x0100;
     }
@@ -1116,6 +1131,15 @@ impl TryFrom<u16> for CurrentCommand {
             0x20 => Ok(CurrentCommand::OpenCursor),
             0x117 => Ok(CurrentCommand::Merge),
             // All unknown values are treated as None, and considered valid.
+            //
+            // This catch-all carries correctness weight: `advance_to_result_boundary`
+            // gates `SQLRowCount` semantics on `cur_cmd`, so an unrecognized value
+            // lands in the "this DONE_COUNT is a real update count" branch. That is
+            // deliberate: both reference drivers deny-list rather than allow-list
+            // (msodbcsql `Info != SQLSELECT && ...`, sqlctokn.cpp:2149-2152; .NET
+            // SqlClient `curCmd != TdsEnums.SELECT`), so an unknown command with a
+            // valid count still counts there too. Do not convert this to an
+            // allow-list; exclude a command by adding its specific variant.
             _ => Ok(CurrentCommand::None),
         }
     }
@@ -1143,6 +1167,7 @@ pub(crate) enum EnvChangeTokenSubType {
     ResetConnection,
     UserInstanceName,
     Routing,
+    EnhancedRouting,
     Unknown(u8),
 }
 
@@ -1170,6 +1195,7 @@ impl TryFrom<u8> for EnvChangeTokenSubType {
             18 => EnvChangeTokenSubType::ResetConnection,
             19 => EnvChangeTokenSubType::UserInstanceName,
             20 => EnvChangeTokenSubType::Routing,
+            21 => EnvChangeTokenSubType::EnhancedRouting,
             unknown => EnvChangeTokenSubType::Unknown(unknown),
         })
     }
@@ -1198,6 +1224,7 @@ impl EnvChangeTokenSubType {
             EnvChangeTokenSubType::ResetConnection => 18,
             EnvChangeTokenSubType::UserInstanceName => 19,
             EnvChangeTokenSubType::Routing => 20,
+            EnvChangeTokenSubType::EnhancedRouting => 21,
             EnvChangeTokenSubType::Unknown(val) => *val,
         }
     }
@@ -1218,6 +1245,10 @@ mod env_change_tests {
             EnvChangeTokenSubType::try_from(20).unwrap(),
             EnvChangeTokenSubType::Routing
         ));
+        assert!(matches!(
+            EnvChangeTokenSubType::try_from(21).unwrap(),
+            EnvChangeTokenSubType::EnhancedRouting
+        ));
 
         // Test invalid values (should not panic, should return Unknown)
         assert!(matches!(
@@ -1234,6 +1265,7 @@ mod env_change_tests {
     fn test_env_change_token_subtype_as_u8() {
         assert_eq!(EnvChangeTokenSubType::Database.as_u8(), 1);
         assert_eq!(EnvChangeTokenSubType::Routing.as_u8(), 20);
+        assert_eq!(EnvChangeTokenSubType::EnhancedRouting.as_u8(), 21);
         assert_eq!(EnvChangeTokenSubType::Unknown(30).as_u8(), 30);
     }
 }
@@ -1279,6 +1311,7 @@ mod coverage_tests {
             (0xD3, TokenType::AltRow),
             (0x81, TokenType::ColMetadata),
             (0xA5, TokenType::ColInfo),
+            (0xA3, TokenType::DataClassification),
             (0xFD, TokenType::Done),
             (0xFE, TokenType::DoneProc),
             (0xFF, TokenType::DoneInProc),
@@ -1304,8 +1337,14 @@ mod coverage_tests {
 
     #[test]
     fn token_type_try_from_invalid() {
-        assert!(TokenType::try_from(0x00).is_err());
-        assert!(TokenType::try_from(0x42).is_err());
+        let zero_error = TokenType::try_from(0x00).unwrap_err();
+        let unrelated_error = TokenType::try_from(0x42).unwrap_err();
+        assert!(zero_error.to_string().contains("Unknown token type: 0x0"));
+        assert!(
+            unrelated_error
+                .to_string()
+                .contains("Unknown token type: 0x42")
+        );
     }
 
     // ── SqlCollation accessors ──
@@ -1391,6 +1430,7 @@ mod coverage_tests {
             protocol: 0,
             port: 1433,
             server: "host.example.com".into(),
+            database: None,
         };
         let container: EnvChangeContainer = (Some(routing), None).into();
         let dbg = format!("{container:?}");
@@ -1457,6 +1497,9 @@ mod coverage_tests {
         let status = DoneStatus::from(0x0020);
         assert!(status.contains(DoneStatus::ATTN));
 
+        let status = DoneStatus::from(0x0080);
+        assert!(status.contains(DoneStatus::RPC_IN_BATCH));
+
         let status = DoneStatus::from(0x0100);
         assert!(status.contains(DoneStatus::SERVER_ERROR));
 
@@ -1509,6 +1552,24 @@ mod coverage_tests {
         for &(val, expected) in cases {
             assert_eq!(CurrentCommand::try_from(val).unwrap(), expected);
         }
+    }
+
+    /// Divergence pin: msodbcsql also excludes `SQLFETCHCURSOR` (0x21) and
+    /// `SQLDBCC` (0xe6) from update counts (sqlctokn.cpp:2151-2152). This driver
+    /// follows .NET SqlClient, which models neither, so both fall through the
+    /// catch-all to `None` and their counts are reported. Adding either variant
+    /// silently changes `SQLRowCount` semantics — see
+    /// `done_count_for_msodbcsql_only_exclusions_is_an_update_count`.
+    #[test]
+    fn msodbcsql_only_exclusions_are_not_modelled() {
+        assert_eq!(
+            CurrentCommand::try_from(0x21).unwrap(),
+            CurrentCommand::None
+        );
+        assert_eq!(
+            CurrentCommand::try_from(0xe6).unwrap(),
+            CurrentCommand::None
+        );
     }
 
     #[test]

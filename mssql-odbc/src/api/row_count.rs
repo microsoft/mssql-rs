@@ -25,13 +25,17 @@ pub(crate) unsafe fn sql_row_count(
     statement_handle: SqlHandle,
     row_count_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(?statement_handle, ?row_count_ptr, "SQLRowCount called");
-
-    crate::ffi_entry!("SQLRowCount", unsafe {
-        sql_row_count_impl(statement_handle, row_count_ptr)
-    })
+    crate::ffi_entry!(
+        "SQLRowCount",
+        statement_handle,
+        debug!(?statement_handle, ?row_count_ptr, "SQLRowCount called"),
+        unsafe { sql_row_count_impl(statement_handle, row_count_ptr) }
+    )
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `row_count_ptr`, when non-null, must be writable for one `SqlLen`.
 unsafe fn sql_row_count_impl(statement_handle: SqlHandle, row_count_ptr: *mut SqlLen) -> SqlReturn {
     // msodbcsql relies on the Driver Manager to reject a null handle before the
     // driver is called and does not null-check it. We validate anyway to keep

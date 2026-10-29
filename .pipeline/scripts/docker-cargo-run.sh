@@ -1,10 +1,11 @@
 #!/bin/bash
-# docker-cargo-run.sh - Wrapper for docker run that injects CARGO registry tokens
+# docker-cargo-run.sh - Forward optional Cargo feed credentials on non-PR runs
 #
 # Usage: docker-cargo-run.sh [docker-run-args...] <image> <command> [command-args...]
 #
-# This script prepends the cargo registry environment variables to any docker run command.
-# It also prints debug info about the token status before running.
+# BUILD_REASON=PullRequest disables feed token/provider forwarding. Azure Pipelines
+# supplies BUILD_REASON automatically. Missing/empty/unresolved tokens are omitted.
+# Callers must not map feed secrets into PR steps: this is not a security sandbox.
 #
 # Example:
 #   .pipeline/scripts/docker-cargo-run.sh --rm -v $PWD:/workspace -w /workspace \
@@ -12,13 +13,19 @@
 
 set -euo pipefail
 
-# Debug: Echo cargo registry token status (masked for security)
-echo "=== Cargo Registry Token Status ==="
-echo "CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN is set: $([ -n "${CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN:-}" ] && echo 'YES' || echo 'NO')"
-echo "CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN length: ${#CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN}"
-echo "CARGO_REGISTRIES_MSSQL_RS_TOKEN is set: $([ -n "${CARGO_REGISTRIES_MSSQL_RS_TOKEN:-}" ] && echo 'YES' || echo 'NO')"
-echo "CARGO_REGISTRIES_MSSQL_RS_TOKEN length: ${#CARGO_REGISTRIES_MSSQL_RS_TOKEN}"
-echo "===================================="
+cargo_env=()
+for registry in MSSQL_RS_PUBLIC MSSQL_RS; do
+  token_var="CARGO_REGISTRIES_${registry}_TOKEN"
+  provider_var="CARGO_REGISTRIES_${registry}_CREDENTIAL_PROVIDER"
+  token="${!token_var:-}"
+  if [[ "${BUILD_REASON:-}" != "PullRequest" && -n "$token" && "$token" != '$('*')' ]]; then
+    # Pass the variable name rather than putting its value in Docker's arguments.
+    cargo_env+=(-e "$token_var" -e "$provider_var=cargo:token")
+  else
+    unset "$token_var" "$provider_var"
+  fi
+done
+unset token
 
 # Check disk space and prune Docker images if free space is below 10%
 # Check both root and the Docker data-root partition
@@ -43,9 +50,4 @@ DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/va
 check_and_prune "root (/)" "/"
 check_and_prune "Docker data-root ($DOCKER_ROOT)" "$DOCKER_ROOT"
 
-exec docker run \
-  -e CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN="$CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN" \
-  -e CARGO_REGISTRIES_MSSQL_RS_PUBLIC_CREDENTIAL_PROVIDER="cargo:token" \
-  -e CARGO_REGISTRIES_MSSQL_RS_TOKEN="$CARGO_REGISTRIES_MSSQL_RS_TOKEN" \
-  -e CARGO_REGISTRIES_MSSQL_RS_CREDENTIAL_PROVIDER="cargo:token" \
-  "$@"
+exec docker run "${cargo_env[@]}" "$@"

@@ -1,18 +1,25 @@
 [package]
-name = "mssql-odbc"
+name = "mssqlodbc"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [lib]
-name = "msodbcsql18"
-crate-type = ["cdylib"]
+name = "mssqlodbc"
+# `rlib` is added alongside `cdylib` so the `fuzz/` crate can link the driver as
+# an ordinary Rust dependency (a cdylib-only crate can't be used with `extern
+# crate`). It has no effect on the shipped dynamic library.
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
 
 [dependencies]
 mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tracing = { version = "0.1.43", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono = { version = "0.4", features = ["clock"] }
 async-trait = "0.1"
 # The azure SDK only ships a rustls-based reqwest transport (its `reqwest_rustls`
 # default), which drags in the vulnerable `ring` crate. Disable those defaults and
@@ -32,6 +39,17 @@ url = "2"
 # connection silently reuse a stale cached credential built from a different
 # secret.
 sha2 = "0.11.0"
+# `RowWriter` exposes UUID values without first boxing them as `ColumnValues`.
+# `v4` supplies the random WS-Trust message id for Entra integrated auth.
+uuid = { version = "1", features = ["v4"] }
+# Entra integrated auth off Windows (ADFS WS-Trust): the SPNEGO header and the
+# SAML-bearer assertion are base64, and the realm/token responses are JSON.
+base64 = "0.22"
+serde_json = "1"
+percent-encoding = "2.3"
+# msodbcsql widens a time-only value with the process-local current date
+# (`localtime_s` in sqlccnvt.cpp), which std cannot supply on every platform.
+libc = "0.2"
 
 # `ActiveDirectoryInteractive` delegates the sign-in UI to `mssql-auth.dll`
 # (OneAuth), the same library msodbcsql loads. The `windows` crate supplies the
@@ -40,8 +58,12 @@ sha2 = "0.11.0"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    # GetLocalTime, used by the Windows TZ regression test to establish that
+    # the process-local CRT date differs from the machine-local calendar date.
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -52,8 +74,9 @@ windows = { version = "0.58", features = [
 # `TdsClient` driven by scripted TDS tokens (see `mssql_tds::test_client_support`)
 # to cover client-driven ODBC paths without a live server.
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
-# Matches the version mssql-tds resolves (workspace lock: 1.x) so the `Uuid`
-# type in tests is the same crate instance as `ColumnValues::Uuid`.
-uuid = "1"
-
+# Drives a real TdsClient over a real socket against a mock TDS server, so
+# SQL_ATTR_QUERY_TIMEOUT regression tests can prove the timeout actually
+# bounds the wire wait (see mssql-rs#439) rather than only checking that the
+# configured value reaches an `ExecuteOptions` struct.
+mssql-mock-tds = { path = "../mssql-mock-tds" }
 [build-dependencies]

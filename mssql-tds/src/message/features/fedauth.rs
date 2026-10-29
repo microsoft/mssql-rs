@@ -101,19 +101,25 @@ impl FedAuthFeature {
             TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow => {
                 Ok(active_directory_device_code_flow)
             }
-            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
-                Ok(active_directory_managed_identity)
-            }
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity
+            | TdsAuthenticationMethod::ActiveDirectoryMSI => Ok(active_directory_managed_identity),
             TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => {
                 Ok(active_directory_workload_identity)
             }
-            TdsAuthenticationMethod::ActiveDirectoryDefault => {
+            // Both resolve to a bearer token out of band, so the server is told
+            // the same thing as for any other non-password credential.
+            TdsAuthenticationMethod::ActiveDirectoryDefault
+            | TdsAuthenticationMethod::ActiveDirectoryTokenCredential => {
                 Ok(active_directory_token_credential)
             }
-            _ => Err(crate::error::Error::ProtocolError(format!(
-                "Unsupported authentication method {:?} used with FedAuth feature",
-                self.tds_authentication_method
-            ))),
+            TdsAuthenticationMethod::Password
+            | TdsAuthenticationMethod::SSPI
+            | TdsAuthenticationMethod::AccessToken => {
+                Err(crate::error::Error::ProtocolError(format!(
+                    "Unsupported authentication method {:?} used with FedAuth feature",
+                    self.tds_authentication_method
+                )))
+            }
         }
     }
 
@@ -231,6 +237,44 @@ mod unittests {
     fn test_get_work_flow_identifier_unsupported() {
         let feature = FedAuthFeature::new(TdsAuthenticationMethod::Password, None, false);
         assert!(feature.get_work_flow_identifier().is_err());
+    }
+
+    /// A token acquired by the application's factory is announced to the server
+    /// exactly as `ActiveDirectoryDefault` is: which credential source the
+    /// factory uses is invisible on the wire.
+    #[test]
+    fn token_credential_flows_share_one_workflow_identifier() {
+        for method in [
+            TdsAuthenticationMethod::ActiveDirectoryDefault,
+            TdsAuthenticationMethod::ActiveDirectoryTokenCredential,
+        ] {
+            let name = format!("{method:?}");
+            let feature = FedAuthFeature::new(method, None, false);
+            assert_eq!(
+                feature.get_work_flow_identifier().unwrap(),
+                0x03,
+                "{name} should announce the interactive identifier"
+            );
+        }
+    }
+
+    /// `ActiveDirectoryMSI` had no arm of its own and fell through to the
+    /// unsupported-method error; it only worked because the ODBC binding
+    /// rewrites the keyword to `ActiveDirectoryManagedIdentity` first. The
+    /// variant is public, so a caller setting it directly hit that error for a
+    /// method the driver does support.
+    #[test]
+    fn msi_and_managed_identity_agree() {
+        let msi = FedAuthFeature::new(TdsAuthenticationMethod::ActiveDirectoryMSI, None, false);
+        let managed = FedAuthFeature::new(
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity,
+            None,
+            false,
+        );
+        assert_eq!(
+            msi.get_work_flow_identifier().unwrap(),
+            managed.get_work_flow_identifier().unwrap()
+        );
     }
 
     #[test]

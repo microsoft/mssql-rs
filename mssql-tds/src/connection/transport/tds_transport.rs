@@ -6,7 +6,7 @@
 
 use crate::core::TdsResult;
 use crate::io::reader_writer::NetworkWriter;
-use crate::io::token_stream::TdsTokenStreamReader;
+use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -18,6 +18,9 @@ use std::time::Duration;
 /// - `MockTransport` (in fuzzing mode) for testing without network I/O
 #[async_trait]
 pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::Debug {
+    /// Get a shared reference to the network writer.
+    fn as_writer_ref(&self) -> &dyn NetworkWriter;
+
     /// Get a mutable reference to the network writer.
     /// Used to create packet writers for sending messages to the server.
     fn as_writer(&mut self) -> &mut dyn NetworkWriter;
@@ -34,7 +37,8 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// This should cleanly shut down any underlying network connections.
     async fn close_transport(&mut self) -> TdsResult<()>;
 
-    /// Send an attention packet and wait for acknowledgment with a timeout.
+    /// Send an attention packet and drain the response to its acknowledgment
+    /// with a timeout.
     ///
     /// This method implements the attention sending flow:
     /// 1. Send MT_ATTN (0x06) packet to the server
@@ -43,14 +47,31 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for acknowledgment
+    /// * `context` - Parser state needed to decode row tokens left in the
+    ///   cancelled response. Rows do not carry their own metadata, so the drain
+    ///   cannot safely reach DONE_ATTN without it.
+    /// * `timeout` - Maximum time for the whole flow, covering the send as well
+    ///   as the wait. Writing the packet can itself stall on a peer that has
+    ///   stopped reading, so implementations must not leave the send unbounded.
     ///
     /// # Returns
     ///
     /// * `Ok(true)` - Attention acknowledged by server
-    /// * `Ok(false)` - Attention sent but timeout expired waiting for ACK
+    /// * `Ok(false)` - Timeout expired before the acknowledgement, either while
+    ///   sending the attention or while waiting for the ACK
     /// * `Err(_)` - Error sending attention or reading response
-    async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
+    ///
+    /// Only `Ok(true)` leaves the connection at a message boundary. On either
+    /// other outcome an ATTENTION is outstanding with no acknowledgement to
+    /// pair it with, so a later read could pick up a stray DONE_ATTN and treat
+    /// it as the answer to a different request. Implementations must mark such
+    /// a connection dead rather than let it be reused, which is why callers may
+    /// ignore the return value.
+    async fn send_attention_with_timeout(
+        &mut self,
+        context: &ParserContext,
+        timeout: Duration,
+    ) -> TdsResult<bool>;
 
     /// Probe whether the underlying connection is dead via a non-blocking socket
     /// poll. Returns `true` if dead, `false` if alive or unknown.

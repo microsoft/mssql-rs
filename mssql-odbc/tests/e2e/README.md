@@ -23,7 +23,9 @@ so tests can be migrated between the two.
 tests/e2e/
 ├── CMakeLists.txt              # Top-level CMake build
 ├── include/
-│   └── odbc_test_fixture.h     # Base test fixture & assertion macros
+│   ├── odbc_test_fixture.h     # Base test fixture & assertion macros
+│   ├── odbc_concurrent_test.h  # ODBC_TEST_F: one test body, single- and multithreaded
+│   └── odbc_sql_server_types.h # SQL Server ODBC extension types and constants
 ├── lib/
 │   ├── odbc_test_fixture.cpp   # ODBCTest fixture (HENV/HDBC/HSTMT lifecycle)
 │   ├── odbc_test_utils.cpp     # Diagnostic helpers
@@ -31,16 +33,32 @@ tests/e2e/
 ├── tests/
 │   ├── smoke_test.cpp          # Smoke tests (alloc, connect, query)
 │   └── alloc_env_test.cpp      # SQLAllocHandle(ENV) variations
+├── check/
+│   └── msodbcsql_types_check.cpp # Compile-time check of odbc_sql_server_types.h against msodbcsql.h
 ├── third_party/                # Reserved for git submodule (unused — using FetchContent)
 ├── run_e2e.sh                  # Build + test runner (Linux / macOS)
 ├── build_e2e.sh                # Build-only half for CI artifact reuse (Linux / macOS)
 ├── run_e2e.ps1                 # Build + test runner (Windows, requires admin)
+├── run_mt_test.sh, .gdb        # Launches <name>_mt entries, under gdb in stress runs (Linux / macOS)
 └── README.md                   # This file
 ```
 
 ## Quick Start
 
 ### Linux / macOS
+
+macOS PR validation runs this suite natively in `Test_MacOS`, using unixODBC
+and the SQL Server container already running under Colima. The job builds the
+Rust `.dylib` and C++ tests, retries failing test executables up to three times,
+and publishes JUnit results even when tests fail. Failed tests or missing results
+fail the job. This leg tests the Rust driver only, without msodbcsql comparison
+or C++ e2e coverage collection.
+
+Query-notification string attributes use explicit `SQLSetStmtAttrW` /
+`SQLGetStmtAttrW` calls with UTF-16 buffers. unixODBC does not convert these
+vendor-specific buffers when forwarding ANSI calls to a Unicode-only driver.
+The attribute suite also covers UTF-16 input at a byte offset; native ARM64
+success alone does not establish that the x64 macOS path is alignment-safe.
 
 ```bash
 # From mssql-odbc/tests/e2e/
@@ -53,15 +71,29 @@ tests/e2e/
 In `--verbose` mode, `run_e2e.sh` defaults to:
 
 - `MSSQL_TDS_TRACE=true`
-- `MSSQL_TDS_TRACE_LEVEL=warn,msodbcsql18=debug`
+- `MSSQL_TDS_TRACE_LEVEL=warn,mssqlodbc=debug`
 
 unless those variables are already set in your environment.
 
 To override the verbose default filter:
 
 ```bash
-MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=trace" ./run_e2e.sh --verbose
+MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=trace" ./run_e2e.sh --verbose
 ```
+
+### Small-stack connection regression
+
+On POSIX platforms, `small_stack_connect_test` connects and fetches a row through
+the Driver Manager on an explicitly sized pthread. Its separate executable also
+covers cold driver/TLS initialization. The native stack size of the existing
+`ODBC_TEST_F` workers is unchanged.
+
+`run_e2e.sh --release` and `build_e2e.sh --release` configure a 128 KiB stack,
+matching musl's default application-thread budget. Debug/coverage drivers use
+512 KiB for unoptimized frames. When configuring CMake directly, pass
+`-DODBC_E2E_RELEASE_DRIVER=ON` for a release driver; the default is OFF.
+The regression runs in the normal POSIX suite, including PR validation, rather
+than relying solely on the post-merge Alpine matrix.
 
 ### Comparing against msodbcsql 18
 
@@ -98,6 +130,33 @@ Summary: 15 parity, 1 divergence(s), 0 shared failure(s), 0 skipped
 === Parity check FAILED (mssql-odbc rc=0, msodbcsql rc=0, parity rc=1) ===
 ```
 
+### Native narrow fetch expectations
+
+`SQL_C_CHAR` fetch output defaults to the Windows system ANSI code page (`GetACP`)
+or the supported active Unix `LC_CTYPE` encoding, with UTF-8 as the fallback for
+C/POSIX and unsupported locales. The usual test process starts in the C locale;
+this does not mean every Unix application receives UTF-8.
+Use `ODBCTestUtils::Utf8ToNativeClient` to convert UTF-8 expected text into native
+**output** bytes. Do not use it for narrow parameter input (still UTF-8 until
+AB#47565), `SQL_C_WCHAR` expectations, or raw `SQL_C_BINARY` wire bytes.
+Compare native output with explicit byte lengths, not C-string semantics:
+UTF-32LE contains embedded zero bytes. Chunk helpers use sentinel-filled buffers
+for truncated chunks and the final successful call's indicator to locate the
+terminator, preserving embedded zeros without counting initialized padding.
+
+`GetDataUtf16Test.NativeClientChar*` covers ordinary/MAX varchar and nvarchar,
+server collations different from the client, terminator-only probes, tiny
+continuations, final byte lengths, and native code-page-loss warning semantics.
+Fitting conversions remain successful without warnings even with
+`SQL_COPT_SS_WARN_ON_CP_ERROR` enabled; lossy truncation exercises the diagnostic
+path with the flag both disabled and enabled. Carry
+tests that need UTF-8 expansion skip on both drivers when the active native
+encoding cannot create that carry; measured source-decoder divergences retain
+their separate reference-driver skips.
+The DBCS text-to-binary continuation regression requires an ASCII-compatible
+client encoding: its binary continuation returns wire bytes, not UTF-32LE
+converted carry.
+
 ### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
 
 Some tests assert behavior that is deliberately stricter in the Rust driver than
@@ -121,19 +180,48 @@ comparison honest; put a genuinely reference-incompatible case in its own test
 (as `DriverConnectLiveTest.InvalidConnectionAttributeValuesRejected` is) so the
 surrounding parity assertions still compare.
 
-**Granularity:** ctest compares at the *test-binary* level — each `*_test`
-executable is a single ctest case and the parity table is keyed on that binary
-name, not on individual gtest cases. A gtest skip is not a failure, so a case
+**One carve-out: a test dedicated to a single registered divergence may assert
+per leg.** When a case exists only to pin one documented difference — it is in
+its own test, it covers nothing else, and it has a numbered entry in
+[`docs/parity-deviations.md`](../../docs/parity-deviations.md) — spelling out
+what *each* driver returns is better than skipping the reference leg, because it
+keeps measuring the reference instead of asserting the divergence from memory. A
+build where msodbcsql stops behaving as recorded then fails the test rather than
+going unnoticed. `ColAttributeLiveTest.EmptyVariantProbeReturnsSuccessWithoutWarning`
+(registry entry 13) is the precedent.
+
+The hazard the preference above guards against is a per-leg guard wrapped around
+*some* assertions inside a broader test, where `PASS`/`PASS` conceals a
+difference nobody chose. That remains discouraged, and
+`SKIP_IF_COMPARING_MSODBCSQL()` remains the right tool for a case that asserts
+mssql-odbc-specific behavior the reference does not share at all. This carve-out
+matches §2.1 of
+[`.github/instructions/mssql-odbc.instructions.md`](../../../.github/instructions/mssql-odbc.instructions.md),
+which admits the macro for three reasons — reference-incompatible behavior, a
+measured divergence, or a documented gap tracked by a work item — and asks that
+anything else assert on both legs. When the divergence is measured, asserting
+both legs records the measurement continuously.
+
+**Granularity:** ctest compares at the *ctest-entry* level — each `*_test`
+executable is one ctest case, or two when it uses `ODBC_TEST_F` (`<name>` and
+`<name>_mt`, see step 4 of "Writing a New Test"), and the parity table is keyed
+on that entry name, not on individual gtest cases. A gtest skip is not a failure, so a case
 guarded by `SKIP_IF_COMPARING_MSODBCSQL()` leaves its binary passing on both
 legs: it shows up as `parity`, not `skipped`. The `skipped (not compared)`
-verdict only appears when an *entire* binary is skipped in one leg. Either way
+verdict only appears when an *entire* entry is skipped in one leg. Either way
 the divergent assertions never execute on the reference leg.
 
 CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
 docker. `.pipeline/scripts/containerized-odbc-e2e.sh` installs a pinned
 `msodbcsql18` from `packages.microsoft.com` when `ODBC_E2E_COMPARE=1`.
 
+Run new or changed parity tests against both drivers before pushing. For output-parameter tests, change pending bindings before fetching can consume the return tokens, and inspect diagnostics immediately after each result-draining API call. A later `SQLMoreResults` call need not preserve a diagnostic already reported by `SQLFetch`. Keep exact SQLSTATE and output-value assertions, including single-delivery checks, rather than skipping the reference leg.
+
+Exercise warning-bearing output tails with a nonempty final rowset (for example, one row with `SQL_ATTR_ROW_ARRAY_SIZE=2`). With the pinned Linux reference driver, unixODBC hides warnings returned alongside an empty `SQL_NO_DATA` fetch. The nonempty rowset keeps the warning observable and permits exact `SQL_SUCCESS_WITH_INFO`/SQLSTATE assertions on both drivers. `output_params_test` records `SQL_DRIVER_VER` in its test properties; verify Linux as well as Windows rather than extrapolating between Driver Managers.
+
 ### Failure modes that are never silently green
+
+Setup DML must account for zero affected rows: deleting from an empty table returns `SQL_NO_DATA` under ODBC 3.x. Assert that result explicitly when zero rows are expected; do not treat it as an execution error or broadly relax the assertions on the operation under test.
 
 Both runners abort — locally and in CI — when:
 
@@ -170,6 +258,41 @@ rustc that produced the instrumented `.so`. In CI, the Linux x64 PR build sets
 `ODBC_E2E_COVERAGE=1`, publishes the report as `CoberturaCoverageOdbcE2E_Linux`,
 and the Merge Coverage stage unions it into the diff-coverage report.
 
+### Cancellation PR coverage
+
+`cancel_test` is registered on every platform, including the Windows Driver
+Manager (`odbc32`) and unixODBC. The tests live under
+[`tests/multithreaded_tests/`](tests/multithreaded_tests/). Run them on both
+driver legs; they record `SQL_DRIVER_VER`. Coverage includes execute, fetch,
+MoreResults, immediate cancel-then-close, final SQLParamData, and a blocked
+SQLPutData packet followed by connection reuse. MoreResults has the explicitly
+approved return-code difference in [registry entry 27](../../docs/parity-deviations.md).
+
+The write test uses a loopback TCP proxy which forwards TLS unchanged and
+temporarily stops reading client bytes. It asserts that the write and cancel
+are pending before resuming forwarding, then verifies HY008 and a live,
+reusable connection. It needs `ODBC_TEST_SERVER` as a direct TCP endpoint
+(host or host,port); a DSN, full connection-string override, or named instance
+cannot be routed by this proxy and is reported as skipped.
+
+The Unix runner creates temporary registrations with `Threading=1` for both
+drivers, without modifying the installed reference registration. unixODBC
+locks `SQLCancel` only at level 3, so at 1 the cross-thread cancel still
+reaches the driver while the other call runs (see "How the scripts register
+the driver"). Rust tests cover
+buffer-only DAE calls, token-publication races, simultaneous cancellers,
+indefinitely stalled writes, and missing acknowledgement deadlines.
+
+To select just this test executable:
+
+```bash
+./run_e2e.sh --filter='^cancel_test$' --compare-with-msodbcsql
+```
+
+```powershell
+.\run_e2e.ps1 -FilterTests '^cancel_test$' -CompareWithMsodbcsql
+```
+
 ### Windows (requires Administrator)
 
 ```powershell
@@ -204,8 +327,11 @@ set once via the `msodbcsqlVersion` pipeline variable (in
 
 When `ODBC_TEST_SERVER` is unset, a dev SQL Server on `localhost:1433` is
 auto-detected — the password is taken from `ODBC_TEST_PWD`, then `SQL_PASSWORD`,
-then `SQL_PASSWORD=` in `mssql-tds\.env`, falling back to integrated auth. This
-matches `run_e2e.sh`.
+then `SQL_PASSWORD=` in `mssql-tds\.env`. With a password, `ODBC_TEST_UID`
+defaults to `sa`. Without one, an unset `ODBC_TEST_UID` stays unset and the
+fixture uses integrated auth; a `ODBC_TEST_UID` you set yourself is kept, and
+the script warns that the fixture will try SQL auth with an empty password.
+This matches `run_e2e.sh`.
 
 `run_e2e.ps1 -Coverage` builds the Rust driver with LLVM source-based
 instrumentation so the driver code exercised by the C++ tests — which load the
@@ -248,7 +374,21 @@ infrastructure works (`runtests.c`).
   `[ODBC Driver 18 for SQL Server (Rust)]`, and sets `ODBCSYSINI` to point at
   it. The env var is scoped to the script process, so the parent shell is never
   affected. A `trap cleanup EXIT` ensures the temp directory is removed even on
-  failure.
+  failure. With `--compare-with-msodbcsql`, the same file also gets a copy of
+  the msodbcsql section from `--msodbcsql-ini`. Both registrations set
+  `Threading=1`, so unixODBC locks each handle for a call as the Windows
+  Driver Manager does, except `SQLCancel`, which it locks only at level 3. At
+  the unixODBC default of 0, the `/SharedStmt` variants crash inside
+  `libodbc` with either driver. Level 1 narrows but does not close that race in
+  released unixODBC ([#243](https://github.com/lurcher/unixODBC/issues/243),
+  fixed by [lurcher/unixODBC#244](https://github.com/lurcher/unixODBC/pull/244)
+  but not yet released). Until the pipelines test against a unixODBC build with
+  the fix (AB#49575), the stress profiles skip `/SharedStmt` on unixODBC, and
+  the `/SharedStmt` variants of
+  `GetDataLiveTest.DefaultTargetStreamsAVarcharMaxAcrossChunks` and
+  `GetDataLiveTest.RunUniqueValuesSurviveEveryRetrievalPath` are unregistered
+  on non-Windows platforms; their other variants and all Windows coverage
+  remain enabled.
 
 - **Windows (`run_e2e.ps1`)**: Writes `Driver` and `Setup` values under
   `HKLM\Software\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server (Rust)`, so an
@@ -274,8 +414,8 @@ running the tests.
   substituting your chosen driver name for `<driver name>`:
   ```
   HKLM\Software\ODBC\ODBCINST.INI\<driver name>
-      Driver = <path to msodbcsql18.dll>
-      Setup  = <path to msodbcsql18.dll>
+      Driver = <path to mssqlodbc.dll>
+      Setup  = <path to mssqlodbc.dll>
 
   HKLM\Software\ODBC\ODBCINST.INI\ODBC Drivers
       <driver name> = Installed
@@ -318,9 +458,12 @@ environment variables to enable them:
 ### Auto-detection
 
 When `ODBC_TEST_SERVER` is not set, `run_e2e.sh` probes `localhost:1433`. If a
-SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost`,
-`ODBC_TEST_UID=sa`, and resolves the password from `ODBC_TEST_PWD`,
-`SQL_PASSWORD`, or `mssql-tds/.env` (in that order).
+SQL Server is listening, it auto-configures `ODBC_TEST_SERVER=localhost` and
+resolves the password from `ODBC_TEST_PWD`, `SQL_PASSWORD`, or `mssql-tds/.env`
+(in that order). If a password is found, `ODBC_TEST_UID` defaults to `sa`.
+Otherwise an unset `ODBC_TEST_UID` stays unset and the fixture uses integrated
+auth; a `ODBC_TEST_UID` you set yourself is kept, with a warning that the
+fixture will try SQL auth with an empty password.
 
 To bring up a local SQL Server in Docker:
 
@@ -370,6 +513,67 @@ add_odbc_test(my_feature_test  tests/my_feature_test.cpp)
 cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
+### 4. Write it with `ODBC_TEST_F` so it also runs multithreaded
+
+Write new behavioral tests with `ODBC_TEST_F` instead of `TEST_F` (include
+`odbc_concurrent_test.h`). The body is unchanged; the macro registers the
+single-threaded test plus `/CrossThread`, `/SharedEnv`, and `/SharedStmt`
+variants that run it across threads. `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
+adds `/SharedDbc`. Use `Worker()`, `Iteration()`, and `WorkerToken()` for
+values that must differ per run.
+
+Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, only when the
+test:
+
+- changes ENV, pooling, or other process-wide state;
+- tests connect, disconnect, or driver loading;
+- creates fixed-name permanent objects;
+- frees or replaces `stmt_` or `dbc_` in the body; or
+- relies on `HasFatalFailure()` (concurrent workers capture failures per
+  thread, so it cannot see them).
+
+A fixture whose `SetUp()` does not `Connect()` — an ENV-only fixture such as
+`smoke_test.cpp`'s `ODBCTest` — has no statement for `/SharedStmt` observers to
+read, so leave that mode out:
+`ODBC_TEST_F_MODES(Fixture, Name, odbc_concurrency::kSingle | odbc_concurrency::kCrossThread | odbc_concurrency::kSharedEnv)`.
+Registering it anyway fails the variant with that advice rather than hanging.
+
+The rule and the `/SharedDbc` conditions are in
+`.github/instructions/mssql-odbc.instructions.md` §10.
+
+CMake registers such an executable as two ctest entries: `<name>` runs the
+single-threaded tests and `<name>_mt` (label `mt`) the concurrent variants, so
+a concurrency failure never hides a parity verdict. Nothing to add in
+`CMakeLists.txt`; reconfigure after converting a file. Both entries pass
+`--gtest_filter`, which overrides a `GTEST_FILTER` environment variable.
+
+```bash
+ctest --test-dir build -L mt                            # every concurrent variant, 2 x 1
+./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt, gdb stacks
+```
+
+```powershell
+.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 50, minidumps in build\mt-dumps
+```
+
+```bash
+# One executable by hand: 8 threads x 20 iterations, only the multithreaded variants
+MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
+  ./build/get_data_test --gtest_filter='*/CrossThread:*/SharedEnv:*/SharedStmt:*/SharedDbc'
+```
+
+`MSSQL_ODBC_MT_THREADS` (default 2) is how many threads run at once,
+`MSSQL_ODBC_MT_ITERS` (default 1) how many times each runs the body, and
+`MSSQL_ODBC_MT_TIMEOUT_SECONDS` (default 300) the hang watchdog, which applies
+separately to a multithreaded variant's fixture `SetUp`, its run, and its
+`TearDown` (the single-threaded test has none, like `TEST_F`). On a hang the
+watchdog writes a minidump on Windows (to `MSSQL_ODBC_MT_DUMP_DIR`, default the
+working directory) or aborts elsewhere. It leaves a process
+alone when a debugger is attached or when it cannot tell (detection covers
+Windows, Linux, and macOS). The profiles, the other `MSSQL_ODBC_MT_*`
+settings, and which tests can use which mode are in
+[multithreaded-testing-plan.md](../../docs/multithreaded-testing-plan.md).
+
 ## How It Works
 
 Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
@@ -383,11 +587,11 @@ splits the flow into a build half and a run half so a single set of binaries can
 be exercised on many Linux versions:
 
 - **`build_e2e.sh [--release] [--out=DIR]`** — builds the Rust driver and the
-  C++ gtest binaries, then stages `build/` (with `libmsodbcsql18.so` copied
+  C++ gtest binaries, then stages `build/` (with `mssqlodbc.so` copied
   inside) into `DIR`. That directory is published as a pipeline artifact.
 - **`run_e2e.sh --skip-build [--driver=PATH]`** — skips all compilation. It
   restores the prebuilt `build/` tree, auto-resolves the driver from
-  `build/libmsodbcsql18.so` (or `--driver`), registers it, and reruns the
+  `build/mssqlodbc.so` (or `--driver`), registers it, and reruns the
   prebuilt binaries via CTest.
 
 `CTestTestfile.cmake` bakes **absolute** paths to the test executables, so the
@@ -401,7 +605,7 @@ across matching distros:
 | Track | Build base | Reused on |
 |---|---|---|
 | glibc modern (x64, arm64) | Ubuntu 22.04 (glibc 2.35, OpenSSL 3) | Debian bookworm, Ubuntu 22.04/24.04, Azure Linux 3 |
-| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18–3.21 |
+| musl (x64, arm64) | Alpine 3.18 (musl, OpenSSL 3) | Alpine 3.18, 3.21 |
 | glibc 2.28 (x64) | manylinux_2_28 / AlmaLinux 8 (OpenSSL 1.1) | RHEL 8 / UBI 8 |
 
 A glibc-2.35 binary may fail to load on older glibc (e.g. RHEL 8's 2.28), and an

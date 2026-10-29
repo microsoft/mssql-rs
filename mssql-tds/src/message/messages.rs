@@ -213,6 +213,11 @@ mod tests {
         fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
             self.encryption
         }
+        // This writer never carries a reset, so there is nothing to record.
+        fn note_reset_dispatched(&mut self) {}
+        fn take_reset_dispatched(&mut self) -> bool {
+            false
+        }
     }
 
     #[tokio::test]

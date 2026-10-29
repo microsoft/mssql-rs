@@ -6,6 +6,10 @@
 #include <array>
 #include <string>
 
+#ifndef SQL_SS_UDT
+#define SQL_SS_UDT (-151)
+#endif
+
 namespace {
 
 struct ParamDescription {
@@ -24,12 +28,17 @@ TEST(DescribeParamTest, NullHandle) {
 
 class DescribeParamLiveTest : public ODBCTest {
 protected:
+    virtual SQLUINTEGER OdbcVersion() const { return SQL_OV_ODBC3_80; }
+
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
             FAIL() << "No connection configured - set ODBC_TEST_SERVER or "
                       "ODBC_TEST_CONNSTR";
         }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
+                      SQL_HANDLE_ENV, env_);
         Connect();
     }
 
@@ -71,6 +80,37 @@ protected:
                    : std::string(reinterpret_cast<const char*>(value));
     }
 };
+
+class DescribeParamOdbcVersionLiveTest
+    : public DescribeParamLiveTest,
+      public ::testing::WithParamInterface<SQLUINTEGER> {
+protected:
+    SQLUINTEGER OdbcVersion() const override { return GetParam(); }
+};
+
+// Benefits-from-mock-tds: request capture could assert that both application
+// versions take the same metadata RPC path; the live test observes the
+// precision values produced from its rows.
+TEST_P(DescribeParamOdbcVersionLiveTest, ApproximateNumericPrecisionMatchesMsodbcsql) {
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS REAL), CAST(? AS FLOAT)"), SQL_HANDLE_STMT, stmt_);
+
+    ParamDescription real;
+    ParamDescription floating;
+    ASSERT_TRUE(Describe(1, real));
+    ASSERT_TRUE(Describe(2, floating));
+    EXPECT_EQ(SQL_REAL, real.data_type);
+    EXPECT_EQ(24U, real.size);
+    EXPECT_EQ(0, real.scale);
+    EXPECT_EQ(SQL_NULLABLE, real.nullable);
+    EXPECT_EQ(SQL_FLOAT, floating.data_type);
+    EXPECT_EQ(53U, floating.size);
+    EXPECT_EQ(0, floating.scale);
+    EXPECT_EQ(SQL_NULLABLE, floating.nullable);
+}
+
+INSTANTIATE_TEST_SUITE_P(Odbc3And38, DescribeParamOdbcVersionLiveTest,
+                         ::testing::Values(static_cast<SQLUINTEGER>(SQL_OV_ODBC3),
+                                           static_cast<SQLUINTEGER>(SQL_OV_ODBC3_80)));
 
 TEST_F(DescribeParamLiveTest, IsAdvertised) {
     SQLUSMALLINT supported = SQL_FALSE;
@@ -117,6 +157,28 @@ TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
         {SQL_VARBINARY, 16, 0, SQL_NULLABLE},
         {SQL_DECIMAL, 12, 3, SQL_NULLABLE},
         {SQL_TYPE_TIMESTAMP, 24, 4, SQL_NULLABLE},
+    }};
+
+    for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
+        ParamDescription actual;
+        ASSERT_TRUE(Describe(ordinal, actual)) << "ordinal " << ordinal;
+        const ParamDescription& wanted = expected[ordinal - 1];
+        EXPECT_EQ(wanted.data_type, actual.data_type) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.size, actual.size) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.scale, actual.scale) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.nullable, actual.nullable) << "ordinal " << ordinal;
+    }
+}
+
+TEST_F(DescribeParamLiveTest, DescribesClrUdtMetadata) {
+    ASSERT_SQL_OK(
+        Prepare("SELECT CAST(? AS geography), CAST(? AS geometry), CAST(? AS hierarchyid)"),
+        SQL_HANDLE_STMT, stmt_);
+
+    const std::array<ParamDescription, 3> expected = {{
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
     }};
 
     for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
@@ -222,6 +284,8 @@ TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
     SQLLEN result = 0;
     GetColumn(1, &result);
     EXPECT_EQ(SQL_NULL_DATA, result);
+    GetColumn(2, &result);
+    EXPECT_EQ(SQL_NULL_DATA, result);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
@@ -248,5 +312,64 @@ TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
     // Compared numerically: a declaration of decimal(1,0) would round 1.5 away,
     // but the textual form of a decimal is not part of the parity contract.
     EXPECT_DOUBLE_EQ(1.5, std::stod(GetColumn(1)));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: this can only observe the outcome - SQL_ERROR, then a
+// later execute that works. A byte-level mock could assert what the outcome
+// implies but does not prove: that sp_describe_undeclared_parameters actually
+// went out. The error-token half is pinned meanwhile by
+// `a_server_error_during_describe_returns_the_connection_for_reuse` in
+// `describe_param.rs`, which drives `fail_with_tds` from a server error and
+// asserts the connection comes back unclaimed.
+TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds) {
+    ExecDirect("CREATE TABLE #dp_tmp (id INT, data VARBINARY(32))");
+    ASSERT_SQL_OK(Prepare("INSERT INTO #dp_tmp (id, data) VALUES (?, ?)"), SQL_HANDLE_STMT,
+                  stmt_);
+
+    // sp_describe_undeclared_parameters cannot resolve a parameter against a
+    // temp table, and both drivers surface that as SQL_ERROR rather than a
+    // guessed type. mssql-python turns this failure into its SQL_VARCHAR
+    // fallback, which is why a VARBINARY NULL needs setinputsizes (GH-627).
+    //
+    // The diagnostics are measured, not derived from the severity tier: both
+    // drivers report two records, and record 1 is the `42S02` for error 208
+    // ("Invalid object name '#dp_tmp'"), not the `42000` the compile-error
+    // record carries. Measured on both legs against msodbcsql18 18.6.2.1
+    // (`SQL_DRIVER_VER` 18.06.0002) and this driver on 2026-09-30. The pair
+    // exercises both mapping paths: 208 has an explicit
+    // `SERVER_ERROR_TO_SQL_STATE_MAP` entry, while 11501 has none and falls
+    // through to `sqlstate_for_severity(16)`.
+    for (SQLUSMALLINT ordinal = 1; ordinal <= 2; ++ordinal) {
+        ParamDescription probe;
+        EXPECT_EQ(SQL_ERROR, SQLDescribeParam(stmt_, ordinal, &probe.data_type, &probe.size,
+                                              &probe.scale, &probe.nullable))
+            << "ordinal " << ordinal;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42S02") << "ordinal " << ordinal;
+        EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "42000"))
+            << "ordinal " << ordinal << ": the compile-error record must survive";
+    }
+
+    // The failed describe must not poison the statement: the explicit binding
+    // that setinputsizes performs still has to execute on the same handle.
+    SQLLEN id_length = 0;
+    SQLINTEGER id = 7;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER, 10, 0,
+                                   &id, 0, &id_length),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLLEN data_length = SQL_NULL_DATA;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 32,
+                                   0, nullptr, 0, &data_length),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    ExecDirect("SELECT id, data FROM #dp_tmp");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("7", GetColumn(1));
+    SQLLEN fetched = 0;
+    GetColumn(2, &fetched);
+    EXPECT_EQ(SQL_NULL_DATA, fetched);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }

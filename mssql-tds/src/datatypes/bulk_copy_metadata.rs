@@ -424,21 +424,10 @@ impl TypeLength {
 /// ```rust,ignore
 /// use mssql_tds::datatypes::bulk_copy_metadata::{BulkCopyColumnMetadata, SqlDbType, TypeLength};
 ///
-/// let metadata = BulkCopyColumnMetadata {
-///     column_name: "id".to_string(),
-///     sql_type: SqlDbType::Int,
-///     tds_type: 0x38, // SQLINT4
-///     length: 4,
-///     length_type: TypeLength::Fixed(4),
-///     precision: 0,
-///     scale: 0,
-///     collation: None,
-///     encoding: None,
-///     is_nullable: false,
-///     is_identity: true,
-///     is_encrypted: false,
-///     table_name: None,
-/// };
+/// let metadata = BulkCopyColumnMetadata::new("id", SqlDbType::Int, 0x38) // SQLINT4
+///     .with_length(4, TypeLength::Fixed(4))
+///     .with_nullable(false)
+///     .with_identity(true);
 /// ```
 #[derive(Debug, Clone)]
 pub struct BulkCopyColumnMetadata {
@@ -471,6 +460,9 @@ pub struct BulkCopyColumnMetadata {
     /// Collation name (e.g., "SQL_Latin1_General_CP1_CI_AS")
     /// This is the collation name retrieved from sp_tablecollations_100
     /// and used in the INSERT BULK SQL command.
+    /// Custom names must be 1-128 ASCII letters, digits, or underscores, starting
+    /// with a letter. Invalid tokens return
+    /// [`Error::UsageError`](crate::error::Error::UsageError) during bulk copy.
     pub collation_name: Option<String>,
 
     /// Character encoding (for character types)
@@ -555,6 +547,7 @@ impl BulkCopyColumnMetadata {
 
     /// Set collation name (for character types).
     /// This is used in the INSERT BULK SQL command.
+    /// See [`Self::collation_name`] for the accepted token format.
     pub fn with_collation_name(mut self, collation_name: impl Into<String>) -> Self {
         self.collation_name = Some(collation_name.into());
         self

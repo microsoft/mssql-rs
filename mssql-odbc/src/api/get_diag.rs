@@ -16,11 +16,12 @@ use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_DIAG_CLASS_ORIGIN, SQL_DIAG_CONNECTION_NAME, SQL_DIAG_DYNAMIC_FUNCTION_CODE,
-    SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_SERVER_NAME,
-    SQL_DIAG_SQLSTATE, SQL_DIAG_SUBCLASS_ORIGIN, SQL_DIAG_UNKNOWN_STATEMENT, SQL_ERROR,
-    SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_INVALID_HANDLE,
-    SQL_NO_DATA, SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_ROW_NUMBER,
+    SQL_DIAG_SERVER_NAME, SQL_DIAG_SQLSTATE, SQL_DIAG_SUBCLASS_ORIGIN, SQL_DIAG_UNKNOWN_STATEMENT,
+    SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
+    SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_ROW_NUMBER, SQL_SQLSTATE_SIZE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
+    SqlWChar,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{DiagRecord, HasDiagnostics};
@@ -41,47 +42,50 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
     buffer_length: SqlSmallInt,
     text_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        handle_type,
-        ?handle,
-        rec_number,
-        ?sql_state,
-        ?native_error_ptr,
-        ?message_text,
-        buffer_length,
-        ?text_length_ptr,
-        "SQLGetDiagRecW called",
-    );
+    crate::ffi_entry!(
+        "SQLGetDiagRecW",
+        handle,
+        debug!(
+            handle_type,
+            ?handle,
+            rec_number,
+            ?sql_state,
+            ?native_error_ptr,
+            ?message_text,
+            buffer_length,
+            ?text_length_ptr,
+            "SQLGetDiagRecW called",
+        ),
+        {
+            if handle.is_null() {
+                error!("SQLGetDiagRecW: handle is null");
+                return SQL_INVALID_HANDLE;
+            }
+            if rec_number < 1 || buffer_length < 0 {
+                error!(
+                    rec_number,
+                    buffer_length, "SQLGetDiagRecW: invalid argument"
+                );
+                return SQL_ERROR;
+            }
 
-    crate::ffi_entry!("SQLGetDiagRecW", {
-        if handle.is_null() {
-            error!("SQLGetDiagRecW: handle is null");
-            return SQL_INVALID_HANDLE;
+            // Per spec, the text-length out-param is initialized to 0.
+            unsafe { write_if_some(text_length_ptr, 0) };
+
+            // TODO: Do we need to snapshot here? Copy to user buffer directly?
+            let snapshot = match unsafe { snapshot_record(handle_type, handle, rec_number) } {
+                Ok(s) => s,
+                Err(rc) => return rc,
+            };
+            let Some(rec) = snapshot else {
+                return SQL_NO_DATA;
+            };
+
+            unsafe { write_sql_state(sql_state, &rec.sql_state) };
+            unsafe { write_if_some(native_error_ptr, rec.native_error) };
+            unsafe { write_message(message_text, buffer_length, text_length_ptr, &rec.message) }
         }
-        if rec_number < 1 || buffer_length < 0 {
-            error!(
-                rec_number,
-                buffer_length, "SQLGetDiagRecW: invalid argument"
-            );
-            return SQL_ERROR;
-        }
-
-        // Per spec, the text-length out-param is initialized to 0.
-        unsafe { write_if_some(text_length_ptr, 0) };
-
-        // TODO: Do we need to snapshot here? Copy to user buffer directly?
-        let snapshot = match unsafe { snapshot_record(handle_type, handle, rec_number) } {
-            Ok(s) => s,
-            Err(rc) => return rc,
-        };
-        let Some(rec) = snapshot else {
-            return SQL_NO_DATA;
-        };
-
-        unsafe { write_sql_state(sql_state, &rec.sql_state) };
-        unsafe { write_if_some(native_error_ptr, rec.native_error) };
-        unsafe { write_message(message_text, buffer_length, text_length_ptr, &rec.message) }
-    })
+    )
 }
 
 /// Implementation of [`SQLGetDiagFieldW`](super::exports::SQLGetDiagFieldW).
@@ -107,47 +111,50 @@ pub(crate) unsafe fn sql_get_diag_field_w(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    debug!(
-        handle_type,
-        ?handle,
-        rec_number,
-        diag_identifier,
-        ?diag_info_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetDiagFieldW called",
-    );
-
-    crate::ffi_entry!("SQLGetDiagFieldW", {
-        if handle.is_null() {
-            error!("SQLGetDiagFieldW: handle is null");
-            return SQL_INVALID_HANDLE;
-        }
-
-        if is_diag_header_field(diag_identifier) {
-            unsafe {
-                handle_header_field(
-                    handle_type,
-                    handle,
-                    rec_number,
-                    diag_identifier,
-                    diag_info_ptr,
-                )
+    crate::ffi_entry!(
+        "SQLGetDiagFieldW",
+        handle,
+        debug!(
+            handle_type,
+            ?handle,
+            rec_number,
+            diag_identifier,
+            ?diag_info_ptr,
+            buffer_length,
+            ?string_length_ptr,
+            "SQLGetDiagFieldW called",
+        ),
+        {
+            if handle.is_null() {
+                error!("SQLGetDiagFieldW: handle is null");
+                return SQL_INVALID_HANDLE;
             }
-        } else {
-            unsafe {
-                handle_record_field(
-                    handle_type,
-                    handle,
-                    rec_number,
-                    diag_identifier,
-                    diag_info_ptr,
-                    buffer_length,
-                    string_length_ptr,
-                )
+
+            if is_diag_header_field(diag_identifier) {
+                unsafe {
+                    handle_header_field(
+                        handle_type,
+                        handle,
+                        rec_number,
+                        diag_identifier,
+                        diag_info_ptr,
+                    )
+                }
+            } else {
+                unsafe {
+                    handle_record_field(
+                        handle_type,
+                        handle,
+                        rec_number,
+                        diag_identifier,
+                        diag_info_ptr,
+                        buffer_length,
+                        string_length_ptr,
+                    )
+                }
             }
         }
-    })
+    )
 }
 
 /// Returns `true` if `diag_identifier` is a header diagnostic field. Header
@@ -275,6 +282,15 @@ unsafe fn handle_record_field(
             unsafe { write_if_some(diag_info_ptr as *mut SqlInteger, rec.native_error) };
             SQL_SUCCESS
         }
+        // Scoped to statement handles per spec (mirrors SQL_DIAG_COLUMN_NUMBER,
+        // which this driver already refuses on every other handle type). No
+        // per-set/per-row attribution is plumbed through `TdsError` yet
+        // (tracked separately), so every record reports "not associated with
+        // a row" rather than a wrong or misleading row number.
+        SQL_DIAG_ROW_NUMBER if handle_type == SQL_HANDLE_STMT => {
+            unsafe { write_if_some(diag_info_ptr as *mut SqlLen, SQL_NO_ROW_NUMBER) };
+            SQL_SUCCESS
+        }
         SQL_DIAG_MESSAGE_TEXT => {
             let utf16: Vec<u16> = rec.message.encode_utf16().collect();
             unsafe {
@@ -362,6 +378,10 @@ unsafe fn diag_record_count(
 /// TODO: Add an OOM-resilient fallback diagnostic path for out-of-memory:
 /// store a non-allocating OOM flag on the handle and return
 /// static HY001 text for record 1 without heap allocation.
+///
+/// # Safety
+/// `handle` must be a valid, non-null handle pointer of the type identified by
+/// `handle_type`.
 unsafe fn snapshot_record(
     handle_type: SqlSmallInt,
     handle: SqlHandle,
@@ -968,6 +988,68 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(native, 42);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn diag_field_row_number_reports_no_row_number_on_stmt() {
+        // No per-set/per-row attribution is plumbed through yet, so every
+        // record on a statement handle must report SQL_NO_ROW_NUMBER rather
+        // than a wrong index.
+        // Assert against the literal sqlext.h value (-1248), not the driver's
+        // own SQL_DIAG_ROW_NUMBER constant, so a transcription slip in that
+        // constant fails this test instead of passing vacuously.
+        use crate::handles::StmtHandle;
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt_ref = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt_ref
+                .inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .push(DiagRecord::new(*b"HY024", 0, "some error"));
+        }
+
+        let mut row_number: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_STMT,
+                h.stmt,
+                1,
+                -1248,
+                &mut row_number as *mut SqlLen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(row_number, SQL_NO_ROW_NUMBER);
+    }
+
+    #[test]
+    fn diag_field_row_number_refused_on_non_stmt_handles() {
+        // SQL_DIAG_ROW_NUMBER (like its sibling SQL_DIAG_COLUMN_NUMBER) is
+        // scoped to statement handles by spec; every other handle type falls
+        // through to the unsupported-identifier path.
+        let env = alloc_env();
+        push_diag(env, *b"HY024", 0, "some error");
+
+        let mut row_number: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                -1248,
+                &mut row_number as *mut SqlLen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 

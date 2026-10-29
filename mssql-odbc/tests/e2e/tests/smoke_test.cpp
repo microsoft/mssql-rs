@@ -10,6 +10,7 @@
 //   export ODBC_TEST_SERVER=myserver
 //   ctest --test-dir build   (or just:  build/smoke_test)
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 // ===================================================================
@@ -18,6 +19,21 @@
 
 // Verify ODBC version attribute was set correctly.
 TEST_F(ODBCTest, OdbcVersionIsSet) {
+    SQLINTEGER version = 0;
+    SQLRETURN rc = SQLGetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                 &version, sizeof(version), nullptr);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_ENV, env_);
+    EXPECT_EQ(static_cast<SQLINTEGER>(SQL_OV_ODBC3_80), version);
+}
+
+// The same body under the concurrent modes an ENV-only fixture can run. It
+// allocates no statement, so /SharedStmt is left out: observers would have
+// nothing to read, and waiting for a read that cannot happen would spin until
+// the watchdog killed the process. Needs no server, so it also pins that these
+// three modes stay server-free.
+ODBC_TEST_F_MODES(ODBCTest, OdbcVersionIsSetAcrossThreads,
+                  odbc_concurrency::kSingle | odbc_concurrency::kCrossThread |
+                      odbc_concurrency::kSharedEnv) {
     SQLINTEGER version = 0;
     SQLRETURN rc = SQLGetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
                                  &version, sizeof(version), nullptr);

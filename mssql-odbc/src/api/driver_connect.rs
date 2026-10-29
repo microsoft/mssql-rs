@@ -6,26 +6,27 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_DRIVER_NOPROMPT, SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE,
+    SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt,
+    SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
-    ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00,
+    SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00, WARN_STRING_TRUNCATION,
     post_diag, post_tds_error, post_tds_info_messages,
 };
 use crate::api::txn::apply_post_connect_txn_settings;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
-use crate::handles::dbc::{ConnectionState, DbcState};
+use crate::handles::dbc::{ConnectionIdentity, ConnectionState, DbcState, VendorConnOverrides};
 use crate::handles::{HandleType, handle_from_raw};
 
-use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
+use mssql_tds::connection::client_context::{ClientContext, DriverVersion, IPAddressPreference};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 use mssql_tds::message::login_options::ApplicationIntent;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 use super::util::read_utf16;
 use crate::auth::{UnsupportedAuth, configure_auth};
@@ -53,30 +54,41 @@ pub(crate) unsafe fn sql_driver_connect_w(
     string_length_2_ptr: *mut SqlSmallInt,
     driver_completion: SqlUSmallInt,
 ) -> SqlReturn {
-    debug!(
-        ?connection_handle,
-        ?in_connection_string,
-        string_length_1,
-        ?out_connection_string,
-        buffer_length,
-        ?string_length_2_ptr,
-        driver_completion,
-        "SQLDriverConnectW called",
-    );
-
-    crate::ffi_entry!("SQLDriverConnectW", unsafe {
-        sql_driver_connect_w_impl(
-            connection_handle,
-            in_connection_string,
+    crate::ffi_entry!(
+        "SQLDriverConnectW",
+        connection_handle,
+        debug!(
+            ?connection_handle,
+            window_handle = ?_window_handle,
+            ?in_connection_string,
             string_length_1,
-            out_connection_string,
+            ?out_connection_string,
             buffer_length,
-            string_length_2_ptr,
+            ?string_length_2_ptr,
             driver_completion,
-        )
-    })
+            "SQLDriverConnectW called",
+        ),
+        unsafe {
+            sql_driver_connect_w_impl(
+                connection_handle,
+                in_connection_string,
+                string_length_1,
+                out_connection_string,
+                buffer_length,
+                string_length_2_ptr,
+                driver_completion,
+            )
+        }
+    )
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
+/// `in_connection_string`, when non-null, must be readable for
+/// `string_length_1` UTF-16 code units, or through a NUL terminator when the
+/// length is `SQL_NTS`. `out_connection_string`, when non-null, must be writable
+/// for `buffer_length` UTF-16 code units, and `string_length_2_ptr`, when
+/// non-null, must be writable for one `SqlSmallInt`.
 unsafe fn sql_driver_connect_w_impl(
     connection_handle: SqlHandle,
     in_connection_string: *const SqlWChar,
@@ -135,6 +147,9 @@ pub(crate) fn sql_driver_connect_w_safe(
         return SQL_ERROR;
     };
 
+    if state.connection_state == ConnectionState::Disconnected {
+        dbc.trace.clear();
+    }
     free_errors(&mut state);
 
     // Only SQL_DRIVER_NOPROMPT is supported (no UI prompting).
@@ -186,16 +201,143 @@ pub(crate) fn sql_driver_connect_w_safe(
 
     // Autocommit and isolation level set before connecting had no session to
     // apply to; push them now. Needs the DBC lock and network I/O, so it runs
-    // only once the connect path has released the lock. A failure downgrades the
-    // connect to SQL_SUCCESS_WITH_INFO rather than failing it: the session is
-    // usable, but the application must be able to see that its requested
-    // settings did not take effect.
+    // only once the connect path has released the lock. A settings failure
+    // downgrades the connect to SQL_SUCCESS_WITH_INFO because the session is
+    // still usable. A session torn down while the settings run fails the
+    // connect with 08003 because nothing usable remains.
     drop(state);
-    if apply_post_connect_txn_settings(dbc) == SQL_SUCCESS_WITH_INFO {
-        return SQL_SUCCESS_WITH_INFO;
-    }
+    combine_connect_results(result, apply_post_connect_txn_settings(dbc))
+}
 
-    result
+fn combine_connect_results(connect_result: SqlReturn, settings_result: SqlReturn) -> SqlReturn {
+    match settings_result {
+        SQL_ERROR => SQL_ERROR,
+        SQL_SUCCESS_WITH_INFO => SQL_SUCCESS_WITH_INFO,
+        _ => connect_result,
+    }
+}
+
+/// Lets the `SQL_COPT_SS_*` attribute forms win over the connection-string
+/// keywords they duplicate.
+///
+/// Only a caller-set attribute (`Some`) displaces anything, so a connection
+/// string on its own still behaves exactly as it did before.
+fn apply_vendor_overrides(params: &mut ConnectionParams, overrides: &VendorConnOverrides) {
+    if let Some(encrypt) = overrides.encrypt {
+        params.encrypt = Some(
+            match u64::from(encrypt) {
+                SQL_EN_OFF => "no",
+                SQL_EN_STRICT => "strict",
+                _ => "yes",
+            }
+            .to_string(),
+        );
+    }
+    if let Some(trust) = overrides.trust_server_certificate {
+        params.trust_server_certificate = trust != 0;
+    }
+    if let Some(integrated) = overrides.integrated_security {
+        params.trusted_connection = Some(integrated != 0);
+    }
+    if let Some(multi_subnet_failover) = overrides.multi_subnet_failover {
+        params.multi_subnet_failover = Some(multi_subnet_failover != 0);
+    }
+}
+
+/// Resolves the `Encrypt=` keyword vocabulary onto an mssql-tds setting.
+///
+/// `ENCRYPT_VALUES` accepts five spellings; `mandatory`/`optional` are the
+/// aliases of `yes`/`no`. An unspecified keyword means encryption on, which is
+/// the ODBC Driver 18 default.
+fn encryption_setting(encrypt: Option<&str>) -> EncryptionSetting {
+    match encrypt {
+        Some(e) if e.eq_ignore_ascii_case("no") || e.eq_ignore_ascii_case("optional") => {
+            EncryptionSetting::PreferOff
+        }
+        Some(e) if e.eq_ignore_ascii_case("strict") => EncryptionSetting::Strict,
+        _ => EncryptionSetting::On,
+    }
+}
+
+/// The settings a post-connect get should report, taken from the connection as
+/// it actually negotiated.
+///
+/// Measured against msodbcsql: a get returns the effective value regardless of
+/// which path produced it. `Encrypt=no` reads back `0` when the server permits
+/// plaintext and `1` when the server forces TLS, so neither the caller's raw
+/// input nor a fixed default would match.
+fn effective_vendor_settings(
+    params: &ConnectionParams,
+    connection_is_encrypted: bool,
+    multi_subnet_failover: bool,
+) -> VendorConnOverrides {
+    let mode = encryption_setting(params.encrypt.as_deref());
+    let encrypt = match (mode, connection_is_encrypted) {
+        (EncryptionSetting::Strict, _) => SQL_EN_STRICT,
+        (_, true) => SQL_EN_ON,
+        (_, false) => SQL_EN_OFF,
+    };
+    let trust = connection_is_encrypted && params.trust_server_certificate;
+    VendorConnOverrides {
+        encrypt: Some(encrypt as u32),
+        trust_server_certificate: Some(u32::from(trust)),
+        integrated_security: Some(u32::from(params.trusted_connection.unwrap_or(false))),
+        multi_subnet_failover: Some(u32::from(multi_subnet_failover)),
+    }
+}
+
+fn initial_database(database_keyword: &str, current_catalog: Option<&str>) -> String {
+    if database_keyword.is_empty() {
+        current_catalog.unwrap_or_default().to_string()
+    } else {
+        database_keyword.to_string()
+    }
+}
+
+const ODBC_LIBRARY_NAME: &str = "ODBC";
+const ODBC_USER_AGENT_LIBRARY_NAME: &str = "MS-ODBCRS";
+const ODBC_DRIVER_VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
+static ODBC_DRIVER_VERSION: OnceLock<DriverVersion> = OnceLock::new();
+
+fn odbc_driver_version() -> DriverVersion {
+    *ODBC_DRIVER_VERSION.get_or_init(parse_odbc_driver_version)
+}
+
+fn parse_version_part_u8(part: Option<&str>) -> u8 {
+    part.and_then(|part| part.parse().ok()).unwrap_or(0)
+}
+
+fn parse_build_part(part: Option<&str>) -> u16 {
+    let Some(part) = part else {
+        return 0;
+    };
+    let digit_len = part
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(part.len());
+    if digit_len == 0 {
+        return 0;
+    }
+    part[..digit_len].parse().unwrap_or(0)
+}
+
+fn parse_odbc_driver_version() -> DriverVersion {
+    let mut parts = ODBC_DRIVER_VERSION_STRING.split('.');
+    DriverVersion::new(
+        parse_version_part_u8(parts.next()),
+        parse_version_part_u8(parts.next()),
+        parse_build_part(parts.next()),
+    )
+}
+
+fn configure_driver_identity(context: &mut ClientContext) {
+    context.library_name = ODBC_LIBRARY_NAME.to_string();
+    context.driver_version = odbc_driver_version();
+    context
+        .user_agent
+        .set_library_name(ODBC_USER_AGENT_LIBRARY_NAME.to_string());
+    context
+        .user_agent
+        .set_driver_version(ODBC_DRIVER_VERSION_STRING.to_string());
 }
 
 /// Inner connect logic, separated so the caller can reset state on failure.
@@ -223,6 +365,19 @@ fn do_connect(
             return SQL_ERROR;
         }
     };
+
+    if params.transparent_network_ip_resolution == Some(true) {
+        error!("SQLDriverConnectW: TNIR is not supported; use MultiSubnetFailover");
+        post_diag(state, super::sqlstate::ERR_TNIR_NOT_SUPPORTED);
+        return SQL_ERROR;
+    }
+
+    // Pre-connect vendor attributes override the matching keyword, which is the
+    // reverse of the `Database=` / `SQL_ATTR_CURRENT_CATALOG` ranking applied
+    // below. Both directions were measured, not assumed.
+    let mut params = params;
+    apply_vendor_overrides(&mut params, &state.vendor_overrides);
+    let params = params;
 
     // Validate required fields. Let mssql-tds validate based on auth method.
     if params.server.is_empty() {
@@ -261,13 +416,18 @@ fn do_connect(
     // Build ClientContext. T1 wired SQL password, integrated (SSPI/GSSAPI), and
     // pre-acquired access tokens; T2 added Entra service principal (secret) and
     // managed identity; T3 adds interactive sign-in (Windows only, matching
-    // msodbcsql) — all via a token factory. Methods that still need token
-    // acquisition (AD password, device code, workload identity, default
-    // credential, AD integrated) are rejected with HYC00 until a later tier.
-    // Off Windows an interactive request is reported as AD integrated, the same
-    // method msodbcsql falls through to there.
+    // msodbcsql); T4 adds AD integrated — all via a token factory. Methods that
+    // still need token acquisition (AD password, device code, workload
+    // identity, default credential) are rejected with HYC00. Off Windows an
+    // interactive request resolves to AD integrated, as it does in msodbcsql.
     let mut context = ClientContext::default();
-    context.database = params.database.clone();
+    context.set_connection_trace(std::sync::Arc::clone(&dbc.trace));
+    configure_driver_identity(&mut context);
+    // The connection string wins over a pre-connect
+    // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`: msodbcsql overwrites the
+    // attribute's `conninfo.DataBase` while parsing the keywords, so a caller
+    // supplying both logs in to the `Database=` one.
+    context.database = initial_database(&params.database, state.current_catalog.as_deref());
 
     // Apply an app-set SQL_ATTR_LOGIN_TIMEOUT before configuring auth so an
     // explicit login timeout takes precedence over any method-specific default
@@ -276,50 +436,38 @@ fn do_connect(
         context.login_timeout = Some(secs);
     }
 
-    if let Err(unsupported) = configure_auth(&mut context, resolved, &params.server) {
-        let UnsupportedAuth {
-            requested,
-            resolved,
-        } = &unsupported;
+    if let Err(UnsupportedAuth(method)) = configure_auth(&mut context, resolved, &params.server) {
         error!(
-            ?requested,
-            ?resolved,
+            ?method,
             "SQLDriverConnectW: authentication method not implemented"
         );
-        // Name the keyword the application actually supplied. Where the
-        // platform maps it to another method, say so rather than reporting a
-        // method the connection string never mentioned.
-        let message = if requested == resolved {
-            format!("Authentication method {requested:?} is not yet supported")
-        } else {
-            format!(
-                "Authentication method {requested:?} resolves to {resolved:?} on this platform, \
-                 which is not yet supported"
-            )
-        };
-        post_sql_error(state, SQLSTATE_HYC00, 0, message);
+        post_sql_error(
+            state,
+            SQLSTATE_HYC00,
+            0,
+            format!("Authentication method {method:?} is not yet supported"),
+        );
         return SQL_ERROR;
     }
 
     context.encryption_options = EncryptionOptions {
         trust_server_certificate: params.trust_server_certificate,
-        mode: match params.encrypt.as_deref() {
-            Some(e) if e.eq_ignore_ascii_case("yes") || e.eq_ignore_ascii_case("mandatory") => {
-                EncryptionSetting::On
-            }
-            Some(e) if e.eq_ignore_ascii_case("no") || e.eq_ignore_ascii_case("optional") => {
-                EncryptionSetting::PreferOff
-            }
-            Some(e) if e.eq_ignore_ascii_case("strict") => EncryptionSetting::Strict,
-            _ => EncryptionSetting::On, // ODBC default
-        },
+        mode: encryption_setting(params.encrypt.as_deref()),
         host_name_in_cert: None,
         server_certificate: None,
     };
 
-    apply_connection_params(&mut context, &params);
+    seed_and_apply_connection_params(&mut context, state.packet_size, &params);
+    // Capture the fully-resolved pre-negotiation size (attr seed, then any
+    // `PacketSize=` override) before `context` is moved into
+    // `create_client` below; only published to `state.effective_packet_size`
+    // once the connection actually succeeds (see the success path), so a
+    // failed attempt does not leave a reusable DBC requesting a size it never
+    // actually established.
+    let resolved_packet_size = u32::from(context.packet_size);
 
-    // Connect via mssql-tds (lock is NOT held - the 'Connecting' state prevents races)
+    // Connect via mssql-tds. The caller's DBC lock is still held across this
+    // I/O, so other entry points block here rather than observing 'Connecting'.
     let provider = TdsConnectionProvider::new();
     let client = dbc
         .runtime
@@ -351,7 +499,65 @@ fn do_connect(
 
     let has_server_info = post_tds_info_messages(state, &info_messages);
 
-    state.client = Some(client);
+    // Publish resolved values only after the connection succeeds. Explicit
+    // attribute overrides remain separate so a reusable DBC does not feed a
+    // previous connection string back into its next connection attempt.
+    let Some(network_policy) = client.multi_subnet_failover_policy() else {
+        error!("SQLDriverConnectW: connected client has no resolved network policy");
+        post_sql_error(
+            state,
+            super::sqlstate::SQLSTATE_HY000,
+            0,
+            "Missing connection network policy",
+        );
+        return SQL_ERROR;
+    };
+    state.effective_vendor_settings = Some(effective_vendor_settings(
+        &params,
+        client.is_encrypted(),
+        network_policy.enabled,
+    ));
+    state.identity = ConnectionIdentity {
+        client_connection_id: Some(std::sync::Arc::clone(&dbc.trace)),
+        data_source_name: params.dsn.clone(),
+        // The server names itself in the INFO tokens it sends at login; the host
+        // the caller dialled is only a fallback for a server that sent none.
+        server_name: client
+            .server_reported_name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(params.server.as_str())
+            .to_string(),
+    };
+    // Belt-and-braces: `sql_disconnect_safe` already clears these, and the DM
+    // rejects a connect on a still-connected handle with `08002`, so no
+    // reachable path arrives here with an entry. Kept because this block is
+    // where the new session is published, and deliberately *not* pinned by a
+    // test — removing it changes no observable behavior, so any test for it
+    // would have to write the field by hand and would pin nothing.
+    state.database_user_name = None;
+    state.database_read_only = None;
+    state.alias_types = None;
+    // Bumped on every successful connect, and read by `publish_lookup` to tell
+    // whether the session a lookup queried is still the one on the handle. The
+    // other half of that check, `connection_state != Connected`, is false in
+    // exactly the case this counter exists for — a reconnect that has already
+    // completed — so this is what distinguishes the sessions. Pinned by
+    // `connect_advances_the_session_generation_and_clears_the_database_user`.
+    state.session_generation = state.session_generation.wrapping_add(1);
+    // Published here (not right after resolving it above) for the same
+    // failed-connect reason as the other fields in this block: kept separate
+    // from `state.packet_size` (the app-set attribute/default) so a
+    // connection-string keyword never outlives this connection and leaks
+    // onto the handle's next attempt — cleared again in `sql_disconnect_safe`.
+    // Never the ENVCHANGE-negotiated value: msodbcsql's own
+    // `SQLGetConnectAttr`/`SQLGetInfo` both read the single `dwOptions`
+    // slot that only ever holds the requested size (`sqlcconn.cpp:3326`
+    // builds LOGIN7 from it, `sqlcmisc.cpp:3465`/`sqlcinfo.cpp:1186` read it
+    // back) — nothing in msodbcsql writes the negotiated size into that
+    // slot; the negotiated value only resizes msodbcsql's own TDS buffer
+    // (`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a separate internal detail.
+    state.effective_packet_size = Some(resolved_packet_size);
+    state.wire.install(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
 
@@ -360,7 +566,7 @@ fn do_connect(
             post_diag(state, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE);
         }
         if truncated {
-            post_diag(state, ERR_STRING_RIGHT_TRUNCATION);
+            post_diag(state, WARN_STRING_TRUNCATION);
         }
         SQL_SUCCESS_WITH_INFO
     } else {
@@ -371,8 +577,12 @@ fn do_connect(
 /// TDS packet-size range accepted by `mssql-tds` (`DefaultClientContextValidator`).
 /// Unlike `ConnectRetryCount` / `ConnectRetryInterval` (which the parser rejects
 /// out-of-range to match msodbcsql), `PacketSize` is clamped to this range.
-const MIN_PACKET_SIZE: u32 = 512;
-const MAX_PACKET_SIZE: u32 = 32768;
+///
+/// Also reused by `set_connect_attr::SQL_ATTR_PACKET_SIZE` to clamp
+/// `DbcState::packet_size` at the point it is set, so no unclamped value can
+/// reach `get_info::max_statement_len`'s `128 * packet_size` before connect.
+pub(super) const MIN_PACKET_SIZE: u32 = 512;
+pub(super) const MAX_PACKET_SIZE: u32 = 32768;
 
 /// Maps parsed [`ConnectionParams`] onto a [`ClientContext`]. `ConnectRetryCount`
 /// and `ConnectRetryInterval` are already range-validated during parsing;
@@ -389,6 +599,9 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
     if let Some(server_spn) = &params.server_spn {
         context.server_spn = Some(server_spn.clone());
     }
+    if let Some(application_name) = &params.application_name {
+        context.application_name = application_name.clone();
+    }
     if let Some(intent) = &params.application_intent {
         context.application_intent = if intent.eq_ignore_ascii_case("readonly") {
             ApplicationIntent::ReadOnly
@@ -397,7 +610,10 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
         };
     }
     if let Some(multi_subnet_failover) = params.multi_subnet_failover {
-        context.multi_subnet_failover = multi_subnet_failover;
+        context.multi_subnet_failover = Some(multi_subnet_failover);
+    }
+    if let Some(partner) = &params.failover_partner {
+        context.failover_partner.clone_from(partner);
     }
     if let Some(count) = params.connect_retry_count {
         context.connect_retry_count = count;
@@ -422,10 +638,44 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
             IPAddressPreference::IPv4First
         };
     }
-    if let Some(size) = params.packet_size {
+    // A `PacketSize=0` keyword is msodbcsql's same "unspecified" sentinel as
+    // `SQL_ATTR_PACKET_SIZE, 0` (`sqlcconn.cpp` stores the keyword's parsed
+    // value into the same `dwOptions[SQL_PACKET_SIZE]` slot verbatim, with no
+    // clamp of its own), so it is exempted here too and `context.packet_size`
+    // keeps its `ClientContext::default()` value instead of being forced to
+    // `MIN_PACKET_SIZE` — seeding a literal `0` would fail `ClientContext`'s
+    // `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]` validation regardless.
+    if let Some(size) = params.packet_size
+        && size != 0
+    {
         context.packet_size =
             u16::try_from(size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE)).unwrap_or(u16::MAX);
     }
+}
+
+/// Seeds `context.packet_size` from any pre-connect
+/// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)` (msodbcsql applies the attribute
+/// to the connect request too) before applying the rest of the connection
+/// params, so a `PacketSize=` connection-string keyword still overrides it.
+/// Zero is msodbcsql's sentinel for "unspecified" (`sqlcmisc.cpp:1909-1917`
+/// exempts it from the packet-size clamp), so it is left out of the seed
+/// entirely and `context.packet_size` keeps its `ClientContext::default()`
+/// value instead — seeding zero directly would fail `ClientContext`'s
+/// `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]` validation. Any other
+/// `state_packet_size` is always clamped to `[MIN_PACKET_SIZE,
+/// MAX_PACKET_SIZE]` (both well within u16), so that cast never truncates.
+/// Extracted out of `do_connect` so a test can drive it directly rather than
+/// re-typing its two statements, which would silently stop guarding the real
+/// code path the moment the two drifted apart.
+fn seed_and_apply_connection_params(
+    context: &mut ClientContext,
+    state_packet_size: u32,
+    params: &ConnectionParams,
+) {
+    if state_packet_size != 0 {
+        context.packet_size = state_packet_size as u16;
+    }
+    apply_connection_params(context, params);
 }
 
 #[cfg(test)]
@@ -437,10 +687,411 @@ mod tests {
     };
     use crate::test_support::{TestHandles, cs};
 
+    #[test]
+    fn stale_post_connect_session_overrides_login_success() {
+        assert_eq!(combine_connect_results(SQL_SUCCESS, SQL_ERROR), SQL_ERROR);
+        assert_eq!(
+            combine_connect_results(SQL_SUCCESS, SQL_SUCCESS_WITH_INFO),
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(
+            combine_connect_results(SQL_SUCCESS_WITH_INFO, SQL_SUCCESS),
+            SQL_SUCCESS_WITH_INFO
+        );
+    }
+
+    #[test]
+    fn initial_database_uses_keyword_then_attribute_then_login_default() {
+        assert_eq!(
+            initial_database("keyword_db", Some("attribute_db")),
+            "keyword_db"
+        );
+        assert_eq!(initial_database("", Some("attribute_db")), "attribute_db");
+        assert_eq!(initial_database("", Some("")), "");
+        assert_eq!(initial_database("", None), "");
+    }
+
+    #[test]
+    fn odbc_driver_identity_is_seeded_into_client_context() {
+        let mut context = ClientContext::default();
+        configure_driver_identity(&mut context);
+        let expected_driver_version = DriverVersion::new(
+            env!("CARGO_PKG_VERSION_MAJOR")
+                .parse()
+                .expect("major version should parse"),
+            env!("CARGO_PKG_VERSION_MINOR")
+                .parse()
+                .expect("minor version should parse"),
+            env!("CARGO_PKG_VERSION_PATCH")
+                .parse()
+                .expect("patch version should parse"),
+        );
+
+        assert_eq!(context.library_name, ODBC_LIBRARY_NAME);
+        assert_eq!(
+            context.user_agent.library_name,
+            ODBC_USER_AGENT_LIBRARY_NAME
+        );
+        assert_eq!(context.driver_version, expected_driver_version);
+        assert_eq!(
+            context.user_agent.driver_version,
+            ODBC_DRIVER_VERSION_STRING
+        );
+    }
+
+    #[test]
+    fn driver_connect_emits_odbc_user_agent_metadata() {
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, connection_store, shutdown_tx, server_handle) =
+            server_runtime.block_on(async {
+                let server = MockTdsServer::new("127.0.0.1:0")
+                    .await
+                    .expect("failed to start mock server");
+                let addr = server.local_addr();
+                let store = server.connection_store();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let handle = tokio::spawn(async move {
+                    let _ = server.run_with_shutdown(rx).await;
+                });
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                (addr, store, tx, handle)
+            });
+
+        let h = TestHandles::with_env_dbc();
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert!(
+            matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+            "connect failed: {ret}"
+        );
+
+        let user_agent = server_runtime.block_on(async {
+            connection_store
+                .lock()
+                .await
+                .all()
+                .values()
+                .last()
+                .and_then(|connection| connection.received_user_agent())
+        });
+        let user_agent = user_agent.expect("mock server should capture the Login7 user agent");
+        let parts: Vec<&str> = user_agent.split('|').collect();
+
+        assert_eq!(parts.first(), Some(&"1"));
+        assert_eq!(parts.get(1), Some(&ODBC_USER_AGENT_LIBRARY_NAME));
+        assert_eq!(parts.get(2), Some(&ODBC_DRIVER_VERSION_STRING));
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
+    /// The value a get reports must match the encryption the connection
+    /// actually uses. These are two separate mappings over the same keyword
+    /// vocabulary, so pin them together rather than trusting them to stay in
+    /// step.
+    #[test]
+    fn reported_encrypt_matches_the_negotiated_setting() {
+        for (keyword, setting, connection_is_encrypted, code) in [
+            (Some("yes"), EncryptionSetting::On, true, 1u32),
+            (Some("mandatory"), EncryptionSetting::On, true, 1),
+            (Some("no"), EncryptionSetting::PreferOff, false, 0),
+            (Some("no"), EncryptionSetting::PreferOff, true, 1),
+            (Some("optional"), EncryptionSetting::PreferOff, false, 0),
+            (Some("strict"), EncryptionSetting::Strict, true, 2),
+            (Some("STRICT"), EncryptionSetting::Strict, true, 2),
+            (None, EncryptionSetting::On, true, 1),
+        ] {
+            assert_eq!(encryption_setting(keyword), setting, "keyword {keyword:?}");
+
+            let (mut params, _) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
+            params.encrypt = keyword.map(str::to_string);
+            assert_eq!(
+                effective_vendor_settings(&params, connection_is_encrypted, true).encrypt,
+                Some(code),
+                "keyword {keyword:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_overrides_displace_the_matching_keyword() {
+        let base = cs(
+            "Server=h;UID=u;<PW>=p;Encrypt=no;TrustServerCertificate=yes;\
+             MultiSubnetFailover=yes;TransparentNetworkIPResolution=Disabled",
+        );
+        let (params, _) = parse_connection_string(&base).unwrap();
+
+        // Nothing set: the connection string is left exactly as parsed.
+        let mut untouched = params.clone();
+        apply_vendor_overrides(&mut untouched, &VendorConnOverrides::default());
+        assert_eq!(untouched.encrypt, params.encrypt);
+        assert_eq!(
+            untouched.trust_server_certificate,
+            params.trust_server_certificate
+        );
+        assert_eq!(untouched.trusted_connection, params.trusted_connection);
+        assert_eq!(untouched.multi_subnet_failover, Some(true));
+        assert_eq!(untouched.transparent_network_ip_resolution, Some(false));
+
+        // Each attribute wins over the keyword it duplicates.
+        let mut overridden = params.clone();
+        apply_vendor_overrides(
+            &mut overridden,
+            &VendorConnOverrides {
+                encrypt: Some(2),
+                trust_server_certificate: Some(0),
+                integrated_security: Some(1),
+                multi_subnet_failover: Some(0),
+            },
+        );
+        assert_eq!(overridden.encrypt.as_deref(), Some("strict"));
+        assert!(!overridden.trust_server_certificate);
+        assert_eq!(overridden.trusted_connection, Some(true));
+        assert_eq!(overridden.multi_subnet_failover, Some(false));
+        assert_eq!(overridden.transparent_network_ip_resolution, Some(false));
+    }
+
+    #[test]
+    fn tnir_keyword_on_and_invalid_values_have_distinct_diagnostics() {
+        for (value, expected_state) in [("Enabled", "HYC00"), ("invalid", "HY024")] {
+            let handles = TestHandles::with_env_dbc();
+            let input: Vec<u16> = format!("Server=host;TransparentNetworkIPResolution={value}")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let result = unsafe {
+                crate::api::exports::SQLDriverConnectW(
+                    handles.dbc,
+                    std::ptr::null_mut(),
+                    input.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert_eq!(result, SQL_ERROR);
+            assert_eq!(unsafe { diag_sqlstate(handles.dbc, 1) }, expected_state);
+        }
+    }
+
+    #[test]
+    fn msf_getter_tracks_connected_policy_without_leaking_keywords_to_reconnects() {
+        use crate::api::exports::{
+            SQLDisconnect, SQLDriverConnectW, SQLGetConnectAttrW, SQLSetConnectAttrW,
+        };
+        use crate::api::odbc_types::{
+            SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_TNIR, SqlPointer,
+        };
+        use mssql_mock_tds::MockTdsServer;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (address, shutdown, server_task) = runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+            let address = server.local_addr();
+            let (shutdown, receiver) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move { server.run_with_shutdown(receiver).await });
+            (address, shutdown, task)
+        });
+        let server = format!("Server=tcp:{},{};", address.ip(), address.port());
+        let address_override = format!(
+            "Server=localhost;Address={},{};",
+            address.ip(),
+            address.port(),
+        );
+        for (keyword, attribute, effective) in [
+            ("", None, 1),
+            ("MultiSubnetFailover=No;", None, 0),
+            ("MultiSubnetFailover=Yes;", Some(0), 0),
+            ("MultiSubnetFailover=No;", Some(1), 1),
+            ("TransparentNetworkIPResolution=Disabled;", None, 1),
+            ("Failover_Partner=mirror;", None, 0),
+            ("FailoverPartner=mirror;", None, 0),
+        ] {
+            let handles = TestHandles::with_env_dbc();
+            if let Some(value) = attribute {
+                assert_eq!(
+                    unsafe {
+                        SQLSetConnectAttrW(
+                            handles.dbc,
+                            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                            value as SqlPointer,
+                            0,
+                        )
+                    },
+                    SQL_SUCCESS,
+                );
+            }
+            for (endpoint, options, expected) in [
+                (&server, keyword, effective),
+                (&address_override, "", attribute.unwrap_or(1)),
+            ] {
+                let input: Vec<u16> = cs(&format!(
+                    "{endpoint}UID=sa;<PW>=unused;Encrypt=no;TrustServerCertificate=yes;{options}",
+                ))
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+                let result = unsafe {
+                    SQLDriverConnectW(
+                        handles.dbc,
+                        std::ptr::null_mut(),
+                        input.as_ptr(),
+                        SQL_NTS,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        SQL_DRIVER_NOPROMPT,
+                    )
+                };
+                assert!(
+                    matches!(result, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+                    "{options}: {result}"
+                );
+                for (attr, expected) in [
+                    (SQL_COPT_SS_MULTISUBNET_FAILOVER, expected),
+                    (SQL_COPT_SS_TNIR, 0),
+                ] {
+                    let mut value = u32::MAX;
+                    let mut length = -1;
+                    assert_eq!(
+                        unsafe {
+                            SQLGetConnectAttrW(
+                                handles.dbc,
+                                attr,
+                                (&mut value as *mut u32).cast(),
+                                4,
+                                &mut length,
+                            )
+                        },
+                        SQL_SUCCESS,
+                    );
+                    assert_eq!(value, expected as u32, "{options}");
+                    assert_eq!(length, 4);
+                }
+                assert_eq!(unsafe { SQLDisconnect(handles.dbc) }, SQL_SUCCESS);
+                let mut value = u32::MAX;
+                assert_eq!(
+                    unsafe {
+                        SQLGetConnectAttrW(
+                            handles.dbc,
+                            SQL_COPT_SS_MULTISUBNET_FAILOVER,
+                            (&mut value as *mut u32).cast(),
+                            4,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    SQL_SUCCESS,
+                );
+                assert_eq!(value, attribute.unwrap_or(1) as u32);
+            }
+        }
+        shutdown.send(()).unwrap();
+        runtime.block_on(server_task).unwrap().unwrap();
+    }
+
+    #[test]
+    fn effective_settings_report_the_resolved_connection() {
+        // A get reads back what the connection resolved to, from whichever path
+        // set it -- measured: `Encrypt=no` with no attribute reads back 0.
+        let (params, _) =
+            parse_connection_string(&cs("Server=h;Trusted_Connection=yes;Encrypt=no")).unwrap();
+        assert_eq!(
+            effective_vendor_settings(&params, false, true),
+            VendorConnOverrides {
+                encrypt: Some(0),
+                trust_server_certificate: Some(0),
+                integrated_security: Some(1),
+                multi_subnet_failover: Some(1),
+            }
+        );
+
+        let (params, _) = parse_connection_string(&cs(
+            "Server=h;MultiSubnetFailover=yes;TransparentNetworkIPResolution=Disabled",
+        ))
+        .unwrap();
+        let settings = effective_vendor_settings(&params, false, false);
+        // The captured policy, not the original keyword, controls the getter.
+        assert_eq!(settings.multi_subnet_failover, Some(0));
+    }
+
+    #[test]
+    fn msf_mapping_preserves_unspecified_and_explicit_false() {
+        let mut context = ClientContext::default();
+        assert_eq!(context.multi_subnet_failover, None);
+
+        let (params, _) = parse_connection_string(&cs(
+            "Server=h;MultiSubnetFailover=no;TransparentNetworkIPResolution=Disabled",
+        ))
+        .unwrap();
+        apply_connection_params(&mut context, &params);
+        assert_eq!(context.multi_subnet_failover, Some(false));
+
+        let (params, _) = parse_connection_string(&cs("Server=h")).unwrap();
+        let mut context = ClientContext::default();
+        apply_connection_params(&mut context, &params);
+        assert_eq!(context.multi_subnet_failover, None);
+    }
+
+    /// The trust flag reports the effective certificate policy, not the
+    /// keyword. Encryption off means there is no certificate in play, and
+    /// msodbcsql reports 0 for it even when `TrustServerCertificate=Yes` was
+    /// asked for -- found by running the e2e parity variation against the
+    /// vendor driver.
+    #[test]
+    fn trust_is_only_reported_when_the_connection_is_encrypted() {
+        for (keywords, connection_is_encrypted, expected) in [
+            ("Encrypt=yes;TrustServerCertificate=yes", true, 1),
+            ("Encrypt=yes;TrustServerCertificate=no", true, 0),
+            ("Encrypt=no;TrustServerCertificate=yes", false, 0),
+            ("Encrypt=no;TrustServerCertificate=no", false, 0),
+            ("Encrypt=no;TrustServerCertificate=yes", true, 1),
+            ("Encrypt=no;TrustServerCertificate=no", true, 0),
+        ] {
+            let (params, _) =
+                parse_connection_string(&cs(&format!("Server=h;UID=u;<PW>=p;{keywords}"))).unwrap();
+            assert_eq!(
+                effective_vendor_settings(&params, connection_is_encrypted, true)
+                    .trust_server_certificate,
+                Some(expected),
+                "{keywords}, encrypted={connection_is_encrypted}"
+            );
+        }
+    }
+
     /// Read SQLSTATE for record `rec_number` on a DBC handle by calling the
     /// driver's own `SQLGetDiagRecW` entry point. Tests use this to verify
     /// the diagnostic surface that real ODBC apps see, not just the internal
     /// `diag_records` vec.
+    ///
+    /// # Safety
+    /// `dbc` must point to a live `DbcHandle`.
     unsafe fn diag_sqlstate(dbc: SqlHandle, rec_number: SqlSmallInt) -> String {
         let mut state_buf = [0u16; 6];
         let mut msg_buf = [0u16; 256];
@@ -614,6 +1265,36 @@ mod tests {
     }
 
     #[test]
+    fn failed_connects_do_not_promote_keywords_to_reusable_attribute_overrides() {
+        let h = TestHandles::with_env_dbc();
+        for encrypt in ["no", "yes"] {
+            let conn_str: Vec<u16> = cs(&format!("UID=u;<PW>=p;Encrypt={encrypt}"))
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let ret = unsafe {
+                sql_driver_connect_w(
+                    h.dbc,
+                    std::ptr::null_mut(),
+                    conn_str.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "attempt with Encrypt={encrypt}");
+
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.connection_state, ConnectionState::Disconnected);
+            assert_eq!(state.vendor_overrides, VendorConnOverrides::default());
+            assert_eq!(state.effective_vendor_settings, None);
+        }
+    }
+
+    #[test]
     fn explicit_string_length() {
         // Pass an explicit length instead of SQL_NTS — extra chars after length are ignored.
         let h = TestHandles::with_env_dbc();
@@ -747,6 +1428,35 @@ mod tests {
     }
 
     #[test]
+    fn apply_params_leaves_packet_size_zero_keyword_unseeded() {
+        // `PacketSize=0` is msodbcsql's same "unspecified" sentinel as
+        // `SQL_ATTR_PACKET_SIZE, 0` — both write the same dwOptions slot
+        // verbatim with no clamp — so it must not be forced up to
+        // `MIN_PACKET_SIZE` any more than the attribute path is.
+        let default_packet_size = ClientContext::default().packet_size;
+        let mut ctx = ClientContext::default();
+        ctx.packet_size = 4096; // simulate a prior nonzero seed being left alone
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                packet_size: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.packet_size, 4096, "a zero keyword must not overwrite");
+
+        let mut fresh_ctx = ClientContext::default();
+        apply_connection_params(
+            &mut fresh_ctx,
+            &ConnectionParams {
+                packet_size: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(fresh_ctx.packet_size, default_packet_size);
+    }
+
+    #[test]
     fn apply_params_maps_keepalive_seconds_to_millis() {
         let mut ctx = ClientContext::default();
         apply_connection_params(
@@ -782,8 +1492,21 @@ mod tests {
             ctx.ipaddress_preference,
             IPAddressPreference::IPv6First
         ));
-        assert!(ctx.multi_subnet_failover);
+        assert_eq!(ctx.multi_subnet_failover, Some(true));
         assert_eq!(ctx.server_spn.as_deref(), Some("MSSQLSvc/host:1433"));
+    }
+
+    #[test]
+    fn apply_params_maps_app_to_application_name() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                application_name: Some("MSSQL-Python".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.application_name, "MSSQL-Python");
     }
 
     #[test]
@@ -791,10 +1514,620 @@ mod tests {
         let mut ctx = ClientContext::default();
         let before_packet = ctx.packet_size;
         let before_retry = ctx.connect_retry_count;
+        let before_app_name = ctx.application_name.clone();
         apply_connection_params(&mut ctx, &ConnectionParams::default());
         assert_eq!(ctx.packet_size, before_packet);
         assert_eq!(ctx.connect_retry_count, before_retry);
+        assert_eq!(ctx.application_name, before_app_name);
         assert_eq!(ctx.encryption_options.host_name_in_cert, None);
         assert_eq!(ctx.encryption_options.server_certificate, None);
+    }
+
+    /// Drives `do_connect`'s actual `seed_and_apply_connection_params` helper
+    /// (not a re-typed copy of it): a pre-connect
+    /// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)` must reach the login
+    /// request when the connection string is silent on `PacketSize=`, but a
+    /// `PacketSize=` keyword must still win when both are present. Deleting
+    /// the seeding line inside the helper fails this test.
+    #[test]
+    fn preconnect_packet_size_attr_seeds_context_but_connection_string_keyword_wins() {
+        let mut ctx = ClientContext::default();
+        seed_and_apply_connection_params(&mut ctx, 16384, &ConnectionParams::default());
+        assert_eq!(
+            ctx.packet_size, 16384,
+            "a pre-connect SQL_ATTR_PACKET_SIZE must reach the login request"
+        );
+
+        let mut ctx = ClientContext::default();
+        seed_and_apply_connection_params(
+            &mut ctx,
+            16384,
+            &ConnectionParams {
+                packet_size: Some(4096),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.packet_size, 4096,
+            "PacketSize= in the connection string must override the pre-connect attribute"
+        );
+    }
+
+    /// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE, 0)` stores the msodbcsql
+    /// "unspecified" sentinel (`set_connect_attr.rs`), which this helper must
+    /// not seed verbatim: `ClientContext` rejects a zero packet size
+    /// (`client_context.rs`'s `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]`
+    /// validation), so seeding it would turn every connect attempt on a
+    /// zeroed handle into a hard failure instead of falling back to the
+    /// context's own default.
+    #[test]
+    fn zero_state_packet_size_leaves_the_context_default_unseeded() {
+        let default_packet_size = ClientContext::default().packet_size;
+
+        let mut ctx = ClientContext::default();
+        seed_and_apply_connection_params(&mut ctx, 0, &ConnectionParams::default());
+        assert_eq!(
+            ctx.packet_size, default_packet_size,
+            "a zero SQL_ATTR_PACKET_SIZE must not override the context default"
+        );
+
+        // A `PacketSize=` keyword must still be honored even though the
+        // attribute itself is the zero sentinel.
+        let mut ctx = ClientContext::default();
+        seed_and_apply_connection_params(
+            &mut ctx,
+            0,
+            &ConnectionParams {
+                packet_size: Some(4096),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.packet_size, 4096,
+            "PacketSize= must still apply when the pre-connect attribute is the zero sentinel"
+        );
+    }
+
+    /// `SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE)` and `SQLGetInfo`'s
+    /// `128 * packet_size` limits must both keep reporting the *requested*
+    /// packet size after connecting, even though the server negotiates a
+    /// different one, matching msodbcsql: its `SQLGetConnectAttr`/
+    /// `SQLGetInfo` read the single `dwOptions` slot the LOGIN7 request was
+    /// built from, and nothing writes the ENVCHANGE-negotiated size back
+    /// into it. This mock server always negotiates down to 4096 regardless
+    /// of what is requested (`mssql-mock-tds/src/protocol.rs`), so
+    /// requesting a different size reliably exercises this.
+    #[test]
+    fn connect_keeps_reporting_the_requested_packet_size_not_the_negotiated_one() {
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::get_info::sql_get_info_w;
+        use crate::api::odbc_types::{
+            SQL_ATTR_PACKET_SIZE, SQL_MAX_CHAR_LITERAL_LEN, SqlInteger, SqlPointer, SqlSmallInt,
+        };
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let requested_packet_size: u32 = 16384;
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;PacketSize={requested_packet_size}",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert!(
+            matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+            "connect failed: {ret}"
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let negotiated = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .wire
+            .client()
+            .expect("connected")
+            .packet_size();
+        assert_eq!(
+            negotiated, 4096,
+            "mock server is expected to always negotiate down to 4096"
+        );
+
+        let mut reported: u32 = 0;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, requested_packet_size,
+            "SQLGetConnectAttr must keep reporting the requested size, not the negotiated one"
+        );
+
+        let mut max_char_literal_len: u32 = 0;
+        let info_ret = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_MAX_CHAR_LITERAL_LEN,
+                &mut max_char_literal_len as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlSmallInt,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(info_ret, SQL_SUCCESS);
+        assert_eq!(
+            max_char_literal_len,
+            128 * requested_packet_size,
+            "SQLGetInfo must derive the limit from the requested size too, agreeing with \
+             SQLGetConnectAttr"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
+    /// `SQLDisconnect` must reset `SQL_ATTR_PACKET_SIZE` (and the derived
+    /// `SQLGetInfo` limits) back to the handle's pre-connect value: a
+    /// connection-string `PacketSize=` must not outlive the connection it
+    /// came from and leak onto the handle's next connect attempt.
+    #[test]
+    fn packet_size_resets_on_disconnect_to_pre_connect_value() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{
+            DEFAULT_PACKET_SIZE, SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer,
+        };
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;PacketSize=16384",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert!(
+            matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+            "connect failed: {ret}"
+        );
+
+        let disconnect_ret = unsafe { sql_disconnect(h.dbc) };
+        assert_eq!(disconnect_ret, SQL_SUCCESS);
+
+        let mut reported: u32 = 0;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, DEFAULT_PACKET_SIZE,
+            "a keyword-derived packet size must not survive SQLDisconnect"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
+    /// A connect attempt that fails after resolving its packet size (but
+    /// before mssql-tds returns a client) must not leave that attempted size
+    /// behind on the DBC: a subsequent connect on the same handle should
+    /// still request the handle's prior value, not the failed attempt's.
+    #[test]
+    fn failed_connect_does_not_persist_the_attempted_packet_size() {
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{
+            DEFAULT_PACKET_SIZE, SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer,
+        };
+
+        let h = TestHandles::with_env_dbc();
+
+        // Reserve a port, then drop the listener so nothing accepts on it —
+        // `create_client` fails quickly with a real connection error, well
+        // past connection-string validation and packet-size resolution.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;PacketSize=16384;ConnectRetryCount=0",
+            addr.ip(),
+            addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR, "connect to an unused port must fail");
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().connection_state,
+            ConnectionState::Disconnected
+        );
+
+        let mut reported: u32 = 0;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, DEFAULT_PACKET_SIZE,
+            "a failed connect must not leave the attempted PacketSize= behind"
+        );
+    }
+
+    /// A pre-connect `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE, 0)` — the
+    /// msodbcsql "unspecified" sentinel — must survive a failed connect
+    /// attempt exactly like any other stored value: unlike `packet_size`
+    /// itself, `effective_packet_size` is never populated on a failed
+    /// attempt, so the handle must keep reporting the zero it was
+    /// explicitly given, not silently drift to `DEFAULT_PACKET_SIZE`.
+    #[test]
+    fn zero_packet_size_survives_a_failed_connect() {
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer};
+        use crate::api::set_connect_attr::sql_set_connect_attr_w;
+
+        let h = TestHandles::with_env_dbc();
+        let set_ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(set_ret, SQL_SUCCESS);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;ConnectRetryCount=0",
+            addr.ip(),
+            addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR, "connect to an unused port must fail");
+
+        let mut reported: u32 = 0xAAAA_AAAA;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, 0,
+            "a failed connect must not disturb the explicitly-set zero sentinel"
+        );
+    }
+
+    /// The zero sentinel must round-trip through a full successful
+    /// connect/disconnect/reconnect cycle: while connected,
+    /// `SQL_ATTR_PACKET_SIZE` reports the resolved (non-zero) size actually
+    /// used for the login, but after `SQLDisconnect` it must go back to
+    /// reporting the zero the caller explicitly asked for — not
+    /// `DEFAULT_PACKET_SIZE` — and a second connect must resolve the same
+    /// way.
+    #[test]
+    fn zero_packet_size_survives_connect_disconnect_reconnect() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer};
+        use crate::api::set_connect_attr::sql_set_connect_attr_w;
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let set_ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(set_ret, SQL_SUCCESS);
+
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        for _ in 0..2 {
+            let ret = unsafe {
+                sql_driver_connect_w(
+                    h.dbc,
+                    std::ptr::null_mut(),
+                    conn_str.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert!(
+                matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+                "connect failed: {ret}"
+            );
+
+            let mut connected_reported: u32 = 0;
+            let get_ret = unsafe {
+                sql_get_connect_attr_w(
+                    h.dbc,
+                    SQL_ATTR_PACKET_SIZE,
+                    &mut connected_reported as *mut u32 as SqlPointer,
+                    std::mem::size_of::<u32>() as SqlInteger,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(get_ret, SQL_SUCCESS);
+            assert_ne!(
+                connected_reported, 0,
+                "while connected the zero sentinel must resolve to an actual size"
+            );
+
+            let disconnect_ret = unsafe { sql_disconnect(h.dbc) };
+            assert_eq!(disconnect_ret, SQL_SUCCESS);
+
+            let mut reported: u32 = 0xAAAA_AAAA;
+            let get_ret = unsafe {
+                sql_get_connect_attr_w(
+                    h.dbc,
+                    SQL_ATTR_PACKET_SIZE,
+                    &mut reported as *mut u32 as SqlPointer,
+                    std::mem::size_of::<u32>() as SqlInteger,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(get_ret, SQL_SUCCESS);
+            assert_eq!(
+                reported, 0,
+                "SQLDisconnect must restore the explicitly-set zero sentinel, not \
+                 DEFAULT_PACKET_SIZE"
+            );
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
+    /// A successful connect must advance `session_generation` and clear the
+    /// cached database principal.
+    ///
+    /// `do_connect` is the only producer of `session_generation` in the crate;
+    /// everything else reads it. `publish_lookup` compares it to decide whether
+    /// the session it queried is still the one on the handle, and without the
+    /// bump that comparison can never fire from a real connect — leaving only
+    /// the `connection_state != Connected` half of the condition, which is
+    /// false in exactly the case the counter exists for: a reconnect that has
+    /// already completed, so the handle is `Connected` again on a *different*
+    /// session.
+    ///
+    /// Driven through a real connect rather than by writing the field, so the
+    /// producer is pinned and not just the comparison.
+    #[test]
+    fn connect_advances_the_session_generation_and_clears_the_database_user() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::handles::dbc::{CachedDatabaseReadOnly, CachedDatabaseUserName};
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let connect = || {
+            let ret = unsafe {
+                sql_driver_connect_w(
+                    h.dbc,
+                    std::ptr::null_mut(),
+                    conn_str.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert!(
+                matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+                "connect failed: {ret}"
+            );
+        };
+
+        connect();
+        let first = dbc.inner.lock().unwrap().session_generation;
+
+        // Stand in for a lookup having cached this session's principal, and
+        // replace the session underneath it.
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.database_user_name = Some(CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                database_change_count: 0,
+                value: "first_session_user".to_string(),
+            });
+            state.database_read_only = Some(Box::new(CachedDatabaseReadOnly {
+                catalog: "master".to_string(),
+                database_change_count: 0,
+                read_only: true,
+            }));
+        }
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().database_read_only.is_none());
+        dbc.inner.lock().unwrap().database_read_only = Some(Box::new(CachedDatabaseReadOnly {
+            catalog: "master".to_string(),
+            database_change_count: 0,
+            read_only: true,
+        }));
+        connect();
+
+        let state = dbc.inner.lock().unwrap();
+        assert_ne!(
+            state.session_generation, first,
+            "a lookup in flight across this reconnect must be able to tell the sessions apart"
+        );
+        assert!(
+            state.database_user_name.is_none(),
+            "the new session's principal is unrelated to the old one's"
+        );
+        assert!(state.database_read_only.is_none());
+        drop(state);
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
     }
 }

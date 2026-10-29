@@ -42,11 +42,30 @@ pub(crate) mod test_utils {
     pub(crate) struct MockReader {
         data: Vec<u8>,
         position: usize,
+        data_classification_version:
+            Option<crate::token::data_classification::DataClassificationVersion>,
     }
 
     impl MockReader {
         pub(crate) fn new(data: Vec<u8>) -> Self {
-            Self { data, position: 0 }
+            Self {
+                data,
+                position: 0,
+                data_classification_version: None,
+            }
+        }
+
+        /// Simulates a connection that negotiated Data Classification at login.
+        pub(crate) fn with_data_classification_version(
+            mut self,
+            version: crate::token::data_classification::DataClassificationVersion,
+        ) -> Self {
+            self.data_classification_version = Some(version);
+            self
+        }
+
+        pub(crate) fn remaining(&self) -> usize {
+            self.data.len() - self.position
         }
 
         pub(crate) fn from_i32(value: i32) -> Self {
@@ -68,6 +87,12 @@ pub(crate) mod test_utils {
     }
 
     impl TdsPacketReader for MockReader {
+        fn negotiated_data_classification_version(
+            &self,
+        ) -> Option<crate::token::data_classification::DataClassificationVersion> {
+            self.data_classification_version
+        }
+
         async fn read_byte(&mut self) -> TdsResult<u8> {
             if self.position >= self.data.len() {
                 return Err(crate::error::Error::Io(std::io::Error::new(

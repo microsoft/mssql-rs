@@ -22,15 +22,31 @@ use crate::api::odbc_types::{SQL_FETCH_NEXT, SqlHandle, SqlReturn};
 ///
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
+/// Every active bound-column data buffer must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `BufferLength` is zero or smaller. Its indicator and octet-length
+/// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
+/// `SQL_ATTR_ROWS_FETCHED_PTR` must be writable for one `SqlULen`,
+/// `SQL_ATTR_ROW_STATUS_PTR` for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlUSmallInt`
+/// values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable for one
+/// `SqlULen`, whenever those attributes are non-null.
 pub(crate) unsafe fn sql_fetch(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLFetch called");
-    crate::ffi_entry!("SQLFetch", unsafe {
-        let rc = sql_fetch_scroll_impl(statement_handle, SQL_FETCH_NEXT, 0);
-        if rc == crate::api::odbc_types::SQL_ERROR {
-            error!("SQLFetch: fetch failed");
+    crate::ffi_entry!(
+        "SQLFetch",
+        statement_handle,
+        debug!(?statement_handle, "SQLFetch called"),
+        unsafe {
+            let rc = sql_fetch_scroll_impl(statement_handle, SQL_FETCH_NEXT, 0);
+            if rc == crate::api::odbc_types::SQL_ERROR {
+                error!("SQLFetch: fetch failed");
+            }
+            rc
         }
-        rc
-    })
+    )
 }
 
 #[cfg(test)]
@@ -70,7 +86,7 @@ mod tests {
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
-            dbc_state.active_stmt = Some(other_stmt);
+            dbc_state.wire.set_owner_for_test(Some(other_stmt));
         }
 
         let ret = unsafe { sql_fetch(h.stmt) };
@@ -86,7 +102,7 @@ mod tests {
         drop(stmt_state);
 
         let dbc_state = dbc_handle.inner.lock().unwrap();
-        assert_eq!(dbc_state.active_stmt, Some(other_stmt));
+        assert_eq!(dbc_state.wire.statement_owner(), Some(other_stmt));
     }
 
     /// CURSOR_OPEN is set but `active_stmt` is `None` — i.e. a previous fetch
@@ -102,7 +118,7 @@ mod tests {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
         }
-        // Leave dbc.active_stmt as None and dbc.client as None — this mirrors
+        // Leave the wire unreserved and without a client — this mirrors
         // the post-drain state that fetch_rows_next produces on Ok(None).
 
         let ret = unsafe { sql_fetch(h.stmt) };
@@ -137,8 +153,8 @@ mod tests {
         let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut dbc_state = dbc_handle.inner.lock().unwrap();
-            dbc_state.client = Some(client);
-            dbc_state.active_stmt = Some(h.stmt);
+            dbc_state.wire.put_client_for_test(client);
+            dbc_state.wire.set_owner_for_test(Some(h.stmt));
         }
 
         let ret = unsafe { sql_fetch(h.stmt) };
@@ -151,7 +167,7 @@ mod tests {
 
         // The client is restored and the connection stays busy on this statement.
         let dbc_state = dbc_handle.inner.lock().unwrap();
-        assert!(dbc_state.client.is_some());
-        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+        assert!(dbc_state.wire.client().is_some());
+        assert_eq!(dbc_state.wire.statement_owner(), Some(h.stmt));
     }
 }

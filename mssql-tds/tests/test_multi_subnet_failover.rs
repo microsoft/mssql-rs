@@ -31,7 +31,7 @@ mod multi_subnet_failover_tests {
     /// Create a client with MultiSubnetFailover enabled
     async fn create_client_with_msf(datasource: &str) -> TdsResult<TdsClient> {
         let mut client_context = create_context();
-        client_context.multi_subnet_failover = true; // Enable MSF
+        client_context.multi_subnet_failover = Some(true); // Enable MSF
         // Use PreferOff encryption to test MSF without TDS 8.0 strict mode
         // trust_server_certificate is read from TRUST_SERVER_CERTIFICATE env var by create_context()
         client_context.encryption_options.mode = EncryptionSetting::PreferOff;
@@ -45,7 +45,7 @@ mod multi_subnet_failover_tests {
     /// Create a client with MultiSubnetFailover disabled (sequential mode)
     async fn create_client_sequential(datasource: &str) -> TdsResult<TdsClient> {
         let mut client_context = create_context();
-        client_context.multi_subnet_failover = false; // Disable MSF (sequential)
+        client_context.multi_subnet_failover = Some(false); // Disable MSF (sequential)
         // Use PreferOff encryption to test sequential mode without TDS 8.0 strict mode
         // trust_server_certificate is read from TRUST_SERVER_CERTIFICATE env var by create_context()
         client_context.encryption_options.mode = EncryptionSetting::PreferOff;
@@ -135,7 +135,7 @@ mod multi_subnet_failover_tests {
         init_tracing();
 
         let mut client_context = create_dummy_context();
-        client_context.multi_subnet_failover = true;
+        client_context.multi_subnet_failover = Some(true);
 
         let provider = TdsConnectionProvider {};
         let result = provider
@@ -154,7 +154,7 @@ mod multi_subnet_failover_tests {
         init_tracing();
 
         let mut client_context = create_dummy_context();
-        client_context.multi_subnet_failover = true;
+        client_context.multi_subnet_failover = Some(true);
 
         // Try to connect to a port that's unlikely to be listening
         let provider = TdsConnectionProvider {};
@@ -170,7 +170,7 @@ mod multi_subnet_failover_tests {
         init_tracing();
 
         let mut client_context = create_dummy_context();
-        client_context.multi_subnet_failover = true;
+        client_context.multi_subnet_failover = Some(true);
         client_context.failover_partner = "mirror.server.com".to_string(); // Set failover partner
 
         let provider = TdsConnectionProvider {};

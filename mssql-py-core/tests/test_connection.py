@@ -3,9 +3,42 @@
 
 """Tests for PyCoreConnection functionality."""
 import time
+from uuid import uuid4
 
 import pytest
 import mssql_py_core
+
+
+def _session_count(cursor, application_name):
+    cursor.execute(
+        "SELECT COUNT(*) FROM sys.dm_exec_sessions "
+        f"WHERE program_name = '{application_name}'"
+    )
+    return cursor.fetchone()[0]
+
+
+def _wait_for_session_close(cursor, application_name):
+    deadline = time.monotonic() + 10
+    while _session_count(cursor, application_name) != 0:
+        assert time.monotonic() < deadline, (
+            f"Session for {application_name!r} still exists 10 seconds after close"
+        )
+        time.sleep(0.1)
+
+
+@pytest.fixture
+def monitored_connection(client_context, connection):
+    application_name = f"mssql-py-close-{uuid4().hex}"
+    context = {**client_context, "application_name": application_name}
+    conn = mssql_py_core.PyCoreConnection(context)
+    try:
+        mon_cursor = connection.cursor()
+        assert _session_count(mon_cursor, application_name) == 1, (
+            "Session with the unique application name should exist before close"
+        )
+        yield conn, mon_cursor, application_name
+    finally:
+        conn.close()
 
 
 def test_module_import():
@@ -14,34 +47,15 @@ def test_module_import():
 
 
 @pytest.mark.integration
-def test_connection_close_terminates_server_session(client_context):
-    """Verify close() terminates the server-side SPID."""
-    # Open a monitoring connection first (gets its own SPID)
-    monitor = mssql_py_core.PyCoreConnection(client_context)
-    mon_cursor = monitor.cursor()
-
-    # Open the connection under test
-    conn = mssql_py_core.PyCoreConnection(client_context)
+def test_connection_close_terminates_server_session(monitored_connection):
+    """Verify close() removes the session identified by its unique application name."""
+    conn, mon_cursor, application_name = monitored_connection
     cursor = conn.cursor()
-    cursor.execute("SELECT @@SPID")
-    spid = cursor.fetchone()[0]
+    cursor.execute("SELECT 1")
+    assert cursor.fetchone()[0] == 1
 
-    # Confirm SPID is alive
-    mon_cursor.execute(
-        f"SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = {spid}"
-    )
-    assert mon_cursor.fetchone()[0] == 1, "SPID should be alive before close"
-
-    # Close and verify SPID is gone
     conn.close()
-    time.sleep(0.5)
-
-    mon_cursor.execute(
-        f"SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = {spid}"
-    )
-    assert mon_cursor.fetchone()[0] == 0, "SPID should be gone after close"
-
-    monitor.close()
+    _wait_for_session_close(mon_cursor, application_name)
 
 
 @pytest.mark.integration
@@ -69,43 +83,32 @@ def test_connection_close_rejects_query_on_existing_cursor(client_context):
 
 
 @pytest.mark.integration
-def test_connection_close_after_bulkcopy(client_context):
+def test_connection_close_after_bulkcopy(monitored_connection):
     """Verify close() works correctly after a bulk copy operation."""
-    monitor = mssql_py_core.PyCoreConnection(client_context)
-    mon_cursor = monitor.cursor()
-
-    conn = mssql_py_core.PyCoreConnection(client_context)
+    conn, mon_cursor, application_name = monitored_connection
     cursor = conn.cursor()
-    cursor.execute("SELECT @@SPID")
-    spid = cursor.fetchone()[0]
 
     table_name = "TestConnectionCloseBCP"
     cursor.execute(
         f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}"
     )
     cursor.execute(f"CREATE TABLE {table_name} (id INT, val NVARCHAR(5))")
+    try:
+        rows = [(i, f"r{i}") for i in range(10)]
+        cursor.bulkcopy(table_name, iter(rows), batch_size=100, timeout=30, table_lock=True)
 
-    rows = [(i, f"r{i}") for i in range(10)]
-    cursor.bulkcopy(table_name, iter(rows), batch_size=100, timeout=30, table_lock=True)
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        assert cursor.fetchone()[0] == 10
 
-    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-    assert cursor.fetchone()[0] == 10
+        conn.close()
+        _wait_for_session_close(mon_cursor, application_name)
 
-    conn.close()
-    time.sleep(0.5)
-
-    # SPID should be gone
-    mon_cursor.execute(
-        f"SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE session_id = {spid}"
-    )
-    assert mon_cursor.fetchone()[0] == 0, "SPID should be gone after close"
-
-    # Data should persist (committed before close)
-    mon_cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-    assert mon_cursor.fetchone()[0] == 10
-
-    mon_cursor.execute(f"DROP TABLE {table_name}")
-    monitor.close()
+        # Data should persist (committed before close)
+        mon_cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        assert mon_cursor.fetchone()[0] == 10
+    finally:
+        conn.close()
+        mon_cursor.execute(f"DROP TABLE {table_name}")
 
 
 @pytest.mark.integration

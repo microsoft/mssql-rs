@@ -1,0 +1,129 @@
+# filepath: .pipeline/templates/build-odbc-windows-template.yml
+#
+# Build the mssql-odbc driver (mssqlodbc.dll) natively on Windows and publish
+# it as a pipeline artifact for the native NuGet package Publish stage.
+#
+# Driver only - no C++ gtest e2e binaries. Windows e2e coverage stays in the
+# PR-only leg in build-template.yml; this is the CI-only leg that stages a
+# releasable driver drop, mirroring build-odbc-template.yml on Linux.
+#
+# CI (non-PR) only.
+
+parameters:
+  # 'x64' or 'ARM64' - selects the build pool the surrounding job runs on.
+  - name: architecture
+    type: string
+  # Pipeline artifact name, e.g. 'Odbc_Windows_x64' / 'Odbc_Windows_arm64'.
+  - name: artifactName
+    type: string
+  # Publish this template's own artifact (disable when the caller does one
+  # combined publish for the whole job, e.g. OneBranch's stages.yml).
+  - name: publishArtifacts
+    type: boolean
+    default: true
+  # Authenticode-sign the driver with ESRP (CP-230012) before it is collected.
+  # Enable for official builds; the caller must load the ESRP variable group.
+  - name: signDriver
+    type: boolean
+    default: false
+  - name: esrpConnectedServiceName
+    type: string
+    default: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
+
+steps:
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+      cargo build --release --package mssqlodbc
+    displayName: 'Build mssql-odbc driver (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+      # Nest under build/ so the Publish stage's extraction step can use the
+      # same relative layout (build/<driver file>) across every platform.
+      $dropDir = "$(Build.SourcesDirectory)\odbc-drop\build"
+      New-Item -ItemType Directory -Force -Path $dropDir | Out-Null
+      # Resolve the cargo cdylib via the finalize script (validates existence
+      # with a clear error) rather than assuming a fixed CARGO_TARGET_DIR layout.
+      $driver = & "$(Build.SourcesDirectory)/mssql-odbc/scripts/finalize-artifact.ps1" -BuildProfile release
+      Copy-Item $driver $dropDir
+    displayName: 'Stage driver into drop (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  # Sign the raw driver at its source so it flows already-signed into whichever
+  # pipeline injects it into the wheels (NonOfficial Publish / Official Release).
+  - ${{ if eq(parameters.signDriver, true) }}:
+    - task: EsrpMalwareScanning@6
+      displayName: 'ESRP Malware Scanning driver (${{ parameters.architecture }})'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        ConnectedServiceName: '${{ parameters.esrpConnectedServiceName }}'
+        AppRegistrationClientId: '$(appRegistrationClientId)'
+        AppRegistrationTenantId: '$(appRegistrationTenantId)'
+        EsrpClientId: '$(EsrpClientId)'
+        FolderPath: '$(Build.SourcesDirectory)\odbc-drop\build'
+        Pattern: 'mssqlodbc.dll'
+        UseMinimatch: true
+        UseMSIAuthentication: true
+        CleanupTempStorage: true
+        VerboseLogin: true
+
+    - task: EsrpCodeSigning@6
+      displayName: 'ESRP CodeSigning driver (${{ parameters.architecture }})'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        ConnectedServiceName: '${{ parameters.esrpConnectedServiceName }}'
+        UseMSIAuthentication: true
+        AppRegistrationClientId: '$(appRegistrationClientId)'
+        AppRegistrationTenantId: '$(appRegistrationTenantId)'
+        EsrpClientId: '$(EsrpClientId)'
+        AuthAKVName: '$(AuthAKVName)'
+        AuthSignCertName: '$(AuthSignCertName)'
+        FolderPath: '$(Build.SourcesDirectory)\odbc-drop\build'
+        Pattern: 'mssqlodbc.dll'
+        UseMinimatch: true
+        signConfigType: inlineSignParams
+        inlineOperation: |
+          [
+            {
+              "KeyCode": "CP-230012",
+              "OperationCode": "SigntoolSign",
+              "ToolName": "sign",
+              "ToolVersion": "1.0",
+              "Parameters": {
+                "OpusName": "Microsoft",
+                "OpusInfo": "https://www.microsoft.com",
+                "FileDigest": "/fd SHA256",
+                "PageHash": "/NPH",
+                "TimeStamp": "/tr \"http://rfc3161.gtm.corp.microsoft.com/TSS/HttpTspServer\" /td sha256"
+              }
+            },
+            {
+              "KeyCode": "CP-230012",
+              "OperationCode": "SigntoolVerify",
+              "ToolName": "sign",
+              "ToolVersion": "1.0",
+              "Parameters": {}
+            }
+          ]
+        VerboseLogin: true
+
+    - pwsh: |
+        $ErrorActionPreference = 'Stop'
+        $driver = "$(Build.SourcesDirectory)\odbc-drop\build\mssqlodbc.dll"
+        $sig = Get-AuthenticodeSignature $driver
+        Write-Host "mssqlodbc.dll: $($sig.Status)"
+        if ($sig.Status -ne 'Valid') {
+          Write-Error "Driver signature invalid or missing: $($sig.Status)"
+          exit 1
+        }
+      displayName: 'Verify signed driver (${{ parameters.architecture }})'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ if eq(parameters.publishArtifacts, true) }}:
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish ${{ parameters.artifactName }}'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+        artifact: ${{ parameters.artifactName }}

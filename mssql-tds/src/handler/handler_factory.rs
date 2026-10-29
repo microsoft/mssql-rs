@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::dns_cache::Resolution;
 use crate::connection::session_recovery::SessionRecoveryData;
 use crate::core::{EncryptionSetting, NegotiatedEncryptionSetting, TdsResult, Version};
 use crate::error::{Error, SqlInfoMessage, SqlServerDiagnostics};
@@ -19,6 +20,7 @@ use crate::message::messages::Request;
 use crate::message::prelogin::{
     EncryptionType, PreloginRequest, PreloginRequestModel, PreloginResponse,
 };
+use crate::token::data_classification::DataClassificationVersion;
 use crate::token::login_ack::LoginAckToken;
 use crate::token::tokens::{SessionStateToken, SqlCollation};
 use tracing::{debug, warn};
@@ -29,6 +31,9 @@ pub(crate) struct HandlerFactory {
     /// Recovery data for session reconnection, passed separately from ClientContext
     /// since it is internal-only state not meant for library consumers.
     pub(crate) recovery_data: Option<Box<SessionRecoveryData>>,
+    /// What the transport resolved a TCP host to; the login's DNS caching
+    /// verdict publishes or removes it.
+    pub(crate) dns_resolution: Option<Resolution>,
 }
 
 impl HandlerFactory {
@@ -89,6 +94,7 @@ impl HandlerFactory {
 // The settings that can be negotiated during and after the login process as well.
 #[derive(Debug)]
 pub(crate) struct NegotiatedSettings {
+    pub client_connection_id: Uuid,
     pub session_settings: SessionSettings,
     pub database_collation: SqlCollation,
     pub language: String,
@@ -99,12 +105,30 @@ pub(crate) struct NegotiatedSettings {
     login_database: String,
     login_language: String,
     login_database_collation: SqlCollation,
-    #[allow(dead_code)] // populated during login, consumed by future env-change tracking
+    /// Character-set name from the login `CHARACTER_SET` `ENVCHANGE`, surfaced
+    /// as `SQL_COLLATION_SEQ`. `None` when the server sends a `SQL_COLLATION`
+    /// change instead, which modern servers do.
     pub char_set: Option<String>,
     /// TDS version from LoginAckToken, captured for session recovery validation.
     pub login_ack_tds_version: Option<TdsVersion>,
     /// Server program version from LoginAckToken, captured for session recovery validation.
     pub login_ack_server_version: Option<Version>,
+    /// The instance name the server reported in the `ServerName` field of the
+    /// INFO tokens it sent during login (`@@SERVERNAME`). Captured here rather
+    /// than read back from `TdsClient::info_messages`, which is cleared at the
+    /// start of every command and is empty on a pooled connection.
+    pub server_reported_name: Option<String>,
+    /// Counts every `ENV_DATABASE` the server has reported, plus every restore
+    /// to login defaults.
+    ///
+    /// The name alone cannot detect every database change: `USE [master]` while
+    /// already in `master` still produces an `ENVCHANGE`, and msodbcsql flags
+    /// its `USER_NAME()` cache for refresh on *any* `ENV_DATABASE` token
+    /// without comparing names (`sqlctokn.cpp:2866-2882`). Combined with an
+    /// `EXECUTE AS`, that same-name event is the only signal that the database
+    /// principal may have changed. Consumers caching per-database state pair
+    /// this with the name so a same-name event still invalidates.
+    pub database_change_count: u64,
 }
 
 impl NegotiatedSettings {
@@ -126,6 +150,7 @@ impl NegotiatedSettings {
         login_ack_server_version: Option<Version>,
     ) -> Self {
         NegotiatedSettings {
+            client_connection_id: Uuid::nil(),
             session_settings,
             database_collation,
             login_database: database.clone(),
@@ -136,6 +161,8 @@ impl NegotiatedSettings {
             char_set,
             login_ack_tds_version,
             login_ack_server_version,
+            server_reported_name: None,
+            database_change_count: 0,
         }
     }
 
@@ -147,6 +174,10 @@ impl NegotiatedSettings {
         self.database = self.login_database.clone();
         self.language = self.login_language.clone();
         self.database_collation = self.login_database_collation;
+        // Counted like a server-reported change: the session's database is
+        // being replaced, so per-database caches must not survive it even when
+        // the login default happens to be the database already in use.
+        self.database_change_count = self.database_change_count.wrapping_add(1);
     }
 
     /// Check if session recovery was acknowledged by the server in FEATUREEXTACK.
@@ -192,6 +223,15 @@ pub(crate) struct SessionSettings {
 }
 
 impl SessionSettings {
+    /// Data Classification version the server enabled at login, which fixes
+    /// the `0xA3` token layout for the connection. `None` when the feature was
+    /// not requested, not acknowledged, or acknowledged as disabled.
+    pub(crate) fn data_classification_version(&self) -> Option<DataClassificationVersion> {
+        self.supported_features
+            .iter()
+            .find_map(|f| f.negotiated_data_classification_version())
+    }
+
     // Note that this destructively consumes the features list.
     fn new(
         context: &ClientContext,
@@ -232,6 +272,7 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         sort_id: 0,
     };
     NegotiatedSettings {
+        client_connection_id: Uuid::nil(),
         session_settings,
         database_collation,
         language: "us_english".to_string(),
@@ -242,6 +283,8 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         char_set: None,
         login_ack_tds_version: None,
         login_ack_server_version: None,
+        server_reported_name: None,
+        database_change_count: 0,
     }
 }
 
@@ -250,6 +293,16 @@ pub(crate) struct SessionHandler<'a, 'b> {
     pub(crate) transport_context: &'b TransportContext,
 }
 
+/// Picks the server's own instance name (`@@SERVERNAME`) out of the INFO tokens
+/// received during login. A token that left the field blank is skipped rather
+/// than taken as the answer.
+fn server_name_from_login_messages(messages: &[SqlInfoMessage]) -> Option<String> {
+    messages
+        .iter()
+        .filter_map(|m| m.server_name.as_deref())
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
+}
 impl<'a, 'b> SessionHandler<'a, 'b> {
     pub(crate) async fn execute<T: NetworkReaderWriter + TdsTokenStreamReader + TdsPacketReader>(
         &mut self,
@@ -354,7 +407,7 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
 
         let language = change_props.language.clone().unwrap_or_default();
 
-        Ok(NegotiatedSettings::new(
+        let mut settings = NegotiatedSettings::new(
             session_settings,
             database_collation,
             language,
@@ -362,7 +415,15 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             change_props.char_set.clone(),
             login_ack_tds_version,
             login_ack_server_version,
-        ))
+        );
+
+        // Every INFO token carries the server's own instance name; the login
+        // response always contains at least the 5701 database-context message.
+        settings.server_reported_name =
+            server_name_from_login_messages(&login_result.diagnostics.info_messages);
+        settings.client_connection_id = prelogin_result.client_connection_id;
+
+        Ok(settings)
     }
 
     async fn get_login_result<T: TdsTokenStreamReader + NetworkReaderWriter>(
@@ -378,6 +439,7 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
 }
 
 struct PreloginResult {
+    client_connection_id: Uuid,
     encryption_setting: NegotiatedEncryptionSetting,
     is_fed_auth_supported: bool,
 }
@@ -394,11 +456,16 @@ impl PreloginHandler<'_> {
         reader_writer: &mut T,
     ) -> TdsResult<PreloginResult> {
         // Create the request.
+        let client_connection_id = Uuid::new_v4();
+        if let Some(trace) = &self.factory.context.connection_trace {
+            trace.begin_attempt(client_connection_id);
+        }
         let request_model = PreloginRequestModel::new(
-            Uuid::new_v4(),
+            client_connection_id,
             Option::from(self.factory.context.mars_enabled),
             Option::from(self.factory.context.encryption_options.mode),
             Option::from(self.factory.context.database_instance.as_str()),
+            self.factory.context.driver_version,
         );
         let prelogin_request = PreloginRequest {
             model: &request_model,
@@ -426,6 +493,7 @@ impl PreloginHandler<'_> {
             // If strict is used, the user is using TDS 8. The server's encryption response is
             // unused and the stream is already (and stays) encrypted.
             return Ok(PreloginResult {
+                client_connection_id,
                 encryption_setting: NegotiatedEncryptionSetting::Strict,
                 is_fed_auth_supported: response_model.federated_auth_supported,
             });
@@ -438,6 +506,7 @@ impl PreloginHandler<'_> {
                 // encryption it will return On and if not returns Unsupported.
                 if request_model.encryption_setting == EncryptionSetting::PreferOff {
                     Ok(PreloginResult {
+                        client_connection_id,
                         encryption_setting: NegotiatedEncryptionSetting::LoginOnly,
                         is_fed_auth_supported: response_model.federated_auth_supported,
                     })
@@ -451,6 +520,7 @@ impl PreloginHandler<'_> {
             EncryptionType::NotSupported => {
                 if request_model.encryption_setting == EncryptionSetting::PreferOff {
                     Ok(PreloginResult {
+                        client_connection_id,
                         encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
                         is_fed_auth_supported: response_model.federated_auth_supported,
                     })
@@ -462,6 +532,7 @@ impl PreloginHandler<'_> {
                 }
             }
             _ => Ok(PreloginResult {
+                client_connection_id,
                 encryption_setting: NegotiatedEncryptionSetting::Mandatory,
                 is_fed_auth_supported: response_model.federated_auth_supported,
             }),
@@ -685,7 +756,7 @@ impl LoginHandler<'_> {
         };
 
         // Create the login request, optionally with SSPI token
-        let request = if let Some(token) = sspi_token {
+        let mut request = if let Some(token) = sspi_token {
             LoginRequest {
                 model: LoginRequestModel::from_context_with_sspi(
                     context,
@@ -699,6 +770,12 @@ impl LoginHandler<'_> {
             self.factory
                 .create_login_request(self.prelogin_fedauth_supported, transport_context)
         };
+        if let Some(resolution) = &self.factory.dns_resolution {
+            request
+                .model
+                .features_request
+                .bind_dns_caching(resolution.clone());
+        }
 
         // Note that the login process uses a timeout at a higher level than the request.
         let mut packet_writer = request.create_packet_writer(reader_writer, None, None);
@@ -726,10 +803,79 @@ impl LoginHandler<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NegotiatedSettings, create_test_negotiated_settings_internal};
+    use super::{
+        NegotiatedSettings, create_test_negotiated_settings_internal,
+        server_name_from_login_messages,
+    };
+    use crate::error::SqlInfoMessage;
     use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+    use crate::message::features::data_classification::DataClassificationFeature;
     use crate::message::features::session_recovery::SessionRecoveryFeature;
     use crate::message::login::Feature;
+    use crate::token::data_classification::DataClassificationVersion;
+
+    fn info_message(server_name: Option<&str>) -> SqlInfoMessage {
+        SqlInfoMessage {
+            message: "Changed database context to 'master'.".to_string(),
+            state: 1,
+            class: 0,
+            number: 5701,
+            server_name: server_name.map(str::to_string),
+            proc_name: None,
+            line_number: None,
+        }
+    }
+
+    /// A connection reset returns the session to its login database, which is
+    /// usually the database already in use — so the name carries no signal and
+    /// a per-database cache would survive a reset that replaced the session.
+    /// Counted like a server-reported change for that reason.
+    #[test]
+    fn restoring_login_defaults_counts_as_a_database_change() {
+        let mut ns = create_test_negotiated_settings_internal();
+        ns.database = "master".to_string();
+        let before = ns.database_change_count;
+
+        ns.restore_login_defaults();
+
+        assert_eq!(ns.database, "master", "the login default is the same name");
+        assert_eq!(
+            ns.database_change_count,
+            before.wrapping_add(1),
+            "the session's database was replaced, so per-database state must not survive"
+        );
+    }
+
+    #[test]
+    fn server_name_comes_from_the_first_login_message_that_carries_one() {
+        let messages = vec![info_message(Some("SQLPROD01")), info_message(Some("OTHER"))];
+        assert_eq!(
+            server_name_from_login_messages(&messages).as_deref(),
+            Some("SQLPROD01")
+        );
+    }
+
+    #[test]
+    fn blank_and_absent_server_names_are_skipped_not_accepted() {
+        // A token that left the field empty must not shadow a later one that
+        // filled it in.
+        let messages = vec![
+            info_message(None),
+            info_message(Some("")),
+            info_message(Some("SQLPROD01")),
+        ];
+        assert_eq!(
+            server_name_from_login_messages(&messages).as_deref(),
+            Some("SQLPROD01")
+        );
+    }
+
+    #[test]
+    fn no_usable_server_name_yields_none() {
+        assert_eq!(server_name_from_login_messages(&[]), None);
+        let blank = vec![info_message(None), info_message(Some(""))];
+        assert_eq!(server_name_from_login_messages(&blank), None);
+    }
 
     fn settings_with_ae(acknowledged: bool) -> NegotiatedSettings {
         let mut settings = create_test_negotiated_settings_internal();
@@ -758,6 +904,43 @@ mod tests {
     fn is_column_encryption_supported_false_when_feature_absent() {
         let settings = create_test_negotiated_settings_internal();
         assert!(!settings.is_column_encryption_supported());
+    }
+
+    fn settings_with_data_classification(ack: Option<&[u8]>) -> NegotiatedSettings {
+        let mut settings = create_test_negotiated_settings_internal();
+        let mut feature = DataClassificationFeature::new(DataClassificationVersion::Version2);
+        if let Some(payload) = ack {
+            feature.set_acknowledged(true);
+            feature.deserialize(payload).unwrap();
+        }
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+        settings
+    }
+
+    #[test]
+    fn data_classification_version_reports_the_acknowledged_version() {
+        let settings = settings_with_data_classification(Some(&[0x01, 0x01]));
+        assert_eq!(
+            settings.session_settings.data_classification_version(),
+            Some(DataClassificationVersion::Version1)
+        );
+    }
+
+    #[test]
+    fn data_classification_version_none_when_disabled_unacknowledged_or_absent() {
+        for settings in [
+            settings_with_data_classification(Some(&[0x02, 0x00])),
+            settings_with_data_classification(None),
+            create_test_negotiated_settings_internal(),
+        ] {
+            assert_eq!(
+                settings.session_settings.data_classification_version(),
+                None
+            );
+        }
     }
 
     fn settings_with_session_recovery(acknowledged: bool) -> NegotiatedSettings {

@@ -44,17 +44,14 @@ use tracing::warn;
 const KNOWN_IGNORED_KEYS: &[&str] = &[
     "savefile",
     "filedsn",
-    "dsn",
     "description",
     "desc",
     "driver",
-    "app",
     "wsid",
     "language",
     "network",
     "net",
     "mars_connection",
-    "failover_partner",
     "failoverpartnerspn",
     "autotranslate",
     "querylog_on",
@@ -68,7 +65,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "attachdbfilename",
     "clientcertificate",
     "columnencryption",
-    "transparentnetworkipresolution",
     "keystoreauthentication",
     "keystoreprincipalid",
     "keystoresecret",
@@ -93,6 +89,9 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
 
 // Valid attribute values
 const YES_NO: &[&str] = &["yes", "no"];
+// `TransparentNetworkIPResolution` alone uses Enabled/Disabled (msodbcsql
+// `IsAttrStrValid`, `KEY_TNIR`).
+const ENABLED_DISABLED: &[&str] = &["Enabled", "Disabled"];
 const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
 const APPLICATION_INTENT_VALUES: &[&str] = &["ReadOnly", "ReadWrite"];
 // Shown in the diagnostic when a numeric attribute (PacketSize, ConnectRetryCount,
@@ -126,6 +125,7 @@ const AUTHENTICATION_VALUES: &[&str] = &[
 
 #[derive(Copy, Clone)]
 enum ConnAttrKey {
+    Dsn,
     Server,
     Database,
     Uid,
@@ -135,8 +135,11 @@ enum ConnAttrKey {
     Authentication,
     TrustedConnection,
     ServerSpn,
+    App,
     ApplicationIntent,
     MultiSubnetFailover,
+    FailoverPartner,
+    TransparentNetworkIpResolution,
     ConnectRetryCount,
     ConnectRetryInterval,
     KeepAlive,
@@ -194,6 +197,7 @@ impl fmt::Display for InvalidAttrValue {
 /// Parsed connection parameters extracted from an ODBC connection string.
 #[derive(Clone, Default)]
 pub(crate) struct ConnectionParams {
+    pub(crate) dsn: String,
     pub(crate) server: String,
     pub(crate) database: String,
     pub(crate) uid: String,
@@ -203,8 +207,11 @@ pub(crate) struct ConnectionParams {
     pub(crate) authentication: Option<String>,
     pub(crate) trusted_connection: Option<bool>,
     pub(crate) server_spn: Option<String>,
+    pub(crate) application_name: Option<String>,
     pub(crate) application_intent: Option<String>,
     pub(crate) multi_subnet_failover: Option<bool>,
+    pub(crate) failover_partner: Option<String>,
+    pub(crate) transparent_network_ip_resolution: Option<bool>,
     pub(crate) connect_retry_count: Option<u32>,
     pub(crate) connect_retry_interval: Option<u32>,
     pub(crate) keep_alive: Option<u32>,
@@ -219,6 +226,9 @@ impl ConnectionParams {
     pub(crate) fn fmt_as_odbc_conn_str(&self) -> String {
         let mut parts = Vec::new();
 
+        if !self.dsn.is_empty() {
+            parts.push(format!("DSN={}", quote_odbc_value(&self.dsn)));
+        }
         if !self.server.is_empty() {
             parts.push(format!("Server={}", quote_odbc_value(&self.server)));
         }
@@ -249,6 +259,9 @@ impl ConnectionParams {
         if let Some(server_spn) = &self.server_spn {
             parts.push(format!("ServerSPN={}", quote_odbc_value(server_spn)));
         }
+        if let Some(application_name) = &self.application_name {
+            parts.push(format!("APP={}", quote_odbc_value(application_name)));
+        }
         if let Some(application_intent) = &self.application_intent {
             parts.push(format!("ApplicationIntent={application_intent}"));
         }
@@ -256,6 +269,15 @@ impl ConnectionParams {
             parts.push(format!(
                 "MultiSubnetFailover={}",
                 if multi_subnet_failover { "yes" } else { "no" }
+            ));
+        }
+        if let Some(partner) = &self.failover_partner {
+            parts.push(format!("Failover_Partner={}", quote_odbc_value(partner)));
+        }
+        if let Some(tnir) = self.transparent_network_ip_resolution {
+            parts.push(format!(
+                "TransparentNetworkIPResolution={}",
+                if tnir { "Enabled" } else { "Disabled" }
             ));
         }
         if let Some(connect_retry_count) = self.connect_retry_count {
@@ -309,6 +331,7 @@ fn quote_odbc_value(value: &str) -> String {
 impl fmt::Debug for ConnectionParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectionParams")
+            .field("dsn", &self.dsn)
             .field("server", &self.server)
             .field("database", &self.database)
             .field("uid", &self.uid)
@@ -318,8 +341,14 @@ impl fmt::Debug for ConnectionParams {
             .field("authentication", &self.authentication)
             .field("trusted_connection", &self.trusted_connection)
             .field("server_spn", &self.server_spn)
+            .field("application_name", &self.application_name)
             .field("application_intent", &self.application_intent)
             .field("multi_subnet_failover", &self.multi_subnet_failover)
+            .field("failover_partner", &self.failover_partner)
+            .field(
+                "transparent_network_ip_resolution",
+                &self.transparent_network_ip_resolution,
+            )
             .field("connect_retry_count", &self.connect_retry_count)
             .field("connect_retry_interval", &self.connect_retry_interval)
             .field("keep_alive", &self.keep_alive)
@@ -362,6 +391,7 @@ fn is_odbc_space(c: char) -> bool {
 /// a key still requires a matching `ConnectionParams` field plus arms in
 /// `assign_value` (compiler-enforced), `fmt_as_odbc_conn_str`, and the `Debug` impl.
 const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
+    ("dsn", ConnAttrKey::Dsn),
     ("server", ConnAttrKey::Server),
     ("addr", ConnAttrKey::Server),
     ("address", ConnAttrKey::Server),
@@ -373,8 +403,15 @@ const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
     ("authentication", ConnAttrKey::Authentication),
     ("trusted_connection", ConnAttrKey::TrustedConnection),
     ("serverspn", ConnAttrKey::ServerSpn),
+    ("app", ConnAttrKey::App),
     ("applicationintent", ConnAttrKey::ApplicationIntent),
     ("multisubnetfailover", ConnAttrKey::MultiSubnetFailover),
+    ("failover_partner", ConnAttrKey::FailoverPartner),
+    ("failoverpartner", ConnAttrKey::FailoverPartner),
+    (
+        "transparentnetworkipresolution",
+        ConnAttrKey::TransparentNetworkIpResolution,
+    ),
     ("connectretrycount", ConnAttrKey::ConnectRetryCount),
     ("connectretryinterval", ConnAttrKey::ConnectRetryInterval),
     ("keepalive", ConnAttrKey::KeepAlive),
@@ -406,6 +443,9 @@ fn assign_value(
     value: &str,
 ) -> Result<(), InvalidAttrValue> {
     match slot {
+        // The DSN's stored attributes are not resolved yet (see `SQLConnect`);
+        // the name is kept only to answer `SQLGetInfo(SQL_DATA_SOURCE_NAME)`.
+        ConnAttrKey::Dsn => params.dsn = value.to_string(),
         // The server/addr/address group is resolved in `parse_connection_string`
         // (Address takes precedence over Server), so this arm is never reached; it
         // only keeps the match exhaustive.
@@ -439,6 +479,7 @@ fn assign_value(
             params.trusted_connection = Some(is_yes(value));
         }
         ConnAttrKey::ServerSpn => params.server_spn = Some(value.to_string()),
+        ConnAttrKey::App => params.application_name = Some(value.to_string()),
         ConnAttrKey::ApplicationIntent => {
             validate_attr(lower, value, APPLICATION_INTENT_VALUES)?;
             params.application_intent = Some(value.to_string());
@@ -446,6 +487,11 @@ fn assign_value(
         ConnAttrKey::MultiSubnetFailover => {
             validate_attr(lower, value, YES_NO)?;
             params.multi_subnet_failover = Some(is_yes(value));
+        }
+        ConnAttrKey::FailoverPartner => params.failover_partner = Some(value.to_string()),
+        ConnAttrKey::TransparentNetworkIpResolution => {
+            validate_attr(lower, value, ENABLED_DISABLED)?;
+            params.transparent_network_ip_resolution = Some(value.eq_ignore_ascii_case("enabled"));
         }
         ConnAttrKey::ConnectRetryCount => {
             params.connect_retry_count = Some(parse_uint_in_range(
@@ -1290,7 +1336,6 @@ mod tests {
         for key in [
             "Driver",
             "DSN",
-            "APP",
             "WSID",
             "Language",
             "Network",
@@ -1298,7 +1343,6 @@ mod tests {
             "AutoTranslate",
             "QuotedId",
             "ColumnEncryption",
-            "TransparentNetworkIPResolution",
             "OEMToANSI",
         ] {
             let s = format!("Server=h;{key}=whatever;UID=u;PWD=p");
@@ -1307,6 +1351,23 @@ mod tests {
             assert_eq!(p.server, "h", "key {key}");
             assert_eq!(p.uid, "u", "key {key}");
         }
+    }
+
+    #[test]
+    fn app_maps_to_application_name() {
+        for key in ["APP", "app", "App"] {
+            let s = format!("Server=h;{key}=My App;UID=u;<PW>=p");
+            let (p, warn) = parse_connection_string(&cs(&s)).unwrap();
+            assert!(!warn, "{key} should map cleanly to APP");
+            assert_eq!(p.application_name.as_deref(), Some("My App"), "key {key}");
+        }
+    }
+
+    #[test]
+    fn app_is_absent_when_not_supplied() {
+        let (p, warn) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.application_name, None);
     }
 
     #[test]
@@ -1388,6 +1449,34 @@ mod tests {
         assert_eq!(p.multi_subnet_failover, Some(false));
         let err = parse_connection_string("Server=h;MultiSubnetFailover=maybe;UID=u").unwrap_err();
         assert_eq!(err.key, "multisubnetfailover");
+    }
+
+    /// msodbcsql accepts only Enabled/Disabled, in any case (`IsAttrStrValid`,
+    /// `KEY_TNIR`); an absent keyword leaves the default to the connection.
+    #[test]
+    fn transparent_network_ip_resolution_is_enabled_disabled() {
+        for (value, expected) in [
+            ("Enabled", true),
+            ("enabled", true),
+            ("Disabled", false),
+            ("DISABLED", false),
+        ] {
+            let s = format!("Server=h;TransparentNetworkIPResolution={value};UID=u");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn, "{value}");
+            assert_eq!(
+                p.transparent_network_ip_resolution,
+                Some(expected),
+                "{value}"
+            );
+        }
+        let (p, _) = parse_connection_string("Server=h;UID=u").unwrap();
+        assert_eq!(p.transparent_network_ip_resolution, None);
+        for value in ["yes", "no", "on"] {
+            let s = format!("Server=h;TransparentNetworkIPResolution={value};UID=u");
+            let err = parse_connection_string(&s).unwrap_err();
+            assert_eq!(err.key, "transparentnetworkipresolution", "{value:?}");
+        }
     }
 
     #[test]
@@ -1485,13 +1574,14 @@ mod tests {
     #[test]
     fn fmt_as_odbc_conn_str_includes_new_keys() {
         let (p, _) = parse_connection_string(
-            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
+            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;TransparentNetworkIPResolution=Disabled;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;APP=MyApp;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
         )
         .unwrap();
         let out = p.fmt_as_odbc_conn_str();
         for expected in [
             "ApplicationIntent=ReadOnly",
             "MultiSubnetFailover=yes",
+            "TransparentNetworkIPResolution=Disabled",
             "ConnectRetryCount=2",
             "ConnectRetryInterval=10",
             "KeepAlive=30",
@@ -1499,6 +1589,7 @@ mod tests {
             "PacketSize=4096",
             "IpAddressPreference=IPv4First",
             "ServerSPN=svc",
+            "APP=MyApp",
             "HostnameInCertificate=cn",
             "ServerCertificate=/tmp/c.pem",
         ] {

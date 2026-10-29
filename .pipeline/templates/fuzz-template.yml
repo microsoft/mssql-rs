@@ -17,6 +17,11 @@ parameters:
   type: string
   default: fuzz_token_stream
 
+- name: fuzzDir
+  displayName: Path to the fuzz crate directory (relative to the repo root)
+  type: string
+  default: mssql-tds/fuzz
+
 steps:
 - bash: |
     echo "Installing Rust nightly toolchain..."
@@ -27,7 +32,7 @@ steps:
   condition: succeeded()
 
 - bash: |
-    cd mssql-tds/fuzz
+    cd ${{ parameters.fuzzDir }}
     
     # Extract corpus if it exists
     CORPUS_ARCHIVE="corpus-${{ parameters.fuzzTarget }}.tar.gz"
@@ -50,7 +55,7 @@ steps:
   workingDirectory: $(Build.SourcesDirectory)
 
 - bash: |
-    cd mssql-tds/fuzz
+    cd ${{ parameters.fuzzDir }}
     
     echo "Running fuzzer for ${{ parameters.fuzzDurationSeconds }} seconds..."
     echo "Target: ${{ parameters.fuzzTarget }}"
@@ -110,7 +115,7 @@ steps:
   continueOnError: false
 
 - bash: |
-    cd mssql-tds/fuzz
+    cd ${{ parameters.fuzzDir }}
     
     if [ -d "artifacts/${{ parameters.fuzzTarget }}" ]; then
       CRASH_COUNT=$(find artifacts/${{ parameters.fuzzTarget }} -type f -name "crash-*" 2>/dev/null | wc -l)

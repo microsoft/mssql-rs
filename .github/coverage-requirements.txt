@@ -1,0 +1,7 @@
+# Python 3.12, Linux x64 reporting runner. Install wheels only with --require-hashes.
+chardet==7.6.0 --hash=sha256:2cf0adaca8b1c4bacfade9d0a1e4f8f70b1bb122833d6f07ab90e3adc84eb13a
+diff-cover==10.6.0 --hash=sha256:a701553060f72d59b81f9cb1645b75ef66204427eb9dd99873c91092220e52ce
+jinja2==3.1.6 --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+markupsafe==3.0.4 --hash=sha256:8e124f974786f831d6043728e38296969d3579db8896fe004682f5758e613581
+pluggy==1.6.0 --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
+pygments==2.21.0 --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9

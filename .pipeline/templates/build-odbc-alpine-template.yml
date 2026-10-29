@@ -18,6 +18,16 @@ parameters:
   - name: buildImage
     type: string
     default: 'ghcr.io/microsoft/mssql-rs/build/alpine:3.18'
+  # Publish this template's own artifact (disable when the caller does one
+  # combined publish for the whole job, e.g. OneBranch's stages.yml).
+  - name: publishArtifacts
+    type: boolean
+    default: true
+  # Keep symbols and line tables in the release driver (LTO and optimization
+  # unchanged) so gdb can name driver frames; used by the stress pipeline.
+  - name: keepDebugInfo
+    type: boolean
+    default: false
 
 steps:
   - script: |
@@ -25,6 +35,7 @@ steps:
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         -v "$PWD:/workspace" \
         -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        ${{ iif(eq(parameters.keepDebugInfo, true), '-e CARGO_PROFILE_RELEASE_STRIP=none -e CARGO_PROFILE_RELEASE_DEBUG=line-tables-only', '') }} \
         -w /workspace \
         ${{ parameters.buildImage }} \
         /workspace/scripts/dockerentry/alpine-odbc-build.sh
@@ -34,9 +45,10 @@ steps:
       CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
       CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
-  - task: PublishPipelineArtifact@1
-    displayName: 'Publish ${{ parameters.artifactName }}'
-    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-    inputs:
-      targetPath: '$(Build.SourcesDirectory)/odbc-drop'
-      artifact: ${{ parameters.artifactName }}
+  - ${{ if eq(parameters.publishArtifacts, true) }}:
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish ${{ parameters.artifactName }}'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+        artifact: ${{ parameters.artifactName }}

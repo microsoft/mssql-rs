@@ -15,6 +15,7 @@ pub const CATALOG_INDEX: usize = 1;
 pub const SCHEMA_INDEX: usize = 2;
 pub const TABLE_INDEX: usize = 3;
 pub const MAX_PARTS: usize = 4;
+const BULK_COPY_MAX_PARTS: usize = 3;
 
 /// Parse a SQL Server multipart identifier.
 ///
@@ -27,7 +28,7 @@ pub const MAX_PARTS: usize = 4;
 ///
 /// # Arguments
 /// * `name` - The identifier string to parse (e.g., "db.schema.table")
-/// * `allow_empty` - Whether to allow completely empty identifiers
+/// * `allow_empty` - Whether to allow empty identifiers and omitted parts (e.g., `db..table`)
 ///
 /// # Returns
 /// Array of 4 optional strings: [server, catalog, schema, table]
@@ -46,6 +47,22 @@ pub const MAX_PARTS: usize = 4;
 pub fn parse_multipart_identifier(
     name: &str,
     allow_empty: bool,
+) -> TdsResult<[Option<String>; MAX_PARTS]> {
+    parse_multipart_identifier_with_max_parts(name, allow_empty, MAX_PARTS)
+}
+
+/// Parse a bulk-copy destination, which supports at most catalog.schema.table.
+pub(crate) fn parse_bulk_copy_target_identifier(
+    name: &str,
+    allow_empty: bool,
+) -> TdsResult<[Option<String>; MAX_PARTS]> {
+    parse_multipart_identifier_with_max_parts(name, allow_empty, BULK_COPY_MAX_PARTS)
+}
+
+fn parse_multipart_identifier_with_max_parts(
+    name: &str,
+    allow_empty: bool,
+    max_parts: usize,
 ) -> TdsResult<[Option<String>; MAX_PARTS]> {
     // State machine states
     #[derive(Debug, PartialEq)]
@@ -171,8 +188,19 @@ pub fn parse_multipart_identifier(
 
     // Handle final part
     match state {
-        State::InPart | State::AfterQuote => {
+        State::InPart => {
             parts.push(current_part.trim_end().to_string());
+        }
+        State::AfterQuote => {
+            parts.push(current_part);
+        }
+        State::AfterDot if allow_empty => {
+            parts.push(String::new());
+        }
+        State::AfterDot => {
+            return Err(crate::error::Error::UsageError(
+                "Empty identifier part is not allowed".to_string(),
+            ));
         }
         State::InQuotedPart => {
             return Err(crate::error::Error::UsageError(
@@ -188,11 +216,11 @@ pub fn parse_multipart_identifier(
     }
 
     // Validate part count
-    if parts.len() > MAX_PARTS {
+    if parts.len() > max_parts {
         return Err(crate::error::Error::UsageError(format!(
             "Too many identifier parts: {} (maximum is {})",
             parts.len(),
-            MAX_PARTS
+            max_parts
         )));
     }
 
@@ -249,6 +277,8 @@ pub fn escape_string_literal(input: &str) -> String {
 /// Build a multipart name from components.
 ///
 /// Reconstructs a qualified identifier from its parts, omitting leading None values.
+/// Empty strings and interior None values preserve omitted qualifiers as empty
+/// segments, so `[database]..[table]` keeps its default-schema semantics.
 ///
 /// # Arguments
 /// * `parts` - Array of optional identifier parts [server, catalog, schema, table]
@@ -266,11 +296,15 @@ pub fn escape_string_literal(input: &str) -> String {
 pub fn build_multipart_name(parts: &[Option<String>; MAX_PARTS]) -> String {
     let mut result = String::new();
 
-    for part in parts.iter().flatten() {
-        if !result.is_empty() {
+    for (i, part) in parts.iter().skip_while(|part| part.is_none()).enumerate() {
+        if i > 0 {
             result.push('.');
         }
-        result.push_str(&escape_identifier(part));
+        if let Some(part) = part
+            && !part.is_empty()
+        {
+            result.push_str(&escape_identifier(part));
+        }
     }
 
     result
@@ -372,6 +406,68 @@ mod tests {
     fn test_parse_unclosed_quote() {
         let result = parse_multipart_identifier("[MyTable", false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_preserves_trailing_empty_part() {
+        for name in ["db.schema.", "db.schema.  "] {
+            assert!(parse_multipart_identifier(name, false).is_err());
+            let parts = parse_multipart_identifier(name, true).unwrap();
+            assert_eq!(parts[CATALOG_INDEX].as_deref(), Some("db"));
+            assert_eq!(parts[SCHEMA_INDEX].as_deref(), Some("schema"));
+            assert_eq!(parts[TABLE_INDEX].as_deref(), Some(""));
+            assert_eq!(build_multipart_name(&parts), "[db].[schema].");
+        }
+        assert!(parse_multipart_identifier("server.db.schema.table.", true).is_err());
+    }
+
+    #[test]
+    fn test_parse_preserves_quoted_whitespace() {
+        for name in [
+            "[ db ].[ schema ].[ table ]  ",
+            "\" db \".\" schema \".\" table \"  ",
+        ] {
+            let parts = parse_multipart_identifier(name, false).unwrap();
+            assert_eq!(parts[CATALOG_INDEX].as_deref(), Some(" db "));
+            assert_eq!(parts[SCHEMA_INDEX].as_deref(), Some(" schema "));
+            assert_eq!(parts[TABLE_INDEX].as_deref(), Some(" table "));
+            assert_eq!(build_multipart_name(&parts), "[ db ].[ schema ].[ table ]");
+        }
+    }
+
+    #[test]
+    fn test_parse_and_build_omitted_qualifiers() {
+        for (name, expected) in [
+            ("db..table", "[db]..[table]"),
+            ("db. .table", "[db]..[table]"),
+            (".table", ".[table]"),
+            ("..table", "..[table]"),
+            ("server...table", "[server]...[table]"),
+            ("tempdb..#table", "[tempdb]..[#table]"),
+        ] {
+            assert!(parse_multipart_identifier(name, false).is_err(), "{name}");
+            let parts = parse_multipart_identifier(name, true).unwrap();
+            assert_eq!(build_multipart_name(&parts), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_build_preserves_missing_interior_slots() {
+        let parts = [
+            None,
+            Some("db".to_string()),
+            None,
+            Some("table".to_string()),
+        ];
+        assert_eq!(build_multipart_name(&parts), "[db]..[table]");
+        let parts = [
+            Some("server".to_string()),
+            None,
+            None,
+            Some("table".to_string()),
+        ];
+        assert_eq!(build_multipart_name(&parts), "[server]...[table]");
+        assert_eq!(build_multipart_name(&[None, None, None, None]), "");
     }
 
     #[test]

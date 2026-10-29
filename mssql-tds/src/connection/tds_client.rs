@@ -19,7 +19,7 @@ use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
-    RpcParameter, StatusFlags, build_parameter_list_string,
+    RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
 };
 use crate::message::rpc::{RpcProcs, RpcType, SqlRpc};
 use crate::message::transaction_management::{
@@ -36,7 +36,9 @@ use crate::{
         ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
     },
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
+    token::tokens::{
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeTokenSubType, Tokens,
+    },
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -44,7 +46,7 @@ use std::num::NonZeroU32;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    core::{CancelHandle, TdsResult},
+    core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult},
     query::metadata::ColumnMetadata,
 };
 use std::sync::Arc;
@@ -62,6 +64,102 @@ const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
 /// with `severity >= 20` marks the transport dead so a pool checkout discards
 /// it, even if the socket is still readable.
 const FATAL_ERROR_SEVERITY: u8 = 20;
+
+/// Most ERROR tokens kept for one failed statement under
+/// [`BatchErrorMode::Continue`] before its DONE. A real statement sends a few;
+/// the run is fed by the server, so past this the server is treated as
+/// misbehaving and the connection retired.
+const MAX_ERRORS_PER_FAILED_STATEMENT: usize = 1_000;
+
+/// Most text, in bytes, kept across one failed statement's errors: message,
+/// server and procedure names. A SQL Server message is at most 2,048
+/// characters, so this admits [`MAX_ERRORS_PER_FAILED_STATEMENT`] full-length
+/// messages, while a server sending messages near the 65,535-unit protocol
+/// limit is stopped long before the count is reached.
+const MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT: usize = 8 * 1024 * 1024;
+
+/// Most tokens read after a statement error under [`BatchErrorMode::Continue`]
+/// before its DONE. Well above [`MAX_ERRORS_PER_FAILED_STATEMENT`], so a valid
+/// statement that also sends many messages is not rejected.
+const MAX_TOKENS_AFTER_STATEMENT_ERROR: u32 = 100_000;
+
+/// Statement errors skipped by a [`TdsClient::close_query`] drain under
+/// [`BatchErrorMode::Continue`]. A batch can hold any number of failing
+/// statements, so the errors kept for the caller are bounded like one failed
+/// statement's: the first ones that fit both [`MAX_ERRORS_PER_FAILED_STATEMENT`]
+/// and [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`]. The rest are only counted,
+/// and the drain goes on, because it must reach the end of the batch to leave
+/// the connection usable.
+#[derive(Default)]
+struct SkippedErrors {
+    errors: Vec<SqlErrorInfo>,
+    bytes: usize,
+    dropped: usize,
+}
+
+impl SkippedErrors {
+    fn keep(&mut self, errors: Vec<SqlErrorInfo>) {
+        for error in errors {
+            let bytes = TdsClient::error_text_bytes(&error);
+            // Once one is dropped, so is every later one: the caller gets a
+            // prefix of the batch's errors, never a gap in the middle.
+            if self.dropped == 0
+                && self.errors.len() < MAX_ERRORS_PER_FAILED_STATEMENT
+                && self.bytes + bytes <= MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT
+            {
+                self.bytes += bytes;
+                self.errors.push(error);
+            } else {
+                self.dropped += 1;
+            }
+        }
+    }
+
+    /// The kept errors as one [`SqlServerError`](crate::error::Error::SqlServerError).
+    /// Errors past the bounds cannot be returned, so their loss is logged.
+    fn into_error(self) -> crate::error::Error {
+        if self.dropped > 0 {
+            warn!(
+                kept = self.errors.len(),
+                dropped = self.dropped,
+                "close_query returns only the first statement errors skipped during its drain"
+            );
+        }
+        crate::error::Error::from_sql_errors(self.errors)
+    }
+}
+
+/// Budget for withdrawing a request, independent of the request's own timeout.
+///
+/// `remaining_request_timeout` is `None` whenever `SQL_ATTR_QUERY_TIMEOUT` is 0,
+/// and inheriting that would block the caller forever on a server that never
+/// acknowledges the withdrawal. Matches msodbcsql's `DEFAULT_CANCEL_TIMEOUT`.
+const CANCEL_TIMEOUT_SECS: u32 = 120;
+
+/// Derived rather than converted, so the budget cannot degrade to unbounded.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(CANCEL_TIMEOUT_SECS as u64);
+
+/// Budget for the ignore packet itself, strictly below [`CANCEL_TIMEOUT`].
+///
+/// `PacketWriter` checks this only after a write returns, so it can fire only
+/// while the stream is still intact — which yields the graceful arm, closing the
+/// transport normally. The outer deadline instead drops the write future and
+/// forces retirement without a shutdown, so a merely slow peer should reach this
+/// one first. Only the ordering matters; the exact value does not.
+const CANCEL_WRITE_TIMEOUT_SECS: u32 = CANCEL_TIMEOUT_SECS / 2;
+
+#[derive(Debug)]
+enum Withdrawal {
+    /// Ignore packet sent and the server's DONE consumed.
+    Done,
+    /// Nothing attempted: no stream left to resynchronize, so not an error.
+    ConnectionAlreadyDead,
+    /// Neither complete nor retracted; the transport must go.
+    Failed(crate::error::Error),
+    /// The ignore write was dropped mid-flight, so the transport must go
+    /// *without* another write on the stream.
+    WriteAbandoned(crate::error::Error),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::connection) enum CommandTimeoutBudget {
@@ -114,6 +212,59 @@ impl CommandTimeoutBudget {
             )),
         }
     }
+}
+
+/// Quotes a possibly multi-part procedure name for interpolation into T-SQL.
+///
+/// Each decoded part is bracketed, so no separator, comment or statement
+/// terminator can escape the identifier. The optional `;n` group is preserved.
+fn quote_procedure_name(name: &str) -> TdsResult<String> {
+    let mut chars = name.char_indices().peekable();
+    let mut delimiter = None;
+    let mut group_separator = None;
+    while let Some((i, c)) = chars.next() {
+        match (delimiter, c) {
+            (None, '[') => delimiter = Some(']'),
+            (None, '"') => delimiter = Some('"'),
+            (None, ';') => {
+                group_separator = Some(i);
+                break;
+            }
+            (Some(close), c) if c == close => {
+                if chars.peek().is_some_and(|&(_, next)| next == close) {
+                    chars.next();
+                } else {
+                    delimiter = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let (body, group) = match group_separator.map(|i| (&name[..i], &name[i + 1..])) {
+        Some((body, group)) if !group.is_empty() && group.bytes().all(|b| b.is_ascii_digit()) => {
+            (body, Some(group))
+        }
+        Some(_) => {
+            return Err(UsageError(format!("Invalid procedure name '{name}'")));
+        }
+        None => (name, None),
+    };
+
+    let parts = crate::sql_identifier::parse_multipart_identifier(body, true)?;
+    if parts.iter().flatten().next().is_none_or(String::is_empty)
+        || parts
+            .last()
+            .and_then(Option::as_ref)
+            .is_none_or(String::is_empty)
+    {
+        return Err(UsageError(format!("Invalid procedure name '{name}'")));
+    }
+    let mut quoted = crate::sql_identifier::build_multipart_name(&parts);
+    if let Some(group) = group {
+        quoted.push(';');
+        quoted.push_str(group);
+    }
+    Ok(quoted)
 }
 
 /// State of the `ReturnStatus` token observed while draining the most recent
@@ -198,12 +349,75 @@ pub enum CursorColumn {
     RowEnded,
 }
 
+/// Result of a non-blocking pull-cursor attempt on concrete [`TdsClient`].
+///
+/// This polling surface is not part of [`ResultSet`]; synchronous bindings use
+/// it directly and continue with the matching async client method on `Pending`.
+#[derive(Debug, PartialEq)]
+pub enum CursorPoll<T> {
+    /// The operation completed entirely from bytes already buffered by the
+    /// transport.
+    Ready(T),
+    /// The existing async cursor method must continue the operation.
+    ///
+    /// No transport bytes or cursor state were consumed by the attempt.
+    Pending,
+}
+
+impl<T> CursorPoll<T> {
+    /// Returns a buffered result immediately or invokes `fallback` once when
+    /// asynchronous continuation is required.
+    pub fn resolve<E>(self, fallback: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        match self {
+            Self::Ready(value) => Ok(value),
+            Self::Pending => fallback(),
+        }
+    }
+}
+
+/// Result of a concrete [`TdsClient`] attempt to decode the next row from
+/// transport-buffered bytes.
+///
+/// `Pending` is non-destructive. `Partial` has written a prefix, so callers must
+/// reuse the same writer with [`TdsClient::finish_row_into`].
+#[derive(Debug, PartialEq)]
+pub enum BufferedRowPoll {
+    /// A complete row was written.
+    Complete,
+    /// A row prefix was written and the cursor holds the continuation state.
+    Partial,
+    /// No row bytes or cursor state were consumed.
+    Pending,
+    /// The current result set was already exhausted.
+    Exhausted,
+}
+
+/// Where a connection stands in the RESETCONNECTION handshake (MS-TDS
+/// 2.2.3.1.2). The bit is armed on the connection and consumed by the packet
+/// writer, so confirming that the server honored it needs all three states
+/// rather than a single "pending" flag: only [`AwaitingAck`](Self::AwaitingAck)
+/// means an acknowledgement is genuinely owed and its absence is a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetAckState {
+    /// No reset armed or outstanding.
+    Idle,
+    /// Armed on the writer; no request has carried the bit to the server yet.
+    /// Carries the mode so a request boundary can re-arm it: `PacketWriter::new`
+    /// consumes the arm before any bytes are written, so a message abandoned
+    /// mid-serialization takes the arm with it.
+    Armed(ResetConnectionMode),
+    /// A request carried the bit; its response must contain the
+    /// `ResetConnection` ENVCHANGE.
+    AwaitingAck,
+}
+
 /// Result of beginning or continuing a streamed PLP parameter write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamedParamStatus {
     /// The server still expects a streamed parameter value. Stream its chunks
     /// next via [`TdsClient::write_streamed_chunk`], then call
-    /// [`TdsClient::end_streamed_param`].
+    /// [`TdsClient::end_streamed_param`] (or
+    /// [`TdsClient::end_execute_prepared_param`] for a prepared stream).
     NeedData {
         /// Name of the streamed parameter now awaiting its value chunks.
         param_name: String,
@@ -211,6 +425,62 @@ pub enum StreamedParamStatus {
     /// All streamed parameters have been written, and the server response has
     /// been positioned exactly as after a normal execute call.
     Complete(StatementResult),
+}
+
+/// Result for one command in a prepared RPC batch.
+#[derive(Debug, Clone)]
+pub struct PreparedBatchRowResult {
+    /// Caller-supplied row index, preserved across skipped application rows.
+    pub row_index: usize,
+    /// Aggregate update count reported for this RPC, or `None` when unavailable.
+    pub rows_affected: Option<u64>,
+    /// SQL Server errors associated with this RPC.
+    pub errors: Vec<SqlErrorInfo>,
+    /// Whether the RPC produced a row-returning result set.
+    pub has_result_set: bool,
+    /// Whether the RPC produced at least one informational message.
+    pub has_info: bool,
+}
+
+/// Ordered results from one logical prepared RPC batch.
+#[derive(Debug, Clone)]
+pub struct PreparedBatchResult {
+    /// One result for every RPC command serialized into the request.
+    pub rows: Vec<PreparedBatchRowResult>,
+    /// Whether the server returned a boundary for every serialized RPC.
+    pub complete: bool,
+}
+
+#[derive(Debug)]
+struct PreparedBatchReadState {
+    remaining: std::vec::IntoIter<usize>,
+    current: Option<PreparedBatchRowResult>,
+    completed: Vec<PreparedBatchRowResult>,
+}
+
+impl PreparedBatchReadState {
+    fn next_row(row_index: usize) -> PreparedBatchRowResult {
+        PreparedBatchRowResult {
+            row_index,
+            rows_affected: None,
+            errors: Vec::new(),
+            has_result_set: false,
+            has_info: false,
+        }
+    }
+}
+
+impl PreparedBatchResult {
+    /// Sum of reported update counts, or `None` when none were available.
+    pub fn total_rows_affected(&self) -> Option<i64> {
+        let mut counts = self.rows.iter().filter_map(|row| row.rows_affected);
+        let first = counts.next()?;
+        Some(
+            counts.fold(i64::try_from(first).unwrap_or(i64::MAX), |total, count| {
+                total.saturating_add(i64::try_from(count).unwrap_or(i64::MAX))
+            }),
+        )
+    }
 }
 
 /// State machine for an in-progress incremental (streamed) PLP parameter write,
@@ -221,6 +491,30 @@ pub enum StreamedParamStatus {
 enum StreamedWriteState {
     Idle,
     Active(Box<StreamedWriteContext>),
+}
+
+#[derive(Debug)]
+enum StreamedXmlBomState {
+    NotXml,
+    Pending { prefix: [u8; 2], len: u8 },
+    Written,
+}
+
+impl StreamedXmlBomState {
+    fn for_param(param: &RpcParameter) -> Self {
+        if matches!(param.streamed_sql_type(), Some(StreamedSqlType::Xml)) {
+            Self::Pending {
+                prefix: [0; 2],
+                len: 0,
+            }
+        } else {
+            Self::NotXml
+        }
+    }
+
+    fn has_pending_bytes(&self) -> bool {
+        matches!(self, Self::Pending { len, .. } if *len != 0)
+    }
 }
 
 /// Owned context for a suspended, partially-written streamed RPC.
@@ -240,12 +534,33 @@ struct StreamedWriteContext {
     /// has been emitted. The opener is written lazily (on the first chunk) so a
     /// parameter can still resolve to NULL before any data is sent.
     value_opened: bool,
+    /// XML values require exactly one UTF-16LE BOM. The first two caller bytes
+    /// are held until a caller-supplied BOM can be recognized across chunks.
+    xml_bom_state: StreamedXmlBomState,
     /// `true` when the caller has signalled the currently-open parameter is NULL
     /// via [`TdsClient::write_streamed_null`]. Closing the parameter then writes
     /// `PLP_NULL` instead of an opener + terminator, and no chunks may follow.
     null_signaled: bool,
     /// Configured timeout reused for each resumed streaming operation.
     timeout_sec: Option<u32>,
+    prepared: Option<StreamedPreparedContext>,
+}
+
+#[derive(Debug)]
+struct StreamedPreparedContext {
+    issued_id: Option<StatementId>,
+    orphaned: Option<StatementId>,
+}
+
+/// Cached row-buffering eligibility paired with the exact metadata allocation it describes.
+#[derive(Debug)]
+struct BufferedRowSupport {
+    /// Metadata allocation whose eligibility was evaluated.
+    metadata: Arc<ColMetadataToken>,
+    /// Whether all columns support buffered whole-row decoding.
+    whole_row: bool,
+    /// Number of inline columns before the first PLP, when a safe prefix exists.
+    prefix_len: Option<usize>,
 }
 
 /// Active TDS connection to a SQL Server instance.
@@ -258,16 +573,11 @@ pub struct TdsClient {
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
-    /// Set by [`prepare_reset_connection`](TdsClient::prepare_reset_connection)
-    /// and cleared by
-    /// [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack). While
-    /// true, a RESETCONNECTION bit has been armed but the server has not yet
-    /// confirmed it. A pool uses [`reset_pending`](TdsClient::reset_pending)
-    /// after the request that carries the bit to verify the reset was actually
-    /// processed, rather than inferring it from the request succeeding. A
-    /// successful reconnect also clears it because the fresh session supersedes
-    /// the reset.
-    reset_pending: bool,
+    /// Where this connection stands in the RESETCONNECTION handshake. Driven by
+    /// [`prepare_reset_connection`](TdsClient::prepare_reset_connection),
+    /// [`observe_response_token`](TdsClient::observe_response_token), and
+    /// [`on_reset_connection_ack`](TdsClient::on_reset_connection_ack).
+    reset_state: ResetAckState,
 
     // pub(crate) batch_result: Option<BatchResult<'static>>,
     pub(crate) current_metadata: Option<Arc<ColMetadataToken>>,
@@ -275,18 +585,58 @@ pub struct TdsClient {
     /// the metadata it was built for so it is rebuilt when the result set
     /// changes. `None` until the first encrypted result set is seen.
     current_decryptor: Option<MemoizedCellDecryptor>,
+    buffered_row_support: Option<Box<BufferedRowSupport>>,
     count_map: HashMap<CurrentCommand, u64>,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
     /// Per-statement affected-row counts captured (in order) from every counted
-    /// DONE token seen since the last COLMETADATA or command start. For a
-    /// pure-DML batch (`UPDATE; DELETE; INSERT`) this holds one entry per
-    /// statement so the ODBC layer can surface each as its own result set via
+    /// DONE token seen since the last COLMETADATA or command start, excluding
+    /// `SQLSELECT`-tagged counts (see
+    /// [`last_rows_affected`](Self::last_rows_affected)). For a pure-DML batch
+    /// (`UPDATE; DELETE; INSERT`) this holds one entry per statement so the ODBC
+    /// layer can surface each as its own result set via
     /// [`take_dml_result_counts`](Self::take_dml_result_counts).
     dml_result_counts: Vec<i64>,
+    prepared_batch: Option<Box<PreparedBatchReadState>>,
+    /// How a statement error is reported for the language batch in flight. Set
+    /// from [`ExecuteOptions::on_error`] by [`execute`](Self::execute) and put
+    /// back to [`BatchErrorMode::Abort`] at every request boundary, so it cannot
+    /// outlive the command that asked for it.
+    batch_error_mode: BatchErrorMode,
+    /// A statement error was returned under [`BatchErrorMode::Continue`] and the
+    /// DONE tokens completing that statement have not all been read. They carry
+    /// the error flag, which is otherwise a protocol violation.
+    statement_error_completion_pending: bool,
+    /// The next DONE completes a statement whose error was already returned
+    /// under [`BatchErrorMode::Continue`] between results, so it must not be
+    /// surfaced again as a result of its own.
+    failed_statement_done_pending: bool,
+    /// Errors of a statement that failed inside a row set under
+    /// [`BatchErrorMode::Continue`], held until the DONE ending the row set so
+    /// they are returned together.
+    row_set_errors: Vec<SqlErrorInfo>,
+    /// Tokens read since the first entry in `row_set_errors`; bounds that run.
+    row_set_error_tokens: u32,
+    /// Text bytes held in `row_set_errors`; see
+    /// [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`].
+    row_set_error_bytes: usize,
+    /// DONE count of the row set just completed; see
+    /// [`last_result_row_count`](Self::last_result_row_count).
+    last_result_row_count: Option<u64>,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
+    /// Whether the work most recently completed on this connection substituted
+    /// a character the narrow encoding it was sent in could not represent.
+    ///
+    /// Usually one message: captured from it once it is built, or noted
+    /// directly by a caller that converts a data-at-execution chunk itself.
+    /// A bulk copy is the exception — `BulkCopy::write_to_server_zerocopy`
+    /// spans several messages and restores the aggregate across every batch
+    /// here, so this is not always "the last message" and must not be
+    /// documented as such. Drained by
+    /// [`take_code_page_conversion_loss`](Self::take_code_page_conversion_loss).
+    code_page_conversion_loss: bool,
     /// Per-statement Always Encrypted parameter metadata, keyed by the same
     /// client-issued [`StatementId`] as `prepared_handles`. Captured by
     /// `execute_sp_prepare` / `sp_prepexec` from
@@ -322,6 +672,10 @@ pub struct TdsClient {
     /// cursor RPC response and interpreted as a [`CursorStatus`](crate::cursor::CursorStatus).
     pub(in crate::connection) last_return_status: ReturnStatus,
     pub(in crate::connection) current_result_set_has_been_read_till_end: bool,
+    /// Whether the DONE that exhausted the current row set was `DONEINPROC`.
+    /// Only that token makes MORE ambiguous between another application result
+    /// and the RPC's protocol-only completion tail.
+    current_result_ended_with_done_in_proc: bool,
 
     /// Column Encryption setting for the command currently executing. Set by
     /// each execute entry point; consulted by the parameter-encryption and
@@ -358,11 +712,33 @@ pub struct TdsClient {
     /// The cancel handle for this client. Used to cancel operations.
     pub(in crate::connection) cancel_handle: Option<CancelHandle>,
 
+    /// One-shot evidence that the latest interrupted read reached DONE_ATTN and
+    /// applied its drained control tokens while the transport remained live.
+    interrupted_read_settled: bool,
+
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
 
     // Active PLP stream state when row decoding paused at a PLP target column.
     active_row_read_state: ActiveRowReadState,
+
+    /// Set by [`peek_past_current_row`](Self::peek_past_current_row) when it
+    /// finds another row: that row is fully positioned (its header has been
+    /// read) but not yet exposed to a caller, so the *next*
+    /// [`next_row_cursor`](Self::next_row_cursor) call must return it
+    /// directly instead of draining it as an abandoned row and reading past
+    /// it. Consumed (reset to `false`) the moment that next call runs, and
+    /// invalidated by anything that discards `active_row_read_state` first
+    /// (see `drain_active_row_if_needed`).
+    row_already_positioned: bool,
+
+    /// A token read by the RPC-terminator look-ahead
+    /// (see [`settle_rpc_terminator`](Self::settle_rpc_terminator)) that turned
+    /// out to start another result instead of ending the response. Replayed by
+    /// [`next_response_token`](Self::next_response_token) before the wire is
+    /// touched again. Boxed to keep the client — and every future that owns it
+    /// by value — small.
+    parked_token: Option<Box<Tokens>>,
 
     /// Test-only: when `Some`, [`check_and_reconnect`](Self::check_and_reconnect)
     /// reports this as the elapsed recovery time and skips the transport, so
@@ -375,6 +751,26 @@ pub struct TdsClient {
     streamed_write_state: StreamedWriteState,
 }
 
+/// Runs `fut` bounded by `remaining`, converting an elapsed timeout into
+/// `Error::TimeoutError`. Extracted out of `TdsClient::reconnect` so the
+/// elapsed branch can be driven directly in a test (`tokio::time::pause` plus
+/// a future that never resolves) instead of needing a live, slow connect
+/// attempt to provoke it.
+async fn attempt_within<T>(
+    remaining: Duration,
+    fut: impl Future<Output = TdsResult<T>>,
+) -> TdsResult<T> {
+    tokio::time::timeout(remaining, fut)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(crate::error::Error::TimeoutError(
+                crate::error::TimeoutErrorType::String(
+                    "Reconnection attempt timed out".to_string(),
+                ),
+            ))
+        })
+}
+
 impl TdsClient {
     pub(crate) fn new(
         transport: AnyTransport,
@@ -383,6 +779,9 @@ impl TdsClient {
         client_context: ClientContext,
         login_session_state_tokens: Vec<SessionStateToken>,
     ) -> Self {
+        if let Some(trace) = &client_context.connection_trace {
+            trace.establish(negotiated_settings.client_connection_id);
+        }
         let mut recovery_context = RecoveryContext::new();
         recovery_context.initialize(
             client_context,
@@ -395,20 +794,31 @@ impl TdsClient {
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
-            reset_pending: false,
+            reset_state: ResetAckState::Idle,
             current_metadata: None,
             current_decryptor: None,
+            buffered_row_support: None,
             count_map: HashMap::new(),
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
+            prepared_batch: None,
+            batch_error_mode: BatchErrorMode::Abort,
+            statement_error_completion_pending: false,
+            failed_statement_done_pending: false,
+            row_set_errors: Vec::new(),
+            row_set_error_tokens: 0,
+            row_set_error_bytes: 0,
+            last_result_row_count: None,
             return_values: Vec::new(),
             info_messages: Vec::new(),
+            code_page_conversion_loss: false,
             prepared_param_encryption: HashMap::new(),
             query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache::new(),
             describe_round_trips: 0,
             output_param_ceks: HashMap::new(),
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
+            current_result_ended_with_done_in_proc: false,
             current_command_ce_setting:
                 crate::connection::client_context::ExecutionColumnEncryptionSetting::default(),
             pending_capture: None,
@@ -417,8 +827,11 @@ impl TdsClient {
             prepared_handles: HashMap::new(),
             remaining_request_timeout: None,
             cancel_handle: None,
+            interrupted_read_settled: false,
             empty_metadata: Vec::new(),
             active_row_read_state: ActiveRowReadState::Idle,
+            row_already_positioned: false,
+            parked_token: None,
             #[cfg(test)]
             reconnect_elapsed_for_test: None,
             streamed_write_state: StreamedWriteState::Idle,
@@ -427,9 +840,11 @@ impl TdsClient {
 
     /// Attempt to reconnect a dead connection by replaying session state.
     ///
-    /// The overall reconnection is bounded by `timeout`. Each individual
-    /// TCP/TDS handshake attempt uses the original `connect_timeout`. Before
-    /// each retry sleep, we verify enough time remains for the interval.
+    /// The overall reconnection is bounded by `timeout`. Each attempt (DNS
+    /// resolution through login) is wrapped in whatever remains of that
+    /// budget, and `connect_timeout` is capped to the same remaining budget
+    /// so it can't ask for more than is left. Before each retry sleep, we
+    /// verify enough time remains for the interval.
     #[instrument(skip(self), level = "info")]
     pub(crate) async fn reconnect(
         &mut self,
@@ -506,18 +921,33 @@ impl TdsClient {
             // Inject recovery data into the client context clone
             let mut reconnect_ctx = client_context.clone();
 
-            // Cap the per-attempt connect timeout to the remaining reconnect budget
-            let remaining_secs =
-                deadline.saturating_duration_since(Instant::now()).as_secs() as u32;
-            reconnect_ctx.connect_timeout = reconnect_ctx.connect_timeout.min(remaining_secs);
+            // Cap the per-attempt connect timeout to the remaining reconnect budget.
+            // `.max(1)`: `remaining` can be under a second this close to the deadline,
+            // and `as_secs()` truncates that to 0 — which `create_base_stream_sequential`
+            // has no "0 means default" fallback for, so it would time out the attempt
+            // on its first poll instead of giving it a real chance. The outer
+            // `attempt_within(remaining, ...)` below is the actual deadline backstop,
+            // so rounding up here can't make an attempt outlive the reconnect budget.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            reconnect_ctx.connect_timeout = reconnect_ctx
+                .connect_timeout
+                .min(remaining.as_secs().max(1) as u32);
 
             info!(attempt, "Attempting reconnection");
+            // `connect_timeout` above only bounds the TCP-connect step inside
+            // `connect_with_transport_context`; DNS resolution ahead of it is
+            // otherwise unbounded here. Wrap the whole attempt (DNS through
+            // login) in `remaining` too, so a slow resolver can't make a
+            // single reconnect attempt outlive the overall reconnect deadline.
             let connect_result = CancelHandle::run_until_cancelled(
                 cancel_handle,
-                TdsConnectionProvider::connect_with_transport_context(
-                    &reconnect_ctx,
-                    &transport_context,
-                    Some(Box::new((*snapshot).clone())),
+                attempt_within(
+                    remaining,
+                    TdsConnectionProvider::connect_with_transport_context(
+                        &reconnect_ctx,
+                        &transport_context,
+                        Some(Box::new((*snapshot).clone())),
+                    ),
                 ),
             )
             .await;
@@ -540,52 +970,13 @@ impl TdsClient {
                         return Err(validation_err);
                     }
 
-                    // Replace connection state
-                    self.transport = new_transport;
-                    self.negotiated_settings = new_settings;
-                    self.execution_context = new_exec_ctx;
-
-                    // Reset per-request state
-                    self.current_metadata = None;
-                    self.count_map.clear();
-                    self.return_values.clear();
-                    self.info_messages.clear();
-                    self.info_messages.extend(info_messages);
-                    // Prepared-statement handles belong to the dead session and
-                    // do not survive a reconnect, so drop them and their cached
-                    // Always Encrypted metadata.
-                    self.clear_session_bound_caches();
-                    self.current_result_set_has_been_read_till_end = false;
-                    self.remaining_request_timeout = None;
-                    self.cancel_handle = None;
-
-                    // Mirror msodbcsql's recovery-login handling
-                    // (ReadUpdatedSessionState, seq 0): the FEATUREEXTACK payload
-                    // REPLACES the current (delta) table (reset-then-reload),
-                    // then any reconnect SESSIONSTATE tokens apply on top. The
-                    // initial baseline is untouched; both blocks serialize on the
-                    // next reconnect.
-                    if let Some(ack) = self
-                        .negotiated_settings
-                        .session_recovery_initial_state()
-                        .map(|s| s.to_vec())
-                    {
-                        self.recovery_context
-                            .session_state_table
-                            .apply_feature_ack_to_delta(&ack);
-                    }
-                    for token in &session_state_tokens {
-                        self.recovery_context.process_session_state(token)?;
-                    }
-
-                    // A pending reset is satisfied — more completely than
-                    // RESETCONNECTION would — by the fresh login: the new
-                    // session is already at its login defaults, and the armed
-                    // header bit died with the old transport, so no
-                    // acknowledgement is coming. Leaving the flag set would make
-                    // the carrying request report the reset as unacknowledged
-                    // and discard a healthy, brand-new connection.
-                    self.reset_pending = false;
+                    self.adopt_recovered_session(
+                        new_transport,
+                        new_settings,
+                        new_exec_ctx,
+                        info_messages,
+                        &session_state_tokens,
+                    )?;
 
                     self.recovery_context.recovery_count += 1;
                     info!(
@@ -611,6 +1002,87 @@ impl TdsClient {
         })
     }
 
+    /// Adopts a freshly recovered session: swaps in the new transport, settings,
+    /// and execution context, then drops everything bound to the dead one.
+    ///
+    /// Split out of [`reconnect`](Self::reconnect) so the invariants a recovered
+    /// session must satisfy can be asserted without a live server.
+    fn adopt_recovered_session(
+        &mut self,
+        transport: AnyTransport,
+        settings: NegotiatedSettings,
+        execution_context: ExecutionContext,
+        info_messages: Vec<SqlInfoMessage>,
+        session_state_tokens: &[crate::token::tokens::SessionStateToken],
+    ) -> TdsResult<()> {
+        self.transport = transport;
+        let database_changes = self.negotiated_settings.database_change_count;
+        self.negotiated_settings = settings;
+        // A recovered session is a *different* session — new login, so the
+        // security context, impersonation and temp tables of the old one are
+        // gone — but the settings block was built fresh and starts its count at
+        // zero. Carry the old count forward and advance it, so per-database
+        // caches cannot match across the reconnect. Without this the counter
+        // moves backwards and an entry cached before the blip can match after
+        // it, which is the one direction that is unsafe.
+        self.negotiated_settings.database_change_count = database_changes.wrapping_add(1);
+        self.execution_context = execution_context;
+
+        // Reset per-request state
+        self.current_metadata = None;
+        self.count_map.clear();
+        self.return_values.clear();
+        self.info_messages.clear();
+        self.info_messages.extend(info_messages);
+        // Prepared-statement handles belong to the dead session and do not
+        // survive a reconnect, so drop them and their cached Always Encrypted
+        // metadata.
+        self.clear_session_bound_caches();
+        self.current_result_set_has_been_read_till_end = false;
+        self.current_result_ended_with_done_in_proc = false;
+        self.active_row_read_state = ActiveRowReadState::Idle;
+        self.row_already_positioned = false;
+        self.parked_token = None;
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+
+        // Mirror msodbcsql's recovery-login handling (ReadUpdatedSessionState,
+        // seq 0): the FEATUREEXTACK payload REPLACES the current (delta) table
+        // (reset-then-reload), then any reconnect SESSIONSTATE tokens apply on
+        // top. The initial baseline is untouched; both blocks serialize on the
+        // next reconnect. Read from `negotiated_settings` *after* the swap above
+        // so it is the recovered session's acknowledgement, not the dead one's.
+        if let Some(ack) = self
+            .negotiated_settings
+            .session_recovery_initial_state()
+            .map(|s| s.to_vec())
+        {
+            self.recovery_context
+                .session_state_table
+                .apply_feature_ack_to_delta(&ack);
+        }
+        for token in session_state_tokens {
+            self.recovery_context.process_session_state(token)?;
+        }
+
+        // A pending reset is satisfied — more completely than RESETCONNECTION
+        // would — by the fresh login: the new session is already at its login
+        // defaults, and the armed header bit died with the old transport, so no
+        // acknowledgement is coming. Leaving the state set would make the next
+        // response report the reset as unacknowledged and discard a healthy,
+        // brand-new connection.
+        self.reset_state = ResetAckState::Idle;
+        if let Some(trace) = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .and_then(|context| context.connection_trace.as_ref())
+        {
+            trace.establish(self.negotiated_settings.client_connection_id);
+        }
+        Ok(())
+    }
+
     /// Clears the caches bound to a specific server session: managed
     /// prepared-statement handles, their cached Always Encrypted describe
     /// metadata, and any in-flight `sp_prepexec` capture state. Shared by the
@@ -633,23 +1105,188 @@ impl TdsClient {
     /// processing path, including resets not coordinated by the ODBC checkout
     /// flow.
     fn on_reset_connection_ack(&mut self) {
-        self.reset_pending = false;
+        self.reset_state = ResetAckState::Idle;
         self.recovery_context.session_state_table.reset();
         self.clear_session_bound_caches();
         self.negotiated_settings.restore_login_defaults();
     }
 
+    /// Advances reset-acknowledgement tracking for one token just read from a
+    /// response, and fails the connection when the acknowledgement is provably
+    /// missing.
+    ///
+    /// The packet writer — not this client — consumes the armed mode, so the
+    /// only way to learn that the bit truly reached the wire is to ask the
+    /// writer. That is done solely while this client still believes a reset is
+    /// armed, so a dispatch record left behind by a response that was never
+    /// read cannot be charged to an unrelated later request.
+    ///
+    /// SQL Server resets the session *before* it parses the carrying request,
+    /// so the `ResetConnection` ENVCHANGE precedes everything that request
+    /// produces. The first token that is evidence the request actually ran is
+    /// therefore the last moment the acknowledgement could still have arrived,
+    /// and its absence means the session was never reset. ERROR is exempt so a
+    /// server diagnostic reaches the caller instead of being masked by this
+    /// one; a reset still unacknowledged after it is caught on the next token.
+    fn observe_response_token(&mut self, token: &Tokens) -> TdsResult<()> {
+        if matches!(self.reset_state, ResetAckState::Armed(_))
+            && self.transport.as_writer().take_reset_dispatched()
+        {
+            self.reset_state = ResetAckState::AwaitingAck;
+        }
+
+        if self.reset_state != ResetAckState::AwaitingAck || !Self::proves_request_ran(token) {
+            return Ok(());
+        }
+
+        warn!(
+            token = Self::token_variant_name(token),
+            "Request carrying the RESETCONNECTION bit produced output without a ResetConnection \
+             ENVCHANGE; marking connection dead"
+        );
+        // Clearing first keeps the failure to a single report: the caller's
+        // error drain reads more tokens on the same dead connection.
+        self.reset_state = ResetAckState::Idle;
+        self.transport.mark_known_dead();
+        Err(crate::error::Error::ConnectionResetNotAcknowledged)
+    }
+
+    /// The token's variant name, for diagnostics. Deliberately *not* `?token`:
+    /// the tokens that reach the failure log are typically ROW or RETURNVALUE,
+    /// whose Debug output is customer row and output-parameter data. The kind is
+    /// the whole diagnostic value here; the payload is not ours to log.
+    ///
+    /// Kept as an explicit match rather than `?token.token_type()` because that
+    /// collapses `Done` / `DoneInProc` / `DoneProc` into a single
+    /// `TokenType::Done`, and which of the three ended the carrying request is
+    /// exactly the detail worth having when diagnosing an unacknowledged reset.
+    /// The match is exhaustive, so a new variant is a build break, not a silent
+    /// gap.
+    fn token_variant_name(token: &Tokens) -> &'static str {
+        match token {
+            Tokens::Done(_) => "Done",
+            Tokens::DoneInProc(_) => "DoneInProc",
+            Tokens::DoneProc(_) => "DoneProc",
+            Tokens::EnvChange(_) => "EnvChange",
+            Tokens::Error(_) => "Error",
+            Tokens::Info(_) => "Info",
+            Tokens::LoginAck(_) => "LoginAck",
+            Tokens::FeatureExtAck(_) => "FeatureExtAck",
+            Tokens::FedAuthInfo(_) => "FedAuthInfo",
+            Tokens::SessionState(_) => "SessionState",
+            Tokens::Sspi(_) => "Sspi",
+            Tokens::Row(_) => "Row",
+            Tokens::ColMetadata(_) => "ColMetadata",
+            Tokens::DataClassification(_) => "DataClassification",
+            Tokens::Order(_) => "Order",
+            Tokens::ReturnStatus(_) => "ReturnStatus",
+            Tokens::ReturnValue(_) => "ReturnValue",
+            Tokens::TabName => "TabName",
+            Tokens::ColInfo => "ColInfo",
+        }
+    }
+
+    /// Whether a token proves the server started executing the request, and so
+    /// is past the point where a `ResetConnection` ENVCHANGE could still
+    /// arrive. ENVCHANGE, INFO, and SESSIONSTATE can legitimately precede or
+    /// accompany the acknowledgement; ERROR is treated as inconclusive so the
+    /// server's own diagnostic wins. DONE_ATTN acknowledges the cancellation,
+    /// not execution of the request that carried RESETCONNECTION.
+    fn proves_request_ran(token: &Tokens) -> bool {
+        match token {
+            Tokens::EnvChange(_) | Tokens::Info(_) | Tokens::SessionState(_) | Tokens::Error(_) => {
+                false
+            }
+            Tokens::Done(done) | Tokens::DoneInProc(done) | Tokens::DoneProc(done)
+                if done.status.contains(DoneStatus::ATTN) =>
+            {
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Settles reset tracking left over from an earlier request whose response
+    /// was abandoned before any verdict could be reached.
+    ///
+    /// Cancellation and timeout are the reachable cases. Their ATTENTION drain
+    /// replays a retained `ResetConnection` ENVCHANGE when one arrived. If the
+    /// drain reaches DONE_ATTN without any token proving the carrying request
+    /// ran, acknowledgement tracking remains outstanding for this boundary to
+    /// settle.
+    ///
+    /// This runs at the request boundary, before the current request has sent
+    /// anything, so a dispatch record or outstanding acknowledgement seen here
+    /// necessarily belongs to an earlier request. Carrying that suspicion
+    /// forward would mark a healthy connection dead on the first token of a
+    /// request that never had anything to do with the reset — the failure mode
+    /// this verification exists to avoid causing.
+    ///
+    /// Called from both [`begin_command`](Self::begin_command) and
+    /// [`check_and_reconnect`](Self::check_and_reconnect) because neither alone
+    /// is universal: the cursor RPCs in `cursor_ops` never call `begin_command`,
+    /// and the transaction ops deliberately skip recovery. Together they cover
+    /// every request path. It is idempotent — once settled, the state is `Idle`
+    /// and the dispatch record consumed — so reaching it twice is harmless.
+    ///
+    /// Settling as reset rather than as a failure is what the protocol
+    /// supports: the server resets the session *before* it processes the
+    /// carrying request, the bit demonstrably reached the wire, and
+    /// `prepare_reset_connection` already reconciled every client-side cache at
+    /// arm time. No pool guarantee is weakened either — an abandoned carrier
+    /// fails its own request, so the checkout that issued it reports failure and
+    /// discards the connection.
+    ///
+    /// This is also where a *lost* arm is recovered. `PacketWriter::new`
+    /// consumes the armed mode before any bytes are written, so a message
+    /// abandoned during serialization (e.g. a parameter-encoding or Always
+    /// Encrypted failure, which propagates without condemning the transport)
+    /// takes the arm with it while leaving no dispatch record. Left alone the
+    /// connection would sit in `Armed` forever: no request would carry the bit,
+    /// so nothing could ever reach `AwaitingAck`, and the session would never be
+    /// reset with nothing to notice. Re-arming the carried mode restores the
+    /// invariant that `Armed` means "the next eligible request carries it".
+    fn settle_abandoned_reset_verification(&mut self) {
+        let carried = self.transport.as_writer().take_reset_dispatched();
+        let abandoned = match self.reset_state {
+            ResetAckState::Idle => false,
+            // Still `Armed` with the bit already sent: an earlier request
+            // carried it and its response was abandoned before the first token.
+            ResetAckState::Armed(mode) => {
+                if !carried {
+                    // The arm may have been consumed by a message that never
+                    // reached the wire. Re-arming is safe either way: if the
+                    // writer still holds it, this overwrites it with the same
+                    // mode; if it was lost, this puts it back.
+                    self.transport.as_writer().set_reset_mode(mode);
+                    return;
+                }
+                true
+            }
+            // The response ended without ever reaching a verdict token.
+            ResetAckState::AwaitingAck => true,
+        };
+        if !abandoned {
+            return;
+        }
+        warn!(
+            "A request carrying the RESETCONNECTION bit was abandoned before its acknowledgement \
+             could be observed; treating the session as reset rather than charging the next request"
+        );
+        self.reset_state = ResetAckState::Idle;
+    }
+
     /// True when a RESETCONNECTION bit has been armed but the server has not yet
     /// acknowledged it with a `ResetConnection` ENVCHANGE.
     ///
-    /// A connection pool checks this *after* the request that carries the bit
-    /// (for a client-side pool, the checkout `SET TRANSACTION ISOLATION LEVEL`)
-    /// to confirm the reset was genuinely processed. A request completing
-    /// successfully is not evidence on its own: without the ENVCHANGE the server
-    /// never reset the session, so the connection must be discarded rather than
-    /// handed to the next borrower.
+    /// The client verifies this itself: the response to the request that carried
+    /// the bit must contain the ENVCHANGE, or the connection is marked dead and
+    /// the request fails with
+    /// [`Error::ConnectionResetNotAcknowledged`](crate::error::Error::ConnectionResetNotAcknowledged).
+    /// This is exposed for observability and for a pool that wants to assert the
+    /// reset has been settled; correctness does not depend on anyone calling it.
     pub fn reset_pending(&self) -> bool {
-        self.reset_pending
+        self.reset_state != ResetAckState::Idle
     }
 
     /// Converts a server `ERROR` token into [`SqlErrorInfo`], marking the
@@ -669,7 +1306,13 @@ impl TdsClient {
             );
             self.transport.mark_known_dead();
         }
-        SqlErrorInfo::from(error_token)
+        let error = SqlErrorInfo::from(error_token);
+        if let Some(batch) = self.prepared_batch.as_mut()
+            && let Some(row) = batch.current.as_mut()
+        {
+            row.errors.push(error.clone());
+        }
+        error
     }
 
     /// Returns the current database collation.
@@ -691,6 +1334,27 @@ impl TdsClient {
         &self.negotiated_settings.database
     }
 
+    /// How many database-change events this session has seen: every
+    /// `ENV_DATABASE` the server reported, plus every restore to login defaults
+    /// on a connection reset, plus every transparent reconnect — a recovered
+    /// session is a different session, so a per-database cache must not match
+    /// across one.
+    ///
+    /// **Compare for equality, do not treat as a watermark.** The count is
+    /// carried across a reconnect and advanced, so it does not decrease today,
+    /// but it is a change token rather than a monotonic clock and wraps on
+    /// overflow; only "same value" carries meaning.
+    ///
+    /// Pair this with [`database()`](Self::database) when caching per-database
+    /// state. The name alone misses a `USE [X]` issued while already in `X`,
+    /// which still produces an `ENVCHANGE` and, combined with an `EXECUTE AS`,
+    /// is the only indication the database principal may have changed.
+    /// msodbcsql flags its own `USER_NAME()` refresh on any `ENV_DATABASE`
+    /// token without comparing names (`sqlctokn.cpp:2866-2882`).
+    pub fn database_change_count(&self) -> u64 {
+        self.negotiated_settings.database_change_count
+    }
+
     /// Returns the language the connection is currently using.
     ///
     /// Reflects any change made after login (e.g. `SET LANGUAGE`, surfaced via
@@ -702,6 +1366,34 @@ impl TdsClient {
         &self.negotiated_settings.language
     }
 
+    /// Returns the login settings for an independent connection to the same
+    /// server and current database, for work that must not disturb this
+    /// session's pending results. Connection retry is disabled on the copy:
+    /// such a connection is short-lived and has no session state to recover.
+    /// The copy does not share this session's connection trace, whose client
+    /// connection ID must keep naming this session.
+    ///
+    /// `None` when the client was built without its login context.
+    pub fn secondary_client_context(&self) -> Option<ClientContext> {
+        let mut context = self.recovery_context.client_context.as_deref()?.clone();
+        context
+            .database
+            .clone_from(&self.negotiated_settings.database);
+        context.connect_retry_count = 0;
+        context.connection_trace = None;
+        Some(context)
+    }
+
+    /// Network policy captured before this connection's first transport attempt.
+    pub fn multi_subnet_failover_policy(
+        &self,
+    ) -> Option<super::multi_subnet_failover::MultiSubnetFailoverPolicy> {
+        self.recovery_context
+            .client_context
+            .as_deref()?
+            .multi_subnet_failover_policy()
+    }
+
     /// Returns the negotiated TDS packet size, in bytes.
     ///
     /// The packet size is fixed for the lifetime of the connection (the server
@@ -711,10 +1403,44 @@ impl TdsClient {
         self.negotiated_settings.session_settings.packet_size
     }
 
+    /// Returns whether application traffic remains encrypted after login.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(
+            self.transport.as_writer_ref().get_encryption_setting(),
+            NegotiatedEncryptionSetting::Mandatory | NegotiatedEncryptionSetting::Strict
+        )
+    }
+
     /// Returns the SQL Server version reported in the `LOGINACK` token, if the
     /// server sent one during login.
     pub fn server_version(&self) -> Option<crate::core::Version> {
         self.negotiated_settings.login_ack_server_version
+    }
+
+    /// Returns the instance name the server reported for itself during login
+    /// (`@@SERVERNAME`), which is not necessarily the host the client dialled.
+    pub fn server_reported_name(&self) -> Option<&str> {
+        self.negotiated_settings.server_reported_name.as_deref()
+    }
+
+    /// The GUID sent in PRELOGIN for the current physical connection.
+    /// Changes after transparent recovery, but not after a pool reset.
+    pub fn client_connection_id(&self) -> uuid::Uuid {
+        self.negotiated_settings.client_connection_id
+    }
+
+    /// Returns the character-set name the server sent in the login
+    /// `CHARACTER_SET` `ENVCHANGE`, if any. Modern servers report a
+    /// `SQL_COLLATION` change instead and send no character-set name, so this is
+    /// commonly `None`.
+    pub fn char_set(&self) -> Option<&str> {
+        self.negotiated_settings.char_set.as_deref()
+    }
+
+    /// The Windows code page the current database collation selects, as
+    /// msodbcsql derives it for `SQL_COLLATION_SEQ` (`CodePageFromTDSCollation`).
+    pub fn collation_code_page(&self) -> Option<u16> {
+        crate::datatypes::sql_string::collation_code_page(self.get_collation())
     }
 
     /// Returns `true` if the connection is known to be dead.
@@ -754,10 +1480,17 @@ impl TdsClient {
     /// Rows affected by the most recently executed statement.
     ///
     /// Returns the row count from the last DONE token that carried the
-    /// `DONE_COUNT` flag, or `-1` when no count is available (DDL,
-    /// `SET NOCOUNT ON`, a forward-only SELECT whose trailing DONE has not been
-    /// read, or before any statement has executed). This maps directly to the
-    /// value ODBC `SQLRowCount` reports.
+    /// `DONE_COUNT` flag **and** was not tagged with the `SQLSELECT` command,
+    /// or `-1` when no such count is available (DDL, `SET NOCOUNT ON`, a
+    /// forward-only SELECT whose trailing DONE has not been read, or before any
+    /// statement has executed). This maps directly to the value ODBC
+    /// `SQLRowCount` reports.
+    ///
+    /// The `SQLSELECT` exclusion exists because SQL Server sets `DONE_COUNT` on
+    /// variable assignment (`DECLARE @x int = 1`, `SET @x = 1`,
+    /// `SELECT @x = col FROM t`) while tagging it `SQLSELECT`; that count is not
+    /// an update count and neither msodbcsql nor .NET SqlClient reports it. See
+    /// the comment in `advance_to_result_boundary`.
     pub fn last_rows_affected(&self) -> i64 {
         self.last_rows_affected
     }
@@ -765,8 +1498,10 @@ impl TdsClient {
     /// Drains the per-statement affected-row counts captured since the last
     /// COLMETADATA (or command start), in statement order. Used by the ODBC
     /// layer to surface each DML statement in a pure-DML batch as its own
-    /// result set. Returns an empty vec when the batch produced no counted DONE
-    /// (e.g. DDL, `SET NOCOUNT ON`).
+    /// result set. `SQLSELECT`-tagged counts are excluded, as for
+    /// [`last_rows_affected`](Self::last_rows_affected). Returns an empty vec
+    /// when the batch produced no qualifying counted DONE (e.g. DDL,
+    /// `SET NOCOUNT ON`, or only variable assignments).
     pub fn take_dml_result_counts(&mut self) -> Vec<i64> {
         std::mem::take(&mut self.dml_result_counts)
     }
@@ -783,6 +1518,12 @@ impl TdsClient {
         });
     }
 
+    #[inline]
+    /// Starts timeout accounting only when the request has a finite budget.
+    fn request_timeout_start(&self) -> Option<Instant> {
+        self.remaining_request_timeout.map(|_| Instant::now())
+    }
+
     /// Pre-execution check: detect a dead connection and attempt session recovery.
     ///
     /// Call this at the top of any operation that sends a TDS request (SQL
@@ -796,9 +1537,9 @@ impl TdsClient {
     /// `timeout_sec` is the overall budget for recovery **and** the subsequent
     /// execution, matching ODBC's `CheckOrRecoverConnection` (which deducts
     /// recovery time from the remaining command timeout). Charge the returned
-    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so a
-    /// 30-second command timeout still means at most 30 seconds total whether
-    /// or not a reconnect occurred. When `timeout_sec` is `None` or `Some(0)`,
+    /// duration back with [`deduct_timeout`](Self::deduct_timeout) so recovery
+    /// and execution share the budget at whole-second precision.
+    /// When `timeout_sec` is `None` or `Some(0)`,
     /// recovery is instead bounded by the login `connect_timeout`, so it can
     /// never block indefinitely.
     ///
@@ -831,9 +1572,37 @@ impl TdsClient {
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Duration> {
+        // Request boundary. `begin_command` misses the cursor RPCs (they never
+        // call it) and this misses the transaction ops (they deliberately skip
+        // recovery), so the settle lives in both; it is idempotent, so a path
+        // that reaches it twice costs nothing.
+        self.settle_abandoned_reset_verification();
+        // Same reasoning: a cursor RPC after a `Continue` batch must not inherit
+        // that batch's error mode.
+        self.reset_statement_walk_state();
+
         #[cfg(test)]
         if let Some(elapsed) = self.reconnect_elapsed_for_test.take() {
             return Ok(elapsed);
+        }
+
+        let connect_retry_count = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .map_or(0, |ctx| ctx.connect_retry_count);
+
+        // A cached dead verdict is authoritative. Without this gate, callers
+        // with recovery disabled (including intentionally closed clients and
+        // clients retired after protocol desynchronization) would fall through
+        // and write another request to the unusable transport.
+        let known_dead = self.transport.connection_known_dead();
+        if known_dead
+            && (!self.recovery_context.session_recovery_negotiated || connect_retry_count == 0)
+        {
+            return Err(crate::error::Error::ConnectionClosed(
+                "Connection is dead and session recovery is unavailable".to_string(),
+            ));
         }
 
         // Only attempt recovery when session recovery was negotiated and
@@ -841,17 +1610,14 @@ impl TdsClient {
         if !self.recovery_context.session_recovery_negotiated {
             return Ok(Duration::ZERO);
         }
-        let connect_retry_count = self
-            .recovery_context
-            .client_context
-            .as_ref()
-            .map_or(0, |ctx| ctx.connect_retry_count);
         if connect_retry_count == 0 {
             return Ok(Duration::ZERO);
         }
 
-        // Non-blocking poll — returns immediately.
-        if !self.transport.is_connection_dead() {
+        // Non-blocking poll — returns immediately. Skipped once the verdict is
+        // already in: a session retired by a fatal ERROR token or a failed drain
+        // stays unusable however healthy its socket still looks.
+        if !known_dead && !self.transport.is_connection_dead() {
             return Ok(Duration::ZERO);
         }
 
@@ -881,7 +1647,9 @@ impl TdsClient {
         };
 
         let start = Instant::now();
-        self.reconnect(reconnect_timeout, cancel_handle).await?;
+        // Keep the login/recovery state out of every command's future. Allocate
+        // only after detecting a dead connection, not on the healthy hot path.
+        Box::pin(self.reconnect(reconnect_timeout, cancel_handle)).await?;
         Ok(start.elapsed())
     }
 
@@ -895,7 +1663,7 @@ impl TdsClient {
         self.check_and_reconnect(timeout_sec, cancel_handle).await
     }
 
-    /// Charges elapsed recovery time against a command-timeout budget.
+    /// Charges whole elapsed seconds against a command-timeout budget.
     ///
     /// # Parameters
     /// - `timeout_sec`: remaining command budget in seconds; `None` means "no
@@ -904,8 +1672,11 @@ impl TdsClient {
     ///
     /// `None` and caller-supplied `Some(0)` both represent an infinite budget.
     /// A positive timeout becomes [`CommandTimeoutBudget::Exhausted`] when
-    /// recovery consumes it, which must be rejected by `into_timeout` before a
+    /// elapsed time consumes it, which must be rejected by `into_timeout` before a
     /// request is serialized.
+    /// Truncate elapsed time so sub-second cleanup cannot exhaust a one-second
+    /// budget. Multi-step callers must pass the original budget and cumulative
+    /// elapsed time, limiting rounding slack to less than one second.
     pub(in crate::connection) fn deduct_timeout(
         timeout_sec: Option<u32>,
         elapsed: Duration,
@@ -913,12 +1684,7 @@ impl TdsClient {
         let Some(timeout_sec) = timeout_sec.and_then(NonZeroU32::new) else {
             return CommandTimeoutBudget::None;
         };
-        let elapsed_secs = u32::try_from(
-            elapsed
-                .as_secs()
-                .saturating_add(u64::from(elapsed.subsec_nanos() > 0)),
-        )
-        .unwrap_or(u32::MAX);
+        let elapsed_secs = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
 
         match NonZeroU32::new(timeout_sec.get().saturating_sub(elapsed_secs)) {
             Some(remaining) => CommandTimeoutBudget::Remaining(remaining),
@@ -960,17 +1726,20 @@ impl TdsClient {
     /// cached database/language/collation (`sqlcmisc.cpp:2373-2461`); it simply
     /// does not extend it to prepared handles.
     ///
-    /// The acknowledgement is still tracked: [`reset_pending`](Self::reset_pending)
-    /// stays true until the server's `ResetConnection` ENVCHANGE arrives, so the
-    /// caller can verify the reset actually happened once the carrying request
-    /// completes.
+    /// The acknowledgement is verified by the client itself: the response to the
+    /// request that carries the bit must contain the server's `ResetConnection`
+    /// ENVCHANGE. If it does not, that request fails with
+    /// [`Error::ConnectionResetNotAcknowledged`](crate::error::Error::ConnectionResetNotAcknowledged)
+    /// and the connection is marked dead, so a pool cannot hand out a session
+    /// that was never reset. Verification therefore does not depend on the
+    /// consumer issuing any particular request after arming.
     pub fn prepare_reset_connection(&mut self, preserve_transaction: bool) {
         let mode = match preserve_transaction {
             true => ResetConnectionMode::ResetSkipTran,
             false => ResetConnectionMode::Reset,
         };
         self.transport.as_writer().set_reset_mode(mode);
-        self.reset_pending = true;
+        self.reset_state = ResetAckState::Armed(mode);
         // A full reset discards the server-side transaction, so mirror that here.
         // Leaving a stale descriptor would make `has_active_transaction()` report
         // a transaction the carrying request is itself about to destroy, and the
@@ -1001,11 +1770,15 @@ impl TdsClient {
     /// # Parameters
     /// - `sql_command` — raw T-SQL text to execute.
     /// - `options` — per-command [`ExecuteOptions`] (timeout, cancellation,
-    ///   Always Encrypted override). Pass `()` for defaults.
+    ///   Always Encrypted override, [statement-error mode](ExecuteOptions::on_error)).
+    ///   Pass `()` for defaults.
     ///
     /// # Errors
     /// Returns [`UsageError`](crate::error::Error::UsageError) if a previous
-    /// batch is still open.
+    /// batch is still open. When the first statement fails, returns
+    /// [`SqlServerError`](crate::error::Error::SqlServerError); under
+    /// [`BatchErrorMode::Continue`] the batch is left open so
+    /// [`advance()`](Self::advance) reaches the statements after it.
     #[instrument(skip(self, options), level = "info")]
     pub async fn execute<'a>(
         &mut self,
@@ -1031,6 +1804,7 @@ impl TdsClient {
             timeout,
             cancel,
             column_encryption,
+            on_error,
         } = options;
         self.current_command_ce_setting = column_encryption;
 
@@ -1042,6 +1816,8 @@ impl TdsClient {
 
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
+        // After the request boundary, which puts the mode back to `Abort`.
+        self.batch_error_mode = on_error;
         let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
         let resolved = budget.into_timeout()?;
         let timeout = resolved.seconds();
@@ -1055,7 +1831,9 @@ impl TdsClient {
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout, cancel);
-        batch.serialize(&mut packet_writer).await?;
+        let serialize_result = batch.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        self.finish_send(serialize_result, message).await?;
         Ok(())
     }
 
@@ -1088,7 +1866,9 @@ impl TdsClient {
             timeout: timeout_sec,
             cancel: cancel_handle,
             column_encryption,
+            on_error,
         } = options.into();
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         if self.command_is_busy() {
@@ -1103,9 +1883,9 @@ impl TdsClient {
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
         // encryption and encrypt them in place before sending the real RPC.
-        let (timeout_sec, request_timeout, database_collation) = self
-            .prepare_sp_executesql_command(timeout_sec, cancel_handle)
-            .await?;
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
+        let (timeout_sec, request_timeout, database_collation) =
+            self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
         self.ensure_parameter_features_supported(named_params.iter())?;
 
         if self.should_encrypt_parameters() && !named_params.is_empty() {
@@ -1132,9 +1912,400 @@ impl TdsClient {
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.position_on_first_result().await
+    }
+
+    async fn execute_sp_execute_batch<'a, I>(
+        &mut self,
+        statement_id: StatementId,
+        rows: I,
+        options: impl Into<ExecuteOptions<'a>>,
+        preserve_rows: bool,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        let Some(handle) = self.prepared_handles.get(&statement_id).copied() else {
+            return Err(UsageError(
+                "Cannot execute. Given prepared statement is not materialized on this connection"
+                    .to_string(),
+            ));
+        };
+
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+            on_error,
+        } = options.into();
+        Self::note_on_error_ignored(on_error);
+        self.current_command_ce_setting = column_encryption;
+        self.remaining_request_timeout = timeout_sec
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(u64::from(seconds)));
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.transport.reset_reader();
+
+        let database_collation = self.negotiated_settings.database_collation;
+        let send_started = self.request_timeout_start();
+        let rows = rows.into_iter();
+        let mut packet_writer = PacketType::RpcRequest.create_packet_writer(
+            self.transport.as_writer(),
+            timeout_sec,
+            cancel_handle,
+        );
+        let (row_count, _) = rows.size_hint();
+        let mut row_indices = Vec::with_capacity(row_count);
+        let mut first = true;
+        let serialization_result = async {
+            for row in rows {
+                // A row's parameters are all converted before any of its bytes
+                // reach the writer, so a build failure leaves no partial
+                // command behind: skipping it keeps the batch well-formed and
+                // the connection synchronised. msodbcsql reaches the same end
+                // state by retracting the started command with
+                // RPCBATCH_IGNORELAST (tdsrpc.cpp:258-268); it needs the byte
+                // because it streams conversion straight into the RPC buffer.
+                let Ok((row_index, mut positional_params)) = row else {
+                    continue;
+                };
+                RpcParameter::reject_data_at_exec(positional_params.iter())?;
+                if positional_params
+                    .iter()
+                    .any(RpcParameter::force_column_encryption)
+                {
+                    return Err(UsageError(
+                        "Batched prepared execution does not support ForceColumnEncryption."
+                            .to_string(),
+                    ));
+                }
+                let handle_parameter =
+                    RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
+                positional_params.insert(0, handle_parameter);
+                let rpc = SqlRpc::new_batch_command(
+                    RpcType::ProcId(RpcProcs::Execute),
+                    Some(positional_params),
+                    None,
+                    &database_collation,
+                    &self.execution_context,
+                    first,
+                );
+                rpc.serialize_batch_command(&mut packet_writer, first)
+                    .await?;
+                first = false;
+                row_indices.push(row_index);
+            }
+            if first {
+                return Err(UsageError(
+                    "Prepared RPC batch contains no executable rows".to_string(),
+                ));
+            }
+            packet_writer.finalize().await
+        }
+        .await;
+        let message = packet_writer.suspend();
+        self.finish_send(serialization_result, message).await?;
+        if let Some(start) = send_started {
+            self.update_remaining_timeout(start);
+        }
+
+        let result = if preserve_rows {
+            let mut remaining = row_indices.into_iter();
+            self.prepared_batch = Some(Box::new(PreparedBatchReadState {
+                current: remaining.next().map(PreparedBatchReadState::next_row),
+                remaining,
+                completed: Vec::new(),
+            }));
+            self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
+            self.advance_prepared_batch().await.map(|_| {
+                self.take_prepared_batch_results()
+                    .unwrap_or(PreparedBatchResult {
+                        rows: Vec::new(),
+                        complete: true,
+                    })
+            })
+        } else {
+            self.drain_prepared_batch(row_indices).await
+        };
+        if result.is_err() {
+            self.prepared_batch = None;
+            self.execution_context.set_has_open_batch(false);
+            self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
+        }
+        result
+    }
+
+    /// Takes completion records accumulated while fetching or advancing a
+    /// row-preserving prepared batch. `complete` is final only once the batch
+    /// is closed; an open batch may still have parameter sets in flight.
+    pub fn take_prepared_batch_results(&mut self) -> Option<PreparedBatchResult> {
+        let batch = self.prepared_batch.as_mut()?;
+        Some(PreparedBatchResult {
+            rows: std::mem::take(&mut batch.completed),
+            complete: batch.current.is_none() && batch.remaining.len() == 0,
+        })
+    }
+
+    /// Index of the parameter set currently producing results, if any.
+    pub fn current_parameter_set(&self) -> Option<usize> {
+        self.prepared_batch
+            .as_ref()?
+            .current
+            .as_ref()
+            .map(|row| row.row_index)
+    }
+
+    fn observe_prepared_batch_done(&mut self, token: &Tokens) -> TdsResult<()> {
+        let Some(batch) = self.prepared_batch.as_mut() else {
+            return Ok(());
+        };
+        let (done, in_proc) = match token {
+            Tokens::DoneInProc(done) => (done, true),
+            Tokens::Done(done) | Tokens::DoneProc(done) => (done, false),
+            _ => return Ok(()),
+        };
+        let row = batch.current.as_mut().ok_or_else(|| {
+            crate::error::Error::ProtocolError("Unexpected prepared batch completion".to_string())
+        })?;
+        if done.has_error() && row.errors.is_empty() {
+            self.transport.mark_known_dead();
+            return Err(crate::error::Error::ProtocolError(
+                "Server reported an error for a batched RPC without an ERROR token".to_string(),
+            ));
+        }
+        if done.status.contains(DoneStatus::COUNT) && done.cur_cmd != CurrentCommand::Select {
+            row.rows_affected = Some(
+                row.rows_affected
+                    .unwrap_or(0)
+                    .saturating_add(done.row_count),
+            );
+        }
+        if in_proc {
+            return Ok(());
+        }
+        if let Some(row) = batch.current.take() {
+            batch.completed.push(row);
+        }
+        if done.status.contains(DoneStatus::RPC_IN_BATCH) {
+            batch.current = batch.remaining.next().map(PreparedBatchReadState::next_row);
+            if batch.current.is_none() {
+                self.transport.mark_known_dead();
+                return Err(crate::error::Error::ProtocolError(
+                    "Batched RPC continuation does not match the submitted parameter sets"
+                        .to_string(),
+                ));
+            }
+        } else if done.has_more() {
+            self.transport.mark_known_dead();
+            return Err(crate::error::Error::ProtocolError(
+                "Batched RPC results ended without a final DONE".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn advance_prepared_batch(&mut self) -> TdsResult<StatementResult> {
+        let result = self.read_prepared_batch_result().await;
+        if let Err(error) = &result {
+            self.current_metadata = None;
+            self.current_result_set_has_been_read_till_end = true;
+            self.execution_context.set_has_open_batch(false);
+            self.prepared_batch = None;
+            if !matches!(
+                error,
+                crate::error::Error::TimeoutError(_)
+                    | crate::error::Error::OperationCancelledError(_)
+            ) {
+                self.retire_after_failed_drain(error);
+            }
+        }
+        result
+    }
+
+    async fn read_prepared_batch_result(&mut self) -> TdsResult<StatementResult> {
+        if self.maybe_has_unread_rows() {
+            self.drain_rows().await?;
+        }
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
+        while self
+            .prepared_batch
+            .as_ref()
+            .is_some_and(|batch| batch.current.is_some())
+        {
+            let token = self.next_response_token(&parser_context).await?;
+            match token {
+                Tokens::ColMetadata(metadata) => {
+                    if let Some(batch) = self.prepared_batch.as_mut()
+                        && let Some(row) = batch.current.as_mut()
+                    {
+                        row.has_result_set = true;
+                    }
+                    self.last_rows_affected = -1;
+                    return Ok(
+                        self.apply_result_boundary(ResultBoundaryKind::RowSet(Arc::new(metadata)))
+                    );
+                }
+                Tokens::Done(_) | Tokens::DoneProc(_) | Tokens::DoneInProc(_) => {}
+                Tokens::Error(error) => {
+                    self.record_error_token(&error);
+                }
+                other => self.apply_drain_side_effect(other, &mut Vec::new())?,
+            }
+        }
+        Ok(self.apply_result_boundary(ResultBoundaryKind::End))
+    }
+
+    async fn drain_prepared_batch(
+        &mut self,
+        row_indices: Vec<usize>,
+    ) -> TdsResult<PreparedBatchResult> {
+        let expected_rows = row_indices.len();
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
+        let mut results = Vec::with_capacity(row_indices.len());
+        let mut row_indices = row_indices.into_iter();
+        let mut current_index = row_indices.next().ok_or_else(|| {
+            UsageError("Prepared RPC batch contains no executable rows".to_string())
+        })?;
+        let mut errors = Vec::new();
+        let mut rows_affected = None;
+        let mut has_result_set = false;
+        let mut info_count = self.info_messages.len();
+
+        loop {
+            let token = self.next_response_token(&parser_context).await?;
+            match token {
+                Tokens::ColMetadata(metadata) => {
+                    has_result_set = true;
+                    if self
+                        .drain_result_set_rows(Arc::new(metadata), &mut errors)
+                        .await?
+                    {
+                        results.push(PreparedBatchRowResult {
+                            row_index: current_index,
+                            rows_affected,
+                            errors,
+                            has_result_set,
+                            has_info: self.info_messages.len() != info_count,
+                        });
+                        // The DONE that ended this result set carried no MORE.
+                        // If sets are still outstanding it ended the stream
+                        // early, so there are unread tokens and the connection
+                        // cannot be reused.
+                        //
+                        // This arm keys off MORE while the DONE arm below keys
+                        // off RPC_IN_BATCH, on the assumption that the server
+                        // moves the two together for a batched RPC. A DONE
+                        // carrying RPC_IN_BATCH with MORE clear would fail here
+                        // rather than continue - loudly, but on a healthy
+                        // connection. No server has been observed doing it.
+                        if row_indices.next().is_some() {
+                            self.transport.mark_known_dead();
+                            return Err(crate::error::Error::ProtocolError(
+                                "Batched RPC result set ended before every set reported"
+                                    .to_string(),
+                            ));
+                        }
+                        break;
+                    }
+                }
+                Tokens::DoneInProc(done) => {
+                    if done.status.contains(DoneStatus::COUNT)
+                        && done.cur_cmd != CurrentCommand::Select
+                    {
+                        rows_affected =
+                            Some(rows_affected.unwrap_or(0u64).saturating_add(done.row_count));
+                    }
+                }
+                Tokens::DoneProc(done) | Tokens::Done(done) => {
+                    if done.status.contains(DoneStatus::COUNT)
+                        && done.cur_cmd != CurrentCommand::Select
+                    {
+                        rows_affected =
+                            Some(rows_affected.unwrap_or(0u64).saturating_add(done.row_count));
+                    }
+                    if done.has_error() && errors.is_empty() {
+                        // Tokens for the rest of the batch are still unread, so
+                        // this connection cannot be handed back to the pool.
+                        self.transport.mark_known_dead();
+                        return Err(crate::error::Error::ProtocolError(
+                            "Server reported an error for a batched RPC without an ERROR token"
+                                .to_string(),
+                        ));
+                    }
+
+                    // msodbcsql treats any non-DONEINPROC DONE as the parameter
+                    // set boundary (sqlctokn.cpp:2329) and uses DONE_RPCINBATCH
+                    // only to say another command follows (:2413). So every DONE
+                    // reaching here reports its set; the flag decides whether to
+                    // expect another, never whether this one counts.
+                    results.push(PreparedBatchRowResult {
+                        row_index: current_index,
+                        rows_affected,
+                        errors,
+                        has_result_set,
+                        has_info: self.info_messages.len() != info_count,
+                    });
+
+                    if !done.status.contains(DoneStatus::RPC_IN_BATCH) {
+                        if done.has_more() {
+                            // No further RPC, yet the server says more tokens
+                            // follow: the batch never reached a final DONE, so
+                            // this connection cannot go back to the pool.
+                            self.transport.mark_known_dead();
+                            return Err(crate::error::Error::ProtocolError(
+                                "Batched RPC results ended without a final DONE".to_string(),
+                            ));
+                        }
+                        break;
+                    }
+                    match row_indices.next() {
+                        Some(next_index) => current_index = next_index,
+                        None => {
+                            self.transport.mark_known_dead();
+                            return Err(crate::error::Error::ProtocolError(
+                                "Server returned more batched RPC results than were sent"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    errors = Vec::new();
+                    rows_affected = None;
+                    has_result_set = false;
+                    info_count = self.info_messages.len();
+                }
+                Tokens::Error(error_token) => {
+                    errors.push(self.record_error_token(&error_token));
+                }
+                other => self.apply_drain_side_effect(other, &mut errors)?,
+            }
+        }
+
+        // A short batch means the stream ended at a final DONE before every
+        // command reported - an accounting mismatch, not a desynchronised
+        // socket, so the connection stays usable and `complete` carries it.
+        let complete = results.len() == expected_rows;
+
+        self.execution_context.set_has_open_batch(false);
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_metadata = None;
+
+        let result = PreparedBatchResult {
+            rows: results,
+            complete,
+        };
+        self.last_rows_affected = result.total_rows_affected().unwrap_or(-1);
+        Ok(result)
     }
 
     /// Starts a parameterized `sp_executesql` whose MAX parameter values are
@@ -1146,11 +2317,11 @@ impl TdsClient {
     /// [`RpcParameter::data_at_exec`] parameters.
     ///
     /// Supported streamed types are listed by [`StreamedSqlType`]. Chunks are
-    /// raw wire bytes and are written verbatim, so the caller owns the encoding:
-    /// `nvarchar(max)` chunks must be UTF-16LE, and `varchar(max)`/
-    /// `varbinary(max)` chunks their corresponding single-byte/binary
-    /// representation. A zero-length stream is a present empty value; use
-    /// [`TdsClient::write_streamed_null`] for SQL `NULL`.
+    /// raw wire bytes, so the caller owns the encoding: `nvarchar(max)` chunks
+    /// must be UTF-16LE, and `varchar(max)`/`varbinary(max)` chunks their
+    /// corresponding single-byte/binary representation. XML's required BOM is
+    /// the only normalization performed here. A zero-length stream is a present
+    /// empty value; use [`TdsClient::write_streamed_null`] for SQL `NULL`.
     ///
     /// The method returns [`StreamedParamStatus::NeedData`] after the RPC
     /// prefix is parked. Supply zero or more chunks and call
@@ -1160,7 +2331,9 @@ impl TdsClient {
     ///
     /// Streamed parameters must be named and must use one of the
     /// [`StreamedSqlType`] variants. Streaming is not supported when Always
-    /// Encrypted is active.
+    /// Encrypted is active. Chunk bytes must use the representation required by
+    /// the selected variant: XML is UTF-16LE (a BOM is optional and the client
+    /// ensures exactly one) and UDT is the opaque CLR-serialized payload.
     ///
     /// # Errors
     /// Returns a usage error for invalid streamed parameters or an active
@@ -1175,7 +2348,9 @@ impl TdsClient {
             timeout: timeout_sec,
             cancel: cancel_handle,
             column_encryption,
+            on_error,
         } = options.into();
+        Self::note_on_error_ignored(on_error);
 
         if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
@@ -1183,8 +2358,12 @@ impl TdsClient {
 
         self.current_command_ce_setting = column_encryption;
 
-        let (streamed_params, materialized_params) =
-            Self::split_and_validate_streamed_params(named_params)?;
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
+
+        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+            named_params,
+            &self.negotiated_settings.database_collation,
+        )?;
 
         if streamed_params.is_empty() {
             let result = self
@@ -1195,10 +2374,18 @@ impl TdsClient {
                         timeout: timeout_sec,
                         cancel: cancel_handle,
                         column_encryption,
+                        on_error: BatchErrorMode::Abort,
                     },
                 )
                 .await?;
             return Ok(StreamedParamStatus::Complete(result));
+        }
+
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Streamed PLP parameter writes are not supported with Always Encrypted."
+                    .to_string(),
+            ));
         }
 
         let mut declaration_params = materialized_params.clone();
@@ -1206,18 +2393,11 @@ impl TdsClient {
         let mut params_list_as_string = String::new();
         build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
 
-        let (timeout_sec, _request_timeout, database_collation) = self
-            .prepare_sp_executesql_command(timeout_sec, cancel_handle)
-            .await?;
+        let (timeout_sec, _request_timeout, database_collation) =
+            self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
         self.ensure_parameter_features_supported(
             materialized_params.iter().chain(streamed_params.iter()),
         )?;
-        if self.should_encrypt_parameters() {
-            return Err(UsageError(
-                "Streamed PLP parameter writes are not supported with Always Encrypted."
-                    .to_string(),
-            ));
-        }
         let rpc = self.build_sp_executesql_rpc(
             sql,
             materialized_params,
@@ -1225,7 +2405,7 @@ impl TdsClient {
             &database_collation,
         );
 
-        self.start_sp_executesql_streamed(
+        self.start_streamed_rpc(
             rpc,
             streamed_params,
             timeout_sec,
@@ -1235,7 +2415,26 @@ impl TdsClient {
         .await
     }
 
-    async fn prepare_sp_executesql_command(
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_execute_batch_for_test<I>(
+        &mut self,
+        statement_id: StatementId,
+        rows: I,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        self.begin_command();
+        self.execute_sp_execute_batch(statement_id, rows, ExecuteOptions::default(), false)
+            .await
+    }
+
+    /// Opens the command boundary, recovers a dead connection, and resolves the
+    /// per-command timeout/cancel state for an RPC the caller is about to build.
+    /// Shared by the `sp_executesql`, `sp_prepexec` and `sp_execute` streamed and
+    /// materialized entry points.
+    async fn prepare_rpc_command(
         &mut self,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
@@ -1290,6 +2489,7 @@ impl TdsClient {
 
     fn split_and_validate_streamed_params(
         named_params: Vec<RpcParameter>,
+        db_collation: &SqlCollation,
     ) -> TdsResult<(Vec<RpcParameter>, Vec<RpcParameter>)> {
         let (streamed_params, materialized_params): (Vec<_>, Vec<_>) = named_params
             .into_iter()
@@ -1299,12 +2499,16 @@ impl TdsClient {
             if param.name.is_none() {
                 return Err(UsageError("Streamed parameters must be named.".to_string()));
             }
+            param.validate_named_before_send(db_collation)?;
+            param.validate_streamed_configuration()?;
         }
 
         Ok((streamed_params, materialized_params))
     }
 
-    async fn start_sp_executesql_streamed(
+    /// Sends the RPC prefix plus the first streamed parameter's header, then
+    /// parks the half-written message so the caller can supply chunks.
+    async fn start_streamed_rpc(
         &mut self,
         rpc: SqlRpc<'_>,
         streamed_params: Vec<RpcParameter>,
@@ -1321,9 +2525,15 @@ impl TdsClient {
             .name
             .clone()
             .expect("streamed parameter names validated above");
+        let xml_bom_state = StreamedXmlBomState::for_param(&first);
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        // A streamed sequence spans several calls and never reaches
+        // `finish_send`, whose assignment is what resets this for an ordinary
+        // request. Clear it here so the sequence starts from a clean verdict and
+        // every later site can OR into it.
+        self.code_page_conversion_loss = false;
         // Write the RPC prefix (headers, proc, positional + materialized named
         // params) then the first streamed parameter's header. The data-at-exec
         // branch of `serialize` writes name + status + TYPE_INFO and stops before
@@ -1341,20 +2551,25 @@ impl TdsClient {
                 .await
         }
         .await;
+        let message = packet_writer.suspend();
         if let Err(error) = serialization_result {
-            drop(packet_writer);
-            self.abort_streamed_write().await;
+            drop(rpc);
+            // The prefix runs every materialized parameter through the same
+            // checks as the non-streamed sites, so this is retractable rather
+            // than a reason to discard the connection.
+            self.retract_partial_request(message).await;
             return Err(error);
         }
-        let message = packet_writer.suspend();
 
         self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
             message,
             pending,
             db_collation: database_collation,
             value_opened: false,
+            xml_bom_state,
             null_signaled: false,
             timeout_sec,
+            prepared: None,
         }));
 
         Ok(StreamedParamStatus::NeedData {
@@ -1368,6 +2583,12 @@ impl TdsClient {
     /// [`begin_sp_executesql`](Self::begin_sp_executesql) (or
     /// [`end_streamed_param`](Self::end_streamed_param)) and the matching
     /// [`end_streamed_param`](Self::end_streamed_param).
+    /// Prepared streams use
+    /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
+    ///
+    /// The bytes are written verbatim except that XML chunks must be UTF-16LE
+    /// and are normalized to start with exactly one BOM. UDT chunks must contain
+    /// the opaque CLR-serialized payload.
     ///
     /// Empty chunks are ignored: a zero-length PLP chunk header is the value
     /// terminator, so it must never be emitted mid-value.
@@ -1405,8 +2626,10 @@ impl TdsClient {
             pending,
             db_collation,
             value_opened,
+            mut xml_bom_state,
             null_signaled,
             timeout_sec,
+            prepared,
         } = *ctx;
         self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
@@ -1422,8 +2645,10 @@ impl TdsClient {
                     pending,
                     db_collation,
                     value_opened,
+                    xml_bom_state,
                     null_signaled,
                     timeout_sec,
+                    prepared,
                 }));
             return Err(UsageError(
                 "write_streamed_chunk called after the parameter was marked NULL.".to_string(),
@@ -1441,10 +2666,42 @@ impl TdsClient {
                     pending,
                     db_collation,
                     value_opened,
+                    xml_bom_state,
                     null_signaled,
                     timeout_sec,
+                    prepared,
                 }));
             return Ok(());
+        }
+
+        let mut xml_prefix_len = 0;
+        let mut xml_had_bom = false;
+        if let StreamedXmlBomState::Pending { prefix, len } = &mut xml_bom_state {
+            let prefix_len = usize::from(*len);
+            let take = if prefix_len == 0 && chunk.len() > 1 {
+                2u8
+            } else {
+                1u8
+            };
+            *len += take;
+            xml_prefix_len = usize::from(take);
+            prefix[prefix_len..prefix_len + xml_prefix_len]
+                .copy_from_slice(&chunk[..xml_prefix_len]);
+            if usize::from(*len) < prefix.len() {
+                self.streamed_write_state =
+                    StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                        message,
+                        pending,
+                        db_collation,
+                        value_opened,
+                        xml_bom_state,
+                        null_signaled,
+                        timeout_sec,
+                        prepared,
+                    }));
+                return Ok(());
+            }
+            xml_had_bom = *prefix == [0xFF, 0xFE];
         }
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
@@ -1455,12 +2712,32 @@ impl TdsClient {
             if !value_opened {
                 packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
             }
-            packet_writer.write_u32_async(chunk.len() as u32).await?;
-            packet_writer.write_async(chunk).await
+            if let StreamedXmlBomState::Pending { prefix, len } = &xml_bom_state {
+                packet_writer.write_u32_async(2).await?;
+                packet_writer.write_async(&[0xFF, 0xFE]).await?;
+                if !xml_had_bom {
+                    packet_writer.write_u32_async(u32::from(*len)).await?;
+                    packet_writer
+                        .write_async(&prefix[..usize::from(*len)])
+                        .await?;
+                }
+                let remainder = &chunk[xml_prefix_len..];
+                if !remainder.is_empty() {
+                    packet_writer
+                        .write_u32_async(remainder.len() as u32)
+                        .await?;
+                    packet_writer.write_async(remainder).await?;
+                }
+            } else {
+                packet_writer.write_u32_async(chunk.len() as u32).await?;
+                packet_writer.write_async(chunk).await?;
+            }
+            Ok(())
         }
         .await;
         let message = packet_writer.suspend();
 
+        let result = result.and_then(|()| message.check_cancellation());
         match result {
             Ok(()) => {
                 // Chunk framed cleanly: re-park the message so the next chunk or
@@ -1472,17 +2749,18 @@ impl TdsClient {
                         pending,
                         db_collation,
                         value_opened: true,
+                        xml_bom_state: match xml_bom_state {
+                            StreamedXmlBomState::Pending { .. } => StreamedXmlBomState::Written,
+                            other => other,
+                        },
                         null_signaled: false,
                         timeout_sec,
+                        prepared,
                     }));
                 Ok(())
             }
             Err(e) => {
-                // A partial value chunk is now on the wire, so this message can no
-                // longer be continued safely. Drop it and abort the streamed
-                // write rather than re-parking it as resumable.
-                drop(message);
-                self.abort_streamed_write().await;
+                self.retract_partial_request(message).await;
                 Err(e)
             }
         }
@@ -1496,12 +2774,19 @@ impl TdsClient {
     /// stream) instead of appending to a corrupt message. The transport is closed
     /// because RESETCONNECTION applies only to a subsequent request and cannot
     /// terminate this incomplete RPC.
+    ///
+    /// The request is lost, but the session need not be: the open-batch flag is
+    /// cleared here, so a caller that keeps the client alive will pass
+    /// `is_recovery_possible` and reconnect on its next
+    /// [`check_and_reconnect`](Self::check_and_reconnect).
     async fn abort_streamed_write(&mut self) {
         self.streamed_write_state = StreamedWriteState::Idle;
         self.execution_context.set_has_open_batch(false);
+        // A streamed `sp_prepexec` armed a capture for the `@handle` RETURNVALUE
+        // that will now never arrive; leaving it armed would divert an unrelated
+        // RPC's first return value into the handle map.
+        self.abort_pending_prepare_capture();
         self.transport.mark_known_dead();
-        // TODO: Match msodbcsql's state-aware cancellation: discard an unsent
-        // request locally, or send EOM | IGNORE and drain DONE after a partial send.
         if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after streamed write abort");
         }
@@ -1509,21 +2794,287 @@ impl TdsClient {
 
     /// Cancels an in-progress streamed PLP write while the client is parked in
     /// [`StreamedParamStatus::NeedData`](StreamedParamStatus::NeedData),
-    /// discarding the half-written RPC and closing the transport.
+    /// discarding the half-written RPC.
     ///
     /// This is the supported way for a caller to bail out of a streamed
     /// parameter sequence once [`begin_sp_executesql`](Self::begin_sp_executesql)
     /// has parked a message (for example, to service `SQLCancel` while an ODBC
-    /// driver is between `SQLPutData` calls). After this returns, no streamed
-    /// write is active, so a subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
+    /// driver is between `SQLPutData` calls, or to unwind after the driver
+    /// rejects a chunk). After this returns, no streamed write is active, so a
+    /// subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
     /// [`write_streamed_null`](Self::write_streamed_null), or
     /// [`end_streamed_param`](Self::end_streamed_param) fails with a usage
     /// error. Calling this with no streamed write active is a no-op.
+    ///
+    /// The connection normally survives, which is what lets an application keep
+    /// using a statement after a cancelled or rejected data-at-execution
+    /// sequence. How that is achieved depends on how much of the request has
+    /// escaped, mirroring msodbcsql's state-aware cancel:
+    ///
+    /// - nothing sent yet: the parked message is dropped locally and no bytes
+    ///   go to the server at all;
+    /// - partially sent: the message is closed with an EOM | IGNORE packet so
+    ///   the server discards it, and the DONE it answers with is consumed.
+    ///
+    /// Only if that handshake fails does the transport close, since the request
+    /// is then neither complete nor retractable.
     pub async fn cancel_streamed_write(&mut self) {
-        if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
+        let StreamedWriteState::Active(context) =
+            std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        else {
+            return;
+        };
+        // Same reasoning as `abort_streamed_write`: a cancelled `sp_prepexec`
+        // never yields its `@handle`, so the capture must not stay armed.
+        self.abort_pending_prepare_capture();
+
+        if context.message.nothing_sent() {
+            // Not a plain drop: the message consumed the connection's pending
+            // RESETCONNECTION bit when it was opened, and it never reached the
+            // network to carry it. `abandon` puts it back so the next request
+            // does, keeping the pool's one-shot reset honest.
+            context.message.abandon(self.transport.as_writer());
+            self.execution_context.set_has_open_batch(false);
             return;
         }
-        self.abort_streamed_write().await;
+
+        match self.withdraw_sent_message(context.message).await {
+            Withdrawal::Done | Withdrawal::ConnectionAlreadyDead => {
+                self.execution_context.set_has_open_batch(false);
+            }
+            Withdrawal::Failed(error) => {
+                warn!(%error, "Failed to withdraw a cancelled streamed write");
+                self.abort_streamed_write().await;
+            }
+            Withdrawal::WriteAbandoned(error) => {
+                warn!(%error, "Abandoned a cancelled streamed write mid-write");
+                self.retire_without_writing();
+            }
+        }
+    }
+
+    /// Gives up a request whose serialization failed, so the failure costs the
+    /// request rather than the connection.
+    ///
+    /// How depends on how much of the message reached the server: nothing is
+    /// discarded locally, part is withdrawn with `EOM | IGNORE`, and all of it is
+    /// cancelled with an attention. Without this the server holds a truncated
+    /// message and answers 4002 on the *next* command.
+    /// An interrupted packet write retires the transport without another write,
+    /// even if earlier packets completed: neither IGNORE nor TLS shutdown is safe.
+    async fn retract_partial_request(&mut self, message: SuspendedMessage) {
+        // Before anything that drains: a RETURNVALUE read with the capture still
+        // armed would record a handle for a request that never ran.
+        // `cancel_streamed_write` disarms up front for the same reason.
+        self.abort_pending_prepare_capture();
+
+        if message.send_incomplete() {
+            self.retire_without_writing();
+            return;
+        }
+
+        if message.nothing_sent() {
+            // Not a plain drop: re-arm the RESETCONNECTION bit this message took.
+            message.abandon(self.transport.as_writer());
+            self.execution_context.set_has_open_batch(false);
+            return;
+        }
+
+        if message.message_complete() {
+            // The server has the whole request and will answer it, so there is
+            // nothing to withdraw - an `EOM | IGNORE` would open a second message
+            // and leave its DONE for the next command. Cancel with an attention
+            // instead, which is msodbcsql's `STATE_BATCH_CMDSENT` arm. The
+            // transport marks itself dead if the attention goes unacknowledged.
+            //
+            // Dropped rather than abandoned: this message carried its reset bit
+            // all the way out and `note_reset_dispatched` recorded it, so the
+            // acknowledgement is already being tracked. Re-arming would send it
+            // twice.
+            let timeout = message
+                .cancellation_deadline()
+                .map_or(Duration::from_secs(ATTENTION_TIMEOUT_SECONDS), |deadline| {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                });
+            drop(message);
+            // `send_attention_and_wait` logs its own timeouts, but the write
+            // failure path returns without logging - and that is the one that
+            // costs a connection.
+            if let Err(error) = self.send_attention_with_timeout(timeout).await {
+                warn!(%error, "Failed to cancel a fully sent request");
+            }
+            return;
+        }
+
+        match self.withdraw_sent_message(message).await {
+            Withdrawal::Done | Withdrawal::ConnectionAlreadyDead => {
+                self.execution_context.set_has_open_batch(false);
+            }
+            Withdrawal::Failed(error) => {
+                warn!(%error, "Failed to withdraw a partially sent request");
+                self.abort_partial_request().await;
+            }
+            Withdrawal::WriteAbandoned(error) => {
+                warn!(%error, "Abandoned a partially sent request mid-write");
+                self.retire_without_writing();
+            }
+        }
+    }
+
+    /// Withdraws with `EOM | IGNORE`. A configured cancellation budget covers
+    /// the write and drain together; otherwise the historical TDS limits apply.
+    async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> Withdrawal {
+        // Cached read, not `is_connection_dead`: that one `try_read`s a byte,
+        // which here could swallow the server's answer to the half-written
+        // request. msodbcsql's `FIsConnectionDead` is likewise a cached flag.
+        if self.transport.connection_known_dead() {
+            // Dead or not, opening this message took the connection's one-shot
+            // reset arm; hand it back rather than swallowing it in a plain drop.
+            message.abandon(self.transport.as_writer());
+            return Withdrawal::ConnectionAlreadyDead;
+        }
+
+        // Read before `resume` takes it: the server discards an ignored message
+        // whole, so a reset bit already on the wire has to ride a later request.
+        let carried_reset = message.reset_mode();
+        let deadline = message.cancellation_deadline();
+
+        let mut packet_writer = PacketWriter::resume(
+            message
+                .with_write_timeout(if deadline.is_some() {
+                    None
+                } else {
+                    Some(CANCEL_WRITE_TIMEOUT_SECS)
+                })
+                .without_cancellation(),
+            self.transport.as_writer(),
+        );
+        // `PacketWriter` only checks its budget once a write returns, so the
+        // ignore packet needs an outer deadline too. Reaching that one means the
+        // write never came back, so the future is dropped mid-record and the
+        // transport is retired without being written to again.
+        let ignored = tokio::time::timeout_at(
+            deadline.unwrap_or_else(|| tokio::time::Instant::now() + CANCEL_TIMEOUT),
+            packet_writer.cancel_current_message(),
+        )
+        .await;
+        let message = packet_writer.suspend();
+        let send_incomplete = message.send_incomplete();
+        drop(message);
+        match ignored {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if send_incomplete => return Withdrawal::WriteAbandoned(error),
+            Ok(Err(error)) => return Withdrawal::Failed(error),
+            Err(_) => {
+                return Withdrawal::WriteAbandoned(crate::error::Error::TimeoutError(
+                    crate::error::TimeoutErrorType::String(
+                        "Timed out sending the ignore packet".to_string(),
+                    ),
+                ));
+            }
+        }
+
+        self.rearm_withdrawn_reset(carried_reset);
+
+        // The server acknowledges an ignored message with a DONE. Leaving it
+        // unread would desynchronize the next command.
+        let budget = deadline.map_or(CANCEL_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        });
+        let saved_timeout = self.remaining_request_timeout.replace(budget);
+        let saved_cancel = self.cancel_handle.take();
+        let drained = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, self.drain_stream()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.retire_without_writing();
+                    Err(crate::error::Error::TimeoutError(
+                        crate::error::TimeoutErrorType::String(
+                            "Timed out draining an ignored request".to_string(),
+                        ),
+                    ))
+                }
+            }
+        } else {
+            self.drain_stream().await
+        };
+        self.cancel_handle = saved_cancel;
+        self.remaining_request_timeout = saved_timeout;
+        match drained {
+            Ok(_) => Withdrawal::Done,
+            Err(error) => Withdrawal::Failed(error),
+        }
+    }
+
+    /// Hands back the RESETCONNECTION bit a withdrawn message carried away.
+    ///
+    /// Packet #1 recorded the dispatch, but the server discards the whole
+    /// ignored message, reset included. Leaving that record set would make the
+    /// withdrawal's own DONE look like a request that ran without resetting, and
+    /// `observe_response_token` would condemn a connection that is still fine.
+    ///
+    /// Deliberately diverges from msodbcsql, which clears `m_fResetConnection`
+    /// as the bit goes out (`SendPacket`, `tds/TdsSend.cpp`) and re-arms only on
+    /// pooled reuse (`odbc/sqlcmisc.cpp`). It has the same hole and never
+    /// notices, having no reset-acknowledgement check to break.
+    fn rearm_withdrawn_reset(&mut self, carried_reset: ResetConnectionMode) {
+        if carried_reset == ResetConnectionMode::None {
+            return;
+        }
+        // Also clears the dispatch record packet 1 left behind.
+        self.transport.as_writer().set_reset_mode(carried_reset);
+    }
+
+    /// Completes a send, retracting the half-sent message when serialization
+    /// failed so the failure costs the request rather than the connection.
+    ///
+    /// SQL batch and RPC sends that can fail after bytes reach an otherwise
+    /// usable transport must pass their result and suspended message here.
+    /// TODO(AB#47772): move these sends behind one API.
+    ///
+    /// The `drop(rpc)` stays at each call site: `SqlRpc` borrows
+    /// `&self.execution_context`, so that borrow has to end before `&mut self`.
+    pub(super) async fn finish_send(
+        &mut self,
+        serialize_result: TdsResult<()>,
+        message: SuspendedMessage,
+    ) -> TdsResult<()> {
+        if let Err(e) = serialize_result {
+            self.retract_partial_request(message).await;
+            return Err(e);
+        }
+        // Below the error return so a retracted request cannot leave the flag
+        // set. Harmless either way today -- `finish_execute` is the only drain
+        // point and is unreachable once a send site has failed, so a stale
+        // `true` is always overwritten by the next send's assignment before
+        // anything reads it -- but the contract the accessor documents is "the
+        // most recently *sent* message", and only this order matches it.
+        self.code_page_conversion_loss = message.code_page_conversion_loss();
+        Ok(())
+    }
+
+    /// Closes the transport after a request could not be retracted.
+    /// RESETCONNECTION applies to a later request and cannot terminate an
+    /// incomplete one, so the socket is all that is left to discard. Clearing
+    /// the open-batch flag lets the next `check_and_reconnect` recover.
+    async fn abort_partial_request(&mut self) {
+        self.retire_without_writing();
+        if let Err(error) = self.transport.close_transport().await {
+            warn!(%error, "Failed to close transport after a partial request abort");
+        }
+    }
+
+    /// Retires the transport without shutting the stream down.
+    ///
+    /// For a write that was dropped mid-flight the stream may still hold a
+    /// half-flushed record, and `close_transport` shuts it down — which on the
+    /// native-tls engine emits a close_notify, one more write on exactly that
+    /// stream. `send_attention_and_wait` avoids it the same way, by marking the
+    /// connection dead and never writing again.
+    fn retire_without_writing(&mut self) {
+        self.execution_context.set_has_open_batch(false);
+        self.abort_pending_prepare_capture();
+        self.transport.mark_known_dead();
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -1532,6 +3083,7 @@ impl TdsClient {
     /// when a data-at-execution parameter resolves to NULL (the ODBC
     /// `SQLPutData(SQL_NULL_DATA)` case). No bytes are written now; when the
     /// parameter is closed with [`end_streamed_param`](Self::end_streamed_param)
+    /// or [`end_execute_prepared_param`](Self::end_execute_prepared_param)
     /// the driver emits `PLP_NULL` instead of an unknown-length opener +
     /// terminator. Mirrors msodbcsql, which writes `VARMAX_LENGTH_NULL` with no
     /// chunks for a DAE parameter that resolves to NULL.
@@ -1555,21 +3107,25 @@ impl TdsClient {
             pending,
             db_collation,
             value_opened,
+            xml_bom_state,
             null_signaled: _,
             timeout_sec,
+            prepared,
         } = *ctx;
 
-        if value_opened {
-            // Chunks are already on the wire; the value cannot become NULL. Re-park
-            // the (still-clean) message — this is a caller sequencing error.
+        if value_opened || xml_bom_state.has_pending_bytes() {
+            // Data was already supplied, so the value cannot become NULL. Re-park
+            // the message — this is a caller sequencing error.
             self.streamed_write_state =
                 StreamedWriteState::Active(Box::new(StreamedWriteContext {
                     message,
                     pending,
                     db_collation,
                     value_opened,
+                    xml_bom_state,
                     null_signaled: false,
                     timeout_sec,
+                    prepared,
                 }));
             return Err(UsageError(
                 "write_streamed_null called after value chunks were already written.".to_string(),
@@ -1581,8 +3137,10 @@ impl TdsClient {
             pending,
             db_collation,
             value_opened: false,
+            xml_bom_state,
             null_signaled: true,
             timeout_sec,
+            prepared,
         }));
         Ok(())
     }
@@ -1601,11 +3159,43 @@ impl TdsClient {
     /// When the last streamed parameter closes, the RPC message is finalized and
     /// sent, then the real server result is returned in
     /// [`StreamedParamStatus::Complete`].
+    /// For a prepared stream, use
+    /// [`end_execute_prepared_param`](Self::end_execute_prepared_param) instead.
     ///
     /// # Errors
     /// Returns a usage error if no streamed parameter is currently open, or an
     /// I/O error if sending fails.
     pub async fn end_streamed_param(&mut self) -> TdsResult<StreamedParamStatus> {
+        self.end_streamed_param_inner(None).await
+    }
+
+    /// Closes a parameter opened by [`begin_execute_prepared`](Self::begin_execute_prepared).
+    ///
+    /// Pass the same statement and orphan slot supplied at begin. Once the
+    /// complete request is sent, the statement receives its new identity and
+    /// the piggybacked orphan is consumed, even if reading the response fails.
+    /// Cancellation or failure before that boundary leaves both unchanged.
+    pub async fn end_execute_prepared_param(
+        &mut self,
+        statement: &mut PreparedStatement,
+        orphaned: &mut Option<StatementId>,
+    ) -> TdsResult<StreamedParamStatus> {
+        self.end_streamed_param_inner(Some((statement, orphaned)))
+            .await
+    }
+
+    async fn end_streamed_param_inner(
+        &mut self,
+        prepared_target: Option<(&mut PreparedStatement, &mut Option<StatementId>)>,
+    ) -> TdsResult<StreamedParamStatus> {
+        if let StreamedWriteState::Active(ctx) = &self.streamed_write_state
+            && ctx.prepared.is_some() != prepared_target.is_some()
+        {
+            return Err(UsageError(
+                "Prepared streams must be closed with end_execute_prepared_param; other streams with end_streamed_param."
+                    .to_string(),
+            ));
+        }
         let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
         {
             StreamedWriteState::Active(ctx) => ctx,
@@ -1620,8 +3210,10 @@ impl TdsClient {
             mut pending,
             db_collation,
             value_opened,
+            xml_bom_state,
             null_signaled,
             timeout_sec,
+            prepared,
         } = *ctx;
         self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
 
@@ -1641,6 +3233,16 @@ impl TdsClient {
                 if !value_opened {
                     packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
                 }
+                if let StreamedXmlBomState::Pending { prefix, len } = &xml_bom_state {
+                    packet_writer.write_u32_async(2).await?;
+                    packet_writer.write_async(&[0xFF, 0xFE]).await?;
+                    if *len != 0 {
+                        packet_writer.write_u32_async(u32::from(*len)).await?;
+                        packet_writer
+                            .write_async(&prefix[..usize::from(*len)])
+                            .await?;
+                    }
+                }
                 packet_writer.write_u32_async(PLP_TERMINATOR).await?;
             }
             match pending.pop_front() {
@@ -1649,6 +3251,7 @@ impl TdsClient {
                         .name
                         .clone()
                         .expect("streamed parameter names validated at begin");
+                    let next_xml_bom_state = StreamedXmlBomState::for_param(&next);
                     next.serialize(
                         &mut packet_writer,
                         &db_collation,
@@ -1656,7 +3259,7 @@ impl TdsClient {
                         &GenericEncoder::new(),
                     )
                     .await?;
-                    Ok(Some(next_name))
+                    Ok(Some((next_name, next_xml_bom_state)))
                 }
                 None => {
                     packet_writer.finalize().await?;
@@ -1666,10 +3269,28 @@ impl TdsClient {
         }
         .await;
 
+        let message = packet_writer.suspend();
+        // A completed final packet can still return a timeout or callback
+        // error. Settle ownership from the wire state, not the Result.
+        if message.message_complete()
+            && let (Some(prepared), Some((statement, orphaned))) =
+                (prepared.as_ref(), prepared_target)
+        {
+            if let Some(id) = prepared.orphaned {
+                self.prepared_handles.remove(&id);
+                self.prepared_param_encryption.remove(&id);
+                *orphaned = None;
+            }
+            if let Some(id) = prepared.issued_id {
+                statement.id = Some(id);
+            }
+        }
+
+        let write_outcome =
+            write_outcome.and_then(|next| message.check_cancellation().map(|()| next));
         match write_outcome {
             // Another streamed parameter is now open for data.
-            Ok(Some(next_name)) => {
-                let message = packet_writer.suspend();
+            Ok(Some((next_name, xml_bom_state))) => {
                 self.streamed_write_state =
                     StreamedWriteState::Active(Box::new(StreamedWriteContext {
                         message,
@@ -1678,32 +3299,42 @@ impl TdsClient {
                         // Fresh parameter: its opener has not been written and it
                         // has not been marked NULL.
                         value_opened: false,
+                        xml_bom_state,
                         null_signaled: false,
                         timeout_sec,
+                        prepared,
                     }));
                 Ok(StreamedParamStatus::NeedData {
                     param_name: next_name,
                 })
             }
             // Last streamed parameter closed and the message was sent: consume
-            // the response exactly like execute_sp_executesql does. A failure
-            // reading the response also aborts (the request is already on the
-            // wire, so the connection must be reset before reuse).
+            // the response exactly like execute_sp_executesql does. An
+            // acknowledged ATTENTION costs only this request, not the session.
             Ok(None) => {
-                drop(packet_writer);
+                // The materialized parameters in this message's prefix were
+                // serialized calls ago; the flag rode along on the suspended
+                // message, and this is the only point at which the whole
+                // message is known to be complete. OR rather than assign: the
+                // streamed chunks in between reported their own substitutions
+                // through `note_code_page_conversion_loss`.
+                self.code_page_conversion_loss |= message.code_page_conversion_loss();
+                drop(message);
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
                     Err(e) => {
-                        self.abort_streamed_write().await;
+                        if !self.take_settled_drain_interruption(&e) {
+                            self.abort_streamed_write().await;
+                        }
                         Err(e)
                     }
                 }
             }
-            // Terminator or next-parameter header write failed mid-message: drop
-            // the half-written message and abort rather than leave it resumable.
+            // Terminator or next-parameter header write failed mid-message:
+            // withdraw it rather than leaving it resumable or discarding the
+            // connection for a failure that cost only the request.
             Err(e) => {
-                drop(packet_writer);
-                self.abort_streamed_write().await;
+                self.retract_partial_request(message).await;
                 Err(e)
             }
         }
@@ -1773,6 +3404,12 @@ impl TdsClient {
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
 
         self.transport.reset_reader();
+
+        // This message's substitution accounting starts clean. Every exit below
+        // publishes a verdict for *this* batch, so a failure before any row is
+        // written must report no substitution rather than leave the previous
+        // message's verdict standing (AB#47598).
+        self.code_page_conversion_loss = false;
 
         // STEP 1: Filter column metadata to only include mapped columns
         // If we have column mappings, only include the destination columns that are mapped.
@@ -1907,6 +3544,23 @@ impl TdsClient {
             }
         }
 
+        // A bulk row goes through the same `TdsValueSerializer` as an RPC
+        // parameter, so a narrow value can be substituted here too. This path
+        // builds its own `PacketWriter` and never reaches `finish_send`, so the
+        // verdict is published by hand.
+        //
+        // Published *here*, before the error branch, rather than after `end`:
+        // every exit below then carries it. Rows streamed before a mid-batch
+        // failure can already have been applied — a bulk copy with no internal
+        // transaction commits as it streams — so a substitution among them is
+        // real, and `BulkCopy::write_to_server_zerocopy` drains this in its
+        // `Err` arm to fold into the operation's verdict. Reading it now also
+        // ends the
+        // writer's borrow of the transport before either exit needs `&mut self`,
+        // and `end` writes only the DONE token, so nothing can be substituted
+        // between here and the return.
+        self.code_page_conversion_loss = writer.code_page_conversion_loss();
+
         // Handle error during row streaming
         if let Some(original_error) = row_write_error {
             // Send attention packet to cancel the bulk load operation gracefully.
@@ -1914,15 +3568,18 @@ impl TdsClient {
             // TDS protocol state so the connection can be reused.
             // The stream is always in a clean state here because writes are never
             // dropped mid-flight (issue #513).
+            // If the attention is never acknowledged the transport marks itself
+            // dead, so clearing the batch flag below cannot hand out a connection
+            // with an ATTENTION still outstanding.
             let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
             let _ = self.send_attention_with_timeout(attention_timeout).await;
-            // Clear the open batch flag since we've cancelled the operation
-            // This allows subsequent operations to use this connection
-            self.execution_context.set_has_open_batch(false);
             return Err(original_error);
         }
 
         // STEP 4: End streaming (write DONE token and finalize)
+        //
+        // The substitution verdict was published above so that the error exits
+        // carry it too; `end` cannot change it.
         let rows_written = writer.end().await?;
 
         // STEP 5: Drain the server response for error handling and INFO capture.
@@ -1948,16 +3605,7 @@ impl TdsClient {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
 
         loop {
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &parser_context,
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
+            let token = self.next_response_token(&parser_context).await?;
 
             match token {
                 Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
@@ -2035,7 +3683,9 @@ impl TdsClient {
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        batch.serialize(&mut packet_writer).await?;
+        let serialize_result = batch.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        self.finish_send(serialize_result, message).await?;
 
         // Consume the response
         self.consume_done_token().await
@@ -2073,7 +3723,9 @@ impl TdsClient {
             timeout: timeout_sec,
             cancel: cancel_handle,
             column_encryption,
+            on_error,
         } = options.into();
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         let mut positional_parameters = positional_parameters;
@@ -2170,7 +3822,10 @@ impl TdsClient {
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.position_on_first_result().await
     }
@@ -2211,21 +3866,27 @@ impl TdsClient {
         &mut self,
         sql: String,
         named_params: Vec<RpcParameter>,
+        command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementId> {
-        if self.command_is_busy() {
-            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
-        };
-
         let ExecuteOptions {
             timeout: timeout_sec,
             cancel: cancel_handle,
             column_encryption,
+            on_error,
         } = options.into();
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let reconnect_elapsed = if command_started {
+            Duration::ZERO
+        } else {
+            if self.command_is_busy() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+            self.check_and_reconnect(timeout_sec, cancel_handle).await?
+        };
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
         let resolved = budget.into_timeout()?;
         let timeout_sec = resolved.seconds();
@@ -2317,10 +3978,13 @@ impl TdsClient {
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         // Drain to completion to get output parameters and any server errors.
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
 
         // We need to get the return value, and then extract the handle from it.
         // If the server reported errors during prepare, surface them instead of a
@@ -2368,19 +4032,17 @@ impl TdsClient {
     /// server handle, so once the connection has reconnected that handle is
     /// already gone — reusing it hits SQL Server error 8179. Staleness needs no
     /// caller check: a reconnect clears `prepared_handles`, so an id with no
-    /// entry is skipped below without an RPC; on a dead connection the send just
-    /// fails and is ignored (best-effort). Forcing recovery, if ever wanted, is
+    /// entry is skipped below without an RPC; on a dead connection the send
+    /// fails and its error is propagated. Forcing recovery, if ever wanted, is
     /// the caller's job (see
     /// [`check_and_reconnect`](Self::check_and_reconnect)).
     /// A low-level wire call with caller-owned recovery — prefer the
     /// managed [`execute_prepared`](Self::execute_prepared) / [`unprepare`](Self::unprepare) API.
     ///
     /// Drops `statement_id`'s handle and cached Always Encrypted metadata from
-    /// the client's maps before sending, whether or not the RPC succeeds: a
-    /// failure is ambiguous (the send may have landed and the response been
-    /// lost), and a map entry naming a plan the server already dropped would
-    /// make the next execute fail with error 8179 instead of re-preparing.
-    /// Absent is the recoverable state; stale-but-present is not.
+    /// the client's maps once a send is attempted, whether or not it succeeds:
+    /// the server may have dropped the plan even if the response is lost.
+    /// Before any send starts, cancellation retains both entries for retry.
     ///
     /// `command_started`: `true` when the caller already opened the command
     /// boundary via `begin_command` (as `unprepare` does before recovery, so the
@@ -2405,8 +4067,10 @@ impl TdsClient {
         let ExecuteOptions {
             timeout: timeout_sec,
             cancel: cancel_handle,
+            on_error,
             ..
         } = options.into();
+        Self::note_on_error_ignored(on_error);
 
         // Store timeout and cancel handle for this operation
         let budget = Self::deduct_timeout(timeout_sec, Duration::ZERO);
@@ -2418,13 +4082,9 @@ impl TdsClient {
 
         self.transport.reset_reader();
 
-        // Evicted before the send: a failed RPC is ambiguous, and keeping an
-        // entry the server may already have dropped is the worse of the two
-        // wrong answers (see this method's docs).
-        let Some(handle) = self.prepared_handles.remove(&statement_id) else {
+        let Some(&handle) = self.prepared_handles.get(&statement_id) else {
             return Ok(());
         };
-        self.prepared_param_encryption.remove(&statement_id);
 
         let database_collation = self.negotiated_settings.database_collation;
 
@@ -2445,14 +4105,43 @@ impl TdsClient {
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(rpc);
+        if message.send_attempted() {
+            self.prepared_handles.remove(&statement_id);
+            self.prepared_param_encryption.remove(&statement_id);
+        }
+        self.finish_send(serialize_result, message).await?;
 
         // Drain the result set. A successful unprepare returns no results,
         // but surface any server errors collected during the drain instead of
         // silently discarding them.
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
+        }
+        Ok(())
+    }
+
+    async fn unprepare_orphan(
+        &mut self,
+        orphaned: &mut Option<StatementId>,
+        options: ExecuteOptions<'_>,
+    ) -> TdsResult<()> {
+        let Some(id) = *orphaned else {
+            return Ok(());
+        };
+        let cancel = options.cancel;
+        let result = self.execute_sp_unprepare(id, true, options).await;
+        if !self.prepared_handles.contains_key(&id) {
+            *orphaned = None;
+        }
+        result?;
+        if cancel.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+            return Err(crate::error::Error::OperationCancelledError(
+                "Request was cancelled during orphan cleanup".to_string(),
+            ));
         }
         Ok(())
     }
@@ -2540,6 +4229,331 @@ impl TdsClient {
         }
     }
 
+    /// Executes parameter rows against one prepared statement in a single TDS
+    /// RPC request.
+    ///
+    /// Rows are pulled from `rows` as each RPC is serialized, so callers can
+    /// convert application buffers lazily without retaining the complete batch.
+    /// The `usize` carried with each row is returned unchanged for result/status
+    /// correlation.
+    ///
+    /// The method recovers once before preparing or sending, reuses one server
+    /// handle for every row, and applies one timeout/cancellation budget to the
+    /// complete operation. Data-at-execution and Always Encrypted parameters are
+    /// rejected; callers must use the scalar execution path for those shapes.
+    pub async fn execute_prepared_batch<'a, I>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        rows: I,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        self.execute_prepared_batch_inner(statement, rows, orphaned, options, false)
+            .await
+    }
+
+    /// Executes the same batched request as `execute_prepared_batch`, but leaves
+    /// row-returning results available through `ResultSet` and `advance`.
+    /// Completion records are returned incrementally by `take_prepared_batch_results`.
+    pub async fn begin_execute_prepared_batch<'a, I>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        rows: I,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        self.execute_prepared_batch_inner(statement, rows, orphaned, options, true)
+            .await
+    }
+
+    async fn execute_prepared_batch_inner<'a, I>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        rows: I,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+        preserve_rows: bool,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        if self.command_is_busy() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let mut rows = rows.into_iter().peekable();
+        // A row that fails to build is skipped rather than aborting the batch,
+        // so the parameter declaration comes from the first row that builds -
+        // not from row 0. The caller's iterator has already recorded the ones
+        // skipped here, so consuming them loses nothing.
+        while matches!(rows.peek(), Some(Err(_))) {
+            rows.next();
+        }
+        let Some(Ok((_, first_params))) = rows.peek() else {
+            return Ok(PreparedBatchResult {
+                rows: Vec::new(),
+                complete: true,
+            });
+        };
+        let declaration_params = first_params.clone();
+        RpcParameter::reject_data_at_exec(declaration_params.iter())?;
+        let mut opts = options.into();
+        // Do not start cleanup for an already-cancelled batch.
+        if opts
+            .cancel
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Err(crate::error::Error::OperationCancelledError(
+                "Request was cancelled before starting its prepared batch".to_string(),
+            ));
+        }
+        self.current_command_ce_setting = opts.column_encryption;
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Batched prepared execution is not supported with Always Encrypted.".to_string(),
+            ));
+        }
+
+        self.begin_command();
+        let started = Instant::now();
+        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        let original_timeout = opts.timeout;
+        let mut budget = Self::deduct_timeout(original_timeout, reconnect_elapsed);
+        opts.timeout = budget.into_timeout()?.seconds();
+
+        let live_id = statement
+            .id
+            .filter(|id| self.prepared_handles.contains_key(id));
+        let statement_id = match live_id {
+            Some(id) => id,
+            None => {
+                if orphaned.is_some() {
+                    self.unprepare_orphan(orphaned, opts.clone()).await?;
+                    budget = Self::deduct_timeout(original_timeout, started.elapsed());
+                    opts.timeout = budget.into_timeout()?.seconds();
+                }
+
+                let declaration_params = declaration_params
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, mut parameter)| {
+                        parameter.name = Some(format!("@P{}", index + 1));
+                        parameter
+                    })
+                    .collect();
+                let statement_id = self
+                    .execute_sp_prepare(
+                        statement.sql.clone(),
+                        declaration_params,
+                        true,
+                        opts.clone(),
+                    )
+                    .await?;
+                statement.id = Some(statement_id);
+                budget = Self::deduct_timeout(original_timeout, started.elapsed());
+                opts.timeout = budget.into_timeout()?.seconds();
+                statement_id
+            }
+        };
+
+        self.execute_sp_execute_batch(statement_id, rows, opts, preserve_rows)
+            .await
+    }
+
+    /// Streaming counterpart to [`execute_prepared`](Self::execute_prepared) for
+    /// statements carrying [`RpcParameter::data_at_exec`] parameters.
+    ///
+    /// Data-at-execution does not change which procedure runs the statement: the
+    /// streamed values are written into the same `sp_prepexec` / `sp_execute`
+    /// RPC the statement would have used with materialized values, so a prepared
+    /// statement stays prepared and keeps reusing its handle. This mirrors
+    /// msodbcsql, which discovers data-at-execution while building the RPC and
+    /// parks the half-written request rather than switching procedures.
+    ///
+    /// Routing matches [`execute_prepared`](Self::execute_prepared): a handle
+    /// belonging to the live session is reused via `sp_execute`, otherwise the
+    /// statement is prepared and executed in one round trip via `sp_prepexec`.
+    /// With no streamed parameters this defers to
+    /// [`execute_prepared`](Self::execute_prepared) and reports
+    /// [`StreamedParamStatus::Complete`].
+    ///
+    /// Close each parameter with
+    /// [`end_execute_prepared_param`](Self::end_execute_prepared_param), passing
+    /// the same statement and orphan slot. `sp_prepexec` carries the orphan in
+    /// its by-reference `@handle`; the orphan remains owned by the caller until
+    /// the complete message is sent. Only then does the statement receive its
+    /// new identity, whose server handle is captured during the response drain.
+    /// Cancelling a parked request retains the orphan without issuing an inert
+    /// statement identity.
+    ///
+    /// Reusing a live statement uses `sp_execute`, which has no piggyback slot.
+    /// That route releases a separate orphan with `sp_unprepare` first, charging
+    /// both operations to the command timeout.
+    ///
+    /// # Errors
+    /// Returns a usage error for invalid streamed parameters, for an already
+    /// executing command, or when Always Encrypted is active for this command,
+    /// plus orphan-release or transport/serialization errors. A failed release
+    /// does not open a new streamed request.
+    pub async fn begin_execute_prepared<'a>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        named_params: Vec<RpcParameter>,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StreamedParamStatus> {
+        if self.command_is_busy() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let opts = options.into();
+        self.current_command_ce_setting = opts.column_encryption;
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
+
+        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+            named_params,
+            &self.negotiated_settings.database_collation,
+        )?;
+
+        if streamed_params.is_empty() {
+            let result = self
+                .execute_prepared(statement, materialized_params, orphaned, opts)
+                .await?;
+            return Ok(StreamedParamStatus::Complete(result));
+        }
+        // `execute_prepared` above notes it for the materialized route.
+        Self::note_on_error_ignored(opts.on_error);
+
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Streamed PLP parameter writes are not supported with Always Encrypted."
+                    .to_string(),
+            ));
+        }
+
+        let started = Instant::now();
+        let (mut timeout_sec, _request_timeout, database_collation) =
+            self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
+
+        self.ensure_parameter_features_supported(
+            materialized_params.iter().chain(streamed_params.iter()),
+        )?;
+
+        if orphaned.is_some_and(|id| !self.prepared_handles.contains_key(&id)) {
+            *orphaned = None;
+        }
+        // A live plan uses sp_execute, whose handle is not a drop slot.
+        let live_handle = statement
+            .id
+            .and_then(|id| self.prepared_handles.get(&id).copied());
+        if live_handle.is_some() && orphaned.is_some() {
+            self.unprepare_orphan(
+                orphaned,
+                ExecuteOptions {
+                    timeout: timeout_sec,
+                    ..opts.clone()
+                },
+            )
+            .await?;
+            let remaining = Self::deduct_timeout(opts.timeout, started.elapsed()).into_timeout()?;
+            timeout_sec = remaining.seconds();
+            self.remaining_request_timeout = remaining.duration();
+            self.cancel_handle = opts.cancel.map(CancelHandle::child_handle);
+        }
+
+        let live_handle = statement
+            .id
+            .and_then(|id| self.prepared_handles.get(&id).copied());
+        let (rpc, issued_id) = match live_handle {
+            Some(handle) => {
+                // `sp_execute` carries the handle plus the parameter values; the
+                // prepared plan already declares their types, so there is no
+                // `@params` string the streamed entries have to appear in.
+                let handle_parameter =
+                    RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
+                let rpc = SqlRpc::new(
+                    RpcType::ProcId(RpcProcs::Execute),
+                    Some(vec![handle_parameter]),
+                    Some(materialized_params),
+                    &database_collation,
+                    &self.execution_context,
+                );
+                (rpc, None)
+            }
+            None => {
+                // The `@params` declaration covers the streamed parameters too,
+                // even though their values arrive later.
+                let mut declaration_params = materialized_params.clone();
+                declaration_params.extend(streamed_params.iter().cloned());
+                let mut params_list_as_string = String::new();
+                build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+
+                let statement_parameter = RpcParameter::new(
+                    None,
+                    StatusFlags::NONE,
+                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(statement.sql.clone()))),
+                );
+                let params_parameter = RpcParameter::new(
+                    None,
+                    StatusFlags::NONE,
+                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
+                );
+                let handle_parameter = RpcParameter::new(
+                    None,
+                    StatusFlags::BY_REF_VALUE,
+                    SqlType::Int(orphaned.and_then(|id| self.prepared_handles.get(&id).copied())),
+                );
+
+                let rpc = SqlRpc::new(
+                    RpcType::ProcId(RpcProcs::PrepExec),
+                    Some(vec![
+                        handle_parameter,
+                        params_parameter,
+                        statement_parameter,
+                    ]),
+                    Some(materialized_params),
+                    &database_collation,
+                    &self.execution_context,
+                );
+
+                // Armed after the RPC is built, so a build failure cannot leave a
+                // stale target: the `@handle` RETURNVALUE trailing the result set
+                // is recorded under this id during the drain.
+                self.pending_prepared_param_encryption = None;
+                let issued_id = self.issue_statement_id();
+                self.pending_capture = Some(issued_id);
+                (rpc, Some(issued_id))
+            }
+        };
+
+        // A serialization failure in here aborts the streamed write, which also
+        // disarms the capture armed above.
+        let status = self
+            .start_streamed_rpc(
+                rpc,
+                streamed_params,
+                timeout_sec,
+                opts.cancel,
+                database_collation,
+            )
+            .await?;
+
+        if let StreamedWriteState::Active(ctx) = &mut self.streamed_write_state {
+            ctx.prepared = Some(StreamedPreparedContext {
+                issued_id,
+                orphaned: *orphaned,
+            });
+        }
+        Ok(status)
+    }
+
     /// Issues the next unique [`StatementId`] for a managed prepared statement.
     fn issue_statement_id(&mut self) -> StatementId {
         let id = StatementId(self.next_statement_id);
@@ -2561,6 +4575,8 @@ impl TdsClient {
     /// and sends `sp_unprepare` only when the statement's connection id still
     /// matches the recovered connection. Take the id with
     /// [`PreparedStatement::take_id`] once the statement is done.
+    /// Keep that id if this call fails before sending; retrying it is safe,
+    /// since a previously attempted release has already removed its map entry.
     pub async fn unprepare<'a>(
         &mut self,
         statement_id: StatementId,
@@ -2664,7 +4680,9 @@ impl TdsClient {
             timeout: timeout_sec,
             cancel: cancel_handle,
             column_encryption,
+            on_error,
         } = options.into();
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         // Store timeout and cancel handle for this operation
@@ -2761,9 +4779,9 @@ impl TdsClient {
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
-        drop(packet_writer);
-        if let Err(e) = serialize_result {
-            self.abort_pending_prepare_capture();
+        let message = packet_writer.suspend();
+        drop(rpc);
+        if let Err(e) = self.finish_send(serialize_result, message).await {
             self.report_issued_id(issued_id, statement_id);
             return Err(e);
         }
@@ -2849,7 +4867,9 @@ impl TdsClient {
             timeout: timeout_sec,
             cancel: cancel_handle,
             column_encryption,
+            on_error,
         } = options.into();
+        Self::note_on_error_ignored(on_error);
         self.current_command_ce_setting = column_encryption;
 
         // Store timeout and cancel handle for this operation
@@ -2900,6 +4920,7 @@ impl TdsClient {
             if let Some(params) = named_parameters.as_mut() {
                 param_refs.extend(params.iter_mut());
             }
+            let database_collation = self.negotiated_settings.database_collation;
             Self::apply_parameter_encryption(
                 &describe,
                 &providers,
@@ -2907,6 +4928,7 @@ impl TdsClient {
                 &mut param_refs,
                 &mut self.output_param_ceks,
                 &trusted_key_paths,
+                &database_collation,
             )
             .await?;
         }
@@ -2935,7 +4957,10 @@ impl TdsClient {
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.position_on_first_result().await
     }
@@ -2948,7 +4973,8 @@ impl TdsClient {
         named_params: Vec<RpcParameter>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementId> {
-        self.execute_sp_prepare(sql, named_params, options).await
+        self.execute_sp_prepare(sql, named_params, false, options)
+            .await
     }
 
     /// Records `handle` under a fresh id without a round-trip, so wire-protocol
@@ -2960,6 +4986,22 @@ impl TdsClient {
         let statement_id = self.issue_statement_id();
         self.prepared_handles.insert(statement_id, handle);
         statement_id
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn set_database_collation_for_test(&mut self, collation: SqlCollation) {
+        self.negotiated_settings.database_collation = collation;
+    }
+
+    /// Data Classification version negotiated at login, as its wire value.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn negotiated_data_classification_version_for_test(&self) -> Option<u8> {
+        self.negotiated_settings
+            .session_settings
+            .data_classification_version()
+            .map(|version| version as u8)
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -3045,26 +5087,165 @@ impl TdsClient {
     #[instrument(skip(self), level = "info")]
     async fn drain_rows(&mut self) -> TdsResult<()> {
         if self.maybe_has_unread_rows() {
-            // A pull cursor (`next_row_cursor`) may have left the current row
-            // partially read (`RowPaused`/`PlpPaused`). The push API used below
-            // rejects that state to avoid silently skipping a row the caller
-            // still expects to see — but here we are intentionally discarding
-            // the rest of the result set, so realign the stream past that parked
-            // row first. `drain_active_row` is a no-op when nothing is parked.
+            // A pull cursor may be partway through a row or PLP value; finish
+            // discarding it before reading the next ROW/NBCROW token.
             self.drain_active_row_if_needed().await?;
-            // Drain the current result set.
-            let mut writer = DiscardRowWriter;
-            while self.next_row_into(&mut writer).await? {
-                info!(
-                    column_count = self
-                        .current_metadata
-                        .as_ref()
-                        .map_or(0, |m| m.columns.len()),
-                    "Consuming row while draining result set"
-                );
+            if self.current_result_set_has_been_read_till_end {
+                return Ok(());
+            }
+            let Some(metadata) = self.current_metadata.as_ref().map(Arc::clone) else {
+                self.abort_pending_prepare_capture();
+                return Err(self.end_walk_on_read_error(UsageError(
+                    "No metadata found while draining the current result set".to_string(),
+                )));
+            };
+            // Discard ciphertext without resolving keys or decoding values.
+            // Key-store I/O must not delay reaching cancellation settlement.
+            let context = ParserContext::ColumnMetadata(metadata, None);
+            loop {
+                let start = Instant::now();
+                let result = self
+                    .transport
+                    .receive_row_into(
+                        &context,
+                        self.remaining_request_timeout,
+                        self.cancel_handle.as_ref(),
+                        ColumnPolicy::SkipAll,
+                        &mut DiscardRowWriter,
+                    )
+                    .await;
+                self.update_remaining_timeout(start);
+                match result {
+                    Ok(RowReadResult::RowWritten) => {}
+                    Ok(RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_)) => {
+                        self.abort_pending_prepare_capture();
+                        return Err(self.end_walk_on_read_error(
+                            crate::error::Error::ProtocolError(
+                                "Unexpected pause while discarding a full row".to_string(),
+                            ),
+                        ));
+                    }
+                    Ok(RowReadResult::Token(token)) => {
+                        match Box::pin(self.handle_row_read_token(token)).await {
+                            Ok(Some(false)) => break,
+                            Ok(_) => {}
+                            Err(error) => {
+                                self.abort_pending_prepare_capture();
+                                return Err(self.end_walk_on_read_error(error));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error = self.fail_read(error);
+                        self.abort_pending_prepare_capture();
+                        return Err(error);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// True when a drain failed because the transport went away, rather than
+    /// because the token stream lost sync.
+    ///
+    /// The distinction decides the remedy, so the two must not be collapsed. A
+    /// desynchronized stream is unrecoverable: the reader is parked at an
+    /// unknown offset in a response that is otherwise fine, and nothing can
+    /// resynchronize it. A socket that dropped mid-drain has no offset left to
+    /// recover — there is nothing to read from — and that is exactly the case
+    /// connection resiliency was built to handle transparently.
+    fn drain_failure_lost_the_transport(error: &crate::error::Error) -> bool {
+        matches!(
+            error,
+            crate::error::Error::Io(_)
+                | crate::error::Error::ConnectionClosed(_)
+                | crate::error::Error::ConnectionError(_)
+                | crate::error::Error::TlsError(_)
+                | crate::error::Error::TlsHandshakeError { .. }
+        )
+    }
+
+    /// Retires the connection after a drain failed, picking the remedy that
+    /// fits the cause.
+    ///
+    /// A timeout or cancellation returned after a successful ATTENTION is not a
+    /// failed drain: the one-shot settlement marker proves DONE_ATTN was reached,
+    /// so that interruption leaves the connection live.
+    ///
+    /// Both cases mark the transport dead, which is what a pool consults, so a
+    /// pooled consumer discards the connection either way. They differ in
+    /// whether session recovery stays armed:
+    ///
+    /// * **Stream desync** (protocol error, or an interruption with no successful
+    ///   settlement) — recovery is disarmed. The socket may be perfectly healthy,
+    ///   so leaving it armed would let the next command silently reconnect and
+    ///   paper over a decoder bug instead of surfacing it.
+    /// * **Transport loss** (I/O, TLS, connection closed) — recovery is left
+    ///   armed. Disarming it would turn a network blip that resiliency handles
+    ///   transparently into a hard failure, and these run on routine cursor
+    ///   open/close/fetch paths, not just exceptional ones.
+    ///
+    /// See [`Self::drain_failure_lost_the_transport`] for the split.
+    ///
+    /// What this does not do: it does not close the socket. A caller reusing
+    /// this `TdsClient` directly is still stopped by the known-dead gate in
+    /// [`Self::check_and_reconnect`]: after a desync it returns
+    /// `ConnectionClosed`, and after a transport loss it attempts session
+    /// recovery when it is available. Closing the socket here is the wrong remedy:
+    /// `close_transport` writes a TLS close_notify on a socket we just failed to
+    /// read from, and its `?` returns before `self.stream = None`, so a
+    /// swallowed error would leave the stream alive in exactly the degraded case
+    /// retirement exists for. Dropping the stream with no I/O is the fix; it
+    /// needs a new transport method and is left as follow-up.
+    fn retire_after_failed_drain(&mut self, error: &crate::error::Error) {
+        if self.take_settled_drain_interruption(error) {
+            return;
+        }
+        self.transport.mark_known_dead();
+        if !Self::drain_failure_lost_the_transport(error) {
+            self.recovery_context.session_recovery_negotiated = false;
+        }
+    }
+
+    /// Consumes the settlement evidence produced by the failing drain itself.
+    ///
+    /// A successful ATTENTION still returns the original timeout or cancellation,
+    /// but DONE_ATTN proves the stream is synchronized and must not be retired.
+    fn take_settled_drain_interruption(&mut self, error: &crate::error::Error) -> bool {
+        let settled = std::mem::take(&mut self.interrupted_read_settled);
+        settled
+            && matches!(
+                error,
+                crate::error::Error::TimeoutError(_)
+                    | crate::error::Error::OperationCancelledError(_)
+            )
+            && !self.transport.connection_known_dead()
+    }
+
+    /// Drains the stream, retiring the connection if the drain gives up partway.
+    ///
+    /// Call sites that would otherwise propagate a drain failure with a bare `?`
+    /// use this instead, so the rule "a drain either reaches the terminal DONE
+    /// or the connection is retired where it gave up" lives in one place rather
+    /// than being re-derived at each site. A site added later that forgets the
+    /// rule is then a missing call here, not a silent hole.
+    ///
+    /// The open-batch flag is cleared on failure for the same reason
+    /// [`Self::close_query`] clears it: leaving it set masks the real error
+    /// behind `ALREADY_EXECUTING_ERROR` on every later call, which is what made
+    /// the original failure look like a permanent wedge.
+    pub(in crate::connection) async fn drain_stream_or_retire(
+        &mut self,
+    ) -> TdsResult<Vec<SqlErrorInfo>> {
+        match self.drain_stream().await {
+            Ok(errors) => Ok(errors),
+            Err(error) => {
+                self.execution_context.set_has_open_batch(false);
+                self.retire_after_failed_drain(&error);
+                Err(error)
+            }
+        }
     }
 
     /// Drains all remaining tokens from the stream until a terminal DONE token.
@@ -3078,6 +5259,7 @@ impl TdsClient {
     /// Skipping that step would leave unparsed row bytes in the transport and
     /// corrupt the connection for reuse.
     pub(in crate::connection) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
+        self.interrupted_read_settled = false;
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
         // A COLMETADATA reached at the top level of the drain must be parsed with
         // the same Always Encrypted awareness as advance_to_result_boundary: when
@@ -3089,16 +5271,7 @@ impl TdsClient {
             self.negotiated_settings.is_column_encryption_supported(),
         );
         loop {
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &parser_context,
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
+            let token = self.next_response_token(&parser_context).await?;
 
             match token {
                 Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
@@ -3160,8 +5333,15 @@ impl TdsClient {
                     ColumnPolicy::SkipAll,
                     &mut writer,
                 )
-                .await?;
+                .await;
             self.update_remaining_timeout(start);
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.settle_interrupted_read(&error);
+                    return Err(error);
+                }
+            };
 
             match result {
                 RowReadResult::RowWritten => {
@@ -3234,6 +5414,131 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Clears result-local state after ATTENTION handling finishes.
+    ///
+    /// Whether the transport reached DONE_ATTN or retired the connection, the
+    /// cancelled result can no longer be resumed. Retaining its metadata,
+    /// timeout, row cursor, or open-batch flag would expose stale state.
+    fn normalize_after_attention(&mut self) {
+        self.prepared_batch = None;
+        self.current_metadata = None;
+        self.current_decryptor = None;
+        self.buffered_row_support = None;
+        self.count_map.clear();
+        self.last_rows_affected = -1;
+        self.dml_result_counts.clear();
+        self.return_values.clear();
+        self.output_param_ceks.clear();
+        self.last_return_status = ReturnStatus::NotReceived;
+        self.abort_pending_prepare_capture();
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        self.active_row_read_state = ActiveRowReadState::Idle;
+        self.row_already_positioned = false;
+        self.parked_token = None;
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_result_ended_with_done_in_proc = false;
+        self.reset_statement_walk_state();
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        self.execution_context.set_has_open_batch(false);
+    }
+
+    /// Applies connection-level control tokens consumed by an ATTENTION drain.
+    ///
+    /// Result-local output and status are intentionally discarded: cancellation
+    /// normalization clears them, and finalizing an encrypted return value could
+    /// fail and retire a stream that already reached DONE_ATTN. The managed
+    /// `sp_prepexec` handle is the exception: it is a plain integer needed to
+    /// release the server-side prepared statement later.
+    fn apply_attention_side_effect(&mut self, token: Tokens) -> TdsResult<()> {
+        match token {
+            Tokens::Error(error_token) => {
+                let _ = self.record_error_token(&error_token);
+            }
+            Tokens::Info(info_token) => self.capture_info_message(&info_token),
+            Tokens::EnvChange(env_change) => {
+                if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                    self.on_reset_connection_ack();
+                }
+                self.execution_context
+                    .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+            }
+            Tokens::SessionState(session_state) => {
+                self.recovery_context
+                    .process_session_state(&session_state)?;
+            }
+            Tokens::ReturnValue(return_value)
+                if self.pending_capture.is_some()
+                    && return_value.param_ordinal == 0
+                    && return_value.column_metadata.crypto_metadata.is_none()
+                    && matches!(&return_value.value, ColumnValues::Int(_)) =>
+            {
+                self.push_return_value(return_value.into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Applies client-visible session state consumed by the transport's drain.
+    ///
+    /// The transport must read through DONE_ATTN to realign the wire, but
+    /// `TdsClient` still owns transaction, environment, recovery, and reset
+    /// acknowledgement state.
+    fn apply_attention_settlement(
+        &mut self,
+        settlement: crate::connection::transport::network_transport::AttentionSettlement,
+    ) -> bool {
+        if settlement.overflowed {
+            // Replaying only a prefix of ENVCHANGE/SESSIONSTATE could expose
+            // client state that no longer matches the server. Fail closed even
+            // though the wire itself reached DONE_ATTN.
+            warn!(
+                retained_tokens = settlement.retained_token_count(),
+                "ATTENTION settlement state exceeded its retention limit"
+            );
+            self.transport.mark_known_dead();
+            return false;
+        }
+        for token in settlement.tokens {
+            if let Err(error) = self
+                .observe_response_token(&token)
+                .and_then(|_| self.apply_attention_side_effect(token))
+            {
+                warn!(?error, "Failed to apply state from the attention drain");
+                self.retire_after_failed_drain(&error);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn consume_attention_settlement(&mut self) -> bool {
+        let Some(settlement) = self.transport.take_attention_settlement() else {
+            return false;
+        };
+        self.apply_attention_settlement(settlement)
+    }
+
+    /// Finalizes client state after a read ended through cancellation or timeout.
+    ///
+    /// Every interruptible read surface calls this so settlement tokens are
+    /// applied once and the cancelled result is discarded before reuse.
+    fn settle_interrupted_read(&mut self, error: &crate::error::Error) {
+        self.interrupted_read_settled = false;
+        if !matches!(
+            error,
+            crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
+        ) {
+            return;
+        }
+
+        let settlement_applied = self.consume_attention_settlement();
+        self.normalize_after_attention();
+        self.interrupted_read_settled =
+            settlement_applied && !self.transport.connection_known_dead();
+    }
+
     /// Reads tokens up to the next result boundary in the response stream.
     ///
     /// With `expose_norow_statements = false` (result-set navigation used by
@@ -3245,8 +5550,9 @@ impl TdsClient {
     /// With `true` (ODBC statement-wise navigation, matching msodbcsql), a
     /// no-row statement's DONE token can be its own result boundary, returned
     /// as [`ResultBoundaryKind::NoRows`] instead of always being skipped. It is
-    /// surfaced only when the statement carries a row count (DONE `COUNT` flag)
-    /// or produced an informational message (PRINT / low-severity RAISERROR);
+    /// surfaced only when the statement carries an update count (DONE `COUNT`
+    /// on a non-`SQLSELECT` command) or produced an informational message
+    /// (PRINT / low-severity RAISERROR);
     /// a pure no-op statement with neither — e.g. a bare `CREATE TABLE` — is
     /// still collapsed into the following result, exactly as in result-set
     /// navigation. This mirrors msodbcsql, which exposes a statement as its own
@@ -3255,6 +5561,16 @@ impl TdsClient {
     /// call) always belongs to a no-row statement, because a row-returning
     /// statement's DONE is consumed while its rows are read/drained.
     async fn advance_to_result_boundary(&mut self) -> TdsResult<ResultBoundaryKind> {
+        // Every error below follows a read — including its two `UsageError`s,
+        // both raised on a token already consumed — so each ends a `Continue`
+        // walk unless it is a statement error.
+        match self.advance_to_result_boundary_inner().await {
+            Err(error) => Err(self.end_walk_on_read_error(error)),
+            ok => ok,
+        }
+    }
+
+    async fn advance_to_result_boundary_inner(&mut self) -> TdsResult<ResultBoundaryKind> {
         // Tell the COLMETADATA parser whether Always Encrypted was negotiated so
         // it can parse the CEK table and per-column crypto metadata.
         let parser_context = ParserContext::ColumnEncryption(
@@ -3280,26 +5596,32 @@ impl TdsClient {
                 );
             }
 
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &parser_context,
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
+            let token = self.next_response_token(&parser_context).await?;
+            // `Tokens` moves into the match below; capture the one distinction
+            // the shared DONE arm erases — only an RPC emits DONEINPROC, and
+            // only there is the MORE flag ambiguous.
+            let is_done_in_proc = matches!(token, Tokens::DoneInProc(_));
             match token {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
                     self.current_result_set_has_been_read_till_end = false;
+                    self.current_result_ended_with_done_in_proc = false;
                     // Positioning on a row-returning result: its count is
                     // unavailable on a forward-only cursor. Clear any count
                     // captured from a preceding DONE-only (DML) result in the
                     // same batch so it is not misreported for this SELECT.
                     self.last_rows_affected = -1;
                     self.dml_result_counts.clear();
+                    // A new row set has no DONE count until its rows are read.
+                    self.last_result_row_count = None;
+                    // The failed statement's own DONE did not come first; nothing
+                    // later is its completion.
+                    self.failed_statement_done_pending = false;
+                    // Nor its error-flagged DONEs: those precede the next result
+                    // set (live captures show the failing statement's DONEINPROC
+                    // before the COLMETADATA, and no enclosing DONEPROC flagged),
+                    // so an error-flagged DONE from here on is unpaired.
+                    self.statement_error_completion_pending = false;
                     return Ok(ResultBoundaryKind::RowSet(Arc::new(md)));
                 }
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -3309,44 +5631,95 @@ impl TdsClient {
                         done.has_more()
                     );
 
-                    if done.has_error() {
-                        return Err(crate::error::Error::ProtocolError(
-                            "Server reported error in DONE token without preceding ERROR token"
-                                .to_string(),
-                        ));
-                    }
+                    // This DONE ends a no-row statement, which has no row-set
+                    // count; drop the previous row set's so it is not read as this
+                    // statement's.
+                    self.last_result_row_count = None;
+                    // A DONE completing a statement error already returned under
+                    // `Continue` is not surfaced again as a result — even with a
+                    // count, since ERROR and COUNT are independent flags. That is
+                    // the first DONE after the error, and also an error-flagged
+                    // DONEPROC or DONE that closes the same completion chain: one
+                    // error can be reflected by both the inner DONEINPROC and the
+                    // enclosing DONEPROC. Read before `validate_done_error`, which
+                    // closes the chain.
+                    let first_done_after_error =
+                        std::mem::take(&mut self.failed_statement_done_pending);
+                    let closes_error_chain = !is_done_in_proc
+                        && done.has_error()
+                        && self.statement_error_completion_pending;
+                    let completes_failed_statement = first_done_after_error || closes_error_chain;
+                    self.validate_done_error(&done, is_done_in_proc)?;
 
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
                     self.current_result_set_has_been_read_till_end = true;
+                    self.current_result_ended_with_done_in_proc = is_done_in_proc;
 
                     let is_last = !done.has_more();
 
-                    // Capture the affected-row count for `SQLRowCount`, but only
-                    // when the DONE_COUNT flag is set — otherwise `row_count` is
-                    // not meaningful (DDL, SET NOCOUNT ON) and must stay -1. Each
-                    // counted DONE is also appended in order so a pure-DML batch
-                    // surfaces one count per statement.
+                    // Capture update counts for `SQLRowCount`. DONE_COUNT on a
+                    // SQLSELECT command is not an update-count result.
                     let has_count = done.status.contains(DoneStatus::COUNT);
-                    if has_count {
+                    // SQL Server compiles variable assignment (`DECLARE @x int = 1`,
+                    // `SET @x = 1`, `SELECT @x = col FROM t`) as a SQLSELECT command
+                    // and still sets DONE_COUNT. Neither reference driver exposes
+                    // those as update-count results, so neither do we:
+                    //   - msodbcsql: `Info != SQLSELECT` (sqlctokn.cpp:2150)
+                    //   - .NET SqlClient: `if (curCmd != TdsEnums.SELECT)`
+                    //     (TdsParser.cs `TryProcessDone`, "Skip the bogus DONE
+                    //     counts sent by the server")
+                    //
+                    // msodbcsql additionally excludes SQLFETCHCURSOR (0x21) and
+                    // SQLDBCC (0xe6) (sqlctokn.cpp:2151-2152); SqlClient does not,
+                    // and does not even define those constants. We follow SqlClient
+                    // because neither is observable here: no DBCC was found to set
+                    // DONE_COUNT, and although `cursor_ops::cursor_fetch` does route
+                    // `sp_cursorfetch` through `next_rowset` into this function, a
+                    // live SQL Server 2022 tags that DONEINPROC
+                    // `status: MORE|COUNT, cur_cmd: 0xc1` — SQLSELECT, already
+                    // handled below. `last_rows_affected` measured -1 across block
+                    // fetches with and without this guard. Add the variants only if
+                    // a capture ever shows 0x21 or 0xe6 arriving with DONE_COUNT.
+                    let has_update_count = has_count
+                        && done.cur_cmd != CurrentCommand::Select
+                        && !completes_failed_statement;
+                    if has_update_count {
                         let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
                         self.last_rows_affected = count;
                         self.dml_result_counts.push(count);
                     }
 
                     // Statement-wise navigation (msodbcsql parity): this DONE is
-                    // a navigable result only if the statement returned a row
-                    // count (COUNT flag) or produced messages. Pure DDL / no-op
+                    // a navigable result only if the statement returned an update
+                    // count or produced messages. Pure DDL / no-op
                     // statements (no count, no messages) are collapsed, exactly
                     // like result-set navigation, so a batch such as
                     // `CREATE; INSERT; SELECT` exposes the INSERT's row count and
                     // the SELECT, not the bare CREATE. `rows_affected` is
-                    // `Some(n)` only when the DONE carried a COUNT.
-                    if has_count || saw_message {
+                    // `Some(n)` only for an update-count result.
+                    if has_update_count || saw_message {
+                        if !has_update_count {
+                            // A message-only result carries no count. Clear any
+                            // count captured from a preceding statement in the
+                            // same batch so it is not re-reported as this
+                            // result's `SQLRowCount` — msodbcsql reports -1
+                            // here (verified for `UPDATE; PRINT`,
+                            // `UPDATE; RAISERROR` and `UPDATE;` followed by a
+                            // warning-raising assignment).
+                            self.last_rows_affected = -1;
+                        }
                         self.execution_context.set_has_open_batch(!is_last);
+                        if !is_last && is_done_in_proc {
+                            // The MORE flag may only be reporting the RPC's own
+                            // trailing DONEPROC; find out before the caller
+                            // treats it as another result.
+                            self.settle_rpc_terminator(&parser_context).await?;
+                            self.current_result_ended_with_done_in_proc = false;
+                        }
                         return Ok(ResultBoundaryKind::NoRows {
-                            rows_affected: if has_count {
+                            rows_affected: if has_update_count {
                                 Some(done.row_count)
                             } else {
                                 None
@@ -3406,7 +5779,74 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
-                    let mut all_errors = vec![self.record_error_token(&error_token)];
+                    let first_error = self.record_error_token(&error_token);
+                    let mut error_bytes = Self::error_text_bytes(&first_error);
+                    let mut all_errors = vec![first_error];
+                    let mut continues = self.continues_after(&error_token);
+                    if continues {
+                        // One failed statement can send several ERROR tokens, with
+                        // INFO between them, before its DONE. Read them all so the
+                        // statement fails once with every diagnostic, and park the
+                        // first token past them for the next call. Parking cannot
+                        // overwrite an earlier one: `next_response_token` hands a
+                        // parked token back before reading the wire, so the slot is
+                        // empty here.
+                        //
+                        // Three bounds, because the run is fed by the server: errors
+                        // kept, the text they hold, and tokens read in all, so a
+                        // run of INFO with no DONE cannot spin forever either.
+                        let mut tokens_read = 0u32;
+                        loop {
+                            tokens_read += 1;
+                            if tokens_read > MAX_TOKENS_AFTER_STATEMENT_ERROR {
+                                return Err(self.abandon_failed_statement(
+                                    Self::too_many_tokens_after_statement_error(),
+                                ));
+                            }
+                            // A transport failure here deliberately wins over the
+                            // SQL errors collected so far: it decides whether the
+                            // connection is retired.
+                            let token = match self.next_response_token(&parser_context).await {
+                                Ok(token) => token,
+                                Err(error) => {
+                                    return Err(self.abandon_failed_statement(error));
+                                }
+                            };
+                            match token {
+                                Tokens::Error(next_error) => {
+                                    if all_errors.len() >= MAX_ERRORS_PER_FAILED_STATEMENT {
+                                        return Err(self.abandon_failed_statement(
+                                            Self::too_many_errors_for_one_statement(),
+                                        ));
+                                    }
+                                    debug!(?next_error);
+                                    let error = self.record_error_token(&next_error);
+                                    error_bytes += Self::error_text_bytes(&error);
+                                    if error_bytes > MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT {
+                                        return Err(self.abandon_failed_statement(
+                                            Self::too_much_error_text_for_one_statement(),
+                                        ));
+                                    }
+                                    all_errors.push(error);
+                                    if !self.continues_after(&next_error) {
+                                        continues = false;
+                                        break;
+                                    }
+                                }
+                                Tokens::Info(info_token) => {
+                                    debug!(?info_token);
+                                    self.capture_info_message(&info_token);
+                                }
+                                other => {
+                                    self.parked_token = Some(Box::new(other));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if continues {
+                        return Err(self.statement_error_keeping_batch_open(all_errors));
+                    }
                     let drain_result = self.drain_stream().await;
                     // Reset batch state before propagating: the error terminates
                     // the batch regardless of whether the drain fully consumed
@@ -3419,7 +5859,12 @@ impl TdsClient {
                     match drain_result {
                         Ok(mut drain_errors) => all_errors.append(&mut drain_errors),
                         Err(e) => {
-                            warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                            warn!(error = ?e, "Drain after statement error failed; retiring the connection");
+                            // The SQL error still surfaces to the caller, but the
+                            // stream is now desynchronized. Without this the error
+                            // returns as `SqlServerError`, which callers treat as a
+                            // healthy connection reporting a failed statement.
+                            self.retire_after_failed_drain(&e);
                         }
                     }
                     return Err(crate::error::Error::from_sql_errors(all_errors));
@@ -3433,6 +5878,11 @@ impl TdsClient {
                     continue;
                 }
                 Tokens::TabName | Tokens::ColInfo => {
+                    continue;
+                }
+                // Parsed with the negotiated version; result-set attachment is
+                // not implemented yet, so the metadata is not surfaced.
+                Tokens::DataClassification(_) => {
                     continue;
                 }
                 _ => {
@@ -3454,7 +5904,16 @@ impl TdsClient {
         loop {
             match self.advance_to_result_boundary().await? {
                 ResultBoundaryKind::RowSet(md) => return Ok(Some(md)),
-                ResultBoundaryKind::NoRows { .. } => continue,
+                // A no-row statement can also be the *last* thing in the
+                // response — a terminal DONE with a count, or an RPC whose
+                // terminator the look-ahead already consumed. Reading on would
+                // block on a token that is never coming, so honour the same
+                // guard `advance` applies.
+                ResultBoundaryKind::NoRows { .. } => {
+                    if !self.execution_context.has_open_batch() {
+                        return Ok(None);
+                    }
+                }
                 ResultBoundaryKind::End => return Ok(None),
             }
         }
@@ -3469,6 +5928,7 @@ impl TdsClient {
                 self.current_metadata = Some(md);
                 self.execution_context.set_has_open_batch(true);
                 self.current_result_set_has_been_read_till_end = false;
+                self.current_result_ended_with_done_in_proc = false;
                 StatementResult::Rows
             }
             ResultBoundaryKind::NoRows { rows_affected } => {
@@ -3486,12 +5946,179 @@ impl TdsClient {
         }
     }
 
-    /// Returns `true` while the current batch still has unconsumed results on
-    /// the wire (a positioned result set, or further statements to navigate to).
+    /// Returns `true` while the current batch still has unconsumed results (a
+    /// positioned result set, or further statements to navigate to).
     /// Used by the ODBC layer to decide whether the connection stays busy after
     /// positioning on a no-row statement result.
+    ///
+    /// A token parked by the RPC-terminator look-ahead is covered without being
+    /// inspected here: parking means the terminal DONEPROC was not reached, so
+    /// the flag this reads is still set.
     pub fn has_open_batch(&self) -> bool {
         self.execution_context.has_open_batch()
+    }
+
+    /// Reads the next response token, replaying one parked by the RPC-terminator
+    /// look-ahead before touching the wire.
+    ///
+    /// A parked token was already timed and observed when it was first read, so
+    /// it is replayed as-is; re-observing it would charge one token's evidence
+    /// to the reset acknowledgement twice.
+    #[inline]
+    async fn next_response_token(&mut self, parser_context: &ParserContext) -> TdsResult<Tokens> {
+        if let Some(token) = self.parked_token.take() {
+            return Ok(*token);
+        }
+        let start = self.request_timeout_start();
+        let result = self
+            .transport
+            .receive_token(
+                parser_context,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+            )
+            .await;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        let token = match result {
+            Ok(token) => token,
+            Err(error) => return Err(self.fail_read(error)),
+        };
+        if let Err(error) = self
+            .observe_response_token(&token)
+            .and_then(|()| self.observe_prepared_batch_done(&token))
+        {
+            return Err(self.end_walk_on_read_error(error));
+        }
+        Ok(token)
+    }
+
+    /// Resolves whether an RPC response has anything left after the no-row
+    /// result just positioned on, closing the batch when it does not.
+    ///
+    /// Every `DONEINPROC` carries the MORE flag, because the RPC's own
+    /// `DONEPROC` still follows it, so the flag alone cannot tell "another
+    /// statement result is coming" from "that was the last one". Resolving that
+    /// ambiguity here lets every caller distinguish an exhausted RPC from one
+    /// with another result still available.
+    ///
+    /// Anything that is not the terminator is parked for the next read, so the
+    /// look-ahead never consumes a result the caller has yet to navigate to.
+    /// The response-tail control tokens that precede `DONEPROC` are absorbed
+    /// exactly as the main loop absorbs them.
+    ///
+    /// Every error exit ends the batch, so no caller can propagate a tail
+    /// failure over a batch nothing will finish reading.
+    ///
+    /// Unlike msodbcsql's short, non-failing single-byte peek, this consumes the
+    /// trailer under the request's remaining timeout. An expiry therefore fails
+    /// the request after the attention acknowledgement restores synchronization;
+    /// the connection remains reusable.
+    async fn settle_rpc_terminator(&mut self, parser_context: &ParserContext) -> TdsResult<()> {
+        if self.prepared_batch.is_some() {
+            return Ok(());
+        }
+        let mut processing_error = None;
+        let mut loop_count = 0u32;
+        loop {
+            loop_count += 1;
+            if loop_count > 10000 {
+                let error = crate::error::Error::ProtocolError(
+                    "Too many RPC trailer tokens without terminal DONEPROC".to_string(),
+                );
+                self.fail_rpc_terminator_look_ahead(&error);
+                return Err(error);
+            }
+
+            let token = match self.next_response_token(parser_context).await {
+                Ok(token) => token,
+                Err(error) => {
+                    self.fail_rpc_terminator_look_ahead(&error);
+                    return Err(error);
+                }
+            };
+            match token {
+                Tokens::ReturnStatus(return_status) => {
+                    self.last_return_status = ReturnStatus::Received(return_status.value);
+                }
+                Tokens::ReturnValue(return_value_token) => {
+                    match self.finalize_return_value(return_value_token) {
+                        Ok(return_value) => self.push_return_value(return_value),
+                        Err(error) => {
+                            processing_error.get_or_insert(error);
+                        }
+                    };
+                }
+                Tokens::EnvChange(env_change) => {
+                    if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.on_reset_connection_ack();
+                    }
+                    if let Err(error) = self
+                        .execution_context
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)
+                    {
+                        processing_error.get_or_insert(error);
+                    }
+                }
+                Tokens::SessionState(session_state) => {
+                    if let Err(error) = self.recovery_context.process_session_state(&session_state)
+                    {
+                        processing_error.get_or_insert(error);
+                    }
+                }
+                Tokens::DoneProc(done) if !done.has_more() && !done.has_error() => {
+                    self.remaining_request_timeout = None;
+                    self.cancel_handle = None;
+                    self.execution_context.set_has_open_batch(false);
+                    return processing_error.map_or(Ok(()), Err);
+                }
+                other => {
+                    self.parked_token = Some(Box::new(other));
+                    return match processing_error {
+                        None => Ok(()),
+                        Some(error) => Err(self.abandon_after_tail_failure(error).await),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Ends the batch after a tail token failed to process, keeping the rule
+    /// "a tail failure always ends the batch" with the loop that breaks it.
+    ///
+    /// The look-ahead parked whatever it could not process, so the rest of the
+    /// response is unread and nothing will come back for it. Leaving the batch
+    /// open masks the returned error behind `ALREADY_EXECUTING_ERROR` on every
+    /// later command for the whole connection.
+    async fn abandon_after_tail_failure(
+        &mut self,
+        error: crate::error::Error,
+    ) -> crate::error::Error {
+        if self.execution_context.has_open_batch() {
+            if let Err(drain_error) = self.drain_stream_or_retire().await {
+                warn!(error = ?drain_error, "Drain after an RPC tail failure failed");
+            }
+            self.execution_context.set_has_open_batch(false);
+        }
+        error
+    }
+
+    fn fail_rpc_terminator_look_ahead(&mut self, error: &crate::error::Error) {
+        self.execution_context.set_has_open_batch(false);
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        let attention_error = matches!(
+            error,
+            crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
+        );
+        if attention_error && self.transport.connection_known_dead() {
+            // ATTENTION did not restore a message boundary. Reconnecting would
+            // hide failed cancellation cleanup, so do not recover this session.
+            self.recovery_context.session_recovery_negotiated = false;
+        } else if !attention_error {
+            self.retire_after_failed_drain(error);
+        }
     }
 
     /// Returns `true` when an open result batch or streamed write blocks a new command.
@@ -3523,10 +6150,19 @@ impl TdsClient {
     /// statement, and row set is surfaced individually (matching msodbcsql's
     /// `SQLMoreResults`). Use [`advance_to_rows()`](Self::advance_to_rows) to
     /// skip straight to the next row-returning result set.
+    ///
+    /// Under [`BatchErrorMode::Continue`] a failed statement is returned here as
+    /// [`SqlServerError`](crate::error::Error::SqlServerError) with the batch
+    /// still open; call `advance` again to move past it.
     #[instrument(skip(self), level = "info")]
     pub async fn advance(&mut self) -> TdsResult<StatementResult> {
-        if !self.execution_context.has_open_batch() {
+        // Moving on ends the previous row set's count, on every path below.
+        self.last_result_row_count = None;
+        if !self.has_open_batch() {
             return Ok(StatementResult::End);
+        }
+        if self.prepared_batch.is_some() {
+            return self.advance_prepared_batch().await;
         }
         if self.maybe_has_unread_rows()
             && let Err(error) = self.drain_rows().await
@@ -3534,11 +6170,13 @@ impl TdsClient {
             self.abort_pending_prepare_capture();
             return Err(error);
         }
+        // The drain read the skipped row set's DONE; its count is not this result's.
+        self.last_result_row_count = None;
         // Draining the current result set may have consumed the batch's final
         // DONE token (has_more=false), which closes the batch. If so there is
         // nothing left on the wire to advance to; reading again would block
         // forever waiting for a token that never arrives.
-        if !self.execution_context.has_open_batch() {
+        if !self.has_open_batch() {
             return Ok(StatementResult::End);
         }
         match self.position_on_first_result().await {
@@ -3564,6 +6202,42 @@ impl TdsClient {
                 StatementResult::End => return Ok(false),
             }
         }
+    }
+
+    /// Settles the protocol-only tail after an exhausted RPC row set.
+    ///
+    /// SQL Server RPC responses can end a row set with `DONE_MORE`, then emit
+    /// RETURNVALUE/RETURNSTATUS tokens and a terminal DONEPROC. For a
+    /// `DONEINPROC`, `settle_rpc_terminator`
+    /// consumes only that control-token tail and parks the first non-tail token
+    /// for [`advance`](Self::advance). Plain batch DONE tokens are never probed.
+    ///
+    /// The `DONEINPROC` gate is msodbcsql's: `OnDone` probes the tail only for
+    /// `RS_SELECTION && DONEINPROC && DONE_MORE` (`sqlctokn.cpp:2208-2240`).
+    /// Widening it to every DONE would make an ordinary multi-statement batch
+    /// block here on the next statement's result.
+    ///
+    /// Returns `true` only when the batch is fully exhausted.
+    pub async fn complete_current_result(&mut self) -> TdsResult<bool> {
+        if !self.current_result_set_has_been_read_till_end {
+            return Ok(false);
+        }
+        if !self.execution_context.has_open_batch() {
+            return Ok(true);
+        }
+        if !self.current_result_ended_with_done_in_proc {
+            return Ok(false);
+        }
+
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
+        if let Err(error) = self.settle_rpc_terminator(&parser_context).await {
+            self.current_metadata = None;
+            self.abort_pending_prepare_capture();
+            return Err(error);
+        }
+        Ok(!self.execution_context.has_open_batch())
     }
 
     /// This functions returns to the next row in the result set.
@@ -3599,16 +6273,30 @@ impl TdsClient {
         params: impl IntoIterator<Item = &'p RpcParameter>,
     ) -> TdsResult<()> {
         let vector_version = self.negotiated_settings.vector_version();
-        let encryption_supported = self.should_encrypt_parameters();
         for param in params {
             param.ensure_vector_version_supported(vector_version)?;
-            if !encryption_supported && param.force_column_encryption() {
-                return Err(crate::error::Error::UsageError(
-                    "A parameter has ForceColumnEncryption set, but Always Encrypted is not enabled \
-                     for this command; enable column encryption on the connection, or clear the flag."
-                        .to_string(),
-                ));
-            }
+            self.ensure_force_column_encryption_supported([param])?;
+        }
+        Ok(())
+    }
+
+    /// Enforces the ForceColumnEncryption precondition: if any supplied parameter
+    /// requires encryption but Always Encrypted is not enabled for this command,
+    /// fail rather than sending it as plaintext. The per-parameter downgrade
+    /// check (server reports the column plaintext) is enforced separately in
+    /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
+    fn ensure_force_column_encryption_supported<'p>(
+        &self,
+        params: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> TdsResult<()> {
+        if !self.should_encrypt_parameters()
+            && params.into_iter().any(|p| p.force_column_encryption())
+        {
+            return Err(crate::error::Error::UsageError(
+                "A parameter has ForceColumnEncryption set, but Always Encrypted is not enabled \
+                 for this command; enable column encryption on the connection, or clear the flag."
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -3780,7 +6468,10 @@ impl TdsClient {
         );
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        rpc.serialize(&mut packet_writer).await?;
+        let serialize_result = rpc.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         let mut result = DescribeParameterEncryptionResult::new();
 
@@ -3872,6 +6563,7 @@ impl TdsClient {
             .await?;
 
         let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
+        let database_collation = self.negotiated_settings.database_collation;
         Self::apply_parameter_encryption(
             &describe,
             &providers,
@@ -3879,6 +6571,7 @@ impl TdsClient {
             params,
             &mut self.output_param_ceks,
             &trusted_key_paths,
+            &database_collation,
         )
         .await?;
         Ok(describe)
@@ -3999,6 +6692,7 @@ impl TdsClient {
         params: &mut [&mut RpcParameter],
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
         trusted_key_paths: &[String],
+        database_collation: &SqlCollation,
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -4102,14 +6796,15 @@ impl TdsClient {
 
             let param = &mut *params[index];
 
+            let (value, value_had_conversion_loss) =
+                param.value_for_encryption(database_collation)?;
             let ciphertext = encrypt_parameter(
-                param.value()?,
+                &value,
                 plaintext_cek.as_slice(),
                 info.cipher_algorithm_id,
                 info.encryption_type,
                 info.normalization_rule_version,
             )?;
-
             param.set_encrypted(
                 ciphertext,
                 RpcEncryptionMetadata {
@@ -4121,6 +6816,7 @@ impl TdsClient {
                     cek_md_version: cek_entry.cek_md_version,
                     normalization_rule_version: info.normalization_rule_version,
                 },
+                value_had_conversion_loss,
             );
         }
         Ok(())
@@ -4165,7 +6861,11 @@ impl TdsClient {
             }
         }
 
-        let mut tsql = format!("EXEC {stored_procedure_name}");
+        // Quoted rather than interpolated raw: with the ODBC {call ...}
+        // escape the procedure name is text lifted straight out of an
+        // application's SQL, so an unquoted name here would be a T-SQL
+        // injection point on Always Encrypted connections.
+        let mut tsql = format!("EXEC {}", quote_procedure_name(stored_procedure_name)?);
         let mut params_decl = String::new();
         let mut first = true;
 
@@ -4331,6 +7031,7 @@ impl TdsClient {
         match result {
             Ok(read) => Ok(read),
             Err(error) => {
+                let error = self.fail_read(error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -4363,21 +7064,66 @@ impl TdsClient {
         })
     }
 
+    /// Attempts to consume the next PLP output chunk entirely from buffered bytes.
+    pub fn try_read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<CursorPoll<PlpChunk>> {
+        let result = self.try_read_active_plp_chunk_inner(out);
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_read_active_plp_chunk_inner(
+        &mut self,
+        out: &mut [u8],
+    ) -> TdsResult<CursorPoll<PlpChunk>> {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        let start = self.request_timeout_start();
+        let read = match &mut self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => self
+                .transport
+                .try_read_buffered_plp(plp_state, out)
+                .map_err(Self::buffered_read_error)?,
+            _ => {
+                return Err(UsageError(
+                    "try_read_active_plp_chunk called with no active PLP stream".to_string(),
+                ));
+            }
+        };
+        let Some(read) = read else {
+            return Ok(CursorPoll::Pending);
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        Ok(CursorPoll::Ready(PlpChunk {
+            read,
+            reached_end: self.active_plp_reached_end(),
+            known_total: self.active_plp_known_len(),
+            total_read: self.active_plp_total_read(),
+        }))
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     ///
     /// This is the **push** entry point used by bulk consumers (Arrow / N-API /
-    /// `next_row`). It always decodes a full row ([`ColumnPolicy::DecodeAll`]) and
+    /// `next_row`). It always decodes a full row (`ColumnPolicy::DecodeAll`) and
     /// never pauses. If the pull cursor
     /// ([`next_row_cursor`](Self::next_row_cursor)) left a row *partially* read,
     /// this returns a [`UsageError`] rather than silently draining and skipping
     /// that row; a fully-consumed or absent row is accepted.
     ///
-    /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
-    /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
-    /// Concrete writers stay concrete through the production transport and
-    /// decode chain. [`ResultSet::next_row_into`] provides the same operation
-    /// through statically dispatched trait calls.
+    /// Buffered, unencrypted, non-PLP rows are decoded synchronously first.
+    /// Incomplete rows continue asynchronously with the same writer; other
+    /// unsupported buffered shapes use `receive_row_into`. All paths bypass the
+    /// intermediate `RowToken { all_values }`. Concrete writers stay concrete
+    /// through the production transport and decode chain.
+    /// [`ResultSet::next_row_into`] provides the same operation through
+    /// statically dispatched trait calls.
     // `#[instrument]` adds enough state to exceed the 4096 B budget once the
     // lazy timeout future is inlined. Successful rows still emit `Row Received`.
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
@@ -4415,6 +7161,27 @@ impl TdsClient {
             }
         }
 
+        match self.try_next_buffered_row_into(writer) {
+            Ok(BufferedRowPoll::Complete) => {
+                info!("Row Received");
+                return Ok(true);
+            }
+            Ok(BufferedRowPoll::Partial) => {
+                if let Err(error) = self.finish_row_into(writer).await {
+                    self.abort_pending_prepare_capture();
+                    return Err(error);
+                }
+                info!("Row Received");
+                return Ok(true);
+            }
+            Ok(BufferedRowPoll::Exhausted) => return Ok(false),
+            Ok(BufferedRowPoll::Pending) => {}
+            Err(error) => {
+                self.abort_pending_prepare_capture();
+                return Err(error);
+            }
+        }
+
         let metadata = Arc::clone(self.current_metadata.as_ref().unwrap());
         let decryptor = match self.resolve_cell_decryptor(&metadata).await {
             Ok(decryptor) => decryptor,
@@ -4439,6 +7206,7 @@ impl TdsClient {
             {
                 Ok(result) => result,
                 Err(error) => {
+                    let error = self.fail_read(error);
                     self.abort_pending_prepare_capture();
                     return Err(error);
                 }
@@ -4454,15 +7222,18 @@ impl TdsClient {
                 RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
                     // DecodeAll never pauses; a pause here is a protocol/logic error.
                     self.abort_pending_prepare_capture();
-                    return Err(crate::error::Error::ProtocolError(
-                        "Unexpected pause while decoding a full row (ColumnPolicy::DecodeAll)"
-                            .to_string(),
-                    ));
+                    return Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(
+                            "Unexpected pause while decoding a full row (ColumnPolicy::DecodeAll)"
+                                .to_string(),
+                        )),
+                    );
                 }
                 RowReadResult::Token(token) => {
                     let handled = match Box::pin(self.handle_row_read_token(token)).await {
                         Ok(handled) => handled,
                         Err(error) => {
+                            let error = self.end_walk_on_read_error(error);
                             self.abort_pending_prepare_capture();
                             return Err(error);
                         }
@@ -4475,6 +7246,201 @@ impl TdsClient {
         }
     }
 
+    /// Attempts to position the cursor from bytes already buffered by the transport.
+    /// A row parked by lookahead is claimed without reading from the transport.
+    ///
+    /// Returns [`CursorPoll::Pending`] without consuming bytes or cursor state
+    /// when the current row must first be drained, the next token needs async
+    /// parsing, encryption keys need resolving, or the row header is incomplete.
+    pub fn try_next_row_cursor(&mut self) -> TdsResult<CursorPoll<bool>> {
+        let result = self.try_next_row_cursor_inner();
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_next_row_cursor_inner(&mut self) -> TdsResult<CursorPoll<bool>> {
+        if self.row_already_positioned {
+            self.row_already_positioned = false;
+            return Ok(CursorPoll::Ready(true));
+        }
+
+        let Some(metadata) = self.current_metadata.as_ref().map(Arc::clone) else {
+            return Err(UsageError(
+                "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
+            ));
+        };
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(CursorPoll::Ready(false));
+        }
+        if !matches!(self.active_row_read_state, ActiveRowReadState::Idle)
+            || self
+                .cancel_handle
+                .as_ref()
+                .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+
+        // Resolving a CEK can call an async key-store provider. Keep encrypted
+        // result sets on the existing async path.
+        if !metadata.cek_table.is_empty()
+            || metadata
+                .columns
+                .iter()
+                .any(|column| column.crypto_metadata.is_some())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+
+        let context = ParserContext::ColumnMetadata(metadata, None);
+        let start = self.request_timeout_start();
+        let pause_state = self
+            .transport
+            .try_receive_row_header(&context)
+            .map_err(Self::buffered_read_error)?;
+        let Some(pause_state) = pause_state else {
+            return Ok(CursorPoll::Pending);
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+        Ok(CursorPoll::Ready(true))
+    }
+
+    /// Attempts to decode the next row directly into `writer` from bytes already
+    /// buffered by the transport.
+    ///
+    /// [`BufferedRowPoll::Pending`] is non-destructive. A
+    /// [`BufferedRowPoll::Partial`] result may already have written a row prefix;
+    /// the same writer must be passed to [`Self::finish_row_into`].
+    pub fn try_next_buffered_row_into<W>(&mut self, writer: &mut W) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.try_next_buffered_row_into_inner(writer);
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_next_buffered_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
+            ));
+        }
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(BufferedRowPoll::Exhausted);
+        }
+        if !matches!(self.active_row_read_state, ActiveRowReadState::Idle)
+            || self
+                .cancel_handle
+                .as_ref()
+                .is_some_and(|handle| handle.cancel_token.is_cancelled())
+            || !self.buffered_row_support()
+        {
+            return Ok(BufferedRowPoll::Pending);
+        }
+        let metadata = Arc::clone(
+            self.current_metadata
+                .as_ref()
+                .ok_or_else(|| UsageError("Buffered row metadata was cleared".to_string()))?,
+        );
+
+        let context = ParserContext::ColumnMetadata(metadata, None);
+        let start = self.request_timeout_start();
+        let Some(mut pause_state) = self
+            .transport
+            .try_receive_row_header(&context)
+            .map_err(Self::buffered_read_error)?
+        else {
+            return Ok(BufferedRowPoll::Pending);
+        };
+        let complete = self
+            .transport
+            .try_read_buffered_row_into(&mut pause_state, writer)
+            .map_err(Self::buffered_read_error)?;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+
+        if complete {
+            writer.end_row();
+            Ok(BufferedRowPoll::Complete)
+        } else {
+            self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+            Ok(BufferedRowPoll::Partial)
+        }
+    }
+
+    /// Attempts to position a row and capture its inline prefix from buffered bytes.
+    pub fn try_next_buffered_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.try_next_buffered_row_prefix_into_inner(prefix_len, writer);
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_next_buffered_row_prefix_into_inner<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
+            ));
+        }
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(BufferedRowPoll::Exhausted);
+        }
+        if !matches!(self.active_row_read_state, ActiveRowReadState::Idle)
+            || self
+                .cancel_handle
+                .as_ref()
+                .is_some_and(|handle| handle.cancel_token.is_cancelled())
+            || self.current_result_bufferable_prefix_len() != Some(prefix_len)
+        {
+            return Ok(BufferedRowPoll::Pending);
+        }
+        let metadata = Arc::clone(
+            self.current_metadata
+                .as_ref()
+                .ok_or_else(|| UsageError("Buffered row metadata was cleared".to_string()))?,
+        );
+        let context = ParserContext::ColumnMetadata(metadata, None);
+        let start = self.request_timeout_start();
+        let Some(mut pause_state) = self
+            .transport
+            .try_receive_row_header(&context)
+            .map_err(Self::buffered_read_error)?
+        else {
+            return Ok(BufferedRowPoll::Pending);
+        };
+        let complete = self
+            .transport
+            .try_read_buffered_row_prefix_into(&mut pause_state, prefix_len, writer)
+            .map_err(Self::buffered_read_error)?;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+        Ok(if complete {
+            BufferedRowPoll::Complete
+        } else {
+            BufferedRowPoll::Partial
+        })
+    }
+
     /// Positions the cursor on the next row without decoding any column
     /// (ODBC `SQLFetch`). Returns `Ok(true)` when positioned on a row and
     /// `Ok(false)` when the result set is exhausted.
@@ -4482,9 +7448,19 @@ impl TdsClient {
     /// After this returns `true`, individual columns are pulled with
     /// [`read_row_column`](Self::read_row_column). Any previously positioned row
     /// is drained first; its remaining column bytes are read and discarded rather
-    /// than returned to the caller.
+    /// than returned to the caller. Use this directly, or after
+    /// [`Self::try_next_row_cursor`] returns [`CursorPoll::Pending`].
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
+        // A previous `peek_past_current_row` already read this row's header
+        // off the wire and parked it in `active_row_read_state` — hand it
+        // over as-is instead of draining it (see `drain_active_row_if_needed`,
+        // which would otherwise treat an unread `RowPaused` as abandoned).
+        if self.row_already_positioned {
+            self.row_already_positioned = false;
+            return Ok(true);
+        }
+
         if self.current_metadata.is_none() {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -4505,7 +7481,7 @@ impl TdsClient {
         let decryptor = self.resolve_cell_decryptor(&metadata).await?;
         let parser_context = ParserContext::ColumnMetadata(metadata, decryptor);
         loop {
-            let start = Instant::now();
+            let start = self.request_timeout_start();
             let header = self
                 .transport
                 .receive_row_header(
@@ -4513,8 +7489,14 @@ impl TdsClient {
                     self.remaining_request_timeout,
                     self.cancel_handle.as_ref(),
                 )
-                .await?;
-            self.update_remaining_timeout(start);
+                .await;
+            if let Some(start) = start {
+                self.update_remaining_timeout(start);
+            }
+            let header = match header {
+                Ok(header) => header,
+                Err(error) => return Err(self.fail_read(error)),
+            };
 
             match header {
                 RowHeader::Positioned(pause_state) => {
@@ -4526,12 +7508,548 @@ impl TdsClient {
                     return Ok(true);
                 }
                 RowHeader::Token(token) => {
-                    if let Some(has_row) = Box::pin(self.handle_row_read_token(token)).await? {
+                    let handled = match Box::pin(self.handle_row_read_token(token)).await {
+                        Ok(handled) => handled,
+                        Err(error) => return Err(self.end_walk_on_read_error(error)),
+                    };
+                    if let Some(has_row) = handled {
                         return Ok(has_row);
                     }
                 }
             }
         }
+    }
+
+    /// Attempts to peek ahead to the next row from buffered bytes and preserves
+    /// it for the next cursor advance.
+    ///
+    /// ODBC execution uses this before its first fetch so an ERROR token sent
+    /// after COLMETADATA is reported by SQLExecDirect/SQLExecute. The ODBC busy
+    /// gate also uses it after delivering a row to discover whether another
+    /// row follows or the wire is now idle.
+    ///
+    /// A row found by [`CursorPoll::Ready`] is parked for the next
+    /// [`next_row_cursor`](Self::next_row_cursor) call. [`CursorPoll::Pending`]
+    /// leaves the peek for [`peek_past_current_row`](Self::peek_past_current_row).
+    pub fn try_peek_past_current_row(&mut self) -> TdsResult<CursorPoll<bool>> {
+        let poll = self.try_next_row_cursor()?;
+        if let CursorPoll::Ready(has_row) = poll {
+            self.row_already_positioned = has_row;
+        }
+        Ok(poll)
+    }
+
+    /// Peeks past the fully consumed row, parking the next row if one exists.
+    ///
+    /// Call this before the first row is positioned, or after every column of
+    /// the current row has been read. Like `next_row_cursor`, it discards any
+    /// unread columns from an already-positioned row.
+    pub async fn peek_past_current_row(&mut self) -> TdsResult<bool> {
+        let has_row = self.next_row_cursor().await?;
+        self.row_already_positioned = has_row;
+        Ok(has_row)
+    }
+
+    /// Attempts to decode the next sequential column from buffered bytes.
+    ///
+    /// Returns [`CursorPoll::Pending`] without consuming bytes or cursor state
+    /// for PLP, encrypted, skipped, unsupported, or incomplete columns. The
+    /// caller then continues with [`Self::read_row_column`].
+    pub fn try_read_row_column(&mut self, target: usize) -> TdsResult<CursorPoll<CursorColumn>> {
+        let result = self.try_read_row_column_inner(target);
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_read_row_column_inner(&mut self, target: usize) -> TdsResult<CursorPoll<CursorColumn>> {
+        let (next_column, column_count) = match &self.active_row_read_state {
+            ActiveRowReadState::Idle => return Ok(CursorPoll::Ready(CursorColumn::RowEnded)),
+            ActiveRowReadState::PlpPaused(_) => return Ok(CursorPoll::Pending),
+            ActiveRowReadState::RowPaused(pause_state) => {
+                (pause_state.next_column_index, pause_state.columns().len())
+            }
+        };
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        if target >= column_count {
+            return Err(UsageError(format!(
+                "read_row_column target column {target} is out of range (row has {column_count} columns)"
+            )));
+        }
+        if target < next_column {
+            return Ok(CursorPoll::Ready(CursorColumn::AlreadyConsumed));
+        }
+        if target != next_column {
+            // Skipping intervening columns can require arbitrarily shaped
+            // decoders. The async path remains authoritative for that case.
+            return Ok(CursorPoll::Pending);
+        }
+
+        let buffered_null = matches!(
+            &self.active_row_read_state,
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        );
+        if buffered_null {
+            let ActiveRowReadState::RowPaused(mut pause_state) =
+                std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+            else {
+                return Err(crate::error::Error::ImplementationError(
+                    "buffered NULL decode lost its row pause state".to_string(),
+                ));
+            };
+            pause_state.next_column_index = target + 1;
+            if pause_state.next_column_index < column_count {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+            }
+            return Ok(CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Null,
+                variant_base: None,
+            }));
+        }
+
+        let buffered_plp = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .columns()
+                    .get(target)
+                    .is_some_and(|metadata| metadata.is_plp()) =>
+            {
+                self.transport
+                    .try_begin_buffered_plp(pause_state, target)
+                    .map_err(Self::buffered_read_error)?
+            }
+            _ => None,
+        };
+        if let Some(stream) = buffered_plp {
+            let ActiveRowReadState::RowPaused(mut pause_state) =
+                std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+            else {
+                return Err(crate::error::Error::ImplementationError(
+                    "buffered PLP decode lost its row pause state".to_string(),
+                ));
+            };
+            pause_state.next_column_index = target + 1;
+            return if let Some(plp_stream) = stream {
+                let collation = plp_stream.collation();
+                self.active_row_read_state =
+                    ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+                        row_pause_state: *pause_state,
+                        plp_stream,
+                    }));
+                Ok(CursorPoll::Ready(CursorColumn::PlpStreaming { collation }))
+            } else {
+                if pause_state.next_column_index < column_count {
+                    self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+                }
+                Ok(CursorPoll::Ready(CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None,
+                }))
+            };
+        }
+
+        let start = self.request_timeout_start();
+        let value = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => self
+                .transport
+                .try_read_buffered_column_with_base(pause_state, target)
+                .map_err(Self::buffered_read_error)?,
+            ActiveRowReadState::Idle | ActiveRowReadState::PlpPaused(_) => None,
+        };
+        let Some((value, variant_base)) = value else {
+            return Ok(CursorPoll::Pending);
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+
+        let ActiveRowReadState::RowPaused(mut pause_state) =
+            std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+        else {
+            return Err(crate::error::Error::ImplementationError(
+                "buffered column decode lost its row pause state".to_string(),
+            ));
+        };
+        pause_state.next_column_index = target + 1;
+        if pause_state.next_column_index < column_count {
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+        }
+        Ok(CursorPoll::Ready(CursorColumn::Value {
+            value,
+            variant_base,
+        }))
+    }
+
+    /// Attempts to consume one complete buffered PLP column without opening a stream.
+    pub fn try_read_row_plp_complete(
+        &mut self,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CursorPoll<Option<PlpChunk>>> {
+        let result = self.try_read_row_plp_complete_inner(target, out);
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_read_row_plp_complete_inner(
+        &mut self,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CursorPoll<Option<PlpChunk>>> {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        let (next_column, column_count) = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => {
+                (pause_state.next_column_index, pause_state.columns().len())
+            }
+            _ => return Ok(CursorPoll::Pending),
+        };
+        if target != next_column || target >= column_count {
+            return Ok(CursorPoll::Pending);
+        }
+        let is_null = matches!(
+            &self.active_row_read_state,
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        );
+        let result = if is_null {
+            Some(None)
+        } else {
+            match &self.active_row_read_state {
+                ActiveRowReadState::RowPaused(pause_state) => self
+                    .transport
+                    .try_read_complete_buffered_plp_column(pause_state, target, out)
+                    .map_err(Self::buffered_read_error)?,
+                _ => None,
+            }
+        };
+        let Some(result) = result else {
+            return Ok(CursorPoll::Pending);
+        };
+        let ActiveRowReadState::RowPaused(mut pause_state) =
+            std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+        else {
+            return Err(crate::error::Error::ImplementationError(
+                "complete buffered PLP lost its row pause state".to_string(),
+            ));
+        };
+        pause_state.next_column_index = target + 1;
+        if pause_state.next_column_index < column_count {
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+        }
+        Ok(CursorPoll::Ready(result.map(
+            |(read, known_total, total_read)| PlpChunk {
+                read,
+                reached_end: true,
+                known_total,
+                total_read,
+            },
+        )))
+    }
+
+    /// Attempts to finish the positioned row through `writer` from bytes already
+    /// buffered by the transport.
+    ///
+    /// `false` means the buffered prefix was consumed and the same writer must be
+    /// passed to [`Self::finish_row_into`] to decode the remainder.
+    pub fn try_finish_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.try_finish_row_into_inner(writer);
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_finish_row_into_inner<W>(&mut self, writer: &mut W) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(false);
+        }
+
+        let start = self.request_timeout_start();
+        let complete = match &mut self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => self
+                .transport
+                .try_read_buffered_row_into(pause_state, writer)
+                .map_err(Self::buffered_read_error)?,
+            ActiveRowReadState::PlpPaused(_) => return Ok(false),
+            ActiveRowReadState::Idle => {
+                return Err(UsageError(
+                    "try_finish_row_into called without a positioned row".to_string(),
+                ));
+            }
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        if complete {
+            self.active_row_read_state = ActiveRowReadState::Idle;
+            writer.end_row();
+        }
+        Ok(complete)
+    }
+
+    /// Attempts to finish an inline row prefix from bytes already buffered.
+    pub fn try_finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let result = self.try_finish_row_prefix_into_inner(prefix_len, writer);
+        self.end_walk_on_try_read_error(result)
+    }
+
+    fn try_finish_row_prefix_into_inner<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(false);
+        }
+        let start = self.request_timeout_start();
+        let complete = match &mut self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => self
+                .transport
+                .try_read_buffered_row_prefix_into(pause_state, prefix_len, writer)
+                .map_err(Self::buffered_read_error)?,
+            ActiveRowReadState::PlpPaused(_) => return Ok(false),
+            ActiveRowReadState::Idle => {
+                return Err(UsageError(
+                    "try_finish_row_prefix_into called without a positioned row".to_string(),
+                ));
+            }
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        Ok(complete)
+    }
+
+    /// Returns whether the current result can be consumed as complete rows
+    /// without changing the pull cursor's PLP streaming behavior.
+    pub fn current_result_supports_row_into(&self) -> bool {
+        let Some(metadata) = self.current_metadata.as_ref() else {
+            return false;
+        };
+        if let Some(cached) = self.buffered_row_support.as_ref()
+            && Arc::ptr_eq(metadata, &cached.metadata)
+        {
+            return cached.whole_row;
+        }
+        Self::metadata_supports_buffered_rows(metadata)
+    }
+
+    /// Returns the contiguous non-PLP prefix eligible for fetch-time capture.
+    pub fn current_result_bufferable_prefix_len(&mut self) -> Option<usize> {
+        self.buffered_row_support();
+        self.buffered_row_support
+            .as_ref()
+            .and_then(|support| support.prefix_len)
+    }
+
+    /// Returns and caches whole-row eligibility for the current metadata allocation.
+    fn buffered_row_support(&mut self) -> bool {
+        let Some(metadata) = self.current_metadata.as_ref() else {
+            return false;
+        };
+        if let Some(cached) = self.buffered_row_support.as_ref()
+            && Arc::ptr_eq(metadata, &cached.metadata)
+        {
+            return cached.whole_row;
+        }
+
+        let whole_row = Self::metadata_supports_buffered_rows(metadata);
+        let prefix_len = if metadata.cek_table.is_empty()
+            && metadata
+                .columns
+                .iter()
+                .all(|column| column.crypto_metadata.is_none())
+        {
+            metadata
+                .columns
+                .iter()
+                .position(|column| column.is_plp())
+                .filter(|prefix_len| *prefix_len > 0)
+        } else {
+            None
+        };
+        self.buffered_row_support = Some(Box::new(BufferedRowSupport {
+            metadata: Arc::clone(metadata),
+            whole_row,
+            prefix_len,
+        }));
+        whole_row
+    }
+
+    /// Checks whether every column can use the non-streaming, non-encrypted row path.
+    fn metadata_supports_buffered_rows(metadata: &ColMetadataToken) -> bool {
+        metadata.cek_table.is_empty()
+            && metadata
+                .columns
+                .iter()
+                .all(|column| !column.is_plp() && column.crypto_metadata.is_none())
+    }
+
+    /// Finishes a row partially consumed by [`Self::try_finish_row_into`].
+    pub async fn finish_row_into<W>(&mut self, writer: &mut W) -> TdsResult<()>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let state = std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle);
+        let pause_state = match state {
+            ActiveRowReadState::RowPaused(pause_state) => pause_state,
+            state => {
+                self.active_row_read_state = state;
+                return Err(UsageError(
+                    "finish_row_into called without a resumable positioned row".to_string(),
+                ));
+            }
+        };
+
+        let start = self.request_timeout_start();
+        let result = self
+            .transport
+            .resume_row_into(
+                *pause_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                ColumnPolicy::DecodeAll,
+                writer,
+            )
+            .await;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+
+        // The arms that fail have consumed row bytes, so a `Continue` walk ends.
+        let outcome = match result {
+            Ok(RowReadResult::RowWritten) => {
+                writer.end_row();
+                Ok(())
+            }
+            Ok(RowReadResult::RowPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "DecodeAll unexpectedly paused while finishing a row".to_string(),
+                ))
+            }
+            Ok(RowReadResult::PlpPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "DecodeAll unexpectedly paused at a PLP value while finishing a row"
+                        .to_string(),
+                ))
+            }
+            Ok(RowReadResult::Token(_)) => Err(crate::error::Error::ProtocolError(
+                "row continuation returned a control token".to_string(),
+            )),
+            Err(error) => {
+                let error = self.fail_read(error);
+                self.abort_pending_prepare_capture();
+                Err(error)
+            }
+        };
+        outcome.map_err(|error| self.end_walk_on_read_error(error))
+    }
+
+    /// Finishes a partially buffered inline prefix and pauses before its first PLP.
+    pub async fn finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let state = std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle);
+        let pause_state = match state {
+            ActiveRowReadState::RowPaused(pause_state) => pause_state,
+            state => {
+                self.active_row_read_state = state;
+                return Err(UsageError(
+                    "finish_row_prefix_into called without a resumable positioned row".to_string(),
+                ));
+            }
+        };
+        let start = self.request_timeout_start();
+        let result = self
+            .transport
+            .resume_row_into(
+                *pause_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                ColumnPolicy::DecodePrefix(prefix_len),
+                writer,
+            )
+            .await;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        // The arms that fail have consumed row bytes, so a `Continue` walk ends.
+        let outcome = match result {
+            Ok(RowReadResult::RowPaused(pause_state))
+                if pause_state.next_column_index == prefix_len =>
+            {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+                Ok(())
+            }
+            Ok(RowReadResult::RowPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "Inline prefix decode paused at the wrong column".to_string(),
+                ))
+            }
+            Ok(RowReadResult::RowWritten) => Err(crate::error::Error::ProtocolError(
+                "Inline prefix decode consumed the complete row".to_string(),
+            )),
+            Ok(RowReadResult::PlpPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "Inline prefix decode consumed the PLP header".to_string(),
+                ))
+            }
+            Ok(RowReadResult::Token(_)) => Err(crate::error::Error::ProtocolError(
+                "Inline prefix continuation returned a control token".to_string(),
+            )),
+            Err(error) => {
+                let error = self.fail_read(error);
+                self.abort_pending_prepare_capture();
+                Err(error)
+            }
+        };
+        outcome.map_err(|error| self.end_walk_on_read_error(error))
     }
 
     /// Pulls column `target` (0-based) of the currently positioned row,
@@ -4542,15 +8060,18 @@ impl TdsClient {
     /// - [`CursorColumn::Value`] with the decoded value for non-PLP columns,
     /// - [`CursorColumn::PlpStreaming`] when `target` is a PLP column whose
     ///   bytes must be pulled via [`read_active_plp_chunk`](Self::read_active_plp_chunk),
-    /// - [`CursorColumn::AlreadyConsumed`] if `target` was already read/skipped
-    ///   (including after the whole row has been consumed),
+    /// - [`CursorColumn::AlreadyConsumed`] if `target` was already read or skipped
+    ///   while the row remains positioned,
     /// - [`CursorColumn::RowEnded`] when no row is positioned.
+    ///
+    /// Use this directly, or after [`Self::try_read_row_column`] returns
+    /// [`CursorPoll::Pending`].
     ///
     /// # Errors
     ///
     /// Returns `UsageError` when `target` is out of range **and** a row is
     /// still positioned with unread columns (partially read). When no row is
-    /// positioned — including after the final column has been read — an
+    /// positioned -- including after the final column has been read -- an
     /// out-of-range or backward `target` yields [`CursorColumn::RowEnded`]
     /// instead of an error.
     ///
@@ -4566,7 +8087,7 @@ impl TdsClient {
     /// guarantee `read_row_column(0)` yields a value: a zero-column row is
     /// positioned with a column count of 0, so `read_row_column(0)` is
     /// out-of-range and returns `UsageError`.
-    #[instrument(skip(self), level = "info")]
+    // Avoid a span for every SQLGetData column; row and token events retain observability.
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
             ActiveRowReadState::Idle => Ok(CursorColumn::RowEnded),
@@ -4608,7 +8129,7 @@ impl TdsClient {
         }
 
         let mut capture = DefaultRowWriter::new(1);
-        let start = Instant::now();
+        let start = self.request_timeout_start();
         let result = self
             .transport
             .resume_row_into(
@@ -4618,18 +8139,26 @@ impl TdsClient {
                 ColumnPolicy::DecodeOne(target),
                 &mut capture,
             )
-            .await?;
-        self.update_remaining_timeout(start);
+            .await;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => return Err(self.fail_read(error)),
+        };
 
         match result {
             RowReadResult::RowPaused(next_pause) => {
                 self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(next_pause));
                 let variant_base = capture.variant_base(0);
-                let value = capture.take_row().into_iter().next().ok_or_else(|| {
-                    crate::error::Error::ProtocolError(format!(
-                        "Decoder produced no value for non-null column {target}"
-                    ))
-                })?;
+                let Some(value) = capture.take_row().into_iter().next() else {
+                    return Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(format!(
+                            "Decoder produced no value for non-null column {target}"
+                        ))),
+                    );
+                };
                 Ok(CursorColumn::Value {
                     value,
                     variant_base,
@@ -4642,11 +8171,13 @@ impl TdsClient {
                 // rewind from "no row positioned" track the column themselves.
                 self.active_row_read_state = ActiveRowReadState::Idle;
                 let variant_base = capture.variant_base(0);
-                let value = capture.take_row().into_iter().next().ok_or_else(|| {
-                    crate::error::Error::ProtocolError(format!(
-                        "Decoder produced no value for non-null column {target}"
-                    ))
-                })?;
+                let Some(value) = capture.take_row().into_iter().next() else {
+                    return Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(format!(
+                            "Decoder produced no value for non-null column {target}"
+                        ))),
+                    );
+                };
                 Ok(CursorColumn::Value {
                     value,
                     variant_base,
@@ -4657,8 +8188,10 @@ impl TdsClient {
                 self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(plp_state));
                 Ok(CursorColumn::PlpStreaming { collation })
             }
-            RowReadResult::Token(_) => Err(crate::error::Error::ProtocolError(
-                "Unexpected token while resuming to a target column".to_string(),
+            RowReadResult::Token(_) => Err(self.end_walk_on_read_error(
+                crate::error::Error::ProtocolError(
+                    "Unexpected token while resuming to a target column".to_string(),
+                ),
             )),
         }
     }
@@ -4670,6 +8203,10 @@ impl TdsClient {
         if matches!(self.active_row_read_state, ActiveRowReadState::Idle) {
             return Ok(());
         }
+
+        // Whatever is parked is being discarded now (as an abandoned row, not
+        // handed to a caller), so a stale peek can no longer be honored.
+        self.row_already_positioned = false;
 
         // Mixing the pull and push APIs is rare. Keep that large continuation
         // out of every ordinary row-fetch future, paying only on this recovery path.
@@ -4705,6 +8242,9 @@ impl TdsClient {
     /// already network-bound, so one allocation there is negligible; an 8 KiB
     /// per-row state machine is not.
     async fn drain_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
+        if plp_state.reached_end() {
+            return Ok(());
+        }
         let mut buffer = vec![0u8; 8192];
         while !plp_state.reached_end() {
             let start = Instant::now();
@@ -4716,13 +8256,19 @@ impl TdsClient {
                     self.cancel_handle.as_ref(),
                     &mut buffer,
                 )
-                .await?;
+                .await;
             self.update_remaining_timeout(start);
+            let read = match read {
+                Ok(read) => read,
+                Err(error) => return Err(self.fail_read(error)),
+            };
 
             if read == 0 && !plp_state.reached_end() {
-                return Err(crate::error::Error::ProtocolError(
-                    "Active PLP drain made no progress before end-of-stream".to_string(),
-                ));
+                return Err(
+                    self.end_walk_on_read_error(crate::error::Error::ProtocolError(
+                        "Active PLP drain made no progress before end-of-stream".to_string(),
+                    )),
+                );
             }
         }
         Ok(())
@@ -4748,8 +8294,12 @@ impl TdsClient {
                 plan,
                 writer,
             )
-            .await?;
+            .await;
         self.update_remaining_timeout(start);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => return Err(self.fail_read(error)),
+        };
         match result {
             RowReadResult::RowWritten => {
                 writer.end_row();
@@ -4765,40 +8315,41 @@ impl TdsClient {
                 Ok(true)
             }
             RowReadResult::Token(token) => {
-                if let Some(has_row) = self.handle_row_read_token(token).await? {
+                let handled = match self.handle_row_read_token(token).await {
+                    Ok(handled) => handled,
+                    Err(error) => return Err(self.end_walk_on_read_error(error)),
+                };
+                if let Some(has_row) = handled {
                     Ok(has_row)
                 } else {
                     // This should not happen in normal resume flow; keep as a defensive guard.
-                    Err(crate::error::Error::ProtocolError(
-                        "Unexpected token during row resume".to_string(),
-                    ))
+                    Err(
+                        self.end_walk_on_read_error(crate::error::Error::ProtocolError(
+                            "Unexpected token during row resume".to_string(),
+                        )),
+                    )
                 }
             }
         }
     }
 
     async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
-        match token {
-            Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                info!("done while get_next_row: {:?}", done);
-
-                if done.has_error() {
-                    return Err(crate::error::Error::ProtocolError(
-                        "Server reported error in DONE token without preceding ERROR token"
-                            .to_string(),
-                    ));
-                }
-
-                let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                *count = count.saturating_add(done.row_count);
-
-                self.current_result_set_has_been_read_till_end = true;
-                if !done.has_more() {
-                    info!("No more rows for current command: {:?}", done.cur_cmd);
-                    self.execution_context.set_has_open_batch(false);
-                }
-                Ok(Some(false))
+        self.observe_prepared_batch_done(&token)?;
+        // Once a statement error has been collected under `Continue`, the server
+        // feeds this loop until the row set's DONE; bound it like the look-ahead
+        // between results. Rows do not pass through here, so a long row set is
+        // not counted.
+        if !self.row_set_errors.is_empty() {
+            self.row_set_error_tokens += 1;
+            if self.row_set_error_tokens > MAX_TOKENS_AFTER_STATEMENT_ERROR {
+                return Err(
+                    self.abandon_failed_statement(Self::too_many_tokens_after_statement_error())
+                );
             }
+        }
+        match token {
+            Tokens::DoneInProc(done) => self.handle_row_done(done, true),
+            Tokens::DoneProc(done) | Tokens::Done(done) => self.handle_row_done(done, false),
             Tokens::Order(order_token) => {
                 info!(?order_token);
                 Ok(None)
@@ -4824,7 +8375,38 @@ impl TdsClient {
             }
             Tokens::Error(error_token) => {
                 info!(?error_token);
-                let mut all_errors = vec![self.record_error_token(&error_token)];
+                // Ahead of the `Continue` check: a prepared batch reports errors
+                // on the row, which is also all `read_prepared_batch_result` does,
+                // so returning it here as well would both double-report and make
+                // the channel depend on whether the statement returned a result set.
+                if self.prepared_batch.is_some() {
+                    self.record_error_token(&error_token);
+                    return Ok(None);
+                }
+                let error = self.record_error_token(&error_token);
+                if self.continues_after(&error_token) {
+                    if self.row_set_errors.len() >= MAX_ERRORS_PER_FAILED_STATEMENT {
+                        return Err(self
+                            .abandon_failed_statement(Self::too_many_errors_for_one_statement()));
+                    }
+                    self.row_set_error_bytes += Self::error_text_bytes(&error);
+                    if self.row_set_error_bytes > MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT {
+                        return Err(self.abandon_failed_statement(
+                            Self::too_much_error_text_for_one_statement(),
+                        ));
+                    }
+                    // A failed statement can send several ERROR tokens before the
+                    // DONE that ends its row set. Collect them here and return
+                    // them together from that DONE (see `handle_row_done`), so the
+                    // statement fails once, with every diagnostic. Rows cannot be
+                    // put back once decoded, so this path collects rather than
+                    // looking ahead as `advance_to_result_boundary` does.
+                    self.row_set_errors.push(error);
+                    self.statement_error_completion_pending = true;
+                    return Ok(None);
+                }
+                let mut all_errors = self.take_row_set_errors();
+                all_errors.push(error);
                 let drain_result = self.drain_stream().await;
                 // Reset batch state before propagating: the error terminates the
                 // batch regardless of whether the drain fully consumed it, so a
@@ -4836,7 +8418,11 @@ impl TdsClient {
                 match drain_result {
                     Ok(drain_errors) => all_errors.extend(drain_errors),
                     Err(e) => {
-                        warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                        warn!(error = ?e, "Drain after statement error failed; retiring the connection");
+                        // Mirrors the ERROR arm in `advance_to_result_boundary`:
+                        // the SQL error still surfaces, but a stream we gave up on
+                        // must not be handed back to a pool as `SqlServerError`.
+                        self.retire_after_failed_drain(&e);
                     }
                 }
                 Err(crate::error::Error::from_sql_errors(all_errors))
@@ -4853,10 +8439,52 @@ impl TdsClient {
                 Ok(None)
             }
             Tokens::TabName | Tokens::ColInfo => Ok(None),
+            // Sent between COLMETADATA and the first row. Parsed with the
+            // negotiated version; result-set attachment is not implemented yet.
+            Tokens::DataClassification(_) => Ok(None),
             _ => Err(crate::error::Error::ProtocolError(format!(
                 "Unexpected token while finding the next row: {token:?}"
             ))),
         }
+    }
+
+    fn handle_row_done(
+        &mut self,
+        done: DoneToken,
+        ended_with_done_in_proc: bool,
+    ) -> TdsResult<Option<bool>> {
+        info!("done while get_next_row: {:?}", done);
+
+        // A prepared batch carries its errors and counts in `PreparedBatchResult`;
+        // only row-producing rows reach here, so taking them from this DONE too
+        // would double-report and make the channel depend on the result shape.
+        if self.prepared_batch.is_none() {
+            self.validate_done_error(&done, ended_with_done_in_proc)?;
+            // This DONE closes a row set, so its count is the row count even when
+            // tagged `SQLSELECT` — that tag is only bogus on variable assignment.
+            self.last_result_row_count = done.has_count().then_some(done.row_count);
+        }
+
+        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+        *count = count.saturating_add(done.row_count);
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_result_ended_with_done_in_proc = ended_with_done_in_proc;
+        let has_more = done.has_more() || self.prepared_batch.is_some();
+        if !has_more {
+            info!("No more rows for current command: {:?}", done.cur_cmd);
+            self.execution_context.set_has_open_batch(false);
+        }
+        // Errors collected from the row set under `Continue` are returned now,
+        // together, once the DONE that ends it has been processed: the row set is
+        // closed and the batch state reflects the DONE's MORE flag. The failed
+        // row set's count is not reported; its outcome is the `Err`.
+        if !self.row_set_errors.is_empty() {
+            self.last_result_row_count = None;
+            return Err(crate::error::Error::from_sql_errors(
+                self.take_row_set_errors(),
+            ));
+        }
+        Ok(Some(false))
     }
 
     /// Returns a clone of all [`ReturnValue`]s collected during the current
@@ -4867,6 +8495,252 @@ impl TdsClient {
     /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
+    }
+
+    /// Validates a DONE's error flag against the statement error it completes.
+    ///
+    /// A DONE carrying the error flag is normally a protocol violation: under
+    /// [`BatchErrorMode::Abort`] the ERROR token that explains it drains the rest
+    /// of the response, so the main loop never sees that DONE. Under
+    /// [`BatchErrorMode::Continue`] the error is returned without draining, so the
+    /// DONEs completing the failed statement are read on the next call and must
+    /// be accepted.
+    ///
+    /// One error can be reflected at two levels — the failing statement's
+    /// DONEINPROC and the enclosing procedure's DONEPROC — so the allowance
+    /// survives a DONEINPROC and is spent by the DONEPROC or plain DONE that
+    /// closes the chain, or ends when the next result set begins. Spending it on
+    /// the DONEINPROC would report the DONEPROC as unpaired and retire a healthy
+    /// connection; keeping it past the closing DONE would let it excuse an
+    /// unrelated error-flagged DONE later.
+    fn validate_done_error(&mut self, done: &DoneToken, is_done_in_proc: bool) -> TdsResult<()> {
+        let completes_returned_error = self.statement_error_completion_pending;
+        if !is_done_in_proc {
+            self.statement_error_completion_pending = false;
+        }
+        if done.has_error() && !completes_returned_error {
+            return Err(crate::error::Error::ProtocolError(
+                "Server reported error in DONE token without preceding ERROR token".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this ERROR token is returned with the rest of the batch left
+    /// readable, rather than draining the batch.
+    ///
+    /// A fatal error (severity >= [`FATAL_ERROR_SEVERITY`]) ends the session
+    /// server-side, so it always takes the draining path and closes the batch,
+    /// even under [`BatchErrorMode::Continue`].
+    fn continues_after(&self, error_token: &crate::token::tokens::ErrorToken) -> bool {
+        self.batch_error_mode == BatchErrorMode::Continue
+            && error_token.severity < FATAL_ERROR_SEVERITY
+    }
+
+    /// Builds the error returned for a failed statement under
+    /// [`BatchErrorMode::Continue`] between results, leaving the reader just past
+    /// its ERROR tokens (the first token after them is parked for the next call).
+    ///
+    /// The batch is marked open because the response still has unread tokens —
+    /// at least the DONE that completes the failed statement. Without this, an
+    /// error on the batch's first statement (which comes before any result
+    /// boundary has opened it) would read as a closed batch, and the next
+    /// command would start reading this one's leftovers.
+    fn statement_error_keeping_batch_open(
+        &mut self,
+        errors: Vec<SqlErrorInfo>,
+    ) -> crate::error::Error {
+        self.execution_context.set_has_open_batch(true);
+        self.statement_error_completion_pending = true;
+        self.failed_statement_done_pending = true;
+        // The client is positioned on the failure, not on the previous result:
+        // nothing from it may still describe the current position. The metadata
+        // would let `on_rows` report the old row set and `advance` drain it again;
+        // the DONEINPROC flag would let `complete_current_result` settle an RPC
+        // terminator over the failed statement's own completion tokens.
+        self.current_metadata = None;
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_result_ended_with_done_in_proc = false;
+        self.last_result_row_count = None;
+        crate::error::Error::from_sql_errors(errors)
+    }
+
+    /// Ends a [`BatchErrorMode::Continue`] walk whose response can no longer be
+    /// read — a transport, decode or protocol failure, or a bound exceeded — and
+    /// returns the error to report.
+    ///
+    /// Tokens have been consumed past the last boundary, so the response cannot
+    /// be resumed: the batch is closed and the statement state cleared, or the
+    /// next command would be refused as already executing. The connection is
+    /// retired unless the failure was an interruption whose ATTENTION settled
+    /// cleanly. The failure deliberately wins over the SQL errors collected so
+    /// far: it is what decides whether the connection can be reused.
+    fn abandon_failed_statement(&mut self, error: crate::error::Error) -> crate::error::Error {
+        self.execution_context.set_has_open_batch(false);
+        self.current_metadata = None;
+        self.current_result_set_has_been_read_till_end = true;
+        let dropped = self.row_set_errors.len();
+        if dropped > 0 {
+            warn!(
+                count = dropped,
+                error = ?error,
+                "Discarding statement errors collected before the read failed"
+            );
+        }
+        // The walk is over: back to `Abort`, so the rule that brought us here
+        // does not fire again for the same failure.
+        self.reset_statement_walk_state();
+        self.retire_after_failed_drain(&error);
+        error
+    }
+
+    /// Settles a read that failed while consuming the response and returns the
+    /// error to report, closing a [`BatchErrorMode::Continue`] walk the failure
+    /// leaves unreadable (see [`end_walk_on_read_error`](Self::end_walk_on_read_error)).
+    fn fail_read(&mut self, error: crate::error::Error) -> crate::error::Error {
+        self.settle_interrupted_read(&error);
+        self.end_walk_on_read_error(error)
+    }
+
+    /// Under [`BatchErrorMode::Continue`], `has_open_batch()` after an `Err`
+    /// means the response can still be walked. A statement error keeps it open:
+    /// the walk goes on past it. Any other error met while consuming the response
+    /// — a transport or decode failure, an unexpected or malformed token —
+    /// leaves the reader at an unknown point, so it closes the batch and retires
+    /// the connection (unless a timeout or cancellation settled cleanly, which
+    /// has already reset the walk). That includes the window before the first
+    /// result boundary, when the batch is not yet marked open but its response is
+    /// already being read. Every place that consumes the response routes its
+    /// errors through here; an error raised before anything is read leaves the
+    /// stream intact and does not.
+    fn end_walk_on_read_error(&mut self, error: crate::error::Error) -> crate::error::Error {
+        if self.batch_error_mode == BatchErrorMode::Continue
+            && !matches!(error, crate::error::Error::SqlServerError { .. })
+        {
+            return self.abandon_failed_statement(error);
+        }
+        error
+    }
+
+    /// [`end_walk_on_read_error`](Self::end_walk_on_read_error) for the
+    /// synchronous `try_*` row reads, applied where they return. A `UsageError`
+    /// is exempt: those reads raise it only to reject a call, before reading.
+    /// What their transport reads return passes through
+    /// [`buffered_read_error`](Self::buffered_read_error) first, so a failure
+    /// after bytes were consumed can never carry that variant.
+    fn end_walk_on_try_read_error<T>(&mut self, result: TdsResult<T>) -> TdsResult<T> {
+        match result {
+            Err(error) if !matches!(error, UsageError(_)) => {
+                Err(self.end_walk_on_read_error(error))
+            }
+            other => other,
+        }
+    }
+
+    /// Reports a failure of a synchronous `try_*` transport read as a
+    /// [`ProtocolError`](crate::error::Error::ProtocolError) rather than a
+    /// `UsageError`. Once the response is being read, a failure is about the
+    /// response, not the call, so it must end a `Continue` walk; see
+    /// [`end_walk_on_try_read_error`](Self::end_walk_on_try_read_error).
+    fn buffered_read_error(error: crate::error::Error) -> crate::error::Error {
+        match error {
+            UsageError(message) => crate::error::Error::ProtocolError(message),
+            other => other,
+        }
+    }
+
+    /// Only [`execute`](Self::execute) honours [`ExecuteOptions::on_error`]. The
+    /// option is on the shared [`ExecuteOptions`], so a caller can pass
+    /// `Continue` to any entry point that takes one — the RPC entry points,
+    /// `unprepare`, transaction requests — and each uses
+    /// [`BatchErrorMode::Abort`]; say so in a trace rather than drop it silently.
+    fn note_on_error_ignored(on_error: BatchErrorMode) {
+        if on_error != BatchErrorMode::Abort {
+            debug!(
+                ?on_error,
+                "Only execute honours ExecuteOptions::on_error; using Abort"
+            );
+        }
+    }
+
+    /// Clears what describes the statements of one request, at every request
+    /// boundary: the error mode goes back to [`BatchErrorMode::Abort`] until an
+    /// `execute` asks otherwise, and nothing from the previous request's
+    /// statements carries over.
+    fn reset_statement_walk_state(&mut self) {
+        self.batch_error_mode = BatchErrorMode::Abort;
+        self.statement_error_completion_pending = false;
+        self.failed_statement_done_pending = false;
+        self.take_row_set_errors();
+        self.last_result_row_count = None;
+    }
+
+    /// Takes the errors collected inside a row set, resetting the token and
+    /// text counts that bound their run with them. Every take or clear of the
+    /// list goes through here, so the counts cannot disagree with it.
+    fn take_row_set_errors(&mut self) -> Vec<SqlErrorInfo> {
+        self.row_set_error_tokens = 0;
+        self.row_set_error_bytes = 0;
+        std::mem::take(&mut self.row_set_errors)
+    }
+
+    /// Text an error holds, counted against
+    /// [`MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT`].
+    fn error_text_bytes(error: &SqlErrorInfo) -> usize {
+        error.message.len()
+            + error.server_name.as_ref().map_or(0, String::len)
+            + error.proc_name.as_ref().map_or(0, String::len)
+    }
+
+    fn too_many_errors_for_one_statement() -> crate::error::Error {
+        crate::error::Error::ProtocolError(
+            "Too many ERROR tokens for one statement without a DONE".to_string(),
+        )
+    }
+
+    fn too_much_error_text_for_one_statement() -> crate::error::Error {
+        crate::error::Error::ProtocolError(
+            "Too much ERROR text for one statement without a DONE".to_string(),
+        )
+    }
+
+    fn too_many_tokens_after_statement_error() -> crate::error::Error {
+        crate::error::Error::ProtocolError(
+            "Too many tokens after a statement error without a DONE".to_string(),
+        )
+    }
+
+    /// The row count the server reported in the DONE token that closed the row
+    /// set just read, or `None` if it sent none.
+    ///
+    /// Read it once [`next_row`](ResultSet::next_row) has returned `None`, before
+    /// [`advance()`](Self::advance) moves on. It fills the one gap in
+    /// statement-wise navigation: a no-row statement's count already arrives on
+    /// [`StatementResult::NoRows`], but a row set's count is only known after its
+    /// rows. Together they give one count per statement without a separate log.
+    ///
+    /// `None` means the server reported no count — `SET NOCOUNT ON`, for one —
+    /// which is deliberately distinct from `Some(0)`, an empty row set whose
+    /// count was reported. It is also `None` while a row set is still being read,
+    /// once [`advance()`](Self::advance) moves past it, after a no-row statement,
+    /// after a cancellation, after [`close_query`](Self::close_query), and for
+    /// prepared batches, which report counts through [`PreparedBatchResult`].
+    pub fn last_result_row_count(&self) -> Option<u64> {
+        self.last_result_row_count
+    }
+
+    /// Returns the procedure's `RETURN` value from the most recent RPC, or
+    /// `None` when the server sent no `ReturnStatus` (0x79) token.
+    ///
+    /// Like [`get_return_values()`](Self::get_return_values) this is only
+    /// populated once the token stream has been read, so call it after the
+    /// result sets are consumed. ODBC surfaces it as the `{? = call ...}`
+    /// return-status parameter.
+    pub fn get_return_status(&self) -> Option<i32> {
+        match self.last_return_status {
+            ReturnStatus::Received(value) => Some(value),
+            ReturnStatus::NotReceived => None,
+        }
     }
 
     /// Returns the informational (INFO-token) messages captured from the
@@ -4901,8 +8775,68 @@ impl TdsClient {
         self.info_messages.extend(messages);
     }
 
+    /// Records that a streamed chunk was written with a substituted character.
+    ///
+    /// The materialized path detects this during serialization and carries it on
+    /// the message; a data-at-execution chunk is converted by the caller and
+    /// written straight to the wire, so the caller reports it here instead. Both
+    /// land on the same flag, drained once by
+    /// [`take_code_page_conversion_loss`](Self::take_code_page_conversion_loss)
+    /// when the statement completes — a diagnostic posted on the `SQLPutData`
+    /// that produced it would be cleared by the next ODBC call on the handle.
+    pub fn note_code_page_conversion_loss(&mut self) {
+        self.code_page_conversion_loss = true;
+    }
+
+    /// Replaces the substitution verdict outright.
+    ///
+    /// In-crate only, and deliberately so: it lets the caller assert a verdict
+    /// for a message it did not serialize, which is safe exactly once — inside
+    /// [`BulkCopy::write_to_server_zerocopy`](crate::connection::bulk_copy::BulkCopy::write_to_server_zerocopy),
+    /// which drains the flag after each batch so one batch's verdict cannot
+    /// overwrite another's, then restores the accumulated result here. Mirrors
+    /// how it restores [`extend_info_messages`](Self::extend_info_messages) over
+    /// the same span. External callers get
+    /// [`note_code_page_conversion_loss`](Self::note_code_page_conversion_loss),
+    /// which can only ever set the flag.
+    pub(crate) fn set_code_page_conversion_loss(&mut self, had_loss: bool) {
+        self.code_page_conversion_loss = had_loss;
+    }
+
+    /// Drains the "a character was substituted on the way to the wire" flag for
+    /// the work most recently completed on this connection.
+    ///
+    /// Set when a narrow (VARCHAR/CHAR/TEXT) value carried a character the
+    /// encoding it was sent in could not represent: the serializers write `?`
+    /// for it, matching msodbcsql and SQL Server's own `CAST`, rather than the
+    /// numeric character reference `encoding_rs` would emit (AB#47598). That
+    /// encoding comes from the collation the value carries, so this reports the
+    /// conversion *this driver* performed, not any later one the server does.
+    /// The substitution is not an error — `mssql-odbc` reports it as SQLSTATE
+    /// `01000` only when the application asked for it via
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`.
+    ///
+    /// Normally reflects one message and is replaced by the next send, so read
+    /// it before issuing another command. A bulk copy is the exception: it
+    /// spans several messages and reports the aggregate across every batch, so
+    /// one read after `write_to_server_zerocopy` covers the whole operation.
+    ///
+    /// Always Encrypted parameters report substitution performed while fitting
+    /// plaintext to the destination collation before encryption. Encrypted
+    /// result values and bulk-copy cells remain silent because their encryption
+    /// paths do not perform narrow conversion. See
+    /// [`StreamingBulkLoadWriter::code_page_conversion_loss`](crate::message::bulk_load::StreamingBulkLoadWriter::code_page_conversion_loss).
+    pub fn take_code_page_conversion_loss(&mut self) -> bool {
+        std::mem::take(&mut self.code_page_conversion_loss)
+    }
+
     fn capture_info_message(&mut self, token: &crate::token::tokens::InfoToken) {
         self.info_messages.push(SqlInfoMessage::from(token));
+        if let Some(batch) = self.prepared_batch.as_mut()
+            && let Some(row) = batch.current.as_mut()
+        {
+            row.has_info = true;
+        }
     }
 
     /// Resets the informational-message buffer at the start of a new command so
@@ -4914,7 +8848,13 @@ impl TdsClient {
     /// new session *after* this point, so those remain visible as part of the
     /// command that triggered the reconnect.
     fn begin_command(&mut self) {
+        self.prepared_batch = None;
+        self.settle_abandoned_reset_verification();
+        self.interrupted_read_settled = false;
         self.info_messages.clear();
+        // A token parked by the look-ahead belongs to the previous response;
+        // replaying it here would desynchronize this command's reader.
+        self.parked_token = None;
         // Clear output parameters / return values from the previous command so a
         // fully-navigated prior RPC does not leave `get_return_values()` /
         // `retrieve_output_params()` reporting stale values for this new command.
@@ -4926,6 +8866,7 @@ impl TdsClient {
         // `SET NOCOUNT ON` / SELECT).
         self.last_rows_affected = -1;
         self.dml_result_counts.clear();
+        self.reset_statement_walk_state();
     }
 
     /// The live server handle the client holds for `statement_id`, if any.
@@ -4953,20 +8894,107 @@ impl TdsClient {
         }
     }
 
+    /// Abandons an outstanding response, including a partially read row or PLP
+    /// value, and waits for ATTENTION acknowledgement before permitting reuse.
+    /// `timeout_secs` bounds cancellation settlement, not the original query.
+    /// Zero uses the transport's default settlement timeout.
+    pub async fn cancel_query(&mut self, timeout_secs: u32) -> TdsResult<()> {
+        if !self.has_open_batch() {
+            return Ok(());
+        }
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(timeout_secs);
+        self.cancel_handle = Some(cancel.child_handle());
+        cancel.cancel();
+        match self.close_query().await {
+            Err(crate::error::Error::OperationCancelledError(_))
+                if !self.transport.connection_known_dead() =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// Drains all remaining result sets and resets the client for the next request.
     ///
     /// Any unread rows and result sets are consumed so the TDS stream is left in
     /// a clean state. Must be called (or the result sets fully iterated) before
     /// executing another query on the same connection.
+    ///
+    /// Under [`BatchErrorMode::Continue`] a statement error met while draining
+    /// does not stop the drain: the rest of the batch is still consumed, and the
+    /// errors that were skipped are returned together as one
+    /// [`SqlServerError`](crate::error::Error::SqlServerError) once it is done.
+    /// Like one failed statement's errors, at most 1,000 of them and 8 MiB of
+    /// their text are kept; any past that are logged as dropped.
+    ///
+    /// If the drain itself fails, the client state is reset regardless and the
+    /// connection is retired: a drain that stops partway leaves the reader at an
+    /// unknown offset in the response, and a TDS stream cannot be
+    /// resynchronized from there. The error is returned to the caller and
+    /// pooled consumers discard the connection rather than reusing it. On a
+    /// direct `TdsClient`, the next request after a stream desynchronization
+    /// fails with [`ConnectionClosed`](crate::error::Error::ConnectionClosed)
+    /// before anything is sent, because session recovery is disabled. After a
+    /// transport loss (I/O, TLS, or connection closed) recovery stays enabled,
+    /// so if session recovery is available the next request may reconnect
+    /// transparently.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
-        if !self.execution_context.has_open_batch() {
+        self.interrupted_read_settled = false;
+        if !self.has_open_batch() {
+            // The request is over even when the walk already reached its end.
+            self.reset_statement_walk_state();
             return Ok(());
         }
+        // Statement errors skipped under `Continue`; see below. Only the errors
+        // are carried: every `SqlServerError` reaching this drain is built by
+        // `Error::from_sql_errors` (statement_error_keeping_batch_open,
+        // handle_row_done, the draining ERROR arm), which attaches no info
+        // messages, so there are none to drop. Server messages reach the caller
+        // through `take_info_messages()` instead.
+        let mut skipped = SkippedErrors::default();
         // call next row to consume any remaining tokens
-        while self.advance_to_rows().await? {}
-        info!("No more rows to consume.");
-
+        let drain_result = loop {
+            match self.advance_to_rows().await {
+                Ok(true) => continue,
+                Ok(false) => break Ok(()),
+                // Under `Continue` a statement error leaves the batch open with
+                // the reader just past it. Stopping here would clear the batch
+                // over unread tokens and desynchronize the next command.
+                Err(crate::error::Error::SqlServerError { diagnostics })
+                    if self.has_open_batch() =>
+                {
+                    skipped.keep(diagnostics.errors);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let drain_result = match drain_result {
+            Ok(()) if skipped.errors.is_empty() => Ok(()),
+            Ok(()) => Err(skipped.into_error()),
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                skipped.keep(diagnostics.errors);
+                Err(skipped.into_error())
+            }
+            Err(error) => {
+                // The failure that stopped the drain is returned, because it
+                // decides whether the connection is retired. The statement errors
+                // skipped before it cannot ride on that error type, so at least
+                // make their loss visible.
+                if !skipped.errors.is_empty() {
+                    warn!(
+                        count = skipped.errors.len() + skipped.dropped,
+                        "Discarding statement errors skipped during the close_query drain"
+                    );
+                }
+                Err(error)
+            }
+        };
+        if drain_result.is_ok() {
+            info!("No more rows to consume.");
+        }
         // Reset the current metadata, return values, and timeout/cancel state.
         // Note: `info_messages` is intentionally NOT cleared here. Draining the
         // trailing token stream above can surface INFO/warning messages (e.g. a
@@ -4976,13 +9004,39 @@ impl TdsClient {
         // The sp_prepexec @handle, if any, was captured during the drain above
         // (see push_return_value) and survives this clear.
         self.current_metadata = None;
+        self.current_result_ended_with_done_in_proc = false;
         self.return_values.clear();
         self.abort_pending_prepare_capture();
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
         self.active_row_read_state = ActiveRowReadState::Idle;
+        self.row_already_positioned = false;
+        self.parked_token = None;
+        self.reset_statement_walk_state();
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
+
+        if let Err(error) = drain_result {
+            // A server-reported error is different: the batch ran and failed,
+            // and the reader is still on a token boundary, so retiring would
+            // poison a healthy pooled connection every time a batch ends in
+            // RAISERROR.
+            //
+            // `SqlServerError` alone does not prove the stream is intact — the
+            // ERROR-token handlers build one even when their own drain fails.
+            // Those arms call `retire_after_failed_drain` themselves, so
+            // by the time such an error reaches here the transport is already
+            // marked dead and this exemption cannot revive it.
+            //
+            // The state above is still cleared first: leaving the batch open
+            // would mask this error behind `ALREADY_EXECUTING_ERROR` on every
+            // later call, which is what made the original failure look like a
+            // permanent wedge.
+            if !matches!(error, crate::error::Error::SqlServerError { .. }) {
+                self.retire_after_failed_drain(&error);
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -4992,21 +9046,26 @@ impl TdsClient {
         // An intentional close is not a recoverable disconnect: disable recovery
         // so a later call on a lingering handle cannot silently resurrect it.
         self.recovery_context.session_recovery_negotiated = false;
+        self.transport.mark_known_dead();
         self.transport.close_transport().await?;
         Ok(())
     }
 
-    /// Send an attention packet and wait for acknowledgment with a timeout.
+    /// Sends ATTENTION and attempts to drain the active response through DONE_ATTN.
     ///
-    /// This method is used by bulk copy operations to implement timeout handling
-    /// per the SqlClient behavior:
+    /// This method:
     /// 1. Send MT_ATTN (0x06) packet to cancel the current operation
-    /// 2. Wait for DONE token with ATTN (0x0020) status flag
-    /// 3. If no acknowledgment within timeout, return false
+    /// 2. Drain unread row and control tokens using the current parser metadata
+    /// 3. Apply state-bearing control tokens and clear the cancelled result
+    /// 4. Stop at a DONE token with the ATTN (0x0020) status flag
+    ///
+    /// Draining is required before reuse because ATTENTION is asynchronous; a
+    /// later command would otherwise consume bytes from the cancelled response.
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for attention acknowledgment
+    /// * `timeout` - Maximum time for sending ATTENTION and draining through its
+    ///   acknowledgement
     ///
     /// # Returns
     ///
@@ -5015,7 +9074,20 @@ impl TdsClient {
     /// * `Err(_)` - Error sending attention or reading response
     #[instrument(skip(self), level = "info")]
     pub async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool> {
-        self.transport.send_attention_with_timeout(timeout).await
+        self.interrupted_read_settled = false;
+        let parser_context = match self.current_metadata.as_ref() {
+            Some(metadata) => ParserContext::ColumnMetadata(Arc::clone(metadata), None),
+            None => ParserContext::ColumnEncryption(
+                self.negotiated_settings.is_column_encryption_supported(),
+            ),
+        };
+        let result = self
+            .transport
+            .send_attention_with_timeout(&parser_context, timeout)
+            .await;
+        self.consume_attention_settlement();
+        self.normalize_after_attention();
+        result
     }
 
     /// Check if the connection has an active transaction.
@@ -5058,22 +9130,52 @@ impl TdsClient {
     /// Begin a new transaction with the given isolation level and optional name.
     ///
     /// Fails if a batch is currently executing. Use [`has_active_transaction`](Self::has_active_transaction)
-    /// to check whether a transaction is already open.
+    /// to check whether a transaction is already open. Runs unbounded — see
+    /// [`begin_transaction_with_options`](Self::begin_transaction_with_options)
+    /// to bound the wait (e.g. with a statement's `SQL_ATTR_QUERY_TIMEOUT`).
     #[instrument(skip(self), level = "info")]
     pub async fn begin_transaction(
         &mut self,
         isolation_level: TransactionIsolationLevel,
         name: Option<String>,
     ) -> TdsResult<()> {
+        self.begin_transaction_with_options(isolation_level, name, ())
+            .await
+    }
+
+    /// Like [`begin_transaction`](Self::begin_transaction), but honors
+    /// `options` — in particular its timeout, so an implicit transaction begin
+    /// (e.g. the autocommit-off prologue a driver runs before every statement)
+    /// cannot wait past a caller-supplied deadline. Mirrors msodbcsql's
+    /// `CheckOptions`, which passes `GetQueryTimeOut(lpstmt)` to
+    /// `ExecTMRImmediate` (`sqlccmd.cpp:10572-10586`).
+    #[instrument(skip(self, options), level = "info")]
+    pub async fn begin_transaction_with_options<'a>(
+        &mut self,
+        isolation_level: TransactionIsolationLevel,
+        name: Option<String>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
         if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
         }
+        let ExecuteOptions {
+            timeout,
+            cancel,
+            on_error,
+            ..
+        } = options.into();
+        Self::note_on_error_ignored(on_error);
 
         self.begin_command();
-        // begin_transaction has no command timeout — use connect_timeout as fallback.
-        let _reconnect_elapsed = self.check_and_reconnect(None, None).await?;
+        let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
+        let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        self.remaining_request_timeout = resolved.duration();
+        self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
         let transaction_params = TransactionManagementType::Begin(CreateTxnParams {
             level: isolation_level,
@@ -5082,8 +9184,11 @@ impl TdsClient {
         let transaction =
             TransactionManagementRequest::new(transaction_params, &self.execution_context);
         let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), None, None);
-        transaction.serialize(&mut packet_writer).await?;
+            transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
+        let sent = transaction.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(transaction);
+        self.finish_send(sent, message).await?;
 
         self.consume_transaction_response().await?;
 
@@ -5216,16 +9321,7 @@ impl TdsClient {
     pub(crate) async fn consume_transaction_response(&mut self) -> TdsResult<()> {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
         loop {
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &ParserContext::None(()),
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
+            let token = self.next_response_token(&ParserContext::None(())).await?;
 
             match token {
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -5426,6 +9522,52 @@ pub struct ExecuteOptions<'a> {
     /// connection). Only has effect when the server acknowledged the Column
     /// Encryption feature during login.
     pub column_encryption: ExecutionColumnEncryptionSetting,
+    /// What a failed statement does to the rest of the batch. Defaults to
+    /// [`BatchErrorMode::Abort`], the behaviour every caller had before this
+    /// option existed.
+    ///
+    /// Honoured by [`execute`](TdsClient::execute), which sends a SQL batch, and
+    /// by nothing else: the RPC entry points (`execute_sp_*`, prepared execution,
+    /// `unprepare`) and transaction requests use [`BatchErrorMode::Abort`] and
+    /// log at debug level when given `Continue`. Prepared batches report per-row
+    /// errors through [`PreparedBatchResult`].
+    pub on_error: BatchErrorMode,
+}
+
+/// What a statement error does to the rest of a SQL batch; set per command
+/// through [`ExecuteOptions::on_error`].
+///
+/// A batch such as `SELECT 1; RAISERROR('boom', 16, 1); SELECT 2` has a result
+/// after the failing statement. The modes differ in whether it can be read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum BatchErrorMode {
+    /// The first statement error drains the rest of the response and is
+    /// returned as [`SqlServerError`](crate::error::Error::SqlServerError);
+    /// results after it are discarded and the batch is closed.
+    #[default]
+    Abort,
+    /// A statement error is returned as
+    /// [`SqlServerError`](crate::error::Error::SqlServerError) from the call
+    /// that met it — [`execute`](TdsClient::execute),
+    /// [`advance`](TdsClient::advance), or [`next_row`](ResultSet::next_row) —
+    /// without draining. The batch stays open, so
+    /// [`advance`](TdsClient::advance) moves on to the results after it; errors
+    /// therefore arrive in order with rows and messages, on the one channel
+    /// every other failure uses. This is ODBC's `SQLMoreResults` after a
+    /// statement returns `SQL_ERROR`.
+    ///
+    /// [`has_open_batch`](TdsClient::has_open_batch) tells the two kinds of
+    /// `Err` apart: `true` after a statement error the batch continues past,
+    /// `false` when the batch has ended. A fatal error (severity >= 20) or a
+    /// transport failure still closes the batch and retires the connection.
+    ///
+    /// A failed statement is one `Err`, carrying every ERROR the server sent for
+    /// it (it can send several) in [`SqlServerDiagnostics`](crate::error::SqlServerDiagnostics).
+    /// An error inside a row set is returned by `next_row` once the DONE ending
+    /// that row set has been read; rows read before it are kept, and `advance`
+    /// moves on. [`close_query`](TdsClient::close_query) drains the rest of the
+    /// batch regardless and returns the errors it skipped.
+    Continue,
 }
 
 impl<'a> ExecuteOptions<'a> {
@@ -5455,6 +9597,18 @@ impl<'a> ExecuteOptions<'a> {
         self.column_encryption = setting;
         self
     }
+
+    /// Chooses what a statement error does to the rest of the batch; see
+    /// [`BatchErrorMode`].
+    ///
+    /// Honoured by [`execute`](TdsClient::execute) only. Every other entry point
+    /// that takes [`ExecuteOptions`] — `execute_sp_executesql`, prepared
+    /// execution, `unprepare`, transaction requests — uses
+    /// [`BatchErrorMode::Abort`] and logs at debug level when given `Continue`.
+    pub fn on_error(mut self, mode: BatchErrorMode) -> Self {
+        self.on_error = mode;
+        self
+    }
 }
 
 impl From<()> for ExecuteOptions<'_> {
@@ -5467,7 +9621,7 @@ impl From<()> for ExecuteOptions<'_> {
 /// [`advance()`](TdsClient::advance).
 ///
 /// This is the lossless, statement-wise view of a batch: every statement that
-/// returns rows, carries a row count, or produced a message is surfaced as its
+/// returns rows, carries an update count, or produced a message is surfaced as its
 /// own result (matching msodbcsql's `SQLMoreResults` and JDBC's
 /// `getMoreResults`/`getUpdateCount`). Consumers that only care about
 /// row-returning result sets can collapse no-row statements with
@@ -5481,11 +9635,15 @@ pub enum StatementResult {
     Rows,
     /// A statement that produced no result set but is still individually
     /// navigable. `rows_affected` is `Some(n)` when the statement's DONE token
-    /// carried a row count (DML), or `None` for a message-only statement
+    /// carried an update count (DML), or `None` for a message-only statement
     /// (`PRINT` / low-severity `RAISERROR`) or plain DDL. Messages are drained
     /// separately via [`take_info_messages`](TdsClient::take_info_messages).
     NoRows {
-        /// Rows affected, when the DONE token carried a COUNT; otherwise `None`.
+        /// Rows affected, when the DONE token carried a COUNT that was not
+        /// tagged `SQLSELECT` — see
+        /// [`TdsClient::last_rows_affected`] for why assignment counts are
+        /// excluded. `None` otherwise, including for a `SQLSELECT` count that
+        /// only surfaces because the statement also raised a message.
         rows_affected: Option<u64>,
     },
     /// No more statements remain in the batch; the connection is idle.
@@ -5559,10 +9717,13 @@ pub trait ResultSet {
 mod tests {
     use super::*;
     use crate::connection::client_context::ClientContext;
+    use crate::connection::cursor_ops::CursorClient;
     use crate::connection::transport::network_transport::TransportSslHandler;
     use crate::connection::transport::tds_transport::TdsTransport;
     use crate::core::{CancelHandle, TdsResult};
     use crate::datatypes::row_writer::RowWriter;
+    use crate::error::Error;
+    use crate::io::packet_reader::TdsPacketReader;
     use crate::io::reader_writer::{NetworkReader, NetworkWriter};
     use crate::io::token_stream::{
         ColumnPolicy, ParserContext, RowHeader, RowPauseState, RowReadResult, TdsTokenStreamReader,
@@ -5570,19 +9731,37 @@ mod tests {
     use crate::message::parameters::rpc_parameters::StreamedSqlType;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
+    use crate::test_packet_support::{
+        TestPacketBuilder, create_network_transport_with_data,
+        create_network_transport_with_live_peer,
+        create_network_transport_with_live_peer_capturing_writes,
+    };
     use crate::token::tokens::{
-        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, Tokens,
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, ReturnStatusToken,
+        TokenType, Tokens,
     };
     use async_trait::async_trait;
     use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn cancel_query_without_an_open_batch_does_not_touch_transport() {
+        let mut client = crate::test_client_support::tds_client_from_tokens(vec![]);
+        client.cancel_query(1).await.unwrap();
+        assert!(!client.has_open_batch());
+        assert!(client.cancel_handle.is_none());
+    }
 
     // ── Minimal mock transport for reconnect() unit tests ──
 
     #[derive(Debug)]
     struct TestTransport {
         closed: bool,
+        close_calls: Arc<std::sync::atomic::AtomicUsize>,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
+        /// Mirrors the production writer's dispatch record so client tests can
+        /// drive acknowledgement verification without a real socket.
+        reset_dispatched: bool,
         /// Every byte handed to `send` (request framing + payload), so tests can
         /// assert what was actually written to the wire.
         sent: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -5592,54 +9771,90 @@ mod tests {
         /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
         /// makes the cursor emit `CursorColumn::PlpStreaming`).
         resume_results: VecDeque<RowReadResult>,
+        /// Byte counts the mock replays from `read_active_plp_bytes` before it
+        /// fails as a closed connection.
+        plp_read_results: VecDeque<usize>,
         /// When set, the next (and every subsequent) `send` fails, simulating a
         /// mid-message wire failure. Shared so a test can flip it after setup.
         send_should_fail: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, `send` never returns, so a test can drive a write deadline
+        /// without a real stalled peer.
+        send_should_hang: Arc<std::sync::atomic::AtomicBool>,
+        /// Fires after the first successful send, allowing a multi-packet
+        /// request to be cancelled while the server holds its first packet.
+        cancel_after_send: Option<tokio_util::sync::CancellationToken>,
+        cancel_on_writer_creation: Option<tokio_util::sync::CancellationToken>,
+        cancel_during_send: Option<tokio_util::sync::CancellationToken>,
+        sends_before_cancel: usize,
+        send_delay: Option<Duration>,
+        /// Attentions requested, so a test can tell the cancel-a-sent-request
+        /// path from the withdraw-a-partial-one path.
+        attentions: Arc<std::sync::atomic::AtomicUsize>,
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
+        receive_error: Option<crate::error::Error>,
+        sync_header_available: bool,
+        /// Returned by the next `try_receive_row_header`, as if the buffered
+        /// bytes it read were rejected.
+        sync_header_error: Option<crate::error::Error>,
+        sync_columns: VecDeque<ColumnValues>,
+        encryption_setting: NegotiatedEncryptionSetting,
+        /// The `remaining_request_timeout` handed to each `receive_token`, so a
+        /// test can assert which budget a read ran under without waiting for one
+        /// to elapse.
+        receive_timeouts: Arc<std::sync::Mutex<Vec<Option<Duration>>>>,
     }
 
     impl TestTransport {
         fn new() -> Self {
             Self {
                 closed: false,
+                close_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
+                reset_dispatched: false,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                plp_read_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cancel_after_send: None,
+                cancel_on_writer_creation: None,
+                cancel_during_send: None,
+                sends_before_cancel: 0,
+                send_delay: None,
+                attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
+                receive_error: None,
+                sync_header_available: false,
+                sync_header_error: None,
+                sync_columns: VecDeque::new(),
+                encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
+                receive_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
         fn with_tokens(tokens: Vec<Tokens>) -> Self {
             Self {
-                closed: false,
                 pending_tokens: VecDeque::from(tokens),
-                reset_mode: ResetConnectionMode::None,
-                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
-                packet_data: Vec::new(),
-                packet_pos: 0,
-                resume_results: VecDeque::new(),
-                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                known_dead: false,
+                ..Self::new()
+            }
+        }
+
+        fn with_tokens_then_error(tokens: Vec<Tokens>, error: crate::error::Error) -> Self {
+            Self {
+                receive_error: Some(error),
+                ..Self::with_tokens(tokens)
             }
         }
 
         fn with_packet_data(packet_data: Vec<u8>) -> Self {
             Self {
-                closed: false,
-                pending_tokens: VecDeque::new(),
-                reset_mode: ResetConnectionMode::None,
-                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 packet_data,
-                packet_pos: 0,
-                resume_results: VecDeque::new(),
-                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                known_dead: false,
+                ..Self::new()
             }
         }
 
@@ -5658,14 +9873,61 @@ mod tests {
 
     #[async_trait]
     impl TdsTokenStreamReader for TestTransport {
+        fn try_receive_row_header(
+            &mut self,
+            context: &ParserContext,
+        ) -> TdsResult<Option<RowPauseState>> {
+            if let Some(error) = self.sync_header_error.take() {
+                return Err(error);
+            }
+            if !self.sync_header_available {
+                return Ok(None);
+            }
+            self.sync_header_available = false;
+            let ParserContext::ColumnMetadata(metadata, decryptor) = context else {
+                return Ok(None);
+            };
+            Ok(Some(RowPauseState {
+                next_column_index: 0,
+                metadata: Arc::clone(metadata),
+                nbc_null_bitmap: None,
+                decryptor: decryptor.clone(),
+            }))
+        }
+
+        fn try_read_buffered_column(
+            &mut self,
+            _pause_state: &RowPauseState,
+            _target: usize,
+        ) -> TdsResult<Option<ColumnValues>> {
+            Ok(self.sync_columns.pop_front())
+        }
+
         async fn receive_token(
             &mut self,
             _context: &ParserContext,
-            _remaining_request_timeout: Option<Duration>,
-            _cancel_handle: Option<&CancelHandle>,
+            remaining_request_timeout: Option<Duration>,
+            cancel_handle: Option<&CancelHandle>,
         ) -> TdsResult<Tokens> {
+            self.receive_timeouts
+                .lock()
+                .unwrap()
+                .push(remaining_request_timeout);
+            // Mirrors the production readers, which run every read under the
+            // handle. Without this a cancelled read looks identical to a healthy
+            // one and tests cannot tell the two apart.
+            if let Some(handle) = cancel_handle
+                && handle.cancel_token.is_cancelled()
+            {
+                return Err(crate::error::Error::OperationCancelledError(
+                    "Request was cancelled".to_string(),
+                ));
+            }
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(tok);
+            }
+            if let Some(error) = self.receive_error.take() {
+                return Err(error);
             }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
@@ -5724,6 +9986,9 @@ mod tests {
             _cancel_handle: Option<&CancelHandle>,
             _out: &mut [u8],
         ) -> TdsResult<usize> {
+            if let Some(read) = self.plp_read_results.pop_front() {
+                return Ok(read);
+            }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
     }
@@ -5741,6 +10006,9 @@ mod tests {
     #[async_trait]
     impl NetworkWriter for TestTransport {
         async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            if let Some(delay) = self.send_delay.take() {
+                tokio::time::sleep(delay).await;
+            }
             if self.closed {
                 return Err(crate::error::Error::ConnectionClosed(
                     "test transport is closed".to_string(),
@@ -5750,24 +10018,55 @@ mod tests {
                 .send_should_fail
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
+                // `NetworkTransport::send` retires the transport on a write
+                // failure; a mock that did not would let tests treat a broken
+                // socket as reusable.
+                self.known_dead = true;
                 return Err(crate::error::Error::ConnectionClosed(
                     "injected send failure".to_string(),
                 ));
             }
+            if self
+                .send_should_hang
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
+            }
+            if self.sends_before_cancel == 0
+                && let Some(cancel) = self.cancel_during_send.take()
+            {
+                self.sent.lock().unwrap().extend_from_slice(&data[..8]);
+                cancel.cancel();
+                std::future::pending::<()>().await;
+            }
+            self.sends_before_cancel = self.sends_before_cancel.saturating_sub(1);
             self.sent.lock().unwrap().extend_from_slice(data);
+            if let Some(cancel) = self.cancel_after_send.take() {
+                cancel.cancel();
+            }
             Ok(())
         }
         fn packet_size(&self) -> u32 {
             4096
         }
         fn get_encryption_setting(&self) -> crate::core::NegotiatedEncryptionSetting {
-            crate::core::NegotiatedEncryptionSetting::NoEncryption
+            self.encryption_setting
         }
         fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
             self.reset_mode = mode;
+            self.reset_dispatched = false;
         }
         fn take_reset_mode(&mut self) -> ResetConnectionMode {
+            if let Some(cancel) = self.cancel_on_writer_creation.take() {
+                cancel.cancel();
+            }
             std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
+        }
+        fn note_reset_dispatched(&mut self) {
+            self.reset_dispatched = true;
+        }
+        fn take_reset_dispatched(&mut self) -> bool {
+            std::mem::replace(&mut self.reset_dispatched, false)
         }
     }
 
@@ -5780,6 +10079,10 @@ mod tests {
 
     #[async_trait]
     impl TdsTransport for TestTransport {
+        fn as_writer_ref(&self) -> &dyn NetworkWriter {
+            self
+        }
+
         fn as_writer(&mut self) -> &mut dyn NetworkWriter {
             self
         }
@@ -5788,11 +10091,23 @@ mod tests {
             4096
         }
         async fn close_transport(&mut self) -> TdsResult<()> {
+            self.close_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.closed = true;
             Ok(())
         }
-        async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
-            Ok(false)
+        async fn send_attention_with_timeout(
+            &mut self,
+            _context: &ParserContext,
+            _timeout: Duration,
+        ) -> TdsResult<bool> {
+            self.attentions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Acknowledged. `Ok(false)` would mean the ACK never came, and
+            // `send_attention_and_wait` retires the transport on every such
+            // outcome - a mock that returned it without doing so would let a test
+            // read a dead connection as a surviving one.
+            Ok(true)
         }
         fn is_connection_dead(&self) -> bool {
             self.closed
@@ -5884,7 +10199,10 @@ mod tests {
     }
 
     fn create_test_client_with_transport(transport: TestTransport) -> TdsClient {
-        let transport = AnyTransport::dynamic(transport);
+        create_test_client_with_any_transport(AnyTransport::dynamic(transport))
+    }
+
+    fn create_test_client_with_any_transport(transport: AnyTransport) -> TdsClient {
         let negotiated_settings =
             crate::handler::handler_factory::create_test_negotiated_settings_internal();
         let execution_context = crate::connection::execution_context::ExecutionContext::new();
@@ -5896,6 +10214,63 @@ mod tests {
             client_context,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn encrypted_state_excludes_login_only_tls() {
+        for (setting, expected) in [
+            (NegotiatedEncryptionSetting::NoEncryption, false),
+            (NegotiatedEncryptionSetting::LoginOnly, false),
+            (NegotiatedEncryptionSetting::Mandatory, true),
+            (NegotiatedEncryptionSetting::Strict, true),
+        ] {
+            let mut transport = TestTransport::new();
+            transport.encryption_setting = setting;
+            assert_eq!(
+                create_test_client_with_transport(transport).is_encrypted(),
+                expected,
+                "{setting:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_connection_id_tracks_physical_sessions_not_pool_resets() {
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::trace_context::ConnectionTrace;
+
+        let trace = Arc::new(ConnectionTrace::default());
+        let mut context = ClientContext::default();
+        context.set_connection_trace(Arc::clone(&trace));
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let mut settings = create_test_negotiated_settings_internal();
+        settings.client_connection_id = first;
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            settings,
+            ExecutionContext::new(),
+            context,
+            Vec::new(),
+        );
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        client.prepare_reset_connection(false);
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        let mut recovered = create_test_negotiated_settings_internal();
+        recovered.client_connection_id = second;
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(TestTransport::new()),
+                recovered,
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(client.client_connection_id(), second);
+        assert_eq!(trace.client_connection_id(), Some(second));
     }
 
     #[test]
@@ -6004,6 +10379,49 @@ mod tests {
         }
     }
 
+    // A cold reconnect future used to inflate all command futures, overflowing
+    // musl's 128 KiB application-thread stack through ODBC's block_on calls.
+    #[test]
+    fn command_futures_stay_small() {
+        const MAX: usize = 8192;
+        let mut client = create_test_client();
+        let mut prepared = PreparedStatement::new(String::new());
+        let mut orphaned = None;
+
+        let reconnect = std::mem::size_of_val(&client.check_and_reconnect(None, None));
+        assert!(reconnect <= 128, "reconnect check future is {reconnect} B");
+        let execute = std::mem::size_of_val(&client.execute(String::new(), ()));
+        let execute_sp_executesql =
+            std::mem::size_of_val(&client.execute_sp_executesql(String::new(), Vec::new(), ()));
+        let begin_sp_executesql =
+            std::mem::size_of_val(&client.begin_sp_executesql(String::new(), Vec::new(), ()));
+        let execute_stored_procedure =
+            std::mem::size_of_val(&client.execute_stored_procedure(String::new(), None, None, ()));
+        let execute_prepared = std::mem::size_of_val(&client.execute_prepared(
+            &mut prepared,
+            Vec::new(),
+            &mut orphaned,
+            (),
+        ));
+        let begin_transaction = std::mem::size_of_val(
+            &client.begin_transaction(TransactionIsolationLevel::NoChange, None),
+        );
+
+        for (name, size) in [
+            ("execute", execute),
+            ("execute_sp_executesql", execute_sp_executesql),
+            ("begin_sp_executesql", begin_sp_executesql),
+            ("execute_stored_procedure", execute_stored_procedure),
+            ("execute_prepared", execute_prepared),
+            ("begin_transaction", begin_transaction),
+        ] {
+            assert!(
+                size <= MAX,
+                "{name} future is {size} B, expected <= {MAX} B"
+            );
+        }
+    }
+
     #[test]
     fn prepare_reset_connection_routes_mode_to_transport() {
         let mut client = create_test_client();
@@ -6049,6 +10467,64 @@ mod tests {
         )
     }
 
+    /// A prepared batch carries its counts in `PreparedBatchResult`. Only
+    /// row-producing rows reach `handle_row_done`, so taking the count there as
+    /// well would both double-report and make the channel depend on whether the
+    /// row returned a result set. The same DONE outside a prepared batch is the
+    /// control: without the guard, the prepared case would report `Some(2)` too.
+    #[test]
+    fn a_prepared_batch_leaves_last_result_row_count_unset() {
+        let done = || DoneToken {
+            status: DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 2,
+        };
+
+        let mut client = create_test_client();
+        client.handle_row_done(done(), false).unwrap();
+        assert_eq!(client.last_result_row_count(), Some(2));
+
+        let mut client = create_test_client();
+        client.prepared_batch = Some(Box::new(PreparedBatchReadState {
+            current: Some(PreparedBatchReadState::next_row(0)),
+            remaining: Vec::new().into_iter(),
+            completed: Vec::new(),
+        }));
+        client.handle_row_done(done(), false).unwrap();
+
+        assert_eq!(
+            client.last_result_row_count(),
+            None,
+            "a prepared batch reports through PreparedBatchResult"
+        );
+    }
+
+    /// A DONE that arrives without the error flag still closes the completion
+    /// chain. Otherwise a returned error whose closing DONE is unflagged would
+    /// leave the allowance armed, absolving a genuinely unpaired error-flagged
+    /// DONE later in the same request.
+    #[test]
+    fn an_unflagged_done_still_closes_the_error_completion_chain() {
+        let mut client = create_test_client();
+        client.statement_error_completion_pending = true;
+
+        client
+            .handle_row_done(
+                DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Select,
+                    row_count: 1,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            !client.statement_error_completion_pending,
+            "the allowance must not survive a DONE that did not need it"
+        );
+    }
+
     /// Builds a client whose transport replays `tokens` and captures every byte
     /// written to the wire, returning the shared capture buffer alongside it.
     fn create_capturing_client(tokens: Vec<Tokens>) -> (TdsClient, Arc<std::sync::Mutex<Vec<u8>>>) {
@@ -6090,10 +10566,12 @@ mod tests {
         }
     }
 
-    const VECTOR_RPC_ROUTES: [&str; 9] = [
+    const VECTOR_RPC_ROUTES: [&str; 11] = [
         "executesql",
         "begin_atomic",
         "begin_streamed",
+        "prepared_streamed_new",
+        "prepared_streamed_reused",
         "stored_positional",
         "stored_named",
         "prepared_new",
@@ -6127,6 +10605,26 @@ mod tests {
                 client.write_streamed_null()?;
                 client.end_streamed_param().await.map(|_| ())
             }
+            "prepared_streamed_new" | "prepared_streamed_reused" => {
+                let mut statement = PreparedStatement::new("SELECT @v, @data");
+                if route == "prepared_streamed_reused" {
+                    statement.id = Some(client.register_prepared_handle_for_test(7));
+                }
+                let mut orphaned = None;
+                client
+                    .begin_execute_prepared(
+                        &mut statement,
+                        vec![streamed_varbinary("@data"), param],
+                        &mut orphaned,
+                        (),
+                    )
+                    .await?;
+                client.write_streamed_null()?;
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .map(|_| ())
+            }
             "stored_positional" => client
                 .execute_stored_procedure("dbo.p".to_string(), Some(vec![param]), None, ())
                 .await
@@ -6153,7 +10651,7 @@ mod tests {
                     .map(|_| ())
             }
             "prepare" => client
-                .execute_sp_prepare("SELECT @v".to_string(), vec![param], ())
+                .execute_sp_prepare("SELECT @v".to_string(), vec![param], false, ())
                 .await
                 .map(|_| ()),
             _ => unreachable!("unknown vector RPC route"),
@@ -6483,6 +10981,8 @@ mod tests {
             "executesql",
             "begin_atomic",
             "begin_streamed",
+            "prepared_streamed_new",
+            "prepared_streamed_reused",
             "stored_named",
             "prepared_new",
             "prepared_reused",
@@ -6540,6 +11040,28 @@ mod tests {
         assert!(matches!(err, UsageError(message) if message.contains("ForceColumnEncryption")));
     }
 
+    /// Like [`create_capturing_client`], but shares the timeout each
+    /// `receive_token` was given instead of the bytes written.
+    fn create_timeout_observing_client(
+        tokens: Vec<Tokens>,
+    ) -> (TdsClient, Arc<std::sync::Mutex<Vec<Option<Duration>>>>) {
+        let transport = TestTransport::with_tokens(tokens);
+        let observed = Arc::clone(&transport.receive_timeouts);
+        let transport = AnyTransport::dynamic(transport);
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        let client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+            Vec::new(),
+        );
+        (client, observed)
+    }
+
     /// Like [`create_capturing_client`], but also returns a shared flag that,
     /// when set, makes the transport's next `send` fail — used to exercise the
     /// mid-stream abort path of the streamed PLP write.
@@ -6569,6 +11091,459 @@ mod tests {
             cur_cmd: CurrentCommand::Insert,
             row_count: 0,
         })
+    }
+
+    /// A rowset DONE with no `DONE_COUNT` (what `SET NOCOUNT ON` produces) must
+    /// read as "reported nothing", which is not the same as "zero rows".
+    #[test]
+    fn last_result_row_count_distinguishes_no_count_from_zero() {
+        let mut client = create_test_client();
+        client
+            .handle_row_done(
+                DoneToken {
+                    status: DoneStatus::FINAL,
+                    cur_cmd: CurrentCommand::Select,
+                    row_count: 7,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(client.last_result_row_count(), None);
+
+        client
+            .handle_row_done(
+                DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Select,
+                    row_count: 0,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(client.last_result_row_count(), Some(0));
+    }
+
+    /// SQL Server tags variable assignment as `SQLSELECT` and still sets
+    /// `DONE_COUNT`, which is why a no-row `SQLSELECT` count is never an update
+    /// count. The same tag on a row set's own DONE carries the real row count.
+    #[test]
+    fn a_row_set_count_is_reported_even_when_tagged_sqlselect() {
+        let mut client = create_test_client();
+        client
+            .handle_row_done(
+                DoneToken {
+                    status: DoneStatus::COUNT,
+                    cur_cmd: CurrentCommand::Select,
+                    row_count: 2,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(client.last_result_row_count(), Some(2));
+    }
+
+    /// Every statement's count comes from the statement walk itself: a row set's
+    /// from `last_result_row_count` once its rows are read, a DML statement's
+    /// from `NoRows`. A new row set starts with no count, so one row set's count
+    /// is never read as the next one's.
+    #[tokio::test]
+    async fn every_statement_count_comes_from_the_statement_walk() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 2, true),
+            done_count(CurrentCommand::Update, 3, true),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 1, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert_eq!(client.last_result_row_count(), None);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.last_result_row_count(), Some(2));
+
+        assert_eq!(
+            client.advance().await.unwrap(),
+            StatementResult::NoRows {
+                rows_affected: Some(3)
+            }
+        );
+        assert_eq!(
+            client.last_result_row_count(),
+            None,
+            "a no-row statement must not report the previous row set's count"
+        );
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert_eq!(
+            client.last_result_row_count(),
+            None,
+            "a new row set must not report the previous one's count"
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.last_result_row_count(), Some(1));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+
+        // Ending the request clears it, including when the walk already ended.
+        client.close_query().await.unwrap();
+        assert_eq!(client.last_result_row_count(), None);
+    }
+
+    /// A DATACLASSIFICATION token follows COLMETADATA. It is parsed but not yet
+    /// attached to the result set, so neither the row loop nor the walk between
+    /// results may treat it as the end of a result or an unexpected token.
+    #[tokio::test]
+    async fn data_classification_tokens_do_not_disturb_result_set_navigation() {
+        use crate::token::data_classification::{
+            DataClassificationMetadata, DataClassificationVersion, SensitivityRank,
+        };
+        fn classification() -> Tokens {
+            Tokens::DataClassification(DataClassificationMetadata {
+                version: DataClassificationVersion::Version2,
+                sensitivity_labels: Vec::new(),
+                information_types: Vec::new(),
+                rank: Some(SensitivityRank::NotDefined),
+                columns: Vec::new(),
+            })
+        }
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, true),
+            classification(),
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Closing a classified result set before reading it drains the stream;
+    /// the drain must pass over the DATACLASSIFICATION tokens too.
+    #[tokio::test]
+    async fn close_query_drains_past_data_classification_tokens() {
+        use crate::token::data_classification::{
+            DataClassificationMetadata, DataClassificationVersion,
+        };
+        fn classification() -> Tokens {
+            Tokens::DataClassification(DataClassificationMetadata {
+                version: DataClassificationVersion::Version1,
+                sensitivity_labels: Vec::new(),
+                information_types: Vec::new(),
+                rank: None,
+                columns: Vec::new(),
+            })
+        }
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, true),
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        client.close_query().await.unwrap();
+
+        assert!(!client.has_open_batch());
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Under `Continue` one error can be reflected by both the failing
+    /// statement's DONEINPROC and the enclosing DONEPROC. Both are accepted, and
+    /// the chain is closed afterwards.
+    #[tokio::test]
+    async fn a_returned_error_allows_error_on_done_in_proc_and_done_proc() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.statement_error_completion_pending);
+        assert!(client.has_open_batch());
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::End
+        ));
+        assert!(!client.statement_error_completion_pending);
+    }
+
+    #[tokio::test]
+    async fn a_returned_error_allows_error_only_on_done_proc() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.statement_error_completion_pending);
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::End
+        ));
+        assert!(!client.statement_error_completion_pending);
+    }
+
+    /// The allowance belongs to the error that was returned. It is spent by the
+    /// DONE that closes that statement, so a later error-flagged DONE with no
+    /// ERROR of its own is still reported as the protocol violation it is.
+    #[tokio::test]
+    async fn the_allowance_does_not_outlive_the_failed_statement() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(client.advance_to_result_boundary().await.is_err());
+        assert!(matches!(
+            client.advance_to_result_boundary().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+    }
+
+    /// The allowance also ends where the next result set begins: in a procedure
+    /// doing `RAISERROR(...); SELECT 2`, the failed statement's error-flagged
+    /// DONEINPROC precedes the COLMETADATA, so an error-flagged DONEINPROC
+    /// closing the succeeding row set is unpaired.
+    #[tokio::test]
+    async fn the_allowance_does_not_span_the_next_row_set() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+
+        assert!(matches!(
+            execute_continue(&mut client).await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(!client.statement_error_completion_pending);
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+    }
+
+    /// `Continue` is not a blanket excuse: a DONE with the error flag and no
+    /// preceding ERROR is still a protocol violation.
+    #[tokio::test]
+    async fn continue_mode_still_rejects_an_unpaired_error_done() {
+        let mut client = create_test_client_with_tokens(vec![Tokens::Done(DoneToken {
+            status: DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        })]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+    }
+
+    /// `Abort` stays the default, so every existing caller keeps the
+    /// end-at-first-error behaviour without changing a line.
+    #[test]
+    fn batch_error_mode_defaults_to_abort() {
+        assert_eq!(ExecuteOptions::default().on_error, BatchErrorMode::Abort);
+        assert_eq!(ExecuteOptions::from(()).on_error, BatchErrorMode::Abort);
+        assert_eq!(
+            ExecuteOptions::new()
+                .on_error(BatchErrorMode::Continue)
+                .on_error,
+            BatchErrorMode::Continue
+        );
+        assert_eq!(create_test_client().batch_error_mode, BatchErrorMode::Abort);
+    }
+
+    /// The mode is per command. Every request boundary puts it back to `Abort`
+    /// — `begin_command` for batches, RPCs and transaction requests, and
+    /// `check_and_reconnect` for the cursor RPCs, which never call
+    /// `begin_command`. Without the second, a cursor fetch after a `Continue`
+    /// batch would return a server error without draining its response.
+    #[tokio::test]
+    async fn every_request_boundary_puts_the_error_mode_back_to_abort() {
+        let mut client = create_test_client();
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.statement_error_completion_pending = true;
+        client.last_result_row_count = Some(4);
+        client.begin_command();
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+        assert!(!client.statement_error_completion_pending);
+        assert_eq!(client.last_result_row_count(), None);
+
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.statement_error_completion_pending = true;
+        client.check_and_reconnect(None, None).await.unwrap();
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+        assert!(!client.statement_error_completion_pending);
+    }
+
+    /// Cancellation ends the request without going through `begin_command` or
+    /// `check_and_reconnect`, so the attention cleanup clears the statement-walk
+    /// state itself: the cancelled statement's count is not reported, and the
+    /// DONE-error allowance does not stay armed.
+    #[test]
+    fn attention_cleanup_clears_the_statement_walk_state() {
+        let mut client = create_test_client();
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.statement_error_completion_pending = true;
+        client
+            .row_set_errors
+            .push(SqlErrorInfo::from(&error_token_with_severity(16)));
+        client.last_result_row_count = Some(4);
+
+        client.normalize_after_attention();
+
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+        assert!(!client.statement_error_completion_pending);
+        assert!(client.row_set_errors.is_empty());
+        assert_eq!(client.last_result_row_count(), None);
+    }
+
+    /// Returning an error must not cost the connection its retirement. A
+    /// severity >= 20 error kills the session server-side, so even under
+    /// `Continue` it closes the batch and leaves the client known-dead —
+    /// otherwise a pool would hand the corpse to the next caller.
+    #[tokio::test]
+    async fn a_fatal_error_closes_the_batch_even_under_continue() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: FATAL_ERROR_SEVERITY,
+                message: "connection is doomed".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_no_more(),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        match error {
+            crate::error::Error::SqlServerError { diagnostics } => {
+                assert_eq!(diagnostics.errors.len(), 1, "the error is reported");
+                assert_eq!(diagnostics.errors[0].number, 50000);
+            }
+            other => panic!("expected SqlServerError, got {other:?}"),
+        }
+        assert!(client.is_connection_dead());
+        assert!(
+            !client.has_open_batch(),
+            "a fatal error ends the batch, so the caller stops"
+        );
+        assert!(!client.statement_error_completion_pending);
+    }
+
+    /// A prepared batch reports errors on the row, and does so whether or not
+    /// the statement produced a result set — `read_prepared_batch_result`
+    /// handles the no-row case and this the mid-row one. `Continue` must not
+    /// return it as `Err` as well, or the channel an error arrives on would
+    /// depend on the shape of the result. The mode is set explicitly: without it
+    /// this test would pass with the prepared-batch check moved after the
+    /// `Continue` one.
+    #[tokio::test]
+    async fn a_prepared_batch_keeps_its_errors_on_the_row_under_continue() {
+        use crate::token::tokens::ErrorToken;
+
+        let mut client = create_test_client();
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.prepared_batch = Some(Box::new(PreparedBatchReadState {
+            current: Some(PreparedBatchReadState::next_row(0)),
+            remaining: Vec::new().into_iter(),
+            completed: Vec::new(),
+        }));
+
+        let outcome = client
+            .handle_row_read_token(Tokens::Error(ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "boom".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }))
+            .await
+            .expect("a prepared batch reports on the row, not as Err");
+
+        assert!(outcome.is_none(), "the error does not end the result set");
+        assert!(!client.statement_error_completion_pending);
+        let row = client.prepared_batch.as_ref().unwrap().current.as_ref();
+        assert_eq!(
+            row.map(|r| r.errors.len()),
+            Some(1),
+            "the error belongs on the prepared row"
+        );
     }
 
     /// A DONE token carrying the `DONE_COUNT` flag (a DML row count). `more`
@@ -6602,14 +11577,101 @@ mod tests {
         Tokens::ColMetadata(ColMetadataToken::default())
     }
 
+    /// A COLMETADATA token for `n` nullable `int` columns, so tests can assert
+    /// the client is positioned on a real row set rather than a 0-column one.
+    fn int_col_metadata(n: usize) -> Tokens {
+        let columns = crate::test_client_support::int_columns(n);
+        Tokens::ColMetadata(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap_or(u16::MAX),
+            columns,
+            cek_table: Vec::new(),
+        })
+    }
+
     fn stale_metadata() -> Arc<ColMetadataToken> {
         Arc::new(ColMetadataToken::default())
+    }
+
+    fn int_column_metadata(column_count: usize) -> Arc<ColMetadataToken> {
+        let columns = (0..column_count)
+            .map(|index| crate::query::metadata::ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: crate::datatypes::sqldatatypes::TypeInfo::fixed_len(
+                    crate::datatypes::sqldatatypes::TdsDataType::Int4,
+                )
+                .unwrap(),
+                data_type: crate::datatypes::sqldatatypes::TdsDataType::Int4,
+                column_name: format!("c{index}"),
+                multi_part_name: None,
+                crypto_metadata: None,
+            })
+            .collect();
+        Arc::new(ColMetadataToken {
+            column_count: u16::try_from(column_count).unwrap(),
+            columns,
+            cek_table: vec![],
+        })
+    }
+
+    fn mixed_lob_metadata(prefix_columns: usize) -> Arc<ColMetadataToken> {
+        let mut columns = int_column_metadata(prefix_columns).columns.clone();
+        columns.push(crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::NVarChar,
+                usize::from(u16::MAX),
+                None,
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::NVarChar,
+            column_name: "lob".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        });
+        Arc::new(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap(),
+            columns,
+            cek_table: vec![],
+        })
+    }
+
+    /// Like [`mixed_lob_metadata`], but with `suffix_columns` plain int
+    /// columns after the PLP column instead of the PLP column being last.
+    fn mixed_lob_metadata_with_int_suffix(
+        prefix_columns: usize,
+        suffix_columns: usize,
+    ) -> Arc<ColMetadataToken> {
+        let mut columns = mixed_lob_metadata(prefix_columns).columns.clone();
+        columns.extend(int_column_metadata(suffix_columns).columns.iter().cloned());
+        Arc::new(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap(),
+            columns,
+            cek_table: vec![],
+        })
     }
 
     fn done_more() -> Tokens {
         Tokens::Done(DoneToken {
             status: DoneStatus::MORE,
             cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn done_in_proc_more() -> Tokens {
+        Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::MORE,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        })
+    }
+
+    fn done_proc_no_more() -> Tokens {
+        Tokens::DoneProc(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Select,
             row_count: 0,
         })
     }
@@ -6730,6 +11792,1657 @@ mod tests {
         assert_eq!(r2, StatementResult::End);
     }
 
+    /// SQL Server compiles variable assignment as a SQLSELECT command and still
+    /// sets DONE_COUNT. Such a DONE must collapse into the following row set
+    /// rather than surface as a leading update-count result.
+    /// Observed token sequence for `DECLARE @out int = 1; EXEC dbo.p;`.
+    #[tokio::test]
+    async fn execute_skips_select_count_before_rowset() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let result = client
+            .execute("DECLARE @out int = 1; EXEC dbo.p;".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1,
+            "must be positioned on the procedure's row set"
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+    }
+
+    /// `DECLARE @x int = 1;` on its own must not report a phantom result.
+    #[tokio::test]
+    async fn execute_select_count_only_batch_ends_immediately() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Select, 1, false)]);
+
+        let result = client
+            .execute("DECLARE @x int = 1;".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::End);
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+    }
+
+    /// Several assignments in a row all collapse.
+    #[tokio::test]
+    async fn execute_skips_consecutive_select_counts() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 2, true),
+            int_col_metadata(1),
+        ]);
+
+        let result = client
+            .execute(
+                "DECLARE @a int = 1; SET @a = 2; SELECT @a = v FROM t; SELECT * FROM t;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    /// AB#47535: a PRINT reached only *after* variable assignments. The
+    /// assignments' SQLSELECT-tagged DONE_COUNTs must collapse so the very first
+    /// result the caller sees is the PRINT's message-only result. Treating them
+    /// as update counts stops the batch on the DECLARE, so `execute` returns
+    /// `NoRows { rows_affected: Some(1) }` with no message and the ODBC layer
+    /// reports plain `SQL_SUCCESS` — the shape that hid PRINT output from
+    /// `mssql-python`'s `cursor.messages`.
+    ///
+    /// Observed token sequence for
+    /// `DECLARE @msg VARCHAR(MAX); SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047); PRINT @msg;`.
+    #[tokio::test]
+    async fn execute_surfaces_print_after_assignment_counts() {
+        let printed = "a".repeat(2047);
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 1, true),
+            info_token(0, 0, &printed),
+            done_no_more(),
+        ]);
+
+        let result = client
+            .execute(
+                "DECLARE @msg VARCHAR(MAX);\
+                 SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047);\
+                 PRINT @msg;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+
+        let messages = client.take_info_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, printed);
+        assert_eq!(messages[0].number, 0);
+    }
+
+    /// A PRINT on its own statement surfaces as a message-only result (its DONE
+    /// carries no count); the following assignment's count is still suppressed.
+    #[tokio::test]
+    async fn execute_surfaces_message_but_skips_select_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "hi"),
+            done_more(),
+            done_count(CurrentCommand::Select, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute("PRINT 'hi'; DECLARE @x int = 1; SELECT 1;".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(second, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    /// Under `Continue` a failure in the first statement comes back from
+    /// `execute` itself. It precedes any result boundary — the thing that
+    /// normally opens the batch — so the batch must be opened explicitly, or the
+    /// caller would stop and the next command would read this one's leftovers.
+    #[tokio::test]
+    async fn execute_under_continue_returns_the_error_and_keeps_the_batch_open() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 50000,
+                state: 1,
+                severity: 16,
+                message: "boom".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        let first = client
+            .execute(
+                "RAISERROR('boom', 16, 1); SELECT 1;".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await;
+
+        match first {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), 1);
+                assert_eq!(diagnostics.errors[0].message, "boom");
+            }
+            other => panic!("expected SqlServerError, got {other:?}"),
+        }
+        assert!(
+            client.has_open_batch(),
+            "the batch continues past the error"
+        );
+        assert!(!client.on_rows());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert!(!client.is_connection_dead());
+    }
+
+    /// One failed statement can send several ERROR tokens (with INFO between
+    /// them) before its DONE. Under `Continue` they come back as one `Err`
+    /// carrying all of them, not as one failed statement per token, and the first
+    /// token after them is kept for the next call.
+    #[tokio::test]
+    async fn continue_returns_every_error_of_a_statement_as_one_err() {
+        use crate::token::tokens::ErrorToken;
+        let error = |number: u32| {
+            Tokens::Error(ErrorToken {
+                number,
+                state: 1,
+                severity: 16,
+                message: format!("error {number}"),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            })
+        };
+        let mut client = create_test_client_with_tokens(vec![
+            error(50001),
+            info_token(3621, 0, "The statement has been terminated."),
+            error(50002),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        let first = client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await;
+
+        match first {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                let numbers: Vec<u32> = diagnostics.errors.iter().map(|e| e.number).collect();
+                assert_eq!(numbers, vec![50001, 50002]);
+            }
+            other => panic!("expected one SqlServerError, got {other:?}"),
+        }
+        assert_eq!(client.take_info_messages().len(), 1);
+        assert!(client.has_open_batch());
+        assert_eq!(
+            client.advance().await.unwrap(),
+            StatementResult::Rows,
+            "the parked DONE closes the failed statement; no second Err"
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    /// The DONE completing a failed statement can carry a count as well as the
+    /// error flag — ERROR and COUNT are independent. That statement's outcome was
+    /// the `Err`, so the DONE must not surface it again as `NoRows`. The client is
+    /// also positioned on the failure, not on the previous row set, so the row
+    /// set's count is not reported while it is.
+    #[tokio::test]
+    async fn a_failed_statement_is_not_surfaced_again_by_its_counted_done() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 1, true),
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::COUNT | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 2,
+            }),
+            done_count(CurrentCommand::Update, 3, false),
+        ]);
+
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.last_result_row_count(), Some(1));
+
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert_eq!(
+            client.last_result_row_count(),
+            None,
+            "positioned on the failure, not on the row set before it"
+        );
+        assert_eq!(
+            client.advance().await.unwrap(),
+            StatementResult::NoRows {
+                rows_affected: Some(3)
+            },
+            "the next result is the UPDATE, not the failed INSERT again"
+        );
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    /// The look-ahead that gathers one statement's ERROR tokens is fed by the
+    /// server, so it is bounded like the other token loops: an endless run of
+    /// ERRORs with no DONE retires the connection instead of growing forever.
+    #[tokio::test]
+    async fn an_endless_run_of_statement_errors_is_bounded_and_retires_connection() {
+        let mut client = create_test_client_with_tokens(
+            std::iter::repeat_with(|| Tokens::Error(error_token_with_severity(16)))
+                .take(MAX_ERRORS_PER_FAILED_STATEMENT + 2)
+                .collect(),
+        );
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::ProtocolError(_)));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    /// A long message is a real token of its own, so the text the errors hold
+    /// is bounded as well as their number: a run of errors near the protocol's
+    /// message limit retires the connection well before the count is reached.
+    #[tokio::test]
+    async fn the_text_of_one_statements_errors_is_bounded() {
+        let runaway = MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / LONG_ERROR_MESSAGE_UNITS + 2;
+        assert!(runaway < MAX_ERRORS_PER_FAILED_STATEMENT);
+        let mut tokens: Vec<Tokens> = std::iter::repeat_with(|| {
+            Tokens::Error(error_token_with_message_units(LONG_ERROR_MESSAGE_UNITS))
+        })
+        .take(runaway)
+        .collect();
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        }));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await.unwrap_err() {
+            crate::error::Error::ProtocolError(message) => {
+                assert!(message.contains("Too much ERROR text"), "{message}");
+            }
+            other => panic!("expected the text bound, got {other:?}"),
+        }
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    /// The bounds leave room for a real statement: the most errors allowed,
+    /// each with a full-length SQL Server message, fail the statement once
+    /// and keep the connection and the batch.
+    #[tokio::test]
+    async fn the_most_errors_a_statement_may_send_are_returned_together() {
+        let mut tokens: Vec<Tokens> = std::iter::repeat_with(|| {
+            Tokens::Error(error_token_with_message_units(SQL_SERVER_MESSAGE_UNITS))
+        })
+        .take(MAX_ERRORS_PER_FAILED_STATEMENT)
+        .collect();
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        }));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.execution_context.set_has_open_batch(true);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), MAX_ERRORS_PER_FAILED_STATEMENT);
+            }
+            other => panic!("expected one SqlServerError, got {other:?}"),
+        }
+        assert!(!client.is_connection_dead());
+        assert!(client.has_open_batch());
+    }
+
+    /// The bound counts the errors kept, not the tokens read: one error followed
+    /// by many INFO messages is a valid statement, and returns one `Err` with the
+    /// batch still open.
+    #[tokio::test]
+    async fn info_messages_do_not_count_against_the_statement_error_bound() {
+        let mut tokens = vec![Tokens::Error(error_token_with_severity(16))];
+        tokens.extend(
+            (0..MAX_ERRORS_PER_FAILED_STATEMENT as u32 + 1).map(|n| info_token(n, 0, "message")),
+        );
+        tokens.push(Tokens::Done(DoneToken {
+            status: DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        }));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), 1);
+            }
+            other => panic!("expected one SqlServerError, got {other:?}"),
+        }
+        assert!(!client.is_connection_dead());
+        assert!(client.has_open_batch());
+        assert_eq!(
+            client.take_info_messages().len(),
+            MAX_ERRORS_PER_FAILED_STATEMENT + 1
+        );
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::End
+        ));
+    }
+
+    /// One error can be reflected by the failing statement's DONEINPROC and by
+    /// the enclosing DONEPROC. When that DONEPROC carries a count as well, it is
+    /// the same failed statement and is not surfaced as a result either.
+    #[tokio::test]
+    async fn an_error_flagged_done_proc_with_a_count_is_not_surfaced_again() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 0,
+            }),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::COUNT | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 2,
+            }),
+            done_count(CurrentCommand::Update, 3, false),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: Some(3)
+            }
+        ));
+    }
+
+    /// INFO is not kept in the error list, so a separate bound on tokens read
+    /// stops a run of INFO that never reaches a DONE.
+    #[tokio::test]
+    async fn an_endless_run_of_info_after_a_statement_error_is_bounded() {
+        let mut tokens = vec![Tokens::Error(error_token_with_severity(16))];
+        tokens.extend((0..100_001).map(|n| info_token(n, 0, "message")));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.execution_context.set_has_open_batch(true);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::ProtocolError(_)));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    /// A transport failure while gathering a statement's errors cannot be
+    /// resumed from, so it closes the batch and retires the connection — even
+    /// when an earlier result had opened the batch.
+    #[tokio::test]
+    async fn a_transport_failure_after_a_statement_error_closes_the_batch() {
+        let mut client =
+            create_test_client_with_tokens(vec![Tokens::Error(error_token_with_severity(16))]);
+        client.execution_context.set_has_open_batch(true);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        let error = client.advance_to_result_boundary().await.unwrap_err();
+
+        assert!(matches!(error, crate::error::Error::ConnectionClosed(_)));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(!client.statement_error_completion_pending);
+    }
+
+    /// The same inside a row set: the errors collected there are dropped with
+    /// the batch, and the batch does not stay open.
+    #[tokio::test]
+    async fn a_transport_failure_inside_a_failed_row_set_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+        ]);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.row_set_errors.is_empty());
+    }
+
+    /// The pull-cursor reader has the same exit: a transport failure after a
+    /// row-set error closes the batch rather than leaving it open.
+    #[tokio::test]
+    async fn a_transport_failure_in_the_cursor_reader_after_a_row_set_error_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+        ]);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row_cursor().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.row_set_errors.is_empty());
+    }
+
+    /// Every other read inside a row set — draining a paused row or PLP value
+    /// before the next row, pulling a column, finishing a row or its prefix,
+    /// reading PLP bytes — closes the batch the same way when it fails after a
+    /// row-set error.
+    #[tokio::test]
+    async fn every_row_set_read_failure_after_a_row_set_error_closes_the_batch() {
+        fn row_paused() -> ActiveRowReadState {
+            ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+                next_column_index: 0,
+                metadata: int_column_metadata(2),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }))
+        }
+
+        fn plp_paused() -> ActiveRowReadState {
+            let metadata = mixed_lob_metadata(0);
+            let Some((Some(plp_stream), _used)) =
+                crate::datatypes::decoder::PlpColumnStream::try_begin_buffered(
+                    &metadata.columns[0],
+                    &4_u64.to_le_bytes(),
+                )
+                .unwrap()
+            else {
+                panic!("a known-length PLP header must yield a started stream");
+            };
+            ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+                row_pause_state: RowPauseState {
+                    next_column_index: 0,
+                    metadata,
+                    nbc_null_bitmap: None,
+                    decryptor: None,
+                },
+                plp_stream,
+            }))
+        }
+
+        fn failed_row_set(state: ActiveRowReadState) -> TdsClient {
+            let mut client = create_test_client();
+            client.batch_error_mode = BatchErrorMode::Continue;
+            client.execution_context.set_has_open_batch(true);
+            client.current_metadata = Some(int_column_metadata(2));
+            client.active_row_read_state = state;
+            client
+                .row_set_errors
+                .push(SqlErrorInfo::from(&error_token_with_severity(16)));
+            client
+        }
+
+        fn assert_closed(client: &TdsClient, surface: &str) {
+            assert!(!client.has_open_batch(), "{surface}: batch left open");
+            assert!(client.is_connection_dead(), "{surface}: not retired");
+            assert!(client.row_set_errors.is_empty(), "{surface}: errors kept");
+        }
+
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.next_row_cursor().await.is_err());
+        assert_closed(&client, "next_row_cursor draining a paused row");
+
+        let mut client = failed_row_set(plp_paused());
+        assert!(client.next_row_cursor().await.is_err());
+        assert_closed(&client, "next_row_cursor draining a paused PLP value");
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.read_row_column(1).await.is_err());
+        assert_closed(&client, "read_row_column");
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert_closed(&client, "finish_row_into");
+
+        let mut client = failed_row_set(row_paused());
+        assert!(client.finish_row_prefix_into(1, &mut writer).await.is_err());
+        assert_closed(&client, "finish_row_prefix_into");
+
+        let mut client = failed_row_set(plp_paused());
+        assert!(client.read_active_plp_bytes(&mut [0u8; 4]).await.is_err());
+        assert_closed(&client, "read_active_plp_bytes");
+    }
+
+    fn assert_walk_ended(client: &TdsClient) {
+        assert!(!client.has_open_batch(), "batch left open");
+        assert!(client.is_connection_dead(), "connection not retired");
+        assert!(client.row_set_errors.is_empty(), "collected errors kept");
+    }
+
+    async fn execute_continue(client: &mut TdsClient) -> TdsResult<StatementResult> {
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+    }
+
+    /// A bad token after a row-set error ends the read just as a transport
+    /// failure does — here an unexpected COLMETADATA, whose `UsageError` is
+    /// raised after the token was consumed. Both row readers close the batch.
+    #[tokio::test]
+    async fn an_unexpected_token_after_a_row_set_error_closes_the_batch() {
+        fn tokens() -> Vec<Tokens> {
+            vec![
+                int_col_metadata(1),
+                Tokens::Error(error_token_with_severity(16)),
+                int_col_metadata(1),
+            ]
+        }
+
+        let mut client = create_test_client_with_tokens(tokens());
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert_walk_ended(&client);
+
+        let mut client = create_test_client_with_tokens(tokens());
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert!(matches!(
+            client.next_row_cursor().await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert_walk_ended(&client);
+    }
+
+    /// After a failed statement's error-flagged DONE with MORE, the walk goes
+    /// on; a transport failure reading what follows ends it rather than leave a
+    /// batch marked open that cannot be read.
+    #[tokio::test]
+    async fn a_transport_failure_after_a_completed_failed_statement_ends_the_walk() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+        ]);
+
+        assert!(matches!(
+            execute_continue(&mut client).await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.has_open_batch());
+
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert_walk_ended(&client);
+    }
+
+    /// A protocol error between results — an unexpected token — ends the walk
+    /// too, even though `advance` reports it as a `UsageError`.
+    #[tokio::test]
+    async fn an_unexpected_token_between_results_ends_the_walk() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+            Tokens::Order(crate::token::tokens::OrderToken {
+                _order_columns: Vec::new(),
+            }),
+        ]);
+
+        assert!(execute_continue(&mut client).await.is_err());
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert_walk_ended(&client);
+    }
+
+    /// Before the first result boundary the batch is not yet marked open, but
+    /// its response is already being read: a protocol error there ends a
+    /// `Continue` walk too, so a desynchronized stream is not reused. `Abort` is
+    /// unchanged.
+    #[tokio::test]
+    async fn an_unexpected_first_token_ends_a_continue_walk() {
+        fn tokens() -> Vec<Tokens> {
+            vec![Tokens::Order(crate::token::tokens::OrderToken {
+                _order_columns: Vec::new(),
+            })]
+        }
+
+        let mut client = create_test_client_with_tokens(tokens());
+        assert!(matches!(
+            execute_continue(&mut client).await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert_walk_ended(&client);
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+
+        let mut client = create_test_client_with_tokens(tokens());
+        assert!(client.execute("q".to_string(), ()).await.is_err());
+        assert!(!client.is_connection_dead(), "Abort behaviour changed");
+    }
+
+    /// A statement error positions the client on the failure, so nothing from
+    /// the previous result describes it: here that result was a row set ended by
+    /// a DONEINPROC, which must not lead `complete_current_result` to settle an
+    /// RPC terminator over the failed statement's own completion tokens.
+    #[tokio::test]
+    async fn a_statement_error_clears_the_previous_results_done_in_proc_position() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::COUNT | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert!(client.current_result_ended_with_done_in_proc);
+
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.has_open_batch());
+        assert!(!client.current_result_ended_with_done_in_proc);
+        assert!(!client.complete_current_result().await.unwrap());
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    /// The rule does not depend on an earlier statement error: under
+    /// `Continue`, any read failure ends the walk.
+    #[tokio::test]
+    async fn a_read_failure_in_a_clean_continue_walk_ends_it() {
+        let mut client = create_test_client_with_tokens(vec![int_col_metadata(1)]);
+        assert_eq!(
+            execute_continue(&mut client).await.unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert_walk_ended(&client);
+    }
+
+    /// The rule itself. Under `Continue` with the batch open, a read error
+    /// closes it; a statement error does not; nothing changes under `Abort`.
+    /// The `try_*` form also exempts a `UsageError`, which those reads raise
+    /// only to reject a call.
+    #[test]
+    fn a_read_error_ends_only_a_continue_walk() {
+        fn walking(mode: BatchErrorMode) -> TdsClient {
+            let mut client = create_test_client();
+            client.batch_error_mode = mode;
+            client.execution_context.set_has_open_batch(true);
+            client
+        }
+        let protocol = || crate::error::Error::ProtocolError("decode".to_string());
+
+        let mut client = walking(BatchErrorMode::Continue);
+        let _ = client.end_walk_on_read_error(protocol());
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+
+        let mut client = walking(BatchErrorMode::Continue);
+        let _ = client.end_walk_on_read_error(crate::error::Error::from_sql_errors(vec![
+            SqlErrorInfo::from(&error_token_with_severity(16)),
+        ]));
+        assert!(client.has_open_batch());
+        assert!(!client.is_connection_dead());
+
+        let mut client = walking(BatchErrorMode::Abort);
+        let _ = client.end_walk_on_read_error(protocol());
+        assert!(client.has_open_batch());
+        assert!(!client.is_connection_dead());
+
+        let mut client = walking(BatchErrorMode::Continue);
+        let result: TdsResult<()> =
+            client.end_walk_on_try_read_error(Err(UsageError("misuse".to_string())));
+        assert!(matches!(result, Err(crate::error::Error::UsageError(_))));
+        assert!(client.has_open_batch());
+
+        let mut client = walking(BatchErrorMode::Continue);
+        let result: TdsResult<()> = client.end_walk_on_try_read_error(Err(protocol()));
+        assert!(result.is_err());
+        assert!(!client.has_open_batch());
+    }
+
+    /// The `UsageError` exemption is for rejected calls only. A sync read that
+    /// had reached the transport cannot be resumed whatever its error says, so
+    /// a `UsageError` coming back from the transport is reported as a
+    /// `ProtocolError` and ends the walk.
+    #[test]
+    fn a_usage_error_from_a_sync_transport_read_still_ends_the_walk() {
+        let mut transport = TestTransport::new();
+        transport.sync_header_error = Some(UsageError("rejected while decoding".to_string()));
+        let mut client = create_test_client_with_transport(transport);
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+
+        let result = client.try_next_row_cursor();
+
+        assert!(
+            matches!(&result, Err(crate::error::Error::ProtocolError(message)) if message == "rejected while decoding"),
+            "{result:?}"
+        );
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+    }
+
+    /// A row read that consumed bytes and then hit a protocol violation ends a
+    /// `Continue` walk, whichever surface met it: a resumed row returning a
+    /// control token or pausing where it must not, a column pull that decoded
+    /// nothing, a paused row drained into a bad token.
+    #[tokio::test]
+    async fn a_protocol_error_in_a_resumed_row_read_ends_the_walk() {
+        fn paused() -> RowPauseState {
+            RowPauseState {
+                next_column_index: 0,
+                metadata: int_column_metadata(2),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+
+        fn walking(resume: RowReadResult) -> TdsClient {
+            let mut transport = TestTransport::new();
+            transport.resume_results.push_back(resume);
+            let mut client = create_test_client_with_transport(transport);
+            client.batch_error_mode = BatchErrorMode::Continue;
+            client.execution_context.set_has_open_batch(true);
+            client.current_metadata = Some(int_column_metadata(2));
+            client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+            client
+        }
+
+        fn assert_ended(client: &TdsClient, surface: &str) {
+            assert!(!client.has_open_batch(), "{surface}: batch left open");
+            assert!(client.is_connection_dead(), "{surface}: not retired");
+        }
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        let mut client = walking(RowReadResult::Token(done_no_more()));
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert_ended(&client, "finish_row_into, control token");
+
+        let mut client = walking(RowReadResult::RowPaused(paused()));
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert_ended(&client, "finish_row_into, pause");
+
+        let mut client = walking(RowReadResult::Token(done_no_more()));
+        assert!(client.finish_row_prefix_into(1, &mut writer).await.is_err());
+        assert_ended(&client, "finish_row_prefix_into, control token");
+
+        let mut client = walking(RowReadResult::Token(done_no_more()));
+        assert!(client.read_row_column(1).await.is_err());
+        assert_ended(&client, "read_row_column, control token");
+
+        // The mock writes nothing, so the column pull decodes no value.
+        let mut client = walking(RowReadResult::RowWritten);
+        assert!(client.read_row_column(1).await.is_err());
+        assert_ended(&client, "read_row_column, no value");
+
+        let mut client = walking(RowReadResult::Token(int_col_metadata(1)));
+        assert!(client.next_row_cursor().await.is_err());
+        assert_ended(&client, "next_row_cursor draining a paused row");
+
+        // A token the handler absorbs without ending the row cannot finish a resume.
+        let mut client = walking(RowReadResult::Token(Tokens::Order(
+            crate::token::tokens::OrderToken {
+                _order_columns: Vec::new(),
+            },
+        )));
+        assert!(client.next_row_cursor().await.is_err());
+        assert_ended(&client, "next_row_cursor, resume ended on a non-row token");
+
+        // A PLP drain that reads nothing before the stream ends.
+        let metadata = mixed_lob_metadata(0);
+        let Some((Some(plp_stream), _used)) =
+            crate::datatypes::decoder::PlpColumnStream::try_begin_buffered(
+                &metadata.columns[0],
+                &4_u64.to_le_bytes(),
+            )
+            .unwrap()
+        else {
+            panic!("a known-length PLP header must yield a started stream");
+        };
+        let mut transport = TestTransport::new();
+        transport.plp_read_results.push_back(0);
+        let mut client = create_test_client_with_transport(transport);
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+        client.current_metadata = Some(Arc::clone(&metadata));
+        client.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+            row_pause_state: RowPauseState {
+                next_column_index: 0,
+                metadata,
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            plp_stream,
+        }));
+        assert!(matches!(
+            client.next_row_cursor().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert_ended(&client, "next_row_cursor, PLP drain without progress");
+    }
+
+    /// Misuse rejected before anything is read leaves a continued row set as it
+    /// was: the batch stays open and the connection healthy.
+    #[tokio::test]
+    async fn a_rejected_call_after_a_row_set_error_keeps_the_batch() {
+        let mut client = create_test_client();
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+        client.current_metadata = Some(int_column_metadata(1));
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(1),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        client
+            .row_set_errors
+            .push(SqlErrorInfo::from(&error_token_with_severity(16)));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        assert!(matches!(
+            client.next_row_into(&mut writer).await,
+            Err(crate::error::Error::UsageError(_))
+        ));
+        assert!(client.has_open_batch());
+        assert!(!client.is_connection_dead());
+        assert_eq!(client.row_set_errors.len(), 1);
+    }
+
+    /// The "next DONE completes the failed statement" flag belongs to that DONE.
+    /// When a new row set starts first, the flag is dropped, so a later DML count
+    /// is still surfaced.
+    #[tokio::test]
+    async fn a_row_set_after_a_statement_error_does_not_hide_a_later_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, true),
+            done_count(CurrentCommand::Update, 3, false),
+        ]);
+
+        assert!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(
+            client.advance().await.unwrap(),
+            StatementResult::NoRows {
+                rows_affected: Some(3)
+            }
+        );
+    }
+
+    /// The first DONE after a returned error completes that statement even
+    /// when it is a counted DONEINPROC — which the error-chain rule, scoped to
+    /// DONEPROC and plain DONE, does not cover. The DML after it still surfaces.
+    #[tokio::test]
+    async fn a_counted_done_in_proc_completing_a_failed_statement_is_not_surfaced() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::COUNT | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Insert,
+                row_count: 2,
+            }),
+            done_count(CurrentCommand::Update, 3, false),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(client.advance_to_result_boundary().await.is_err());
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::NoRows {
+                rows_affected: Some(3)
+            }
+        ));
+    }
+
+    /// Inside a row set the collected errors are bounded too: a server that
+    /// keeps sending ERROR before the row set's DONE retires the connection.
+    #[tokio::test]
+    async fn an_endless_run_of_errors_inside_a_row_set_is_bounded() {
+        let mut tokens = vec![int_col_metadata(1)];
+        tokens.extend(
+            std::iter::repeat_with(|| Tokens::Error(error_token_with_severity(16)))
+                .take(MAX_ERRORS_PER_FAILED_STATEMENT + 2),
+        );
+        let mut client = create_test_client_with_tokens(tokens);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+        assert!(client.row_set_errors.is_empty());
+    }
+
+    /// The text bound applies inside a row set too, and abandoning the
+    /// statement clears what it was holding.
+    #[tokio::test]
+    async fn the_text_of_errors_inside_a_row_set_is_bounded() {
+        let runaway = MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / LONG_ERROR_MESSAGE_UNITS + 2;
+        let mut tokens = vec![int_col_metadata(1)];
+        tokens.extend(
+            std::iter::repeat_with(|| {
+                Tokens::Error(error_token_with_message_units(LONG_ERROR_MESSAGE_UNITS))
+            })
+            .take(runaway),
+        );
+        let mut client = create_test_client_with_tokens(tokens);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        match client.next_row().await {
+            Err(crate::error::Error::ProtocolError(message)) => {
+                assert!(message.contains("Too much ERROR text"), "{message}");
+            }
+            other => panic!("expected the text bound, got {other:?}"),
+        }
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+        assert!(client.row_set_errors.is_empty());
+        assert_eq!(client.row_set_error_bytes, 0);
+    }
+
+    /// And so is the total run: one error inside a row set followed by INFO that
+    /// never reaches a DONE stops at the token bound.
+    #[tokio::test]
+    async fn an_endless_run_of_info_after_a_row_set_error_is_bounded() {
+        let mut tokens = vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+        ];
+        tokens.extend((0..100_001).map(|n| info_token(n, 0, "message")));
+        let mut client = create_test_client_with_tokens(tokens);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+    }
+
+    /// `advance` moves past the row set, so its count no longer applies —
+    /// whether the rows were read or drained by `advance` itself, and also
+    /// when the batch has already ended.
+    #[tokio::test]
+    async fn advance_clears_the_previous_row_set_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 2, false),
+        ]);
+        client.execute("q".to_string(), ()).await.unwrap();
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.last_result_row_count(), Some(2));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert_eq!(client.last_result_row_count(), None);
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 2, false),
+        ]);
+        client.execute("q".to_string(), ()).await.unwrap();
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert_eq!(
+            client.last_result_row_count(),
+            None,
+            "a row set drained by advance does not report its count"
+        );
+    }
+
+    /// If a later ERROR of the same statement is fatal, the whole run drains
+    /// and closes as `Abort` would, and the earlier errors are not lost.
+    #[tokio::test]
+    async fn a_fatal_error_after_a_statement_error_still_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Error(error_token_with_severity(FATAL_ERROR_SEVERITY)),
+            done_no_more(),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        match client.advance_to_result_boundary().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), 2);
+            }
+            other => panic!("expected SqlServerError, got {other:?}"),
+        }
+        assert!(client.is_connection_dead());
+        assert!(!client.has_open_batch());
+        assert!(client.parked_token.is_none());
+    }
+
+    /// The default still ends the batch at the first error: the rest of the
+    /// response is drained, so the result after the error is gone and the batch
+    /// is closed.
+    #[tokio::test]
+    async fn abort_still_drains_the_batch_at_the_first_error() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        let first = client.execute("q".to_string(), ()).await;
+
+        assert!(matches!(
+            first,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(!client.has_open_batch());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert!(!client.is_connection_dead());
+    }
+
+    /// An error inside a row set is returned by `next_row` once the DONE ending
+    /// the row set arrives, together with every other ERROR the statement sent.
+    /// The row set is then finished, and `advance` moves to the next result.
+    #[tokio::test]
+    async fn an_error_inside_a_row_set_comes_from_next_row_and_advance_moves_past_it() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+            info_token(3621, 0, "The statement has been terminated."),
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        match client.next_row().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                assert_eq!(diagnostics.errors.len(), 2, "one statement, one Err");
+            }
+            other => panic!("expected SqlServerError, got {other:?}"),
+        }
+        assert!(client.has_open_batch());
+        assert!(
+            client.next_row().await.unwrap().is_none(),
+            "the failed row set is finished"
+        );
+        assert_eq!(client.take_info_messages().len(), 1);
+
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.last_result_row_count(), Some(0));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    /// `close_query` normally stops at an `Err`, because under `Abort` the error
+    /// already drained the batch. Under `Continue` it has not, so stopping would
+    /// clear the batch over unread tokens. The drain goes on to the end, and the
+    /// error it skipped is returned rather than lost.
+    #[tokio::test]
+    async fn close_query_drains_past_errors_under_continue() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 50001,
+                state: 1,
+                severity: 16,
+                message: "skipped".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR | DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_count(CurrentCommand::Select, 0, true),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 50002,
+                state: 1,
+                severity: 16,
+                message: "also skipped".to_string(),
+                server_name: String::new(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ]);
+        assert!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .is_err()
+        );
+
+        // Two skipped errors, with a row set between them: stopping at the first
+        // would leave the rest of the batch unread and lose the second.
+        match client.close_query().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                let numbers: Vec<u32> = diagnostics.errors.iter().map(|e| e.number).collect();
+                assert_eq!(numbers, vec![50001, 50002]);
+            }
+            other => panic!("expected the skipped error, got {other:?}"),
+        }
+        assert!(!client.has_open_batch());
+        // The request is over: nothing from its statement walk carries on.
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+        assert!(!client.statement_error_completion_pending);
+        assert!(!client.failed_statement_done_pending);
+        assert!(
+            !client.is_connection_dead(),
+            "a statement error is not a reason to retire the connection"
+        );
+    }
+
+    /// A batch of failing statements built for `close_query` to drain: one
+    /// failure that `execute` returns, then `skipped` more, each with its own
+    /// error number from 1 and a message of `units` characters.
+    fn batch_of_failing_statements(skipped: u32, units: usize) -> Vec<Tokens> {
+        let mut tokens = Vec::new();
+        for number in 0..=skipped {
+            tokens.push(Tokens::Error(crate::token::tokens::ErrorToken {
+                number,
+                ..error_token_with_message_units(units)
+            }));
+            tokens.push(Tokens::Done(DoneToken {
+                status: if number == skipped {
+                    DoneStatus::ERROR
+                } else {
+                    DoneStatus::ERROR | DoneStatus::MORE
+                },
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }));
+        }
+        tokens
+    }
+
+    async fn close_query_after_a_failing_first_statement(
+        tokens: Vec<Tokens>,
+    ) -> (TdsClient, Vec<u32>) {
+        let mut client = create_test_client_with_tokens(tokens);
+        assert!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .is_err()
+        );
+        let numbers = match client.close_query().await {
+            Err(crate::error::Error::SqlServerError { diagnostics }) => {
+                diagnostics.errors.iter().map(|e| e.number).collect()
+            }
+            other => panic!("expected the skipped errors, got {other:?}"),
+        };
+        (client, numbers)
+    }
+
+    /// A batch can hold any number of failing statements, so the errors a
+    /// drain keeps are bounded: the first ones, up to the per-statement count.
+    /// The drain itself still reaches the end, so the connection stays usable.
+    #[tokio::test]
+    async fn close_query_keeps_at_most_the_error_bound_from_a_long_batch() {
+        let skipped = MAX_ERRORS_PER_FAILED_STATEMENT as u32 + 5;
+        let (client, numbers) =
+            close_query_after_a_failing_first_statement(batch_of_failing_statements(skipped, 10))
+                .await;
+
+        let expected: Vec<u32> = (1..=MAX_ERRORS_PER_FAILED_STATEMENT as u32).collect();
+        assert_eq!(numbers, expected, "the first errors, in order");
+        assert!(!client.has_open_batch(), "the drain reached the end");
+        assert!(!client.is_connection_dead());
+    }
+
+    /// And by their text: long messages stop being kept at the text bound,
+    /// well before the count is reached.
+    #[tokio::test]
+    async fn close_query_keeps_at_most_the_error_text_bound_from_a_long_batch() {
+        let skipped =
+            (MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / LONG_ERROR_MESSAGE_UNITS) as u32 + 5;
+        let (client, numbers) = close_query_after_a_failing_first_statement(
+            batch_of_failing_statements(skipped, LONG_ERROR_MESSAGE_UNITS),
+        )
+        .await;
+
+        let per_error = LONG_ERROR_MESSAGE_UNITS + "test-server".len();
+        let fit = (MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT / per_error) as u32;
+        assert!(fit < skipped);
+        let expected: Vec<u32> = (1..=fit).collect();
+        assert_eq!(numbers, expected, "the first errors that fit, in order");
+        assert!(!client.has_open_batch(), "the drain reached the end");
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Once an error is dropped, so is every later one, even one small enough
+    /// to fit: the caller gets a prefix of the errors, never a gap.
+    #[test]
+    fn skipped_errors_keep_a_prefix() {
+        let error = |message: String| SqlErrorInfo {
+            message,
+            state: 1,
+            class: 16,
+            number: 1,
+            server_name: None,
+            proc_name: None,
+            line_number: None,
+        };
+        let mut skipped = SkippedErrors::default();
+        skipped.keep(vec![
+            error("x".repeat(MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT - 1)),
+            error("too long to fit".to_string()),
+            error(String::new()),
+        ]);
+
+        assert_eq!(skipped.errors.len(), 1);
+        assert_eq!(skipped.dropped, 2);
+    }
+
+    /// A RESETCONNECTION acknowledgement arriving in a `Continue` batch's
+    /// response is not a request boundary, so it leaves that batch's mode alone.
+    #[tokio::test]
+    async fn reset_ack_does_not_change_the_error_mode_of_its_response() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: crate::token::tokens::EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            Tokens::Error(error_token_with_severity(16)),
+            done_more(),
+            int_col_metadata(1),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+
+        assert!(matches!(
+            client.advance_to_result_boundary().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Continue);
+        assert!(matches!(
+            client.advance_to_result_boundary().await.unwrap(),
+            ResultBoundaryKind::RowSet(_)
+        ));
+    }
+
+    /// Divergence pin: msodbcsql excludes `SQLFETCHCURSOR` (0x21) and `SQLDBCC`
+    /// (0xe6) alongside `SQLSELECT`; this driver excludes only `SQLSELECT`,
+    /// matching .NET SqlClient. Neither value is modelled, so a `DONE_COUNT`
+    /// carrying one parses as `None` and *is* reported as an update count.
+    /// Fails the moment someone adopts the msodbcsql-only exclusions, forcing
+    /// that `SQLRowCount` change to be deliberate rather than incidental.
+    #[tokio::test]
+    async fn done_count_for_msodbcsql_only_exclusions_is_an_update_count() {
+        for raw in [0x21u16, 0xe6] {
+            let cmd = CurrentCommand::try_from(raw).unwrap();
+            let mut client = create_test_client_with_tokens(vec![done_count(cmd, 3, false)]);
+
+            let result = client
+                .execute("EXEC sp_cursorfetch @handle".to_string(), ())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result,
+                StatementResult::NoRows {
+                    rows_affected: Some(3)
+                },
+                "raw cur_cmd {raw:#x}"
+            );
+            assert_eq!(client.last_rows_affected(), 3, "raw cur_cmd {raw:#x}");
+            assert_eq!(
+                client.take_dml_result_counts(),
+                vec![3],
+                "raw cur_cmd {raw:#x}"
+            );
+        }
+    }
+
+    /// The only path where `saw_message` and `has_count` land on the *same* DONE:
+    /// a warning raised by the assignment itself. The result must still surface
+    /// so the message is visible, but must carry no row count — this PR changed
+    /// `rows_affected` here from `Some(1)` to `None`.
+    ///
+    /// A genuine `UPDATE` precedes the assignment so the assertion is real: with
+    /// a bare assignment `last_rows_affected` is still `-1` from `begin_command`
+    /// and would pass even if the message-only branch leaked a prior count.
+    ///
+    /// Live capture for
+    /// `UPDATE #t SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;`
+    /// where `#t.v` contains a NULL:
+    /// ```text
+    /// DONE status=MORE|COUNT cur_cmd=Update row_count=2
+    /// INFO 8153 "Warning: Null value is eliminated by an aggregate or other SET operation."
+    /// DONE status=MORE|COUNT cur_cmd=Select row_count=1
+    /// COLMETADATA(1) + row
+    /// ```
+    /// msodbcsql reports `rowcount=2`, then `rowcount=-1`, then `rowcount=-1`.
+    #[tokio::test]
+    async fn execute_surfaces_assignment_warning_without_rowcount() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 2, true),
+            info_token(
+                8153,
+                0,
+                "Warning: Null value is eliminated by an aggregate or other SET operation.",
+            ),
+            done_count(CurrentCommand::Select, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute(
+                "UPDATE #t SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(2)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 2);
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(
+            second,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(
+            client.last_rows_affected(),
+            -1,
+            "the UPDATE's count must not leak into the message-only result"
+        );
+
+        let third = client.advance().await.unwrap();
+        assert_eq!(third, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    /// A genuine DML count following an assignment is still reported.
+    #[tokio::test]
+    async fn execute_keeps_update_count_after_select_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Update, 2, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute(
+                "DECLARE @x int = 1; UPDATE t SET v = v; SELECT * FROM t;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(2)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 2);
+        assert_eq!(client.take_dml_result_counts(), vec![2]);
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(second, StatementResult::Rows);
+    }
+
+    /// `SELECT ... INTO` reports DONE_COUNT with no CurCmd, which is a genuine
+    /// update count and must survive the SQLSELECT filter.
+    #[tokio::test]
+    async fn execute_keeps_select_into_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::None, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute("SELECT 1 AS a INTO #t; SELECT * FROM #t;".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(1)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 1);
+        assert_eq!(client.take_dml_result_counts(), vec![1]);
+    }
+
     #[tokio::test]
     async fn advance_end_when_no_open_batch() {
         let mut client = create_test_client();
@@ -6772,6 +13485,1191 @@ mod tests {
         let resolved = budget.into_timeout().unwrap();
         assert_eq!(resolved.seconds(), None);
         assert_eq!(resolved.duration(), None);
+    }
+
+    #[test]
+    fn cursor_poll_resolves_ready_without_fallback() {
+        let mut calls = 0;
+        let value = CursorPoll::Ready(7).resolve::<()>(|| {
+            calls += 1;
+            Ok(9)
+        });
+
+        assert_eq!(value, Ok(7));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn cursor_poll_resolves_pending_with_one_fallback() {
+        let mut calls = 0;
+        let value = CursorPoll::Pending.resolve::<()>(|| {
+            calls += 1;
+            Ok(9)
+        });
+
+        assert_eq!(value, Ok(9));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn sync_cursor_attempt_reads_buffered_header_and_columns_in_order() {
+        let metadata = int_column_metadata(2);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        transport.sync_columns = VecDeque::from([ColumnValues::Int(10), ColumnValues::Int(20)]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert_eq!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(10),
+                variant_base: None,
+            })
+        );
+        assert_eq!(
+            client.try_read_row_column(1).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None,
+            })
+        );
+        assert_eq!(
+            client.try_read_row_column(1).unwrap(),
+            CursorPoll::Ready(CursorColumn::RowEnded)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_peek_parks_the_buffered_row_for_the_next_cursor_call() {
+        let metadata = int_column_metadata(1);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(
+            client.try_peek_past_current_row().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert!(client.row_already_positioned);
+
+        assert!(client.next_row_cursor().await.unwrap());
+        assert!(!client.row_already_positioned);
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_claims_parked_rows_without_advancing() {
+        let expected = [42_i32, 84_i32];
+        let mut payload = vec![0xff];
+        for value in expected {
+            payload.push(TokenType::Row as u8);
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+
+        for value in expected {
+            for _ in 0..2 {
+                assert_eq!(
+                    client.try_peek_past_current_row().unwrap(),
+                    CursorPoll::Ready(true)
+                );
+                assert!(client.row_already_positioned);
+            }
+            assert_eq!(
+                client.try_next_row_cursor().unwrap(),
+                CursorPoll::Ready(true)
+            );
+            assert!(!client.row_already_positioned);
+            assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+            assert_eq!(
+                client.try_read_row_column(0).unwrap(),
+                CursorPoll::Ready(CursorColumn::Value {
+                    value: ColumnValues::Int(value),
+                    variant_base: None,
+                })
+            );
+        }
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_claims_cancelled_parked_rows_like_async() {
+        for synchronous in [false, true] {
+            let mut transport = TestTransport::new();
+            transport.sync_header_available = true;
+            transport.sync_columns.push_back(ColumnValues::Int(42));
+            let mut client = create_test_client_with_transport(transport);
+            client.current_metadata = Some(int_column_metadata(1));
+            client.current_result_set_has_been_read_till_end = false;
+            assert_eq!(
+                client.try_peek_past_current_row().unwrap(),
+                CursorPoll::Ready(true)
+            );
+            let cancellation = CancelHandle::new();
+            client.cancel_handle = Some(cancellation.child_handle());
+            cancellation.cancel();
+
+            if synchronous {
+                assert_eq!(
+                    client.try_next_row_cursor().unwrap(),
+                    CursorPoll::Ready(true)
+                );
+            } else {
+                assert!(client.next_row_cursor().await.unwrap());
+            }
+            assert!(!client.row_already_positioned);
+            assert_eq!(client.try_read_row_column(0).unwrap(), CursorPoll::Pending);
+        }
+    }
+
+    /// A decode failure in a synchronous column pull ends a `Continue` walk like
+    /// one on the async path: a sql_variant whose base type byte is not a type.
+    #[tokio::test]
+    async fn a_decode_failure_in_try_read_row_column_ends_the_walk() {
+        let column = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::var_len(
+                TdsDataType::SsVariant,
+                8009,
+            )
+            .unwrap(),
+            data_type: TdsDataType::SsVariant,
+            column_name: "variant".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![column],
+            cek_table: Vec::new(),
+        });
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&6_u32.to_le_bytes());
+        payload.extend_from_slice(&[0x01, 0]);
+        payload.extend_from_slice(&42_i32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        client.batch_error_mode = BatchErrorMode::Continue;
+        client.execution_context.set_has_open_batch(true);
+
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        let result = client.try_read_row_column(0);
+        assert!(
+            matches!(&result, Err(e) if !matches!(e, UsageError(_))),
+            "expected a decode failure, got {result:?}"
+        );
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn sync_cursor_decodes_buffered_sql_variant_with_base_type() {
+        let column = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::var_len(
+                TdsDataType::SsVariant,
+                8009,
+            )
+            .unwrap(),
+            data_type: TdsDataType::SsVariant,
+            column_name: "variant".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![column],
+            cek_table: Vec::new(),
+        });
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&6_u32.to_le_bytes());
+        payload.extend_from_slice(&[TdsDataType::Int4 as u8, 0]);
+        payload.extend_from_slice(&42_i32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert_eq!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(42),
+                variant_base: Some(TdsDataType::Int4),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_row_poll_completes_without_parking_cursor_state() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(expected.len()));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_leaves_and_consumes_complete_plp() {
+        let metadata = mixed_lob_metadata(2);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(&4_i64.to_le_bytes());
+        payload.extend_from_slice(&4_u32.to_le_bytes());
+        payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        assert_eq!(client.current_result_bufferable_prefix_len(), Some(2));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert_eq!(
+            writer.take_row(),
+            vec![ColumnValues::Int(10), ColumnValues::Int(20)]
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+
+        let mut bytes = [0_u8; 4];
+        let CursorPoll::Ready(Some(chunk)) =
+            client.try_read_row_plp_complete(2, &mut bytes).unwrap()
+        else {
+            panic!("complete buffered PLP should not require async continuation");
+        };
+        assert_eq!(bytes, [b'o', 0, b'k', 0]);
+        assert_eq!(chunk.read, 4);
+        assert!(chunk.reached_end);
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_updates_the_remaining_timeout() {
+        // Needs a trailing PLP column so `prefix_len` (the PLP column's
+        // index) is a valid buffered-prefix boundary; the prefix itself
+        // only touches the leading int column.
+        let metadata = mixed_lob_metadata(1);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&42_i32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(1, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert!(client.remaining_request_timeout.unwrap() < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_propagates_a_column_decode_error() {
+        // An invalid `IntN` length byte makes the underlying buffered decoder
+        // return a `ProtocolError`, which must propagate out of
+        // `try_next_buffered_row_prefix_into` instead of being swallowed. A
+        // trailing PLP column makes column 0's index a valid prefix boundary.
+        let mut columns = vec![crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::var_len(
+                crate::datatypes::sqldatatypes::TdsDataType::IntN,
+                4,
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::IntN,
+            column_name: "c0".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        }];
+        columns.extend(mixed_lob_metadata(0).columns.iter().cloned());
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap(),
+            columns,
+            cek_table: vec![],
+        });
+        let payload = vec![0xff, TokenType::Row as u8, 3];
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        let error = client
+            .try_next_buffered_row_prefix_into(1, &mut writer)
+            .unwrap_err();
+        assert!(matches!(error, crate::error::Error::ProtocolError(_)));
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_continues_across_packets() {
+        let metadata = mixed_lob_metadata(2);
+        let second_value = 20_i32.to_le_bytes();
+        let mut first_payload = vec![0xff, TokenType::Row as u8];
+        first_payload.extend_from_slice(&10_i32.to_le_bytes());
+        first_payload.extend_from_slice(&second_value[..2]);
+        let mut first = TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut second =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(
+            &second
+                .append_bytes(&second_value[2..])
+                .append_bytes(&(-1_i64).to_le_bytes())
+                .build(),
+        );
+        let mut transport = create_network_transport_with_data(&stream);
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Partial
+        );
+        client.finish_row_prefix_into(2, &mut writer).await.unwrap();
+        assert_eq!(
+            writer.take_row(),
+            vec![ColumnValues::Int(10), ColumnValues::Int(20)]
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+    }
+
+    /// Sets up `client` positioned at a buffered `[int, int, PLP]` row with
+    /// `client.try_next_buffered_row_prefix_into(2, writer)` already run, so
+    /// `active_row_read_state` is `RowPaused` right before the PLP column.
+    async fn positioned_before_buffered_plp_column(
+        plp_payload: &[u8],
+    ) -> (TdsClient, crate::datatypes::row_writer::DefaultRowWriter) {
+        let metadata = mixed_lob_metadata(2);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(plp_payload);
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        (client, writer)
+    }
+
+    #[tokio::test]
+    async fn cursor_column_begins_a_buffered_plp_stream_when_length_is_known() {
+        // Known-length header (4) + a complete chunk + terminator, all already
+        // buffered: `try_read_row_column` must open a real `PlpStreaming`
+        // cursor from bytes alone, without waiting on async I/O.
+        let mut plp_payload = Vec::new();
+        plp_payload.extend_from_slice(&4_i64.to_le_bytes());
+        plp_payload.extend_from_slice(&4_u32.to_le_bytes());
+        plp_payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        plp_payload.extend_from_slice(&0_u32.to_le_bytes());
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let result = client.try_read_row_column(2).unwrap();
+        assert!(matches!(
+            result,
+            CursorPoll::Ready(CursorColumn::PlpStreaming { .. })
+        ));
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::PlpPaused(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_column_reports_null_for_a_buffered_plp_sentinel() {
+        // `SQL_PLP_NULL` (all bits set) means the PLP column itself is NULL on
+        // the wire; `try_read_row_column` must report it as a plain NULL value
+        // without ever entering the `PlpPaused` streaming state.
+        let plp_payload = (-1_i64).to_le_bytes();
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let result = client.try_read_row_column(2).unwrap();
+        assert!(matches!(
+            result,
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Null,
+                variant_base: None,
+            })
+        ));
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_active_plp_chunk_reads_a_buffered_chunk_and_updates_the_timeout() {
+        let mut plp_payload = Vec::new();
+        plp_payload.extend_from_slice(&4_i64.to_le_bytes());
+        plp_payload.extend_from_slice(&4_u32.to_le_bytes());
+        plp_payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        plp_payload.extend_from_slice(&0_u32.to_le_bytes());
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+        assert!(matches!(
+            client.try_read_row_column(2).unwrap(),
+            CursorPoll::Ready(CursorColumn::PlpStreaming { .. })
+        ));
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+
+        let mut out = [0_u8; 4];
+        let CursorPoll::Ready(chunk) = client.try_read_active_plp_chunk(&mut out).unwrap() else {
+            panic!("the whole chunk was already buffered");
+        };
+        assert_eq!(out, [b'o', 0, b'k', 0]);
+        assert_eq!(chunk.read, 4);
+        assert!(chunk.reached_end);
+        assert!(client.remaining_request_timeout.unwrap() < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn try_read_active_plp_chunk_defers_when_the_socket_has_no_more_data_yet() {
+        // The chunk header is only partially buffered and the peer stays
+        // connected without sending more, so `try_read_buffered_plp` must fall
+        // through its "no more data yet" branch and report `Pending` rather
+        // than blocking or erroring.
+        let metadata = mixed_lob_metadata(2);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(&4_i64.to_le_bytes()); // known-length PLP header
+        payload.extend_from_slice(&[0, 0]); // partial chunk-length header only
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_live_peer(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert!(matches!(
+            client.try_read_row_column(2).unwrap(),
+            CursorPoll::Ready(CursorColumn::PlpStreaming { .. })
+        ));
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_active_plp_chunk(&mut out).unwrap(),
+            CursorPoll::Pending
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::PlpPaused(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_row_plp_complete_reports_a_buffered_null_column() {
+        // The PLP header itself carries `SQL_PLP_NULL`, distinct from the
+        // NBCROW null-bitmap null path exercised elsewhere.
+        let plp_payload = (-1_i64).to_le_bytes();
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_row_plp_complete(2, &mut out).unwrap(),
+            CursorPoll::Ready(None)
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_row_plp_complete_is_pending_without_the_full_chunk() {
+        // Only the 8-byte known-length header is buffered; the chunk header
+        // and payload haven't arrived yet, so the client must defer instead
+        // of erroring or fabricating a result.
+        let plp_payload = 4_i64.to_le_bytes();
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_row_plp_complete(2, &mut out).unwrap(),
+            CursorPoll::Pending
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_row_plp_complete_leaves_row_paused_when_more_columns_remain() {
+        // With a plain int column after the PLP column, completing the PLP
+        // value from buffered bytes must keep the row parked instead of
+        // dropping to `Idle`.
+        let metadata = mixed_lob_metadata_with_int_suffix(2, 1);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(&4_i64.to_le_bytes());
+        payload.extend_from_slice(&4_u32.to_le_bytes());
+        payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&30_i32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(4);
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+
+        let mut out = [0_u8; 4];
+        let CursorPoll::Ready(Some(chunk)) = client.try_read_row_plp_complete(2, &mut out).unwrap()
+        else {
+            panic!("complete buffered PLP should not require async continuation");
+        };
+        assert_eq!(out, [b'o', 0, b'k', 0]);
+        assert_eq!(chunk.read, 4);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 3
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_finish_row_into_completes_a_fully_buffered_row() {
+        let expected = [11_i32, 22_i32];
+        let mut payload = vec![0xff];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        // Force a packet read so the int columns are already buffered before
+        // `try_finish_row_into` runs its synchronous, buffer-only pass.
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(expected.len()),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert!(client.try_finish_row_into(&mut writer).unwrap());
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn next_row_into_uses_buffered_dispatch() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(expected.len()));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert!(client.next_row_into(&mut writer).await.unwrap());
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn next_row_into_continues_a_partial_buffered_row() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let second = expected[1].to_le_bytes();
+        let mut first_payload = vec![0xff, TokenType::Row as u8];
+        first_payload.extend_from_slice(&expected[0].to_le_bytes());
+        first_payload.extend_from_slice(&second[..2]);
+        let mut first = TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut second_packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(&second_packet.append_bytes(&second[2..]).build());
+        let mut transport = create_network_transport_with_data(&stream);
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(expected.len()));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert!(client.next_row_into(&mut writer).await.unwrap());
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_row_poll_parks_only_an_incomplete_row() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let second = expected[1].to_le_bytes();
+        let mut first_payload = vec![0xff, TokenType::Row as u8];
+        first_payload.extend_from_slice(&expected[0].to_le_bytes());
+        first_payload.extend_from_slice(&second[..2]);
+        let mut first = TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut second_packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(&second_packet.append_bytes(&second[2..]).build());
+        let mut transport = create_network_transport_with_data(&stream);
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(expected.len()));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Partial
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 1
+        ));
+        client.finish_row_into(&mut writer).await.unwrap();
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[test]
+    fn sync_cursor_pending_leaves_cursor_state_untouched() {
+        let mut client = create_test_client();
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(1),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_read_row_column(0).unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 0
+        ));
+    }
+
+    #[test]
+    fn sync_cursor_ready_preserves_explicit_zero_timeout() {
+        let metadata = int_column_metadata(1);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        transport.sync_columns.push_back(ColumnValues::Int(42));
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        client.remaining_request_timeout = Some(Duration::ZERO);
+
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert_eq!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(42),
+                variant_base: None,
+            })
+        );
+        assert_eq!(client.remaining_request_timeout, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn sync_cursor_defers_cancelled_operations_without_consuming_state() {
+        let metadata = int_column_metadata(1);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        transport.sync_columns.push_back(ColumnValues::Int(42));
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(Arc::clone(&metadata));
+        client.current_result_set_has_been_read_till_end = false;
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_read_row_column(0).unwrap(), CursorPoll::Pending);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 0
+        ));
+    }
+
+    #[test]
+    fn try_read_active_plp_chunk_defers_when_cancelled() {
+        let mut client = create_test_client();
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_active_plp_chunk(&mut out).unwrap(),
+            CursorPoll::Pending
+        );
+    }
+
+    #[test]
+    fn try_read_active_plp_chunk_errors_without_an_active_stream() {
+        let mut client = create_test_client();
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        let mut out = [0_u8; 4];
+        let error = client.try_read_active_plp_chunk(&mut out).unwrap_err();
+        assert!(matches!(error, UsageError(_)));
+    }
+
+    #[test]
+    fn row_writer_finish_is_limited_to_non_plp_results() {
+        let mut client = create_test_client();
+        assert!(!client.current_result_supports_row_into());
+        assert!(!client.buffered_row_support());
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
+
+        client.current_metadata = Some(int_column_metadata(1));
+        assert!(client.current_result_supports_row_into());
+        assert!(client.buffered_row_support());
+        assert!(client.buffered_row_support());
+
+        let column = crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::BigVarBinary,
+                usize::from(u16::MAX),
+                None,
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::BigVarBinary,
+            column_name: "payload".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        client.current_metadata = Some(Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![column],
+            cek_table: vec![],
+        }));
+        assert!(!client.current_result_supports_row_into());
+        assert!(!client.buffered_row_support());
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Pending
+        );
+    }
+
+    #[test]
+    fn prefix_eligibility_requires_inline_columns_and_no_encryption() {
+        let mut client = create_test_client();
+        client.current_metadata = Some(mixed_lob_metadata(2));
+        assert_eq!(client.current_result_bufferable_prefix_len(), Some(2));
+
+        client.current_metadata = Some(mixed_lob_metadata(0));
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
+
+        let mut encrypted = mixed_lob_metadata(2).as_ref().clone();
+        encrypted.columns[0].crypto_metadata = Some(ae_crypto_metadata());
+        client.current_metadata = Some(Arc::new(encrypted));
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
+    }
+
+    #[test]
+    fn buffered_cursor_edge_states_preserve_the_async_fallback_contract() {
+        let mut client = create_test_client();
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert!(client.try_next_row_cursor().is_err());
+        assert!(client.try_next_buffered_row_into(&mut writer).is_err());
+
+        let metadata = int_column_metadata(2);
+        client.current_metadata = Some(Arc::clone(&metadata));
+        client.current_result_set_has_been_read_till_end = true;
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(false)
+        );
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Exhausted
+        );
+
+        client.current_result_set_has_been_read_till_end = false;
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 1,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Pending
+        );
+        assert_eq!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::AlreadyConsumed)
+        );
+        assert!(client.try_read_row_column(2).is_err());
+        assert_eq!(client.try_read_row_column(1).unwrap(), CursorPoll::Pending);
+        assert!(!client.try_finish_row_into(&mut writer).unwrap());
+
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+        assert!(!client.try_finish_row_into(&mut writer).unwrap());
+        client.cancel_handle = None;
+
+        client.active_row_read_state = ActiveRowReadState::Idle;
+        assert!(client.try_finish_row_into(&mut writer).is_err());
+
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(3),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_read_row_column(1).unwrap(), CursorPoll::Pending);
+    }
+
+    #[tokio::test]
+    async fn finish_row_into_rejects_non_resumable_state() {
+        let mut client = create_test_client();
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn finish_row_into_handles_transport_outcomes() {
+        fn paused() -> RowPauseState {
+            RowPauseState {
+                next_column_index: 0,
+                metadata: int_column_metadata(1),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+
+        let mut complete_transport = TestTransport::new();
+        complete_transport
+            .resume_results
+            .push_back(RowReadResult::RowWritten);
+        let mut complete = create_test_client_with_transport(complete_transport);
+        complete.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        complete.remaining_request_timeout = Some(Duration::from_secs(1));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+        complete.finish_row_into(&mut writer).await.unwrap();
+        assert!(matches!(
+            complete.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        let mut paused_transport = TestTransport::new();
+        paused_transport
+            .resume_results
+            .push_back(RowReadResult::RowPaused(paused()));
+        let mut still_paused = create_test_client_with_transport(paused_transport);
+        still_paused.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        assert!(still_paused.finish_row_into(&mut writer).await.is_err());
+        assert!(matches!(
+            still_paused.active_row_read_state,
+            ActiveRowReadState::RowPaused(_)
+        ));
+
+        let mut token_transport = TestTransport::new();
+        token_transport
+            .resume_results
+            .push_back(RowReadResult::Token(done_no_more()));
+        let mut token = create_test_client_with_transport(token_transport);
+        token.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        assert!(token.finish_row_into(&mut writer).await.is_err());
+
+        let mut failed = create_test_client();
+        failed.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        assert!(failed.finish_row_into(&mut writer).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn finish_row_prefix_into_handles_transport_outcomes() {
+        fn paused_at(next_column_index: usize) -> RowPauseState {
+            RowPauseState {
+                next_column_index,
+                metadata: int_column_metadata(2),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+
+        const PREFIX_LEN: usize = 1;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        // `RowPaused` at the requested prefix boundary succeeds.
+        let mut ok_transport = TestTransport::new();
+        ok_transport
+            .resume_results
+            .push_back(RowReadResult::RowPaused(paused_at(PREFIX_LEN)));
+        let mut ok = create_test_client_with_transport(ok_transport);
+        ok.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        ok.finish_row_prefix_into(PREFIX_LEN, &mut writer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ok.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == PREFIX_LEN
+        ));
+
+        // `RowPaused` at a different column than requested is a protocol error.
+        let mut wrong_column_transport = TestTransport::new();
+        wrong_column_transport
+            .resume_results
+            .push_back(RowReadResult::RowPaused(paused_at(0)));
+        let mut wrong_column = create_test_client_with_transport(wrong_column_transport);
+        wrong_column.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            wrong_column
+                .finish_row_prefix_into(PREFIX_LEN, &mut writer)
+                .await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(matches!(
+            wrong_column.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 0
+        ));
+
+        // Decoding the whole row instead of stopping at the prefix is also an error.
+        let mut whole_row_transport = TestTransport::new();
+        whole_row_transport
+            .resume_results
+            .push_back(RowReadResult::RowWritten);
+        let mut whole_row = create_test_client_with_transport(whole_row_transport);
+        whole_row.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            whole_row
+                .finish_row_prefix_into(PREFIX_LEN, &mut writer)
+                .await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+
+        // Pausing at a PLP header before reaching the requested prefix is an error.
+        let plp_metadata = mixed_lob_metadata(2);
+        let Some((Some(plp_stream), _used)) =
+            crate::datatypes::decoder::PlpColumnStream::try_begin_buffered(
+                &plp_metadata.columns[2],
+                &4_u64.to_le_bytes(),
+            )
+            .unwrap()
+        else {
+            panic!("a known-length PLP header must yield a started stream");
+        };
+        let plp_pause = PlpPauseState {
+            row_pause_state: paused_at(2),
+            plp_stream,
+        };
+        let mut plp_transport = TestTransport::new();
+        plp_transport
+            .resume_results
+            .push_back(RowReadResult::PlpPaused(plp_pause));
+        let mut plp = create_test_client_with_transport(plp_transport);
+        plp.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            plp.finish_row_prefix_into(PREFIX_LEN, &mut writer).await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(matches!(
+            plp.active_row_read_state,
+            ActiveRowReadState::PlpPaused(_)
+        ));
+
+        // A control token in place of a row is a protocol error.
+        let mut token_transport = TestTransport::new();
+        token_transport
+            .resume_results
+            .push_back(RowReadResult::Token(done_no_more()));
+        let mut token = create_test_client_with_transport(token_transport);
+        token.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            token.finish_row_prefix_into(PREFIX_LEN, &mut writer).await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+
+        // A transport failure propagates and aborts any pending prepare capture.
+        let mut failed = create_test_client();
+        failed.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(
+            failed
+                .finish_row_prefix_into(PREFIX_LEN, &mut writer)
+                .await
+                .is_err()
+        );
     }
 
     // ── PLP streaming lifecycle contract tests ──
@@ -6921,6 +14819,271 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn peek_past_current_row_reports_end_of_set_and_releases_batch() {
+        // Every column of the current row has already been read (the caller's
+        // obligation), so `active_row_read_state` is `Idle` and the wire's next
+        // token is the terminating DONE — exactly what the ODBC busy gate uses
+        // to release a connection early instead of waiting for an explicit
+        // cursor close (AB#47508).
+        let transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        let has_more = client.peek_past_current_row().await.unwrap();
+
+        assert!(!has_more, "no more rows: the DONE carried no MORE flag");
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(!client.has_open_batch());
+        assert!(
+            !client.row_already_positioned,
+            "nothing was parked; the flag must stay clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_drains_rpc_tail_and_captures_prepared_handle() {
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            Tokens::ReturnStatus(ReturnStatusToken { value: 0 }),
+            done_proc_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+        client.pending_capture = Some(sid(1));
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(client.has_open_batch(), "DONE_MORE keeps the RPC open");
+        assert!(client.complete_current_result().await.unwrap());
+
+        assert!(!client.has_open_batch());
+        assert_eq!(client.prepared_handles.get(&sid(1)).copied(), Some(9));
+        assert!(matches!(
+            client.last_return_status,
+            ReturnStatus::Received(0)
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_retires_a_truncated_rpc_tail() {
+        let transport = TestTransport::with_tokens(vec![done_in_proc_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.current_result_set_has_been_read_till_end);
+    }
+
+    #[tokio::test]
+    async fn advancing_to_a_no_row_result_clears_the_rpc_tail_gate() {
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            done_count(CurrentCommand::Update, 3, true),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.current_result_ended_with_done_in_proc);
+
+        assert!(matches!(
+            client.advance().await,
+            Ok(StatementResult::NoRows {
+                rows_affected: Some(3)
+            })
+        ));
+        assert!(
+            !client.current_result_ended_with_done_in_proc,
+            "a plain batch DONE must not leave the previous RPC's tail gate armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_abandons_the_batch_when_a_tail_token_fails() {
+        // The tail parses far enough to park the next result, then reports the
+        // failed RETURNVALUE. Leaving that batch open would strand the ODBC
+        // busy claim on a statement whose cursor is already finished.
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.parked_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn advance_abandons_the_batch_when_a_tail_token_fails() {
+        // The other `settle_rpc_terminator` call site. Propagating the failure
+        // with the batch still open would mask it behind ALREADY_EXECUTING_ERROR
+        // on every later command for the whole connection.
+        let transport = TestTransport::with_tokens(vec![
+            info_token(0, 0, "print"),
+            done_in_proc_more(),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        client.current_result_set_has_been_read_till_end = true;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.command_is_busy());
+        assert!(client.parked_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_parks_a_following_rowset() {
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(client.has_open_batch());
+
+        assert!(matches!(client.advance().await, Ok(StatementResult::Rows)));
+        assert!(!client.current_result_set_has_been_read_till_end);
+
+        client.close_query().await.unwrap();
+        assert!(client.parked_token.is_none());
+        assert!(!client.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn peek_past_current_row_already_exhausted_touches_nothing() {
+        // Calling the peek when `next_row_cursor` would already short-circuit
+        // (end of set previously observed) must stay free: the ODBC layer
+        // calls this unconditionally after every fetch, so it must not cost an
+        // extra wire round trip when the answer is already known. An empty
+        // token queue makes any real transport read fail the test.
+        let transport = TestTransport::with_tokens(vec![]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = true;
+
+        let has_more = client.peek_past_current_row().await.unwrap();
+
+        assert!(!has_more);
+        assert!(!client.row_already_positioned);
+    }
+
+    #[tokio::test]
+    async fn next_row_cursor_returns_a_parked_row_without_reading_the_wire() {
+        // Simulates the outcome of a prior `peek_past_current_row` call that
+        // found another row: `active_row_read_state` already holds it and
+        // `row_already_positioned` marks it unclaimed. The very next
+        // `next_row_cursor` call must hand it back directly — not drain it as
+        // an abandoned row and not touch the transport — so an empty token
+        // queue still succeeds.
+        let transport = TestTransport::with_tokens(vec![]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.row_already_positioned = true;
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: Arc::new(ColMetadataToken::default()),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+
+        let has_row = client.next_row_cursor().await.unwrap();
+
+        assert!(has_row);
+        assert!(
+            !client.row_already_positioned,
+            "the parked row is claimed exactly once"
+        );
+        assert!(
+            matches!(
+                client.active_row_read_state,
+                ActiveRowReadState::RowPaused(_)
+            ),
+            "the parked row itself must still be there for read_row_column"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_row_cursor_drains_an_unclaimed_parked_row_as_abandoned() {
+        // If the caller moves on without ever consuming a parked row (no
+        // `read_row_column` call in between), a second `next_row_cursor` call
+        // must treat it like any other abandoned row: drain it and read the
+        // next thing on the wire, rather than returning it a second time.
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        // The drain resumes the parked row's remaining columns first; the mock
+        // reports that skip completing cleanly (nothing revealed yet), so the
+        // subsequent read genuinely comes from `receive_row_header` below —
+        // matching the two-step shape a real skip-then-read-next-token would
+        // have on the wire.
+        transport
+            .resume_results
+            .push_back(RowReadResult::RowWritten);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: Arc::new(ColMetadataToken::default()),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        // Deliberately NOT setting `row_already_positioned`: this row was
+        // positioned by ordinary means (or a peek already claimed and it is
+        // being abandoned unread), so the next call must drain it.
+
+        let has_row = client.next_row_cursor().await.unwrap();
+
+        assert!(!has_row, "the row was discarded; DONE was next on the wire");
+        assert!(client.current_result_set_has_been_read_till_end);
+    }
+
     #[test]
     fn normalize_param_name_strips_at_and_uppercases() {
         // A single leading '@' is stripped and the name is ASCII-uppercased, so a
@@ -6932,6 +15095,72 @@ mod tests {
         // Only one leading '@' is stripped.
         assert_eq!(TdsClient::normalize_param_name("@@version"), "@VERSION");
         assert_eq!(TdsClient::normalize_param_name(""), "");
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_does_not_probe_a_plain_batch() {
+        let transport = TestTransport::with_tokens(vec![done_more(), empty_col_metadata()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.parked_token.is_none());
+        assert!(matches!(client.advance().await, Ok(StatementResult::Rows)));
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_requires_an_exhausted_rowset() {
+        let mut client = create_test_client_with_tokens(vec![done_in_proc_more()]);
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.execution_context.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_disarms_recovery_when_attention_cleanup_fails() {
+        let transport = TestTransport::with_tokens(vec![done_in_proc_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+        client.transport.mark_known_dead();
+
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(!client.recovery_context.session_recovery_negotiated);
+        assert!(!client.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_preserves_recovery_when_cancel_leaves_transport_alive() {
+        let transport = TestTransport::with_tokens(vec![done_in_proc_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(!client.is_connection_dead());
+        assert!(!client.has_open_batch());
     }
 
     #[tokio::test]
@@ -7113,6 +15342,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn secondary_client_context_targets_the_current_database_without_retry() {
+        let mut client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        client_context.database = "login_db".to_string();
+        client_context.user_name = "app_login".to_string();
+        client_context.connect_retry_count = 3;
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+            crate::connection::execution_context::ExecutionContext::new(),
+            client_context,
+            Vec::new(),
+        );
+        client.negotiated_settings.database = "current_db".to_string();
+
+        let context = client
+            .secondary_client_context()
+            .expect("the login context is retained");
+
+        assert_eq!(context.database, "current_db");
+        assert_eq!(context.connect_retry_count, 0);
+        assert_eq!(context.user_name, "app_login");
+        assert_eq!(context.data_source, "tcp:localhost,1433");
+    }
+
+    #[test]
+    fn a_secondary_login_keeps_the_sessions_client_connection_id() {
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::trace_context::ConnectionTrace;
+
+        let trace = Arc::new(ConnectionTrace::default());
+        let mut client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        client_context.set_connection_trace(Arc::clone(&trace));
+        let session_id = uuid::Uuid::new_v4();
+        let mut settings = create_test_negotiated_settings_internal();
+        settings.client_connection_id = session_id;
+        let client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            client_context,
+            Vec::new(),
+        );
+
+        let secondary_context = client
+            .secondary_client_context()
+            .expect("the login context is retained");
+        assert!(secondary_context.connection_trace.is_none());
+        let mut secondary_settings = create_test_negotiated_settings_internal();
+        secondary_settings.client_connection_id = uuid::Uuid::new_v4();
+        let _secondary = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            secondary_settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            secondary_context,
+            Vec::new(),
+        );
+
+        assert_eq!(trace.client_connection_id(), Some(session_id));
+    }
+
     #[tokio::test]
     async fn execute_sp_unprepare_clears_stale_info_messages() {
         // Regression: token-consuming commands beyond the execute*/query family
@@ -7254,6 +15544,110 @@ mod tests {
     }
 
     #[test]
+    fn attention_settlement_discards_encrypted_return_value_without_finalizing() {
+        let mut client = create_test_client();
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        let token = ae_return_value_token(
+            "@out",
+            ColumnValues::Bytes(vec![1, 2, 3]),
+            Some(ae_crypto_metadata()),
+        );
+
+        client
+            .apply_attention_side_effect(Tokens::ReturnValue(token))
+            .unwrap();
+
+        assert!(client.return_values.is_empty());
+        assert!(!client.transport.connection_known_dead());
+    }
+
+    #[test]
+    fn attention_settlement_captures_plain_prepexec_handle() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let mut client = create_test_client();
+        client.pending_capture = Some(sid(4));
+        let describe = Arc::new(DescribeParameterEncryptionResult::new());
+        client.pending_prepared_param_encryption = Some(Arc::clone(&describe));
+        let token = ae_return_value_token("@handle", ColumnValues::Int(27), None);
+
+        client
+            .apply_attention_side_effect(Tokens::ReturnValue(token))
+            .unwrap();
+        client.normalize_after_attention();
+
+        assert_eq!(client.prepared_handles.get(&sid(4)).copied(), Some(27));
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&sid(4)).unwrap(),
+            &describe
+        ));
+        assert!(client.pending_capture.is_none());
+        assert!(client.pending_prepared_param_encryption.is_none());
+        assert!(client.return_values.is_empty());
+    }
+
+    #[test]
+    fn attention_settlement_replays_connection_level_side_effects() {
+        use crate::connection::transport::network_transport::AttentionSettlement;
+        use crate::token::tokens::{
+            EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, ErrorToken,
+            SessionStateToken,
+        };
+
+        let mut client = create_test_client();
+        client.prepared_handles.insert(sid(1), 27);
+        let tokens = vec![
+            Tokens::Error(ErrorToken {
+                number: 21,
+                state: 1,
+                severity: FATAL_ERROR_SEVERITY,
+                message: "fatal server error".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            info_token(50_000, 10, "attention warning"),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            Tokens::SessionState(SessionStateToken {
+                sequence_number: u32::MAX,
+                status: 0,
+                states: Vec::new(),
+            }),
+        ];
+
+        assert!(client.apply_attention_settlement(AttentionSettlement {
+            tokens,
+            overflowed: false,
+        }));
+
+        assert!(client.transport.connection_known_dead());
+        assert_eq!(client.info_messages()[0].message, "attention warning");
+        assert!(client.prepared_handles.is_empty());
+        assert!(
+            client
+                .recovery_context
+                .session_state_table
+                .master_recovery_disabled
+        );
+    }
+
+    #[test]
+    fn overflowing_attention_settlement_retires_the_connection() {
+        use crate::connection::transport::network_transport::AttentionSettlement;
+
+        let mut client = create_test_client();
+
+        assert!(!client.apply_attention_settlement(AttentionSettlement {
+            tokens: Vec::new(),
+            overflowed: true,
+        }));
+        assert!(client.transport.connection_known_dead());
+    }
+
+    #[test]
     fn finalize_return_value_decrypts_null_output() {
         // A NULL encrypted output parameter decrypts to NULL without invoking the
         // cipher.
@@ -7378,6 +15772,28 @@ mod tests {
         );
     }
 
+    /// Covers the elapsed branch of `attempt_within` directly, since nothing
+    /// in `reconnect`'s own tests can provoke it: every failure a test can
+    /// reach today (no server, bad recovery state, ...) returns well before
+    /// any deadline. `start_paused` lets the timeout fire on a fake clock
+    /// instead of a real, slow connect attempt.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_within_times_out_when_the_future_never_completes() {
+        let remaining = Duration::from_secs(5);
+        let handle = tokio::spawn(attempt_within(
+            remaining,
+            std::future::pending::<TdsResult<()>>(),
+        ));
+
+        tokio::time::advance(remaining + Duration::from_millis(1)).await;
+
+        let result = handle.await.expect("attempt_within task panicked");
+        match result {
+            Err(crate::error::Error::TimeoutError(_)) => {}
+            other => panic!("expected a TimeoutError once the deadline elapses, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn reconnect_returns_session_recovery_failed_on_connection_failure() {
         let mut client = create_test_client();
@@ -7417,16 +15833,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_and_reconnect_is_noop_after_close_connection() {
+    async fn check_and_reconnect_rejects_after_close_connection() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
 
         client.close_connection().await.unwrap();
         assert!(!client.recovery_context.session_recovery_negotiated);
 
-        // A dead transport must not be resurrected once the caller closed it.
-        let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
-        assert_eq!(elapsed, Duration::ZERO);
+        // A dead transport must neither be resurrected nor reused once the
+        // caller closed it.
+        assert!(matches!(
+            client.check_and_reconnect(Some(5), None).await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
     }
 
     #[tokio::test]
@@ -7478,6 +15897,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_and_reconnect_recovers_a_retired_session_on_a_live_socket() {
+        // A fatal ERROR token or a failed drain retires the session while the
+        // socket still polls healthy. Trusting that poll would send the next
+        // command over a connection the client already reports as dead.
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.transport.mark_known_dead();
+        assert!(
+            !client.transport.is_connection_dead(),
+            "socket is still open"
+        );
+
+        let err = client.check_and_reconnect(Some(1), None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Session recovery failed"),
+            "Expected a reconnect attempt, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn check_and_reconnect_skips_when_no_client_context() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
@@ -7489,6 +15928,82 @@ mod tests {
     }
 
     // ── deduct_timeout tests ──
+
+    #[test]
+    fn request_timeout_clock_is_skipped_without_budget() {
+        let client = create_test_client();
+        assert!(client.request_timeout_start().is_none());
+    }
+
+    #[test]
+    fn request_timeout_clock_is_kept_for_exhausted_budget() {
+        let mut client = create_test_client();
+        client.remaining_request_timeout = Some(Duration::ZERO);
+
+        let start = client
+            .request_timeout_start()
+            .expect("an explicit zero budget must still be measured");
+        client.update_remaining_timeout(start);
+
+        assert_eq!(client.remaining_request_timeout, Some(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn response_tokens_preserve_unlimited_and_finite_timeout_budgets() {
+        use crate::token::tokens::ReturnStatusToken;
+
+        for budget in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
+            let transport = TestTransport::with_tokens(vec![
+                Tokens::ReturnStatus(ReturnStatusToken { value: 1 }),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 2 }),
+            ]);
+            let timeouts = transport.receive_timeouts.clone();
+            let mut client = create_test_client_with_transport(transport);
+            client.remaining_request_timeout = budget;
+            let context = ParserContext::None(());
+
+            assert!(matches!(
+                client.next_response_token(&context).await.unwrap(),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 1 })
+            ));
+            let remaining = client.remaining_request_timeout;
+            match budget {
+                None => assert_eq!(remaining, None),
+                Some(budget) => assert!(remaining.unwrap() <= budget),
+            }
+            assert!(matches!(
+                client.next_response_token(&context).await.unwrap(),
+                Tokens::ReturnStatus(ReturnStatusToken { value: 2 })
+            ));
+            assert_eq!(*timeouts.lock().unwrap(), vec![budget, remaining]);
+        }
+    }
+
+    #[tokio::test]
+    async fn replaying_a_parked_token_does_not_charge_the_timeout_again() {
+        use crate::token::tokens::ReturnStatusToken;
+
+        let transport = TestTransport::new();
+        let timeouts = transport.receive_timeouts.clone();
+        let mut client = create_test_client_with_transport(transport);
+        client.parked_token = Some(Box::new(Tokens::ReturnStatus(ReturnStatusToken {
+            value: 42,
+        })));
+        client.remaining_request_timeout = Some(Duration::from_secs(1));
+
+        assert!(matches!(
+            client
+                .next_response_token(&ParserContext::None(()))
+                .await
+                .unwrap(),
+            Tokens::ReturnStatus(ReturnStatusToken { value: 42 })
+        ));
+        assert_eq!(
+            client.remaining_request_timeout,
+            Some(Duration::from_secs(1))
+        );
+        assert!(timeouts.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn deduct_timeout_subtracts_elapsed() {
@@ -7540,13 +16055,34 @@ mod tests {
     }
 
     #[test]
-    fn deduct_timeout_rounds_up_sub_second() {
-        // 1.9 seconds elapsed should round up to 2 seconds deducted
-        let result = TdsClient::deduct_timeout(Some(30), Duration::from_millis(1900));
-        assert_eq!(
-            result,
-            CommandTimeoutBudget::Remaining(NonZeroU32::new(28).unwrap())
-        );
+    fn deduct_timeout_preserves_partial_seconds() {
+        for (timeout, elapsed, remaining) in [
+            (1, Duration::from_nanos(1), 1),
+            (1, Duration::from_millis(999), 1),
+            (30, Duration::from_millis(1900), 29),
+        ] {
+            let result = TdsClient::deduct_timeout(Some(timeout), elapsed);
+            assert_eq!(
+                result,
+                CommandTimeoutBudget::Remaining(NonZeroU32::new(remaining).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn deduct_timeout_charges_cumulative_elapsed_time() {
+        for (elapsed, remaining) in [(600, Some(1)), (1200, None)] {
+            let result = TdsClient::deduct_timeout(Some(1), Duration::from_millis(elapsed));
+            match remaining {
+                Some(remaining) => {
+                    assert_eq!(result.into_timeout().unwrap().seconds(), Some(remaining));
+                }
+                None => assert!(matches!(
+                    result.into_timeout(),
+                    Err(crate::error::Error::TimeoutError(_))
+                )),
+            }
+        }
     }
 
     /// A reconnect that consumes the whole command budget must fail the call
@@ -7783,6 +16319,62 @@ mod tests {
         assert!(
             bytes.windows(expected.len()).any(|w| w == expected),
             "sp_execute must address the cached handle on the wire"
+        );
+    }
+
+    // ── Autocommit OutstandingRequestCount wire format ──
+    //
+    // MS-TDS 2.2.5.3.2 requires OutstandingRequestCount to be 1 on every
+    // request while the connection has no active transaction descriptor
+    // (autocommit mode). It used to come from a single process-wide `static`
+    // counter (see the fix for the "outstanding request count" bug), so it
+    // grew across *every* non-transactional request issued anywhere in the
+    // test binary — even ones from unrelated connections — instead of
+    // staying pinned at 1 per request.
+
+    /// Extracts, in wire order, the OutstandingRequestCount carried by every
+    /// autocommit TransactionDescriptor (ALL_HEADERS) header found in `sent`.
+    fn autocommit_outstanding_request_counts(sent: &[u8]) -> Vec<u32> {
+        // TransactionDescriptorHeader::write_async serializes, in order:
+        // HeaderLength=18 (u32 LE), HeaderType=0x0002 (u16 LE),
+        // TransactionDescriptor=0 (u64 LE — autocommit), then
+        // OutstandingRequestCount (u32 LE), which this scan reads off the end.
+        const PREFIX: [u8; 14] = [18, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        sent.windows(PREFIX.len())
+            .enumerate()
+            .filter(|(_, window)| *window == PREFIX)
+            .map(|(i, _)| {
+                let start = i + PREFIX.len();
+                u32::from_le_bytes(sent[start..start + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    /// Repro for the bug fixed by replacing the static counter: two
+    /// interleaved, independent connections must each see a constant `1`,
+    /// never a value influenced by requests sent on the other connection.
+    #[tokio::test]
+    async fn autocommit_requests_always_report_outstanding_count_of_one() {
+        let (mut client_a, sent_a) = create_capturing_client(vec![done_no_more(), done_no_more()]);
+        let (mut client_b, sent_b) = create_capturing_client(vec![done_no_more()]);
+
+        client_a.execute("SELECT 1".to_string(), ()).await.unwrap();
+        client_b.execute("SELECT 2".to_string(), ()).await.unwrap();
+        client_a.execute("SELECT 3".to_string(), ()).await.unwrap();
+
+        let counts_a = autocommit_outstanding_request_counts(&sent_a.lock().unwrap());
+        let counts_b = autocommit_outstanding_request_counts(&sent_b.lock().unwrap());
+
+        assert_eq!(
+            counts_a,
+            vec![1, 1],
+            "connection A's autocommit requests must each report count 1"
+        );
+        assert_eq!(
+            counts_b,
+            vec![1],
+            "connection B's autocommit request must report count 1, \
+             not a value bumped by connection A's requests"
         );
     }
 
@@ -8354,6 +16946,467 @@ mod tests {
         assert_eq!(client.take_dml_result_counts(), vec![3, 2, 1]);
     }
 
+    /// A `DONEINPROC` carrying a DML count. Every one of these sets `DONE_MORE`
+    /// on the wire — the RPC's own `DONEPROC` still follows — which is exactly
+    /// the ambiguity the terminator look-ahead resolves.
+    fn done_in_proc_count(cmd: CurrentCommand, rows: u64) -> Tokens {
+        Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::COUNT | DoneStatus::MORE,
+            cur_cmd: cmd,
+            row_count: rows,
+        })
+    }
+
+    /// The terminal `DONEPROC` that closes an RPC response.
+    fn done_proc_final() -> Tokens {
+        Tokens::DoneProc(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn return_status(value: i32) -> Tokens {
+        Tokens::ReturnStatus(crate::token::tokens::ReturnStatusToken { value })
+    }
+
+    /// A single-statement `sp_executesql` DML: its `DONEINPROC` claims MORE, but
+    /// the only thing behind it is the RPC's `RETURNSTATUS`/`DONEPROC` trailer.
+    /// The batch must be reported closed so the ODBC layer leaves the statement
+    /// re-executable instead of parking a 0-column cursor on it (which surfaced
+    /// as 24000 on the second parameterized INSERT — AB#47531).
+    #[tokio::test]
+    async fn sp_executesql_single_dml_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            done_proc_final(),
+        ]);
+        let cancel_handle = CancelHandle::new();
+        let result = client
+            .execute_sp_executesql(
+                "INSERT INTO t VALUES (@P1)".to_string(),
+                Vec::new(),
+                ExecuteOptions::new()
+                    .timeout_secs(30)
+                    .cancel(&cancel_handle),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, StatementResult::NoRows { .. }));
+        assert!(
+            !client.has_open_batch(),
+            "only the RPC trailer followed, so nothing is left to navigate to"
+        );
+        assert_eq!(client.last_rows_affected(), 1);
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+    }
+
+    /// Output parameters belong to the RPC trailer and must be finalized before
+    /// the terminal `DONEPROC` closes the batch.
+    #[tokio::test]
+    async fn sp_executesql_output_parameters_close_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::ReturnValue(ae_return_value_token("@out1", ColumnValues::Int(7), None)),
+            Tokens::ReturnValue(ae_return_value_token("@out2", ColumnValues::Int(9), None)),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("SET @out1 = 7; SET @out2 = 9".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        let values = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].value, ColumnValues::Int(7));
+        assert_eq!(values[1].value, ColumnValues::Int(9));
+    }
+
+    /// Session-state control tokens can appear in the RPC response tail and
+    /// must be applied without keeping the batch open.
+    #[tokio::test]
+    async fn sp_executesql_session_state_trailer_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::SessionState(SessionStateToken {
+                sequence_number: u32::MAX,
+                status: 0,
+                states: Vec::new(),
+            }),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("SET NOCOUNT ON".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        assert!(
+            client
+                .recovery_context
+                .session_state_table
+                .master_recovery_disabled
+        );
+    }
+
+    /// Environment changes in the RPC response tail must update connection
+    /// state without keeping the batch open.
+    #[tokio::test]
+    async fn sp_executesql_env_change_trailer_closes_the_batch() {
+        use crate::token::tokens::{EnvChangeToken, EnvChangeTokenSubType};
+
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::BeginTransaction,
+                change_type: (0u64, 42u64).into(),
+            }),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("BEGIN TRANSACTION".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        assert_eq!(client.execution_context.get_transaction_descriptor(), 42);
+    }
+
+    /// A fully parsed output parameter that cannot be decrypted is a command
+    /// error, not a transport or synchronization failure.
+    #[tokio::test]
+    async fn sp_executesql_output_decryption_error_does_not_retire_connection() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            done_proc_final(),
+        ]);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let result = client
+            .execute_sp_executesql(
+                "SET @out = 7".to_string(),
+                Vec::new(),
+                ExecuteOptions::new().column_encryption(ExecutionColumnEncryptionSetting::Enabled),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+    }
+
+    /// Timeout and cancellation drain through the attention acknowledgement, so
+    /// request state is cleared without retiring the synchronized connection.
+    #[tokio::test]
+    async fn sp_executesql_terminator_timeout_clears_request_state() {
+        let errors = [
+            crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                "test timeout".to_string(),
+            )),
+            crate::error::Error::OperationCancelledError("test cancellation".to_string()),
+        ];
+
+        for error in errors {
+            let transport = TestTransport::with_tokens_then_error(
+                vec![done_in_proc_count(CurrentCommand::Insert, 1)],
+                error,
+            );
+            let mut client = create_test_client_with_transport(transport);
+            client.recovery_context.session_recovery_negotiated = true;
+            let cancel_handle = CancelHandle::new();
+
+            let result = client
+                .execute_sp_executesql(
+                    "INSERT INTO t VALUES (@P1)".to_string(),
+                    Vec::new(),
+                    ExecuteOptions::new()
+                        .timeout_secs(30)
+                        .cancel(&cancel_handle),
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert!(!client.has_open_batch());
+            assert!(client.remaining_request_timeout.is_none());
+            assert!(client.cancel_handle.is_none());
+            assert!(!client.transport.connection_known_dead());
+            assert!(client.recovery_context.session_recovery_negotiated);
+        }
+    }
+
+    /// Verifies that cancelling inside a ROW both preserves the connection and
+    /// removes all state belonging to the cancelled result.
+    #[tokio::test]
+    async fn cancelled_row_read_normalizes_client_state_after_attention() {
+        let mut response = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(TokenType::Row as u8)
+            .append_i32(42)
+            .build();
+        response.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&done_bytes(DoneStatus::ATTN.bits()))
+                .build(),
+        );
+        let (transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&response);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+        client.current_result_ended_with_done_in_proc = true;
+        client.execution_context.set_has_open_batch(true);
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        let mut writer = DefaultRowWriter::new(1);
+        let result = client.next_row_into(&mut writer).await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(client.current_metadata.is_none());
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(!client.current_result_ended_with_done_in_proc);
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+        assert!(!client.command_is_busy());
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn cancel_query_does_not_wait_for_an_uncached_encryption_key() {
+        use crate::query::metadata::{CekTableEntry, EncryptedCekValue};
+        use crate::security::keystore::ColumnEncryptionKeyStoreProvider;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SuspendedProvider(Arc<AtomicUsize>);
+        #[async_trait]
+        impl ColumnEncryptionKeyStoreProvider for SuspendedProvider {
+            async fn decrypt_column_encryption_key(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[u8],
+            ) -> TdsResult<Vec<u8>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+
+        for acknowledge in [true, false] {
+            let response = if acknowledge {
+                TestPacketBuilder::new(PacketType::TabularResult)
+                    .append_bytes(&done_bytes(DoneStatus::ATTN.bits()))
+                    .build()
+            } else {
+                Vec::new()
+            };
+            let (transport, mut written) =
+                create_network_transport_with_live_peer_capturing_writes(&response);
+            let mut client =
+                create_test_client_with_any_transport(AnyTransport::network(transport));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut context = ClientContext::default();
+            context.register_column_encryption_key_store_provider(
+                "suspended",
+                Arc::new(SuspendedProvider(Arc::clone(&calls))),
+            );
+            client.recovery_context.client_context = Some(Box::new(context));
+            let mut metadata = (*int_column_metadata(1)).clone();
+            metadata.columns[0].crypto_metadata = Some(ae_crypto_metadata());
+            metadata.columns[0].flags |= 0x0800;
+            metadata.cek_table = vec![CekTableEntry {
+                database_id: 1,
+                cek_id: 1,
+                cek_version: 1,
+                cek_md_version: [0; 8],
+                encrypted_cek_values: vec![EncryptedCekValue {
+                    encrypted_key: vec![1],
+                    key_store_name: "suspended".to_string(),
+                    key_path: "test".to_string(),
+                    algorithm_name: "RSA_OAEP".to_string(),
+                }],
+            }];
+            client.current_metadata = Some(Arc::new(metadata));
+            client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+            client.current_result_set_has_been_read_till_end = false;
+            client.execution_context.set_has_open_batch(true);
+
+            let started = Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(3), client.cancel_query(1))
+                .await
+                .expect("cancellation must not wait for the key-store provider");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(result.is_ok(), acknowledge);
+            assert_eq!(client.is_connection_dead(), !acknowledge);
+            assert!(!client.has_open_batch());
+            let attention = tokio::time::timeout(Duration::from_secs(1), written.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            if !acknowledge {
+                assert!(started.elapsed() >= Duration::from_secs(1));
+                assert!(started.elapsed() < Duration::from_secs(3));
+            }
+        }
+    }
+
+    /// A malicious or corrupt server cannot keep the trailer scanner alive
+    /// indefinitely by streaming control tokens without a terminal `DONEPROC`.
+    #[tokio::test]
+    async fn sp_executesql_terminator_iteration_limit_retires_connection() {
+        let mut tokens = vec![done_in_proc_count(CurrentCommand::Insert, 1)];
+        tokens.extend((0..10000).map(|_| return_status(0)));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let result = client
+            .execute_sp_executesql("INSERT INTO t VALUES (@P1)".to_string(), Vec::new(), ())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::ProtocolError(message))
+                if message == "Too many RPC trailer tokens without terminal DONEPROC"
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
+        assert!(!client.recovery_context.session_recovery_negotiated);
+    }
+
+    /// The same look-ahead must not swallow a real second statement: a
+    /// two-statement parameterized DML batch keeps the batch open, and the
+    /// parked token is replayed as the next result rather than re-read from the
+    /// wire.
+    #[tokio::test]
+    async fn sp_executesql_second_dml_keeps_the_batch_open() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            done_in_proc_count(CurrentCommand::Insert, 5),
+            return_status(0),
+            done_proc_final(),
+        ]);
+        client
+            .execute_sp_executesql(
+                "INSERT INTO t VALUES (@P1); INSERT INTO t VALUES (@P2)".to_string(),
+                Vec::new(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(client.has_open_batch());
+        assert_eq!(client.last_rows_affected(), 1);
+
+        let next = client.advance().await.unwrap();
+        assert!(matches!(next, StatementResult::NoRows { .. }));
+        assert_eq!(client.last_rows_affected(), 5);
+        assert!(!client.has_open_batch());
+    }
+
+    /// A row-returning statement behind the first result is likewise preserved:
+    /// the parked COLMETADATA becomes the next navigable result set.
+    #[tokio::test]
+    async fn sp_executesql_dml_then_select_keeps_the_select_navigable() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            int_col_metadata(1),
+            done_proc_final(),
+        ]);
+        client
+            .execute_sp_executesql(
+                "INSERT INTO t VALUES (@P1); SELECT 42".to_string(),
+                Vec::new(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(client.has_open_batch());
+        assert!(matches!(
+            client.advance().await.unwrap(),
+            StatementResult::Rows
+        ));
+    }
+
+    /// A message-only statement (PRINT) is surfaced the same way a counted one
+    /// is, so it needs the same resolution — otherwise a parameterized PRINT
+    /// also stranded a cursor.
+    #[tokio::test]
+    async fn sp_executesql_message_only_statement_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "printed"),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            return_status(0),
+            done_proc_final(),
+        ]);
+        client
+            .execute_sp_executesql("PRINT CAST(@P1 AS VARCHAR(10))".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+        assert!(!client.has_open_batch());
+    }
+
+    /// A plain SQL batch has no `DONEPROC` trailer, so its `DONE_MORE` is
+    /// unambiguous and must be left alone: the second statement's count is still
+    /// a separate result.
+    #[tokio::test]
+    async fn plain_batch_more_flag_is_not_second_guessed() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Insert, 1, true),
+            done_count(CurrentCommand::Insert, 1, false),
+        ]);
+        client
+            .execute(
+                "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            client.has_open_batch(),
+            "a plain batch's DONE_MORE always means another statement result"
+        );
+        assert!(
+            client.parked_token.is_none(),
+            "a plain batch's DONE_MORE needs no look-ahead"
+        );
+    }
+
+    /// `next_rowset` collapses no-row results, but a no-row result can also be
+    /// the last thing in the response. Without a batch-open guard it reads on
+    /// and blocks (here: the mock runs dry) on a token that never arrives.
+    #[tokio::test]
+    async fn next_rowset_stops_at_a_terminal_no_row_result() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Update, 3, false)]);
+        assert!(client.next_rowset().await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn select_clears_preceding_dml_counts() {
         // UPDATE (counted, has_more) then SELECT: advancing onto COLMETADATA
@@ -8511,6 +17564,35 @@ mod tests {
             Some(&7),
             "a pre-send failure must leave the orphan releasable"
         );
+    }
+
+    /// RPC paths keep `Abort` regardless of the mode a previous `Continue` batch
+    /// used: `begin_command` puts it back, so the error drains the response and
+    /// closes the batch as before.
+    #[tokio::test]
+    async fn execute_sp_prepexec_error_is_not_continued_by_a_previous_batch_mode() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_no_more(),
+        ]);
+        client.batch_error_mode = BatchErrorMode::Continue;
+        let mut orphan = None;
+
+        let result = client
+            .execute_sp_prepexec_for_test("SELECT 1".to_string(), Vec::new(), &mut orphan, ())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.pending_capture.is_none());
+        assert_eq!(client.batch_error_mode, BatchErrorMode::Abort);
+        assert!(
+            !client.has_open_batch(),
+            "Abort drains and closes the batch"
+        );
+        assert!(!client.statement_error_completion_pending);
     }
 
     #[tokio::test]
@@ -8672,7 +17754,9 @@ mod tests {
             TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &[], &params)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC dbo.my_proc @id=@id, @count=@count OUTPUT");
+        // The name is bracketed per part: it is application text on the
+        // ODBC {call ...} path.
+        assert_eq!(tsql, "EXEC [dbo].[my_proc] @id=@id, @count=@count OUTPUT");
         assert_eq!(params_decl, "@id int, @count bigint OUTPUT");
     }
 
@@ -8697,7 +17781,7 @@ mod tests {
             TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC proc @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
+        assert_eq!(tsql, "EXEC [proc] @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
         assert_eq!(
             params_decl,
             "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
@@ -8757,6 +17841,12 @@ mod tests {
             &mut params,
             &mut output_param_ceks,
             &[],
+            &SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags: 0,
+                sort_id: 0,
+            },
         )
         .await
         .expect_err("a forced parameter omitted from the describe result must be rejected");
@@ -8900,6 +17990,7 @@ mod tests {
 
     const DONE_MORE_ERROR: u16 = 0x0003; // DONE_MORE | DONE_ERROR
     const DONE_FINAL: u16 = 0x0000;
+    const DONE_ERROR_FINAL: u16 = 0x0002; // DONE_ERROR, batch complete
 
     fn expect_sql_error(err: crate::error::Error) -> crate::error::SqlServerDiagnostics {
         match err {
@@ -8995,6 +18086,349 @@ mod tests {
         assert!(
             !client.has_open_batch(),
             "a failed drain must still close the batch"
+        );
+    }
+
+    /// A drain that stops partway leaves the reader at an unknown offset in the
+    /// response. `close_query` must still reset its own state and retire the
+    /// connection.
+    ///
+    /// Before this fix the `?` on the drain returned early, so
+    /// `set_has_open_batch(false)` never ran. Every later call then failed with
+    /// `ALREADY_EXECUTING_ERROR` instead of the real error — the connection
+    /// looked permanently wedged, with no way to clear it.
+    #[tokio::test]
+    async fn close_query_drain_failure_closes_batch_and_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(row_int_bytes(1));
+        // Stream ends here: no terminal DONE, so the drain read fails.
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        client
+            .close_query()
+            .await
+            .expect_err("a truncated drain must surface an error");
+
+        assert!(
+            !client.has_open_batch(),
+            "a failed drain must still close the batch"
+        );
+        assert!(
+            !client.command_is_busy(),
+            "a failed drain must not leave the connection reporting ALREADY_EXECUTING_ERROR"
+        );
+        assert!(
+            client.transport.connection_known_dead(),
+            "a failed drain must retire the connection: a TDS stream cannot be \
+             resynchronized from an unknown offset"
+        );
+        assert!(
+            !client.recovery_context.session_recovery_negotiated,
+            "a desynchronized session must not be silently recovered"
+        );
+    }
+
+    /// A drain that gives up partway must retire the connection no matter which
+    /// call site issued it. `drain_stream_or_retire` is the one place that rule
+    /// lives, so pinning it here covers every site that routes through it
+    /// (`execute_sp_prepare`, `execute_sp_unprepare`, and the five cursor
+    /// operations) without duplicating this test seven times.
+    ///
+    /// Those sites previously used a bare `?`, which propagated the error while
+    /// leaving the connection reusable *and* the batch open — the same
+    /// `ALREADY_EXECUTING_ERROR` masking that made the original failure look
+    /// like a permanent wedge.
+    ///
+    /// The stream here is truncated, i.e. the transport went away, so session
+    /// recovery must stay armed: reconnecting is exactly the remedy for that.
+    #[tokio::test]
+    async fn drain_stream_or_retire_failure_closes_batch_and_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(row_int_bytes(1));
+        // Stream ends here: no terminal DONE, so the drain read fails.
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let error = client
+            .drain_stream_or_retire()
+            .await
+            .expect_err("a truncated drain must surface an error");
+
+        assert!(
+            !client.has_open_batch(),
+            "a failed drain must still close the batch"
+        );
+        assert!(
+            !client.command_is_busy(),
+            "a failed drain must not leave the connection reporting ALREADY_EXECUTING_ERROR"
+        );
+        assert!(
+            client.transport.connection_known_dead(),
+            "a failed drain must retire the connection regardless of call site"
+        );
+        assert!(
+            TdsClient::drain_failure_lost_the_transport(&error),
+            "a truncated stream must classify as transport loss, got {error:?}"
+        );
+        assert!(
+            client.recovery_context.session_recovery_negotiated,
+            "losing the transport mid-drain is what resiliency exists for; \
+             disarming it turns a recoverable blip into a hard failure"
+        );
+    }
+
+    fn cancelled_client_with_attention_ack() -> TdsClient {
+        let response = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&done_bytes(DoneStatus::ATTN.bits()))
+            .build();
+        let (transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&response);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+        client.recovery_context.session_recovery_negotiated = true;
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+        client
+    }
+
+    /// A drain that returned the original cancellation after reaching DONE_ATTN
+    /// must leave the synchronized connection reusable.
+    #[tokio::test]
+    async fn drain_stream_or_retire_preserves_settled_cancellation() {
+        let mut client = cancelled_client_with_attention_ack();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), client.drain_stream_or_retire())
+            .await
+            .expect("settled cancellation should not hang")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(!client.interrupted_read_settled);
+    }
+
+    /// Closing a query uses a separate outer drain wrapper and must apply the
+    /// same DONE_ATTN distinction before deciding to retire the connection.
+    #[tokio::test]
+    async fn close_query_preserves_settled_cancellation() {
+        let mut client = cancelled_client_with_attention_ack();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), client.close_query())
+            .await
+            .expect("settled cancellation should not hang")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(!client.interrupted_read_settled);
+    }
+
+    /// A timeout/cancellation without a transport settlement is still an
+    /// unproven partial drain and must retire the connection.
+    #[tokio::test]
+    async fn drain_stream_or_retire_retires_unsettled_cancellation() {
+        let mut client = create_test_client_with_transport(TestTransport::with_tokens_then_error(
+            Vec::new(),
+            crate::error::Error::OperationCancelledError("test cancellation".to_string()),
+        ));
+        client.execution_context.set_has_open_batch(true);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let error = client.drain_stream_or_retire().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
+        assert!(!client.recovery_context.session_recovery_negotiated);
+        assert!(!client.interrupted_read_settled);
+    }
+
+    /// The other half of the split: when the drain failed because the *token
+    /// stream* lost sync, the socket may still be perfectly healthy. Recovery
+    /// must be disarmed there, otherwise the next command silently reconnects
+    /// and papers over a decoder bug instead of surfacing it.
+    #[tokio::test]
+    async fn retire_after_failed_drain_disarms_recovery_only_for_desync() {
+        let desync = crate::error::Error::ProtocolError("unexpected token".to_string());
+        assert!(!TdsClient::drain_failure_lost_the_transport(&desync));
+
+        let mut client = client_over_bytes(Vec::new());
+        client.recovery_context.session_recovery_negotiated = true;
+        client.retire_after_failed_drain(&desync);
+
+        assert!(
+            client.transport.connection_known_dead(),
+            "a desynchronized stream must not go back to a pool"
+        );
+        assert!(
+            !client.recovery_context.session_recovery_negotiated,
+            "a desynchronized stream cannot be fixed by reconnecting"
+        );
+    }
+
+    /// Control: the helper must stay quiet on a healthy stream. The drain
+    /// reaches the terminal DONE and merely reports a server-side error, so the
+    /// connection is still synchronized and must remain reusable — otherwise
+    /// every `RAISERROR` inside a prepare or cursor operation would poison a
+    /// pooled connection.
+    #[tokio::test]
+    async fn drain_stream_or_retire_sql_error_leaves_connection_alive() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_ERROR_FINAL));
+
+        let mut client = client_over_bytes(stream);
+
+        let errors = client
+            .drain_stream_or_retire()
+            .await
+            .expect("a drain reaching the terminal DONE must succeed");
+
+        assert_eq!(errors.len(), 1, "the ERROR token must still be collected");
+        assert_eq!(errors[0].number, 1222);
+        assert!(
+            !client.transport.connection_known_dead(),
+            "a drain that reached the terminal DONE must not retire the connection"
+        );
+    }
+
+    /// Control: the drain surfacing a *server-reported* error must not retire
+    /// the connection. Here the drain reaches the terminal DONE, so the stream
+    /// is fully consumed and still synchronized — nothing about it is unsafe to
+    /// reuse. (The case where the drain itself fails is covered by
+    /// `error_token_with_truncated_remainder_retires_connection`.)
+    ///
+    /// Without this distinction an ordinary batch like
+    /// `SELECT 1; RAISERROR('boom', 16, 1)` where the caller stops early would
+    /// poison a pooled connection every time.
+    #[tokio::test]
+    async fn close_query_drain_sql_error_leaves_connection_alive() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_ERROR_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        let err = client
+            .close_query()
+            .await
+            .expect_err("a server-reported error must still surface");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+
+        assert!(!client.has_open_batch(), "the batch is closed either way");
+        assert!(
+            !client.transport.connection_known_dead(),
+            "a fully drained stream must stay usable: the error came from the \
+             server, not from losing track of the stream"
+        );
+    }
+
+    /// An ERROR token whose *drain* then fails still builds a `SqlServerError`,
+    /// so the error type alone cannot tell a failed batch apart from a lost
+    /// stream. The handler must retire the connection at the point it gives up.
+    #[tokio::test]
+    async fn error_token_with_truncated_remainder_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        // Stream ends here: that DONE said more was coming, so the drain fails.
+
+        let mut client = client_over_bytes(stream);
+        let err = client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+
+        assert!(
+            client.transport.connection_known_dead(),
+            "a drain that gave up mid-stream must retire the connection even \
+             though the error it returns is a SqlServerError"
+        );
+        assert!(
+            !client.recovery_context.session_recovery_negotiated,
+            "a desynchronized session must not be silently recovered"
+        );
+    }
+
+    /// End-to-end version of the above through `close_query`, which exempts
+    /// `SqlServerError` from retirement. This pins that the exemption cannot
+    /// resurrect a connection whose stream was already abandoned.
+    #[tokio::test]
+    async fn close_query_sql_error_over_truncated_stream_still_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        let err = client
+            .close_query()
+            .await
+            .expect_err("the server-reported error must still surface");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+
+        assert!(
+            client.transport.connection_known_dead(),
+            "the SqlServerError exemption must not hand back a connection whose \
+             stream was abandoned mid-response"
+        );
+    }
+
+    /// Control: a drain that completes must leave the connection usable.
+    #[tokio::test]
+    async fn close_query_success_leaves_connection_alive() {
+        let mut client = client_over_bytes(done_bytes(DONE_FINAL));
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        client
+            .close_query()
+            .await
+            .expect("a complete drain must succeed");
+
+        assert!(
+            !client.has_open_batch(),
+            "a complete drain closes the batch"
+        );
+        assert!(
+            !client.transport.connection_known_dead(),
+            "a complete drain must not retire the connection"
         );
     }
 
@@ -9243,6 +18677,528 @@ mod tests {
         );
     }
 
+    // ── Batched prepared RPC execution ──
+
+    fn batch_done_in_proc(rows: u64) -> Tokens {
+        Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::MORE | DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: rows,
+        })
+    }
+
+    fn batch_done_proc(more: bool, error: bool) -> Tokens {
+        let mut status = if more {
+            DoneStatus::RPC_IN_BATCH
+        } else {
+            DoneStatus::FINAL
+        };
+        if error {
+            status |= DoneStatus::ERROR;
+        }
+        Tokens::DoneProc(DoneToken {
+            status,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_serializes_two_rpc_commands_in_one_message() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, sent) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![
+            Ok((
+                3,
+                vec![RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(10)),
+                )],
+            )),
+            Ok((
+                7,
+                vec![RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(20)),
+                )],
+            )),
+        ];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("batched sp_execute should succeed");
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].row_index, 3);
+        assert_eq!(result.rows[0].rows_affected, Some(1));
+        assert_eq!(result.rows[1].row_index, 7);
+        assert_eq!(result.rows[1].rows_affected, Some(1));
+        assert_eq!(result.total_rows_affected(), Some(2));
+
+        let wire = sent.lock().unwrap();
+        let packet_len = u16::from_be_bytes([wire[2], wire[3]]) as usize;
+        assert_eq!(
+            packet_len,
+            wire.len(),
+            "batch must be one logical TDS message"
+        );
+        assert_eq!(wire[0], PacketType::RpcRequest as u8);
+        assert_ne!(
+            wire[1] & crate::message::messages::PacketStatusFlags::Eom as u8,
+            0
+        );
+        let payload = reassemble_sent(&wire);
+        let proc_marker = [0xff, 0xff, RpcProcs::Execute as u8, 0, 0, 0];
+        assert_eq!(
+            payload
+                .windows(proc_marker.len())
+                .filter(|window| *window == proc_marker)
+                .count(),
+            2
+        );
+        let delimiter_and_proc = [0xff, 0xff, 0xff, RpcProcs::Execute as u8, 0, 0, 0];
+        assert!(
+            payload
+                .windows(delimiter_and_proc.len())
+                .any(|window| window == delimiter_and_proc)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_skips_a_row_that_fails_to_build() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, sent) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let int_row = |index: usize, value: i32| {
+            Ok((
+                index,
+                vec![RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(value)),
+                )],
+            ))
+        };
+        let rows = vec![
+            int_row(3, 10),
+            Err(UsageError("row 5 changed after validation".to_string())),
+            int_row(7, 20),
+        ];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("a row that fails to build must not fail the batch");
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].row_index, 3);
+        assert_eq!(result.rows[1].row_index, 7);
+
+        // The skipped row must leave no trace on the wire: two commands joined
+        // by exactly one delimiter, in one complete message.
+        let wire = sent.lock().unwrap();
+        let packet_len = u16::from_be_bytes([wire[2], wire[3]]) as usize;
+        assert_eq!(
+            packet_len,
+            wire.len(),
+            "a skipped row must still leave one complete TDS message"
+        );
+        assert_ne!(
+            wire[1] & crate::message::messages::PacketStatusFlags::Eom as u8,
+            0
+        );
+        let payload = reassemble_sent(&wire);
+        let proc_marker = [0xff, 0xff, RpcProcs::Execute as u8, 0, 0, 0];
+        assert_eq!(
+            payload
+                .windows(proc_marker.len())
+                .filter(|window| *window == proc_marker)
+                .count(),
+            2,
+            "the failed row must not have contributed a command"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_correlates_a_server_error_to_its_row() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 2627,
+                state: 1,
+                severity: 14,
+                message: "duplicate key".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            batch_done_proc(false, true),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![Ok((0, Vec::new())), Ok((1, Vec::new()))];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("row-scoped SQL errors should remain correlated results");
+        assert!(result.rows[0].errors.is_empty());
+        assert_eq!(result.rows[1].errors.len(), 1);
+        assert_eq!(result.rows[1].errors[0].number, 2627);
+        assert!(result.complete);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_preserves_an_early_batch_aborting_error() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 8115,
+                state: 1,
+                severity: 16,
+                message: "arithmetic overflow".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            batch_done_proc(false, true),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![
+            Ok((0, Vec::new())),
+            Ok((1, Vec::new())),
+            Ok((2, Vec::new())),
+        ];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("batch-aborting SQL errors remain row results");
+        assert!(!result.complete);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[1].errors[0].number, 8115);
+        assert_eq!(result.total_rows_affected(), Some(1));
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_reports_a_short_reply_with_no_error_to_explain_it() {
+        // Two commands sent, one reported, and the stream ends cleanly with no
+        // server error. The shortfall is carried on `complete` so the ODBC
+        // layer can report it while keeping the set the server did report.
+        let tokens = vec![batch_done_in_proc(1), batch_done_proc(false, false)];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![Ok((0, Vec::new())), Ok((1, Vec::new()))];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("a short batch is reported, not rejected");
+        assert!(!result.complete, "one of two commands reported");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].row_index, 0);
+        assert!(
+            !client.is_connection_dead(),
+            "the stream ended at a final DONE, so the socket is still usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_reports_instead_of_silently_discarding_result_sets() {
+        let tokens = vec![
+            empty_col_metadata(),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, vec![Ok((4, Vec::new()))])
+            .await
+            .expect("row-returning RPC should be drained and reported");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].row_index, 4);
+        assert!(result.rows[0].has_result_set);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_rejects_forced_encryption_before_writing() {
+        let (mut client, sent) = create_capturing_client(Vec::new());
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let forced = RpcParameter::new(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )
+        .with_force_column_encryption(true);
+
+        let error = client
+            .execute_sp_execute_batch_for_test(statement_id, vec![Ok((0, vec![forced]))])
+            .await
+            .expect_err("forced encryption is unsupported on the batch fast path");
+        assert!(matches!(&error, UsageError(message) if message.contains("ForceColumnEncryption")));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_streams_result_sets_and_reports_completed_indices() {
+        let tokens = vec![
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        let first = client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((2, Vec::new())), Ok((5, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(first.rows.is_empty());
+        assert!(!first.complete);
+        assert!(client.on_rows());
+        assert_eq!(client.current_parameter_set(), Some(2));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        let first = client.take_prepared_batch_results().unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.rows[0].row_index, 2);
+        assert!(first.rows[0].has_result_set);
+        assert!(first.rows[0].errors.is_empty());
+        assert_eq!(first.total_rows_affected(), Some(1));
+        assert!(!first.complete);
+        assert_eq!(client.current_parameter_set(), Some(5));
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        let last = client.take_prepared_batch_results().unwrap();
+        assert_eq!(last.rows.len(), 1);
+        assert_eq!(last.rows[0].row_index, 5);
+        assert!(last.complete);
+        assert!(!client.has_open_batch());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_close_drains_unread_sets_without_losing_status() {
+        let tokens = vec![
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((0, Vec::new())), Ok((1, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        client.close_query().await.unwrap();
+        let result = client.take_prepared_batch_results().unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.complete);
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|row| row.has_result_set && row.errors.is_empty())
+        );
+        assert!(!client.has_open_batch());
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_failed_resume_retires_the_unread_stream() {
+        let tokens = vec![empty_col_metadata(), batch_done_proc(true, false)];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(&mut statement, vec![Ok((0, Vec::new()))], &mut None, ())
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.on_rows());
+        assert!(client.is_connection_dead());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_row_doneproc_keeps_completion_available_to_advance() {
+        let tokens = vec![empty_col_metadata(), batch_done_proc(false, false)];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(&mut statement, vec![Ok((0, Vec::new()))], &mut None, ())
+            .await
+            .unwrap();
+        client.drain_rows().await.unwrap();
+        assert!(client.has_open_batch());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        let result = client.take_prepared_batch_results().unwrap();
+        assert!(result.complete);
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].has_result_set);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_streaming_rejects_invalid_completion_tokens() {
+        for done in [
+            batch_done_proc(false, true),
+            batch_done_proc(true, false),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+        ] {
+            let (mut client, _) = create_capturing_client(vec![done]);
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let mut statement =
+                PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+            let result = client
+                .begin_execute_prepared_batch(
+                    &mut statement,
+                    vec![Ok((0, Vec::new()))],
+                    &mut None,
+                    (),
+                )
+                .await;
+            assert!(matches!(result, Err(crate::error::Error::ProtocolError(_))));
+            assert!(client.is_connection_dead());
+            assert!(!client.has_open_batch());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_streaming_preserves_an_error_after_metadata() {
+        let tokens = vec![
+            empty_col_metadata(),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 2627,
+                state: 1,
+                severity: 14,
+                message: "duplicate key".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            batch_done_proc(true, true),
+            empty_col_metadata(),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((0, Vec::new())), Ok((1, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        let first = client.take_prepared_batch_results().unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert!(first.rows[0].has_result_set);
+        assert_eq!(first.rows[0].errors[0].number, 2627);
+        client.close_query().await.unwrap();
+        let last = client.take_prepared_batch_results().unwrap();
+        assert!(last.complete);
+        assert!(last.rows[0].errors.is_empty());
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_deducts_send_time_from_response_budget() {
+        let tokens = vec![batch_done_in_proc(1), batch_done_proc(false, false)];
+        let (mut client, observed) = create_timeout_observing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t VALUES (@P1)", statement_id);
+        let mut orphaned = None;
+        let row = Ok((
+            0,
+            vec![RpcParameter::new(
+                Some("@P1".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            )],
+        ));
+
+        client
+            .execute_prepared_batch(
+                &mut statement,
+                vec![row],
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(1),
+            )
+            .await
+            .expect("batch should complete against scripted response");
+        let observed = observed.lock().unwrap();
+        let response_budget = observed[0].expect("finite timeout should reach the reader");
+        assert!(
+            response_budget < Duration::from_secs(1),
+            "serialization/send time must be charged before response reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_preserves_unavailable_row_count() {
+        let tokens = vec![batch_done_proc(false, false)];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, vec![Ok((0, Vec::new()))])
+            .await
+            .expect("batch without DONE_COUNT should still succeed");
+        assert_eq!(result.total_rows_affected(), None);
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
     // ── Streamed (data-at-execution) PLP parameter write ──
 
     /// Reassembles the TDS packet stream captured by the mock transport into the
@@ -9288,6 +19244,30 @@ mod tests {
         )
     }
 
+    fn streamed_xml(name: &str) -> RpcParameter {
+        RpcParameter::data_at_exec(
+            Some(name.to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Xml,
+        )
+    }
+
+    #[test]
+    fn streamed_udt_metadata_is_validated_before_the_rpc_opens() {
+        use crate::datatypes::sql_udt::UdtTypeName;
+
+        let param = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::Udt(UdtTypeName::new(None, None, "x".repeat(256))),
+        );
+
+        let error =
+            TdsClient::split_and_validate_streamed_params(vec![param], &SqlCollation::default())
+                .unwrap_err();
+        assert!(matches!(error, Error::UsageError(_)));
+    }
+
     /// A single streamed chunk is framed as `[u32 len][bytes]` and the value is
     /// then closed with the PLP terminator.
     #[tokio::test]
@@ -9331,6 +19311,115 @@ mod tests {
             client.streamed_write_state,
             StreamedWriteState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn streamed_xml_adds_bom_before_payload() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client
+            .write_streamed_chunk(&[b'<', 0, b'r', 0])
+            .await
+            .unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'<', 0]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'r', 0]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_xml_preserves_one_bom_across_later_chunks() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client.write_streamed_chunk(&[0xFF]).await.unwrap();
+        client.write_streamed_chunk(&[0xFE, b'<', 0]).await.unwrap();
+        client.write_streamed_chunk(&[b'r', 0]).await.unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'<', 0]);
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'r', 0]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_empty_xml_still_writes_bom() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_xml_pending_byte_prevents_null() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_xml("@v")], ())
+            .await
+            .unwrap();
+        client.write_streamed_chunk(b"<").await.unwrap();
+
+        let error = client.write_streamed_null().unwrap_err();
+        assert!(matches!(error, UsageError(_)));
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xFF, 0xFE]);
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.push(b'<');
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
     }
 
     /// A streamed parameter marked NULL (before any chunk) is closed with
@@ -9799,7 +19888,7 @@ mod tests {
             StreamedWriteState::Idle
         ));
         assert!(
-            client.is_connection_dead(),
+            client.transport.connection_known_dead(),
             "a failed final send must make the connection non-reusable"
         );
     }
@@ -9841,6 +19930,27 @@ mod tests {
             .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
             .await
             .expect_err("unnamed data-at-exec parameter must be rejected");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_rejects_encoded_byte_limit_on_data_at_exec_param() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let bad = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarcharMax,
+        )
+        .with_narrow_string_byte_limit(1);
+
+        let err = client
+            .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
+            .await
+            .expect_err("streamed encoded-byte limits must be rejected before opening the RPC");
         assert!(matches!(err, UsageError(_)));
         assert!(matches!(
             client.streamed_write_state,
@@ -9892,6 +20002,1191 @@ mod tests {
         assert!(matches!(err, UsageError(_)));
     }
 
+    // ── begin_execute_prepared: data-at-execution keeps the prepared path ──
+    //
+    // Data-at-execution must not downgrade a prepared statement to ad-hoc
+    // `sp_executesql`, so these pin the proc id that actually reaches the wire:
+    // sp_prepexec (13) is `FF FF 0D 00`, sp_execute (12) is `FF FF 0C 00`.
+
+    #[tokio::test]
+    async fn begin_execute_prepared_streams_into_sp_prepexec_when_unmaterialized() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        let status = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+
+        assert!(statement.id().is_none(), "a parked request has no identity");
+
+        client.write_streamed_chunk(&[0xAA, 0xBB]).await.unwrap();
+        let status = client
+            .end_execute_prepared_param(&mut statement, &mut orphaned)
+            .await
+            .expect("closing the only streamed parameter completes the RPC");
+        assert!(matches!(status, StreamedParamStatus::Complete(_)));
+        let statement_id = statement
+            .id()
+            .expect("the completed send issues an identity");
+
+        // Asserted after finalize: the parked prefix stays buffered until the
+        // last parameter closes, so nothing is on the wire before that.
+        assert!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]),
+            "a data-at-execution prepare must go out as sp_prepexec"
+        );
+        assert_eq!(
+            client.prepared_handles.get(&statement_id).copied(),
+            Some(9),
+            "the trailing @handle must materialize under the claimed identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_streams_into_sp_execute_when_handle_is_live() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let statement_id = sid(1);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", statement_id);
+        client.prepared_handles.insert(statement_id, 55);
+        let mut orphaned = None;
+
+        let status = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+        assert_eq!(
+            statement.id(),
+            Some(statement_id),
+            "reuse must keep the statement's identity"
+        );
+        assert!(
+            client.pending_capture.is_none(),
+            "sp_execute returns no @handle, so no capture may be armed"
+        );
+
+        client.write_streamed_chunk(&[0xAA]).await.unwrap();
+        let status = client
+            .end_execute_prepared_param(&mut statement, &mut orphaned)
+            .await
+            .unwrap();
+        assert!(matches!(status, StreamedParamStatus::Complete(_)));
+
+        let bytes = sent.lock().unwrap().clone();
+        assert!(
+            bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0C, 0x00]),
+            "a live handle must be reused via sp_execute, not re-prepared"
+        );
+        // The @handle positional addressing plan 55 — see
+        // `execute_prepared_reuses_a_live_handle_via_sp_execute` for the layout.
+        let expected = [0x00, 0x00, 0x26, 0x04, 0x04, 0x37, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "the streamed sp_execute must address the cached handle"
+        );
+    }
+
+    /// With no streamed parameters the call is an ordinary prepared execute and
+    /// reports its result directly rather than parking.
+    #[tokio::test]
+    async fn begin_execute_prepared_without_streamed_params_completes() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("SELECT 1");
+        let mut orphaned = None;
+
+        let status = client
+            .begin_execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await
+            .expect("a materialized-only execute must not park");
+        assert!(matches!(status, StreamedParamStatus::Complete(_)));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .any(|w| w == [0xFF, 0xFF, 0x0D, 0x00])
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_piggybacks_each_orphan_with_one_second_timeout() {
+        let tokens = (78..82)
+            .flat_map(|handle| {
+                [
+                    Tokens::ReturnValue(ae_return_value_token(
+                        "@handle",
+                        ColumnValues::Int(handle),
+                        None,
+                    )),
+                    done_no_more(),
+                ]
+            })
+            .collect();
+        let (mut client, sent) = create_capturing_client(tokens);
+        let first_id = client.issue_statement_id();
+        client.prepared_handles.insert(first_id, 77);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", first_id);
+
+        for handle in 77i32..81 {
+            let mut orphaned = statement.take_id();
+            let old_id = orphaned.unwrap();
+            let offset = sent.lock().unwrap().len();
+            let status = client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+            assert_eq!(orphaned, Some(old_id));
+            assert_eq!(client.prepared_handles.get(&old_id), Some(&handle));
+            assert!(statement.id().is_none());
+            match &client.streamed_write_state {
+                StreamedWriteState::Idle => panic!("expected a parked stream"),
+                StreamedWriteState::Active(state) => assert_eq!(state.timeout_sec, Some(1)),
+            }
+
+            assert_eq!(sent.lock().unwrap().len(), offset);
+
+            client.cancel_streamed_write().await;
+            assert_eq!(client.prepared_handles.get(&old_id), Some(&handle));
+            assert_eq!(orphaned, Some(old_id));
+            assert!(
+                statement.take_id().is_none(),
+                "cancel/rebind must not add an orphan"
+            );
+            assert!(client.pending_capture.is_none());
+            assert_eq!(sent.lock().unwrap().len(), offset);
+
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            client.write_streamed_chunk(&[0xAA]).await.unwrap();
+            assert!(matches!(
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+            assert!(orphaned.is_none());
+            let wire = sent.lock().unwrap()[offset..].to_vec();
+            assert_eq!(
+                wire.windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0D, 0x00])
+                    .count(),
+                1,
+            );
+            assert!(!wire.windows(4).any(|w| w == [0xFF, 0xFF, 0x0F, 0x00]));
+            let mut parameter = vec![0, 1, 0x26, 4, 4];
+            parameter.extend_from_slice(&handle.to_le_bytes());
+            assert!(wire.windows(parameter.len()).any(|w| w == parameter));
+            assert_eq!(client.prepared_handles.len(), 1);
+            assert_eq!(
+                client.prepared_handles.get(&statement.id().unwrap()),
+                Some(&(handle + 1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_multiple_params_assigns_id_only_after_last() {
+        let (mut client, _) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token(
+                "@handle",
+                ColumnValues::Int(78),
+                None,
+            )),
+            done_no_more(),
+        ]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut statement = PreparedStatement::new("SELECT @v, @w");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v"), streamed_varbinary("@w")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap();
+        client.write_streamed_null().unwrap();
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::NeedData { .. }
+        ));
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        client.write_streamed_chunk(&[]).await.unwrap();
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::Complete(_)
+        ));
+        assert!(orphaned.is_none());
+        assert_eq!(
+            client.prepared_handles.get(&statement.id().unwrap()),
+            Some(&78)
+        );
+        assert!(!client.prepared_handles.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_partial_cancel_retains_orphan_and_metadata() {
+        use crate::message::messages::PacketStatusFlags;
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+        client
+            .prepared_param_encryption
+            .insert(id, Arc::clone(&metadata));
+        let mut statement = PreparedStatement::new("SELECT @v, @w");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v"), streamed_varbinary("@w")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.end_streamed_param().await,
+            Err(UsageError(_))
+        ));
+        client.write_streamed_chunk(&[]).await.unwrap();
+        client.write_streamed_null().unwrap();
+        assert!(matches!(
+            client.write_streamed_chunk(&[]).await,
+            Err(UsageError(_))
+        ));
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::NeedData { .. }
+        ));
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        client
+            .write_streamed_chunk(&vec![0xAB; 10_000])
+            .await
+            .unwrap();
+        assert!(matches!(client.write_streamed_null(), Err(UsageError(_))));
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "the test must flush a partial packet"
+        );
+        client.cancel_streamed_write().await;
+        let wire = sent.lock().unwrap();
+        assert_eq!(
+            wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE + 1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+        );
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&id).unwrap(),
+            &metadata
+        ));
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_interrupted_send_retires_without_writing_again() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        for (prior_packet, final_packet) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let cancel = CancelHandle::new();
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            transport.sends_before_cancel = usize::from(prior_packet);
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let close_calls = Arc::clone(&transport.close_calls);
+            let mut client = create_test_client_with_transport(transport);
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::clone(&metadata));
+            let mut statement = PreparedStatement::new("SELECT @v");
+            let mut orphaned = Some(id);
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().cancel(&cancel),
+                )
+                .await
+                .unwrap();
+            if prior_packet {
+                client
+                    .write_streamed_chunk(&vec![0xAB; 4096])
+                    .await
+                    .unwrap();
+            }
+            let offset = sent.lock().unwrap().len();
+            assert_eq!(offset, if prior_packet { 4096 } else { 0 });
+            let error = tokio::time::timeout(Duration::from_secs(1), async {
+                if final_packet {
+                    client
+                        .end_execute_prepared_param(&mut statement, &mut orphaned)
+                        .await
+                        .map(|_| ())
+                } else {
+                    client.write_streamed_chunk(&vec![0xAB; 4096]).await
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert!(
+                client.is_connection_dead(),
+                "an interrupted packet cannot be retracted"
+            );
+            assert_eq!(
+                sent.lock().unwrap().len(),
+                offset + 8,
+                "no IGNORE after a partial packet"
+            );
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                close_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "TLS shutdown must not write after interruption"
+            );
+            assert!(statement.id().is_none());
+            assert_eq!(orphaned, Some(id));
+            assert_eq!(client.prepared_handles.get(&id), Some(&77));
+            assert!(Arc::ptr_eq(
+                client.prepared_param_encryption.get(&id).unwrap(),
+                &metadata
+            ));
+            assert!(client.pending_capture.is_none());
+            for _ in 0..2 {
+                client.cancel_streamed_write().await;
+                assert!(matches!(
+                    client.write_streamed_chunk(&[0xAB]).await,
+                    Err(UsageError(_))
+                ));
+                assert_eq!(sent.lock().unwrap().len(), offset + 8);
+                assert_eq!(close_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_cancellation_between_packets_keeps_connection_reusable() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let close_calls = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        client
+            .write_streamed_chunk(&vec![0xAB; 4096])
+            .await
+            .unwrap();
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            4096,
+            "exactly one packet completed"
+        );
+        assert!(cancel.cancel_token.is_cancelled());
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(!client.is_connection_dead());
+        assert_eq!(close_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        let wire = sent.lock().unwrap();
+        assert_eq!(wire.len(), 4096 + PacketWriter::PACKET_HEADER_SIZE);
+        assert_eq!(
+            wire[4097],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_failed_final_send_retains_ownership() {
+        let (mut client, fail) = create_failing_capturing_client(vec![]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = Some(id);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .is_err()
+        );
+        assert!(statement.id().is_none());
+        assert_eq!(orphaned, Some(id));
+        assert_eq!(client.prepared_handles.get(&id), Some(&77));
+        assert!(client.pending_capture.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_completed_send_consumes_orphan_on_error() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        // The first case fails while reading the response; the second fails
+        // the writer's timeout check after the final packet reached the peer.
+        for delayed_send in [false, true] {
+            let mut transport = TestTransport::new();
+            if delayed_send {
+                transport.send_delay = Some(Duration::from_millis(2100));
+            }
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::new(DescribeParameterEncryptionResult::new()));
+            let mut statement = PreparedStatement::new("SELECT @v");
+            let mut orphaned = Some(id);
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            let error = client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap_err();
+            if delayed_send {
+                assert!(matches!(error, crate::error::Error::TimeoutError(_)));
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            assert!(statement.id().is_some());
+            assert!(orphaned.is_none());
+            assert!(!client.prepared_handles.contains_key(&id));
+            assert!(!client.prepared_param_encryption.contains_key(&id));
+            let wire = sent.lock().unwrap();
+            assert_eq!(wire[1] & 1, 1, "the final EOM packet must have been sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_cross_identity_orphan_uses_standalone_release() {
+        let (mut client, sent) = create_capturing_client(vec![
+            done_no_more(),
+            done_no_more(),
+            done_no_more(),
+            done_no_more(),
+        ]);
+        let live_id = client.issue_statement_id();
+        client.prepared_handles.insert(live_id, 99);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @v", live_id);
+        for _ in 0..2 {
+            let old_id = client.issue_statement_id();
+            client.prepared_handles.insert(old_id, 77);
+            let mut orphaned = Some(old_id);
+            let offset = sent.lock().unwrap().len();
+            let cancel = CancelHandle::new();
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+                )
+                .await
+                .unwrap();
+            assert!(orphaned.is_none());
+            assert!(!client.prepared_handles.contains_key(&old_id));
+            assert_eq!(statement.id(), Some(live_id));
+            assert!(
+                client.cancel_handle.is_some(),
+                "unprepare must restore the execution token"
+            );
+            assert!(matches!(
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+            let wire = sent.lock().unwrap()[offset..].to_vec();
+            assert_eq!(
+                wire.windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                    .count(),
+                1
+            );
+            assert_eq!(
+                wire.windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0C, 0x00])
+                    .count(),
+                1
+            );
+            assert!(!wire.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
+            assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_unprepare_retains_an_unsent_orphan_on_cancellation() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut orphaned = Some(id);
+        let cancel = CancelHandle::new();
+        cancel.cancel();
+        let error = client
+            .unprepare_orphan(
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(orphaned, Some(id));
+        assert!(client.prepared_handles.contains_key(&id));
+        assert!(sent.lock().unwrap().is_empty());
+        client
+            .unprepare_orphan(&mut orphaned, ExecuteOptions::new())
+            .await
+            .unwrap();
+        assert!(orphaned.is_none());
+        assert!(!client.prepared_handles.contains_key(&id));
+        assert!(client.cancel_handle.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn internal_unprepare_cancellation_bounds_a_stalled_write() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut orphaned = Some(id);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.unprepare_orphan(&mut orphaned, ExecuteOptions::new().cancel(&cancel)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert!(
+            orphaned.is_none(),
+            "an attempted release is not safe to resend"
+        );
+        assert!(!client.prepared_handles.contains_key(&id));
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_begin_cancellation_bounds_and_retires_a_stalled_write() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.begin_transaction_with_options(
+                TransactionIsolationLevel::NoChange,
+                None,
+                ExecuteOptions::new().cancel(&cancel),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_active_transaction());
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn final_streamed_param_retires_unsettled_cancellation() {
+        let mut client = create_test_client_with_transport(TestTransport::with_tokens_then_error(
+            Vec::new(),
+            crate::error::Error::OperationCancelledError("unsettled cancellation".to_string()),
+        ));
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_varbinary("@v")], ())
+            .await
+            .unwrap();
+        let err = client.end_streamed_param().await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_skips_absent_orphans_without_unprepare() {
+        for orphaned in [None, Some(sid(77))] {
+            let (mut client, sent) = create_capturing_client(vec![]);
+            let mut orphaned = orphaned;
+            let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                )
+                .await
+                .unwrap();
+            assert!(orphaned.is_none());
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "no cleanup RPC for an absent handle"
+            );
+            client.cancel_streamed_write().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_release_failure_does_not_open_a_stream() {
+        let (mut client, sent) = create_capturing_client(vec![]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 77);
+        let live_id = client.issue_statement_id();
+        client.prepared_handles.insert(live_id, 99);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
+        let mut orphaned = Some(orphan_id);
+
+        assert!(
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    (),
+                )
+                .await
+                .is_err()
+        );
+        assert!(orphaned.is_none(), "the release crossed its send boundary");
+        assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+        assert!(!client.prepared_handles.contains_key(&orphan_id));
+        assert!(client.pending_capture.is_none());
+        assert_eq!(statement.id(), Some(live_id));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        let bytes = sent.lock().unwrap();
+        assert!(bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0F, 0x00]));
+        assert!(!bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_invalid_parameter_keeps_orphan_without_io() {
+        let (mut client, sent) = create_capturing_client(vec![]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 77);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = Some(orphan_id);
+        let mut param = streamed_varbinary("@v");
+        param.name = None;
+        assert!(matches!(
+            client
+                .begin_execute_prepared(&mut statement, vec![param], &mut orphaned, ())
+                .await,
+            Err(UsageError(_))
+        ));
+        assert_eq!(orphaned, Some(orphan_id));
+        assert_eq!(client.prepared_handles.get(&orphan_id), Some(&77));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_release_server_error_preserves_connection_reuse() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 8179,
+                state: 1,
+                severity: 16,
+                message: "Could not find prepared statement with handle 77.".to_string(),
+                server_name: "test".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            done_no_more(),
+            done_no_more(),
+        ]);
+        let orphan_id = client.issue_statement_id();
+        client.prepared_handles.insert(orphan_id, 77);
+        let mut orphaned = Some(orphan_id);
+        let live_id = client.issue_statement_id();
+        client.prepared_handles.insert(live_id, 99);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
+
+        let error = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(expect_sql_error(error).errors[0].number, 8179);
+        assert!(orphaned.is_none());
+        assert_eq!(statement.id(), Some(live_id));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(!client.is_connection_dead());
+
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .unwrap();
+        client.write_streamed_chunk(&[0xAA]).await.unwrap();
+        assert!(matches!(
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphaned)
+                .await
+                .unwrap(),
+            StreamedParamStatus::Complete(_)
+        ));
+        assert_eq!(client.prepared_handles.len(), 1);
+        assert_eq!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                .count(),
+            1,
+            "retry must not release the old handle twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_cancelled_final_send_keeps_orphan_for_retry() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let tokens = (78..80)
+            .flat_map(|handle| {
+                [
+                    Tokens::ReturnValue(ae_return_value_token(
+                        "@handle",
+                        ColumnValues::Int(handle),
+                        None,
+                    )),
+                    done_no_more(),
+                ]
+            })
+            .collect();
+        let (mut client, sent) = create_capturing_client(tokens);
+        let first_id = client.issue_statement_id();
+        client.prepared_handles.insert(first_id, 77);
+        let mut orphaned = Some(first_id);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let cancellation = CancelHandle::new();
+        let cancelled = cancellation.child_handle();
+        cancellation.cancel();
+
+        for handle in 77..79 {
+            let id = orphaned.unwrap();
+            let metadata = Arc::new(DescribeParameterEncryptionResult::new());
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::clone(&metadata));
+            let offset = sent.lock().unwrap().len();
+            for _ in 0..2 {
+                client
+                    .begin_execute_prepared(
+                        &mut statement,
+                        vec![streamed_varbinary("@v")],
+                        &mut orphaned,
+                        ExecuteOptions::new().cancel(&cancelled),
+                    )
+                    .await
+                    .unwrap();
+                let error = client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::error::Error::OperationCancelledError(_)
+                ));
+                assert_eq!(
+                    sent.lock().unwrap().len(),
+                    offset,
+                    "nothing reached the server"
+                );
+                assert_eq!(orphaned, Some(id));
+                assert!(statement.id().is_none());
+                assert_eq!(client.prepared_handles.get(&id), Some(&handle));
+                assert!(Arc::ptr_eq(
+                    client.prepared_param_encryption.get(&id).unwrap(),
+                    &metadata
+                ));
+                assert!(!client.is_connection_dead());
+            }
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(orphaned, Some(id));
+            assert!(client.prepared_param_encryption.contains_key(&id));
+            client.write_streamed_chunk(&[0xAA]).await.unwrap();
+            assert!(matches!(
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+            assert_eq!(client.prepared_handles.len(), 1);
+            assert!(orphaned.is_none());
+            assert!(!client.prepared_param_encryption.contains_key(&id));
+            orphaned = statement.take_id();
+            assert_eq!(
+                client.prepared_handles.get(&orphaned.unwrap()),
+                Some(&(handle + 1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_cancels_during_release_without_opening_stream() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        for send_started in [false, true] {
+            let cancel = CancelHandle::new();
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            if send_started {
+                transport.cancel_after_send = Some(cancel.cancel_token.clone());
+            } else {
+                transport.cancel_on_writer_creation = Some(cancel.cancel_token.clone());
+            }
+            let sent = Arc::clone(&transport.sent);
+            let mut client =
+                create_test_client_with_any_transport(AnyTransport::dynamic(transport));
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            client
+                .prepared_param_encryption
+                .insert(id, Arc::new(DescribeParameterEncryptionResult::new()));
+            let mut orphaned = Some(id);
+            let live_id = client.issue_statement_id();
+            client.prepared_handles.insert(live_id, 99);
+            let mut statement =
+                PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", live_id);
+
+            assert!(!cancel.cancel_token.is_cancelled());
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.begin_execute_prepared(
+                    &mut statement,
+                    vec![streamed_varbinary("@v")],
+                    &mut orphaned,
+                    ExecuteOptions::new().cancel(&cancel),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(cancel.cancel_token.is_cancelled());
+            assert_eq!(orphaned, if send_started { None } else { Some(id) });
+            assert_eq!(client.prepared_handles.contains_key(&id), !send_started);
+            assert_eq!(
+                client.prepared_param_encryption.contains_key(&id),
+                !send_started
+            );
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            // This scripted reader reports cancellation without acknowledging
+            // ATTENTION. A release already sent cannot leave that link reusable.
+            assert_eq!(client.is_connection_dead(), send_started);
+            assert!(matches!(
+                client.streamed_write_state,
+                StreamedWriteState::Idle
+            ));
+            assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+            let bytes = sent.lock().unwrap();
+            assert_eq!(
+                bytes
+                    .windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                    .count(),
+                usize::from(send_started)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_unsent_release_keeps_orphan_for_retry_with_one_second_timeout() {
+        for stream_results in [false, true] {
+            let (mut client, sent) = create_capturing_client(vec![
+                done_no_more(),
+                Tokens::ReturnValue(ae_return_value_token(
+                    "@handle",
+                    ColumnValues::Int(78),
+                    None,
+                )),
+                done_no_more(),
+                batch_done_proc(false, false),
+            ]);
+            let id = client.issue_statement_id();
+            client.prepared_handles.insert(id, 77);
+            let mut orphaned = Some(id);
+            let mut statement = PreparedStatement::new("SELECT 1");
+            let cancellation = CancelHandle::new();
+            let cancelled = cancellation.child_handle();
+            cancellation.cancel();
+            for _ in 0..2 {
+                let error = client
+                    .execute_prepared_batch_inner(
+                        &mut statement,
+                        vec![Ok((0, Vec::new()))],
+                        &mut orphaned,
+                        ExecuteOptions::new().cancel(&cancelled),
+                        stream_results,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::error::Error::OperationCancelledError(_)
+                ));
+                assert!(sent.lock().unwrap().is_empty());
+                assert_eq!(orphaned, Some(id));
+                assert_eq!(client.prepared_handles.get(&id), Some(&77));
+                assert!(!client.is_connection_dead());
+            }
+            client
+                .execute_prepared_batch_inner(
+                    &mut statement,
+                    vec![Ok((0, Vec::new()))],
+                    &mut orphaned,
+                    ExecuteOptions::new().timeout_secs(1),
+                    stream_results,
+                )
+                .await
+                .unwrap();
+            assert!(orphaned.is_none());
+            assert_eq!(client.prepared_handles.len(), 1);
+            assert_eq!(
+                client.prepared_handles.get(&statement.id().unwrap()),
+                Some(&78)
+            );
+        }
+    }
+
+    /// Cancelling a parked `sp_prepexec` disarms the `@handle` capture. Leaving
+    /// it armed would divert the next unrelated RPC's first RETURNVALUE into the
+    /// handle map, aliasing a plan the statement never prepared.
+    #[tokio::test]
+    async fn cancel_streamed_write_disarms_the_prepexec_handle_capture() {
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(client.pending_capture.is_some());
+
+        client.cancel_streamed_write().await;
+
+        assert!(client.pending_capture.is_none());
+        assert!(statement.id().is_none());
+        assert!(client.prepared_handles.is_empty());
+    }
+
+    /// Opening a streamed RPC consumes the connection's pending RESETCONNECTION
+    /// bit. Cancelling before the first packet goes out must return it, or the
+    /// pool's one-shot reset is silently swallowed.
+    #[tokio::test]
+    async fn cancel_streamed_write_rearms_an_unsent_connection_reset() {
+        use crate::message::messages::PacketStatusFlags;
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
+
+        // The request that ends up carrying the re-armed bit must see the
+        // server acknowledge it, or the client declares the session dirty and
+        // fails it - see `observe_response_token`.
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        client.prepare_reset_connection(false);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the parked message must not have reached the network yet"
+        );
+
+        client.cancel_streamed_write().await;
+
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("the next request should succeed");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent[1] & PacketStatusFlags::ResetConnection as u8,
+            PacketStatusFlags::ResetConnection as u8,
+            "the reset the cancelled message consumed must ride the next request"
+        );
+    }
+
     /// Cancelling while idle must be a no-op that keeps the connection reusable.
     #[tokio::test]
     async fn cancel_streamed_write_on_idle_client_is_noop() {
@@ -9907,11 +21202,11 @@ mod tests {
         ));
     }
 
-    /// Cancelling an active streamed write must discard parked state and mark
-    /// the connection dead so it cannot be reused by a pool checkout.
+    /// Cancelling before any packet has left the client discards the request
+    /// locally: nothing is written to the wire and the connection stays usable.
     #[tokio::test]
-    async fn cancel_streamed_write_aborts_active_stream_and_marks_connection_dead() {
-        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+    async fn cancel_streamed_write_before_first_packet_discards_locally() {
+        let (mut client, sent) = create_capturing_client(vec![]);
         let status = client
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
@@ -9924,17 +21219,915 @@ mod tests {
             status,
             StreamedParamStatus::NeedData { param_name: _ }
         ));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the RPC header must still be buffered, not on the wire"
+        );
+
+        client.cancel_streamed_write().await;
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a request the server never saw must not be cancelled over the wire"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "abandoning an unsent request must leave the connection reusable"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(matches!(
+            client.write_streamed_chunk(&[0x01]).await,
+            Err(UsageError(_))
+        ));
+    }
+
+    /// Cancelling after part of the request is on the wire closes the message
+    /// with EOM | IGNORE so the server discards it, consumes the DONE it
+    /// answers with, and keeps the connection reusable.
+    #[tokio::test]
+    async fn cancel_streamed_write_after_partial_send_ignores_and_drains() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+
+        // Overflow the payload buffer so at least one packet is flushed.
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
+        let sent_before_cancel = sent.lock().unwrap().len();
+        assert!(
+            sent_before_cancel > 0,
+            "a large chunk must have flushed at least one packet"
+        );
+
+        client.cancel_streamed_write().await;
+
+        // The trailing packet must carry EOM | IGNORE and no payload.
+        let wire = sent.lock().unwrap().clone();
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "the cancelled message must be terminated with an ignore packet"
+        );
+        assert_eq!(
+            u16::from_be_bytes([last[2], last[3]]) as usize,
+            PacketWriter::PACKET_HEADER_SIZE
+        );
+
+        assert!(
+            !client.is_connection_dead(),
+            "an ignored request leaves the connection clean for reuse"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(matches!(
+            client.write_streamed_chunk(&[0x01]).await,
+            Err(UsageError(_))
+        ));
+    }
+
+    /// If the ignore packet cannot be sent, the request is neither complete nor
+    /// retracted, so the connection must be closed rather than handed back.
+    #[tokio::test]
+    async fn cancel_streamed_write_falls_back_to_close_when_ignore_fails() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        client.cancel_streamed_write().await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a request that could not be retracted must not be reused"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// The retraction is only complete once the DONE the server answers the
+    /// ignore packet with has been consumed. If that read fails the next
+    /// command on this connection would pick the DONE up as its own, so the
+    /// connection is closed instead of pooled.
+    #[tokio::test]
+    async fn cancel_streamed_write_falls_back_to_close_when_the_drain_fails() {
+        // No DONE queued: the ignore packet goes out but is never acknowledged.
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
 
         client.cancel_streamed_write().await;
 
         assert!(
             client.is_connection_dead(),
-            "an aborted streamed write must not hand a live-looking connection back to the pool"
+            "an unacknowledged retraction leaves the stream desynchronized"
         );
         assert!(matches!(
-            client.write_streamed_chunk(&[0x01]).await,
-            Err(UsageError(_))
+            client.streamed_write_state,
+            StreamedWriteState::Idle
         ));
+    }
+
+    /// Opens an RPC message with `payload_len` bytes and suspends it - the state
+    /// a send site holds when serialization fails part-way.
+    async fn suspend_message_with(client: &mut TdsClient, payload_len: usize) -> SuspendedMessage {
+        suspend_message_under(client, payload_len, None).await
+    }
+
+    /// As [`suspend_message_with`], but the message carries `cancel_handle` the
+    /// way a real request's writer does.
+    async fn suspend_message_under(
+        client: &mut TdsClient,
+        payload_len: usize,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> SuspendedMessage {
+        let mut writer = PacketWriter::new(
+            PacketType::RpcRequest,
+            client.transport.as_writer(),
+            None,
+            cancel_handle,
+        );
+        writer
+            .write_async(&vec![0xABu8; payload_len])
+            .await
+            .unwrap();
+        writer.suspend()
+    }
+
+    /// Dropped locally, and `abandon` rather than `drop` because opening the
+    /// message consumed the connection's pending RESETCONNECTION bit.
+    #[tokio::test]
+    async fn retract_partial_request_before_first_packet_discards_locally() {
+        let (mut client, sent) = create_capturing_client(vec![]);
+        client
+            .transport
+            .as_writer()
+            .set_reset_mode(ResetConnectionMode::Reset);
+        let message = suspend_message_with(&mut client, 16).await;
+        assert!(message.nothing_sent());
+
+        client.retract_partial_request(message).await;
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a request the server never saw must not be retracted over the wire"
+        );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the abandoned message must hand its reset back to the connection"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "abandoning an unsent request must leave the connection reusable"
+        );
+    }
+
+    /// Once a packet is on the wire the server is mid-message, so the request is
+    /// closed with EOM | IGNORE and its DONE consumed.
+    #[tokio::test]
+    async fn retract_partial_request_after_partial_send_ignores_and_drains() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let message = suspend_message_with(&mut client, 10_000).await;
+        assert!(
+            !message.nothing_sent(),
+            "a payload larger than one packet must have flushed"
+        );
+
+        client.retract_partial_request(message).await;
+
+        let wire = sent.lock().unwrap().clone();
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "the retracted message must be terminated with an ignore packet"
+        );
+        assert_eq!(
+            u16::from_be_bytes([last[2], last[3]]) as usize,
+            PacketWriter::PACKET_HEADER_SIZE,
+            "the ignore packet carries no payload"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a retracted request leaves the connection clean for reuse"
+        );
+    }
+
+    /// Packet #1 recorded the RESETCONNECTION dispatch, but the server discards
+    /// the whole ignored message, reset included. Unless the record is cleared
+    /// and the bit re-armed, the withdrawal's own DONE reads as a request that
+    /// ran without resetting and condemns a healthy connection.
+    #[tokio::test]
+    async fn retracting_hands_back_a_reset_the_server_discarded() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+        let message = suspend_message_with(&mut client, 10_000).await;
+        assert!(!message.nothing_sent(), "the reset must be on the wire");
+
+        client.retract_partial_request(message).await;
+
+        assert!(
+            !client.is_connection_dead(),
+            "withdrawing a reset-carrying request must not condemn the connection"
+        );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the discarded reset must ride the next request instead"
+        );
+    }
+
+    /// The retraction must not inherit the caller's cancellation. The request is
+    /// already over; a cancelled cleanup would strand the very message it exists
+    /// to withdraw.
+    #[tokio::test]
+    async fn retracting_ignores_a_cancel_fired_against_the_request() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let parent = CancelHandle::new();
+        let message = suspend_message_under(&mut client, 10_000, Some(&parent)).await;
+        client.cancel_handle = Some(parent.child_handle());
+        parent.cancel();
+
+        client.retract_partial_request(message).await;
+
+        let wire = sent.lock().unwrap().clone();
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "a fired cancel must not stop the ignore packet"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "the drain must still run, leaving the connection reusable"
+        );
+    }
+
+    /// `PacketWriter` only checks its budget once a write returns, so a stalled
+    /// peer would block the withdrawal forever. The deadline must fire, and the
+    /// transport must be retired rather than reused - dropping a write future
+    /// mid-flight is only safe because nothing writes to that stream again.
+    #[tokio::test(start_paused = true)]
+    async fn the_ignore_packet_gives_up_on_a_stalled_peer() {
+        let transport = TestTransport::new();
+        let hang = Arc::clone(&transport.send_should_hang);
+        let mut client = create_test_client_with_transport(transport);
+        let message = suspend_message_with(&mut client, 10_000).await;
+
+        hang.store(true, std::sync::atomic::Ordering::SeqCst);
+        client.retract_partial_request(message).await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a withdrawal that cannot be written must retire the transport"
+        );
+    }
+
+    /// A budget expiry on the *last* packet leaves the server holding the whole
+    /// request, so there is nothing to withdraw. Sending `EOM | IGNORE` there
+    /// would open a second message and leave its DONE for the next command;
+    /// the request has to be cancelled with an attention instead.
+    #[tokio::test]
+    async fn a_complete_message_is_cancelled_rather_than_withdrawn() {
+        let transport = TestTransport::new();
+        let attentions = Arc::clone(&transport.attentions);
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+
+        let mut writer = PacketWriter::new(
+            PacketType::RpcRequest,
+            client.transport.as_writer(),
+            None,
+            None,
+        );
+        writer.write_async(&[0xABu8; 16]).await.unwrap();
+        writer.finalize().await.unwrap();
+        let message = writer.suspend();
+        assert!(message.message_complete(), "finalize sent the last packet");
+        let sent_before = sent.lock().unwrap().len();
+
+        client.retract_partial_request(message).await;
+
+        assert_eq!(
+            attentions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a request the server has in full must be cancelled, not withdrawn"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            sent_before,
+            "no second message may be opened to withdraw the first"
+        );
+        assert!(
+            !client.transport.connection_known_dead(),
+            "an acknowledged attention leaves the connection reusable"
+        );
+    }
+
+    /// If the ignore packet cannot be sent, the request is neither complete nor
+    /// retracted, so the socket is discarded rather than pooled.
+    #[tokio::test]
+    async fn retract_partial_request_falls_back_to_close_when_ignore_fails() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+        let message = suspend_message_with(&mut client, 10_000).await;
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        client.retract_partial_request(message).await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a request that could not be retracted must not be reused"
+        );
+    }
+
+    /// The retraction is only complete once the DONE is consumed. If that read
+    /// fails, the next command would pick the DONE up as its own.
+    #[tokio::test]
+    async fn retract_partial_request_falls_back_to_close_when_the_drain_fails() {
+        // No DONE queued: the ignore packet goes out but is never acknowledged.
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        let message = suspend_message_with(&mut client, 10_000).await;
+
+        client.retract_partial_request(message).await;
+
+        assert!(
+            client.is_connection_dead(),
+            "an unacknowledged retraction leaves the stream desynchronized"
+        );
+    }
+
+    /// The liveness check is the cached flag, never the socket-polling
+    /// `is_connection_dead`: this runs with a half-written message outstanding,
+    /// where a `try_read` probe could swallow the server's answer to it.
+    #[tokio::test]
+    async fn retract_partial_request_skips_the_withdrawal_on_a_dead_connection() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+        let message = suspend_message_with(&mut client, 10_000).await;
+        let sent_before = sent.lock().unwrap().len();
+        client.transport.mark_known_dead();
+
+        client.retract_partial_request(message).await;
+
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            sent_before,
+            "no withdrawal may be attempted on a dead connection"
+        );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the skipped message must still hand back the reset arm it took"
+        );
+    }
+
+    /// Parameter validation covers the complete list before serialization, so
+    /// a late encoded-length failure cannot flush the earlier large parameter.
+    #[tokio::test]
+    async fn a_send_site_rejects_encoded_overflow_before_writing() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let big = RpcParameter::new(
+            Some("@big".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarcharMax(Some(SqlString::from_utf8_string("a".repeat(20_000)))),
+        );
+        let overlong = RpcParameter::new(
+            Some("@bad".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(SqlString::from_utf8_string("abcdefghij".to_string())),
+                1,
+            ),
+        );
+
+        let result = client
+            .execute_sp_executesql("SELECT @big, @bad".to_string(), vec![big, overlong], ())
+            .await;
+
+        assert_overlong_parameter_error(result.expect_err("the over-long value must be rejected"));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "preflight must reject every parameter before writing the RPC"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a locally rejected request leaves the connection reusable"
+        );
+    }
+
+    fn cursor_params_with_encoded_overflow() -> Vec<RpcParameter> {
+        vec![
+            RpcParameter::new(
+                Some("@big".to_string()),
+                StatusFlags::NONE,
+                SqlType::VarcharMax(Some(SqlString::from_utf8_string("a".repeat(20_000)))),
+            ),
+            RpcParameter::new(
+                Some("@bad".to_string()),
+                StatusFlags::NONE,
+                SqlType::Varchar(
+                    Some(SqlString::from_utf8_string("abcdefghij".to_string())),
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    fn assert_cursor_send_was_retracted(client: &TdsClient, sent: &Arc<std::sync::Mutex<Vec<u8>>>) {
+        use crate::message::messages::PacketStatusFlags;
+
+        let wire = sent.lock().unwrap().clone();
+        assert!(
+            wire.len() >= PacketWriter::PACKET_HEADER_SIZE,
+            "expected at least one complete TDS packet, got {} bytes",
+            wire.len()
+        );
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            u16::from_be_bytes([last[2], last[3]]) as usize,
+            PacketWriter::PACKET_HEADER_SIZE,
+            "the withdrawal must end with a header-only TDS packet"
+        );
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "the half-sent cursor RPC must be withdrawn"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a withdrawn cursor RPC must leave the connection reusable"
+        );
+    }
+
+    fn assert_overlong_parameter_error(error: crate::error::Error) {
+        assert!(matches!(
+            error,
+            crate::error::Error::EncodedValueTooLong {
+                actual: 10,
+                maximum: 1
+            }
+        ));
+    }
+
+    fn assert_cursor_parameter_preflight_sent_nothing(
+        client: &TdsClient,
+        sent: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "parameter preflight must complete before the cursor RPC is written"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a locally rejected cursor RPC must leave the connection reusable"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_open_with_params_rejects_encoded_overflow_before_writing() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .cursor_open_with_params(
+                "SELECT @big, @bad",
+                cursor_params_with_encoded_overflow(),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_open_retracts_when_cancelled_after_a_flush() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let sent = Arc::clone(&transport.sent);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let mut client = create_test_client_with_transport(transport);
+
+        let error = client
+            .cursor_open(
+                &"a".repeat(20_000),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                Some(&cancel),
+            )
+            .await
+            .expect_err("cancellation after packet one must stop serialization");
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_prepare_retracts_when_cancelled_after_a_flush() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let sent = Arc::clone(&transport.sent);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let mut client = create_test_client_with_transport(transport);
+
+        let error = client
+            .cursor_prepare(
+                &"a".repeat(20_000),
+                "",
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                None,
+                Some(&cancel),
+            )
+            .await
+            .expect_err("cancellation after packet one must stop serialization");
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn set_cursor_option_retracts_when_cancelled_after_a_flush() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let sent = Arc::clone(&transport.sent);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let mut client = create_test_client_with_transport(transport);
+
+        let error = client
+            .set_cursor_option(
+                1,
+                crate::cursor::CursorOptionCode::CursorName,
+                crate::cursor::CursorOptionValue::String("a".repeat(20_000)),
+                None,
+                Some(&cancel),
+            )
+            .await
+            .expect_err("cancellation after packet one must stop serialization");
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn perform_cursor_operation_rejects_encoded_overflow_before_writing() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .perform_cursor_operation(
+                1,
+                crate::cursor::CursorOperation::UPDATE,
+                1,
+                "",
+                cursor_params_with_encoded_overflow(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_prepexec_rejects_encoded_overflow_before_writing() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .cursor_prepexec(
+                "SELECT @big, @bad",
+                cursor_params_with_encoded_overflow(),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_execute_rejects_encoded_overflow_before_writing() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .cursor_execute(
+                1,
+                cursor_params_with_encoded_overflow(),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_parameter_preflight_sent_nothing(&client, &sent);
+    }
+
+    /// The retraction runs on its own budget, so a request that had a timeout
+    /// left does not have it spent by the withdrawal — and one that had none
+    /// still gets a bounded drain rather than blocking forever.
+    #[tokio::test]
+    async fn retracting_does_not_spend_the_request_timeout() {
+        for budget in [None, Some(Duration::from_secs(30))] {
+            let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+            let message = suspend_message_with(&mut client, 10_000).await;
+            client.remaining_request_timeout = budget;
+
+            client.retract_partial_request(message).await;
+
+            assert_eq!(
+                client.remaining_request_timeout, budget,
+                "the cancel budget must not leak into the request's"
+            );
+        }
+    }
+
+    /// The drain that consumes the withdrawal's DONE must run under
+    /// [`CANCEL_TIMEOUT`], never under the request's own budget. A request
+    /// without a timeout is the case that matters: inheriting its `None` would
+    /// block forever on a server that never acknowledges the withdrawal, holding
+    /// the connection with no way for the application to intervene.
+    ///
+    /// Asserting the budget the read was *given* is the whole property; that
+    /// `tokio::time::timeout` honours a `Duration` is not this crate's to prove.
+    #[tokio::test]
+    async fn the_withdrawal_drain_runs_under_the_cancel_budget() {
+        for request_budget in [None, Some(Duration::from_secs(3600))] {
+            let (mut client, observed) = create_timeout_observing_client(vec![done_no_more()]);
+            let message = suspend_message_with(&mut client, 10_000).await;
+            client.remaining_request_timeout = request_budget;
+
+            client.retract_partial_request(message).await;
+
+            let seen = observed.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "the withdrawal reads exactly one DONE");
+            assert_eq!(
+                seen[0],
+                Some(CANCEL_TIMEOUT),
+                "request budget {request_budget:?} must not reach the withdrawal"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_finishes_the_packet_then_withdraws_streamed_data() {
+        for finish_parameter in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(2);
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.send_delay = Some(Duration::from_millis(500));
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            client
+                .begin_sp_executesql(
+                    "SELECT @p".to_string(),
+                    vec![streamed_varbinary("@p")],
+                    ExecuteOptions::new().cancel(&cancel),
+                )
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.cancel();
+            });
+            let start = tokio::time::Instant::now();
+            let error = if finish_parameter {
+                client.end_streamed_param().await.unwrap_err()
+            } else {
+                client
+                    .write_streamed_chunk(&vec![7; 10_000])
+                    .await
+                    .unwrap_err()
+            };
+            task.await.unwrap();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert_eq!(start.elapsed(), Duration::from_millis(500));
+            assert!(!client.is_connection_dead());
+            assert!(matches!(
+                client.streamed_write_state,
+                StreamedWriteState::Idle
+            ));
+            let bytes = sent.lock().unwrap();
+            if finish_parameter {
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(bytes[1] & 1, 1);
+            } else {
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], &[3, 3, 0, 8]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_retires_a_packet_that_cannot_finish() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        client
+            .begin_sp_executesql(
+                "SELECT @p".to_string(),
+                vec![streamed_varbinary("@p")],
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let error = client
+            .write_streamed_chunk(&vec![7; 10_000])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            8,
+            "no IGNORE, ATTENTION or TLS shutdown after a partial packet"
+        );
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_withdrawal_shares_the_original_cancellation_deadline() {
+        let (mut client, observed) = create_timeout_observing_client(vec![done_no_more()]);
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(3);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        client.retract_partial_request(message).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![Some(Duration::from_secs(2))]
+        );
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_withdrawal_keeps_deadline_when_timeout_is_reset() {
+        let (mut client, observed) = create_timeout_observing_client(vec![done_no_more()]);
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(3);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        cancel.cancel();
+        let deadline = message.cancellation_deadline().unwrap();
+        cancel.set_cancel_timeout_secs(0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(message.cancellation_deadline(), Some(deadline));
+        assert!(matches!(
+            message.check_cancellation(),
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        client.retract_partial_request(message).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![Some(Duration::from_secs(2))]
+        );
+        assert!(!client.is_connection_dead());
+    }
+
+    /// A parked streamed write owns the connection until it closes. A second
+    /// execute would interleave its RPC into the half-written request.
+    #[tokio::test]
+    async fn begin_execute_prepared_rejects_a_second_call_while_streaming() {
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+
+        let mut second = PreparedStatement::new("SELECT 1");
+        let err = client
+            .begin_execute_prepared(&mut second, Vec::new(), &mut orphaned, ())
+            .await
+            .expect_err("the connection is busy with a parked streamed write");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// Always Encrypted resolves parameter ciphertext from the complete value
+    /// set before the request is built, which a value that only arrives in later
+    /// chunks cannot satisfy. The combination is refused rather than silently
+    /// sent as plaintext.
+    #[tokio::test]
+    async fn begin_execute_prepared_rejects_streamed_params_under_always_encrypted() {
+        use crate::connection::client_context::ExecutionColumnEncryptionSetting;
+        use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+        use crate::message::login::Feature;
+
+        let mut negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let mut feature = AlwaysEncryptedFeature::default();
+        feature.set_acknowledged(true);
+        negotiated_settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            negotiated_settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+            Vec::new(),
+        );
+
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+        let err = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                ExecuteOptions::new().column_encryption(ExecutionColumnEncryptionSetting::Enabled),
+            )
+            .await
+            .expect_err("a streamed value cannot be encrypted");
+        assert!(matches!(err, UsageError(_)));
     }
 
     /// `write_streamed_chunk` with no active streamed parameter is a usage error.
@@ -10015,6 +22208,7 @@ mod tests {
         client.remaining_request_timeout = Some(Duration::from_secs(1));
         client.end_streamed_param().await.unwrap();
     }
+
     /// Little-endian UTF-16 encoding of `s`, matching how parameter names are
     /// written on the wire (length-prefixed unicode).
     fn utf16le(s: &str) -> Vec<u8> {
@@ -10166,6 +22360,19 @@ mod tests {
         }
     }
 
+    /// Longest message SQL Server itself sends, in characters.
+    const SQL_SERVER_MESSAGE_UNITS: usize = 2_048;
+
+    /// A message near the protocol's 65,535-unit limit.
+    const LONG_ERROR_MESSAGE_UNITS: usize = 60_000;
+
+    fn error_token_with_message_units(units: usize) -> crate::token::tokens::ErrorToken {
+        crate::token::tokens::ErrorToken {
+            message: "x".repeat(units),
+            ..error_token_with_severity(16)
+        }
+    }
+
     /// A server-acknowledged connection reset must return the client to its
     /// login baseline: session-bound caches emptied and negotiated
     /// database/language/collation restored to their login values, so a
@@ -10275,6 +22482,439 @@ mod tests {
         );
     }
 
+    /// The fail-at-checkout guarantee: a request that carried the
+    /// RESETCONNECTION bit and completed without the server's ENVCHANGE ran
+    /// against a session that was never reset. The client fails that request and
+    /// marks itself dead so a pool discards the connection instead of handing a
+    /// dirty session to the next borrower.
+    #[tokio::test]
+    async fn unacknowledged_reset_fails_the_carrying_request_and_marks_it_dead() {
+        // No ResetConnection ENVCHANGE: the batch just completes.
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        let err = client
+            .execute(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                (),
+            )
+            .await
+            .expect_err("an unacknowledged reset must fail the carrying request");
+
+        assert!(
+            matches!(err, crate::error::Error::ConnectionResetNotAcknowledged),
+            "expected ConnectionResetNotAcknowledged, got {err:?}"
+        );
+        assert!(
+            client.is_connection_dead(),
+            "the connection must be marked dead so the pool discards it"
+        );
+        assert!(
+            !client.reset_pending(),
+            "the failure is reported once; the drain that follows must not repeat it"
+        );
+    }
+
+    /// A row-returning carrier fails at its COLMETADATA rather than waiting for
+    /// the rows to be read: the reset ENVCHANGE precedes everything the request
+    /// produces, so the first result-set token already proves it never arrived.
+    #[tokio::test]
+    async fn unacknowledged_reset_fails_a_row_returning_carrier_at_its_metadata() {
+        let mut client = create_test_client_with_tokens(vec![empty_col_metadata(), done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        let err = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect_err("an unacknowledged reset must fail the carrying request");
+
+        assert!(
+            matches!(err, crate::error::Error::ConnectionResetNotAcknowledged),
+            "expected ConnectionResetNotAcknowledged, got {err:?}"
+        );
+        assert!(client.is_connection_dead());
+    }
+
+    /// The server's own diagnostic must win over the reset verdict: a request
+    /// that fails outright tells the caller something more actionable, and the
+    /// unacknowledged reset is still caught on the next token.
+    #[tokio::test]
+    async fn server_error_on_the_carrier_is_not_masked_by_the_reset_verdict() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_no_more(),
+        ]);
+        client.prepare_reset_connection(false);
+
+        let err = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect_err("the server error must surface");
+
+        assert!(
+            matches!(err, crate::error::Error::SqlServerError { .. }),
+            "the server diagnostic must reach the caller, got {err:?}"
+        );
+        assert!(
+            client.is_connection_dead(),
+            "the unacknowledged reset is not lost: the drain that follows the error \
+             still condemns the connection"
+        );
+    }
+
+    /// The bit is armed on the connection but consumed by the packet writer, so
+    /// an arm that never reached the wire owes nothing. This is the shape a
+    /// transparent reconnect leaves behind — the armed bit died with the old
+    /// transport — and it must never condemn the responses that follow.
+    #[tokio::test]
+    async fn armed_reset_that_never_reached_the_wire_condemns_nothing() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        client
+            .drain_stream()
+            .await
+            .expect("a response no reset bit was sent on must not be condemned");
+
+        assert!(
+            !client.is_connection_dead(),
+            "nothing was ever owed, so nothing may be failed"
+        );
+        assert!(
+            client.reset_pending(),
+            "the reset is still armed and will ride the next request"
+        );
+    }
+
+    #[test]
+    fn attention_ack_does_not_disprove_reset_for_an_interrupted_request() {
+        use crate::connection::transport::network_transport::AttentionSettlement;
+
+        let mut client = create_test_client();
+        client.reset_state = ResetAckState::AwaitingAck;
+        client.recovery_context.session_recovery_negotiated = true;
+
+        assert!(client.apply_attention_settlement(AttentionSettlement {
+            tokens: vec![Tokens::Done(DoneToken {
+                status: DoneStatus::ATTN,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            })],
+            overflowed: false,
+        }));
+        assert!(!client.is_connection_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(client.reset_pending());
+
+        client.settle_abandoned_reset_verification();
+        assert!(!client.reset_pending());
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Regression: a carrying request whose response is abandoned before a
+    /// reset verdict must not leave its suspicion behind for the *next* request
+    /// to answer for. Doing so would mark a healthy connection dead on a token
+    /// that had nothing to do with the reset.
+    #[tokio::test]
+    async fn abandoned_carrier_does_not_condemn_the_next_request() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        // Send the carrier but never read its response: the bit is on the wire
+        // and no verdict token was observed.
+        client
+            .send_query_batch(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                ().into(),
+            )
+            .await
+            .expect("the carrier is sent");
+        assert!(
+            client.reset_pending(),
+            "precondition: the reset is still outstanding when the response is abandoned"
+        );
+
+        // The next, unrelated request must complete normally.
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("an unrelated request must not answer for an abandoned reset");
+
+        assert!(
+            !client.is_connection_dead(),
+            "the next request must not be charged for a reset it never carried"
+        );
+        assert!(
+            !client.reset_pending(),
+            "the abandoned reset is settled, not left outstanding forever"
+        );
+    }
+
+    /// The other abandonment shape: the response *was* partially read — a
+    /// non-verdict token advanced tracking to `AwaitingAck` — and then ended
+    /// before any token could settle it. Cancellation landing mid-response
+    /// produces this, and like the never-read case it must not be carried into
+    /// the next request.
+    #[tokio::test]
+    async fn abandoned_carrier_that_reached_awaiting_ack_is_settled_too() {
+        // One INFO token, then the stream ends: INFO is not evidence the
+        // request ran, so tracking advances to `AwaitingAck` and stops there.
+        let mut client = create_test_client_with_tokens(vec![info_token(0, 0, "mid-response")]);
+        client.prepare_reset_connection(false);
+
+        client
+            .execute(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                (),
+            )
+            .await
+            .expect_err("the scripted stream ends before the batch completes");
+        assert!(
+            !client.is_connection_dead(),
+            "an inconclusive token must not condemn the carrier itself"
+        );
+        assert!(
+            client.reset_pending(),
+            "precondition: the acknowledgement is still outstanding when the response ends"
+        );
+
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect_err("the scripted transport has no tokens left");
+
+        assert!(
+            !client.is_connection_dead(),
+            "the next request must not be charged for the abandoned reset"
+        );
+        assert!(
+            !client.reset_pending(),
+            "the abandoned reset is settled at the start of the next command"
+        );
+    }
+
+    /// The settlement above must not fire on the ordinary armed-but-unsent
+    /// reset: starting a command while a reset is armed is the normal path, and
+    /// that command is the one that carries the bit.
+    #[tokio::test]
+    async fn starting_a_command_leaves_an_unsent_armed_reset_alone() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: crate::token::tokens::EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        client.prepare_reset_connection(false);
+
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("the armed reset must still ride this request and be acknowledged");
+
+        assert!(!client.is_connection_dead());
+        assert!(
+            !client.reset_pending(),
+            "the acknowledgement arrived on the carrying request"
+        );
+    }
+
+    /// Session recovery supersedes a pending reset: the new login is already at
+    /// the session defaults and the old bit died with the old transport, so no
+    /// acknowledgement is coming. Adopting the recovered session must clear the
+    /// pending reset, or the first response on a healthy new connection would
+    /// report it as unacknowledged and throw the connection away.
+    #[tokio::test]
+    async fn adopting_a_recovered_session_clears_a_pending_reset() {
+        // A server error is inconclusive about the reset, and the stream ends
+        // there — the shape of a session that errored and then dropped — so the
+        // reset is still outstanding when recovery kicks in.
+        let mut client =
+            create_test_client_with_tokens(vec![Tokens::Error(error_token_with_severity(16))]);
+        client.prepare_reset_connection(false);
+        let _ = client.execute("SELECT 1".to_string(), ()).await;
+        assert!(client.reset_pending());
+
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(TestTransport::with_tokens(vec![done_no_more()])),
+                crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .expect("adopting a recovered session must succeed");
+
+        assert!(
+            !client.reset_pending(),
+            "a fresh login supersedes the reset it can no longer acknowledge"
+        );
+        client
+            .drain_stream()
+            .await
+            .expect("the recovered session must serve responses normally");
+    }
+
+    /// A recovered session is a different session — new login, so impersonation
+    /// and every other session-scoped effect is gone — but its settings block
+    /// is built fresh and starts counting at zero. The count must therefore be
+    /// carried forward and advanced, or it moves *backwards* across a reconnect
+    /// and a per-database cache entry from before the blip can match after it.
+    #[tokio::test]
+    async fn adopting_a_recovered_session_advances_the_database_change_count() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        // Stand in for a session that has already seen some database activity.
+        client.negotiated_settings.database_change_count = 7;
+
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(TestTransport::with_tokens(vec![done_no_more()])),
+                crate::handler::handler_factory::create_test_negotiated_settings_internal(),
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .expect("adopting a recovered session must succeed");
+
+        assert_eq!(
+            client.database_change_count(),
+            8,
+            "the recovered session must not reuse a count a cache could already hold"
+        );
+    }
+
+    /// Regression: the cursor RPCs consume their responses via `drain_stream`
+    /// but never call `begin_command`, so settling only there left a cursor op
+    /// issued after an abandoned carrier to be condemned on its first token —
+    /// the exact false positive the settlement exists to prevent. Every cursor
+    /// entry point does call `check_and_reconnect`, so the settle lives there
+    /// too. Driven through `check_and_reconnect` directly, which is the shared
+    /// request boundary the cursor path relies on.
+    #[tokio::test]
+    async fn cursor_path_request_boundary_settles_an_abandoned_carrier() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        // Send a carrier but never read its response, leaving no reset verdict.
+        client
+            .send_query_batch(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                ().into(),
+            )
+            .await
+            .expect("the carrier is sent");
+        assert!(
+            client.reset_pending(),
+            "precondition: the acknowledgement is outstanding when the response is abandoned"
+        );
+
+        // A cursor op's boundary: no `begin_command`, only `check_and_reconnect`.
+        client
+            .check_and_reconnect(None, None)
+            .await
+            .expect("the boundary check must not fail");
+
+        assert!(
+            !client.reset_pending(),
+            "the cursor path's request boundary must settle the abandoned reset"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a cursor op must not be charged for a reset it never carried"
+        );
+    }
+
+    /// Regression: the arm is consumed by `PacketWriter::new` *before* any bytes
+    /// are written, so a message abandoned during serialization takes it with it
+    /// while leaving no dispatch record — e.g. a parameter-encoding failure,
+    /// which propagates without condemning the transport. The connection would
+    /// then sit in `Armed` forever: nothing carries the bit, so nothing reaches
+    /// `AwaitingAck`, and the session is silently never reset. The request
+    /// boundary must put the arm back.
+    #[tokio::test]
+    async fn an_arm_lost_with_an_abandoned_message_is_restored_at_the_next_boundary() {
+        use crate::message::messages::ResetConnectionMode;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: crate::token::tokens::EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        client.prepare_reset_connection(false);
+
+        // Simulate a message that consumed the arm and was then abandoned before
+        // anything reached the wire: the writer's mode is taken, and no dispatch
+        // was recorded.
+        let taken = client.transport.as_writer().take_reset_mode();
+        assert_eq!(
+            taken,
+            ResetConnectionMode::Reset,
+            "precondition: arm consumed"
+        );
+        assert!(
+            !client.transport.as_writer().take_reset_dispatched(),
+            "precondition: nothing reached the wire"
+        );
+
+        // The next request's boundary must put the arm back on the writer. This
+        // is asserted directly rather than via the scripted response: the mock
+        // replays its ResetConnection ENVCHANGE unconditionally, so collecting an
+        // acknowledgement proves nothing about whether the bit was actually sent.
+        client.settle_abandoned_reset_verification();
+        assert!(
+            client.reset_pending(),
+            "the reset is still owed; it must not be silently dropped"
+        );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the lost arm must be restored to the writer, or no request ever carries the bit"
+        );
+        // Put it back for the end-to-end leg (the assertion above consumed it).
+        client
+            .transport
+            .as_writer()
+            .set_reset_mode(ResetConnectionMode::Reset);
+
+        // ...so this request actually carries the bit and collects the ack.
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("the re-armed reset must ride this request");
+        assert!(
+            !client.reset_pending(),
+            "the restored arm must have been carried and acknowledged"
+        );
+        assert!(!client.is_connection_dead());
+    }
+
+    /// The fourth `receive_token` loop — `consume_done_token`, the INSERT BULK
+    /// preamble's response reader — must reach the same verdict as the other
+    /// three when the carrier's response lacks the acknowledgement.
+    #[tokio::test]
+    async fn unacknowledged_reset_is_caught_in_consume_done_token() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        client
+            .send_query_batch("SELECT 1".to_string(), ().into())
+            .await
+            .expect("the carrier is sent");
+
+        let err = client
+            .consume_done_token()
+            .await
+            .expect_err("an unacknowledged reset must fail here too");
+
+        assert!(
+            matches!(err, crate::error::Error::ConnectionResetNotAcknowledged),
+            "expected ConnectionResetNotAcknowledged, got {err:?}"
+        );
+        assert!(client.is_connection_dead());
+    }
+
     /// D3: a server fatal-error token (severity/class ≥ 20) marks the transport
     /// known-dead even on a still-open socket, so a pool checkout discards it.
     #[test]
@@ -10303,5 +22943,90 @@ mod tests {
             !client.is_connection_dead(),
             "a class < 20 error must not mark the connection dead"
         );
+    }
+}
+
+#[cfg(test)]
+mod procedure_name_quoting_tests {
+    use super::quote_procedure_name;
+
+    #[test]
+    fn regular_parts_are_bracketed() {
+        assert_eq!(quote_procedure_name("p").unwrap(), "[p]");
+        assert_eq!(quote_procedure_name("dbo.p").unwrap(), "[dbo].[p]");
+        assert_eq!(quote_procedure_name("db.dbo.p").unwrap(), "[db].[dbo].[p]");
+        // An empty middle part is legal: db..proc.
+        assert_eq!(quote_procedure_name("db..p").unwrap(), "[db]..[p]");
+    }
+
+    #[test]
+    fn delimited_parts_are_decoded_and_requoted() {
+        assert_eq!(quote_procedure_name("[my proc]").unwrap(), "[my proc]");
+        assert_eq!(
+            quote_procedure_name("[db].[dbo].[my proc]").unwrap(),
+            "[db].[dbo].[my proc]"
+        );
+        assert_eq!(quote_procedure_name("\"q p\"").unwrap(), "[q p]");
+        assert_eq!(quote_procedure_name("[p]];q]").unwrap(), "[p]];q]");
+        assert_eq!(quote_procedure_name("\"p\"\";q\"").unwrap(), "[p\";q]");
+    }
+
+    #[test]
+    fn group_numbers_survive() {
+        assert_eq!(quote_procedure_name("p;2").unwrap(), "[p];2");
+        assert!(quote_procedure_name("p;").is_err());
+        assert!(quote_procedure_name("p;x").is_err());
+        assert_eq!(quote_procedure_name("[p;q]").unwrap(), "[p;q]");
+        assert_eq!(quote_procedure_name("[p;q];2").unwrap(), "[p;q];2");
+        assert_eq!(quote_procedure_name("\"p;q\";2").unwrap(), "[p;q];2");
+        assert_eq!(quote_procedure_name("[p]];q];2").unwrap(), "[p]];q];2");
+        for name in ["[p;q];", "[p;q];x", "[p;q];2;3", "[p;q];2--x"] {
+            assert!(quote_procedure_name(name).is_err(), "{name}");
+        }
+    }
+
+    /// The point of the quoting: nothing an application can put in a procedure
+    /// name may escape the identifier and become a second statement.
+    #[test]
+    fn injection_attempts_stay_inside_the_identifier() {
+        for name in [
+            "p; DROP TABLE t",
+            "p--comment",
+            "p'x'",
+            "p]; DROP TABLE t--",
+            "p /* c */",
+        ] {
+            // Either outcome is safe: a name that cannot be a group number is
+            // rejected outright, and anything else is bracketed so the payload
+            // stays inside the identifier.
+            let Ok(quoted) = quote_procedure_name(name) else {
+                continue;
+            };
+            assert!(quoted.starts_with('['), "{name} -> {quoted}");
+            assert!(quoted.ends_with(']'), "{name} -> {quoted}");
+            let inner = &quoted[1..quoted.len() - 1];
+            assert!(
+                !inner.contains(']') || inner.contains("]]"),
+                "{name} -> {quoted} leaves an unescaped bracket"
+            );
+        }
+        // A closing bracket is doubled, not passed through.
+        assert_eq!(quote_procedure_name("a]b").unwrap(), "[a]]b]");
+    }
+
+    #[test]
+    fn unterminated_and_overlong_names_are_rejected() {
+        for name in [
+            "[unclosed",
+            "a.b.c.d.e",
+            "[p]x",
+            "[p]/*x*/",
+            "\"p\"x",
+            "",
+            ".p",
+            "p.",
+        ] {
+            assert!(quote_procedure_name(name).is_err(), "{name}");
+        }
     }
 }

@@ -22,6 +22,12 @@ class RecordingLogger:
         self.messages.append(message)
 
 
+def test_async_connection_exposes_user_facing_docstrings():
+    assert "Do not cancel" in mssql_py_core.PyAsyncConnection.__doc__
+    assert "autocommit" in mssql_py_core.PyAsyncConnection.connect.__doc__
+    assert "Idempotent" in mssql_py_core.PyAsyncConnection.close.__doc__
+
+
 # ---------------------------------------------------------------------------
 # Preview warning
 # ---------------------------------------------------------------------------
@@ -136,6 +142,46 @@ def test_connection_operations_reuse_connect_logger(client_context):
         assert await conn.commit() is None
 
         logger.messages.clear()
+        cursor = conn.cursor()
+        await cursor.execute("SELECT 1 AS value", use_prepare=False)
+        assert any(
+            "PyAsyncCursor::execute: query executed successfully; "
+            "has_result_set=true; column_count=1; description_materialization_ms="
+            in message
+            for message in logger.messages
+        )
+        assert await cursor.fetchone() == (1,)
+
+        decimal_module = sys.modules["decimal"]
+        sys.modules["decimal"] = None
+        logger.messages.clear()
+        try:
+            with pytest.raises(
+                mssql_py_core.InternalError,
+                match="Query executed but cursor description materialization failed",
+            ):
+                await cursor.execute(
+                    "SELECT CAST(1 AS decimal(10, 2)) AS value", use_prepare=False
+                )
+        finally:
+            sys.modules["decimal"] = decimal_module
+        assert cursor.description is None
+        assert any(
+            "PyAsyncCursor::execute: cursor description materialization failed; "
+            "column_count=1; elapsed_ms=" in message
+            for message in logger.messages
+        )
+        with pytest.raises(
+            mssql_py_core.ProgrammingError, match="No active result set"
+        ):
+            await cursor.fetchone()
+
+        await cursor.execute("SELECT 2 AS recovered_value", use_prepare=False)
+        assert cursor.description[0][:2] == ("recovered_value", int)
+        assert await cursor.fetchone() == (2,)
+        await cursor.close()
+
+        logger.messages.clear()
         await conn.close()
         assert any(
             "PyAsyncConnection::close: connection closed" in message
@@ -147,6 +193,9 @@ def test_connection_operations_reuse_connect_logger(client_context):
 
 @pytest.mark.integration
 def test_autocommit_defaults_false_and_can_be_enabled(client_context):
+    # TODO: When mode changes are supported, cover lazy begin, restart after
+    # commit/rollback, both mode transitions, context finalization, and
+    # cleanup-error precedence.
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)

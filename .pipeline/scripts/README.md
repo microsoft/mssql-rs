@@ -7,11 +7,20 @@ This directory contains scripts used by the Azure DevOps pipeline to configure a
 Boots a SQL Server docker container on an x64 1ES agent so ARM test jobs can
 run against a real SQL Server without depending on a static (ACI) IP address.
 The SQL host job and the ARM test jobs run concurrently and rendezvous through
-pipeline-artifact sentinels; the SA password is derived deterministically from
-the build context so no secret is transported between jobs.
+pipeline-artifact sentinels. `InitializeValidation` generates a cryptographically
+random SA password once and exposes it only as a secret-marked output variable.
+Only cross-pool SQL jobs map that output via `stageDependencies`; standalone
+SQL jobs retain job-local random passwords.
 
-- **start.sh** — Receives the SA password (derived by `derive-sql-password.sh`
-  in the YAML templates), generates certs (adding the host's private VNet IPv4
+- **generate-shared-password.py** — Runs in `InitializeValidation.Initialize`
+  after the PR duplicate check (CI explicitly reports nonduplicate). Produces
+  a SQL-policy prefix plus 192 random bits and an independent nonsecret
+  generation ID. RNG failure fails initialization; there is no fallback.
+- **import-sql-password.sh / Import-SqlPassword.ps1** — Validate explicitly
+  mapped `SHARED_SQL_PASSWORD` and `SQL_CREDENTIAL_GENERATION`, then establish
+  the job's secret `SQL_PASSWORD` and `SQL_PASSWORD_GENERATED` marker. Missing,
+  unresolved, or malformed outputs fail without regenerating a password.
+- **start.sh** — Receives the imported SA password, generates certs (adding the host's private VNet IPv4
   as an extra SAN via `EXTRA_IP_SAN`), starts the SQL container, and publishes
   the `sql-ready-<instanceId>` sentinel carrying the endpoint plus
   `ca.crt`/`mssql.pem`.
@@ -20,9 +29,221 @@ the build context so no secret is transported between jobs.
   once every expected sentinel has been published.
 - **teardown.sh** — Stops and removes the SQL container and network.
 
+Endpoint and teardown artifacts are namespaced by the nonsecret generation ID
+and stage attempt. Endpoints also carry the generation ID; both Linux and
+Windows pollers reject a mismatch before exposing the endpoint. Artifacts never
+contain the credential. Rerun the entire consuming stage to restart its host
+alongside tests, retaining the original initialization output. Do not rerun
+initialization while consumers are active; queue a new run when reinitializing.
+Local tests cover the contract, not Azure Pipelines' output retention or masking
+on retries; those require a scoped live validation.
+
+`scripts/test_shared_sql_credentials.py` runs in both the Windows packaging
+checks and a focused Linux build-job step. The suite requires PowerShell on
+Windows and Bash on Linux, so a missing native shell fails rather than silently
+skipping that platform's executable regressions. The other platform's shell
+cases may skip when its interpreter is unavailable.
+
 See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
+
+### docker-cargo-run.sh
+
+Wraps `docker run` and forwards the `MSSQL_RS_PUBLIC` and `MSSQL_RS` Cargo feed
+tokens with `cargo:token` providers only for non-PR execution. Azure Pipelines
+automatically supplies `BUILD_REASON`; `PullRequest` removes both feeds' token
+and provider variables from the Docker process environment and adds no Cargo
+credential arguments. Other reasons (or an unset reason for local use) retain
+authenticated forwarding for each populated token. Absent, empty, or unresolved
+Azure `$(...)` token values are omitted, including their providers. No token
+values, lengths, or presence diagnostics are logged.
+
+PR-only callers must not map feed secrets into their step environments. Shared
+PR/CI callers gate those mappings with
+`${{ if ne(variables['Build.Reason'], 'PullRequest') }}`; Cargo authentication and
+CI feed configuration are already non-PR-only. This wrapper is not a sandbox
+against arbitrary PR code, caller-supplied Docker arguments, mounted credentials,
+or credentials inherited from an agent. Keeping live feed secrets out of PR jobs,
+isolating agents, and limiting service-token permissions remain deployment
+requirements. Actual PR secret availability and live permissions have not been
+verified by this hardening.
+
+Run the mocked-Docker and template-gating regression tests without Docker or feed
+access using `python -m pytest scripts/test_docker_cargo_run.py -q` (Bash required).
+The Linux validation job enforces these executable tests; Windows runs the
+template checks and skips executable cases only when Bash is not installed.
+
+### stamp-crate-versions.ps1
+
+Stamps the selected crates (by default `mssql-tds` and `mssql-mock-tds`) from the
+first selected crate's source version and aligns the mock crate's inline
+`mssql-tds` dependency. Official builds retain the source SemVer, including
+prerelease/build metadata. Non-official scheduled builds append
+`-nightly.YYYYMMDD`; other non-official builds append `-dev.YYYYMMDD.BuildId`.
+Existing prerelease suffixes are retained. Non-official source build metadata
+is rejected because appending after `+` would not create a prerelease.
+
+```powershell
+.\.pipeline\scripts\stamp-crate-versions.ps1 -BuildReason Manual -BuildId 123 -WhatIf
+```
+
+`BuildId` must be a positive ASCII decimal integer without leading zeroes, even
+on official/scheduled builds. `BuildReason` is an ASCII alphanumeric identifier
+starting with a letter (for example `Manual`, `PullRequest`, or `Schedule`).
+`IsOfficial` accepts only `True`/`False` (case insensitive). Crate directory names
+must be unique bare names containing ASCII letters, digits, `_` or `-`, starting
+with a letter or digit; paths/traversal are not supported. `RepositoryRoot` must
+not contain control characters or Azure logging commands.
+
+The script deliberately supports a restricted manifest layout, not arbitrary
+TOML: one bare `[package]` table with one bare `version` key containing a
+double-quoted, single-line SemVer. Core components must fit Cargo's unsigned
+64-bit representation. Duplicate declarations, inherited versions, quoted
+package keys/table names, multiline package strings and already stamped source
+versions fail explicitly. The mock crate requires one single-line inline
+`mssql-tds` entry in `[dependencies]`, with bare keys, no escaped values and one
+literal SemVer `version`; quoted keys and multiline strings in any of the mock
+crate's dependency sections (including dev/build and target-specific sections)
+are unsupported. Ordinary indentation, comments and LF/CRLF are preserved.
+Quoted dependency-name segments in dependency subtable headers are also
+unsupported. Target table kinds must be bare (for example
+`[target.'cfg(windows)'.dev-dependencies]`, not a quoted `dev-dependencies`
+segment); the target selector itself may still be quoted. This restriction also
+applies to dependency subtables and escaped quoted table-kind spellings.
+Root keys must be bare, and package/dependency/target declarations must use
+explicit table headers rather than root dotted or inline assignments.
+Target-parent tables (`[target]` or `[target.'cfg(...)']`) may contain only comments
+and whitespace; put dependency declarations under their explicit dependency
+table headers. These checks do not apply to similarly named metadata keys.
+Package metadata arrays of tables (such as cargo-release replacement arrays)
+are supported; arrays of package/version, dependency, or target tables are not.
+Quoted target selectors may contain closing brackets, and quoted dependency
+paths may contain braces; these characters are not treated as table delimiters.
+Nested arrays and multiline strings are rejected across the entire manifest
+(including package metadata) before section extraction, so array elements or
+string contents cannot hide or impersonate declarations. Use ordinary strings
+for metadata examples rather than multiline TOML strings. One-dimensional
+arrays remain supported. Backslashes in single-quoted literal dependency paths
+are preserved; escape sequences in double-quoted dependency values remain
+unsupported.
+Triple-quote text inside ordinary strings or comments is preserved;
+only actual multiline-string delimiters are rejected.
+Multiline arrays in package fields or unrelated dependencies are supported, as
+are inline feature arrays and comments on table headers. Dependency declarations
+are counted only in dependency tables, not in features or metadata. Inline
+dependency fields are separated outside quoted strings and arrays, so a
+version-like substring inside a path is never treated as the version field.
+Renamed dependencies whose `package` is `mssql-tds` are rejected in inline and
+table forms, including dev/build and target-specific dependencies, rather than
+leaving an alias on an incompatible source requirement. Other renamed packages
+remain supported. Dependency field keys must be bare and dependency `package`
+names must be unescaped literals so alternate spellings cannot hide an alias.
+The reserved `mssql-tds` dependency key must not contain a `package` field: it
+must identify `mssql-tds` directly, never rename another package to that key.
+
+All selected source versions and planned replacements are validated before
+printing versions, emitting pipeline variables or writing any manifest. A
+validation failure in a later manifest leaves earlier manifests unchanged.
+This is preflight validation, not a filesystem transaction: an I/O failure
+during the write phase can still leave some files updated. `-WhatIf` performs
+the same validation without writing files or emitting pipeline variables.
+Rejected values are not echoed in validation errors. These checks harden
+release inputs and logging; they do not establish a pipeline trust boundary.
+
+The executable regression cases run in the existing release-test CI selector:
+
+```powershell
+python -m pytest scripts/test_release_pipeline.py -k crate_stamp -q
+```
+
+### clone-mssql-python.sh
+
+Both the macOS cross-repo tests and the full upstream suite against the Rust
+ODBC replacement use the full commit SHA in
+[`../mssql-python-revision.txt`](../mssql-python-revision.txt) for PR validation.
+Non-PR pipeline runs fetch the latest upstream `main` instead. The shared script
+uses Azure Pipelines' `BUILD_REASON`: `PullRequest` (or unset for local use) selects
+the pin; other reasons, including manual and scheduled CI, select `main`.
+Both modes check out detached and log HEAD. Invalid or unavailable PR pins fail
+without falling back to main; an unavailable CI main fails without using the pin.
+PR-description overrides are not supported.
+
+From the repository root, with Bash and Git installed, reproduce the checkout:
+
+```bash
+bash .pipeline/scripts/clone-mssql-python.sh
+```
+
+The default destination is `../mssql-python` and must not already exist. To avoid
+touching a developer checkout, select a new destination explicitly:
+
+```bash
+MSSQL_PYTHON_CLONE_DIR=/tmp/mssql-python-pinned bash .pipeline/scripts/clone-mssql-python.sh
+```
+
+Existing local workflows such as `dev/test-python.sh --mssql-python` still use
+the developer's sibling checkout. Set `BUILD_REASON=IndividualCI` when invoking
+the clone script to follow main locally. Use the logged HEAD as the pin to
+reproduce a specific CI run.
+A source pin does not freeze container tags or package indexes.
+
+Python test failures in both cross-repo jobs block PR validation against the pin.
+In non-PR CI they report warnings and mark the test step `SucceededWithIssues`,
+without blocking the pipeline. Per-file crashes and timeouts reported as test
+failures by the ODBC runner follow the same policy. Checkout, build, and
+test-harness failures remain blocking in both modes. JUnit results are still
+published, including failed tests.
+
+The ODBC runner treats per-file pytest exit 2 as a test failure because a driver
+import error can prevent collection. Pytest internal/usage errors (3/4) and
+command-launch failures remain harness errors.
+
+Upstream's `pytest.ini` deselects `stress`-marked tests by default. The ODBC job
+overrides that with `PYTEST_MARK_EXPR="not slow"` (template parameter
+`pytestMarker`), so the same pass also covers multithreaded load from 2 to 100
+threads, pool exhaustion, GIL release, and large result sets, under the same
+blocking policy as the rest of the suite. Only the `slow` tests, including the
+fixed 5-minute sustained-load test, are left out; `pytestMarker: ''` selects
+every test. Leaving `PYTEST_MARK_EXPR` unset keeps upstream's default.
+
+Tests can be excluded through `PYTEST_DESELECT` (template parameter
+`pytestDeselect`, a list of pytest node IDs passed as `--deselect`). The default
+list holds `test_concurrent_connection_gil_release`, which asserts a >2x
+wall-clock speedup for 10 concurrent connects; CI agents measure 1.88x-2.82x, so
+it fails without a GIL or driver regression
+([#762](https://github.com/microsoft/mssql-rs/issues/762)). Remove it once the
+upstream test checks GIL release directly instead of a speedup ratio.
+
+The macOS job owns the locally built Rust and source-matched ODBC wheels and
+installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
+third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a
+pytest smoke check of the installed runtime: direct dependency versions/markers
+and the provider ID/driver path. Only the two native version pins are exempt.
+New missing/incompatible requirements fail setup; extras or URL requirements
+require explicit setup support rather than a custom dependency resolver.
+
+Provider API/id/path drift fails PR/local runs but produces a warning and a
+skipped smoke test on non-PR runs. Pytest publishes the setup result in either
+case; Docker/Colima provisioning, SQL startup, and driver tests run only after
+a successful smoke check. An advisory skip also skips Docker cleanup, but the
+upstream checkout is always cleaned up. The shared Docker template defaults to
+`succeeded()` for other callers. Native builds,
+packaging/install commands, dependency failures, import/loader errors, and
+unexpected exceptions remain blocking. Focused YAML assertions cover readiness
+gates and the shared default; actual PR jobs validate the build/install wiring.
+
+To advance the pin, review the upstream commit comparison, replace the full SHA,
+and validate both cross-repo jobs in the pin-update PR. CI following main never
+updates the pin automatically.
+
+Keep the pin under `.pipeline/`: the public PR pipeline's configured path
+exclusions cover documentation and `.github/`, not `.pipeline/`. Both cross-repo
+jobs run in `Build_mssql_python` on PRs and in non-PR CI, except dedicated fuzz
+and long-haul runs. Duplicate PR validation is reusable only
+for a successful run of the same PR head SHA; a pin edit changes that SHA and
+must receive fresh validation. Do not exclude the pin from the pipeline's
+server-side PR trigger filters.
 
 ### Generate-SqlCertificates.ps1
 Generates and installs self-signed certificates for SQL Server TLS encryption.
@@ -80,6 +301,159 @@ Enables Named Pipes and Shared Memory protocols for SQL Server via registry modi
 - Enables Shared Memory protocol via registry
 - Optionally restarts SQL Server service to apply changes
 - Provides detailed configuration status
+
+### run-bounded.sh
+Sourced helper providing `run_bounded <seconds> <command...>`. macOS ships no
+coreutils `timeout`, so long-running commands are bounded by running them in the
+background and killing them on overrun. Returns 124 on timeout.
+
+### start-colima-macos.sh
+Boots a Colima VM on a hosted macOS agent from the packaged toolchain, retrying
+on the transient lima hostagent boot failures seen in ~3% of runs. VM size stays
+at the long-standing 4 GiB / 4 CPU.
+
+Nothing is installed or downloaded here. `TOOLCHAIN_DIR` points at a payload
+fetched by `.pipeline/templates/macos-docker-steps.yml`; the script puts its
+`bin/` on PATH and copies the guest image into
+`~/Library/Caches/colima/caches/<cache_filename>`, which is where colima looks
+for it by sha256 of the URL it would otherwise download from. So a run contacts
+neither Homebrew nor ghcr.io nor github.com. The executable bit is restored on
+the way in because Universal Packages do not preserve POSIX modes.
+
+`TOOLCHAIN_DIR` is required, and a payload missing its manifest, any of
+`bin/{docker,colima,limactl}`, or its guest image fails the step by name. There
+is deliberately no Homebrew fallback: it would reintroduce the dependency this
+exists to remove, and a path that only runs when the primary breaks is a path
+nothing ever exercises.
+
+Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
+boot still reaches the delete/retry path rather than running until the pipeline
+step timeout. That bound sits above the slowest healthy boot observed (509s over
+113 runs in 2026-08; re-measured 2026-09 at max 453s over 123 runs) — the real
+failures give up within seconds, so a shorter bound would only kill
+slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps the retries as a whole.
+
+**Environment overrides:** `TOOLCHAIN_DIR` (required), `COLIMA_CPU`,
+`COLIMA_MEMORY`, `COLIMA_DISK`, `COLIMA_START_ATTEMPTS` (3),
+`COLIMA_START_TIMEOUT_SECONDS` (540), `COLIMA_BUDGET_SECONDS` (480).
+
+### build-macos-docker-toolchain.py
+Assembles the macOS docker toolchain payload for one architecture: the install
+prefixes of the `docker`, `colima` and `lima` Homebrew bottles, plus the Ubuntu
+guest disk image colima boots, plus a `manifest.json` recording versions, source
+URLs and digests. Published as a Universal Package by
+`.pipeline/macos-docker-toolchain-pipeline.yml`, so macOS jobs install the
+toolchain from our own feed rather than reaching Homebrew, ghcr.io and
+github.com at job time.
+
+The whole prefix is packaged, not just `bin/`: `limactl` resolves
+`../share/lima/lima-guestagent.*` and `../libexec/lima/*` relative to itself, so
+a bin-only payload yields a lima that cannot boot a VM. The build fails if the
+guest agent is missing rather than shipping one that would.
+
+The three prefixes merge into one tree, so each formula's `LICENSE`, `NOTICE`,
+`README.md` and `sbom.spdx.json` — all of which sit at the prefix root — go to
+`metadata/<formula>/`. Merged flat they would overwrite each other and leave the
+payload describing itself as whichever formula was extracted last.
+
+The guest image is not hard-coded. colima embeds a table of
+`<arch> <runtime> <url> <sha512> <filename>` for the image release it expects, so
+both the image and the checksum to verify it against are read out of the binary
+being packaged — colima 0.10.3 wants colima-core v0.10.4, which a hand-maintained
+mapping would get wrong.
+
+Runs on Linux and cross-builds both macOS payloads, so it verifies the Mach-O
+architecture of every binary it packs; a mis-resolved bottle fails the build
+instead of shipping.
+
+**Usage:** `build-macos-docker-toolchain.py --arch x86_64|arm64 --out <dir>`
+`--macos-major` sets the oldest macOS the payload must run on (default 14);
+bottles built for an older macOS run on newer hosts, so this is a compatibility
+floor rather than a target.
+
+### resolve-toolchain-version.py
+Decides whether the toolchain needs republishing, and at what version, so nobody
+has to read the feed and pick a number. The payload is a derived artifact — its
+bytes are a function of the three bottles, the macOS floor they are selected for,
+and `PAYLOAD_FORMAT` — so `payload_identity()` digests exactly those inputs and
+the decision falls out of comparing that digest with what is already published.
+
+Nothing is downloaded to decide. Bottle versions and digests come from registry
+metadata, and the published side is read back out of the package description,
+where publishing records it as `[layout:N id:...]`. The guest image is
+deliberately not part of the identity: colima carries the image URL and checksum
+in its own binary, so the colima bottle digest already covers it.
+
+A scheduled run that finds upstream unmoved publishes nothing, which keeps the
+version history a record of upstream movement rather than of the schedule
+firing. Otherwise the version is derived: a patch bump for an upstream release,
+a minor bump when `PAYLOAD_FORMAT` changed, since consumers resolving paths into
+the tree may have to change with it.
+
+The decision is made once for every architecture rather than per package, so a
+given version always means the same build produced all of them — worth more than
+skipping the occasional unchanged republish.
+
+**Usage:** `resolve-toolchain-version.py --org <url> --feed <project/feed> --arch
+x86_64 --arch arm64 --macos-major 14 [--version X.Y.Z|auto] [--force]`, reading
+`SYSTEM_ACCESSTOKEN`; emits `shouldPublish`, `packageVersion` and
+`identity_<arch>` as pipeline output variables. `--version auto` is the normal
+case — a sentinel rather than an empty string because the run panel refuses to
+queue with a blank string parameter. `--describe <manifest.json>
+--expect-identity <id>` is the publish side: it composes the description and
+fails if the built payload disagrees with what was resolved, which means a
+release landed mid-run. Covered by `test_resolve_toolchain_version.py`.
+
+### install-brew-bottle.py
+Installs the newest Homebrew bottle of a formula that exists for a given
+platform, by reading Homebrew's OCI registry on ghcr.io directly — no `brew`, no
+taps, no local Homebrew state. `build-macos-docker-toolchain.py` uses it to
+assemble the toolchain payload, cross-building both macOS architectures from
+Linux.
+
+Bottles are content-addressed, so the download is verified against the digest the
+registry advertises rather than a checksum vendored here. Bottles built for an
+older macOS are accepted (they run on newer hosts) but never a newer one; a macOS
+major the script doesn't recognize is an error rather than a guess, because
+guessing means handing the agent a binary it can't run. Formulas bottled `:all`
+are not selected — the CLIs installed here aren't, and taking one blindly is
+worse than reporting no match.
+
+Homebrew spells a formula revision two ways: the registry tag is `29.7.2-1` but
+the ref names inside it read `29.7.2.<platform>.1`, so the two are matched
+separately. Only the newest `MAX_VERSIONS_SCANNED` (15) versions are examined —
+each costs a registry round-trip, and this keeps a no-match failure from eating
+the caller's install budget before it reports.
+
+**Usage:** `install-brew-bottle.py <formula> <dest-bin-dir>`; prints the resolved
+version. `extract_bin` flattens just the executables (what the docker CLI
+fallback needs); `extract_prefix` keeps the whole install tree (what a packaged
+lima needs). `BOTTLE_ARCH_OVERRIDE` and `BOTTLE_MACOS_MAJOR_OVERRIDE` select a
+platform other than the running one — used by the toolchain producer to
+cross-build both macOS payloads from Linux, and handy for testing.
+Covered by `test_install_brew_bottle.py`.
+
+### start-sql-server-macos.sh
+Starts the SQL Server test container inside the Colima VM. Retries the image
+pull, recreates the container when SQL Server hits a SQLPAL startup crash
+(~13% of macOS runs), dumps container state plus logs on every failed attempt,
+and exits non-zero when the server never becomes reachable.
+
+The macOS job is capped at 60 minutes, so every retry is bounded by wall clock
+as well as by attempt count: `SETUP_BUDGET_SECONDS` covers the whole step,
+`PULL_BUDGET_SECONDS` carves out the pull phase so a slow registry cannot
+starve the retries, and `READY_TIMEOUT_SECONDS` bounds each container attempt.
+The pipeline step adds a `timeoutInMinutes` backstop over the top.
+
+Every bound is sized above the measured worst case of the *successful* runs, so
+it only ever catches a hang: pulls run p50 292s / p95 478s / max 724s over 112
+runs, and a healthy readiness wait maxes out at 157s over 97 runs. An earlier
+480s pull budget would have killed 4.5% of runs outright.
+
+**Environment:** requires `SQL_PASSWORD`. Overrides: `SQL_IMAGE`,
+`SQL_CONTAINER`, `SETUP_BUDGET_SECONDS` (1200), `PULL_BUDGET_SECONDS` (900),
+`READY_TIMEOUT_SECONDS` (240), `MAX_START_ATTEMPTS` (3),
+`PROBE_LOGIN_TIMEOUT_SECONDS` (5), `PROBE_INTERVAL_SECONDS` (3).
 
 ## Pipeline Integration
 

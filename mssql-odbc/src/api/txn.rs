@@ -11,7 +11,8 @@
 //! batch (`sqlcmisc.cpp:1760`), so the transaction-manager request carries
 //! `NoChange` and inherits the session setting.
 
-use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::connection::tds_client::{ExecuteOptions, TdsClient};
+use mssql_tds::core::CancelHandle;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use tracing::{debug, error};
 
@@ -22,15 +23,15 @@ use super::odbc_types::{
     SQL_TXN_REPEATABLE_READ, SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlReturn,
 };
 use super::sqlstate::{
-    ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_BUSY, ERR_CONNECTION_DOES_NOT_EXIST,
-    ERR_INVALID_ATTRIBUTE_VALUE, ERR_NO_ACTIVE_TDS_CLIENT, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED,
-    SQLSTATE_08S01, SQLSTATE_01000, SQLSTATE_08007, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED,
-    post_diag, post_tds_error,
+    ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_DOES_NOT_EXIST, ERR_INVALID_ATTRIBUTE_VALUE,
+    ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_08S01, SQLSTATE_01000, SQLSTATE_08007,
+    SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, claim_error_diag, post_diag, post_tds_error,
 };
 use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
-use crate::handles::dbc::ConnectionState;
-use crate::handles::{StmtHandle, handle_from_raw};
+use crate::handles::dbc::{ConnectionState, DbcState};
+use crate::handles::wire::{ClaimPolicy, LeaseReturn, WireLease, WireOwner};
+use crate::handles::{StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Maps an ODBC `SQL_TXN_*` bit to the T-SQL clause msodbcsql emits for it
 /// (`sqlcstr.cpp:56-60`). `None` for any value outside the accepted set, which
@@ -68,12 +69,10 @@ fn fail_cursor_close(dbc: &DbcHandle, op: &str) -> SqlReturn {
 /// Claims the connection's TDS client for a connection-scoped operation that no
 /// statement owns (commit, rollback, isolation change, autocommit change).
 ///
-/// Unlike [`super::exec_common::claim_connection`] there is no statement handle
-/// to attribute the claim to, so `active_stmt` is left alone; the caller must
-/// have closed every cursor first (see [`close_all_cursors`]) so the connection
-/// is genuinely idle. Returns `Err` with the diagnostic already posted to the
-/// DBC.
-pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, SqlReturn> {
+/// The caller must have closed every cursor first (see [`close_all_cursors`])
+/// so the connection is genuinely idle. Returns `Err` with the diagnostic
+/// already posted to the DBC.
+pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<WireLease, SqlReturn> {
     let Ok(mut state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned");
         return Err(SQL_ERROR);
@@ -83,36 +82,93 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
         post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
         return Err(SQL_ERROR);
     }
-    if state.active_stmt.is_some() {
-        error!("{op}: connection is busy with results for another statement");
-        post_diag(&mut state, ERR_CONNECTION_BUSY);
-        return Err(SQL_ERROR);
-    }
-    let Some(client) = state.client.take() else {
-        error!("{op}: no active TDS client");
-        post_diag(&mut state, ERR_NO_ACTIVE_TDS_CLIENT);
-        return Err(SQL_ERROR);
-    };
-    Ok(client)
-}
-
-/// Returns a client claimed by [`claim_dbc_client`].
-///
-/// If the DBC mutex is poisoned the client cannot be stored and is dropped, so
-/// the connection is marked disconnected rather than left as `Connected` with
-/// `client == None`. That combination otherwise reads as "claimed, not known
-/// dead" to `SQL_ATTR_CONNECTION_DEAD`, and a pool would keep handing out a DBC
-/// on which every operation fails with `ERR_NO_ACTIVE_TDS_CLIENT`.
-pub(super) fn release_dbc_client(dbc: &DbcHandle, client: TdsClient) {
-    match dbc.inner.lock() {
-        Ok(mut state) => state.client = Some(client),
-        Err(mut poisoned) => {
-            error!("release_dbc_client: dbc mutex poisoned; marking DBC disconnected");
-            // The lock guard is still reachable through the poison error, so the
-            // state can be corrected even though the mutex is poisoned.
-            poisoned.get_mut().connection_state = ConnectionState::Disconnected;
+    match state
+        .wire
+        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+    {
+        Ok(lease) => Ok(lease),
+        Err(claim_error) => {
+            error!(?claim_error, "{op}: connection is not available");
+            post_diag(&mut state, claim_error_diag(claim_error));
+            Err(SQL_ERROR)
         }
     }
+}
+
+/// Claims the connection's TDS client for an **internal** connection-scoped
+/// query, without posting any diagnostic.
+///
+/// Unlike [`claim_dbc_client`], a refusal here is not an application-visible
+/// error: the caller must fall back to whatever it already knows. That mirrors
+/// msodbcsql's `RefreshShilohUDTCache` (`sqlccmd.cpp:10337`), which returns
+/// `void` — when the connection is busy it spawns a second connection, and if
+/// even that fails it simply leaves the cached value alone rather than failing
+/// the `SQLGetInfo` that triggered it.
+///
+/// Returns `None` — with no side effects and no diagnostic — when the DBC is
+/// not connected or the wire is reserved or checked out. On success the cached
+/// `USER_NAME()` entry is returned **with** the lease, read under the same
+/// lock: the caller uses it as the value to report if the lookup yields
+/// nothing, and reading it separately would let a session change land in
+/// between and attach one session's principal to another.
+pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(WireLease, u64, String)> {
+    let mut state = dbc.inner.lock().ok()?;
+    if state.connection_state != ConnectionState::Connected {
+        return None;
+    }
+    let generation = state.session_generation;
+    let cached = state
+        .database_user_name
+        .as_ref()
+        .map(|entry| entry.value.clone())
+        .unwrap_or_default();
+    // Snapshot the collation before the client leaves the DBC, exactly as
+    // `claim_connection` does: `SQL_COLLATION_SEQ` reads the live client when it
+    // is present and these fields when it is not, so a concurrent read during
+    // the lookup would otherwise report the empty string for a connection that
+    // answers normally on either side of it.
+    let cache = state
+        .wire
+        .client()
+        .map(super::get_info::collation_cache_inputs);
+    let lease = state
+        .wire
+        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+        .ok()?;
+    if let Some((code_page, char_set)) = cache {
+        state.last_collation_code_page = code_page;
+        state.last_char_set = char_set;
+    }
+    Some((lease, generation, cached))
+}
+
+/// Returns a lease claimed by [`claim_dbc_client`] or
+/// [`try_claim_idle_dbc_client`]. `false` means the operation's session is gone
+/// (see [`fail_lost_session`]).
+#[must_use]
+pub(super) fn release_dbc_client(dbc: &DbcHandle, client: WireLease) -> bool {
+    dbc.return_lease(client, LeaseReturn::Release)
+}
+
+pub(super) fn release_dbc_client_and_publish<R>(
+    dbc: &DbcHandle,
+    client: WireLease,
+    op: &str,
+    publish: impl FnOnce(&mut DbcState) -> R,
+) -> Result<R, SqlReturn> {
+    dbc.return_lease_and_publish(client, LeaseReturn::Release, publish)
+        .ok_or_else(|| fail_lost_session(dbc, op))
+}
+
+/// Fails a connection-scoped operation whose lease could not be returned. Its
+/// outcome belonged to a session `SQLDisconnect` has since torn down, so none of
+/// it is recorded: the attributes it would set outlive that session.
+pub(super) fn fail_lost_session(dbc: &DbcHandle, op: &str) -> SqlReturn {
+    error!("{op}: the session ended during the operation; its outcome is not recorded");
+    if let Ok(mut state) = dbc.inner.lock() {
+        post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
+    }
+    SQL_ERROR
 }
 
 /// Runs `sql` as a language batch on an already-claimed client and drains the
@@ -194,7 +250,7 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     // connection cursor-closed on the strength of that. The combination is
     // reachable in plain autocommit mode: nothing there ever sets
     // `local_tran_started`, and no other path sweeps, so a cursor left open
-    // across `SQLEndTran` would keep `active_stmt` claimed behind the DM's back
+    // across `SQLEndTran` would keep the wire reserved behind the DM's back
     // and lock out every other statement on the connection.
     //
     // msodbcsql returns before its own sweep here (`sqlctran.cpp:293` precedes
@@ -233,32 +289,29 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
         Ok(())
     };
 
-    release_dbc_client(dbc, client);
+    release_dbc_client_and_publish(dbc, client, op, |state| {
+        // Cleared unconditionally, matching msodbcsql's `Return:` label, so a failed
+        // commit cannot strand the connection permanently un-disconnectable.
+        state.local_tran_started = false;
 
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{op}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    // Cleared unconditionally, matching msodbcsql's `Return:` label, so a failed
-    // commit cannot strand the connection permanently un-disconnectable.
-    state.local_tran_started = false;
+        if let Err(e) = result {
+            error!(%e, "{op}: transaction-manager request failed");
+            // 08007 is ODBC's specific state for "connection failure during
+            // transaction": the commit or rollback did not reach the server, so its
+            // outcome is unknown to the application. Neither 08007 nor HY000 puts
+            // the connection into the suspended state, so this is a strictly more
+            // precise diagnostic, not a behavioural change.
+            post_tds_error(state, &e, SQLSTATE_08007);
+            return SQL_ERROR;
+        }
 
-    if let Err(e) = result {
-        error!(%e, "{op}: transaction-manager request failed");
-        // 08007 is ODBC's specific state for "connection failure during
-        // transaction": the commit or rollback did not reach the server, so its
-        // outcome is unknown to the application. Neither 08007 nor HY000 puts
-        // the connection into the suspended state, so this is a strictly more
-        // precise diagnostic, not a behavioural change.
-        post_tds_error(&mut state, &e, SQLSTATE_08007);
-        return SQL_ERROR;
-    }
-
-    debug!(
-        "{op}: transaction {} complete",
-        if commit { "commit" } else { "rollback" }
-    );
-    SQL_SUCCESS
+        debug!(
+            "{op}: transaction {} complete",
+            if commit { "commit" } else { "rollback" }
+        );
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Begins a transaction on an already-claimed client when the connection is in
@@ -266,13 +319,21 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 /// as holding user work. Called immediately before every statement execution;
 /// on failure the caller unwinds through `fail_with_tds`.
 ///
-/// Mirrors msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`). Running it
-/// per statement — rather than only at the autocommit switch — is what recovers
-/// from a transaction the server aborted or the application rolled back with
-/// raw T-SQL.
+/// Mirrors msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`), including
+/// its use of the statement's query timeout: `CheckOptions` passes
+/// `GetQueryTimeOut(lpstmt)` to `ExecTMRImmediate` so this implicit begin
+/// cannot outlast `SQL_ATTR_QUERY_TIMEOUT` any more than the statement it
+/// precedes. `timeout_secs` is that budget (already deducted for any elapsed
+/// time from earlier steps in the same call); `0` means unlimited. Running it
+/// per statement — rather than only at the autocommit switch — is what
+/// recovers from a transaction the server aborted or the application rolled
+/// back with raw T-SQL.
 ///
 /// The transaction-manager request carries `NoChange` so it inherits the
 /// session isolation level already applied by `SET TRANSACTION ISOLATION LEVEL`.
+///
+/// The owning statement's cancellation handle also bounds startup and settlement;
+/// standalone connection-scoped transaction operations do not use this helper.
 ///
 /// This runs before every statement, so it is a hot path: both steady states
 /// (autocommit on, and manual-commit with a transaction already open and
@@ -282,9 +343,15 @@ pub(super) fn begin_transaction_if_manual(
     dbc: &DbcHandle,
     client: &mut TdsClient,
     op: &str,
+    timeout_secs: u32,
+    cancel: &CancelHandle,
 ) -> Result<(), mssql_tds::error::Error> {
-    let (autocommit, already_recorded) = match dbc.inner.lock() {
-        Ok(state) => (state.autocommit, state.local_tran_started),
+    let (autocommit, already_recorded, generation) = match dbc.inner.lock() {
+        Ok(state) => (
+            state.autocommit,
+            state.local_tran_started,
+            state.session_generation,
+        ),
         Err(_) => {
             error!("{op}: dbc mutex poisoned reading autocommit");
             return Err(mssql_tds::error::Error::ImplementationError(
@@ -296,28 +363,43 @@ pub(super) fn begin_transaction_if_manual(
         return Ok(());
     }
 
-    if client.has_active_transaction() {
+    let result = if client.has_active_transaction() {
         // Steady state: transaction already open and already recorded, so there
         // is nothing to write back and no reason to retake the lock.
         if already_recorded {
             return Ok(());
         }
+        Ok(())
     } else {
         debug!("{op}: manual-commit mode with no active transaction — beginning one");
-        dbc.runtime
-            .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))?;
-    }
+        dbc.runtime.block_on(
+            client.begin_transaction_with_options(
+                TransactionIsolationLevel::NoChange,
+                None,
+                ExecuteOptions::new()
+                    .timeout_secs(timeout_secs)
+                    .cancel(cancel),
+            ),
+        )
+    };
 
-    // The transaction is open on the server at this point; failing to record it
-    // would leak it past commit/rollback and past disconnect.
+    // ATTENTION may arrive after BEGIN succeeded. Preserve the transaction
+    // state observed during settlement even when the owning statement is cancelled.
     let Ok(mut state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned recording transaction state");
         return Err(mssql_tds::error::Error::ImplementationError(
             "connection state is poisoned".to_string(),
         ));
     };
-    state.local_tran_started = true;
-    Ok(())
+    if state.connection_state != ConnectionState::Connected
+        || state.session_generation != generation
+    {
+        return Err(mssql_tds::error::Error::ConnectionClosed(
+            "the session ended while beginning a transaction".to_string(),
+        ));
+    }
+    state.local_tran_started = client.has_active_transaction();
+    result
 }
 
 /// Applies `SQL_ATTR_AUTOCOMMIT`.
@@ -387,17 +469,20 @@ pub(super) fn set_autocommit(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// - **No stale client-side state.** `prepare_reset_connection` drops the
 ///   session-bound caches at arm time, so a borrower can never be served from a
 ///   prepared handle the reset is about to invalidate.
-/// - **Fail at checkout.** `pending_reset_ack` suppresses the same-value
-///   short circuit in `set_txn_isolation`, so the pool's checkout
-///   `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` (D9/#343) always emits and
-///   carries the armed bit. A failed reset therefore surfaces inside the pool's
-///   `reset()` — before the connection is handed out — and that handler verifies
-///   the server acknowledged it rather than assuming the batch succeeding
-///   implies it.
+/// - **Fail at checkout.** `TdsClient` verifies the acknowledgement itself on
+///   whichever request carries the bit: if that request's response lacks the
+///   `ResetConnection` ENVCHANGE the client is marked dead and the request
+///   fails. For `mssql-python` the carrier is the checkout
+///   `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` (D9/#343), so a failed
+///   reset surfaces inside the pool's `reset()`; a consumer with a different
+///   checkout sequence gets the same guarantee on whatever request it sends
+///   first.
 ///
-/// A consumer that never issues the checkout isolation SET still gets a correct
-/// reset — the bit rides its first request, which is reset-before-execute — but
-/// loses the early discard, since nothing verifies the acknowledgement.
+/// `server_isolation_unknown` is set here for a different reason: SQL Server's
+/// reset does not restore the isolation level, so the driver's cached value can
+/// no longer be trusted and the next `SQL_ATTR_TXN_ISOLATION` must not
+/// short-circuit. It is set before the client is claimed so no concurrent
+/// checkout can slip through against a stale cache.
 ///
 /// This is *not* msodbcsql's behavior. msodbcsql arms the bit and then
 /// immediately sends its own re-sync batch on the driver statement
@@ -428,12 +513,31 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // D4: read the transaction flag *before* claiming the client. Every other
     // claim site in this file does the same, and the ordering matters: if this
     // lock were taken after the claim and turned out to be poisoned, the early
-    // return would drop the owned client, leaving `state.client == None` while
+    // return would drop the owned lease, leaving the wire checked out while
     // `connection_state` is still `Connected` — which the cached liveness read
     // interprets as "busy but healthy", so the pool would keep handing out a
     // connection that can never serve a request again.
+    //
+    // The isolation cache is invalidated in the same lock rather than after the
+    // client is released: from the moment this connection is being recycled the
+    // driver cannot vouch for the server's isolation level, and setting it here
+    // leaves no window in which another thread's checkout SET could still
+    // short-circuit. Arming may yet fail below, in which case the flag costs at
+    // most one redundant SET on a connection the pool is about to discard.
+    //
+    // The cached database user goes with it, for the same reason and one more:
+    // `release_dbc_client` below makes the client claimable again a few lines
+    // before the post-arm block runs, so a clear deferred to there would leave a
+    // window in which `SQL_USER_NAME` still answers from this borrower's
+    // principal. Clearing here also covers the rollback-failure path, which
+    // returns before that block is reached.
     let started = match dbc.inner.lock() {
-        Ok(state) => state.local_tran_started,
+        Ok(mut state) => {
+            state.server_isolation_unknown = true;
+            state.database_user_name = None;
+            state.database_read_only = None;
+            state.local_tran_started
+        }
         Err(_) => {
             error!("{OP}: dbc mutex poisoned");
             return SQL_ERROR;
@@ -453,8 +557,8 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         return fail_cursor_close(dbc, OP);
     }
 
-    // Claim the idle client: this rejects a busy connection (open cursor /
-    // `active_stmt`) with ERR_CONNECTION_BUSY and a disconnected DBC with
+    // Claim the idle client: this rejects a busy connection (a reserved or
+    // checked-out wire) with ERR_CONNECTION_BUSY and a disconnected DBC with
     // ERR_CONNECTION_DOES_NOT_EXIST (08003, D7). From here until
     // `release_dbc_client` the DBC mutex is never taken again.
     let mut client = match claim_dbc_client(dbc, OP) {
@@ -488,56 +592,46 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     if result.is_err() {
         client.mark_connection_dead();
     }
-    release_dbc_client(dbc, client);
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{OP}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        // The rollback failed, so the reset was never armed and the server may
-        // still hold the transaction. Leave `local_tran_started` alone: claiming
-        // no transaction is open would be a lie the next operation acts on.
-        error!(%e, "{OP}: connection reset failed");
-        state.pending_reset_ack = false;
-        post_tds_error(&mut state, &e, SQLSTATE_08S01);
-        return SQL_ERROR;
-    }
-    // The reset is armed; the server discards the transaction before it
-    // processes the carrying request, so the driver's view catches up here.
-    state.local_tran_started = false;
-    // The checkout isolation SET must now emit so it carries the armed bit.
-    state.pending_reset_ack = true;
-    debug!("{OP}: reset armed; it will be carried by the next request");
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, OP, |state| {
+        if let Err(e) = result {
+            // The rollback failed, so the reset was never armed and the server may
+            // still hold the transaction. Leave `local_tran_started` alone: claiming
+            // no transaction is open would be a lie the next operation acts on.
+            error!(%e, "{OP}: connection reset failed");
+            post_tds_error(state, &e, SQLSTATE_08S01);
+            return SQL_ERROR;
+        }
+        // The reset is armed; the server discards the transaction before it
+        // processes the carrying request, so the driver's view catches up here.
+        state.local_tran_started = false;
+        // The reset restores the login's defaults — security context included, so
+        // an `EXECUTE AS` this borrower ran is undone — but the cached principal
+        // would survive it. The catalog key cannot catch that: the reset returns
+        // the session to the login's default database, which is usually the one
+        // the entry was already keyed to, so the next borrower would get a cache
+        // hit carrying the previous borrower's `USER_NAME()`. Re-asserted here with
+        // the isolation flag; the clear that closes the window is the early one.
+        state.database_user_name = None;
+        state.database_read_only = None;
+        // Re-assert the invalidation under the lock that records the completed arm,
+        // and bump the generation. The early set above narrows the window before
+        // arming; this pair is what makes the invalidation stick afterwards. A
+        // checkout SET that claimed the client first and is clearing the flag around
+        // now captured an older generation, so it will leave this newer invalidation
+        // alone instead of short-circuiting the next checkout against a session this
+        // reset just made unknown again.
+        state.server_isolation_unknown = true;
+        state.reset_generation = state.reset_generation.wrapping_add(1);
+        debug!("{OP}: reset armed; it will be carried by the next request");
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Manual-commit → autocommit. Any transaction holding user work is **committed**
 /// with a `01000` warning; a driver-begun piggyback transaction is rolled back
 /// silently (`sqlcconn.cpp:3692-3741`).
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    let had_user_txn = match dbc.inner.lock() {
-        Ok(state) => state.local_tran_started,
-        Err(_) => {
-            error!("{op}: dbc mutex poisoned");
-            return SQL_ERROR;
-        }
-    };
-
-    if had_user_txn {
-        let ret = end_transaction(dbc, true, op);
-        if ret != SQL_SUCCESS {
-            return ret;
-        }
-        let Ok(mut state) = dbc.inner.lock() else {
-            error!("{op}: dbc mutex poisoned");
-            return SQL_ERROR;
-        };
-        state.autocommit = true;
-        post_diag(&mut state, WARN_TRANSACTION_COMMITTED);
-        return SQL_SUCCESS_WITH_INFO;
-    }
-
     if close_all_cursors(dbc) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
@@ -545,27 +639,50 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         Ok(c) => c,
         Err(ret) => return ret,
     };
-    let result = if client.has_active_transaction() {
+    let had_user_txn = match dbc.inner.lock() {
+        Ok(state) => state.local_tran_started,
+        Err(_) => {
+            error!("{op}: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    let result = if had_user_txn && client.has_active_transaction() {
+        debug!("{op}: committing user transaction");
+        dbc.runtime.block_on(client.commit_transaction(None, None))
+    } else if client.has_active_transaction() {
         debug!("{op}: rolling back driver-begun transaction");
         dbc.runtime
             .block_on(client.rollback_transaction(None, None))
     } else {
         Ok(())
     };
-    release_dbc_client(dbc, client);
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{op}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        error!(%e, "{op}: rollback of driver-begun transaction failed");
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
-        return SQL_ERROR;
-    }
-    state.autocommit = true;
-    state.local_tran_started = false;
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, op, |state| {
+        if had_user_txn {
+            // A failed commit has an unknown server outcome, but retaining this
+            // flag would make SQLDisconnect reject the connection with 25000.
+            // Match end_transaction and msodbcsql's unconditional Return cleanup.
+            state.local_tran_started = false;
+        }
+        if let Err(e) = result {
+            if had_user_txn {
+                error!(%e, "{op}: transaction-manager request failed");
+                post_tds_error(state, &e, SQLSTATE_08007);
+            } else {
+                error!(%e, "{op}: rollback of driver-begun transaction failed");
+                post_tds_error(state, &e, SQLSTATE_HY000);
+            }
+            return SQL_ERROR;
+        }
+        state.autocommit = true;
+        state.local_tran_started = false;
+        if had_user_txn {
+            post_diag(state, WARN_TRANSACTION_COMMITTED);
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        }
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Autocommit → manual-commit. Opens a transaction immediately so `@@TRANCOUNT`
@@ -595,20 +712,17 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         dbc.runtime
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))
     };
-    release_dbc_client(dbc, client);
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{op}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        error!(%e, "{op}: could not begin transaction");
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
-        return SQL_ERROR;
-    }
-    state.autocommit = false;
-    state.local_tran_started = false;
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, op, |state| {
+        if let Err(e) = result {
+            error!(%e, "{op}: could not begin transaction");
+            post_tds_error(state, &e, SQLSTATE_HY000);
+            return SQL_ERROR;
+        }
+        state.autocommit = false;
+        state.local_tran_started = false;
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Applies `SQL_ATTR_TXN_ISOLATION` (msodbcsql `sqlcmisc.cpp:1754-1827`), and
@@ -616,7 +730,7 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
 pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     const OP: &str = "SQLSetConnectAttrW(SQL_ATTR_TXN_ISOLATION)";
 
-    let (level, tsql) = {
+    let (level, tsql, reset_generation) = {
         let Ok(mut state) = dbc.inner.lock() else {
             error!("{OP}: dbc mutex poisoned");
             return SQL_ERROR;
@@ -640,18 +754,15 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // outside one.
         //
         // This cache tracks only isolation set through this attribute. Raw T-SQL
-        // can therefore make SQLGetConnectAttr report a stale value. Pool reuse
-        // is still safe: a pending reset suppresses this short circuit, forcing
-        // the checkout SET to restore READ COMMITTED on the server.
+        // can therefore make SQLGetConnectAttr report a stale value.
         //
-        // The short circuit is suppressed while a pooling reset is armed: this
-        // SET is the request that carries the RESETCONNECTION bit, so skipping
-        // it would defer the reset to the borrower's first query and give up
-        // fail-at-checkout. That also closes the cross-borrower isolation leak:
-        // `sp_reset_connection` does not restore the isolation level (D9), so
-        // forcing this batch to emit is what returns the session to READ
-        // COMMITTED even when the previous borrower changed it via raw T-SQL.
-        if level == state.txn_isolation && !state.pending_reset_ack {
+        // The short circuit is suppressed once a pooling reset has been armed.
+        // SQL Server's reset does not restore the isolation level (D9), and the
+        // previous borrower may have changed it through raw T-SQL this cache
+        // never saw, so the cached value is no longer evidence about the server.
+        // Forcing this batch to emit is what returns the session to the level
+        // the new borrower asked for.
+        if level == state.txn_isolation && !state.server_isolation_unknown {
             debug!(value, "{OP}: already at this isolation level");
             return SQL_SUCCESS;
         }
@@ -667,7 +778,13 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             debug!(value, "{OP}: stored for next connect");
             return SQL_SUCCESS;
         }
-        (level, tsql)
+        // Captured *before* the round trip below and before the client is
+        // released: that ordering is what makes the guard work. Capturing after
+        // the send would read a generation a concurrent reset had already
+        // bumped, and this batch would then clear an invalidation it never
+        // satisfied. `a_reset_armed_mid_flight_is_not_cleared_by_the_older_isolation_set`
+        // pins the guard; keep the capture here.
+        (level, tsql, state.reset_generation)
     };
 
     if close_all_cursors(dbc) == SQL_ERROR {
@@ -701,49 +818,50 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
             .runtime
             .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None));
     }
-    // If a pooling reset was armed, this batch carried its RESETCONNECTION bit.
-    // Confirm the server actually acknowledged it: the batch succeeding is not
-    // evidence on its own, and an unacknowledged reset means the session was
-    // never returned to its login defaults.
-    let reset_unacknowledged = result.is_ok() && client.reset_pending();
-    if reset_unacknowledged {
-        client.mark_connection_dead();
-    }
-    release_dbc_client(dbc, client);
-
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{OP}: dbc mutex poisoned");
-        return SQL_ERROR;
-    };
-    if let Err(e) = result {
-        error!(%e, "{OP}: could not apply isolation level");
-        state.pending_reset_ack = false;
-        post_tds_error(&mut state, &e, SQLSTATE_HY000);
-        return SQL_ERROR;
-    }
-    if reset_unacknowledged {
-        error!("{OP}: the armed connection reset was not acknowledged by the server");
-        state.pending_reset_ack = false;
-        post_sql_error(
-            &mut state,
-            SQLSTATE_08S01,
-            0,
-            "The connection reset was not acknowledged by the server",
-        );
-        return SQL_ERROR;
-    }
-    state.pending_reset_ack = false;
-    // `value` was validated into `level` above.
-    state.txn_isolation = level;
-    debug!(tsql, "{OP}: isolation level applied");
-    SQL_SUCCESS
+    release_dbc_client_and_publish(dbc, client, OP, |state| {
+        if let Err(e) = result {
+            // A failed SET leaves the server's level unknown, so the flag stays set
+            // and the next attempt emits again. If the failure was an armed reset
+            // going unacknowledged, `TdsClient` has already marked the connection
+            // dead and `post_tds_error` maps it to 08S01 so the pool discards it.
+            error!(%e, "{OP}: could not apply isolation level");
+            post_tds_error(state, &e, SQLSTATE_HY000);
+            return SQL_ERROR;
+        }
+        // The batch reached the server, so the cache and the session agree again —
+        // unless a reset was armed while it was in flight, which made the server's
+        // level unknown all over again. That newer invalidation is not this batch's
+        // to clear.
+        if !settle_isolation_invalidation(state, reset_generation) {
+            debug!(
+                "{OP}: a reset was armed while this batch was in flight; the server's isolation level is unknown again"
+            );
+        }
+        // `value` was validated into `level` above.
+        state.txn_isolation = level;
+        debug!(tsql, "{OP}: isolation level applied");
+        SQL_SUCCESS
+    })
+    .unwrap_or_else(|ret| ret)
 }
 
 /// Rolls back a driver-begun transaction that carries no user work, so the
 /// session is not left holding locks when the socket drops. Best-effort: every
 /// failure is logged and swallowed, and no diagnostic is posted, because the
 /// caller is already tearing the connection down.
+///
+/// Skipped entirely once the process is exiting — see the round-trip guard
+/// below. `SQLDisconnect` sits between `SQLFreeHandle(SQL_HANDLE_STMT)` and
+/// `SQLFreeHandle(SQL_HANDLE_ENV)` in a host's teardown sequence, so it is on
+/// the same `DLL_PROCESS_DETACH` path those two already guard.
 pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
+    rollback_before_disconnect_inner(dbc, process_is_shutting_down())
+}
+
+/// The body of [`rollback_before_disconnect`], with the loader's shutdown flag
+/// passed in rather than read, so the skip arm below — unreachable in a live
+/// process — is testable.
+fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: bool) {
     const OP: &str = "SQLDisconnect(rollback)";
 
     // A cursor that will not close leaves the connection mid-batch, so the
@@ -755,33 +873,82 @@ pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
     }
 
     let client = match dbc.inner.lock() {
-        Ok(mut state) => state.client.take(),
+        Ok(mut state) => state
+            .wire
+            .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+            .ok(),
         Err(_) => {
             error!("{OP}: dbc mutex poisoned");
             return;
         }
     };
+    // If another thread holds the wire, the server rolls back on disconnect.
     let Some(mut client) = client else {
         return;
     };
-    if client.has_active_transaction()
+    // The rollback is a server round-trip, so it needs the scheduler's worker to
+    // drive the socket — and that worker is gone if the host is disconnecting
+    // from a static destructor or `onexit` handler during
+    // `DLL_PROCESS_DETACH`, where `block_on` would park this thread forever
+    // (AB#47510). Skipping costs nothing the exit does not already cost: this
+    // transaction carries no user work, and the server rolls it back when the
+    // socket closes — the same fallback the cursor-sweep bail-out above takes.
+    if process_is_shutting_down {
+        debug!("{OP}: process is exiting — the server will roll back on disconnect");
+    } else if client.has_active_transaction()
         && let Err(e) = dbc
             .runtime
             .block_on(client.rollback_transaction(None, None))
     {
         error!(%e, "{OP}: rollback failed; the server will roll back on disconnect");
     }
-    release_dbc_client(dbc, client);
+    // Nothing is recorded after it, and the caller tears the session down next.
+    let _ = release_dbc_client(dbc, client);
+}
+
+/// Records that `DbcState::txn_isolation` once again reflects the server, so
+/// `SQL_ATTR_TXN_ISOLATION` may take its same-value short circuit. Best-effort:
+/// a poisoned lock only leaves the cache marked untrusted, which costs one
+/// redundant SET rather than correctness.
+///
+/// **Post-connect only.** This clears the invalidation unconditionally, with no
+/// `reset_generation` guard, which is safe solely because its one caller runs
+/// right after login where no pool reset can be in flight. On a checkout path
+/// use [`settle_isolation_invalidation`] instead — the two look interchangeable
+/// at the call site, but only that one is race-safe.
+fn mark_server_isolation_known(dbc: &DbcHandle) {
+    match dbc.inner.lock() {
+        Ok(mut state) => state.server_isolation_unknown = false,
+        Err(_) => error!("dbc mutex poisoned; leaving the isolation cache marked untrusted"),
+    }
+}
+
+/// Clears the isolation invalidation on behalf of an isolation SET that reached
+/// the server, but only if no newer pool reset was armed while that SET was in
+/// flight.
+///
+/// `captured_generation` is the value the SET read before it sent. A mismatch
+/// means a reset armed after it went out, which made the server's isolation
+/// level unknown all over again — an invalidation this older SET did not
+/// satisfy and must not clear, or the next same-value checkout SET would
+/// short-circuit and leave the previous borrower's level in place.
+///
+/// Returns whether the cache is trusted on return.
+fn settle_isolation_invalidation(state: &mut DbcState, captured_generation: u64) -> bool {
+    if state.reset_generation != captured_generation {
+        return false;
+    }
+    state.server_isolation_unknown = false;
+    true
 }
 
 /// Applies transaction attributes that were set before `SQLDriverConnect` and so
 /// could not reach the server. Called once the login completes.
 ///
-/// A failure does not fail the connection — the session is usable — but it must
-/// not pass unnoticed either: an unapplied isolation level would leave
-/// `SQLGetConnectAttr` reporting a level the server is not actually running at.
-/// Returns `SQL_SUCCESS_WITH_INFO` with a diagnostic posted in that case, which
-/// the caller promotes into the `SQLDriverConnect` result.
+/// A settings failure leaves the session usable, so it returns
+/// `SQL_SUCCESS_WITH_INFO` with a diagnostic. A stale lease means the session
+/// was torn down while the settings ran; that returns `SQL_ERROR` / `08003`
+/// because the successful login no longer represents a usable connection.
 #[must_use]
 pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
     const OP: &str = "SQLDriverConnectW(transaction settings)";
@@ -798,6 +965,10 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
         }
     };
     if autocommit && isolation == SQL_TXN_READ_COMMITTED {
+        // A fresh login is already at READ COMMITTED, so the cache and the
+        // session agree even if this DBC carried an untrusted cache in from an
+        // earlier pool reset.
+        mark_server_isolation_known(dbc);
         return SQL_SUCCESS;
     }
 
@@ -829,6 +1000,7 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
              applied to the session: {e}"
         ));
     }
+    let isolation_applied = failure.is_none();
 
     if !autocommit
         && !client.has_active_transaction()
@@ -842,22 +1014,50 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
         });
     }
 
-    release_dbc_client(dbc, client);
+    finish_post_connect_txn_settings(dbc, client, isolation_applied, failure, OP)
+}
 
-    let Some(message) = failure else {
-        return SQL_SUCCESS;
-    };
-    let Ok(mut state) = dbc.inner.lock() else {
-        error!("{OP}: dbc mutex poisoned");
-        return SQL_SUCCESS;
-    };
-    post_sql_error(&mut state, SQLSTATE_01000, 0, &message);
-    SQL_SUCCESS_WITH_INFO
+fn finish_post_connect_txn_settings(
+    dbc: &DbcHandle,
+    client: WireLease,
+    isolation_applied: bool,
+    failure: Option<String>,
+    op: &str,
+) -> SqlReturn {
+    match release_dbc_client_and_publish(dbc, client, op, |state| {
+        if isolation_applied {
+            state.server_isolation_unknown = false;
+        }
+        if let Some(message) = failure {
+            post_sql_error(state, SQLSTATE_01000, 0, &message);
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        }
+    }) {
+        Ok(rc) | Err(rc) => rc,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_begin_records_server_transaction_even_when_its_response_fails() {
+        use mssql_tds::test_client_support::{
+            env_change_begin_transaction, tds_client_from_tokens,
+        };
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().autocommit = false;
+        let mut client = tds_client_from_tokens(vec![env_change_begin_transaction(42)]);
+        let result = begin_transaction_if_manual(dbc, &mut client, "test", 0, &CancelHandle::new());
+        assert!(result.is_err(), "the response has no terminating DONE");
+        assert!(client.has_active_transaction());
+        assert!(dbc.inner.lock().unwrap().local_tran_started);
+    }
 
     #[test]
     fn isolation_maps_to_expected_tsql() {
@@ -890,6 +1090,97 @@ mod tests {
         for level in [0, 3, 5, 0x10, 0x40, u32::MAX] {
             assert_eq!(txn_isolation_to_tsql(level), None, "level {level:#x}");
         }
+    }
+
+    #[test]
+    fn replaced_session_is_rejected_between_restoration_and_publication() {
+        use std::cell::Cell;
+
+        use crate::api::sqlstate::SQLSTATE_08003;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.session_generation = state.session_generation.wrapping_add(1);
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+
+        let published = Cell::new(false);
+
+        assert_eq!(
+            release_dbc_client_and_publish(dbc, client, "test", |state| {
+                published.set(true);
+                state.autocommit = false;
+            }),
+            Err(SQL_ERROR)
+        );
+
+        assert!(!published.get());
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.autocommit);
+        assert!(state.wire.client().is_some());
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08003);
+    }
+
+    #[test]
+    fn post_connect_settings_publish_nothing_from_a_stale_lease() {
+        use crate::api::sqlstate::SQLSTATE_08003;
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = {
+            let mut state = dbc.inner.lock().unwrap();
+            state.server_isolation_unknown = true;
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.session_generation = state.session_generation.wrapping_add(1);
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+        }
+
+        assert_eq!(
+            finish_post_connect_txn_settings(
+                dbc,
+                client,
+                true,
+                Some("old session warning".to_string()),
+                "test",
+            ),
+            SQL_ERROR
+        );
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.server_isolation_unknown);
+        assert_eq!(state.diag_records().len(), 1);
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08003);
     }
 
     #[test]
@@ -1012,15 +1303,19 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![]));
-            state.active_stmt = Some(std::ptr::dangling_mut::<c_void>());
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
+            state
+                .wire
+                .set_owner_for_test(Some(std::ptr::dangling_mut::<c_void>()));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY000);
         // The busy connection was rejected without taking the client.
-        assert!(state.client.is_some());
+        assert!(state.wire.client().is_some());
     }
 
     #[test]
@@ -1038,7 +1333,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 env_change_reset_connection(),
                 done_no_more(),
             ]));
@@ -1048,7 +1343,7 @@ mod tests {
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert!(!state.local_tran_started);
-        let client = state.client.as_ref().expect("client restored after reset");
+        let client = state.wire.client().expect("client restored after reset");
         assert!(
             !client.is_connection_dead(),
             "a reset that was acknowledged must leave the connection reusable"
@@ -1091,14 +1386,14 @@ mod tests {
                 client.has_active_transaction(),
                 "precondition: the client must start with a live transaction"
             );
-            state.client = Some(client);
+            state.wire.put_client_for_test(client);
             state.local_tran_started = true;
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert!(!state.local_tran_started);
-        let client = state.client.as_ref().expect("client restored after reset");
+        let client = state.wire.client().expect("client restored after reset");
         assert!(
             !client.has_active_transaction(),
             "the live transaction must be rolled back before the reset"
@@ -1136,7 +1431,7 @@ mod tests {
                 0xDEAD_BEEF,
             );
             assert!(client.has_active_transaction());
-            state.client = Some(client);
+            state.wire.put_client_for_test(client);
             // The driver-begun transaction carries no user work.
             state.local_tran_started = false;
         }
@@ -1144,7 +1439,7 @@ mod tests {
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         {
             let state = dbc.inner.lock().unwrap();
-            let client = state.client.as_ref().expect("client restored after arming");
+            let client = state.wire.client().expect("client restored after arming");
             assert!(
                 !client.has_active_transaction(),
                 "arming a full reset must drop the transaction the reset discards"
@@ -1157,7 +1452,7 @@ mod tests {
             SQL_SUCCESS
         );
         let state = dbc.inner.lock().unwrap();
-        let client = state.client.as_ref().expect("client restored");
+        let client = state.wire.client().expect("client restored");
         assert!(
             !client.reset_pending(),
             "the SET must have carried the bit and collected the acknowledgement"
@@ -1182,8 +1477,15 @@ mod tests {
         {
             let mut state = dbc.inner.lock().unwrap();
             // No tokens: the rollback round trip runs dry and fails.
-            state.client = Some(tds_client_from_tokens_in_transaction(vec![], 0xDEAD_BEEF));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(vec![], 0xDEAD_BEEF));
             state.local_tran_started = true;
+            state.database_user_name = Some(crate::handles::dbc::CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                database_change_count: 0,
+                value: "impersonated_user".to_string(),
+            });
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
@@ -1194,8 +1496,14 @@ mod tests {
             "a failed rollback must not clear the driver's transaction flag"
         );
         assert!(
-            !state.pending_reset_ack,
-            "no reset was armed, so nothing should be waiting on an acknowledgement"
+            state.server_isolation_unknown,
+            "the connection is being recycled, so the cached isolation level is no longer \
+             evidence about the server even though arming failed"
+        );
+        assert!(
+            state.database_user_name.is_none(),
+            "this path returns before the post-arm block, so only the early clear can have \
+             dropped the principal — and it must, since the client was handed back"
         );
     }
 
@@ -1223,31 +1531,31 @@ mod tests {
             stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
 
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 // Drained by the cursor sweep.
                 done_no_more(),
                 // Collected later by the request that carries the reset bit.
                 env_change_reset_connection(),
                 done_no_more(),
             ]));
-            state.active_stmt = Some(h.stmt);
+            state.wire.set_owner_for_test(Some(h.stmt));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert!(state.diag_records().is_empty());
         assert!(
-            state.active_stmt.is_none(),
+            state.wire.statement_owner().is_none(),
             "the sweep must release the cursor claim"
         );
-        assert!(state.pending_reset_ack);
+        assert!(state.server_isolation_unknown);
     }
 
     #[test]
     fn reset_connection_arms_without_any_io() {
         // Arming performs no round trip, so it succeeds even against a client
         // with no queued tokens — that is the whole point of the no-RTT design.
-        // It leaves the ack outstanding so the checkout isolation SET cannot
+        // It invalidates the isolation cache so the checkout SET cannot
         // short-circuit, and drops session-bound state immediately.
         use crate::error::HasDiagnostics;
         use crate::test_support::TestHandles;
@@ -1258,17 +1566,19 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![]));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert!(state.diag_records().is_empty());
         assert!(
-            state.pending_reset_ack,
-            "the armed reset must force the checkout isolation SET to emit"
+            state.server_isolation_unknown,
+            "the reset leaves the server's isolation level unknown, so the checkout SET must emit"
         );
-        let client = state.client.as_ref().expect("client restored after arming");
+        let client = state.wire.client().expect("client restored after arming");
         assert!(
             client.reset_pending(),
             "the acknowledgement is outstanding until the carrying request completes"
@@ -1280,12 +1590,47 @@ mod tests {
     }
 
     #[test]
+    fn reset_connection_drops_the_cached_database_user() {
+        // A pooled connection is the case this protects: one borrower can
+        // `EXECUTE AS USER` and prime `SQL_USER_NAME`, and the reset undoes the
+        // impersonation without touching the cache. The catalog key cannot
+        // notice, because the reset returns the session to the same default
+        // database the entry was keyed to — so the next borrower would read the
+        // previous borrower's principal.
+        use crate::handles::dbc::CachedDatabaseUserName;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
+            state.database_user_name = Some(CachedDatabaseUserName {
+                catalog: "master".to_string(),
+                database_change_count: 0,
+                value: "impersonated_user".to_string(),
+            });
+        }
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+
+        assert!(
+            dbc.inner.lock().unwrap().database_user_name.is_none(),
+            "the next borrower must not inherit this session's principal"
+        );
+    }
+
+    #[test]
     fn unacknowledged_reset_poisons_client_on_the_carrying_request() {
-        // The carrying request is where a failed reset now surfaces. If the
-        // checkout isolation SET completes but the server never sent the
-        // ResetConnection ENVCHANGE, the session was never reset: surface 08S01
-        // so the pool discards the connection and poison the client so a later
-        // SQL_ATTR_CONNECTION_DEAD read reports dead, while restoring it so
+        // The carrying request is where a failed reset surfaces, and `TdsClient`
+        // is what detects it: if the batch's response lacks the ResetConnection
+        // ENVCHANGE the session was never reset, so the client fails the request
+        // and marks itself dead. This driver only has to map that to 08S01 so
+        // the pool discards the connection, while restoring the client so
         // SQLDisconnect can still tear it down.
         use crate::api::sqlstate::SQLSTATE_08S01;
         use crate::error::HasDiagnostics;
@@ -1298,7 +1643,9 @@ mod tests {
         {
             let mut state = dbc.inner.lock().unwrap();
             // The batch completes, but with no ResetConnection acknowledgement.
-            state.client = Some(tds_client_from_tokens(vec![done_no_more()]));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![done_no_more()]));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
@@ -1311,10 +1658,10 @@ mod tests {
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08S01);
         assert!(
-            !state.pending_reset_ack,
-            "the pending flag must not survive a failed checkout"
+            state.server_isolation_unknown,
+            "the SET never took effect, so the server's isolation level is still unknown"
         );
-        let client = state.client.as_ref().expect("client restored for teardown");
+        let client = state.wire.client().expect("client restored for teardown");
         assert!(
             client.is_connection_dead(),
             "an unacknowledged reset must poison the client so the pool discards it"
@@ -1324,10 +1671,10 @@ mod tests {
     #[test]
     fn armed_reset_suppresses_the_isolation_short_circuit() {
         // The same-value short circuit would normally skip the checkout SET when
-        // the borrower never changed isolation (D6). While a reset is armed that
-        // SET is the request carrying the bit, so it must emit anyway — proven
-        // here by the reset being acknowledged, which only happens on a real
-        // round trip.
+        // the borrower never changed isolation (D6). A reset leaves the server's
+        // isolation level unknown — SQL Server's reset does not restore it (D9)
+        // — so the SET must emit anyway, proven here by the reset being
+        // acknowledged, which only happens on a real round trip.
         use crate::test_support::TestHandles;
         use mssql_tds::test_client_support::{
             done_no_more, env_change_reset_connection, tds_client_from_tokens,
@@ -1338,7 +1685,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 env_change_reset_connection(),
                 done_no_more(),
             ]));
@@ -1354,13 +1701,83 @@ mod tests {
         );
 
         let state = dbc.inner.lock().unwrap();
-        assert!(!state.pending_reset_ack);
-        let client = state.client.as_ref().expect("client restored");
+        assert!(
+            !state.server_isolation_unknown,
+            "the SET reached the server, so the cache and the session agree again"
+        );
+        let client = state.wire.client().expect("client restored");
         assert!(
             !client.reset_pending(),
             "the SET must have emitted and collected the reset acknowledgement"
         );
         assert!(!client.is_connection_dead());
+    }
+
+    #[test]
+    fn a_reset_armed_mid_flight_is_not_cleared_by_the_older_isolation_set() {
+        // Race guard: a checkout SET can read the invalidation, claim the client,
+        // and reach the server *before* a concurrent `reset_connection` arms its
+        // reset. If that older SET then cleared the flag, the next same-value
+        // checkout SET would short-circuit against a session the newer reset had
+        // made unknown again — recreating the cross-borrower isolation leak.
+        //
+        // The interleaving lives inside the SET's own round trip, so the guard is
+        // driven directly: the arm bumps the generation the SET captured before
+        // it sent.
+        //
+        // This exercises the helper, not `set_txn_isolation`'s capture *ordering*
+        // — reorder that capture to after the round trip and this test still
+        // passes. Forcing the real interleaving needs two threads racing a live
+        // round trip, which the scripted transport cannot express; the ordering
+        // is pinned by the comment at the capture site instead.
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+
+        let captured = state.reset_generation;
+        // A reset arms while the SET is on the wire, exactly as
+        // `reset_connection` does on its success path.
+        state.server_isolation_unknown = true;
+        state.reset_generation = state.reset_generation.wrapping_add(1);
+
+        assert!(
+            !settle_isolation_invalidation(&mut state, captured),
+            "a SET that predates the newer reset must not report the cache trusted"
+        );
+        assert!(
+            state.server_isolation_unknown,
+            "the newer reset's invalidation must survive the older SET"
+        );
+
+        // The SET issued *after* that arm does satisfy it.
+        let captured = state.reset_generation;
+        assert!(settle_isolation_invalidation(&mut state, captured));
+        assert!(!state.server_isolation_unknown);
+    }
+
+    #[test]
+    fn arming_a_reset_bumps_the_generation_and_reasserts_the_invalidation() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let before = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
+            state.reset_generation
+        };
+
+        assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
+
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.reset_generation, before.wrapping_add(1));
+        assert!(state.server_isolation_unknown);
     }
 
     #[test]
@@ -1382,7 +1799,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 // SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
                 done_no_more(),
                 // reset round trip
@@ -1409,7 +1826,7 @@ mod tests {
             "checkout must re-apply READ COMMITTED after the reset"
         );
         assert!(
-            !state.client.as_ref().unwrap().is_connection_dead(),
+            !state.wire.client().unwrap().is_connection_dead(),
             "the connection stays reusable across reset + isolation re-apply"
         );
         assert!(state.diag_records().is_empty());
@@ -1433,7 +1850,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 // acquire: reset round trip
                 env_change_reset_connection(),
                 done_no_more(),
@@ -1461,10 +1878,241 @@ mod tests {
 
         let state = dbc.inner.lock().unwrap();
         let client = state
-            .client
-            .as_ref()
+            .wire
+            .client()
             .expect("same client reused across cycle");
         assert!(!client.is_connection_dead());
         assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn enabling_autocommit_commits_user_work_and_publishes_the_warning() {
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_commit_transaction, tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(
+                    vec![env_change_commit_transaction(), done_no_more()],
+                    0xDEAD_BEEF,
+                ));
+            state.autocommit = false;
+            state.local_tran_started = true;
+        }
+
+        assert_eq!(
+            set_autocommit(dbc, u64::from(SQL_AUTOCOMMIT_ON)),
+            SQL_SUCCESS_WITH_INFO
+        );
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.autocommit);
+        assert!(!state.local_tran_started);
+        assert!(
+            !state
+                .wire
+                .client()
+                .expect("client restored after commit")
+                .has_active_transaction()
+        );
+        assert_eq!(state.diag_records().len(), 1);
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_01000);
+    }
+
+    #[test]
+    fn failed_autocommit_commit_does_not_strand_the_local_transaction_flag() {
+        use crate::error::HasDiagnostics;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens_in_transaction;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(
+                    Vec::new(),
+                    0xDEAD_BEEF,
+                ));
+            state.autocommit = false;
+            state.local_tran_started = true;
+        }
+
+        assert_eq!(set_autocommit(dbc, u64::from(SQL_AUTOCOMMIT_ON)), SQL_ERROR);
+
+        let state = dbc.inner.lock().unwrap();
+        assert!(!state.autocommit);
+        assert!(
+            !state.local_tran_started,
+            "a failed commit must not leave SQLDisconnect blocked by stale bookkeeping"
+        );
+        assert_eq!(state.diag_records().len(), 1);
+        assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_08007);
+    }
+
+    /// The AB#47510 guard on the `SQLDisconnect` rollback. A host that
+    /// disconnects from a static destructor or `onexit` handler reaches this
+    /// after the loader has terminated the runtime's worker, where
+    /// `block_on(rollback_transaction())` can never complete. The flag is
+    /// threaded in because a live test process always reads it as `false`;
+    /// without that seam this arm is dead code under test.
+    ///
+    /// The transaction is left open on the client, which is what proves no
+    /// rollback was sent — the server discards it when the socket closes.
+    #[test]
+    fn rollback_before_disconnect_skips_the_round_trip_while_the_process_is_exiting() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_rollback_transaction, tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            // Queued so a rollback that *is* sent completes and clears the
+            // transaction. That is what makes "still active" below evidence of
+            // a skip rather than of a round-trip that merely failed.
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(
+                    vec![env_change_rollback_transaction(), done_no_more()],
+                    1,
+                ));
+            state.local_tran_started = true;
+        }
+
+        rollback_before_disconnect_inner(dbc, true);
+
+        let state = dbc.inner.lock().unwrap();
+        let client = state
+            .wire
+            .client()
+            .expect("the client must be handed back so teardown stays consistent");
+        assert!(
+            client.has_active_transaction(),
+            "the transaction must be left open — a skipped rollback sends nothing"
+        );
+        assert!(
+            state.diag_records().is_empty(),
+            "this path is best-effort and must post no diagnostic"
+        );
+    }
+
+    /// AB#49225: an execute while a connection-scoped operation holds the
+    /// client must get the busy error.
+    /// `SQLDisconnect` and a reconnect can land while a connection-scoped
+    /// operation has the session checked out. The operation's outcome belonged
+    /// to the torn-down session, so none of it may reach the replacement.
+    #[test]
+    fn an_operation_whose_session_ended_records_nothing_on_the_replacement() {
+        use crate::error::HasDiagnostics;
+        use crate::test_support::{TestHandles, connect_mock_server};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+        use std::time::{Duration, Instant};
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server = connect_mock_server(
+            dbc,
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            mssql_mock_tds::QueryResponse::select_one().with_delay(Duration::from_millis(500)),
+        );
+        let before = dbc.inner.lock().unwrap().txn_isolation;
+
+        let rc = std::thread::scope(|scope| {
+            let set = scope.spawn(|| set_txn_isolation(dbc, u64::from(SQL_TXN_SERIALIZABLE)));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while dbc.inner.lock().unwrap().wire.client().is_some() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the SET never checked out the session"
+                );
+                std::thread::yield_now();
+            }
+            let mut state = dbc.inner.lock().unwrap();
+            drop(state.wire.uninstall());
+            state.wire.install(tds_client_from_tokens(Vec::new()));
+            drop(state);
+            set.join().unwrap()
+        });
+
+        assert_eq!(rc, SQL_ERROR);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.txn_isolation, before);
+        assert!(
+            state.wire.client().is_some(),
+            "the replacement keeps its client"
+        );
+        assert_eq!(
+            state.diag_records().last().unwrap().sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
+    }
+
+    #[test]
+    fn a_connection_operation_in_flight_reports_busy_to_an_execute() {
+        use crate::api::exec_common::{claim_connection, return_client_idle};
+        use crate::api::sqlstate::ERR_CONNECTION_BUSY;
+        use crate::handles::wire::WireLease;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        type Claim = fn(&DbcHandle) -> WireLease;
+        let claims: [(&str, Claim); 2] = [
+            ("SQLEndTran", |dbc| {
+                claim_dbc_client(dbc, "SQLEndTran").unwrap()
+            }),
+            ("SQL_USER_NAME / alias-type lookup", |dbc| {
+                try_claim_idle_dbc_client(dbc).unwrap().0
+            }),
+        ];
+        for (name, claim) in claims {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+
+            let lease = claim(dbc);
+            assert!(
+                matches!(
+                    claim_connection(dbc, stmt, h.stmt, "SQLExecDirectW"),
+                    Err(SQL_ERROR)
+                ),
+                "{name}"
+            );
+            {
+                let ss = stmt.inner.lock().unwrap();
+                assert_eq!(ss.diag_records.len(), 1, "{name}");
+                assert!(
+                    ss.diag_records[0]
+                        .message
+                        .ends_with(ERR_CONNECTION_BUSY.text),
+                    "{name}: {}",
+                    ss.diag_records[0].message
+                );
+            }
+
+            assert!(release_dbc_client(dbc, lease));
+            let lease = claim_connection(dbc, stmt, h.stmt, "SQLExecDirectW")
+                .unwrap_or_else(|_| panic!("{name}: the released wire must be claimable"));
+            return_client_idle(dbc, h.stmt, lease);
+        }
     }
 }

@@ -12,12 +12,29 @@
 #   ./run_e2e.sh [--release] [--verbose] [--retries=N] [--coverage[=OUTPUT]]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
 #                [--skip-build] [--driver=PATH]
+#                [--filter=REGEX] [--mt-profile=pr|nightly|weekly]
 #
 # Default: runs the e2e suite against mssql-odbc only.
 #
+# --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
+# registers them as a separate <name>_mt entry per converted executable):
+#   pr       (default) every ctest entry; concurrent variants, every mode, at the
+#            harness default of 2 threads x 1 iteration.
+#   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
+#   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
+# nightly and weekly ignore --retries (an intermittent failure is what they
+# look for) and run each entry under gdb through run_mt_test.sh when gdb is
+# installed, so a crash or a watchdog abort prints every thread's stack. With
+# --compare-with-msodbcsql the msodbcsql leg runs at 2 x 1: it checks that the
+# tests suit the modes, not msodbcsql's thread safety. /SharedStmt is left out
+# of the stress profiles because unixODBC releases up to 2.3.14 corrupt their
+# own diagnostic list when two threads use one statement (unixODBC #243, fixed
+# on master in ea454e49). Already-set MSSQL_ODBC_MT_THREADS, MSSQL_ODBC_MT_ITERS
+# and MSSQL_ODBC_MT_SKIP_MODES ("none" skips nothing) override a profile.
+#
 # --skip-build reuses a driver and CMake `build/` produced earlier by
 # build_e2e.sh (no cargo/cmake needed — only the unixODBC runtime). Combine
-# with --driver=PATH to point at the prebuilt libmsodbcsql18.so. This is how
+# with --driver=PATH to point at the prebuilt mssqlodbc.so. This is how
 # CI runs prebuilt binaries across distro containers.
 #
 # --retries=N reruns each failing test up to N extra times (ctest
@@ -46,10 +63,19 @@
 # connection string and would pin both legs to one driver; the script rejects
 # that in comparison mode.
 #
+# Both legs run with unixODBC Threading=1, registered in one temporary
+# odbcinst.ini (the msodbcsql section is copied from --msodbcsql-ini, which is
+# not modified). Level 1 takes a lock per handle for most of each call, but
+# unixODBC clears a handle's diagnostics on entry before taking it, so two
+# threads on one statement can still corrupt that list (unixODBC #243; the
+# /SharedStmt variants crash inside libodbc). SQLCancel is locked only at level
+# 3, so a cross-thread cancel still reaches the driver while another call runs
+# on that statement. The unixODBC default, 0, takes no lock at all.
+#
 # Rust driver logs are controlled by MSSQL_TDS_TRACE and
 # MSSQL_TDS_TRACE_LEVEL.
 # In --verbose mode, this script defaults to:
-#   MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL=warn,msodbcsql18=debug
+#   MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL=warn,mssqlodbc=debug
 # unless they are already set in the environment.
 #
 # Examples:
@@ -131,10 +157,16 @@ COVERAGE_OUTPUT="${COVERAGE_OUTPUT:-$ODBC_CRATE_DIR/../target/cobertura-odbc-e2e
 MSODBCSQL_INI="/etc/odbcinst.ini"
 SKIP_BUILD=0
 DRIVER_OVERRIDE=""
+TEST_FILTER=""
+MT_PROFILE="pr"
+# Extra environment for the msodbcsql leg only (see apply_mt_profile).
+MS_LEG_ENV=()
 
 CTEST_ARGS=(--output-on-failure)
 RUST_INI_DIR=""    # tempdir holding our generated odbcinst.ini
 RUST_DRIVER_PATH=""
+# unixODBC thread-protection level for both legs; see the header.
+UNIXODBC_THREADING=1
 
 # ----------------------------------------------------------------------------
 # CLI parsing / help
@@ -160,10 +192,50 @@ parse_args() {
             --msodbcsql-ini=*) MSODBCSQL_INI="${arg#--msodbcsql-ini=}" ;;
             --skip-build) SKIP_BUILD=1 ;;
             --driver=*) DRIVER_OVERRIDE="${arg#--driver=}" ;;
+            --filter=*) TEST_FILTER="${arg#--filter=}" ;;
+            --mt-profile=*) MT_PROFILE="${arg#--mt-profile=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
     done
+}
+
+# ----------------------------------------------------------------------------
+# --mt-profile: sizes and modes for the ODBC_TEST_F concurrent variants (see the
+# header). Settings already in the environment win over the profile.
+# ----------------------------------------------------------------------------
+apply_mt_profile() {
+    local threads iters
+    case "$MT_PROFILE" in
+        pr)
+            ;;
+        nightly|weekly)
+            if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
+            export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
+            export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"
+            export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
+            # run_mt_test.sh runs each <name>_mt entry under gdb; the watchdog must
+            # still end a hang inside the traced process.
+            export MSSQL_ODBC_MT_GDB="${MSSQL_ODBC_MT_GDB:-1}"
+            export MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER=1
+            if [ "$MSSQL_ODBC_MT_GDB" = 1 ] && ! command -v gdb >/dev/null 2>&1; then
+                echo "Warning: gdb is not installed; a crash in a stress run will leave no stacks." >&2
+            fi
+            # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
+            # this only bounds an entry whose many phases all progress slowly.
+            CTEST_ARGS+=(-L mt --timeout 3600)
+            if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
+                echo "--mt-profile=$MT_PROFILE ignores --retries=$RETRIES: an intermittent failure is the signal."
+                RETRIES=0
+            fi
+            MS_LEG_ENV=(MSSQL_ODBC_MT_THREADS=2 MSSQL_ODBC_MT_ITERS=1)
+            ;;
+        *)
+            echo "Unknown --mt-profile '$MT_PROFILE' (expected pr, nightly, or weekly)" >&2
+            exit 2
+            ;;
+    esac
+    echo "MT profile: $MT_PROFILE (threads=${MSSQL_ODBC_MT_THREADS:-2} iterations=${MSSQL_ODBC_MT_ITERS:-1} skip_modes='${MSSQL_ODBC_MT_SKIP_MODES:-}')"
 }
 
 # ----------------------------------------------------------------------------
@@ -182,7 +254,7 @@ trap cleanup EXIT
 # `cargo llvm-cov show-env` exports RUSTFLAGS (-C instrument-coverage), the
 # llvm-cov target dir and an LLVM_PROFILE_FILE pattern (with %p/%m so distinct
 # gtest processes and ctest retries never clobber each other's .profraw). The
-# subsequent `cargo build` then produces an instrumented libmsodbcsql18.so, and
+# subsequent `cargo build` then produces an instrumented mssqlodbc.so, and
 # every ctest child process inherits LLVM_PROFILE_FILE from this environment.
 setup_coverage_env() {
     echo "=== Enabling coverage instrumentation for the Rust driver ==="
@@ -201,7 +273,7 @@ setup_coverage_env() {
 setup_tracing() {
     if [ "$VERBOSE" -eq 1 ]; then
         export MSSQL_TDS_TRACE="${MSSQL_TDS_TRACE:-true}"
-        export MSSQL_TDS_TRACE_LEVEL="${MSSQL_TDS_TRACE_LEVEL:-warn,msodbcsql18=debug}"
+        export MSSQL_TDS_TRACE_LEVEL="${MSSQL_TDS_TRACE_LEVEL:-warn,mssqlodbc=debug}"
         echo "Verbose: MSSQL_TDS_TRACE=$MSSQL_TDS_TRACE MSSQL_TDS_TRACE_LEVEL=$MSSQL_TDS_TRACE_LEVEL"
     fi
 }
@@ -210,12 +282,12 @@ setup_tracing() {
 # Step 2: Build the Rust driver and resolve its shared library path
 # ----------------------------------------------------------------------------
 build_rust_driver() {
-    # Resolve the driver's shared-library filename for this platform.
+    # Resolve the shipped shared-library filename for this platform.
     local libname
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        libname="libmsodbcsql18.dylib"
+        libname="mssqlodbc.dylib"
     else
-        libname="libmsodbcsql18.so"
+        libname="mssqlodbc.so"
     fi
 
     # Prebuilt mode: an explicit --driver=PATH wins; otherwise --skip-build
@@ -240,28 +312,25 @@ build_rust_driver() {
                 cargo build
             fi
         )
+        RUST_DRIVER_PATH="$(bash "$ODBC_CRATE_DIR/scripts/finalize-artifact.sh" "$BUILD_TYPE")"
     else
         echo "=== Skipping driver build (--skip-build) ==="
         # build_e2e.sh stages the driver inside the build tree, so prefer that
-        # copy when it exists before falling back to the cargo target dir.
+        # copy when it exists before re-running the finalizer.
         if [ -f "$BUILD_DIR/$libname" ]; then
             RUST_DRIVER_PATH="$BUILD_DIR/$libname"
             echo "Using staged driver: $RUST_DRIVER_PATH"
             return
         fi
+        # No staged copy: re-run the finalizer so the shipped artifact reflects
+        # Cargo's current output. Resolving the finalized copy directly could run
+        # a stale driver, since `cargo build` never refreshes that copy.
+        if ! RUST_DRIVER_PATH="$(bash "$ODBC_CRATE_DIR/scripts/finalize-artifact.sh" "$BUILD_TYPE")"; then
+            echo "Error: could not finalize the driver for --skip-build" >&2
+            echo "Hint: run 'cargo build' (add --release for release), or pass --driver=PATH" >&2
+            exit 1
+        fi
     fi
-
-    # Cargo builds into the workspace root's target/ directory, which may
-    # differ from the crate-local directory. Use `cargo metadata` to resolve it.
-    # Under coverage, `cargo llvm-cov show-env` may redirect the build via
-    # CARGO_TARGET_DIR; `cargo metadata` honors that env var, so target_directory
-    # always points at wherever the instrumented .so actually lands.
-    local target_dir
-    target_dir="$(cd "$ODBC_CRATE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
-        | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
-        || echo "$ODBC_CRATE_DIR/target")"
-
-    RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/$libname"
 
     if [ ! -f "$RUST_DRIVER_PATH" ]; then
         echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2
@@ -289,6 +358,7 @@ register_rust_driver() {
 [$RUST_DRIVER_SECTION]
 Description=Microsoft ODBC Driver 18 for SQL Server (Rust)
 Driver=$RUST_DRIVER_PATH
+Threading=$UNIXODBC_THREADING
 UsageCount=1
 EOF
     echo "Rust driver registered at: $RUST_INI_DIR/odbcinst.ini"
@@ -325,6 +395,17 @@ validate_compare_preconditions() {
     # Resolve to absolute path so subprocesses see the same file regardless of cwd.
     MSODBCSQL_INI="$(cd "$(dirname "$MSODBCSQL_INI")" && pwd)/$(basename "$MSODBCSQL_INI")"
     echo "msodbcsql ini: $MSODBCSQL_INI"
+    # Copy the reference registration next to ours with the same Threading
+    # level (see the header); the installed file is left untouched.
+    printf '\n' >> "$RUST_INI_DIR/odbcinst.ini"
+    awk -v section="[$MSODBCSQL_DRIVER_SECTION]" -v level="$UNIXODBC_THREADING" '
+        /^\[/ {
+            selected = index($0, section) == 1
+            if (selected) { print; print "Threading=" level }
+            next
+        }
+        selected && tolower($0) !~ /^[[:space:]]*threading[[:space:]]*=/ { print }
+    ' "$MSODBCSQL_INI" >> "$RUST_INI_DIR/odbcinst.ini"
 }
 
 # ----------------------------------------------------------------------------
@@ -339,7 +420,6 @@ setup_dev_sql_env() {
     fi
 
     export ODBC_TEST_SERVER="localhost"
-    export ODBC_TEST_UID="${ODBC_TEST_UID:-sa}"
     export ODBC_TEST_TRUST_CERT="${ODBC_TEST_TRUST_CERT:-Yes}"
 
     if [ -z "${ODBC_TEST_PWD:-}" ]; then
@@ -355,10 +435,16 @@ setup_dev_sql_env() {
     fi
 
     if [ -n "${ODBC_TEST_PWD:-}" ]; then
-        echo "Auto-detected dev SQL Server at localhost:1433 (sa login)"
+        # Default the SQL login only once a password exists; a UID without one
+        # makes the fixture attempt SQL auth with an empty password.
+        export ODBC_TEST_UID="${ODBC_TEST_UID:-sa}"
+        echo "Auto-detected dev SQL Server at localhost:1433 (${ODBC_TEST_UID} login)"
+    elif [ -n "${ODBC_TEST_UID:-}" ]; then
+        echo "Warning: SQL Server detected on localhost:1433 but no password found for ODBC_TEST_UID=${ODBC_TEST_UID}."
+        echo "  Set SQL_PASSWORD or ODBC_TEST_PWD, or unset ODBC_TEST_UID to use integrated auth."
     else
-        echo "Warning: SQL Server detected on localhost:1433 but no password found."
-        echo "  Set SQL_PASSWORD, ODBC_TEST_PWD, or run dev/dev-launchsql.sh first."
+        echo "Warning: SQL Server detected on localhost:1433 but no password found; using integrated auth."
+        echo "  Set SQL_PASSWORD, ODBC_TEST_PWD, or run dev/dev-launchsql.sh first, to use SQL auth."
     fi
 }
 
@@ -383,9 +469,14 @@ configure_and_build_tests() {
 
     echo ""
     echo "=== Configuring e2e tests (CMake) ==="
+    local release_driver=OFF
+    if [ "$BUILD_TYPE" = "release" ]; then
+        release_driver=ON
+    fi
     # Linux/macOS default to platform TCHAR mode unless explicitly overridden.
     cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
-        -DODBC_E2E_FORCE_UNICODE="${ODBC_E2E_FORCE_UNICODE:-OFF}"
+        -DODBC_E2E_FORCE_UNICODE="${ODBC_E2E_FORCE_UNICODE:-OFF}" \
+        -DODBC_E2E_RELEASE_DRIVER="$release_driver"
 
     echo ""
     echo "=== Building e2e tests ==="
@@ -399,14 +490,19 @@ configure_and_build_tests() {
 #   $2 = ODBCSYSINI directory
 #   $3 = absolute path to JUnit XML output
 #   $4 = odbcinst.ini section name the tests should connect through
+#   $5... = extra NAME=VALUE environment for this leg only
 # Returns ctest's exit code (does not abort the script).
 # ----------------------------------------------------------------------------
 run_tests() {
     local label="$1" ini_dir="$2" junit_out="$3" driver_name="$4"
+    shift 4
     echo ""
     echo "=== Running e2e tests against $label ==="
     echo "ODBCSYSINI=$ini_dir"
     echo "ODBC_TEST_DRIVER=$driver_name"
+    if [ "$#" -gt 0 ]; then
+        echo "Leg environment: $*"
+    fi
 
     local rc=0
     (
@@ -415,8 +511,8 @@ run_tests() {
         # against ("mssql-odbc" or "msodbcsql") so mssql-odbc-specific tests can
         # SKIP_IF_COMPARING_MSODBCSQL() on the reference-driver leg.
         # ODBC_TEST_DRIVER selects the driver by name in the connection string.
-        ODBC_TEST_TARGET="$label" ODBC_TEST_DRIVER="$driver_name" \
-            ODBCSYSINI="$ini_dir" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
+        env ODBC_TEST_TARGET="$label" ODBC_TEST_DRIVER="$driver_name" \
+            ODBCSYSINI="$ini_dir" "$@" ctest "${CTEST_ARGS[@]}" --output-junit "$junit_out"
     ) || rc=$?
     return $rc
 }
@@ -463,7 +559,7 @@ generate_coverage_report() {
         echo "WARNING: failed to create ODBC e2e coverage output directory" >&2
         return 0
     fi
-    if cargo llvm-cov report --package mssql-tds --package mssql-odbc \
+    if cargo llvm-cov report --package mssql-tds --package mssqlodbc \
         --cobertura --output-path "$COVERAGE_OUTPUT"; then
         echo "Coverage report written to $COVERAGE_OUTPUT"
     else
@@ -476,6 +572,10 @@ generate_coverage_report() {
 # ----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    apply_mt_profile
+    if [ -n "$TEST_FILTER" ]; then
+        CTEST_ARGS+=(-R "$TEST_FILTER")
+    fi
     if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
         # until-pass:N runs a failing test up to N times total, so N retries = N+1.
         CTEST_ARGS+=(--repeat "until-pass:$((RETRIES + 1))")
@@ -518,9 +618,8 @@ main() {
     fi
 
     # Comparison mode: also run against the C++ driver, then print the table.
-    local ms_ini_dir
-    ms_ini_dir="$(dirname "$MSODBCSQL_INI")"
-    run_tests "msodbcsql"  "$ms_ini_dir"  "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" || ms_rc=$?
+    run_tests "msodbcsql" "$RUST_INI_DIR" "$ms_junit" "$MSODBCSQL_DRIVER_SECTION" \
+        ${MS_LEG_ENV[@]+"${MS_LEG_ENV[@]}"} || ms_rc=$?
     assert_tests_executed "$ms_junit" "msodbcsql"
 
     local parity_rc=0
