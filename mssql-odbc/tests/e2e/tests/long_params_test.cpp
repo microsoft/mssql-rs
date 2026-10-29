@@ -243,8 +243,16 @@ ODBC_TEST_F(LongParameterTest, ExplicitMaxTypesAreUnaffected) {
 
 ODBC_TEST_F(LongParameterTest, DescribedLongNullsExecuteTheDescribedInsert) {
     SetLongAsMax(SQL_XL_OFF);
+    // Global temp tables are server-wide; the session id keeps concurrent runs
+    // apart, as in transaction_test.cpp.
+    ASSERT_SQL_OK(Direct("SELECT @@SPID"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER spid = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &spid, 0, nullptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     for (const auto& type : kTypes) {
-        const std::string table = "[##" + WorkerToken(type.legacy) + "]";
+        const std::string table =
+            "[##" + WorkerToken(type.legacy) + "-" + std::to_string(spid) + "]";
         ASSERT_SQL_OK(Direct("CREATE TABLE " + table + " (v " + type.legacy + ")"),
                       SQL_HANDLE_STMT, stmt_);
         Drain();
