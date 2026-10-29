@@ -1952,6 +1952,7 @@ impl TdsClient {
         self.transport.reset_reader();
 
         let database_collation = self.negotiated_settings.database_collation;
+        let vector_version = self.negotiated_settings.vector_version();
         let send_started = self.request_timeout_start();
         let rows = rows.into_iter();
         let mut packet_writer = PacketType::RpcRequest.create_packet_writer(
@@ -1975,6 +1976,9 @@ impl TdsClient {
                     continue;
                 };
                 RpcParameter::reject_data_at_exec(positional_params.iter())?;
+                for param in &positional_params {
+                    param.ensure_vector_version_supported(vector_version)?;
+                }
                 if positional_params
                     .iter()
                     .any(RpcParameter::force_column_encryption)
@@ -18960,6 +18964,50 @@ mod tests {
             .expect_err("forced encryption is unsupported on the batch fast path");
         assert!(matches!(&error, UsageError(message) if message.contains("ForceColumnEncryption")));
         assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_rejects_float16_without_negotiated_vector_v2() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        let float16 = || {
+            RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Vector(None, 2, VectorBaseType::Float16),
+            )
+        };
+        let int = || RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(1)));
+
+        for ack in [Some((1, true)), None] {
+            // Reused handle: the first (and only) row carries the float16 value.
+            let (mut client, sent) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, ack);
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let error = client
+                .execute_sp_execute_batch_for_test(statement_id, vec![Ok((0, vec![float16()]))])
+                .await
+                .expect_err("float16 needs negotiated vector version 2");
+            assert!(
+                matches!(&error, UsageError(message) if message.contains("negotiated vector version 2")),
+                "{ack:?}"
+            );
+            assert!(sent.lock().unwrap().is_empty(), "{ack:?}");
+
+            // Fresh batch: a later row carries the float16 value.
+            let (mut client, _) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, ack);
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let rows = vec![Ok((0, vec![int()])), Ok((1, vec![float16()]))];
+            let error = client
+                .execute_sp_execute_batch_for_test(statement_id, rows)
+                .await
+                .expect_err("a later float16 row must be rejected too");
+            assert!(
+                matches!(&error, UsageError(message) if message.contains("negotiated vector version 2")),
+                "{ack:?}"
+            );
+        }
     }
 
     #[tokio::test]
