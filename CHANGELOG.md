@@ -86,9 +86,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   an Enhanced Routing acknowledgement of 1 fails the login, matching msodbcsql
   (AB#49295).
 
+- `mssql-tds`: TLS 1.3 and the post-quantum `X25519MLKEM768` key exchange on
+  macOS for TDS 8.0 (Strict) connections. Direct handshakes run on Apple's
+  Network.framework, with certificates still evaluated by Security.framework, so
+  keychain roots and trust settings apply. The post-quantum group needs macOS 26
+  and a server that offers it; current SQL Server negotiates X25519. TDS 7.x
+  handshakes remain on Secure Transport (TLS 1.2 maximum). The default-on
+  `tls-network-framework-on-macos` feature controls this;
+  `default-features = false` restores native-tls throughout. Handshake failures
+  surface as `Error::TlsHandshakeError` on every engine.
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-tds`: `Error::TlsHandshakeError` now covers failures from all TLS
+  engines. Its `source` is now boxed and the placeholder `cert_sans` field was
+  removed; this is a breaking public API change.
 
 - Eligible TCP connections now default to immediate parallel MSF attempts,
   without TNIR's first-address phase. Explicit non-TCP transports, failover

@@ -12,7 +12,7 @@ categories = ["database", "network-programming"]
 exclude = ["**/.env*", "tests/**", "benches/**"]
 
 [features]
-default = ["integrated-auth", "tls-schannel-direct-on-windows"]
+default = ["integrated-auth", "tls-schannel-direct-on-windows", "tls-network-framework-on-macos"]
 # Windows SSPI (Security Support Provider Interface) for integrated authentication
 sspi = []
 # Unix GSSAPI (Kerberos) for integrated authentication
@@ -29,6 +29,16 @@ tls-schannel-direct = []
 # unconditionally — useful as an escape hatch if the rewrite needs to
 # be temporarily disabled in production.
 tls-schannel-direct-on-windows = ["tls-schannel-direct"]
+# Use the Network.framework TLS engine on macOS (macOS-only effect: the engine
+# and its dependencies are not built on other targets) for direct TDS 8.0
+# (Strict) handshakes. Secure Transport, which native-tls uses on macOS, cannot
+# negotiate TLS 1.3 or post-quantum key exchange. TDS 7.x handshakes stay on
+# native-tls.
+tls-network-framework = ["dep:block2"]
+# Default-on bundle that routes the dispatcher to the Network.framework engine
+# on macOS. Disable with `default-features = false` to fall back to native-tls
+# (Secure Transport, TLS 1.2 maximum).
+tls-network-framework-on-macos = ["tls-network-framework"]
 # Exposes in-process test helpers used only by tests and tooling: key
 # provisioning (RSA generation / PKCS#8 export, `RsaKeyStoreProvider`) and
 # serializer wire-byte capture (`test_client_support`).
@@ -113,6 +123,9 @@ openssl = { version = "0.10.66" }
 security-framework = { version = "3.7.0" }
 security-framework-sys = { version = "2.17.0" }
 core-foundation = { version = "0.10.1" }
+# Objective-C blocks, the callback type Network.framework's C API takes. The TLS
+# itself is Apple's; this crate only builds the closures the framework calls.
+block2 = { version = "0.6.2", optional = true }
 
 [dependencies.uuid]
 version = "1.19.0"
