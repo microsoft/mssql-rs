@@ -321,11 +321,13 @@ impl TdsConnectionProvider {
 
             // Compute the overall login deadline up front. It bounds the
             // shared-memory shortcut below and the connect/retry loop — the phases
-            // that run the TDS/auth handshake. Name resolution is bounded
-            // separately and is not covered by this deadline: SSRP uses its own
-            // `ssrp_timeout_ms` (default 1s) and LocalDB resolution is a local pipe
-            // lookup. `login_timeout` falls back to `connect_timeout` for callers
-            // that only set the historical single knob; `0` means "no deadline".
+            // that run the TDS/auth handshake. Name resolution is not covered by
+            // this deadline: SSRP uses its own `ssrp_timeout_ms` (default 1s), and
+            // LocalDB resolution, which starts an instance that is not running, has
+            // no limit of its own and ends early only when the caller cancels the
+            // connect or times it out. `login_timeout` falls back to
+            // `connect_timeout` for callers that only set the historical single
+            // knob; `0` means "no deadline".
             // `connect_timeout` still bounds each individual TCP-connect attempt,
             // so an unreachable host fails fast even when the login budget is large
             // (e.g. interactive sign-in).

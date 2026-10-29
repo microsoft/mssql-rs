@@ -500,8 +500,11 @@ fn running_instance_pipe(instance_name: &str) -> TdsResult<Option<String>> {
 /// LocalDBGetInstanceInfo only reads its state and pipe, so a connection to a
 /// running instance takes no blocking-pool thread. Otherwise the instance has
 /// to be started, and LocalDBStartInstance, which can take a while or stall,
-/// runs on the blocking pool, so the login timeout and cancellation still
-/// apply. It also reports the error for an instance that does not exist.
+/// runs on the blocking pool, so the runtime thread stays free and the caller
+/// can stop waiting, by cancelling or by its own timeout around the connect.
+/// The provider's login deadline does not cover LocalDB resolution, so a
+/// stalled start is not ended by `login_timeout`. It also reports the error
+/// for an instance that does not exist.
 ///
 /// # Arguments
 /// * `instance_name` - The LocalDB instance name (e.g., "MSSQLLocalDB", "v11.0")
