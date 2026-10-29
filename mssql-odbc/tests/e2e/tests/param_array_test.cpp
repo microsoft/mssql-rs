@@ -2559,6 +2559,73 @@ TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
+// AB#49495: a parameter set's failure is reported by the call where msodbcsql
+// reads it, measured on msodbcsql 18.6.2.1. Navigation onto a set that fails
+// before its first row returns SQL_SUCCESS_WITH_INFO; the fetch that meets a
+// set failing after its row returns SQL_NO_DATA; navigation that discards a
+// failed set's unread rest posts the error but returns SQL_SUCCESS.
+TEST_F(ParamArrayTest, SetErrorsAreReportedByTheCallThatReachesThem) {
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLUSMALLINT status[3] = {};
+    SQLULEN processed = 0;
+    const auto reset = [&] {
+        for (auto& item : status) {
+            item = SQL_PARAM_UNUSED;
+        }
+        processed = 0;
+    };
+
+    // Set 2 divides by zero before producing a row.
+    Prepare("SELECT 1 / (CAST(? AS int) - 2) AS q");
+    BindIntArray(values, indicators, 3, status, &processed);
+    reset();
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(-1);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLMoreResults(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+    EXPECT_EQ(SQL_PARAM_UNUSED, status[2]);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(1);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(3u, processed);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[2]);
+
+    // Set 2 returns one row, then divides by zero.
+    Prepare("SELECT 1 / (CASE WHEN CAST(? AS int) = 2 AND v = 0 THEN 0 ELSE 1 END) AS q "
+            "FROM (VALUES (1), (0)) AS t(v) ORDER BY v DESC");
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    reset();
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1, value);
+    EXPECT_EQ(1u, processed);
+    EXPECT_EQ(SQL_PARAM_UNUSED, status[1]) << "the error follows the row";
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    reset();
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    // The driver posts the discarded rest's error, but a Driver Manager need
+    // not surface diagnostics after SQL_SUCCESS, so only the outputs are checked.
+    EXPECT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+}
+
 TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {
     Prepare("DECLARE @value int = ?; IF @value = 2 "
             "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");

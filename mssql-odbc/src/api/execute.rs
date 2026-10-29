@@ -612,6 +612,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             finish_parameter_array(
                 dbc,
                 stmt,
+                statement_handle,
                 client,
                 result,
                 BatchClientResults {
@@ -651,12 +652,39 @@ unsafe fn write_params_processed(processed_ptr: *mut SqlULen, processed: SqlULen
 fn finish_parameter_array(
     dbc: &crate::handles::DbcHandle,
     stmt: &StmtHandle,
+    statement_handle: SqlHandle,
     mut client: WireLease,
-    result: PreparedBatchResult,
+    mut result: PreparedBatchResult,
     mut batch: BatchClientResults,
 ) -> SqlReturn {
-    let has_more = client.has_open_batch();
     let metadata = client.get_metadata().clone();
+    let positioned = client.current_parameter_set();
+    // Like a scalar execute, wait for the first row or the end of an empty
+    // first set. msodbcsql's SQLExecute reads an empty set through its DONE
+    // (OnDone), reporting that set's status and any error now (measured on
+    // 18.6.2.1); a row stays parked for the first fetch.
+    let mut settled = None;
+    if client.on_rows() {
+        let read = dbc.runtime.block_on(async {
+            if client.peek_past_current_row().await? || !client.has_prepared_batch() {
+                return Ok(None);
+            }
+            client.complete_current_result().await.map(Some)
+        });
+        match read {
+            Ok(done) => settled = done,
+            Err(error) => {
+                error!(%error, "SQLExecute: parameter-array execution failed");
+                return fail_with_tds(dbc, stmt, statement_handle, client, &error);
+            }
+        }
+        if let Some(more) = client.take_prepared_batch_results() {
+            result.rows.extend(more.rows);
+            result.complete = more.complete;
+        }
+    }
+    let has_more = client.has_open_batch();
+    let cursor_open = has_more || settled.is_some();
     let info_messages = client.take_info_messages();
     // Parameter arrays are serialized through the same `PacketWriter` as a
     // scalar execute (`execute_sp_execute_batch`), so an unmappable value in
@@ -681,7 +709,15 @@ fn finish_parameter_array(
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
-    let mut rc = report_parameter_array(&mut stmt_state, result, &mut batch, current_set, has_more);
+    stmt_state.positioned_parameter_set = positioned;
+    let mut rc = report_parameter_array(
+        &mut stmt_state,
+        result,
+        &mut batch,
+        current_set,
+        has_more,
+        None,
+    );
     let posted_info = post_tds_info_messages(&mut stmt_state, &info_messages)
         | super::exec_common::post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
     if posted_info && rc == SQL_SUCCESS {
@@ -690,10 +726,14 @@ fn finish_parameter_array(
     stmt_state.clear_exhaustion_state();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    if has_more {
+    if cursor_open {
         stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
         stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
-        stmt_state.parameter_array = Some(batch);
+        stmt_state.result_set_exhausted = settled.is_some();
+        stmt_state.batch_exhausted = !has_more;
+        if has_more {
+            stmt_state.parameter_array = Some(batch);
+        }
     } else {
         stmt_state.row_count = batch.rows_affected.unwrap_or(SQL_NO_ROWCOUNT_TOTAL);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
@@ -716,15 +756,33 @@ pub(crate) struct ParameterArrayUpdate {
     has_more: bool,
     result: Option<PreparedBatchResult>,
     current_set: Option<usize>,
+    /// A set whose failure is reported without failing the call.
+    quiet_set: Option<usize>,
 }
 
-/// Publishes completions a buffered unbound fetch read ahead of msodbcsql,
-/// at the call where msodbcsql's `OnDone` would have read them.
+impl ParameterArrayUpdate {
+    /// Whether a set this update completes reported a server error.
+    pub(super) fn has_failed_set(&self) -> bool {
+        self.result
+            .as_ref()
+            .is_some_and(|result| result.rows.iter().any(|row| !row.errors.is_empty()))
+    }
+
+    /// Reports `set`'s failure without counting it toward the return code, as
+    /// msodbcsql does for the set `SQLMoreResults` navigates past.
+    pub(super) fn quiet(mut self, set: Option<usize>) -> Self {
+        self.quiet_set = set;
+        self
+    }
+}
+
+/// Publishes completions a read-ahead found before msodbcsql would, at the call
+/// where msodbcsql's `OnDone` reads them. `Err` is an internal failure.
 pub(super) fn publish_deferred_parameter_array(
     stmt: &StmtHandle,
     update: Option<Box<ParameterArrayUpdate>>,
-) -> SqlReturn {
-    apply_parameter_array_update(stmt, update.map(|update| *update))
+) -> Result<SqlReturn, SqlReturn> {
+    try_apply_parameter_array_update(stmt, update.map(|update| *update))
 }
 
 pub(super) fn take_parameter_array_update(
@@ -748,6 +806,7 @@ pub(super) fn take_parameter_array_update(
         has_more: client.has_open_batch(),
         result: client.take_prepared_batch_results(),
         current_set: client.current_parameter_set(),
+        quiet_set: None,
     }))
 }
 
@@ -755,8 +814,18 @@ pub(super) fn apply_parameter_array_update(
     stmt: &StmtHandle,
     update: Option<ParameterArrayUpdate>,
 ) -> SqlReturn {
+    try_apply_parameter_array_update(stmt, update).unwrap_or_else(|rc| rc)
+}
+
+/// Like [`apply_parameter_array_update`], but an internal failure (a poisoned
+/// lock) is `Err`, distinct from a parameter set's own `SQL_ERROR`, so callers
+/// that otherwise downgrade a set's failure to a warning can still fail.
+pub(super) fn try_apply_parameter_array_update(
+    stmt: &StmtHandle,
+    update: Option<ParameterArrayUpdate>,
+) -> Result<SqlReturn, SqlReturn> {
     let Some(update) = update else {
-        return SQL_SUCCESS;
+        return Ok(SQL_SUCCESS);
     };
     let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
     let (param_status_ptr, params_processed_ptr) = {
@@ -770,7 +839,7 @@ pub(super) fn apply_parameter_array_update(
                     "Internal error reading the parameter status pointers",
                 );
             }
-            return SQL_ERROR;
+            return Err(SQL_ERROR);
         };
         (
             ipd_state.header.array_status_ptr.cast::<SqlUSmallInt>(),
@@ -778,10 +847,10 @@ pub(super) fn apply_parameter_array_update(
         )
     };
     let Ok(mut stmt_state) = stmt.inner.lock() else {
-        return SQL_ERROR;
+        return Err(SQL_ERROR);
     };
     let Some(mut batch) = stmt_state.parameter_array.take() else {
-        return SQL_SUCCESS;
+        return Ok(SQL_SUCCESS);
     };
     batch.outputs.param_status_ptr = param_status_ptr;
     batch.outputs.params_processed_ptr = params_processed_ptr;
@@ -792,13 +861,14 @@ pub(super) fn apply_parameter_array_update(
             &mut batch,
             update.current_set,
             update.has_more,
+            update.quiet_set,
         ),
         None => SQL_SUCCESS,
     };
     if update.has_more {
         stmt_state.parameter_array = Some(batch);
     }
-    rc
+    Ok(rc)
 }
 
 fn report_parameter_array(
@@ -807,6 +877,7 @@ fn report_parameter_array(
     batch: &mut BatchClientResults,
     current_set: Option<usize>,
     has_more: bool,
+    quiet_set: Option<usize>,
 ) -> SqlReturn {
     let mut failed_sets = std::mem::take(&mut batch.client_side_failures);
     let complete = result.complete;
@@ -835,7 +906,9 @@ fn report_parameter_array(
                 SQL_PARAM_SUCCESS
             }
         } else {
-            failed_sets += 1;
+            if quiet_set != Some(row.row_index) {
+                failed_sets += 1;
+            }
             post_tds_error(
                 stmt_state,
                 &TdsError::from_sql_errors(row.errors),
@@ -3684,6 +3757,7 @@ mod tests {
                 &mut batch,
                 None,
                 false,
+                None,
             );
             assert_eq!(status, SQL_PARAM_SUCCESS_WITH_INFO);
             assert_eq!(processed, 1);
@@ -3724,6 +3798,7 @@ mod tests {
             finish_parameter_array(
                 dbc,
                 stmt,
+                h.stmt,
                 client,
                 PreparedBatchResult {
                     rows: vec![reported_row(0)],
@@ -3903,6 +3978,7 @@ mod tests {
             has_more: false,
             result: None,
             current_set: None,
+            quiet_set: None,
         };
         assert_eq!(apply_parameter_array_update(stmt, Some(update)), SQL_ERROR);
         assert_eq!(

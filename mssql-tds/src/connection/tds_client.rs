@@ -2125,17 +2125,15 @@ impl TdsClient {
         result
     }
 
+    /// Ends a prepared batch whose read failed. Shares the RPC terminator's
+    /// failure rule: an interruption whose ATTENTION went unacknowledged
+    /// disables session recovery so the retired connection is not reopened, an
+    /// acknowledged one keeps the connection, and any other error retires it.
     fn abandon_prepared_batch(&mut self, error: &crate::error::Error) {
         self.current_metadata = None;
         self.current_result_set_has_been_read_till_end = true;
-        self.execution_context.set_has_open_batch(false);
         self.prepared_batch = None;
-        if !matches!(
-            error,
-            crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
-        ) {
-            self.retire_after_failed_drain(error);
-        }
+        self.fail_rpc_terminator_look_ahead(error);
     }
 
     /// Reads a batched RPC's trailer after its row set, stopping at that RPC's
@@ -18593,6 +18591,46 @@ mod tests {
         );
         assert!(!client.has_open_batch());
         assert!(!client.is_connection_dead());
+    }
+
+    /// Interrupting a parameter set's trailer read follows the RPC terminator's
+    /// rule: an unacknowledged ATTENTION disarms recovery so the retired
+    /// connection is not transparently reopened.
+    #[tokio::test]
+    async fn prepared_batch_trailer_disarms_recovery_when_attention_cleanup_fails() {
+        let tokens = vec![
+            empty_col_metadata(),
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            empty_col_metadata(),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+        client
+            .begin_execute_prepared_batch(
+                &mut statement,
+                vec![Ok((0, Vec::new())), Ok((1, Vec::new()))],
+                &mut None,
+                (),
+            )
+            .await
+            .unwrap();
+        client.recovery_context.session_recovery_negotiated = true;
+        assert!(!client.peek_past_current_row().await.unwrap());
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+        client.transport.mark_known_dead();
+
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(!client.recovery_context.session_recovery_negotiated);
+        assert!(!client.has_open_batch());
+        assert!(!client.has_prepared_batch());
     }
 
     /// AB#49495: an exhausted row set settles its RPC's RETURNSTATUS and DONE,

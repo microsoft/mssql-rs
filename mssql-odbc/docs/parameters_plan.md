@@ -849,24 +849,33 @@ accept/store contract itself belongs to AB#46377 and is documented in
   reported.
 - **Deferred completion.** A row-returning array is not finished when execute
   returns. A set's status and the processed count are written at the call
-  where msodbcsql's `OnDone` reads that set's RPC DONE: a bound fetch of its
-  last row or the fetch that finds no more rows, `SQLGetData` reaching the
-  last column of its last row, or navigation. An unbound row that Rust buffers
-  for `SQLGetData` reads ahead further than msodbcsql, which leaves that row on
-  the wire, so the completion it finds is held until one of those calls (all
-  measured call by call on msodbcsql 18.6.2.1). Like `OnDone`, the processed
-  count reports completed sets, not the set now producing results. Close and
-  cancel publish nothing for sets the cursor did not reach, including a held
-  completion; those statuses keep `SQL_PARAM_UNUSED`. Inspect the final
-  processed count and status array after `SQLMoreResults` reaches
-  `SQL_NO_DATA`. A set that completes with an error fails
-  the fetch that reads its DONE only when no rows were delivered and no status
-  array is bound; otherwise that fetch reports `SQL_SUCCESS_WITH_INFO`. A
-  successful set is never marked `SQL_PARAM_ERROR` merely for returning rows.
-  A real per-set error retains its status and diagnostic while later results
-  remain fetchable, including when `SQLMoreResults` reports `SQL_ERROR`
-  without a status array. Pending results keep the connection claimed until
-  they are navigated or closed.
+  where msodbcsql's `OnDone` reads that set's RPC DONE: `SQLExecute` or
+  `SQLMoreResults` positioning on an empty set, a bound fetch of a set's last
+  row or the fetch that finds no more rows, `SQLGetData` reaching the last
+  column of the last row, or navigation past the set. Rust's read-ahead can
+  read a DONE before msodbcsql would, either past an unbound row buffered for
+  `SQLGetData`, which msodbcsql leaves on the wire, or past an ERROR token,
+  where msodbcsql's peek stops; that completion is held until one of those
+  calls (all measured call by call on msodbcsql 18.6.2.1). Like `OnDone`, the
+  processed count reports completed sets, not the set now producing results.
+  Close and cancel publish nothing for sets the cursor did not reach,
+  including a held completion; those statuses keep `SQL_PARAM_UNUSED`. Inspect
+  the final processed count and status array after `SQLMoreResults` reaches
+  `SQL_NO_DATA`.
+- **Per-set error return codes** (measured on msodbcsql 18.6.2.1). The call
+  that reports a set's failure posts its diagnostics and writes
+  `SQL_PARAM_ERROR`. Navigation (`SQLExecute`, `SQLMoreResults`) that positions
+  on a set failing before its first row returns `SQL_SUCCESS_WITH_INFO` with a
+  status array and `SQL_ERROR` without one. A fetch that finds a set failing
+  after its rows returns `SQL_NO_DATA` with a status array and `SQL_ERROR`
+  without one. `SQLMoreResults` that discards the unread rest of a failed set
+  posts the error without failing the call. A successful set is never marked
+  `SQL_PARAM_ERROR` merely for returning rows, and later results remain
+  fetchable after a per-set error. Pending results keep the connection claimed
+  until they are navigated or closed. Known gap: after a set fails before its
+  first row with no status array bound, msodbcsql answers `24000` to
+  `SQLFetch` and `SQLCloseCursor` until the next `SQLMoreResults`; Rust reports
+  an empty result.
 - **Failure handling.** A set that fails to build client-side does not abort the
   batch - the request serializes as it streams, so earlier sets are already on
   the wire. The return code is decided once, from one rule, whether the set

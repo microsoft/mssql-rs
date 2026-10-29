@@ -73,17 +73,15 @@ fn sql_more_results_operation(statement_handle: SqlHandle, stmt: &StmtHandle) ->
         stmt_state.deferred_array_update.take()
     };
     // A buffered fetch deferred the current set's completion; msodbcsql reads
-    // its DONE while moving past the result, before the next one.
-    if deferred_array_update.is_none() {
-        return advance_results(statement_handle, stmt);
+    // its DONE while discarding the rest of that result, posting its status
+    // and diagnostics without failing the call (measured on 18.6.2.1).
+    if deferred_array_update.is_some()
+        && let Err(rc) =
+            super::execute::publish_deferred_parameter_array(stmt, deferred_array_update)
+    {
+        return rc;
     }
-    let array_rc = super::execute::publish_deferred_parameter_array(stmt, deferred_array_update);
-    let rc = advance_results(statement_handle, stmt);
-    match (array_rc, rc) {
-        (SQL_ERROR, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA) => SQL_ERROR,
-        (SQL_SUCCESS_WITH_INFO, SQL_SUCCESS | SQL_NO_DATA) => SQL_SUCCESS_WITH_INFO,
-        _ => rc,
-    }
+    advance_results(statement_handle, stmt)
 }
 
 /// The body of `SQLMoreResults` after its diagnostics are cleared.
@@ -91,7 +89,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
     // DESC locks must not nest beneath STMT, including the exhausted fast path.
     let snapshot = snapshot_bound_params(stmt);
     // Observe cursor state.
-    let (cursor_open, bound_params) = {
+    let (cursor_open, bound_params, leaving_set) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLMoreResults: stmt mutex poisoned");
             return SQL_ERROR;
@@ -177,7 +175,11 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             }
             return SQL_SUCCESS;
         }
-        (stmt_state.has_state(STMT_STATE_CURSOR_OPEN), bound_params)
+        (
+            stmt_state.has_state(STMT_STATE_CURSOR_OPEN),
+            bound_params,
+            stmt_state.positioned_parameter_set,
+        )
     };
 
     if !cursor_open {
@@ -209,20 +211,40 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
 
     let result = dbc.runtime.block_on(async {
         let result = client.advance().await?;
+        let mut metadata = None;
+        let mut settled = None;
+        let mut positioned = None;
         if matches!(result, StatementResult::Rows) {
-            client.peek_past_current_row().await?;
+            metadata = Some(client.get_metadata().clone());
+            positioned = client.current_parameter_set();
+            // msodbcsql's navigation reads an empty parameter set through its
+            // DONE (OnDone), reporting that set's status and any error now
+            // rather than on the next fetch (measured on 18.6.2.1).
+            if !client.peek_past_current_row().await? && client.has_prepared_batch() {
+                settled = Some(client.complete_current_result().await?);
+            }
         }
-        Ok(result)
+        Ok((result, metadata, settled, positioned))
     });
-    let array_update = super::execute::take_parameter_array_update(stmt, &mut client);
+    // The unread rest of the result being left is discarded: its set's error is
+    // posted but does not fail this call (measured on 18.6.2.1).
+    let array_update = super::execute::take_parameter_array_update(stmt, &mut client)
+        .map(|update| update.map(|update| update.quiet(leaving_set)));
     match result {
-        Ok(StatementResult::Rows) => {
+        Ok((StatementResult::Rows, metadata, settled, positioned)) => {
             // Positioned on a new row-returning result set. Refresh metadata,
-            // clear row state, keep CURSOR_OPEN and the wire reserved.
-            let metadata = client.get_metadata().clone();
+            // clear row state, keep CURSOR_OPEN, and keep the wire reserved
+            // unless settling an empty final set ended the batch.
+            let metadata = metadata.unwrap_or_default();
             let row_count = client.last_rows_affected();
             let info_messages = client.take_info_messages();
-            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+            let batch_done = settled == Some(true);
+            let lease_return = if batch_done {
+                LeaseReturn::Release
+            } else {
+                LeaseReturn::KeepReservation
+            };
+            if !dbc.return_lease(client, lease_return) {
                 return SQL_ERROR;
             }
             let array_rc = match array_update {
@@ -236,8 +258,9 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             };
             stmt_state.begin_result_set(metadata);
             stmt_state.reset_row_stream();
-            stmt_state.result_set_exhausted = false;
-            stmt_state.batch_exhausted = false;
+            stmt_state.positioned_parameter_set = positioned;
+            stmt_state.result_set_exhausted = settled.is_some();
+            stmt_state.batch_exhausted = batch_done;
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = row_count;
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -262,7 +285,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             }
         }
-        Ok(StatementResult::NoRows { .. }) => {
+        Ok((StatementResult::NoRows { .. }, _, _, _)) => {
             // Positioned on a no-row statement result (PRINT / low-severity
             // RAISERROR / DDL / DML): zero columns, so it is not fetchable
             // (SQLFetch returns 24000), but it is a navigable result and may
@@ -316,7 +339,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             }
         }
-        Ok(StatementResult::End) => {
+        Ok((StatementResult::End, _, _, _)) => {
             // Batch exhausted. Close cursor state and release the connection.
             let info_messages = client.take_info_messages();
             let return_values = client.get_return_values();

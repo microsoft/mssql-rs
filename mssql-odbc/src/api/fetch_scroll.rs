@@ -40,7 +40,7 @@ use uuid::Uuid;
 use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::post_claim_error;
-use crate::api::exec_common::release_busy_if_row_exhausted;
+use crate::api::exec_common::{RowDelivery, release_busy_if_row_exhausted};
 use crate::api::get_data::{
     TextError, column_value_to_bytes, column_value_to_text, convert_typed_c,
     converted_narrow_indicator, decode_narrow_into_pending, hex_buffer_elements,
@@ -1502,17 +1502,20 @@ fn fill_rowset(
             // being posted below: it all left the wire before anything the release
             // peek finds, and posting it afterward would invert the order
             // SQLGetDiagRec reports it in.
-            // SQLGetData-buffered rows defer parameter-set completion: msodbcsql
-            // leaves unbound columns on the wire and has not read the set's DONE.
-            let defer_array_completion = buffered_get_data_row.is_some();
-            let Ok(outcome) = release_busy_if_row_exhausted(
-                dbc,
-                stmt,
-                statement_handle,
-                client,
-                defer_array_completion,
-                |s| post_row_diagnostics(s, &info_messages, worst),
-            ) else {
+            // msodbcsql leaves a row buffered here for SQLGetData on the wire, so
+            // it has not read the set's DONE yet.
+            let delivery = if buffered_get_data_row.is_some() {
+                RowDelivery::Buffered
+            } else if rows_filled > 0 {
+                RowDelivery::Read
+            } else {
+                RowDelivery::None
+            };
+            let Ok(outcome) =
+                release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, delivery, |s| {
+                    post_row_diagnostics(s, &info_messages, worst)
+                })
+            else {
                 return SQL_ERROR;
             };
             outcome
@@ -1742,12 +1745,15 @@ fn finish_exhausted_fetch(
         };
         (rc, deferred_array_update)
     };
-    // msodbcsql reads the set's DONE on this fetch when the previous one left
-    // an unbound row on the wire; a failed set without a status array fails it.
+    // msodbcsql reads the set's DONE on this fetch when the previous call left
+    // it unread (an unbound row on the wire, or an ERROR token after the row).
+    // Measured on 18.6.2.1: a failed set reports `SQL_NO_DATA` with its
+    // diagnostic when a status array carries it, `SQL_ERROR` otherwise.
     let rc = if deferred_array_update.is_some()
-        && super::execute::publish_deferred_parameter_array(stmt, deferred_array_update)
-            == SQL_ERROR
-    {
+        && !matches!(
+            super::execute::publish_deferred_parameter_array(stmt, deferred_array_update),
+            Ok(SQL_SUCCESS | SQL_SUCCESS_WITH_INFO)
+        ) {
         SQL_ERROR
     } else {
         rc

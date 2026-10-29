@@ -558,10 +558,14 @@ pub(crate) struct StmtState {
     /// `sp_execute` reuse path.
     pub(crate) pending_unprepare: Option<StatementId>,
     pub(crate) parameter_array: Option<crate::api::execute::BatchClientResults>,
-    /// Parameter-set completions a buffered unbound fetch read before msodbcsql
-    /// would. Published by the next fetch, a `SQLGetData` reaching the last
-    /// column, or `SQLMoreResults`; discarded with the cursor.
+    /// Parameter-set completions a read-ahead found before msodbcsql would
+    /// (past a buffered unbound row or an ERROR token). Published at the call
+    /// where msodbcsql reads them; discarded with the cursor.
     pub(crate) deferred_array_update: Option<Box<crate::api::execute::ParameterArrayUpdate>>,
+    /// The parameter set whose result the cursor is positioned on. msodbcsql
+    /// discards the unread rest of that set when navigating past it: its error
+    /// is posted but does not fail `SQLMoreResults`.
+    pub(crate) positioned_parameter_set: Option<usize>,
     /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
@@ -1855,6 +1859,7 @@ impl StmtHandle {
                 pending_unprepare: None,
                 parameter_array: None,
                 deferred_array_update: None,
+                positioned_parameter_set: None,
                 row_positioned: false,
                 last_captured: None,
                 captured_plp_wire: None,

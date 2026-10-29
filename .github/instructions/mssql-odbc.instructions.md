@@ -610,7 +610,8 @@ For ODBC hot paths:
     connection setter's statement fan-out.
   - Parameter-array rowsets remain visible in parameter-set order through
     fetch and `SQLMoreResults`. Publish each set's status and the processed
-    count at the call where msodbcsql reads its RPC DONE; hold a completion
-    found by reading ahead of a buffered unbound row until the next fetch,
-    `SQLGetData` of the last column, or `SQLMoreResults`. Closing abandons
-    later sets, and any held completion, without reporting or re-executing them.
+    count at the call where msodbcsql reads its RPC DONE, including
+    navigation onto an empty set; hold a completion found by reading ahead of
+    a buffered unbound row or past an ERROR token until the call msodbcsql
+    would read it. Closing abandons later sets, and any held completion,
+    without reporting or re-executing them.
