@@ -33,6 +33,11 @@ use rust_decimal::prelude::*;
 use tracing::instrument;
 
 fn parse_iso_time(value: &str) -> Option<NaiveTime> {
+    let (hour, minute, second, nanoseconds) = parse_iso_time_components(value)?;
+    NaiveTime::from_hms_nano_opt(hour, minute, second, nanoseconds)
+}
+
+fn parse_iso_time_components(value: &str) -> Option<(u32, u32, u32, u32)> {
     if !value.is_ascii() {
         return None;
     }
@@ -82,12 +87,12 @@ fn parse_iso_time(value: &str) -> Option<NaiveTime> {
             .then(|| part.parse::<u32>().ok())
             .flatten()
     };
-    NaiveTime::from_hms_nano_opt(
+    Some((
         component(hour)?,
         component(minute)?,
         component(second)?,
         nanoseconds,
-    )
+    ))
 }
 
 fn parse_bulk_datetime(value: &str, metadata: &BulkCopyColumnMetadata) -> TdsResult<ColumnValues> {
@@ -105,15 +110,20 @@ fn parse_bulk_datetime(value: &str, metadata: &BulkCopyColumnMetadata) -> TdsRes
     let offset = match zone {
         "" | "Z" => 0,
         _ if zone.starts_with(['+', '-']) => {
-            let offset = parse_iso_time(&zone[1..]).ok_or_else(invalid)?;
+            let (hour, minute, second, nanoseconds) =
+                parse_iso_time_components(&zone[1..]).ok_or_else(invalid)?;
+            // Unlike clock fields, Python offset fields carry into the next unit.
+            let seconds = i64::from(hour * 3600 + minute * 60 + second);
+            if seconds >= 24 * 3600 {
+                return Err(invalid());
+            }
             if metadata.sql_type == SqlDbType::DateTimeOffset
-                && (offset.second() != 0 || offset.nanosecond() != 0)
+                && (seconds % 60 != 0 || nanoseconds != 0)
             {
                 return Err(Error::UsageError(
                     "DATETIMEOFFSET requires a whole-minute UTC offset".into(),
                 ));
             }
-            let seconds = i64::from(offset.num_seconds_from_midnight());
             if zone.starts_with('-') {
                 -seconds
             } else {
@@ -2519,6 +2529,93 @@ mod tests {
     }
 
     #[test]
+    fn datetime_strings_normalize_offset_components() {
+        for (zone, normalized) in [
+            ("+05:60", "+06:00"),
+            ("-05:60", "-06:00"),
+            ("+00:00:60", "+00:01"),
+            ("-00:00:60", "-00:01"),
+            ("+00:90", "+01:30"),
+            ("+0560", "+06:00"),
+            ("-000060", "-00:01"),
+            ("+13:59:60", "+14:00"),
+            ("-13:60", "-14:00"),
+        ] {
+            for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+                let input = format!("2024-07-01T00:00:00.1234567{zone}");
+                let expected = format!("2024-07-01T00:00:00.1234567{normalized}");
+                assert_eq!(
+                    convert(&input, sql_type, 7).unwrap(),
+                    convert(&expected, sql_type, 7).unwrap(),
+                    "{input}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offset_component_ranges_match_python_datetime() {
+        Python::attach(|py| {
+            let datetime = py.import("datetime").unwrap().getattr("datetime").unwrap();
+            for hour in [0, 5, 13, 14, 22, 23, 24, 99] {
+                for minute in [0, 59, 60, 90, 99] {
+                    for second in [0, 59, 60, 99] {
+                        for sign in ["+", "-"] {
+                            let input = format!(
+                                "2024-07-01T12:00:00.1234567{sign}{hour:02}:{minute:02}:{second:02}"
+                            );
+                            let expected = datetime.call_method1("fromisoformat", (&input,));
+                            for sql_type in [SqlDbType::DateTime2, SqlDbType::DateTimeOffset] {
+                                let actual = convert(&input, sql_type, 7);
+                                let Ok(expected) = &expected else {
+                                    assert!(actual.is_err(), "{input}");
+                                    continue;
+                                };
+                                let seconds = expected
+                                    .call_method0("utcoffset")
+                                    .unwrap()
+                                    .call_method0("total_seconds")
+                                    .unwrap()
+                                    .extract::<f64>()
+                                    .unwrap() as i64;
+                                if sql_type == SqlDbType::DateTimeOffset
+                                    && (seconds % 60 != 0 || seconds.abs() > 14 * 3600)
+                                {
+                                    assert!(actual.is_err(), "{input}");
+                                    continue;
+                                }
+                                let (value, offset) = match actual.unwrap() {
+                                    ColumnValues::DateTime2(value) => (value, 0),
+                                    ColumnValues::DateTimeOffset(value) => {
+                                        assert_eq!(
+                                            i64::from(value.offset) * 60,
+                                            seconds,
+                                            "{input}"
+                                        );
+                                        (value.datetime2, seconds)
+                                    }
+                                    other => panic!("Unexpected value: {other:?}"),
+                                };
+                                let ticks = 432_001_234_567i64 - offset * 10_000_000;
+                                assert_eq!(
+                                    i64::from(value.days),
+                                    739_067 + ticks.div_euclid(864_000_000_000),
+                                    "{input}"
+                                );
+                                assert_eq!(
+                                    value.time.time_nanoseconds as i64,
+                                    ticks.rem_euclid(864_000_000_000),
+                                    "{input}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn datetime2_strings_ignore_subminute_offsets() {
         for offset in [
             "+00:00:30",
@@ -2529,6 +2626,8 @@ mod tests {
             "-0000301234567",
             "+00:00:00:1",
             "-00:00:30:1234567",
+            "+00:99:99",
+            "-00:00:60.1",
         ] {
             let input = format!("2024-07-01T00:00:00.1234567{offset}");
             let ColumnValues::DateTime2(value) = convert(&input, SqlDbType::DateTime2, 7).unwrap()
@@ -2569,6 +2668,9 @@ mod tests {
                 "2024-07-01T12:00:00.",
                 "2024-07-01T12:00:00.12345678",
                 "2024-07-01T12:00:00+24:00",
+                "2024-07-01T12:00:00+23:59:60",
+                "2024-07-01T12:00:00-23:60",
+                "2024-07-01T12:00:00+00:100",
                 "2024-07-01T12:00:00Z12",
                 "2024-07-01T1:00:00",
                 "2024-07-01T0\u{20ac}00",
@@ -2585,6 +2687,8 @@ mod tests {
         for input in [
             "2024-07-01T12:00:00+14:01",
             "2024-07-01T12:00:00-14:01",
+            "2024-07-01T12:00:00+13:60:60",
+            "2024-07-01T12:00:00-14:60",
             "2024-07-01T12:00:00+00:00:30",
             "2024-07-01T12:00:00+00:00:00.1",
             "0001-01-01T00:00:00+00:01",

@@ -37,7 +37,9 @@ are retained; both represent `12:00:00.12`.
 `DATETIME2` retains the local date and time when an offset is present.
 `DATETIMEOFFSET` preserves the offset and normalizes its wire timestamp to UTC;
 offsets must be whole minutes within `-14:00` through `+14:00`, and both the local
-and UTC dates must be within years 1 through 9999. Strings without an offset
+and UTC dates must be within years 1 through 9999. Offset fields are normalized
+before validation, matching Python (for example, `+05:60` becomes `+06:00`).
+Strings without an offset
 continue to use UTC for `DATETIMEOFFSET`. Python `datetime` objects retain their
 existing microsecond resolution.
 
