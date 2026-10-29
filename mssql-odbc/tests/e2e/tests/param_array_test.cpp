@@ -292,7 +292,8 @@ ODBC_TEST_F(ParamArrayTest, DescriptorArraySizeExecutesEveryParameterSet) {
 // so both directions are pinned, as is the row side staying put: it is
 // a different descriptor and must not move with the parameter side.
 // -------------------------------------------------------------------
-ODBC_TEST_F(ParamArrayTest, ParamsetSizeAndDescriptorArraySizeAgree) {
+ODBC_TEST_F_MODES(ParamArrayTest, ParamsetSizeAndDescriptorArraySizeAgree,
+                  odbc_concurrency::kAllModes) {
     SQLHDESC apd = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
                   SQL_HANDLE_STMT, stmt_);
@@ -388,7 +389,7 @@ ODBC_TEST_F_MODES(ParamArrayTest, ExplicitAppParamDescCarriesItsOwnArraySize,
 //     every platform, SQL_ERROR here. That is the real, observable
 //     divergence, and it is what this case pins.
 // -------------------------------------------------------------------
-ODBC_TEST_F(ParamArrayTest, ArraySizeZeroIsRejected) {
+ODBC_TEST_F_MODES(ParamArrayTest, ArraySizeZeroIsRejected, odbc_concurrency::kAllModes) {
     SQLHDESC apd = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
                   SQL_HANDLE_STMT, stmt_);
@@ -465,7 +466,8 @@ ODBC_TEST_F(ParamArrayTest, ArraySizeZeroIsRejected) {
 // `row_array_size_clamps_but_paramset_size_stores_verbatim` pins the
 // diagnostic at the driver boundary, where it is unambiguous.
 // -------------------------------------------------------------------
-ODBC_TEST_F(ParamArrayTest, OverlargeParamsetSizeIsStoredVerbatim) {
+ODBC_TEST_F_MODES(ParamArrayTest, OverlargeParamsetSizeIsStoredVerbatim,
+                  odbc_concurrency::kAllModes) {
     const SQLULEN over = static_cast<SQLULEN>(INT32_MAX) + 1000;
     EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, over))
         << "PARAMSET_SIZE has no upper clamp on either driver";
@@ -597,7 +599,8 @@ ODBC_TEST_F(ParamArrayTest, DescriptorOperationArraySkipsIgnoredSets) {
 // 1i. AB#49060: each parameter-side attribute and its descriptor field are
 // one value, in both directions.
 // -------------------------------------------------------------------
-ODBC_TEST_F(ParamArrayTest, ParameterAttributesAndDescriptorFieldsAgree) {
+ODBC_TEST_F_MODES(ParamArrayTest, ParameterAttributesAndDescriptorFieldsAgree,
+                  odbc_concurrency::kAllModes) {
     SQLHDESC apd = SQL_NULL_HDESC;
     SQLHDESC ipd = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
@@ -1657,7 +1660,8 @@ ODBC_TEST_F(ParamArrayTest, ArrayCommitsEveryRowUnderAutocommit) {
     EXPECT_EQ(2, ScalarInt("SELECT COUNT(*) FROM #pa"));
 }
 
-ODBC_TEST_F(ParamArrayTest, SelectArrayPreservesEmptyAndNullResults) {
+ODBC_TEST_F_MODES(ParamArrayTest, SelectArrayPreservesEmptyAndNullResults,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT value FROM (VALUES (CAST(? AS int))) AS source(value) "
             "WHERE value IS NULL OR value > 0");
     SQLINTEGER values[3] = {0, 7, 9};
@@ -2422,7 +2426,8 @@ ODBC_TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
     EXPECT_EQ(6, ScalarInt("SELECT COUNT(*) FROM #pa_out3"));
 }
 
-ODBC_TEST_F(ParamArrayTest, PendingArrayResultKeepsConnectionBusy) {
+ODBC_TEST_F_MODES(ParamArrayTest, PendingArrayResultKeepsConnectionBusy,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int)");
     SQLINTEGER values[2] = {1, 2};
     SQLLEN indicators[2] = {};
@@ -2445,7 +2450,8 @@ ODBC_TEST_F(ParamArrayTest, PendingArrayResultKeepsConnectionBusy) {
     FreeStmt(probe);
 }
 
-ODBC_TEST_F(ParamArrayTest, ClosingArrayCursorReleasesConnection) {
+ODBC_TEST_F_MODES(ParamArrayTest, ClosingArrayCursorReleasesConnection,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int)");
     SQLINTEGER values[2] = {1, 2};
     SQLLEN indicators[2] = {};
@@ -2488,7 +2494,8 @@ ODBC_TEST_F(ParamArrayTest, ProcedureArrayDeliversEveryResultSet) {
     }
 }
 
-ODBC_TEST_F(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClose) {
+ODBC_TEST_F_MODES(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClose,
+                  odbc_concurrency::kAllModes) {
     Prepare("DECLARE @value int = ?; IF @value = 1 PRINT 'first set info'; SELECT @value");
     SQLINTEGER values[3] = {1, 2, 3};
     SQLLEN indicators[3] = {};
@@ -2517,7 +2524,7 @@ ODBC_TEST_F(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClos
     }
 }
 
-ODBC_TEST_F(ParamArrayTest, RowReturningArraySkipsIgnoredSets) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArraySkipsIgnoredSets, odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int)");
     SQLINTEGER values[4] = {1, 2, 3, 4};
     SQLLEN indicators[4] = {};
@@ -2532,7 +2539,8 @@ ODBC_TEST_F(ParamArrayTest, RowReturningArraySkipsIgnoredSets) {
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
 }
 
-ODBC_TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArrayContinuesAfterASetError,
+                  odbc_concurrency::kAllModes) {
     Prepare("DECLARE @value int = ?; IF @value = 2 "
             "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");
     SQLINTEGER values[3] = {1, 2, 3};
@@ -2570,7 +2578,8 @@ ODBC_TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
-ODBC_TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors,
+                  odbc_concurrency::kAllModes) {
     Prepare("DECLARE @value int = ?; IF @value = 2 "
             "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");
     SQLINTEGER values[3] = {1, 2, 3};
@@ -2602,7 +2611,8 @@ ODBC_TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
-ODBC_TEST_F(ParamArrayTest, RowReturningArrayDrainsPartialLobOnAdvance) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArrayDrainsPartialLobOnAdvance,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int), REPLICATE(CAST('x' AS varchar(max)), 1048576)");
     SQLINTEGER values[2] = {1, 2};
     SQLLEN indicators[2] = {};
@@ -2625,6 +2635,9 @@ ODBC_TEST_F(ParamArrayTest, RowReturningArrayDrainsPartialLobOnAdvance) {
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
+// Not /SharedDbc: each attempt holds the shared connection for its 2 s query
+// timeout, so at 8 x 20 the other workers reach the busy-retry deadline, even
+// with backoff (both drivers, about 1,750 attempts each).
 ODBC_TEST_F(ParamArrayTest, RowReturningArrayTimeoutDuringNavigation) {
     Prepare("SELECT CAST(? AS int); "
             "RAISERROR ('result available', 0, 1) WITH NOWAIT; "
@@ -2830,4 +2843,61 @@ ODBC_TEST_F(ParamArrayTest, Time2ArrayStridesByItsStructSize) {
     EXPECT_EQ("10,11,12",
               ScalarString("SELECT STRING_AGG(CONVERT(varchar(2), DATEPART(hour, v)), ',') "
                            "WITHIN GROUP (ORDER BY id) FROM #pa_t2"));
+}
+
+// Fifty run-unique parameter sets each answer with their own result, so under the
+// concurrent modes a set or result delivered to another worker's statement,
+// skipped, or out of order fails here. It writes nothing, so a busy retry in
+// /SharedDbc repeats no work.
+ODBC_TEST_F_MODES(ParamArrayTest, RunUniqueParameterSetsAnswerInOrder,
+                  odbc_concurrency::kAllModes) {
+    constexpr SQLULEN kSets = 50;
+    const std::string token = WorkerToken("set");
+    const SQLINTEGER base = (Worker() * 1000 + Iteration() % 1000) * 100;
+    SQLINTEGER ids[kSets] = {};
+    SQLLEN id_ind[kSets] = {};
+    char text[kSets][48] = {};
+    SQLLEN text_ind[kSets] = {};
+    SQLUSMALLINT status[kSets] = {};
+    SQLULEN processed = 0;
+    for (SQLULEN i = 0; i < kSets; ++i) {
+        ids[i] = base + static_cast<SQLINTEGER>(i);
+        const std::string value = token + "-" + std::to_string(i);
+        std::memcpy(text[i], value.c_str(), value.size() + 1);
+        text_ind[i] = SQL_NTS;
+    }
+    Prepare("SELECT CAST(? AS INT), CAST(? AS VARCHAR(48))");
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   ids, 0, id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 47, 0,
+                                   text, sizeof(text[0]), text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, kSets));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, &processed));
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    for (SQLULEN i = 0; i < kSets; ++i) {
+        SCOPED_TRACE(i);
+        if (i > 0) {
+            ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_))
+                << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER id = -1;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, nullptr), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(ids[i], id);
+        char value[64] = {};
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, value, sizeof(value), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_STREQ(text[i], value);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(kSets, processed);
+    for (SQLULEN i = 0; i < kSets; ++i) {
+        EXPECT_EQ(SQL_PARAM_SUCCESS, status[i]) << "set " << i;
+    }
 }

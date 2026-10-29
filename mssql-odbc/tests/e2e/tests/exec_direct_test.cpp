@@ -59,13 +59,13 @@ protected:
 };
 
 // NULL SQL text pointer returns SQL_ERROR.
-ODBC_TEST_F(ExecDirectLiveTest, NullSqlText) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, NullSqlText, odbc_concurrency::kAllModes) {
     SQLRETURN rc = SQLExecDirect(stmt_, nullptr, SQL_NTS);
     EXPECT_SQL_ERROR(rc);
 }
 
 // Simple scalar query returns SQL_SUCCESS.
-ODBC_TEST_F(ExecDirectLiveTest, SelectScalar) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, SelectScalar, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -88,7 +88,7 @@ ODBC_TEST_F(ExecDirectLiveTest, SelectScalar) {
 
 // Query that produces no rows still returns SQL_SUCCESS.
 // Callers discover "no rows" via SQLFetch -> SQL_NO_DATA.
-ODBC_TEST_F(ExecDirectLiveTest, EmptyResultSet) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, EmptyResultSet, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 WHERE 1 = 0");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -110,7 +110,7 @@ ODBC_TEST_F(ExecDirectLiveTest, EmptyResultSet) {
 }
 
 // Syntactically invalid SQL returns SQL_ERROR.
-ODBC_TEST_F(ExecDirectLiveTest, InvalidSql) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, InvalidSql, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("NOT VALID SQL @@##");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_SQL_ERROR(rc);
@@ -121,7 +121,7 @@ ODBC_TEST_F(ExecDirectLiveTest, InvalidSql) {
 // compatibility tiers, severity 11-18 reports 42000, which wrappers classify as
 // a programming error. None of the error numbers below is in the map — nor in
 // msodbcsql's — so these tests only pass through the severity tier.
-ODBC_TEST_F(ExecDirectLiveTest, SyntaxErrorReports42000) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, SyntaxErrorReports42000, odbc_concurrency::kAllModes) {
     // Error 102/156, severity 15.
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT * FROM");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
@@ -129,7 +129,7 @@ ODBC_TEST_F(ExecDirectLiveTest, SyntaxErrorReports42000) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, ConversionErrorReports42000) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, ConversionErrorReports42000, odbc_concurrency::kAllModes) {
     // Error 257, severity 16 — implicit varchar→varbinary conversion.
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
         "DECLARE @b VARBINARY(10); SET @b = 'not binary';");
@@ -138,7 +138,8 @@ ODBC_TEST_F(ExecDirectLiveTest, ConversionErrorReports42000) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, RaiseErrorSeverity16Reports42000) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, RaiseErrorSeverity16Reports42000,
+                  odbc_concurrency::kAllModes) {
     // Native 50000 — RAISERROR's generic user-message number. It is deliberately
     // absent from the map (it carries no fixed semantic), so only severity can
     // classify it.
@@ -156,7 +157,7 @@ ODBC_TEST_F(ExecDirectLiveTest, RaiseErrorSeverity16Reports42000) {
 // Re-executing on the same STMT requires closing the cursor first.
 // SQLExecDirectW leaves an open cursor for result-bearing queries; the caller
 // must call SQLCloseCursor (or SQLFreeStmt(SQL_CLOSE)) before re-executing.
-ODBC_TEST_F(ExecDirectLiveTest, ReExecute) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, ReExecute, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -192,7 +193,8 @@ ODBC_TEST_F(ExecDirectLiveTest, DmlDoesNotOpenCursor) {
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, InfoMessagesSurfaceAsDiagnostics) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, InfoMessagesSurfaceAsDiagnostics,
+                  odbc_concurrency::kAllModes) {
     // Statement-wise navigation (msodbcsql parity): each no-row statement is its
     // own result. The PRINT surfaces on SQLExecDirect; the low-severity
     // RAISERROR surfaces on the next SQLMoreResults; then the batch ends.
@@ -227,7 +229,8 @@ ODBC_TEST_F(ExecDirectLiveTest, InfoMessagesSurfaceAsDiagnostics) {
 // assignment and SQLExecDirect returned plain SQL_SUCCESS, so callers that only
 // read diagnostics on SQL_SUCCESS_WITH_INFO (mssql-python's cursor.messages)
 // saw nothing at all.
-ODBC_TEST_F(ExecDirectLiveTest, PrintAfterAssignmentsSurfacesOnExecute) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, PrintAfterAssignmentsSurfacesOnExecute,
+                  odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
         "DECLARE @msg VARCHAR(MAX);"
         " SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047);"
@@ -248,13 +251,15 @@ ODBC_TEST_F(ExecDirectLiveTest, PrintAfterAssignmentsSurfacesOnExecute) {
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, FetchOnFreshStatementReturnsHy010) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, FetchOnFreshStatementReturnsHy010,
+                  odbc_concurrency::kAllModes) {
     SQLRETURN rc = SQLFetch(stmt_);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, FreeStmtCloseAfterNoDataAllowsReExecute) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, FreeStmtCloseAfterNoDataAllowsReExecute,
+                  odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -271,7 +276,8 @@ ODBC_TEST_F(ExecDirectLiveTest, FreeStmtCloseAfterNoDataAllowsReExecute) {
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, CloseVsFreeStmtWhenNoCursorOpen) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, CloseVsFreeStmtWhenNoCursorOpen,
+                  odbc_concurrency::kAllModes) {
     SQLRETURN rc = SQLCloseCursor(stmt_);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
@@ -280,7 +286,7 @@ ODBC_TEST_F(ExecDirectLiveTest, CloseVsFreeStmtWhenNoCursorOpen) {
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, DoubleFetchAtEndReturnsNoData) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, DoubleFetchAtEndReturnsNoData, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -297,7 +303,7 @@ ODBC_TEST_F(ExecDirectLiveTest, DoubleFetchAtEndReturnsNoData) {
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
 
-ODBC_TEST_F(ExecDirectLiveTest, GetDataBasicChar) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, GetDataBasicChar, odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 42");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
@@ -359,22 +365,26 @@ std::string ExecAndReadFirstCell(SQLHSTMT stmt, const char* sql) {
 }  // namespace
 
 // DECLARE with an initializer, followed by a SELECT.
-ODBC_TEST_F(ExecDirectLiveTest, DeclareWithInitializerDoesNotPrecedeRowSet) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, DeclareWithInitializerDoesNotPrecedeRowSet,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("7", ExecAndReadFirstCell(stmt_, "DECLARE @x int = 1; SELECT 7 AS a;"));
 }
 
 // SET assignment is compiled the same way as an initialized DECLARE.
-ODBC_TEST_F(ExecDirectLiveTest, SetAssignmentDoesNotPrecedeRowSet) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, SetAssignmentDoesNotPrecedeRowSet,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("8", ExecAndReadFirstCell(stmt_, "DECLARE @x int; SET @x = 1; SELECT 8 AS a;"));
 }
 
 // Assignment-SELECT reports the source row count on its DONE token.
-ODBC_TEST_F(ExecDirectLiveTest, AssignmentSelectDoesNotPrecedeRowSet) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, AssignmentSelectDoesNotPrecedeRowSet,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("9", ExecAndReadFirstCell(stmt_, "DECLARE @x int; SELECT @x = 1; SELECT 9 AS a;"));
 }
 
 // Several assignments in a row all collapse into the following row set.
-ODBC_TEST_F(ExecDirectLiveTest, ConsecutiveAssignmentsDoNotPrecedeRowSet) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, ConsecutiveAssignmentsDoNotPrecedeRowSet,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("10",
               ExecAndReadFirstCell(
                   stmt_, "DECLARE @a int = 1; DECLARE @b int = 2; SET @a = 3; SELECT 10 AS a;"));
@@ -394,7 +404,8 @@ ODBC_TEST_F(ExecDirectLiveTest, DeclareThenExecProcOpensProcRowSet) {
 
 // A batch that is only an assignment must not report a phantom row count.
 // msodbcsql reports SQLRowCount -1 here, not 1.
-ODBC_TEST_F(ExecDirectLiveTest, AssignmentOnlyBatchReportsNoRowCount) {
+ODBC_TEST_F_MODES(ExecDirectLiveTest, AssignmentOnlyBatchReportsNoRowCount,
+                  odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("DECLARE @x int = 1;");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);

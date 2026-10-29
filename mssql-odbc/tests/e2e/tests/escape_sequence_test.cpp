@@ -119,7 +119,7 @@ protected:
 
 // --- SQLNativeSql ---------------------------------------------------------
 
-ODBC_TEST_F(EscapeSequenceLiveTest, NativeSqlIsAdvertised) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, NativeSqlIsAdvertised, odbc_concurrency::kAllModes) {
     SQLUSMALLINT supported = SQL_FALSE;
     ASSERT_SQL_OK(SQLGetFunctions(dbc_, SQL_API_SQLNATIVESQL, &supported),
                   SQL_HANDLE_DBC, dbc_);
@@ -131,7 +131,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, NativeSqlIsAdvertised) {
 }
 
 /// SQL Server parses these natively, so the driver forwards them untouched.
-ODBC_TEST_F(EscapeSequenceLiveTest, NativeEscapesArePassedThrough) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, NativeEscapesArePassedThrough,
+                  odbc_concurrency::kAllModes) {
     const char* const passthrough[] = {
         "SELECT {fn UCASE('abc')}",
         "SELECT {d '2020-01-02'}",
@@ -148,7 +149,7 @@ ODBC_TEST_F(EscapeSequenceLiveTest, NativeEscapesArePassedThrough) {
     }
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, LiteralTranslations) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, LiteralTranslations, odbc_concurrency::kAllModes) {
     SQLRETURN rc = SQL_SUCCESS;
     EXPECT_EQ(" 'INTERVAL +''1'' DAY(2)' ",
               NativeSql(dbc_, "{interval '1' DAY}", rc));
@@ -159,13 +160,14 @@ ODBC_TEST_F(EscapeSequenceLiveTest, LiteralTranslations) {
               NativeSql(dbc_, "x LIKE 'a\\_b' {escape '\\'}", rc));
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, CallTranslatesToExecText) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, CallTranslatesToExecText, odbc_concurrency::kAllModes) {
     SQLRETURN rc = SQL_SUCCESS;
     EXPECT_EQ(" EXEC sp_who  ", NativeSql(dbc_, "{call sp_who}", rc));
     EXPECT_EQ(" EXEC ?=sp_who ?  ", NativeSql(dbc_, "{? = call sp_who(?)}", rc));
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, IntervalInsideCallIsPassedThrough) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, IntervalInsideCallIsPassedThrough,
+                  odbc_concurrency::kAllModes) {
     for (const char* interval : {
              "{interval '1' DAY}",
              "{INTERVAL '100' DAY}",
@@ -178,6 +180,9 @@ ODBC_TEST_F(EscapeSequenceLiveTest, IntervalInsideCallIsPassedThrough) {
     }
 }
 
+// Not /SharedDbc: SQLNativeSql reports on the connection, so another worker's call
+// on the shared DBC clears the record before this one reads it (both drivers,
+// 8 x 20).
 ODBC_TEST_F(EscapeSequenceLiveTest, MalformedEscapeIsRejected) {
     SQLRETURN rc = SQL_SUCCESS;
     NativeSql(dbc_, "SELECT {bogus 1}", rc);
@@ -187,6 +192,9 @@ ODBC_TEST_F(EscapeSequenceLiveTest, MalformedEscapeIsRejected) {
 
 /// The interval escape reports through the type converter, not the escape
 /// parser, so its SQLSTATEs differ from every other escape's.
+// Not /SharedDbc: SQLNativeSql reports on the connection, so another worker's call
+// on the shared DBC clears the record before this one reads it (both drivers,
+// 8 x 20).
 ODBC_TEST_F(EscapeSequenceLiveTest, IntervalErrorsUseConverterSqlStates) {
     SQLRETURN rc = SQL_SUCCESS;
     NativeSql(dbc_, "SELECT {interval '100' DAY}", rc);
@@ -200,7 +208,7 @@ ODBC_TEST_F(EscapeSequenceLiveTest, IntervalErrorsUseConverterSqlStates) {
 
 // --- execution ------------------------------------------------------------
 
-ODBC_TEST_F(EscapeSequenceLiveTest, EscapesExecute) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, EscapesExecute, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT {fn UCASE('abc')}");
     ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
     SQLCHAR value[32] = {};
@@ -219,7 +227,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, EscapesExecute) {
     SQLCloseCursor(stmt_);
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, MalformedEscapeFailsBeforeExecute) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, MalformedEscapeFailsBeforeExecute,
+                  odbc_concurrency::kAllModes) {
     SqlTString text = ODBCTestUtils::ToSqlTStr("SELECT {bogus 1}");
     EXPECT_EQ(SQL_ERROR,
               SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS));
@@ -228,7 +237,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, MalformedEscapeFailsBeforeExecute) {
 
 /// With NOSCAN on the text goes to the server as written, so a malformed escape
 /// becomes the server's syntax error rather than the driver's.
-ODBC_TEST_F(EscapeSequenceLiveTest, NoscanSuppressesTranslation) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, NoscanSuppressesTranslation,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_NOSCAN,
                                  reinterpret_cast<SQLPOINTER>(SQL_NOSCAN_ON), 0),
                   SQL_HANDLE_STMT, stmt_);
@@ -241,7 +251,7 @@ ODBC_TEST_F(EscapeSequenceLiveTest, NoscanSuppressesTranslation) {
 
 // --- {call} ---------------------------------------------------------------
 
-ODBC_TEST_F(EscapeSequenceLiveTest, CallExecutesAndReturnsRows) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, CallExecutesAndReturnsRows, odbc_concurrency::kAllModes) {
     CreateProc("@a int AS BEGIN SELECT @a * 2 AS doubled; END");
 
     ExecDirect("{call " + proc_name_ + "(21)}");
@@ -253,7 +263,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, CallExecutesAndReturnsRows) {
     EXPECT_EQ(42, value);
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, CallWithBoundInputParameter) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, CallWithBoundInputParameter,
+                  odbc_concurrency::kAllModes) {
     CreateProc("@a int AS BEGIN SELECT @a * 2 AS doubled; END");
 
     SqlTString text = ODBCTestUtils::ToSqlTStr("{call " + proc_name_ + "(?)}");
@@ -274,7 +285,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, CallWithBoundInputParameter) {
 
 // --- output parameters ----------------------------------------------------
 
-ODBC_TEST_F(EscapeSequenceLiveTest, OutputParameterIsWrittenBack) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, OutputParameterIsWrittenBack,
+                  odbc_concurrency::kAllModes) {
     CreateProc("@a int, @b int OUTPUT AS BEGIN SET @b = @a * 2; END");
 
     SqlTString text = ODBCTestUtils::ToSqlTStr("{call " + proc_name_ + "(?, ?)}");
@@ -299,7 +311,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, OutputParameterIsWrittenBack) {
     EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), out_ind);
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, NullOutputParameterSetsTheIndicator) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, NullOutputParameterSetsTheIndicator,
+                  odbc_concurrency::kAllModes) {
     CreateProc("@b int OUTPUT AS BEGIN SET @b = NULL; END");
 
     SqlTString text = ODBCTestUtils::ToSqlTStr("{call " + proc_name_ + "(?)}");
@@ -316,7 +329,7 @@ ODBC_TEST_F(EscapeSequenceLiveTest, NullOutputParameterSetsTheIndicator) {
     EXPECT_EQ(SQL_NULL_DATA, out_ind);
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, ReturnStatusIsWrittenBack) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, ReturnStatusIsWrittenBack, odbc_concurrency::kAllModes) {
     CreateProc("AS BEGIN RETURN 7; END");
 
     SqlTString text = ODBCTestUtils::ToSqlTStr("{? = call " + proc_name_ + "}");
@@ -343,7 +356,7 @@ ODBC_TEST_F(EscapeSequenceLiveTest, UnboundReturnStatusIsRejected) {
 
 // --- SQLNumParams / SQLDescribeParam --------------------------------------
 
-ODBC_TEST_F(EscapeSequenceLiveTest, NumParamsCountsCallMarkers) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, NumParamsCountsCallMarkers, odbc_concurrency::kAllModes) {
     CreateProc("@a int, @b varchar(20), @c int OUTPUT AS BEGIN SELECT @a; END");
 
     struct Case {
@@ -368,7 +381,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, NumParamsCountsCallMarkers) {
     }
 }
 
-ODBC_TEST_F(EscapeSequenceLiveTest, NumParamsRequiresAPreparedStatement) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, NumParamsRequiresAPreparedStatement,
+                  odbc_concurrency::kAllModes) {
     SQLSMALLINT count = -1;
     EXPECT_EQ(SQL_ERROR, SQLNumParams(stmt_, &count));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
@@ -376,7 +390,7 @@ ODBC_TEST_F(EscapeSequenceLiveTest, NumParamsRequiresAPreparedStatement) {
 
 /// The return-status parameter is described as an integer; the rest come from
 /// the server's own metadata for the EXEC form.
-ODBC_TEST_F(EscapeSequenceLiveTest, DescribeParamHandlesCall) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, DescribeParamHandlesCall, odbc_concurrency::kAllModes) {
     CreateProc("@a int, @b varchar(20), @c int OUTPUT AS BEGIN SELECT @a; END");
 
     SqlTString text =
@@ -401,7 +415,8 @@ ODBC_TEST_F(EscapeSequenceLiveTest, DescribeParamHandlesCall) {
 
 // --- SQLGetInfo -----------------------------------------------------------
 
-ODBC_TEST_F(EscapeSequenceLiveTest, EscapeCapabilitiesAreAdvertised) {
+ODBC_TEST_F_MODES(EscapeSequenceLiveTest, EscapeCapabilitiesAreAdvertised,
+                  odbc_concurrency::kAllModes) {
     SQLUINTEGER mask = 0;
     ASSERT_SQL_OK(SQLGetInfo(dbc_, SQL_OJ_CAPABILITIES, &mask, sizeof(mask), nullptr),
                   SQL_HANDLE_DBC, dbc_);
