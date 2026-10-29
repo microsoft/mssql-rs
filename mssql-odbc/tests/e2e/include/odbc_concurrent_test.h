@@ -559,6 +559,10 @@ struct WorkerResult {
     std::string skip_message;
 };
 
+// Thrown by AttemptReporter to end a SharedDbc attempt; RunCapturedIteration
+// catches it around the body and RunPhase lets it through.
+struct AttemptStopped {};
+
 // gtest turns an exception into a test failure only on the thread running the
 // test, and only around the calls it makes itself. The runners call fixture
 // phases themselves, often on other threads, where an escaping exception would
@@ -578,6 +582,8 @@ bool RunPhase(const char* location, F&& phase) {
     try {
         phase();
         return true;
+    } catch (const AttemptStopped&) {
+        throw;
     } catch (const std::exception& e) {
         message = std::string("C++ exception with description \"") + e.what() +
                   "\" thrown in " + location + ".";
@@ -603,6 +609,42 @@ bool RunPhase(const char* location, F&& phase) {
 template <typename T>
 using RetainedFixtures = std::vector<std::unique_ptr<T>>;
 
+// Records one attempt's failures for this thread only. In SharedDbc it also
+// ends the body at the first fatal failure, and at the first failure caused by
+// a busy connection (by its text, or by the statement's own diagnostic when the
+// assertion carries none). gtest's ASSERT returns only from the function it is
+// in, so a busy error inside a fixture helper such as ODBCTest::ExecDirect
+// would otherwise let the body go on to fail on the statement that never ran
+// (HY010), and that cascade is not a busy error Classify can retry. The
+// retried attempt reruns the body from the start, so nothing the stopped
+// attempt skipped goes unchecked.
+class AttemptReporter : public ::testing::ScopedFakeTestPartResultReporter {
+   public:
+    explicit AttemptReporter(::testing::TestPartResultArray* parts)
+        : ScopedFakeTestPartResultReporter(INTERCEPT_ONLY_CURRENT_THREAD, parts) {}
+
+    // Arms the stop for the body of a SharedDbc attempt on |stmt|.
+    void Arm(SQLHSTMT stmt) {
+        armed_ = true;
+        stmt_ = stmt;
+    }
+    void Disarm() { armed_ = false; }
+
+    void ReportTestPartResult(const ::testing::TestPartResult& result) override {
+        ScopedFakeTestPartResultReporter::ReportTestPartResult(result);
+        if (armed_ && result.failed() &&
+            (result.fatally_failed() || MentionsConnectionBusy(result.message()) ||
+             StatementReportsBusy(stmt_))) {
+            armed_ = false;
+            throw AttemptStopped{};
+        }
+    }
+
+   private:
+    bool armed_ = false;
+    SQLHSTMT stmt_ = SQL_NULL_HSTMT;
+};
+
 // Runs one iteration with its failures captured for this thread only. Workers
 // must not report into, or read, the current test's shared TestResult while
 // other workers write to it: gtest appends to it under a lock but reads it
@@ -611,8 +653,7 @@ template <typename T>
 void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
                           const std::string& tag, ::testing::TestPartResultArray& parts,
                           bool& statement_busy, RetainedFixtures<T>& retained) {
-    ::testing::ScopedFakeTestPartResultReporter reporter(
-        ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD, &parts);
+    AttemptReporter reporter(&parts);
     SCOPED_TRACE(tag);
     std::unique_ptr<T> test;
     // Retains the fixture on every path out, including a throwing constructor.
@@ -635,7 +676,14 @@ void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int i
         set_up = set_up && !part.fatally_failed() && !part.skipped();
     }
     if (set_up) {
-        RunPhase("the test body", [&] { test->ConcurrentBody(); });
+        if (mode == kSharedDbc) {
+            reporter.Arm(test->ConcurrentStmt());
+        }
+        try {
+            RunPhase("the test body", [&] { test->ConcurrentBody(); });
+        } catch (const AttemptStopped&) {
+        }
+        reporter.Disarm();
     }
     RunPhase("TearDown()", [&] {
         statement_busy = StatementReportsBusy(test->ConcurrentStmt());

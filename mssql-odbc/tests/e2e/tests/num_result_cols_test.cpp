@@ -9,6 +9,7 @@
 //   5. NullOutPtrIsTolerated               - null ColumnCountPtr → SQL_SUCCESS
 //   6. MultiStatementBatchReportsFirstResultSet - SELECT 1; SELECT 1,2,3 → colCount = 1
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 // SQLNumResultCols with SQL_NULL_HSTMT — DM rejects before driver.
@@ -29,7 +30,8 @@ protected:
     }
 };
 
-TEST_F(NumResultColsLiveTest, FreshStatementReturnsSequenceError) {
+ODBC_TEST_F_MODES(NumResultColsLiveTest, FreshStatementReturnsSequenceError,
+                  odbc_concurrency::kAllModes) {
     SQLSMALLINT colCount = -1;
     SQLRETURN rc = SQLNumResultCols(stmt_, &colCount);
     EXPECT_SQL_ERROR(rc);
@@ -39,7 +41,8 @@ TEST_F(NumResultColsLiveTest, FreshStatementReturnsSequenceError) {
     }
 }
 
-TEST_F(NumResultColsLiveTest, SelectReturnsProjectedColumnCount) {
+ODBC_TEST_F_MODES(NumResultColsLiveTest, SelectReturnsProjectedColumnCount,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1 AS INT) AS i, CAST('abc' AS VARCHAR(10)) AS v, CAST(N'xy' AS NVARCHAR(12)) AS n");
 
     SQLSMALLINT colCount = -1;
@@ -50,7 +53,7 @@ TEST_F(NumResultColsLiveTest, SelectReturnsProjectedColumnCount) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(NumResultColsLiveTest, DmlReturnsZeroColumns) {
+ODBC_TEST_F(NumResultColsLiveTest, DmlReturnsZeroColumns) {
     ExecDirect("CREATE TABLE #num_result_cols_t(i int); INSERT INTO #num_result_cols_t VALUES (1);");
 
     SQLSMALLINT colCount = -1;
@@ -59,7 +62,7 @@ TEST_F(NumResultColsLiveTest, DmlReturnsZeroColumns) {
     EXPECT_EQ(0, colCount);
 }
 
-TEST_F(NumResultColsLiveTest, NullOutPtrIsTolerated) {
+ODBC_TEST_F_MODES(NumResultColsLiveTest, NullOutPtrIsTolerated, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS i");
 
     SQLRETURN rc = SQLNumResultCols(stmt_, nullptr);
@@ -71,7 +74,8 @@ TEST_F(NumResultColsLiveTest, NullOutPtrIsTolerated) {
 // Multi-statement batch: SQLNumResultCols reflects the *current* result set
 // only. Until SQLMoreResults advances to the next set, it must report the
 // first SELECT's column count (1), not the second's (3).
-TEST_F(NumResultColsLiveTest, MultiStatementBatchReportsFirstResultSet) {
+ODBC_TEST_F_MODES(NumResultColsLiveTest, MultiStatementBatchReportsFirstResultSet,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS a; SELECT 1 AS a, 2 AS b, 3 AS c");
 
     SQLSMALLINT colCount = -1;

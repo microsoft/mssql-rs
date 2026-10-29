@@ -29,14 +29,14 @@
 namespace {
 
 #ifdef _WIN32
-constexpr unsigned kStreamingGetDataModes = odbc_concurrency::kDefaultModes;
+constexpr unsigned kStreamingGetDataModes = odbc_concurrency::kAllModes;
 #else
 // These two SharedStmt cases hit the unixODBC diagnostic-list race fixed by
 // https://github.com/lurcher/unixODBC/pull/244. Re-enable SharedStmt once either
 // (1) a fixed release reaches all supported OS package channels (long-term), or
 // (2) the mssql-odbc pipelines build/use latest unixODBC code containing the fix.
 constexpr unsigned kStreamingGetDataModes =
-    odbc_concurrency::kDefaultModes & ~odbc_concurrency::kSharedStmt;
+    odbc_concurrency::kAllModes & ~odbc_concurrency::kSharedStmt;
 #endif
 
 // Builds `token` repeated `count` times.
@@ -392,7 +392,8 @@ protected:
 
 // Benefits-from-mock-tds: supply exact regular/PLP varchar and nvarchar
 // metadata and payloads without relying on SQL Server casts.
-ODBC_TEST_F(GetDataLiveTest, OdbcTemporalLiteralsFromCharacterColumns) {
+ODBC_TEST_F_MODES(GetDataLiveTest, OdbcTemporalLiteralsFromCharacterColumns,
+                  odbc_concurrency::kAllModes) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -455,7 +456,7 @@ ODBC_TEST_F(GetDataLiveTest, OdbcTemporalLiteralsFromCharacterColumns) {
     }
 }
 
-ODBC_TEST_F(GetDataLiveTest, PlpTypedConversions) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedConversions, odbc_concurrency::kAllModes) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -505,7 +506,8 @@ ODBC_TEST_F(GetDataLiveTest, PlpTypedConversions) {
     }
 }
 
-TEST_F(GetDataLiveTest, PlpTypedDiagnosticsAndFollowingRows) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedDiagnosticsAndFollowingRows,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         const char* literal;
         SQLRETURN result;
@@ -548,7 +550,10 @@ TEST_F(GetDataLiveTest, PlpTypedDiagnosticsAndFollowingRows) {
     }
 }
 
-TEST_F(GetDataLiveTest, EmptyTextTypedConversionsLeaveOutputUntouched) {
+// Not /SharedDbc: every busy error restarts this long, many-statement body, so with
+// eight workers on one connection the Debug driver starved at 8 x 20 (the release
+// driver and msodbcsql finish it).
+ODBC_TEST_F(GetDataLiveTest, EmptyTextTypedConversionsLeaveOutputUntouched) {
     for (const char* type : {"varchar(max)", "nvarchar(max)", "varchar(32)", "nvarchar(32)"}) {
         for (SQLSMALLINT target : {SQL_C_SLONG, SQL_C_SBIGINT, SQL_C_UBIGINT, SQL_C_SSHORT,
                                   SQL_C_USHORT, SQL_C_STINYINT, SQL_C_UTINYINT, SQL_C_BIT,
@@ -586,7 +591,7 @@ TEST_F(GetDataLiveTest, EmptyTextTypedConversionsLeaveOutputUntouched) {
     }
 }
 
-TEST_F(GetDataLiveTest, PlpTypedNullsAndChunkBoundaries) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedNullsAndChunkBoundaries, odbc_concurrency::kAllModes) {
     for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
         SCOPED_TRACE(type);
         ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS " + std::string(type) + "), 99"),
@@ -616,7 +621,7 @@ TEST_F(GetDataLiveTest, PlpTypedNullsAndChunkBoundaries) {
     }
 }
 
-TEST_F(GetDataLiveTest, PlpTypedAfterCharacterProbeOrRead) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedAfterCharacterProbeOrRead, odbc_concurrency::kAllModes) {
     for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
         for (SQLSMALLINT target : {SQL_C_CHAR, SQL_C_WCHAR}) {
             for (bool probe : {false, true}) {
@@ -643,7 +648,8 @@ TEST_F(GetDataLiveTest, PlpTypedAfterCharacterProbeOrRead) {
     }
 }
 
-TEST_F(GetDataLiveTest, PlpTypedAfterConsumingOversizedCharacterPrefix) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedAfterConsumingOversizedCharacterPrefix,
+                  odbc_concurrency::kAllModes) {
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -677,7 +683,8 @@ TEST_F(GetDataLiveTest, PlpTypedAfterConsumingOversizedCharacterPrefix) {
     }
 }
 
-TEST_F(GetDataLiveTest, PlpTypedOversizedValueIsRefusedAndDrained) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedOversizedValueIsRefusedAndDrained,
+                  odbc_concurrency::kAllModes) {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool reference = target && std::string(target) == "msodbcsql";
     for (const char* type : {"varchar(max)", "nvarchar(max)"}) {
@@ -702,7 +709,8 @@ TEST_F(GetDataLiveTest, PlpTypedOversizedValueIsRefusedAndDrained) {
 
 // Benefits-from-mock-tds: typed_plp_drained_errors_release_the_connection also
 // checks the internal busy claim, which a Driver Manager test cannot inspect.
-TEST_F(GetDataLiveTest, PlpTypedOversizedOnlyColumnReleasesConnection) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTypedOversizedOnlyColumnReleasesConnection,
+                  odbc_concurrency::kAllModes) {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool reference = target && std::string(target) == "msodbcsql";
     SQLCHAR version[32] = {};
@@ -982,11 +990,11 @@ protected:
     }
 };
 
-TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsCharDecoding) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsCharDecoding) {
     CheckIssue627Collation(SQL_C_CHAR);
 }
 
-TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsWcharDecoding) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsWcharDecoding) {
     CheckIssue627Collation(SQL_C_WCHAR);
 }
 
@@ -994,17 +1002,17 @@ TEST_F(GetDataUtf16Test, Issue627SqlSortIdControlsWcharDecoding) {
 // 18.6.2.1-1 (SQL_DRIVER_VER 18.06.0002), Linux C.UTF-8, fails the CHAR/WCHAR
 // payload assertions for these cases. Rust exceeds that coverage by using the
 // server's CodePage; the common sort-ID matrix above still runs on both legs.
-TEST_F(GetDataUtf16Test, Issue627SqlServerExtendedSortIdsCharDecoding) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627SqlServerExtendedSortIdsCharDecoding) {
     SKIP_IF_COMPARING_MSODBCSQL();
     CheckIssue627Collation(SQL_C_CHAR, true);
 }
 
-TEST_F(GetDataUtf16Test, Issue627SqlServerExtendedSortIdsWcharDecoding) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627SqlServerExtendedSortIdsWcharDecoding) {
     SKIP_IF_COMPARING_MSODBCSQL();
     CheckIssue627Collation(SQL_C_WCHAR, true);
 }
 
-TEST_F(GetDataUtf16Test, Issue627FittingMaxCharReadCompletesImmediately) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627FittingMaxCharReadCompletesImmediately) {
     struct Case {
         const char* type;
         const char* hex;
@@ -1080,7 +1088,7 @@ TEST(NativeClientEncodingTest, ChunkLengthExcludesInitializedPaddingButPreserves
 
 // AB#47564: the bytes a narrow client (including mssql-python) receives are
 // native client bytes, independent of the server/column collation. No opt-in.
-TEST_F(GetDataUtf16Test, NativeClientCharDefaultsAcrossCollationsAndChunks) {
+ODBC_TEST_F(GetDataUtf16Test, NativeClientCharDefaultsAcrossCollationsAndChunks) {
     const auto expected = ODBCTestUtils::Utf8ToNativeClient("caf\xC3\xA9 \xE2\x82\xAC \xC3\xB1");
     ASSERT_FALSE(expected.empty());
 #ifdef _WIN32
@@ -1160,7 +1168,7 @@ TEST_F(GetDataUtf16Test, NativeClientCharDefaultsAcrossCollationsAndChunks) {
 // Measured with native Windows DLL 18.6.1.1 (FileVersion 2018.0186.0001.01):
 // fitting lossy reads stay SQL_SUCCESS even with WARN_ON_CP_ERROR enabled.
 // sqlcdata.h:1210-1217 bypasses the wError block that posts loss at 1311-1312.
-TEST_F(GetDataUtf16Test, NativeClientCharLossFitsWithoutWarning) {
+ODBC_TEST_F(GetDataUtf16Test, NativeClientCharLossFitsWithoutWarning) {
 #ifdef _WIN32
     RecordProperty("client_acp", static_cast<int>(GetACP()));
 #endif
@@ -1210,7 +1218,7 @@ TEST_F(GetDataUtf16Test, NativeClientCharLossFitsWithoutWarning) {
 
 // With native Windows ACP substitution the emoji is "??". A two-byte buffer
 // delivers one byte plus NUL, entering InternalGetColData's wError branch.
-TEST_F(GetDataUtf16Test, NativeClientCharLossTruncationHonorsWarningFlag) {
+ODBC_TEST_F(GetDataUtf16Test, NativeClientCharLossTruncationHonorsWarningFlag) {
 #ifdef _WIN32
     RecordProperty("client_acp", static_cast<int>(GetACP()));
 #endif
@@ -1260,15 +1268,15 @@ TEST_F(GetDataUtf16Test, NativeClientCharLossTruncationHonorsWarningFlag) {
     }
 }
 
-TEST_F(GetDataUtf16Test, Issue627CharGetDataIndicatorIncludesExpansion) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627CharGetDataIndicatorIncludesExpansion) {
     CheckIssue627EuroIndicator(false);
 }
 
-TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorIncludesExpansion) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorIncludesExpansion) {
     CheckIssue627EuroIndicator(true);
 }
 
-TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorRetainsUnreadWire) {
+ODBC_TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorRetainsUnreadWire) {
     const auto euro = ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC");
     ASSERT_EQ(SQL_SUCCESS, ExecDirect(
         "SET NOCOUNT ON; DECLARE @t TABLE(v varchar(max) "
@@ -1298,15 +1306,15 @@ TEST_F(GetDataUtf16Test, Issue627BoundCharIndicatorRetainsUnreadWire) {
     ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
 }
 
-TEST_F(GetDataUtf16Test, Cp1252VarcharPreservesBomShapedBytes) {
+ODBC_TEST_F(GetDataUtf16Test, Cp1252VarcharPreservesBomShapedBytes) {
     CheckVarcharBomCollation(false);
 }
 
-TEST_F(GetDataUtf16Test, Utf8VarcharPreservesBomAndHighBytes) {
+ODBC_TEST_F(GetDataUtf16Test, Utf8VarcharPreservesBomAndHighBytes) {
     CheckVarcharBomCollation(true);
 }
 
-TEST_F(GetDataUtf16Test, Cp1252MaterializedRoutesFitExactCapacity) {
+ODBC_TEST_F(GetDataUtf16Test, Cp1252MaterializedRoutesFitExactCapacity) {
     const auto& values = Cp1252TestData::Values();
     ASSERT_FALSE(values.empty());
     const auto& exhaustive = values.front().bytes;
@@ -1378,7 +1386,7 @@ TEST_F(GetDataUtf16Test, Cp1252MaterializedRoutesFitExactCapacity) {
     }
 }
 
-TEST_F(GetDataUtf16Test, NonCp1252MaterializedHealthyControls) {
+ODBC_TEST_F(GetDataUtf16Test, NonCp1252MaterializedHealthyControls) {
     struct Control {
         const char* collation;
         SQLINTEGER codepage;
@@ -1429,7 +1437,7 @@ TEST_F(GetDataUtf16Test, NonCp1252MaterializedHealthyControls) {
     }
 }
 
-TEST_F(GetDataUtf16Test, Cp1252WideOutputParameterFitsExactCapacity) {
+ODBC_TEST_F(GetDataUtf16Test, Cp1252WideOutputParameterFitsExactCapacity) {
     for (const auto& value : Cp1252TestData::Values()) {
         SCOPED_TRACE(value.name);
         ASSERT_EQ(SQL_SUCCESS,
@@ -1475,7 +1483,7 @@ TEST_F(GetDataUtf16Test, Cp1252WideOutputParameterFitsExactCapacity) {
     }
 }
 
-TEST_F(GetDataUtf16Test, Cp1252NullEmptyThenValueReusesDestination) {
+ODBC_TEST_F(GetDataUtf16Test, Cp1252NullEmptyThenValueReusesDestination) {
     const std::vector<SQLWCHAR> expected = {0x20AC, 0, 0x2019, 0};
     for (bool bound : {false, true}) {
         SCOPED_TRACE(bound);
@@ -1516,7 +1524,7 @@ TEST_F(GetDataUtf16Test, Cp1252NullEmptyThenValueReusesDestination) {
 }
 
 // #604: compare code units, not decoded strings or NUL-terminated lengths.
-TEST_F(GetDataUtf16Test, RawUnitsBesideNvarcharMax) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, RawUnitsBesideNvarcharMax, odbc_concurrency::kAllModes) {
     static_assert(sizeof(SQLWCHAR) == 2);
     constexpr SQLWCHAR sentinel = 0xCCCC;
     for (const auto& value : Utf16TestData::Values()) {
@@ -1559,7 +1567,8 @@ TEST_F(GetDataUtf16Test, RawUnitsBesideNvarcharMax) {
 }
 
 // Eight bounded columns select the complete-buffered SQLGetData entry route.
-TEST_F(GetDataUtf16Test, RawUnitsThroughCompleteBufferedRows) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, RawUnitsThroughCompleteBufferedRows,
+                  odbc_concurrency::kAllModes) {
     for (const auto& value : Utf16TestData::Values()) {
         SCOPED_TRACE(value.name);
         for (const char* type : {"nvarchar(32)", "nchar(8)"}) {
@@ -1603,7 +1612,7 @@ TEST_F(GetDataUtf16Test, RawUnitsThroughCompleteBufferedRows) {
 
 // Benefits-from-mock-tds: inspect RETURNVALUE token bytes independently of the
 // server's binary-to-nvarchar conversion; this checks their public delivery.
-TEST_F(GetDataUtf16Test, RawUnitsInWideOutputParameter) {
+ODBC_TEST_F(GetDataUtf16Test, RawUnitsInWideOutputParameter) {
     for (const auto& value : Utf16TestData::Values()) {
         SCOPED_TRACE(value.name);
         ASSERT_EQ(SQL_SUCCESS, ExecDirect(
@@ -1646,7 +1655,7 @@ TEST_F(GetDataUtf16Test, RawUnitsInWideOutputParameter) {
     }
 }
 
-TEST_F(GetDataUtf16Test, NullThenRawUnitsReuseDestination) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, NullThenRawUnitsReuseDestination, odbc_concurrency::kAllModes) {
     for (bool bound : {false, true}) {
         SCOPED_TRACE(bound);
         for (const char* type : {"nvarchar(32)", "nchar(4)", "nvarchar(max)"}) {
@@ -1687,7 +1696,8 @@ TEST_F(GetDataUtf16Test, NullThenRawUnitsReuseDestination) {
     }
 }
 
-TEST_F(GetDataUtf16Test, BoundedRawUnitsAcrossRepeatedReads) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, BoundedRawUnitsAcrossRepeatedReads,
+                  odbc_concurrency::kAllModes) {
     const std::vector<SQLWCHAR> expected = {
         0xD800, 0x0041, 0xDC00, 0x0042, 0xFEFF, 0xFFFE,
         0, 0x0043, 0xD83D, 0xDE00, 0, 0};
@@ -1738,7 +1748,8 @@ TEST_F(GetDataUtf16Test, BoundedRawUnitsAcrossRepeatedReads) {
 
 // The application read boundary is fixed here; SQL Server chooses the wire's
 // PLP chunk layout, which needs a mock TDS server to control independently.
-TEST_F(GetDataUtf16Test, RawNvarcharMaxCrossesEightKiBReadBoundary) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, RawNvarcharMaxCrossesEightKiBReadBoundary,
+                  odbc_concurrency::kAllModes) {
     std::vector<SQLWCHAR> expected(4095, 0x0041);
     const std::vector<SQLWCHAR> tail = {
         0xD83D, 0xDE00, 0xD800, 0x0042, 0xDC00, 0xFEFF, 0xFFFE, 0, 0x0043, 0};
@@ -1781,7 +1792,7 @@ TEST_F(GetDataUtf16Test, RawNvarcharMaxCrossesEightKiBReadBoundary) {
 }
 
 // SQLGetData without a positioned row (no SQLFetch yet) fails with 24000.
-TEST_F(GetDataLiveTest, NoCurrentRow) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NoCurrentRow, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT 1 AS c1"), SQL_HANDLE_STMT, stmt_);
 
     SQLCHAR buf[16] = {0};
@@ -1795,7 +1806,7 @@ TEST_F(GetDataLiveTest, NoCurrentRow) {
 
 // Column-wise retrieval: request columns in ascending order; intervening
 // columns are drained transparently.
-TEST_F(GetDataLiveTest, ColumnWiseAscending) {
+ODBC_TEST_F_MODES(GetDataLiveTest, ColumnWiseAscending, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT CAST(1 AS INT) AS c1, "
                       "CAST('two' AS VARCHAR(10)) AS c2, "
@@ -1844,7 +1855,8 @@ TEST_F(GetDataLiveTest, ColumnWiseAscending) {
 // *partially* consumed column must instead resume from where it stopped -- that
 // truncation-recovery path is covered by NonPlpChunkedReadAccumulatesFullValue,
 // not here.
-TEST_F(GetDataLiveTest, BackwardColumnRejectedRereadIsNoData) {
+ODBC_TEST_F_MODES(GetDataLiveTest, BackwardColumnRejectedRereadIsNoData,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT CAST(10 AS INT) AS c1, "
@@ -1880,7 +1892,7 @@ TEST_F(GetDataLiveTest, BackwardColumnRejectedRereadIsNoData) {
 // text target, but bypasses it for binary (sqlcdata.h, InternalGetColData).
 // Windows 18.06.0002 instead emits CP1252 0x80, leaving no converted carry;
 // Linux 18.06.0002 emits 0xE2 and holds 0x82,0xAC for the next text target.
-TEST_F(GetDataUtf16Test, PlpTargetSwitchFromConvertedChar) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchFromConvertedChar, odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "requires a UTF-8 client encoding to create converted carry";
     }
@@ -1941,7 +1953,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchFromConvertedChar) {
     }
 }
 
-TEST_F(GetDataUtf16Test, PlpTargetSwitchFromOddNarrowCarry) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchFromOddNarrowCarry,
+                  odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC\xC3\xA9") != "\xE2\x82\xAC\xC3\xA9") {
         GTEST_SKIP() << "requires a UTF-8 client encoding to create odd converted carry";
     }
@@ -1992,7 +2005,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchFromOddNarrowCarry) {
     }
 }
 
-TEST_F(GetDataUtf16Test, PlpTargetSwitchFromWcharDoesNotOverread) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchFromWcharDoesNotOverread,
+                  odbc_concurrency::kAllModes) {
     for (const SQLSMALLINT target : {SQL_C_CHAR, SQL_C_BINARY}) {
         ASSERT_SQL_OK(ExecDirect("SELECT CAST('ABCDE' AS varchar(max)), 42"),
                       SQL_HANDLE_STMT, stmt_);
@@ -2013,7 +2027,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchFromWcharDoesNotOverread) {
     }
 }
 
-TEST_F(GetDataUtf16Test, PlpTargetSwitchBinaryBypassesButRetainsTextCarry) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchBinaryBypassesButRetainsTextCarry,
+                  odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "requires a UTF-8 client encoding to create converted carry";
     }
@@ -2046,7 +2061,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchBinaryBypassesButRetainsTextCarry) {
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(GetDataUtf16Test, PlpTargetSwitchWcharProbeReportsWireLength) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchWcharProbeReportsWireLength,
+                  odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "requires a UTF-8 client encoding to create converted carry";
     }
@@ -2092,7 +2108,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchWcharProbeReportsWireLength) {
 
 // A probe leaves the UTF-8 sequence intact. A consuming binary read does not:
 // retail 18.6.2.1 resumes at the next byte and replaces both orphaned continuations.
-TEST_F(GetDataUtf16Test, PlpTargetSwitchAfterBinaryProbeOrPartialCharacter) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchAfterBinaryProbeOrPartialCharacter,
+                  odbc_concurrency::kAllModes) {
     for (const SQLLEN binary_size : {0, 1}) {
         ASSERT_SQL_OK(
             ExecDirect("SELECT CAST(NCHAR(0x20AC) + N'ABCD' "
@@ -2121,7 +2138,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchAfterBinaryProbeOrPartialCharacter) {
     }
 }
 
-TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesSurrogateAfterPriorOutput) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchCompletesSurrogateAfterPriorOutput,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(N'A' + NCHAR(0xD83D) + NCHAR(0xDE00) AS nvarchar(max)), 42"),
         SQL_HANDLE_STMT, stmt_);
@@ -2139,7 +2157,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesSurrogateAfterPriorOutput) {
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesDbcsAfterPriorOutput) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchCompletesDbcsAfterPriorOutput,
+                  odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("A") != "A") {
         GTEST_SKIP() << "requires an ASCII-compatible client encoding to combine converted text and wire bytes";
     }
@@ -2171,7 +2190,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesDbcsAfterPriorOutput) {
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesWideningAfterPriorOutput) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpTargetSwitchCompletesWideningAfterPriorOutput,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST((N'A' + NCHAR(0xD83D) + NCHAR(0xDE00) + N'BC') "
                    "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(max)), 42"),
@@ -2195,7 +2215,8 @@ TEST_F(GetDataUtf16Test, PlpTargetSwitchCompletesWideningAfterPriorOutput) {
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(GetDataUtf16Test, PlpWideningFillsRemainingCapacityWithoutOverreading) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, PlpWideningFillsRemainingCapacityWithoutOverreading,
+                  odbc_concurrency::kAllModes) {
     for (const std::string tail : {"", "BC"}) {
         SCOPED_TRACE(tail);
         ASSERT_SQL_OK(
@@ -2227,7 +2248,7 @@ TEST_F(GetDataUtf16Test, PlpWideningFillsRemainingCapacityWithoutOverreading) {
     }
 }
 
-TEST_F(GetDataLiveTest, PlpVarcharMaxStreamed) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpVarcharMaxStreamed, odbc_concurrency::kAllModes) {
     const int kTotal = 9000;
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS c1"),
@@ -2260,7 +2281,8 @@ TEST_F(GetDataLiveTest, PlpVarcharMaxStreamed) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(GetDataUtf16Test, NullSourcesPreserveCharacterBuffers) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, NullSourcesPreserveCharacterBuffers,
+                  odbc_concurrency::kAllModes) {
     for (const char* type : {"INT", "VARCHAR(8)", "NVARCHAR(8)",
                              "VARCHAR(MAX)", "NVARCHAR(MAX)"}) {
         SCOPED_TRACE(type);
@@ -2291,7 +2313,8 @@ TEST_F(GetDataUtf16Test, NullSourcesPreserveCharacterBuffers) {
     }
 }
 
-TEST_F(GetDataUtf16Test, NullAfterBufferedPrefixPreservesWideBuffer) {
+ODBC_TEST_F_MODES(GetDataUtf16Test, NullAfterBufferedPrefixPreservesWideBuffer,
+                  odbc_concurrency::kAllModes) {
     for (SQLLEN capacity : {0, 1, 2, 3, 32}) {
         SCOPED_TRACE(capacity);
         ASSERT_EQ(SQL_SUCCESS, ExecDirect("SELECT 1, CAST(NULL AS NVARCHAR(MAX)), 42"));
@@ -2314,7 +2337,7 @@ TEST_F(GetDataUtf16Test, NullAfterBufferedPrefixPreservesWideBuffer) {
 }
 
 // A NULL value reports SQL_NULL_DATA in the indicator with SQL_SUCCESS.
-TEST_F(GetDataLiveTest, NullColumn) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NullColumn, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS VARCHAR(10)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -2336,7 +2359,8 @@ TEST_F(GetDataLiveTest, NullColumn) {
 // the exact regression reported: mssql-python fetches SQL_INTEGER columns via
 // SQL_C_SLONG with a null indicator and relies on the ODBC-mandated error to
 // detect NULL, falling back to None only when SQLGetData fails.
-TEST_F(GetDataLiveTest, NullColumnWithoutIndicatorReturns22002) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NullColumnWithoutIndicatorReturns22002,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT NULL"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -2353,7 +2377,8 @@ TEST_F(GetDataLiveTest, NullColumnWithoutIndicatorReturns22002) {
 // the distinct SQL_PLP_NULL wire marker and RowWriter::write_null, not the
 // fixed/var-length NULL length prefix NullColumn above exercises. Both paths
 // must converge on the identical SQLGetData guard.
-TEST_F(GetDataLiveTest, PlpNullColumnWithoutIndicatorReturns22002) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpNullColumnWithoutIndicatorReturns22002,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS VARCHAR(MAX)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2373,7 +2398,7 @@ TEST_F(GetDataLiveTest, PlpNullColumnWithoutIndicatorReturns22002) {
 // A scalar column followed by a PLP column: the scalar is delivered in one shot,
 // then the PLP value streams to completion. Exercises the scalar→PLP transition
 // within a single row.
-TEST_F(GetDataLiveTest, MixedPlpAndNonPlpColumns) {
+ODBC_TEST_F_MODES(GetDataLiveTest, MixedPlpAndNonPlpColumns, odbc_concurrency::kAllModes) {
     const std::string expected_plp = RepeatToken("x", 128);
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT CAST(42 AS INT) AS c1, "
@@ -2396,7 +2421,7 @@ TEST_F(GetDataLiveTest, MixedPlpAndNonPlpColumns) {
 
 // Requesting a later column skips an intervening PLP column: the driver drains
 // the unread VARCHAR(MAX) in the middle while advancing to column 3.
-TEST_F(GetDataLiveTest, SkipsPlpMiddleColumn) {
+ODBC_TEST_F_MODES(GetDataLiveTest, SkipsPlpMiddleColumn, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT CAST('first' AS VARCHAR(10)) AS c1, "
                       "CAST(REPLICATE(CAST('y' AS VARCHAR(MAX)), 64) AS VARCHAR(MAX)) AS c2, "
@@ -2421,7 +2446,8 @@ TEST_F(GetDataLiveTest, SkipsPlpMiddleColumn) {
 
 // Two PLP columns in the same row, both streamed: read column 2 (VARCHAR(MAX))
 // to completion, skip the PLP column 3, then stream column 4 (VARCHAR(MAX)).
-TEST_F(GetDataLiveTest, TwoPlpColumnsStreamedWithSkippedPlpBetween) {
+ODBC_TEST_F_MODES(GetDataLiveTest, TwoPlpColumnsStreamedWithSkippedPlpBetween,
+                  odbc_concurrency::kAllModes) {
     const std::string expected_c2 = RepeatToken("ab", 500);   // 1000 bytes
     const std::string expected_c4 = RepeatToken("wxyz", 300);  // 1200 bytes
     ASSERT_SQL_OK(ExecDirect(
@@ -2442,7 +2468,7 @@ TEST_F(GetDataLiveTest, TwoPlpColumnsStreamedWithSkippedPlpBetween) {
 }
 
 // Multiple rows: loop SQLFetch and read scalar columns on each row.
-TEST_F(GetDataLiveTest, MultiRowScalarColumns) {
+ODBC_TEST_F_MODES(GetDataLiveTest, MultiRowScalarColumns, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT n, CAST(n * 10 AS INT) AS m FROM (VALUES (1), (2), (3)) AS v(n) "
                       "ORDER BY n"),
@@ -2464,7 +2490,7 @@ TEST_F(GetDataLiveTest, MultiRowScalarColumns) {
 }
 
 // Multiple rows each carrying a PLP column, streamed to completion on every row.
-TEST_F(GetDataLiveTest, MultiRowPlpStreamedPerRow) {
+ODBC_TEST_F_MODES(GetDataLiveTest, MultiRowPlpStreamedPerRow, odbc_concurrency::kAllModes) {
     const std::string expected_r1 = RepeatToken("row1", 250);  // 1000 bytes
     const std::string expected_r2 = RepeatToken("row2", 300);  // 1200 bytes
     ASSERT_SQL_OK(ExecDirect(
@@ -2491,7 +2517,8 @@ TEST_F(GetDataLiveTest, MultiRowPlpStreamedPerRow) {
 
 // Advancing to the next row while the current row still has an in-progress PLP
 // stream: SQLFetch must drain the unfinished PLP value and position on row 2.
-TEST_F(GetDataLiveTest, FetchDrainsPartiallyReadPlpFromPriorRow) {
+ODBC_TEST_F_MODES(GetDataLiveTest, FetchDrainsPartiallyReadPlpFromPriorRow,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT 1 AS n, REPLICATE(CAST('aaaa' AS VARCHAR(MAX)), 500) AS c "
                       "UNION ALL "
@@ -2517,7 +2544,7 @@ TEST_F(GetDataLiveTest, FetchDrainsPartiallyReadPlpFromPriorRow) {
 }
 
 // Requesting a column past the end of the row returns SQLSTATE 07009.
-TEST_F(GetDataLiveTest, ColumnBeyondEndReturns07009) {
+ODBC_TEST_F_MODES(GetDataLiveTest, ColumnBeyondEndReturns07009, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(123 AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2532,7 +2559,7 @@ TEST_F(GetDataLiveTest, ColumnBeyondEndReturns07009) {
 }
 
 // An empty VARCHAR(MAX) reports a 0-length indicator with SQL_SUCCESS.
-TEST_F(GetDataLiveTest, EmptyVarcharMaxChar) {
+ODBC_TEST_F_MODES(GetDataLiveTest, EmptyVarcharMaxChar, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARCHAR(MAX)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -2548,7 +2575,7 @@ TEST_F(GetDataLiveTest, EmptyVarcharMaxChar) {
 }
 
 // An empty NVARCHAR(MAX) read as SQL_C_WCHAR reports a 0-length indicator.
-TEST_F(GetDataLiveTest, EmptyNvarcharMaxWchar) {
+ODBC_TEST_F_MODES(GetDataLiveTest, EmptyNvarcharMaxWchar, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'' AS NVARCHAR(MAX)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -2569,7 +2596,7 @@ TEST_F(GetDataLiveTest, EmptyNvarcharMaxWchar) {
 // own tests above, and IMAGE is in binary_fetch_test.cpp.
 // Benefits-from-mock-tds: send each type's zero-length encoding (PLP length 0
 // with its terminator, non-PLP length 0) directly, not via SQL Server casts.
-ODBC_TEST_F(GetDataLiveTest, EmptyValuesAreZeroLengthNotNull) {
+ODBC_TEST_F_MODES(GetDataLiveTest, EmptyValuesAreZeroLengthNotNull, odbc_concurrency::kAllModes) {
     struct Column {
         const char* expression;
         SQLSMALLINT c_type;
@@ -2618,7 +2645,8 @@ ODBC_TEST_F(GetDataLiveTest, EmptyValuesAreZeroLengthNotNull) {
 // msodbcsql 18 writes on NULL (measured).
 // Benefits-from-mock-tds: send each type's NULL encoding (PLP NULL, 0xFFFF
 // short-length NULL, legacy LOB without a text pointer) directly.
-ODBC_TEST_F(GetDataLiveTest, NullReportsNullDataAcrossTypedTargets) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NullReportsNullDataAcrossTypedTargets,
+                  odbc_concurrency::kAllModes) {
     struct Column {
         const char* sql_type;
         SQLSMALLINT c_type;
@@ -2678,7 +2706,7 @@ ODBC_TEST_F(GetDataLiveTest, NullReportsNullDataAcrossTypedTargets) {
 
 // A tiny caller buffer forces many continuation calls; the reassembled value
 // must equal the full payload and at least one call reports truncation.
-TEST_F(GetDataLiveTest, PlpTinyBufferManyCalls) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpTinyBufferManyCalls, odbc_concurrency::kAllModes) {
     const std::string expected = RepeatToken("abc", 200);  // 600 bytes
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1"),
@@ -2717,7 +2745,7 @@ TEST_F(GetDataLiveTest, PlpTinyBufferManyCalls) {
 // `kTotal - bytes_consumed_by_prior_calls` for both the truncated
 // (SQL_SUCCESS_WITH_INFO) chunks and the final (SQL_SUCCESS) chunk. This matches
 // the reference msodbcsql driver, so the assertion runs on both legs.
-TEST_F(GetDataLiveTest, PlpKnownLengthIndicatorCountsDown) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpKnownLengthIndicatorCountsDown, odbc_concurrency::kAllModes) {
     const int kTotal = 20000;
     ASSERT_SQL_OK(ExecDirect(
                       "SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 20000) AS c1"),
@@ -2760,7 +2788,8 @@ TEST_F(GetDataLiveTest, PlpKnownLengthIndicatorCountsDown) {
 // PLP refill once reserved room / 3, returning 679 bytes per chunk.
 // Benefits-from-mock-tds: place the PLP chunk boundaries at and around the
 // buffer boundary; SQL Server picks them, so this cannot steer them.
-ODBC_TEST_F(GetDataLiveTest, VarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxAsciiFillsEveryTruncatedCharBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2779,7 +2808,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
 // as CP1252 nothing can split.
 // Benefits-from-mock-tds: supply the exact collation bytes and end a PLP chunk
 // inside the euro sign; SQL Server decides both here.
-ODBC_TEST_F(GetDataLiveTest, CharChunksSplitAUtf8CharacterToFillBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, CharChunksSplitAUtf8CharacterToFillBuffer,
+                  odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "requires a UTF-8 client encoding to split a character";
     }
@@ -2814,7 +2844,8 @@ ODBC_TEST_F(GetDataLiveTest, CharChunksSplitAUtf8CharacterToFillBuffer) {
 // NvarcharMaxAsciiFillsEveryTruncatedCharBuffer below.
 // Benefits-from-mock-tds: split the value across TDS packets at the buffer
 // boundary; the negotiated packet size decides the split here.
-ODBC_TEST_F(GetDataLiveTest, VarcharFillsEveryTruncatedCharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharFillsEveryTruncatedCharBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE('A', 8000) AS VARCHAR(8000)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2825,7 +2856,7 @@ ODBC_TEST_F(GetDataLiveTest, VarcharFillsEveryTruncatedCharBuffer) {
 
 // Benefits-from-mock-tds: split the legacy LOB value across TDS packets at the
 // buffer boundary; the negotiated packet size decides the split here.
-ODBC_TEST_F(GetDataLiveTest, TextFillsEveryTruncatedCharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, TextFillsEveryTruncatedCharBuffer, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS TEXT) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -2842,7 +2873,8 @@ ODBC_TEST_F(GetDataLiveTest, TextFillsEveryTruncatedCharBuffer) {
 // makes the column varbinary(max) rather than a character value read as bytes.
 // Benefits-from-mock-tds: place the PLP chunk boundaries at and around the
 // buffer boundary; SQL Server picks them, so this cannot steer them.
-ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) "
                    "AS VARBINARY(MAX)) AS c1"),
@@ -2861,7 +2893,8 @@ ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxFillsEveryTruncatedBinaryBuffer) {
 // or 2000 bytes in a 2000-byte binary buffer.
 // Benefits-from-mock-tds: end the final PLP chunk exactly at the last buffer
 // boundary, so the terminator chunk arrives as a separate read.
-ODBC_TEST_F(GetDataLiveTest, VarcharMaxExactFitFinalCharChunkSucceeds) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxExactFitFinalCharChunkSucceeds,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 24000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2872,7 +2905,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxExactFitFinalCharChunkSucceeds) {
 
 // Benefits-from-mock-tds: end the final PLP chunk exactly at the last buffer
 // boundary, so the terminator chunk arrives as a separate read.
-ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxExactFitFinalBinaryChunkSucceeds) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarbinaryMaxExactFitFinalBinaryChunkSucceeds,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 6000) "
                    "AS VARBINARY(MAX)) AS c1"),
@@ -2886,7 +2920,8 @@ ODBC_TEST_F(GetDataLiveTest, VarbinaryMaxExactFitFinalBinaryChunkSucceeds) {
 
 // Benefits-from-mock-tds: split the value across TDS packets at the buffer
 // boundary; the negotiated packet size decides the split here.
-ODBC_TEST_F(GetDataLiveTest, BinaryFillsEveryTruncatedBinaryBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, BinaryFillsEveryTruncatedBinaryBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE(CAST(0x00FF5A01 AS VARBINARY(MAX)), 2000) "
                              "AS BINARY(8000)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2904,7 +2939,8 @@ ODBC_TEST_F(GetDataLiveTest, BinaryFillsEveryTruncatedBinaryBuffer) {
 // UTF-16 to UTF-16, streamed as PLP.
 // Benefits-from-mock-tds: end a PLP chunk on an odd byte, inside a UTF-16 code
 // unit; SQL Server sends whole units, so this cannot.
-ODBC_TEST_F(GetDataLiveTest, NvarcharMaxFillsEveryTruncatedWcharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharMaxFillsEveryTruncatedWcharBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT LEFT(REPLICATE(CAST(N'a' + NCHAR(233) + NCHAR(20013) "
                              "AS NVARCHAR(MAX)), 8000), 24000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2917,7 +2953,8 @@ ODBC_TEST_F(GetDataLiveTest, NvarcharMaxFillsEveryTruncatedWcharBuffer) {
 // A CP1252 VARCHAR(MAX) widened to UTF-16.
 // Benefits-from-mock-tds: place the PLP chunk boundaries at and around the
 // buffer boundary; SQL Server picks them, so this cannot steer them.
-ODBC_TEST_F(GetDataLiveTest, VarcharMaxCp1252FillsEveryTruncatedWcharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxCp1252FillsEveryTruncatedWcharBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(N'a' + NCHAR(233) "
                              "COLLATE Latin1_General_100_CI_AS AS VARCHAR(MAX)), 12000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2932,7 +2969,8 @@ ODBC_TEST_F(GetDataLiveTest, VarcharMaxCp1252FillsEveryTruncatedWcharBuffer) {
 // suite runs under, while still exposing worst-case reservation per unit.
 // Benefits-from-mock-tds: end a PLP chunk on an odd byte, inside a UTF-16 code
 // unit; SQL Server sends whole units, so this cannot.
-ODBC_TEST_F(GetDataLiveTest, NvarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharMaxAsciiFillsEveryTruncatedCharBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(N'A' AS NVARCHAR(MAX)), 24000) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2944,7 +2982,8 @@ ODBC_TEST_F(GetDataLiveTest, NvarcharMaxAsciiFillsEveryTruncatedCharBuffer) {
 // A non-PLP NVARCHAR(4000), which arrives materialized rather than streamed.
 // Benefits-from-mock-tds: split the value across TDS packets inside a UTF-16
 // code unit; the negotiated packet size decides the split here.
-ODBC_TEST_F(GetDataLiveTest, NvarcharFillsEveryTruncatedWcharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharFillsEveryTruncatedWcharBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(REPLICATE(N'a' + NCHAR(233) + NCHAR(20013), 1333) "
                              "+ N'a' AS NVARCHAR(4000)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2957,7 +2996,8 @@ ODBC_TEST_F(GetDataLiveTest, NvarcharFillsEveryTruncatedWcharBuffer) {
 // NTEXT, the legacy LOB stream.
 // Benefits-from-mock-tds: split the legacy LOB value across TDS packets inside
 // a UTF-16 code unit; the negotiated packet size decides the split here.
-ODBC_TEST_F(GetDataLiveTest, NtextFillsEveryTruncatedWcharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NtextFillsEveryTruncatedWcharBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(LEFT(REPLICATE(CAST(N'a' + NCHAR(233) + NCHAR(20013) "
                              "AS NVARCHAR(MAX)), 8000), 24000) AS NTEXT) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2970,7 +3010,7 @@ ODBC_TEST_F(GetDataLiveTest, NtextFillsEveryTruncatedWcharBuffer) {
 // XML, which the server sends as a UTF-16 PLP stream.
 // Benefits-from-mock-tds: end a PLP chunk on an odd byte, inside a UTF-16 code
 // unit; SQL Server sends whole units, so this cannot.
-ODBC_TEST_F(GetDataLiveTest, XmlFillsEveryTruncatedWcharBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, XmlFillsEveryTruncatedWcharBuffer, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'<r>' + LEFT(REPLICATE(CAST(N'a' + NCHAR(233) + "
                              "NCHAR(20013) AS NVARCHAR(MAX)), 8000), 23993) + N'</r>' AS XML) "
                              "AS c1"),
@@ -2987,7 +3027,7 @@ ODBC_TEST_F(GetDataLiveTest, XmlFillsEveryTruncatedWcharBuffer) {
 }
 
 // NVARCHAR(MAX) delivered as SQL_C_WCHAR round-trips the UTF-16 content.
-TEST_F(GetDataLiveTest, NvarcharMaxWideRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharMaxWideRoundTrip, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'wide chars' AS NVARCHAR(MAX)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -3013,7 +3053,8 @@ TEST_F(GetDataLiveTest, NvarcharMaxWideRoundTrip) {
 //
 // msodbcsql consumes the column after the failed conversion and returns
 // SQL_NO_DATA from the follow-up call.
-TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable) {
+ODBC_TEST_F_MODES(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -3040,7 +3081,8 @@ TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable
 // in the "Known divergences from msodbcsql" table in
 // docs/typed-columnar-fetch-plan.md. Retarget this test at another unimplemented
 // C type when that gap closes, rather than deleting the coverage.
-TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
+ODBC_TEST_F_MODES(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -3064,7 +3106,8 @@ TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
 // Jumping to a later column while a PLP stream is still open is incorrect usage
 // per the ODBC spec. The driver must clear the stale stream, drain the partially
 // read column, and return the later column's value rather than corrupt the row.
-TEST_F(GetDataLiveTest, PartialPlpReadThenJumpToLaterColumnClearsStaleStream) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PartialPlpReadThenJumpToLaterColumnClearsStaleStream,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1, "
                    "CAST(42 AS INT) AS c2"),
@@ -3089,7 +3132,7 @@ TEST_F(GetDataLiveTest, PartialPlpReadThenJumpToLaterColumnClearsStaleStream) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(GetDataLiveTest, PlpColumnToShortTarget) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpColumnToShortTarget, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('123' AS VARCHAR(MAX)) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -3117,7 +3160,7 @@ TEST_F(GetDataLiveTest, PlpColumnToShortTarget) {
 // readable, so the app can re-call with a right-sized buffer. BufferLength 1
 // (room for the terminator only) is the portable probe form: the Windows Driver
 // Manager rejects a NULL pointer and a 0 length for character C types.
-TEST_F(GetDataLiveTest, NonPlpProbeThenFetchReturnsValue) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NonPlpProbeThenFetchReturnsValue, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(REPLICATE('0123456789', 10) AS VARCHAR(100)) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -3145,7 +3188,8 @@ TEST_F(GetDataLiveTest, NonPlpProbeThenFetchReturnsValue) {
 
 // A non-PLP character column larger than the caller's buffer must be delivered
 // across repeated calls, exactly as a PLP column is.
-TEST_F(GetDataLiveTest, NonPlpChunkedReadAccumulatesFullValue) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NonPlpChunkedReadAccumulatesFullValue,
+                  odbc_concurrency::kAllModes) {
     const std::string expected = RepeatToken("0123456789", 100);  // 1000 bytes
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(REPLICATE('0123456789', 100) AS VARCHAR(1000)) AS c1"),
@@ -3166,7 +3210,8 @@ TEST_F(GetDataLiveTest, NonPlpChunkedReadAccumulatesFullValue) {
 // ===================================================================
 
 // Control: nvarchar(max) delivered as SQL_C_WCHAR in small chunks round-trips.
-TEST_F(GetDataLiveTest, NvarcharMaxToWcharChunkedRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharMaxToWcharChunkedRoundTrip,
+                  odbc_concurrency::kAllModes) {
     const std::string ascii = RepeatToken("0123456789", 300);  // 3000 chars
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'0123456789' AS NVARCHAR(MAX)), 300) AS c1"),
@@ -3202,7 +3247,8 @@ TEST_F(GetDataLiveTest, NvarcharMaxToWcharChunkedRoundTrip) {
 // byte-for-byte. ASCII content keeps the output one byte per unit so a framing error
 // surfaces as a shifted or dropped byte. Buffer size 1024 is the one the
 // reviewer used to pin the original defect (first mismatch at byte 511).
-TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip,
+                  odbc_concurrency::kAllModes) {
     const std::string expected = RepeatToken("0123456789", 300);  // 3000 bytes
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'0123456789' AS NVARCHAR(MAX)), 300) AS c1"),
@@ -3223,7 +3269,8 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAsciiRoundTrip) {
 //
 // Native output may substitute an astral character; splitting the surrogate
 // must not change the result compared with converting the complete value.
-TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip,
+                  odbc_concurrency::kAllModes) {
     const std::string emoji = "\xF0\x9F\x98\x80";       // U+1F600, 4 UTF-8 bytes
     const auto expected = ODBCTestUtils::Utf8ToNativeClient(RepeatToken(emoji, 500));
     ASSERT_SQL_OK(
@@ -3246,7 +3293,8 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
 //
 // Benefits-from-mock-tds: force the exact PLP wire chunks and assert that the
 // final UTF-8 tail remains pending after the wire is exhausted.
-TEST_F(GetDataLiveTest, NvarcharMaxToCharSurrogateStraddleRetainsUtf8Tail) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NvarcharMaxToCharSurrogateStraddleRetainsUtf8Tail,
+                  odbc_concurrency::kAllModes) {
     const auto expected = ODBCTestUtils::Utf8ToNativeClient("A\xF0\x90\x90\xB7\xE4\xBD\xA0");
     ASSERT_SQL_OK(
         ExecDirect(
@@ -3273,7 +3321,8 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharSurrogateStraddleRetainsUtf8Tail) {
 // boundary.
 //
 // Runs on both legs: msodbcsql answers the probe the same way.
-TEST_F(GetDataLiveTest, PlpLengthProbeBufferReportsLengthAndKeepsValue) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpLengthProbeBufferReportsLengthAndKeepsValue,
+                  odbc_concurrency::kAllModes) {
     // Spelled as NCHAR() rather than a UTF-8 literal: ExecDirect widens the
     // narrow SQL text byte by byte, so a multi-byte literal would reach the
     // server as one character per UTF-8 byte.
@@ -3307,7 +3356,7 @@ TEST_F(GetDataLiveTest, PlpLengthProbeBufferReportsLengthAndKeepsValue) {
 //
 // ASCII content keeps the wire bytes 1:1 with code units, so a framing error
 // shows up as a shifted or dropped character rather than a decode artifact.
-TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip, odbc_concurrency::kAllModes) {
     const std::string expected = RepeatToken("0123456789", 3000);  // 30000 chars
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST('0123456789' AS VARCHAR(MAX)), 3000) AS c1"),
@@ -3326,7 +3375,8 @@ TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip) {
 // Decode the column's CP1252 collation, then encode to the native client.
 // A C/UTF-8 Unix client sees UTF-8; Windows sees its ACP, not the server's
 // code page. No connection option is needed for either default (AB#47564).
-TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip,
+                  odbc_concurrency::kAllModes) {
     // UTF-8 spelling of the source text; the expected buffer is native-encoded.
     const std::string token = "caf\xC3\xA9 Ren\xC3\xA9 se\xC3\xB1or M\xC3\xBCller "
                               "Gr\xC3\xB6\xC3\x9F"
@@ -3363,7 +3413,8 @@ TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip) {
 // "bc" where "abc" belongs). So the divergence is chunk-boundary handling in
 // msodbcsql, not the '?' best-fit its SQL_C_WCHAR twin documents -- a different
 // mechanism, and this driver is on the correct side of it.
-TEST_F(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
                               "abc";  // 你好世界abc
@@ -3384,7 +3435,8 @@ TEST_F(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks) {
 // in one call and in many must produce the same value. A buffer of 7 is the
 // tightest interesting size -- decoding expands, so the driver's read has to be
 // sized down from the caller's capacity or output overruns every call.
-TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkSizeDoesNotChangeValue) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxCp1252ToCharChunkSizeDoesNotChangeValue,
+                  odbc_concurrency::kAllModes) {
     const char* kQuery =
         "SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Gr' + NCHAR(0xF6) + NCHAR(0xDF) "
         "+ N'e na' + NCHAR(0xEF) + N've ' "
@@ -3408,7 +3460,8 @@ TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkSizeDoesNotChangeValue) {
 
 // A UTF-8 collation is already native only on UTF-8 clients. Other clients
 // transcode once; interpreting the wire as a legacy code page produces mojibake.
-TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted,
+                  odbc_concurrency::kAllModes) {
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
                               "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
     const auto expected = ODBCTestUtils::Utf8ToNativeClient(RepeatToken(token, 300));
@@ -3429,7 +3482,8 @@ TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted) {
 // `narrow_decoder` unset here, and the SQL_C_CHAR continuation then fell through
 // to a verbatim copy even when the client and source encodings differ.
 // Conversion readiness must not depend on call history.
-TEST_F(GetDataLiveTest, VarcharMaxBinaryFirstStillConvertsOnLaterCharRead) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxBinaryFirstStillConvertsOnLaterCharRead,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' ' "
                    "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
@@ -3452,7 +3506,8 @@ TEST_F(GetDataLiveTest, VarcharMaxBinaryFirstStillConvertsOnLaterCharRead) {
 // CP1252 value must come back as the original characters and not as raw bytes
 // zero-extended into code units. A 26-byte buffer delivers 12 characters per
 // call, so the value is reassembled over hundreds of continuations.
-TEST_F(GetDataLiveTest, VarcharMaxCp1252ToWcharChunkedRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxCp1252ToWcharChunkedRoundTrip,
+                  odbc_concurrency::kAllModes) {
     // UTF-8 spelling of "café René Größe naïve " — the expected decoded value.
     const std::string token = "caf\xC3\xA9 Ren\xC3\xA9 Gr\xC3\xB6\xC3\x9F"
                               "e na\xC3\xAF"
@@ -3487,7 +3542,8 @@ TEST_F(GetDataLiveTest, VarcharMaxCp1252ToWcharChunkedRoundTrip) {
 // "????????abc..." -- silent data loss. Asserting the round-trip on that leg
 // would only re-report a divergence this driver is deliberately on the right
 // side of.
-TEST_F(GetDataLiveTest, VarcharMaxDbcsToWcharSplitsCharacterAcrossChunks) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxDbcsToWcharSplitsCharacterAcrossChunks,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
                               "abc";  // 你好世界abc
@@ -3507,7 +3563,8 @@ TEST_F(GetDataLiveTest, VarcharMaxDbcsToWcharSplitsCharacterAcrossChunks) {
 // A UTF-8 collation puts 1-4 byte sequences on the wire for the same column
 // type, and an astral character has to survive both the UTF-8 chunk boundary
 // and the surrogate-pair encode on the way out.
-TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToWcharChunkedRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxUtf8CollationToWcharChunkedRoundTrip,
+                  odbc_concurrency::kAllModes) {
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
                               "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
     const std::string expected = RepeatToken(token, 300);
@@ -3525,7 +3582,8 @@ TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToWcharChunkedRoundTrip) {
 
 // Chunking must be invisible to the caller: the same column read in one call
 // and in many must produce the same value.
-TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkSizeDoesNotChangeValue) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxToWcharChunkSizeDoesNotChangeValue,
+                  odbc_concurrency::kAllModes) {
     const char* kQuery =
         "SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Ren' + NCHAR(0xE9) "
         "+ N' Gr' + NCHAR(0xF6) + NCHAR(0xDF) + N'e na' + NCHAR(0xEF) + N've ' "
@@ -3554,7 +3612,8 @@ TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkSizeDoesNotChangeValue) {
 // `encoding_rs::GBK` returns OutputFull having consumed nothing — so the DBCS
 // case below is the one that actually pins the behaviour; the ASCII case is here
 // to separate "one character per call" from "multi-byte character handling".
-TEST_F(GetDataLiveTest, VarcharMaxToWcharSingleCharacterBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxToWcharSingleCharacterBuffer,
+                  odbc_concurrency::kAllModes) {
     const std::string expected = RepeatToken("0123456789", 20);  // 200 chars
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('0123456789' AS VARCHAR(MAX)), 20) AS c1"),
                   SQL_HANDLE_STMT, stmt_);
@@ -3572,7 +3631,8 @@ TEST_F(GetDataLiveTest, VarcharMaxToWcharSingleCharacterBuffer) {
 // Skipped on the msodbcsql leg for the same reason as
 // VarcharMaxDbcsToWcharSplitsCharacterAcrossChunks: msodbcsql on Linux best-fits
 // the CJK characters to '?' rather than decoding the column's GBK collation.
-TEST_F(GetDataLiveTest, VarcharMaxDbcsToWcharSingleCharacterBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxDbcsToWcharSingleCharacterBuffer,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
                               "abc";  // 你好世界abc
@@ -3598,7 +3658,7 @@ TEST_F(GetDataLiveTest, VarcharMaxDbcsToWcharSingleCharacterBuffer) {
 //
 // Non-ASCII and a small buffer are both deliberate: they force multi-byte
 // sequences to straddle chunk boundaries on the no-collation path.
-TEST_F(GetDataLiveTest, JsonToWcharChunkedRoundTrip) {
+ODBC_TEST_F_MODES(GetDataLiveTest, JsonToWcharChunkedRoundTrip, odbc_concurrency::kAllModes) {
     if (!ServerSupportsNativeJson()) {
         GTEST_SKIP() << "server has no native json type";
     }
@@ -3618,7 +3678,8 @@ TEST_F(GetDataLiveTest, JsonToWcharChunkedRoundTrip) {
 
 // The same json value through a length probe: ColumnSize is 0 for json exactly
 // as it is for a MAX column, so mssql-python sends the same 2-byte buffer here.
-TEST_F(GetDataLiveTest, JsonLengthProbeReportsTruncationAndKeepsValue) {
+ODBC_TEST_F_MODES(GetDataLiveTest, JsonLengthProbeReportsTruncationAndKeepsValue,
+                  odbc_concurrency::kAllModes) {
     if (!ServerSupportsNativeJson()) {
         GTEST_SKIP() << "server has no native json type";
     }
@@ -3649,7 +3710,8 @@ TEST_F(GetDataLiveTest, JsonLengthProbeReportsTruncationAndKeepsValue) {
 // chunking is in code units, and the UTF-16 passthrough path splits on the same
 // rule -- so it is the assembled value, not the chunk boundaries, that has to
 // round-trip.
-TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer,
+                  odbc_concurrency::kAllModes) {
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
                               "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
     const std::string expected = RepeatToken(token, 60);
@@ -3685,7 +3747,8 @@ TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
 // Benefits-from-mock-tds: assert that alternate calls drain the UTF-8 tail
 // without consuming more wire data, and that the final call reports the
 // delivered byte count rather than SQL_NO_TOTAL.
-TEST_F(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeIsAnswered) {
+ODBC_TEST_F_MODES(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeIsAnswered,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'abcd' AS NVARCHAR(MAX)), 50) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -3728,7 +3791,8 @@ TEST_F(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeIsAnswered) 
 // hold even the terminator, and 3 bytes has a spare byte that no whole code
 // unit fits in -- neither can make progress, so both are HY090 rather than a
 // truncation an application would retry forever.
-TEST_F(GetDataLiveTest, WidenedPlpRejectsBuffersThatCannotHoldACodeUnit) {
+ODBC_TEST_F_MODES(GetDataLiveTest, WidenedPlpRejectsBuffersThatCannotHoldACodeUnit,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     for (SQLLEN len : {SQLLEN{1}, SQLLEN{3}}) {
         ASSERT_SQL_OK(
@@ -3769,7 +3833,8 @@ TEST_F(GetDataLiveTest, WidenedPlpRejectsBuffersThatCannotHoldACodeUnit) {
 // whether the column is delivered from the captured value or from an open PLP
 // stream. Before this was hoisted ahead of the dispatch, the PLP path reached
 // its own compatibility gate first and reported HYC00 instead.
-TEST_F(GetDataLiveTest, InvalidTargetTypeOnPlpStreamReportsHy003) {
+ODBC_TEST_F_MODES(GetDataLiveTest, InvalidTargetTypeOnPlpStreamReportsHy003,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -3804,7 +3869,8 @@ TEST_F(GetDataLiveTest, InvalidTargetTypeOnPlpStreamReportsHy003) {
 
 // tests/test_004_cursor.py::test_emoji_round_trip -- NVARCHAR(MAX) holding
 // short strings with astral characters, ZWJ sequences and combining marks.
-TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNvarcharMaxEmoji) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DescribeColSizedFetchOnNvarcharMaxEmoji,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         const char* sql_literal;
         const char* expected_utf8;
@@ -3845,7 +3911,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNvarcharMaxEmoji) {
 
 // tests/test_015_pyformat_parameters.py::test_unicode_single_param -- a bound
 // parameter echoed straight back, so the result column has no declared width.
-TEST_F(GetDataLiveTest, DescribeColSizedFetchOnBoundParameterEcho) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DescribeColSizedFetchOnBoundParameterEcho,
+                  odbc_concurrency::kAllModes) {
     // "Hello " + U+4E16 U+754C + " " + U+1F30D
     const std::string expected = "Hello \xE4\xB8\x96\xE7\x95\x8C \xF0\x9F\x8C\x8D";
     const std::vector<SQLWCHAR> param = {'H',    'e',    'l',    'l',    'o',   ' ',
@@ -3867,7 +3934,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnBoundParameterEcho) {
 // ::test_geometry_as_text -- STAsText() converts the UDT server-side, so the
 // column is nvarchar with no declared width. The UDT itself never crosses the
 // wire, which is why these are in scope even though UDT fetch is not.
-TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSpatialAsText) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DescribeColSizedFetchOnSpatialAsText,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT geography::STGeomFromText('POINT(-122.34900 47.65100)', 4326)"
                    ".STAsText() AS wkt"),
@@ -3895,7 +3963,7 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSpatialAsText) {
 // through CAST(... AS NVARCHAR(MAX)). The isclass test reads cursor.description
 // for many columns but still has to fetchall() at the end, which is where it
 // died.
-TEST_F(GetDataLiveTest, DescribeColSizedFetchOnXmlColumn) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DescribeColSizedFetchOnXmlColumn, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('<r/>' AS XML) AS x"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("<r/>", FetchLikeDescribeColClient(stmt_, 1));
@@ -3912,7 +3980,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnXmlColumn) {
 
 // The same client shape over a value far larger than one chunk, so the probe is
 // followed by a real multi-call stream rather than a single follow-up read.
-TEST_F(GetDataLiveTest, DescribeColSizedFetchOnLargeNvarcharMax) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DescribeColSizedFetchOnLargeNvarcharMax,
+                  odbc_concurrency::kAllModes) {
     const std::string expected = RepeatToken("0123456789", 3000);  // 30000 chars
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'0123456789' AS NVARCHAR(MAX)), 3000) AS c1"),
@@ -3932,7 +4001,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnLargeNvarcharMax) {
 // A sized column takes the other branch: the computed buffer has real room, so
 // the value arrives in one call with SQL_SUCCESS. This is why the bug never
 // showed up on ordinary columns.
-TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSizedColumnIsSingleCall) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DescribeColSizedFetchOnSizedColumnIsSingleCall,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(N'Hello ' + NCHAR(0xD83D) + NCHAR(0xDE04) AS NVARCHAR(50)) AS c"),
         SQL_HANDLE_STMT, stmt_);
@@ -3952,7 +4022,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSizedColumnIsSingleCall) {
 // of the varbinary(max) test. A NULL MAX column must report SQL_NULL_DATA on the
 // probe rather than failing. The non-NULL delivery leg is covered by the binary
 // delivery tests below.
-TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS NVARCHAR(MAX)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -3974,7 +4045,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn) {
 //
 // The nonzero buffer is the point of this test: with a zero-length buffer the
 // read is admitted as a length probe and the NULL gate is never consulted.
-TEST_F(GetDataLiveTest, NullVarbinaryMaxToBinaryTargetReportsNull) {
+ODBC_TEST_F_MODES(GetDataLiveTest, NullVarbinaryMaxToBinaryTargetReportsNull,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS VARBINARY(MAX)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -4005,7 +4077,8 @@ TEST_F(GetDataLiveTest, NullVarbinaryMaxToBinaryTargetReportsNull) {
 //
 // This only asserts the probe contract; delivering the bytes on the retry is
 // AB#47239.
-TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationWhenBytesRemain) {
+ODBC_TEST_F_MODES(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationWhenBytesRemain,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('asdfghjkl' AS BINARY(9)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -4028,7 +4101,8 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationWhenBytesRemain) {
 // value the column is consumed -- a repeat reports SQL_NO_DATA. Measured
 // identically on msodbcsql 18.6.2.1 (SQL_SUCCESS with indicator 0 and no
 // diagnostic, then SQL_NO_DATA).
-TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceedsAndConsumesColumn) {
+ODBC_TEST_F_MODES(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceedsAndConsumesColumn,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARBINARY(8)) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -4060,7 +4134,8 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceedsAndConsumesColu
 // the driver buffer the inline prefix; the `binary(9)` is the column that
 // crashed. It is read without ever binding a column, exactly as mssql-python
 // does.
-TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationOnBufferedRow) {
+ODBC_TEST_F_MODES(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationOnBufferedRow,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('asdfghjkl' AS BINARY(9)) AS c1,"
                              " CAST(N'hey' AS NVARCHAR(MAX)) AS c2"),
                   SQL_HANDLE_STMT, stmt_);
@@ -4082,7 +4157,8 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationOnBufferedRow) {
 
 // The empty-value half of the buffered path: nothing remains, so the probe is a
 // plain success and the column is consumed.
-TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyBufferedValueConsumesColumn) {
+ODBC_TEST_F_MODES(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyBufferedValueConsumesColumn,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARBINARY(8)) AS c1,"
                              " CAST(N'hey' AS NVARCHAR(MAX)) AS c2"),
                   SQL_HANDLE_STMT, stmt_);
@@ -4131,7 +4207,8 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyBufferedValueConsumesColumn)
 // against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) each query below
 // answers `SQL_ERROR` with `22003`, so the comparison leg genuinely fails rather
 // than the macro papering over an untested guess.
-TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnFixedSourceTypesReportsTruncation) {
+ODBC_TEST_F_MODES(GetDataLiveTest, ZeroLengthBinaryProbeOnFixedSourceTypesReportsTruncation,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     struct Case {
@@ -4186,7 +4263,8 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnFixedSourceTypesReportsTruncation
 //
 // Deliberately mirrors `GetDataVar`'s zero-length-probe-then-grow-and-retry loop
 // rather than doing one clean sized read, because the crash lived in that loop.
-TEST_F(GetDataLiveTest, BinaryColumnBesideALobStaysWithinItsBuffer) {
+ODBC_TEST_F_MODES(GetDataLiveTest, BinaryColumnBesideALobStaysWithinItsBuffer,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x010203040506070809 AS BINARY(9)) AS b,"
                              " CAST(N'hey' AS NVARCHAR(MAX)) AS lob"),
                   SQL_HANDLE_STMT, stmt_);
@@ -4238,7 +4316,7 @@ TEST_F(GetDataLiveTest, BinaryColumnBesideALobStaysWithinItsBuffer) {
 
 // An integer column delivered to its natural fixed-width C target, rather than
 // being rendered as text.
-TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {
+ODBC_TEST_F_MODES(GetDataLiveTest, IntColumnToSlongTarget, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(-2000000 AS INT) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -4256,7 +4334,8 @@ TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {
 // DATETIME2(7) into SQL_C_TYPE_TIMESTAMP. The fractional field is the guard
 // against a units mismatch in the wire value (it is carried in 100 ns ticks, not
 // nanoseconds), which no unit test that builds SqlTime by hand can catch.
-TEST_F(GetDataLiveTest, Datetime2ToTimestampTargetKeepsFraction) {
+ODBC_TEST_F_MODES(GetDataLiveTest, Datetime2ToTimestampTargetKeepsFraction,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('2023-06-15 12:34:56.1234567' AS DATETIME2(7)) AS c1"),
         SQL_HANDLE_STMT, stmt_);
@@ -4287,7 +4366,8 @@ TEST_F(GetDataLiveTest, Datetime2ToTimestampTargetKeepsFraction) {
 // comes from the target side, which cannot be closed by adding a source
 // conversion. msodbcsql supports this target, so the assertion is
 // mssql-odbc-specific.
-TEST_F(GetDataLiveTest, UnsupportedTargetHyc00PreservesValue) {
+ODBC_TEST_F_MODES(GetDataLiveTest, UnsupportedTargetHyc00PreservesValue,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -4314,7 +4394,7 @@ TEST_F(GetDataLiveTest, UnsupportedTargetHyc00PreservesValue) {
 // data whose length is authoritative, but the parser is the one msodbcsql uses
 // in both directions - CharToBigint's loop stops at the NUL whichever way the
 // data moves (sqlccnvt.cpp:7800) - so "1\0 2" reads as 1 rather than 22018.
-TEST_F(GetDataLiveTest, EmbeddedNulEndsANumericColumn) {
+ODBC_TEST_F_MODES(GetDataLiveTest, EmbeddedNulEndsANumericColumn, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(CHAR(49) + CHAR(0) + CHAR(50) AS VARCHAR(8))"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -4334,7 +4414,8 @@ TEST_F(GetDataLiveTest, EmbeddedNulEndsANumericColumn) {
 // dropped-fraction flag (param_conversions_test.cpp,
 // WideDecimalLiteralReportsTruncation); routing that reduction to a double would
 // yield about 1.1 here.
-TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
+ODBC_TEST_F_MODES(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('1.234567890123456789012345678901234567890'"
                              " AS VARCHAR(64))"),
                   SQL_HANDLE_STMT, stmt_);
@@ -4359,7 +4440,8 @@ TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
 // Deliberately uses the two types both drivers resolve identically — int to
 // SQL_C_SLONG and narrow varchar to SQL_C_CHAR — so this runs on the msodbcsql
 // leg too and compares. The deviating types are covered separately below.
-ODBC_TEST_F(GetDataLiveTest, DefaultTargetResolvesFromTheColumnType) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetResolvesFromTheColumnType,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(4242 AS INT), CAST('hello' AS VARCHAR(16))"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -4390,7 +4472,8 @@ ODBC_TEST_F(GetDataLiveTest, DefaultTargetResolvesFromTheColumnType) {
 //
 // Skipped on the reference leg by construction: asserting a deviation is the
 // point, so comparing it would always report a divergence.
-TEST_F(GetDataLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST(N'one' AS NVARCHAR(8)), "
@@ -4435,7 +4518,8 @@ TEST_F(GetDataLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
 //
 // msodbcsql resolves to SQL_C_CHAR and truncates inside BufferLength, so this
 // asserts a deviation and does not run on the reference leg.
-TEST_F(GetDataLiveTest, DefaultTargetTooNarrowForItsFixedTargetIsRefused) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetTooNarrowForItsFixedTargetIsRefused,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(
         ExecDirect("SELECT CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER)"),
@@ -4464,7 +4548,8 @@ TEST_F(GetDataLiveTest, DefaultTargetTooNarrowForItsFixedTargetIsRefused) {
 // A varbinary column resolves to SQL_C_BINARY, and the resolved target now
 // delivers the bytes (AB#47239) -- both through the zero-length probe and a
 // real read. msodbcsql answers identically, so this runs on both legs.
-TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnDeliversTheBytes) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetOnABinaryColumnDeliversTheBytes,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x4142434445464748 AS VARBINARY(8))"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -4499,7 +4584,8 @@ TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnDeliversTheBytes) {
 //
 // NULL is deliberately not covered here: it never enters the streaming path
 // (see NullVarbinaryMaxToBinaryTargetReportsNull).
-ODBC_TEST_F(GetDataLiveTest, DefaultTargetOnABinaryMaxColumnDeliversTheBytes) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetOnABinaryMaxColumnDeliversTheBytes,
+                  odbc_concurrency::kAllModes) {
     const char* kQuery = "SELECT CAST(0x4142434445464748 AS VARBINARY(MAX))";
 
     // Resolved from SQL_C_DEFAULT.
@@ -4574,8 +4660,7 @@ ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks,
 // Every value is derived from the run, so under the concurrent modes a result
 // delivered to another worker's connection or statement fails here instead of
 // matching an identical constant. Covers a fixed-width, narrow, wide, binary,
-// and multi-chunk PLP read on one row. Opts into SharedDbc once that mode runs
-// nightly only (AB#49263).
+// and multi-chunk PLP read on one row.
 // Benefits-from-mock-tds: delay one connection's response so concurrent reads
 // interleave by construction rather than by scheduling.
 ODBC_TEST_F_MODES(GetDataLiveTest, RunUniqueValuesSurviveEveryRetrievalPath,
@@ -4641,13 +4726,181 @@ ODBC_TEST_F_MODES(GetDataLiveTest, RunUniqueValuesSurviveEveryRetrievalPath,
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// One row with a column of every scalar SQL Server type, each derived from the
+// run and read through SQLGetData into its natural C type, so under the
+// concurrent modes a value delivered to another worker's statement fails on
+// whichever type carries it. CLR UDTs (geography, geometry, hierarchyid), json,
+// and vector are left out: they have no run-derived literal that every
+// supported server and both drivers decode the same way.
+ODBC_TEST_F_MODES(GetDataLiveTest, RunUniqueTypedRowCoversEveryFetchableType,
+                  odbc_concurrency::kAllModes) {
+    const int k = 1 + Worker() * 1000 + Iteration();
+    const std::string ks = std::to_string(k);
+    const std::string token = WorkerToken("typed");
+    // smalldatetime ends in 2079.
+    const int year = 2000 + k % 70, month = 1 + k % 12, day = 1 + k % 28;
+    const int hour = k % 24, minute = k % 60, second = (k / 60) % 60;
+    char guid[40];
+    std::snprintf(guid, sizeof(guid), "%08X-1234-5678-9ABC-DEF012345678",
+                  static_cast<unsigned>(k));
+    const std::string ymd =
+        std::to_string(year) + ", " + std::to_string(month) + ", " + std::to_string(day);
+    const std::string hm = std::to_string(hour) + ", " + std::to_string(minute);
+    const std::string hms = hm + ", " + std::to_string(second);
+    const std::string q = "'" + token + "'";
+    const std::string nq = "N'" + token + "'";
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(" + ks + " % 2 AS BIT), CAST(" + ks + " % 256 AS TINYINT), "
+                   "CAST(" + ks + " AS SMALLINT), CAST(" + ks + " AS INT) * 100003, "
+                   "CAST(" + ks + " AS BIGINT) * CAST(10000000019 AS BIGINT), "
+                   "CAST(" + ks + ".25 AS DECIMAL(19,4)), CAST(" + ks + ".25 AS NUMERIC(38,10)), "
+                   "CAST(" + ks + ".5 AS MONEY), CAST(" + ks + ".75 AS SMALLMONEY), "
+                   "CAST(" + ks + ".5 AS REAL), CAST(" + ks + " * 1.5 AS FLOAT), "
+                   "DATEFROMPARTS(" + ymd + "), TIMEFROMPARTS(" + hms + ", 0, 0), "
+                   "DATETIMEFROMPARTS(" + ymd + ", " + hms + ", 0), "
+                   "DATETIME2FROMPARTS(" + ymd + ", " + hms + ", " + ks + ", 7), "
+                   "SMALLDATETIMEFROMPARTS(" + ymd + ", " + hm + "), "
+                   "DATETIMEOFFSETFROMPARTS(" + ymd + ", " + hms + ", " + ks + ", " +
+                   std::to_string(k % 14) + ", 30, 7), "
+                   "CAST('" + guid + "' AS UNIQUEIDENTIFIER), "
+                   "CAST(" + q + " AS CHAR(32)), CAST(" + q + " AS VARCHAR(64)), "
+                   "CAST(" + nq + " AS NCHAR(32)), CAST(" + nq + " AS NVARCHAR(64)), "
+                   "CAST(" + q + " AS VARCHAR(MAX)), CAST(" + nq + " AS NVARCHAR(MAX)), "
+                   "CAST(" + q + " AS BINARY(32)), CAST(" + q + " AS VARBINARY(64)), "
+                   "CAST(" + q + " AS VARBINARY(MAX)), CAST(" + q + " AS TEXT), "
+                   "CAST(" + nq + " AS NTEXT), CAST(CAST(" + q + " AS VARBINARY(MAX)) AS IMAGE), "
+                   "CAST('<t>" + token + "</t>' AS XML), "
+                   "CAST(CAST(" + q + " AS VARCHAR(64)) AS SQL_VARIANT)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLUSMALLINT col = 0;
+    SQLLEN ind = 0;
+    auto get = [&](SQLSMALLINT type, void* out, SQLLEN size) {
+        ++col;
+        ind = -99;
+        const SQLRETURN rc = SQLGetData(stmt_, col, type, out, size, &ind);
+        EXPECT_EQ(SQL_SUCCESS, rc) << "column " << col << ": "
+                                   << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    };
+    auto text = [&]() {
+        SQLCHAR buf[128] = {};
+        get(SQL_C_CHAR, buf, sizeof(buf));
+        return std::string(reinterpret_cast<const char*>(buf));
+    };
+    auto wide = [&]() {
+        SQLWCHAR buf[128] = {};
+        get(SQL_C_WCHAR, buf, sizeof(buf));
+        std::string ascii;
+        for (SQLLEN i = 0; i < ind / static_cast<SQLLEN>(sizeof(SQLWCHAR)); ++i) {
+            ascii += static_cast<char>(buf[i]);
+        }
+        return ascii;
+    };
+    auto bytes = [&]() {
+        SQLCHAR buf[128] = {};
+        get(SQL_C_BINARY, buf, sizeof(buf));
+        return std::string(reinterpret_cast<const char*>(buf), ind > 0 ? ind : 0);
+    };
+    const std::string padded = token + std::string(32 - token.size(), ' ');
+
+    SQLCHAR bit = 9, tiny = 0;
+    get(SQL_C_BIT, &bit, 0);
+    EXPECT_EQ(k % 2, bit);
+    get(SQL_C_UTINYINT, &tiny, 0);
+    EXPECT_EQ(k % 256, tiny);
+    SQLSMALLINT smallint_value = 0;
+    get(SQL_C_SSHORT, &smallint_value, 0);
+    EXPECT_EQ(k, smallint_value);
+    SQLINTEGER integer = 0;
+    get(SQL_C_SLONG, &integer, 0);
+    EXPECT_EQ(k * 100003, integer);
+    SQLBIGINT big = 0;
+    get(SQL_C_SBIGINT, &big, 0);
+    EXPECT_EQ(k * 10000000019LL, big);
+    double number = 0;
+    get(SQL_C_DOUBLE, &number, 0);
+    EXPECT_EQ(k + 0.25, number) << "decimal";
+    EXPECT_EQ(ks + ".2500000000", text()) << "numeric";
+    get(SQL_C_DOUBLE, &number, 0);
+    EXPECT_EQ(k + 0.5, number) << "money";
+    get(SQL_C_DOUBLE, &number, 0);
+    EXPECT_EQ(k + 0.75, number) << "smallmoney";
+    float single = 0;
+    get(SQL_C_FLOAT, &single, 0);
+    EXPECT_EQ(k + 0.5f, single) << "real";
+    get(SQL_C_DOUBLE, &number, 0);
+    EXPECT_EQ(k * 1.5, number) << "float";
+
+    SQL_DATE_STRUCT date = {};
+    get(SQL_C_TYPE_DATE, &date, 0);
+    EXPECT_EQ(year, date.year);
+    EXPECT_EQ(month, date.month);
+    EXPECT_EQ(day, date.day);
+    SQL_TIME_STRUCT time = {};
+    get(SQL_C_TYPE_TIME, &time, 0);
+    EXPECT_EQ(hour, time.hour);
+    EXPECT_EQ(minute, time.minute);
+    EXPECT_EQ(second, time.second);
+    auto expect_stamp = [&](SQLUSMALLINT expected_second, SQLUINTEGER fraction,
+                            const char* type) {
+        SQL_TIMESTAMP_STRUCT stamp = {};
+        get(SQL_C_TYPE_TIMESTAMP, &stamp, 0);
+        EXPECT_EQ(year, stamp.year) << type;
+        EXPECT_EQ(month, stamp.month) << type;
+        EXPECT_EQ(day, stamp.day) << type;
+        EXPECT_EQ(hour, stamp.hour) << type;
+        EXPECT_EQ(minute, stamp.minute) << type;
+        EXPECT_EQ(expected_second, stamp.second) << type;
+        EXPECT_EQ(fraction, stamp.fraction) << type;
+    };
+    expect_stamp(second, 0, "datetime");
+    expect_stamp(second, static_cast<SQLUINTEGER>(k) * 100, "datetime2");
+    expect_stamp(0, 0, "smalldatetime");
+    SQL_SS_TIMESTAMPOFFSET_STRUCT offset = {};
+    get(SQL_C_SS_TIMESTAMPOFFSET, &offset, sizeof(offset));
+    EXPECT_EQ(year, offset.year);
+    EXPECT_EQ(day, offset.day);
+    EXPECT_EQ(second, offset.second);
+    EXPECT_EQ(static_cast<SQLUINTEGER>(k) * 100, offset.fraction);
+    EXPECT_EQ(k % 14, offset.timezone_hour);
+    EXPECT_EQ(30, offset.timezone_minute);
+    SQLGUID uuid = {};
+    get(SQL_C_GUID, &uuid, 0);
+    EXPECT_EQ(static_cast<unsigned>(k), uuid.Data1);
+    EXPECT_EQ(0x1234, uuid.Data2);
+    EXPECT_EQ(0x5678, uuid.Data3);
+    const unsigned char data4[8] = {0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78};
+    EXPECT_EQ(0, std::memcmp(data4, uuid.Data4, sizeof(data4)));
+
+    EXPECT_EQ(padded, text()) << "char";
+    EXPECT_EQ(token, text()) << "varchar";
+    EXPECT_EQ(padded, wide()) << "nchar";
+    EXPECT_EQ(token, wide()) << "nvarchar";
+    EXPECT_EQ(token, text()) << "varchar(max)";
+    EXPECT_EQ(token, wide()) << "nvarchar(max)";
+    EXPECT_EQ(token + std::string(32 - token.size(), '\0'), bytes()) << "binary";
+    EXPECT_EQ(token, bytes()) << "varbinary";
+    EXPECT_EQ(token, bytes()) << "varbinary(max)";
+    EXPECT_EQ(token, text()) << "text";
+    EXPECT_EQ(token, wide()) << "ntext";
+    EXPECT_EQ(token, bytes()) << "image";
+    EXPECT_EQ("<t>" + token + "</t>", wide()) << "xml";
+    EXPECT_EQ(token, text()) << "sql_variant";
+    EXPECT_EQ(32, col);
+
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
+
 // The wide half of the same streaming path: an NVARCHAR(MAX) resolves to
 // SQL_C_WCHAR and is delivered as UTF-16 across chunks, which also exercises
 // the per-stream decoder that widening builds once at stream start. That
 // resolution is the registered deviation — msodbcsql resolves the wide types to
 // its ANSI SQL_C_CHAR — so this does not run on the reference leg. See the
 // preceding test for why any max column reaches the streaming path here.
-TEST_F(GetDataLiveTest, DefaultTargetStreamsAnNvarcharMaxAsWideChunks) {
+ODBC_TEST_F_MODES(GetDataLiveTest, DefaultTargetStreamsAnNvarcharMaxAsWideChunks,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     const size_t kTotal = 9000;
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(N'A' AS NVARCHAR(MAX)), 9000)"),
@@ -4679,7 +4932,8 @@ TEST_F(GetDataLiveTest, DefaultTargetStreamsAnNvarcharMaxAsWideChunks) {
 // unskipped on the msodbcsql parity leg, so retail is what pins the answer: a
 // `float` column at 1e-40 read into a `SQL_C_FLOAT` buffer is 22003 there too,
 // not a silent subnormal write.
-TEST_F(GetDataLiveTest, FloatTargetRejectsUnderflowAsWellAsOverflow) {
+ODBC_TEST_F_MODES(GetDataLiveTest, FloatTargetRejectsUnderflowAsWellAsOverflow,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         const char* literal;
         const char* what;

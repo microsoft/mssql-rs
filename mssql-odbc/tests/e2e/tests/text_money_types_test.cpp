@@ -12,6 +12,7 @@
 // without VARCHAR, NVARCHAR and XML each being exercised through them. These
 // pin the source side.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <string>
@@ -50,7 +51,7 @@ protected:
 
 // Money has its own formatter, so the sub-one rule is verified here rather than
 // inherited from the decimal path.
-TEST_F(TextMoneyTypesLiveTest, MoneySubOneRendering) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, MoneySubOneRendering, odbc_concurrency::kAllModes) {
     EXPECT_EQ(".5000", TextOf("SELECT CAST(0.5 AS MONEY) AS c1"));
     EXPECT_EQ("-.5000", TextOf("SELECT CAST(-0.5 AS MONEY) AS c1"));
     EXPECT_EQ(".0001", TextOf("SELECT CAST(0.0001 AS MONEY) AS c1"));
@@ -59,7 +60,8 @@ TEST_F(TextMoneyTypesLiveTest, MoneySubOneRendering) {
 // At or above one the leading digit is real, so nothing is stripped. Exact zero
 // is stripped too -- msodbcsql applies the rule unconditionally rather than
 // treating zero as a special case.
-TEST_F(TextMoneyTypesLiveTest, MoneyAtOrAboveOneKeepsItsDigits) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, MoneyAtOrAboveOneKeepsItsDigits,
+                  odbc_concurrency::kAllModes) {
     EXPECT_EQ("1.5000", TextOf("SELECT CAST(1.5 AS MONEY) AS c1"));
     EXPECT_EQ("-1.5000", TextOf("SELECT CAST(-1.5 AS MONEY) AS c1"));
     EXPECT_EQ(".0000", TextOf("SELECT CAST(0 AS MONEY) AS c1"));
@@ -67,17 +69,17 @@ TEST_F(TextMoneyTypesLiveTest, MoneyAtOrAboveOneKeepsItsDigits) {
 
 // The range ends, where money's 64-bit scaled representation is closest to
 // overflowing on the way to text.
-TEST_F(TextMoneyTypesLiveTest, MoneyRangeEnds) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, MoneyRangeEnds, odbc_concurrency::kAllModes) {
     EXPECT_EQ("922337203685477.5807", TextOf("SELECT CAST(922337203685477.5807 AS MONEY) AS c1"));
     EXPECT_EQ("-922337203685477.5808", TextOf("SELECT CAST(-922337203685477.5808 AS MONEY) AS c1"));
 }
 
-TEST_F(TextMoneyTypesLiveTest, SmallmoneyRendering) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, SmallmoneyRendering, odbc_concurrency::kAllModes) {
     EXPECT_EQ(".5000", TextOf("SELECT CAST(0.5 AS SMALLMONEY) AS c1"));
     EXPECT_EQ("214748.3647", TextOf("SELECT CAST(214748.3647 AS SMALLMONEY) AS c1"));
 }
 
-TEST_F(TextMoneyTypesLiveTest, MoneyToCharViaBoundFetch) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, MoneyToCharViaBoundFetch, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.5 AS MONEY) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     char buf[32] = {};
@@ -92,7 +94,7 @@ TEST_F(TextMoneyTypesLiveTest, MoneyToCharViaBoundFetch) {
 // Character sources. The audit counted C targets, not source types.
 // ---------------------------------------------------------------------------
 
-TEST_F(TextMoneyTypesLiveTest, VarcharToCharViaBoundFetch) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, VarcharToCharViaBoundFetch, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"), SQL_HANDLE_STMT, stmt_);
 
     char buf[32] = {};
@@ -110,7 +112,8 @@ TEST_F(TextMoneyTypesLiveTest, VarcharToCharViaBoundFetch) {
 // The character is built with NCHAR(233) rather than written into the literal:
 // a \\u escape in a narrow C++ string lands in the query text as UTF-8 bytes,
 // so the test would be asserting against mangled SQL rather than the driver.
-TEST_F(TextMoneyTypesLiveTest, NvarcharNonAsciiToWcharViaBoundFetch) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, NvarcharNonAsciiToWcharViaBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'caf' + NCHAR(233) AS NVARCHAR(20)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
 
@@ -129,7 +132,8 @@ TEST_F(TextMoneyTypesLiveTest, NvarcharNonAsciiToWcharViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(TextMoneyTypesLiveTest, NvarcharNonAsciiToWcharViaGetData) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, NvarcharNonAsciiToWcharViaGetData,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'caf' + NCHAR(233) AS NVARCHAR(20)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -149,7 +153,7 @@ TEST_F(TextMoneyTypesLiveTest, NvarcharNonAsciiToWcharViaGetData) {
 // 47361). msodbcsql does deliver it, so a bound version of this test would sit
 // in the suite as a permanent divergence rather than a useful assertion -- it
 // belongs with 47361.
-TEST_F(TextMoneyTypesLiveTest, XmlToWcharViaGetData) {
+ODBC_TEST_F_MODES(TextMoneyTypesLiveTest, XmlToWcharViaGetData, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('<a b=\"1\"/>' AS XML) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
