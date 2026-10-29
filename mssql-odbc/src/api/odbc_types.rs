@@ -739,6 +739,12 @@ pub const SQL_CA_SS_UDT_CATALOG_NAME: SqlUSmallInt = 1218;
 pub const SQL_CA_SS_UDT_SCHEMA_NAME: SqlUSmallInt = 1219;
 pub const SQL_CA_SS_UDT_TYPE_NAME: SqlUSmallInt = 1220;
 pub const SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME: SqlUSmallInt = 1221;
+// Table-valued-parameter (and generic user-type) name descriptor fields. A TVP
+// carries its three-part catalog/schema/type name in these, distinct from the
+// UDT-specific trio above; both resolve to the same server type identity.
+pub const SQL_CA_SS_CATALOG_NAME: SqlUSmallInt = 1225;
+pub const SQL_CA_SS_SCHEMA_NAME: SqlUSmallInt = 1226;
+pub const SQL_CA_SS_TYPE_NAME: SqlUSmallInt = 1227;
 
 // ---- SQLColAttribute field identifiers --------------------------------------
 // The low-numbered ids are the ODBC 3.x descriptor fields that double as the

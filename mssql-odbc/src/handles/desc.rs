@@ -78,16 +78,16 @@ use std::sync::Mutex;
 use super::stmt::{STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS};
 use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
 use crate::api::odbc_types::{
-    SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME,
-    SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME,
-    SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER, SQL_DESC_ARRAY_SIZE,
-    SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE,
-    SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR,
-    SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH,
-    SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
-    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
-    SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT, SQL_SUCCESS, SqlInteger, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME,
+    SQL_CA_SS_TYPE_NAME, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
+    SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE,
+    SQL_DESC_ALLOC_USER, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
+    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
+    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
+    SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
+    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
+    SQL_DESC_UNNAMED, SQL_ERROR, SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT,
+    SQL_SUCCESS, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, SQLSTATE_HY000, post_diag};
 use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
@@ -333,7 +333,7 @@ pub(crate) struct ParameterDefinition {
     length: SqlULen,
     precision: SqlSmallInt,
     scale: SqlSmallInt,
-    /// Catalog/schema/type of a UDT, which `sp_executesql` spells out in the
+    /// Catalog/schema/type of a UDT or TVP, which `sp_executesql` spells out in the
     /// declaration and so must invalidate a materialized handle when it
     /// changes. The assembly-qualified name is excluded: it never reaches the
     /// wire, so rewriting it cannot change the prepared text.
@@ -410,7 +410,7 @@ impl DescRecord {
             precision,
             scale,
             // Only the three wire parts, and only on a record that actually
-            // declares a UDT: the concise type says so, and a type name is
+            // declares a UDT or TVP: the concise type says so, and a type name is
             // present. The `SQL_CA_SS_UDT_*` fields are writable on any IPD
             // record (`classify_field` gates on kind, not type), so without
             // the first test a UDT name on an `int` marker would orphan a
@@ -425,13 +425,15 @@ impl DescRecord {
             // a catalog or schema declares nothing. Once a type name is
             // present the catalog and schema travel with it, so changing
             // either still invalidates, and a later switch away from
-            // `SQL_SS_UDT` invalidates through `sql_type`.
+            // either structured type invalidates through `sql_type`.
             udt: self
                 .udt_names
                 .as_ref()
                 .filter(|names| {
-                    self.concise_type == crate::api::odbc_types::SQL_SS_UDT
-                        && !names.type_name.is_empty()
+                    matches!(
+                        self.concise_type,
+                        crate::api::odbc_types::SQL_SS_UDT | crate::api::odbc_types::SQL_SS_TABLE
+                    ) && !names.type_name.is_empty()
                 })
                 .map(Arc::clone),
         }
@@ -829,6 +831,144 @@ impl DescHandle {
         Ok((fetching, executing))
     }
 
+    pub(crate) fn update_focused_tvp_bindings(
+        &self,
+        record_number: SqlSmallInt,
+        is_valid: impl Fn(&crate::params::BoundParam) -> bool,
+        update: impl FnMut(&mut crate::params::BoundParam),
+    ) -> Result<Option<bool>, ()> {
+        self.update_focused_tvp_bindings_after_validation(record_number, is_valid, update, || {})
+    }
+
+    fn update_focused_tvp_bindings_after_validation(
+        &self,
+        record_number: SqlSmallInt,
+        is_valid: impl Fn(&crate::params::BoundParam) -> bool,
+        mut update: impl FnMut(&mut crate::params::BoundParam),
+        after_validation: impl FnOnce(),
+    ) -> Result<Option<bool>, ()> {
+        let Some(column_index) = usize::try_from(record_number)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+        else {
+            return Ok(None);
+        };
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("updating focused TVP descriptor records: dbc mutex poisoned");
+            return Err(());
+        };
+
+        let mut found = false;
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(state) = stmt.inner.lock() else {
+                error!("validating focused TVP descriptor records: stmt mutex poisoned");
+                return Err(());
+            };
+            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus == 0 {
+                continue;
+            }
+            if let Some(binding) = state
+                .tvp_column_bindings
+                .get(&focus)
+                .and_then(|columns| columns.get(column_index))
+                .and_then(Option::as_ref)
+            {
+                found = true;
+                if !is_valid(binding) {
+                    return Ok(Some(false));
+                }
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+
+        after_validation();
+
+        let mut updated = false;
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(mut state) = stmt.inner.lock() else {
+                error!("updating focused TVP descriptor records: stmt mutex poisoned");
+                return Err(());
+            };
+            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus == 0 {
+                continue;
+            }
+            if let Some(Some(binding)) = state
+                .tvp_column_bindings
+                .get_mut(&focus)
+                .and_then(|columns| columns.get_mut(column_index))
+            {
+                if !is_valid(binding) {
+                    return Ok(Some(false));
+                }
+                update(binding);
+                updated = true;
+            }
+        }
+        Ok(updated.then_some(true))
+    }
+
+    pub(crate) fn focused_tvp_bindings(
+        &self,
+        record_number: SqlSmallInt,
+    ) -> Result<Vec<crate::params::BoundParam>, ()> {
+        let Some(column_index) = usize::try_from(record_number)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+        else {
+            return Ok(Vec::new());
+        };
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("reading focused TVP descriptor records: dbc mutex poisoned");
+            return Err(());
+        };
+        let mut bindings = Vec::new();
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(state) = stmt.inner.lock() else {
+                error!("reading focused TVP descriptor records: stmt mutex poisoned");
+                return Err(());
+            };
+            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus == 0 {
+                continue;
+            }
+            if let Some(Some(binding)) = state
+                .tvp_column_bindings
+                .get(&focus)
+                .and_then(|columns| columns.get(column_index))
+            {
+                bindings.push(*binding);
+            }
+        }
+        Ok(bindings)
+    }
+
     fn invalidate_prepared_owner(&self, first_changed: usize) -> Result<(), ()> {
         // The DM keeps the parent alive; its child list is protected for the
         // walk, matching SQLFreeHandle(DESC)'s existing DBC -> STMT traversal.
@@ -993,9 +1133,12 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         // matching SQL_DESC_NAME's own IRD/IPD split above.
         SQL_DESC_UNNAMED if is_ird || is_ipd => (Record, is_ipd),
         SQL_DESC_PARAMETER_TYPE if is_ipd => (Record, true),
-        // The UDT identity for a `SQL_SS_UDT` parameter. IPD-only and
-        // writable. An application writing here is one of two sources; the
-        // other is `refine_ipd`, which copies the server's
+        // The server type identity. The UDT trio (1218-1220) is UDT-specific;
+        // the un-prefixed trio (`SQL_CA_SS_CATALOG_NAME`/`SCHEMA_NAME`/
+        // `TYPE_NAME`, 1225-1227) is what a TVP uses for its three-part table
+        // type name. Both are IPD-only, writable, and resolve to the same
+        // stored identity. An application writing here is one of two sources;
+        // the other is `refine_ipd`, which copies the server's
         // `suggested_user_type_*` columns into any record the application has
         // not claimed. The assembly-qualified name is accepted and echoed but
         // never sent - the parameter header has no field for it, and msodbcsql
@@ -1004,6 +1147,9 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
         | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+        | SQL_CA_SS_CATALOG_NAME
+        | SQL_CA_SS_SCHEMA_NAME
+        | SQL_CA_SS_TYPE_NAME
             if is_ipd =>
         {
             (Record, true)
@@ -1047,6 +1193,53 @@ mod tests {
             };
             assert_eq!(lps(old), lps(new), "{old}");
         }
+    }
+
+    #[test]
+    fn focused_tvp_update_revalidates_after_focus_changes() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_NUMERIC, SQL_PARAM_INPUT};
+
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            let binding = |precision, scale| {
+                Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: SQL_C_NUMERIC,
+                    sql_type: SQL_NUMERIC,
+                    column_size: 10,
+                    decimal_digits: scale,
+                    app_precision: precision,
+                    app_scale: scale,
+                    parameter_value_ptr: std::ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: std::ptr::null_mut(),
+                    octet_length_ptr: std::ptr::null_mut(),
+                })
+            };
+            state.tvp_column_bindings.insert(1, vec![binding(10, 2)]);
+            state.tvp_column_bindings.insert(2, vec![binding(10, 8)]);
+        }
+
+        let result = desc.update_focused_tvp_bindings_after_validation(
+            1,
+            |binding| binding.app_scale <= 5,
+            |binding| binding.app_precision = 5,
+            || {
+                let mut state = stmt.inner.lock().unwrap();
+                state.vendor_attrs.store_param_focus(2);
+            },
+        );
+
+        assert!(matches!(result, Ok(Some(false))));
+        let state = stmt.inner.lock().unwrap();
+        let a = state.tvp_column_bindings[&1][0].unwrap();
+        let b = state.tvp_column_bindings[&2][0].unwrap();
+        assert_eq!((a.app_precision, a.app_scale), (10, 2));
+        assert_eq!((b.app_precision, b.app_scale), (10, 8));
     }
 
     #[test]

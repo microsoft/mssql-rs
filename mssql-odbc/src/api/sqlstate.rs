@@ -79,7 +79,7 @@ pub(crate) const SQLSTATE_HY008: [u8; 5] = *b"HY008";
 // this — their text comes from the wire (see `post_tds_error`).
 
 /// A driver-raised diagnostic: a fixed SQLSTATE and its canonical message.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiagMsg {
     pub(crate) state: [u8; 5],
     pub(crate) text: &'static str,
@@ -335,6 +335,10 @@ pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
 pub(crate) const ERR_MISSING_UDT_TYPE_NAME: DiagMsg = DiagMsg {
     state: SQLSTATE_HY000,
     text: "A UDT parameter requires SQL_CA_SS_UDT_TYPE_NAME to be set",
+};
+pub(crate) const ERR_MISSING_TVP_TYPE_NAME: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "A table-valued parameter requires SQL_CA_SS_TYPE_NAME to be set",
 };
 // A streamed parameter is either NULL or a sequence of value chunks; mixing the
 // two in one `SQL_NEED_DATA` window has no representation on the wire

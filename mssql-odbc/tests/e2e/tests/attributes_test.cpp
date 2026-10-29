@@ -72,7 +72,7 @@
 //   48. VendorBooleanAttributesRejectOutOfRangeValues  - driver-sourced HY024
 //   49. VendorRangeAttributesAcceptTheirWholeRange     - masks, not enumerations
 //   50. QueryNotificationTimeoutRejectsZeroAndKeepsItsValue - 0 is not "no limit"
-//   51. VendorUnsupportedFeatureAttributesRefuseEveryValue - HY024, not HY092
+//   51. ColumnEncryptionRefusesEveryValue              - HY024, not HY092
 //   52. VendorGetOnlyAttributesAreNotSettable          - HY092, not HY024
 //   53. CurrentCommandTracksTheResultSetOrdinal        - per execute, not a flag
 //   54. QueryNotificationStringsFollowTheByteLengthContract - bytes, not chars
@@ -1771,22 +1771,15 @@ TEST_F(AttributesTest, QueryNotificationTimeoutRejectsZeroAndKeepsItsValue) {
 }
 
 // -------------------------------------------------------------------
-// Variation 51 - PARAM_FOCUS and COLUMN_ENCRYPTION are recognized
-// identifiers whose features are unavailable, so every value is refused
-// with HY024 rather than the identifier being refused with HY092. The
-// distinction matters: a caller probing for Always Encrypted must be able
-// to tell "this driver knows the attribute but cannot honour it" from
-// "this is not an attribute".
+// Variation 51 - COLUMN_ENCRYPTION remains unavailable. PARAM_FOCUS is
+// covered by tvp_test now that focused TVP binding is supported.
 // -------------------------------------------------------------------
-TEST_F(AttributesTest, VendorUnsupportedFeatureAttributesRefuseEveryValue) {
-    for (SQLINTEGER attribute : {kSsParamFocus, kSsColumnEncryption}) {
-        SCOPED_TRACE(attribute);
-        for (SQLULEN value : {SQLULEN{0}, SQLULEN{1}, SQLULEN{2}}) {
-            EXPECT_EQ(SQL_ERROR, SetStmtULen(attribute, value));
-            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
-        }
-        EXPECT_EQ(SQLULEN{0}, GetStmtULen(attribute));
+TEST_F(AttributesTest, ColumnEncryptionRefusesEveryValue) {
+    for (SQLULEN value : {SQLULEN{0}, SQLULEN{1}, SQLULEN{2}}) {
+        EXPECT_EQ(SQL_ERROR, SetStmtULen(kSsColumnEncryption, value));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
     }
+    EXPECT_EQ(SQLULEN{0}, GetStmtULen(kSsColumnEncryption));
 }
 
 // -------------------------------------------------------------------

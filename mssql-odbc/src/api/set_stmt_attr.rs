@@ -64,9 +64,9 @@ use crate::api::odbc_types::{
     SQL_ATTR_ROWS_FETCHED_PTR, SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY,
     SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_FALSE, SQL_INSENSITIVE, SQL_INVALID_HANDLE,
     SQL_NONSCROLLABLE, SQL_NTS, SQL_ROWSET_SIZE, SQL_SC_UNIQUE, SQL_SOPT_SS_CURRENT_COMMAND,
-    SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen,
-    SqlWChar,
+    SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+    SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SS_TABLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlWChar,
 };
 use crate::api::set_desc_field::clamp_array_size;
 use crate::api::sqlstate::{
@@ -179,6 +179,28 @@ unsafe fn sql_set_stmt_attr_w_impl(
     unsafe { sql_set_stmt_attr_w_safe(stmt, attribute, value_ptr, string_length) }
 }
 
+/// Whether `ordinal` (1-based) names a parameter currently bound as a
+/// table-valued parameter (`SQL_SS_TABLE`) on `stmt`'s IPD.
+///
+/// Mirrors msodbcsql's `IsValidTvpOrdinal` (`sqlcdesc.cpp`): a zero ordinal is
+/// never valid (it is the non-specific focus), and the record must exist and
+/// carry the table type. Reads the IPD without holding the STMT lock, per the
+/// crate's locking rule. `stmt.ipd` is never reassociated or independently freed
+/// (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so no liveness recheck is needed.
+fn is_valid_tvp_ordinal(stmt: &StmtHandle, ordinal: SqlULen) -> Result<bool, ()> {
+    if ordinal == 0 {
+        return Ok(false);
+    }
+    let Ok(record_number) = SqlSmallInt::try_from(ordinal) else {
+        return Ok(false);
+    };
+    let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
+    let ipd_state = ipd.inner.lock().map_err(|_| ())?;
+    Ok(ipd_state
+        .record(record_number)
+        .is_some_and(|record| record.concise_type == SQL_SS_TABLE))
+}
+
 /// # Safety
 /// For the two string-valued attributes (`SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT`
 /// and `..._OPTIONS`) `value_ptr` must point to `string_length` readable bytes of
@@ -196,6 +218,26 @@ unsafe fn sql_set_stmt_attr_w_safe(
         return SQL_ERROR;
     };
     free_errors(&mut state);
+
+    let focus = state.vendor_attrs.get(SQL_SOPT_SS_PARAM_FOCUS).unwrap_or(0);
+    if focus != 0
+        && let Some(field) = tvp_layout_field(attribute)
+    {
+        if state.has_state(STMT_STATE_EXEC_STARTED) {
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
+        if attribute == SQL_ATTR_PARAMSET_SIZE && value_ptr.is_null() {
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+            return SQL_ERROR;
+        }
+        field.write(
+            state.tvp_column_layouts.entry(focus).or_default(),
+            value_ptr,
+            value_ptr as SqlULen,
+        );
+        return SQL_SUCCESS;
+    }
 
     match attribute {
         SQL_ATTR_PARAMSET_SIZE
@@ -526,6 +568,76 @@ unsafe fn sql_set_stmt_attr_w_safe(
             }
             SQL_SUCCESS
         }
+        // Table-valued-parameter focus. Validity depends on the statement's
+        // bound parameters, not a static rule: 0 restores top-level binding,
+        // and a non-zero value must name a parameter already bound as
+        // SQL_SS_TABLE (msodbcsql's IsValidTvpOrdinal). While focus is set,
+        // SQLBindParameter targets that TVP's constituent columns. Validated
+        // and stored here; the execute path enforces that it is 0 at execute
+        // time (HY024).
+        SQL_SOPT_SS_PARAM_FOCUS => {
+            let focus = value_ptr as SqlULen;
+            if focus != 0 {
+                // Read the IPD after releasing the STMT lock (locking rule).
+                drop(state);
+                let valid = match is_valid_tvp_ordinal(stmt, focus) {
+                    Ok(valid) => valid,
+                    Err(()) => {
+                        error!("SQLSetStmtAttrW: ipd mutex poisoned validating PARAM_FOCUS");
+                        if let Ok(mut state) = stmt.inner.lock() {
+                            post_sql_error(
+                                &mut state,
+                                SQLSTATE_HY000,
+                                0,
+                                "Internal error reading table-valued parameter metadata",
+                            );
+                        }
+                        return SQL_ERROR;
+                    }
+                };
+                if !valid {
+                    let Ok(mut state) = stmt.inner.lock() else {
+                        error!("SQLSetStmtAttrW: stmt mutex poisoned validating PARAM_FOCUS");
+                        return SQL_ERROR;
+                    };
+                    error!(
+                        focus,
+                        "SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS does not name a bound table-valued parameter"
+                    );
+                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                    return SQL_ERROR;
+                }
+                // Focused APD descriptor updates hold the parent DBC lock
+                // across validation and mutation; serialize focus changes with
+                // those updates.
+                let dbc = stmt.parent_dbc();
+                let Ok(_dbc_state) = dbc.inner.lock() else {
+                    error!("SQLSetStmtAttrW: dbc mutex poisoned setting PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                let Ok(mut state) = stmt.inner.lock() else {
+                    error!("SQLSetStmtAttrW: stmt mutex poisoned setting PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                state.vendor_attrs.store_param_focus(focus);
+                debug!(focus, "SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS set");
+                SQL_SUCCESS
+            } else {
+                drop(state);
+                let dbc = stmt.parent_dbc();
+                let Ok(_dbc_state) = dbc.inner.lock() else {
+                    error!("SQLSetStmtAttrW: dbc mutex poisoned clearing PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                let Ok(mut state) = stmt.inner.lock() else {
+                    error!("SQLSetStmtAttrW: stmt mutex poisoned clearing PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                state.vendor_attrs.store_param_focus(0);
+                debug!("SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS cleared");
+                SQL_SUCCESS
+            }
+        }
         // SQL Server vendor attributes. Unlike the inert set these validate
         // before storing: the Driver Manager has no knowledge of ids 1225-1238
         // and passes any value straight through, so rejecting an out-of-range
@@ -695,13 +807,18 @@ impl HeaderField {
     }
 }
 
-/// Statement attributes stored on a descriptor header: the alias table in
-/// `handles::desc`, plus `SQL_ROWSET_SIZE`. Mirrors where msodbcsql's
-/// `SQLSetStmtAttr`/`SQLGetStmtAttr` keep each one. msodbcsql routes
-/// `PARAMSET_SIZE`/`PARAM_BIND_TYPE`/`PARAM_BIND_OFFSET_PTR` to the TVP child
-/// APD under `SQL_SOPT_SS_PARAM_FOCUS` (`pAPDActual`) but
-/// `PARAM_OPERATION_PTR` to the statement's APD; the same here today only
-/// because param focus is rejected.
+/// Layout attributes that follow the focused TVP's child APD (`pAPDActual`).
+fn tvp_layout_field(attribute: SqlInteger) -> Option<HeaderField> {
+    match attribute {
+        SQL_ATTR_PARAMSET_SIZE => Some(HeaderField::ArraySize),
+        SQL_ATTR_PARAM_BIND_TYPE => Some(HeaderField::BindType),
+        SQL_ATTR_PARAM_BIND_OFFSET_PTR => Some(HeaderField::BindOffsetPtr),
+        _ => None,
+    }
+}
+
+/// Statement descriptor-header aliases. `PARAM_OPERATION_PTR` remains on the
+/// outer APD even while the layout attributes follow TVP focus.
 fn header_alias(attribute: SqlInteger) -> Option<(HeaderOwner, HeaderField)> {
     let alias = match attribute {
         SQL_ATTR_ROW_ARRAY_SIZE => (HeaderOwner::Ard, HeaderField::ArraySize),
@@ -960,6 +1077,27 @@ unsafe fn sql_get_stmt_attr_w_safe(
         return SQL_ERROR;
     };
     free_errors(&mut state);
+
+    let focus = state.vendor_attrs.get(SQL_SOPT_SS_PARAM_FOCUS).unwrap_or(0);
+    if focus != 0
+        && let Some(field) = tvp_layout_field(attribute)
+    {
+        let value = field.read(
+            state
+                .tvp_column_layouts
+                .get(&focus)
+                .unwrap_or(&DescHeader::default()),
+        );
+        drop(state);
+        unsafe {
+            write_if_some(value_ptr.cast::<SqlULen>(), value);
+            write_if_some(
+                string_length_ptr,
+                SqlInteger::try_from(size_of::<SqlULen>()).unwrap_or(SqlInteger::MAX),
+            );
+        }
+        return SQL_SUCCESS;
+    }
 
     // Header aliases are read from the owning descriptor, after dropping this
     // lock.
@@ -2894,22 +3032,250 @@ mod tests {
         }
     }
 
-    /// `SQL_SOPT_SS_PARAM_FOCUS` and `SQL_SOPT_SS_COLUMN_ENCRYPTION` name
-    /// features neither driver offers here, and msodbcsql refuses every value
-    /// for them — including the "off" value its own headers define, and
-    /// including `COLUMN_ENCRYPTION` on a connection opened with
-    /// `ColumnEncryption=Enabled`. They are recognized, so the answer is
-    /// `HY024` (bad value) rather than `HY092` (bad identifier).
+    /// `SQL_SOPT_SS_COLUMN_ENCRYPTION` names a feature this driver does not
+    /// offer, and msodbcsql refuses every value for it — including the "off"
+    /// value its own headers define, and including on a connection opened with
+    /// `ColumnEncryption=Enabled`. It is recognized, so the answer is `HY024`
+    /// (bad value) rather than `HY092` (bad identifier).
     #[test]
     fn vendor_unsupported_features_reject_every_value() {
-        for attribute in [SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_COLUMN_ENCRYPTION] {
-            for value in [0, 1, 2] {
-                let h = TestHandles::with_env_dbc_stmt();
-                let ret = unsafe { sql_set_stmt_attr_w(h.stmt, attribute, value as SqlPointer, 0) };
-                assert_eq!(ret, SQL_ERROR, "set {attribute} = {value}");
-                assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
-            }
+        for value in [0, 1, 2] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let ret = unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_SOPT_SS_COLUMN_ENCRYPTION,
+                    value as SqlPointer,
+                    0,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "set COLUMN_ENCRYPTION = {value}");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
         }
+    }
+
+    /// Setting `SQL_SOPT_SS_PARAM_FOCUS` to 0 always succeeds (it restores
+    /// top-level binding), and reads back as 0.
+    #[test]
+    fn param_focus_zero_is_accepted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 0 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_PARAM_FOCUS), 0);
+    }
+
+    /// A non-zero focus that does not name a bound table-valued parameter is
+    /// rejected with HY024, and the stored focus stays 0.
+    #[test]
+    fn param_focus_rejects_an_ordinal_that_is_not_a_bound_tvp() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_PARAM_FOCUS), 0);
+    }
+
+    #[test]
+    fn param_focus_reports_a_poisoned_ipd_as_an_internal_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        poison_desc(h.ipd());
+
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY000);
+    }
+
+    /// Once a parameter is bound as `SQL_SS_TABLE`, focusing on its ordinal is
+    /// accepted and reads back.
+    #[test]
+    fn focused_tvp_layout_is_independent_and_used_for_column_positioning() {
+        use crate::api::exports::{
+            SQLBindParameter, SQLGetStmtAttrW, SQLSetDescFieldW, SQLSetStmtAttrW,
+        };
+        use crate::api::odbc_types::{
+            SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH_PTR,
+            SQL_INTEGER, SQL_PARAM_INPUT, SQL_SS_TABLE, SqlLen,
+        };
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        #[repr(C)]
+        struct Row {
+            value: i32,
+            indicator: SqlLen,
+        }
+        let mut rows = [
+            Row {
+                value: -1,
+                indicator: 0,
+            },
+            Row {
+                value: 11,
+                indicator: 0,
+            },
+            Row {
+                value: 22,
+                indicator: 0,
+            },
+        ];
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut name: Vec<u16> = "Orders".encode_utf16().chain(Some(0)).collect();
+        let mut indicator: SqlLen = 0;
+        let mut count: SqlLen = 2;
+        assert_eq!(
+            unsafe {
+                SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_BINARY,
+                    SQL_SS_TABLE,
+                    2,
+                    0,
+                    name.as_mut_ptr().cast(),
+                    SqlLen::from(SQL_NTS),
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    h.apd(),
+                    1,
+                    SQL_DESC_OCTET_LENGTH_PTR.try_into().unwrap(),
+                    (&raw mut count).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { SQLSetStmtAttrW(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1usize as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        let mut offset = SqlLen::try_from(size_of::<Row>()).unwrap();
+        for (attribute, value) in [
+            (SQL_ATTR_PARAMSET_SIZE, 2usize),
+            (SQL_ATTR_PARAM_BIND_TYPE, size_of::<Row>()),
+            (SQL_ATTR_PARAM_BIND_OFFSET_PTR, (&raw mut offset).addr()),
+        ] {
+            assert_eq!(
+                unsafe { SQLSetStmtAttrW(h.stmt, attribute, value as SqlPointer, 0) },
+                SQL_SUCCESS
+            );
+            let mut actual: SqlULen = 0;
+            assert_eq!(
+                unsafe {
+                    SQLGetStmtAttrW(
+                        h.stmt,
+                        attribute,
+                        (&raw mut actual).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(actual, value);
+        }
+        assert_eq!(
+            unsafe {
+                SQLBindParameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    (&raw mut rows[0].value).cast(),
+                    0,
+                    &raw mut rows[0].indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { SQLSetStmtAttrW(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, std::ptr::null_mut(), 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAMSET_SIZE), 1);
+        assert_eq!(
+            get_attr(h.stmt, SQL_ATTR_PARAM_BIND_TYPE),
+            SQL_BIND_BY_COLUMN
+        );
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_PARAM_BIND_OFFSET_PTR), 0);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        for null_indicator in [false, true] {
+            if null_indicator {
+                assert_eq!(
+                    unsafe {
+                        SQLSetDescFieldW(
+                            h.apd(),
+                            1,
+                            SQL_DESC_INDICATOR_PTR.try_into().unwrap(),
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+            }
+            let snapshot = crate::api::exec_common::snapshot_bound_params(stmt).unwrap();
+            assert_eq!(snapshot.header.array_size, 1);
+            let mut state = stmt.inner.lock().unwrap();
+            state.bound_params = snapshot.params;
+            let built =
+                unsafe { crate::api::exec_common::build_named_params(&mut state, 1, 0, "test") }
+                    .unwrap();
+            let SqlType::Table(_, Some(table)) =
+                mssql_tds::test_client_support::rpc_parameter_value(&built.params[0]).unwrap()
+            else {
+                panic!("expected a populated table");
+            };
+            assert_eq!(
+                table.rows,
+                vec![vec![SqlType::Int(Some(11))], vec![SqlType::Int(Some(22))]]
+            );
+        }
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_RESET_PARAMS)
+            },
+            SQL_SUCCESS
+        );
+        assert!(stmt.inner.lock().unwrap().tvp_column_layouts.is_empty());
+    }
+
+    #[test]
+    fn param_focus_accepts_a_bound_tvp_ordinal() {
+        use crate::api::odbc_types::{SQL_C_BINARY, SQL_PARAM_INPUT, SQL_SS_TABLE, SqlLen};
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            crate::api::bind_param::sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_BINARY,
+                SQL_SS_TABLE,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS, "binding the TVP");
+
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS, "focusing on the bound TVP");
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_PARAM_FOCUS), 1);
     }
 
     /// A rejected value leaves the previous one in place — a failed set is not

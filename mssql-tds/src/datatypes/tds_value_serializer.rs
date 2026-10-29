@@ -113,6 +113,17 @@ impl TdsTypeContext {
 pub struct TdsValueSerializer;
 
 impl TdsValueSerializer {
+    fn effective_narrow_string_byte_limit(
+        value: &SqlString,
+        column_limit: Option<usize>,
+    ) -> Option<usize> {
+        match (value.narrow_string_byte_limit(), column_limit) {
+            (Some(value_limit), Some(column_limit)) => Some(value_limit.min(column_limit)),
+            (Some(value_limit), None) => Some(value_limit),
+            (None, column_limit) => column_limit,
+        }
+    }
+
     fn narrow_string_maximum(
         ctx: &TdsTypeContext,
         narrow_string_byte_limit: Option<usize>,
@@ -179,6 +190,12 @@ impl TdsValueSerializer {
             return Ok(());
         }
 
+        let narrow_string_byte_limit = match value {
+            ColumnValues::String(value) => {
+                Self::effective_narrow_string_byte_limit(value, narrow_string_byte_limit)
+            }
+            _ => narrow_string_byte_limit,
+        };
         let Some(maximum) = Self::narrow_string_maximum(ctx, narrow_string_byte_limit) else {
             return Ok(());
         };
@@ -198,6 +215,8 @@ impl TdsValueSerializer {
             return Ok(None);
         }
 
+        let narrow_string_byte_limit =
+            Self::effective_narrow_string_byte_limit(value, narrow_string_byte_limit);
         let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit);
         if let Some(bytes) = value.as_raw_wire_bytes() {
             let bytes = match maximum {
@@ -1458,6 +1477,9 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
+        let narrow_string_byte_limit =
+            Self::effective_narrow_string_byte_limit(value, narrow_string_byte_limit);
+
         // For NVARCHAR/NCHAR types, we need UTF-16LE encoding
         // The SqlString might already be UTF-16 encoded, so check first to avoid re-encoding
         let (utf16_bytes, is_unicode) = match ctx.tds_type {
@@ -1942,20 +1964,8 @@ impl TdsValueSerializer {
         Ok(())
     }
 
-    /// Helper to serialize a single-byte string for CHAR/VARCHAR types.
-    ///
-    /// Takes single-byte encoded data and serializes it according to the TDS type context.
     fn fit_narrow_bytes(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
-        if bytes.len() <= maximum {
-            return Ok(bytes);
-        }
-        if bytes[maximum..].iter().all(|byte| *byte == b' ') {
-            return Ok(&bytes[..maximum]);
-        }
-        Err(Error::EncodedValueTooLong {
-            actual: bytes.len(),
-            maximum,
-        })
+        crate::datatypes::sql_string::fit_narrow_byte_limit(bytes, maximum)
     }
 
     async fn serialize_char_varchar_direct<'a, 'b>(

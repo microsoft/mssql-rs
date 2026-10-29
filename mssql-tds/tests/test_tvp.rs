@@ -31,7 +31,7 @@ mod tvp_tests {
     use mssql_tds::datatypes::decoder::DecimalParts;
     use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sql_tvp::{
-        TvpColumnDef, TvpOrderFlags, TvpOrderHint, TvpTableData, TvpTypeName,
+        TvpColumnDef, TvpColumnFlags, TvpOrderFlags, TvpOrderHint, TvpTableData, TvpTypeName,
     };
     use mssql_tds::datatypes::sqltypes::SqlType;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
@@ -40,6 +40,16 @@ mod tvp_tests {
     #[ctor::ctor]
     fn init() {
         init_tracing();
+    }
+
+    #[test]
+    fn tvp_column_def_keeps_its_public_four_field_literal() {
+        let _ = TvpColumnDef {
+            column_type: SqlType::Int(None),
+            flags: TvpColumnFlags::NULLABLE,
+            precision: None,
+            scale: None,
+        };
     }
 
     /// Runs a statement that returns no result set (DDL) and finishes the batch.

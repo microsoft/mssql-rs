@@ -672,9 +672,9 @@ fn refine_ipd(
         // cache-served describe answer (`:189`), so not skipping costs ~N^2
         // allocations across a describe-all pass over N non-UDT markers.
         //
-        // A claim always accompanies a stored identity (`set_udt_name` creates
-        // the record before claiming; both clears drop the record only when
-        // nothing is claimed), so this cannot skip a record with live claims.
+        // A claim always accompanies a stored identity (`set_user_type_name`
+        // creates the record before claiming; both clears drop the record only
+        // when nothing is claimed), so this cannot skip a record with live claims.
         debug_assert!(
             record.udt_names.is_some() || record.udt_name_claimed == UdtNameClaims::default(),
             "a claimed UDT name part must have a record to live on"
@@ -740,8 +740,8 @@ fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>
         } else {
             let names = Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
             // This driver does not read the assembly-qualified column (see
-            // `read_udt_names`), so an application's survives the refresh of
-            // the parts around it.
+            // `read_user_type_names`), so an application's survives the refresh
+            // of the parts around it.
             if !claims.catalog {
                 names.catalog.clone_from(&fresh.catalog);
             }
@@ -846,8 +846,8 @@ fn parse_parameter_row(
     let scale = read_optional_u8(row, SUGGESTED_SCALE, "suggested_scale")?;
 
     let description = describe_tds_type(data_type, length, precision, scale)?;
-    let udt_names = read_udt_names(row, description.data_type);
-    Ok((index, description, udt_names))
+    let user_type_names = read_user_type_names(row, description.data_type);
+    Ok((index, description, user_type_names))
 }
 
 fn describe_tds_type(
@@ -1112,10 +1112,14 @@ fn read_optional_string(row: &[ColumnValues], index: usize) -> Option<String> {
     }
 }
 
-/// The CLR type identity for a described `udt` parameter, or `None` for every
-/// other type. msodbcsql fills the same three IPD fields from these columns.
-fn read_udt_names(row: &[ColumnValues], data_type: SqlSmallInt) -> Option<Arc<UdtNames>> {
-    if data_type != SQL_SS_UDT {
+/// The server-side type identity for a described `udt` or table-valued
+/// (`SQL_SS_TABLE`) parameter, or `None` for every other type. Both carry a
+/// three-part (catalog / schema / type) name in the same
+/// `suggested_user_type_*` columns, and both populate the same three IPD name
+/// fields; msodbcsql fills them the same way. A TVP has no assembly-qualified
+/// name, which is left empty exactly as it is for a UDT (see below).
+fn read_user_type_names(row: &[ColumnValues], data_type: SqlSmallInt) -> Option<Arc<UdtNames>> {
+    if !matches!(data_type, SQL_SS_UDT | SQL_SS_TABLE) {
         return None;
     }
     let type_name = read_optional_string(row, SUGGESTED_USER_TYPE_NAME)?;
@@ -1183,7 +1187,7 @@ mod tests {
     use crate::handles::desc::UdtNameClaims;
 
     /// `SQLSetDescField` for one `SQL_CA_SS_UDT_*` name on record 1, so tests
-    /// exercise `set_udt_name`'s provenance claim rather than reaching past it.
+    /// exercise `set_user_type_name`'s provenance claim rather than reaching past it.
     fn set_udt_name_field(ipd: SqlHandle, field: SqlUSmallInt, value: &str) {
         let mut wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
         let ret = unsafe {
@@ -2012,6 +2016,28 @@ mod tests {
         assert_eq!(names.type_name, "hierarchyid");
     }
 
+    /// A table-valued parameter carries its three-part type name in the same
+    /// `suggested_user_type_*` columns as a UDT, so describe surfaces the TVP's
+    /// identity the same way - this is what lets the execute path name the
+    /// table type without the application restating it.
+    #[test]
+    fn table_names_come_from_the_server_describe_columns() {
+        let mut r = row(1, TdsDataType::SqlTable, 0, 0, 0);
+        r[SUGGESTED_USER_TYPE_DATABASE] = ColumnValues::String(utf8("mydb"));
+        r[SUGGESTED_USER_TYPE_SCHEMA] = ColumnValues::String(utf8("sales"));
+        r[SUGGESTED_USER_TYPE_NAME] = ColumnValues::String(utf8("OrderList"));
+
+        let names = parse_parameter_row(&r, 1)
+            .unwrap()
+            .2
+            .expect("table type names");
+        assert_eq!(names.catalog, "mydb");
+        assert_eq!(names.schema, "sales");
+        assert_eq!(names.type_name, "OrderList");
+        // A table type has no assembly-qualified name.
+        assert_eq!(names.assembly_type_name, "");
+    }
+
     /// Only a `udt` row carries an identity; every other type leaves the IPD's
     /// UDT fields alone.
     #[test]
@@ -2419,8 +2445,8 @@ mod tests {
 
     /// The three wire parts are independently writable, so provenance is
     /// per field. Both writes go through `SQLSetDescField` so the test guards
-    /// `set_udt_name`'s claim as well as the merge. Two orders prove one flag
-    /// cannot express it:
+    /// `set_user_type_name`'s claim as well as the merge. Two orders prove one
+    /// flag cannot express it:
     ///
     /// 1. Server fills the identity, then the application overrides only the
     ///    schema. A single flag marks the whole identity application-owned,
@@ -2535,8 +2561,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
 
-        // Exactly what `set_udt_name` does for the assembly field on a fresh
-        // record: it claims no wire part.
+        // Exactly what `set_user_type_name` does for the assembly field on a
+        // fresh record: it claims no wire part.
         {
             let mut state = ipd.inner.lock().unwrap();
             state.set_record_count(1, ipd.kind);

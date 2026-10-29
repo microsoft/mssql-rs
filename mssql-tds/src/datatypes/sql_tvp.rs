@@ -588,7 +588,13 @@ pub(crate) async fn write_tvp_rows(
             // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
             // buffered, which would leave a half-written TVP on the wire.
             apply_column_metadata(column, &mut value)?;
-            TdsValueSerializer::serialize_value(packet_writer, &value, &ctx).await?;
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                packet_writer,
+                &value,
+                &ctx,
+                None,
+            )
+            .await?;
         }
     }
 
@@ -639,14 +645,128 @@ mod tests {
         mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
     }
 
-    async fn row_bytes(columns: &[TvpColumnDef], rows: &[Vec<SqlType>]) -> Vec<u8> {
+    #[tokio::test]
+    async fn utf8_varchar_cell_fits_only_trailing_blanks_to_declared_byte_length() {
+        let column = TvpColumnDef::new(SqlType::Varchar(None, 3));
+        let row = vec![SqlType::Varchar(
+            Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                "€ ".to_string(),
+            )),
+            3,
+        )];
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
         let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        write_tvp_rows(&mut writer, columns, rows, &default_collation())
+        write_tvp_rows(&mut writer, &[column], &[row], &collation)
             .await
             .unwrap();
         writer.finalize().await.unwrap();
-        mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
+
+        assert_eq!(
+            &mock.data[PacketWriter::PACKET_HEADER_SIZE..],
+            &[TVP_ROW_TOKEN, 3, 0, 0xE2, 0x82, 0xAC, TVP_END_TOKEN]
+        );
+    }
+
+    #[test]
+    fn narrow_string_limit_discards_only_trailing_ascii_spaces() {
+        assert_eq!(
+            crate::datatypes::sql_string::fit_narrow_byte_limit("€ ".as_bytes(), 3).unwrap(),
+            "€".as_bytes()
+        );
+        assert!(crate::datatypes::sql_string::fit_narrow_byte_limit("€a".as_bytes(), 3).is_err());
+    }
+
+    async fn row_bytes_with_collation(
+        columns: &[TvpColumnDef],
+        rows: &[Vec<SqlType>],
+        collation: &SqlCollation,
+    ) -> TdsResult<Vec<u8>> {
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        write_tvp_rows(&mut writer, columns, rows, collation).await?;
+        writer.finalize().await.unwrap();
+        Ok(mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec())
+    }
+
+    async fn row_bytes(columns: &[TvpColumnDef], rows: &[Vec<SqlType>]) -> Vec<u8> {
+        row_bytes_with_collation(columns, rows, &default_collation())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tvp_narrow_limit_is_applied_after_collation_encoding() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let mut string = crate::datatypes::sql_string::SqlString::new(
+            "éé".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        );
+        string.set_narrow_string_byte_limit(2);
+        let columns = [TvpColumnDef::new(SqlType::VarcharMax(None))];
+        let rows = [vec![SqlType::VarcharMax(Some(string))]];
+
+        let bytes = row_bytes_with_collation(&columns, &rows, &collation)
+            .await
+            .unwrap();
+        assert!(bytes.windows(2).any(|window| window == [0xE9, 0xE9]));
+    }
+
+    #[tokio::test]
+    async fn tvp_narrow_limit_preserves_padding_that_fits_after_encoding() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let mut string = crate::datatypes::sql_string::SqlString::new(
+            "€ ".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        );
+        string.set_narrow_string_byte_limit(3);
+        let columns = [TvpColumnDef::new(SqlType::VarcharMax(None))];
+        let rows = [vec![SqlType::VarcharMax(Some(string))]];
+
+        let bytes = row_bytes_with_collation(&columns, &rows, &collation)
+            .await
+            .unwrap();
+        assert!(bytes.windows(2).any(|window| window == [0x80, b' ']));
+    }
+
+    #[tokio::test]
+    async fn tvp_narrow_limit_rejects_encoded_overflow() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let mut string = crate::datatypes::sql_string::SqlString::new(
+            "é".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        );
+        string.set_narrow_string_byte_limit(1);
+        let columns = [TvpColumnDef::new(SqlType::VarcharMax(None))];
+        let rows = [vec![SqlType::VarcharMax(Some(string))]];
+
+        assert!(matches!(
+            row_bytes_with_collation(&columns, &rows, &collation).await,
+            Err(Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            })
+        ));
     }
 
     #[tokio::test]
