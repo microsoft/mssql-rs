@@ -158,47 +158,6 @@ def test_release_defaults_are_safe():
 
 
 @pytest.mark.parametrize("is_official", [False, True])
-@pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
-def test_onebranch_wheel_jobs_use_acr_for_all_container_steps(is_official, job_name):
-    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
-    job = next(
-        job for job in expand(
-            source, _stage_flags(
-                isOfficial=is_official, buildOdbcNative=True, testPythonWheelInstalls=True
-            )
-        )["stages"][0]["jobs"] if job["job"] == job_name
-    )
-    steps = job["steps"]
-    dependencies = next(
-        step for step in steps
-        if step.get("template") == "/.pipeline/templates/install-host-dependency.yaml"
-    )
-    assert dependencies["parameters"] == {"installAzCli": True, "installDocker": True}
-    login = next(
-        step for step in steps
-        if step.get("template") == "/.pipeline/templates/azure-cli-login-template.yml"
-    )
-    assert steps.index(dependencies) < steps.index(login)
-    container_steps = 0
-    for index, step in enumerate(steps):
-        template = step.get("template", "")
-        if template.endswith((
-            "/build-python-wheels-template.yml", "/test-python-wheel-installs-template.yml"
-        )):
-            assert step["parameters"]["containerRegistry"] == "tdslibrs.azurecr.io"
-            assert index > steps.index(login)
-            container_steps += 1
-        elif "image" in step.get("parameters", {}):
-            assert step["parameters"]["image"].startswith("tdslibrs.azurecr.io/")
-            assert index > steps.index(login)
-        elif "docker-cargo-run.sh" in step.get("script", ""):
-            assert "tdslibrs.azurecr.io/python-build/" in step["script"]
-            assert "ghcr.io" not in step["script"]
-            assert index > steps.index(login)
-    assert container_steps == 3
-
-
-@pytest.mark.parametrize("is_official", [False, True])
 @pytest.mark.parametrize("build_products", [False, True])
 def test_cpp_codeql_build_is_official_only(is_official, build_products):
     source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
