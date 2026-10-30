@@ -89,6 +89,13 @@ String decoding follows column metadata, not BOM-shaped prefixes in values.
 The [behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
 documents encoding and stack-use details.
 
+## Legacy LOB parameters
+
+`SqlType::Text`, `SqlType::NText`, and `SqlType::Image` RPC parameters accept
+materialized, empty, and NULL values. A streamed value can keep its legacy
+declaration through `RpcParameter::with_streamed_declaration` while sending a
+MAX/PLP payload, without buffering the whole value.
+
 ## License
 
 MIT

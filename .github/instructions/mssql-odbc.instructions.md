@@ -385,6 +385,11 @@ on; these guarantees were verified against msodbcsql's behavior.
 
 ### 7.3. Prepared parameter definitions
 
+- `LongAsMax` defaults off. Snapshot it with the execution's bindings so
+  materialized, streamed, and buffered DAE parameters agree. Preserve cached
+  declarations when the connection option changes: msodbcsql changes subsequent
+  wire values but does not invalidate the prepared handle. A new prepare selects
+  the new declaration. Keep DAE payloads PLP-framed even for legacy declarations.
 - Compare SQL definitions during IPD mutation, not APD addresses or conversion
   metadata on every execute. Preserve plans for equivalent `SQLBindParameter`
   calls and APD-only changes. `DESC_CONSISTENT` in msodbcsql controls validation,

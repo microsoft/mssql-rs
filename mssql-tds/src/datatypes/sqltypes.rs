@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Cow;
+
 use uuid::Uuid;
 
 use crate::datatypes::column_values::{
@@ -101,6 +103,8 @@ pub enum SqlType {
     Text(Option<SqlString>),
     /// Legacy variable-length Unicode string (`ntext`).
     NText(Option<SqlString>),
+    /// Legacy variable-length binary data (`image`).
+    Image(Option<Vec<u8>>),
 
     /// JSON document.
     Json(Option<SqlJson>),
@@ -160,6 +164,9 @@ pub(crate) const PLP_NULL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 pub(crate) const NO_XML_SCHEMA: u8 = 0x00;
 
+// TEXT, NTEXT, and IMAGE RPC lengths are limited to 2 GiB - 1 bytes.
+const LEGACY_LOB_MAX_BYTES: usize = 0x7fff_ffff;
+
 impl SqlType {
     fn get_nullable_type(&self) -> NullableTdsType {
         match self {
@@ -178,6 +185,7 @@ impl SqlType {
             SqlType::NChar(_, _) => TdsDataType::NChar,
             SqlType::Text(_) => TdsDataType::Text,
             SqlType::NText(_) => TdsDataType::NText,
+            SqlType::Image(_) => TdsDataType::Image,
             SqlType::Json(_) => TdsDataType::Json,
 
             SqlType::Time(_) => TdsDataType::TimeN,
@@ -569,6 +577,19 @@ impl SqlType {
                 };
                 (cv, ctx)
             }
+            SqlType::Image(opt) => {
+                let value = match opt {
+                    Some(bytes) => ColumnValues::Bytes(bytes.clone()),
+                    None => ColumnValues::Null,
+                };
+                (
+                    value,
+                    TdsTypeContext {
+                        max_size: usize::MAX,
+                        ..base_ctx
+                    },
+                )
+            }
 
             // Binary types
             SqlType::Binary(opt, param_len) => {
@@ -719,6 +740,29 @@ impl SqlType {
             return self
                 .serialize_table(packet_writer, db_collation, type_name, table)
                 .await;
+        }
+
+        // RPC LOBs carry lengths, not the textptr/timestamp used by bulk ROWs.
+        // Resolve encoding once so MaxLen, ActualLen, and the payload agree.
+        if matches!(self, Self::Text(_) | Self::NText(_) | Self::Image(_)) {
+            let (encoded, had_loss) = self.legacy_lob_wire_bytes(db_collation)?;
+            let fitted = encoded
+                .as_deref()
+                .map(|bytes| self.fit_legacy_lob(bytes, narrow_string_byte_limit))
+                .transpose()?;
+            let length = fitted.map_or(0, |(_, length)| length);
+            self.write_legacy_lob_type_info(packet_writer, db_collation, length)
+                .await?;
+            packet_writer
+                .write_u32_async(if fitted.is_some() { length } else { u32::MAX })
+                .await?;
+            if let Some((bytes, _)) = fitted {
+                packet_writer.write_async(bytes).await?;
+            }
+            if had_loss {
+                packet_writer.note_code_page_conversion_loss();
+            }
+            return Ok(());
         }
 
         // Step 1: Write the RPC type metadata preamble
@@ -971,22 +1015,11 @@ impl SqlType {
                 .await?;
             }
 
-            // Text/NText: type byte + u32 max_size + collation(5 bytes) + table name parts
-            SqlType::Text(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u32_async(0x7FFFFFFF).await?; // max size
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
-                // No table name parts for RPC parameters
-                packet_writer.write_byte_async(0).await?; // num parts = 0
-            }
-            SqlType::NText(_) => {
-                packet_writer.write_byte_async(nullable_type as u8).await?;
-                packet_writer.write_u32_async(0x7FFFFFFF).await?; // max size
-                packet_writer.write_u32_async(db_collation.info).await?;
-                packet_writer.write_byte_async(db_collation.sort_id).await?;
-                // No table name parts for RPC parameters
-                packet_writer.write_byte_async(0).await?; // num parts = 0
+            SqlType::Text(_) | SqlType::NText(_) | SqlType::Image(_) => {
+                let (bytes, _) = self.legacy_lob_wire_bytes(db_collation)?;
+                let length = Self::legacy_lob_length(bytes.as_deref().map_or(0, <[u8]>::len))?;
+                self.write_legacy_lob_type_info(packet_writer, db_collation, length)
+                    .await?;
             }
 
             // Binary types: type byte + param_len(u16)
@@ -1084,10 +1117,10 @@ impl SqlType {
     /// request that has to be cancelled and drained.
     ///
     /// Every fallible *scalar* metadata check in `write_type_info` belongs
-    /// here: today the UDT name, the `sql_variant` inner type, and the vector
-    /// dimension/base-type bounds. The duplicates in `write_type_info` stay,
-    /// since that function must remain correct for callers that reach it by
-    /// another route.
+    /// here: the UDT name, the `sql_variant` inner type, vector dimension/base-type
+    /// bounds, raw NTEXT byte alignment, and the legacy LOB length limit. The
+    /// duplicates in the serializer stay, since that function must remain
+    /// correct for callers that reach it by another route.
     ///
     /// `SqlType::Table` is the known exception. A TVP's validation lives in
     /// `serialize_table` / `write_tvp_type_name` / `write_tvp_column_metadata`
@@ -1102,6 +1135,13 @@ impl SqlType {
     ) -> TdsResult<()> {
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
+            SqlType::NText(Some(value)) => {
+                Self::validate_ntext(value)?;
+                self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
+            }
+            SqlType::Image(Some(_)) => {
+                self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
+            }
             SqlType::Variant(inner) => {
                 Self::validate_variant_inner(inner)?;
                 inner.validate_for_send(db_collation, None)
@@ -1111,8 +1151,9 @@ impl SqlType {
             {
                 Ok(())
             }
-            SqlType::VarcharMax(_) | SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
-                Ok(())
+            SqlType::VarcharMax(_) if narrow_string_byte_limit.is_none() => Ok(()),
+            SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
+                self.validate_legacy_lob_length(db_collation, None)
             }
             SqlType::Vector(vector, dimensions, base_type) => {
                 Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
@@ -1126,7 +1167,8 @@ impl SqlType {
                     &value,
                     &ctx,
                     narrow_string_byte_limit,
-                )
+                )?;
+                self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
             }
             _ => Ok(()),
         }
@@ -1183,6 +1225,7 @@ impl SqlType {
             SqlType::VarBinaryMax(_) => Some("varbinary(max)"),
             SqlType::Text(_) => Some("text"),
             SqlType::NText(_) => Some("ntext"),
+            SqlType::Image(_) => Some("image"),
             SqlType::Xml(_) => Some("xml"),
             SqlType::Json(_) => Some("json"),
             SqlType::Vector(_, _, _) => Some("vector"),
@@ -1203,6 +1246,121 @@ impl SqlType {
             ))),
             None => Ok(()),
         }
+    }
+
+    fn validate_ntext(value: &SqlString) -> TdsResult<()> {
+        if matches!(
+            value.encoding_type(),
+            crate::datatypes::sql_string::EncodingType::Utf16
+                | crate::datatypes::sql_string::EncodingType::DelayedSet
+        ) && !value.bytes.len().is_multiple_of(2)
+        {
+            return Err(Error::UsageError(
+                "NTEXT data must contain complete UTF-16 code units.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn legacy_lob_wire_bytes(
+        &self,
+        collation: &SqlCollation,
+    ) -> TdsResult<(Option<Cow<'_, [u8]>>, bool)> {
+        match self {
+            Self::Text(Some(value)) => {
+                let (bytes, had_loss) =
+                    TdsValueSerializer::narrow_string_wire_bytes(value, Some(*collation));
+                Ok((Some(bytes), had_loss))
+            }
+            Self::NText(Some(value)) => {
+                Self::validate_ntext(value)?;
+                let bytes = match value.encoding_type() {
+                    crate::datatypes::sql_string::EncodingType::Utf16
+                    | crate::datatypes::sql_string::EncodingType::DelayedSet => {
+                        Cow::Borrowed(value.bytes.as_slice())
+                    }
+                    _ => Cow::Owned(
+                        value
+                            .to_utf8_string()
+                            .encode_utf16()
+                            .flat_map(u16::to_le_bytes)
+                            .collect(),
+                    ),
+                };
+                Ok((Some(bytes), false))
+            }
+            Self::Image(Some(bytes)) => Ok((Some(Cow::Borrowed(bytes)), false)),
+            Self::Text(None) | Self::NText(None) | Self::Image(None) => Ok((None, false)),
+            _ => Err(Error::ImplementationError(
+                "Legacy LOB serialization requires text, ntext, or image.".to_string(),
+            )),
+        }
+    }
+
+    /// Rejects a value whose RPC length would exceed the legacy LOB limit,
+    /// using the same encoding and TEXT trimming as the serializer.
+    fn validate_legacy_lob_length(
+        &self,
+        collation: &SqlCollation,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<()> {
+        let source_len = match self {
+            Self::Text(Some(value)) | Self::NText(Some(value)) => value.bytes.len(),
+            Self::Image(Some(bytes)) => bytes.len(),
+            _ => return Ok(()),
+        };
+        // Encoding at most triples a value, and a TEXT limit within the cap
+        // has already been enforced by the narrow-string check.
+        let limited_text = matches!(self, Self::Text(_))
+            && narrow_string_byte_limit.is_some_and(|maximum| maximum <= LEGACY_LOB_MAX_BYTES);
+        if limited_text || source_len <= LEGACY_LOB_MAX_BYTES / 3 {
+            return Ok(());
+        }
+        let (encoded, _) = self.legacy_lob_wire_bytes(collation)?;
+        if let Some(bytes) = encoded.as_deref() {
+            self.fit_legacy_lob(bytes, narrow_string_byte_limit)?;
+        }
+        Ok(())
+    }
+
+    /// Applies TEXT's encoded-byte limit, which may trim trailing spaces,
+    /// before the legacy LOB length limit.
+    fn fit_legacy_lob<'a>(
+        &self,
+        bytes: &'a [u8],
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<(&'a [u8], u32)> {
+        let bytes = match narrow_string_byte_limit {
+            Some(maximum) if matches!(self, Self::Text(_)) => {
+                TdsValueSerializer::fit_narrow_bytes(bytes, maximum)?
+            }
+            _ => bytes,
+        };
+        Ok((bytes, Self::legacy_lob_length(bytes.len())?))
+    }
+
+    fn legacy_lob_length(length: usize) -> TdsResult<u32> {
+        u32::try_from(length)
+            .ok()
+            .filter(|length| *length as usize <= LEGACY_LOB_MAX_BYTES)
+            .ok_or_else(|| Error::UsageError("Legacy LOB exceeds 2 GiB - 1 bytes.".to_string()))
+    }
+
+    async fn write_legacy_lob_type_info(
+        &self,
+        writer: &mut PacketWriter<'_>,
+        collation: &SqlCollation,
+        length: u32,
+    ) -> TdsResult<()> {
+        writer
+            .write_byte_async(self.get_nullable_type() as u8)
+            .await?;
+        writer.write_u32_async(length).await?;
+        if !matches!(self, Self::Image(_)) {
+            writer.write_u32_async(collation.info).await?;
+            writer.write_byte_async(collation.sort_id).await?;
+        }
+        Ok(())
     }
 
     async fn serialize_json(
@@ -1338,6 +1496,114 @@ impl TryFrom<&SqlType> for FixedLengthTypes {
                 "SqlType is not a fixed length type.".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod legacy_lob_tests {
+    use super::*;
+    use crate::datatypes::sql_string::EncodingType;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::messages::PacketType;
+
+    #[test]
+    fn ntext_preflight_checks_only_raw_utf16_alignment() {
+        let collation = SqlCollation::default();
+        for encoding in [
+            EncodingType::Utf16,
+            EncodingType::DelayedSet,
+            EncodingType::Utf8,
+            EncodingType::LcidBased(collation),
+        ] {
+            for length in 0..=3 {
+                let value = SqlType::NText(Some(SqlString::new(vec![b'a'; length], encoding)));
+                let expected = length.is_multiple_of(2)
+                    || !matches!(encoding, EncodingType::Utf16 | EncodingType::DelayedSet);
+                assert_eq!(
+                    value.validate_for_send(&collation, None).is_ok(),
+                    expected,
+                    "{encoding:?}, {length} bytes"
+                );
+            }
+        }
+        assert!(
+            SqlType::NText(None)
+                .validate_for_send(&collation, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn legacy_length_has_a_signed_32_bit_ceiling() {
+        assert_eq!(SqlType::legacy_lob_length(0).unwrap(), 0);
+        assert_eq!(
+            SqlType::legacy_lob_length(0x7fff_ffff).unwrap(),
+            0x7fff_ffff
+        );
+        assert!(SqlType::legacy_lob_length(0x8000_0000).is_err());
+    }
+
+    #[tokio::test]
+    async fn text_rpc_keeps_encoded_byte_limits_and_trimmed_lengths() {
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        for encoding in [EncodingType::Utf8, EncodingType::DelayedSet] {
+            for (text, maximum, fits) in [
+                ("\u{e9} ", 2, true),
+                ("\u{e9}", 1, false),
+                ("\u{e9}x", 2, false),
+            ] {
+                let value = SqlType::Text(Some(SqlString::new(text.as_bytes().to_vec(), encoding)));
+                let mut mock = MockNetworkWriter::new(64);
+                let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+                let result = value
+                    .serialize_with_narrow_string_byte_limit(
+                        &mut writer,
+                        &collation,
+                        None,
+                        Some(maximum),
+                    )
+                    .await;
+                if fits {
+                    result.unwrap();
+                    let mut expected = vec![0x23];
+                    expected.extend_from_slice(&2u32.to_le_bytes());
+                    expected.extend_from_slice(&[0; 5]);
+                    expected.extend_from_slice(&2u32.to_le_bytes());
+                    expected.extend_from_slice("\u{e9}".as_bytes());
+                    assert_eq!(
+                        &writer.get_payload().into_inner()[PacketWriter::PACKET_HEADER_SIZE..],
+                        expected
+                    );
+                } else {
+                    assert!(matches!(result, Err(Error::EncodedValueTooLong { .. })));
+                    assert!(writer.get_payload().into_inner().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn odd_ntext_is_rejected_before_type_metadata() {
+        let value = SqlType::NText(Some(SqlString::new(vec![1], EncodingType::Utf16)));
+        let mut mock = MockNetworkWriter::new(64);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        assert!(matches!(
+            value
+                .serialize_with_narrow_string_byte_limit(
+                    &mut writer,
+                    &SqlCollation::default(),
+                    None,
+                    None
+                )
+                .await,
+            Err(Error::UsageError(_))
+        ));
+        assert!(writer.get_payload().into_inner().is_empty());
     }
 }
 

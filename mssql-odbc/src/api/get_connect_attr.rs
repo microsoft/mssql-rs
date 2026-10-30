@@ -21,10 +21,10 @@ use crate::api::odbc_types::{
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
     SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_CLIENT_CONNECTION_ID, SQL_COPT_SS_ENCRYPT,
-    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_TNIR,
-    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
-    SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle,
-    SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_LONGASMAX, SQL_COPT_SS_MULTISUBNET_FAILOVER,
+    SQL_COPT_SS_TNIR, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION,
+    SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -197,6 +197,22 @@ fn sql_get_connect_attr_w_safe(
             let secs = state.login_timeout.unwrap_or(DEFAULT_LOGIN_TIMEOUT_SECS);
             unsafe { write_u32_attr(value_ptr, string_length_ptr, secs) };
             debug!(secs, "SQLGetConnectAttrW: login timeout returned");
+            SQL_SUCCESS
+        }
+        SQL_COPT_SS_LONGASMAX => {
+            if value_ptr.is_null() {
+                error!("SQLGetConnectAttrW: SQL_COPT_SS_LONGASMAX value pointer is null");
+                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
+                return SQL_ERROR;
+            }
+            let [b0, b1, b2, b3, ..] = state.long_as_max().to_le_bytes();
+            unsafe {
+                write_if_some(
+                    value_ptr.cast::<u32>(),
+                    u32::from_le_bytes([b0, b1, b2, b3]),
+                );
+                write_if_some(string_length_ptr, 4);
+            }
             SQL_SUCCESS
         }
         // The remaining attributes the set-side accepts. Returning HYC00 here
@@ -955,6 +971,7 @@ mod tests {
                 trust_server_certificate: Some(1),
                 integrated_security: Some(1),
                 multi_subnet_failover: Some(1),
+                long_as_max: None,
             });
             state.connection_state = ConnectionState::Connected;
         }
@@ -972,9 +989,66 @@ mod tests {
     }
 
     #[test]
+    fn long_as_max_defaults_off_and_round_trips_before_and_after_connect() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_LONGASMAX), 0);
+        for connected in [false, true] {
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.connection_state = if connected {
+                    ConnectionState::Connected
+                } else {
+                    ConnectionState::Disconnected
+                };
+                state.effective_vendor_settings = connected.then(VendorConnOverrides::default);
+            }
+            for (raw, expected) in [(0usize, 0u32), (1, 1), (2, 2), (usize::MAX, u32::MAX)] {
+                let rc = unsafe {
+                    sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_LONGASMAX, raw as SqlPointer, 0)
+                };
+                assert_eq!(rc, SQL_SUCCESS);
+                let mut value = 0u32;
+                let mut length = -1;
+                let rc = unsafe {
+                    sql_get_connect_attr_w(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        (&raw mut value).cast(),
+                        0,
+                        &mut length,
+                    )
+                };
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(value, expected);
+                assert_eq!(length, 4);
+                assert_eq!(dbc.inner.lock().unwrap().long_as_max(), raw);
+            }
+        }
+    }
+
+    #[test]
+    fn long_as_max_keyword_does_not_survive_disconnect() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.connection_state = ConnectionState::Connected;
+            state.effective_vendor_settings = Some(VendorConnOverrides {
+                long_as_max: Some(1),
+                ..VendorConnOverrides::default()
+            });
+        }
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_LONGASMAX), 1);
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Disconnected;
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_LONGASMAX), 0);
+    }
+
+    #[test]
     fn vendor_attribute_null_pointer_is_rejected() {
         let h = TestHandles::with_env_dbc();
         for attribute in [
+            SQL_COPT_SS_LONGASMAX,
             SQL_COPT_SS_ENCRYPT,
             SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
             SQL_COPT_SS_INTEGRATED_SECURITY,

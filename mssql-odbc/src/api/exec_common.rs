@@ -875,12 +875,19 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
 /// reading `StmtState::bound_params` exactly as it did before AB#47437.
 ///
-/// `Err(SQL_ERROR)` on a poisoned STMT/env/APD/IPD mutex: the caller posts a
+/// `Err(SQL_ERROR)` on a poisoned STMT/DBC/env/APD/IPD mutex: the caller posts a
 /// diagnostic against the statement and fails the execute outright, rather
 /// than silently snapshotting "every parameter unbound" — which used to let
 /// a zero-marker statement execute successfully despite the internal
 /// failure, and reported a misleading `07002` for one with markers.
 pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, SqlReturn> {
+    let long_as_max = {
+        let Ok(state) = stmt.parent_dbc().inner.lock() else {
+            error!("snapshotting parameters: dbc mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        state.long_as_max() == crate::api::odbc_types::SQL_XL_ON
+    };
     // Read before the STMT lock below, matching bind_param.rs's own
     // parent-before-child lock ordering for the same lookup.
     let odbc_version = {
@@ -920,7 +927,12 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
         return Err(SQL_ERROR);
     };
     Ok(BoundParamSet {
-        params: BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
+        params: BoundParam::all_from_descriptor_states(
+            &apd_state,
+            &ipd_state,
+            odbc_version,
+            long_as_max,
+        ),
         header: ParamArrayHeader::from_headers(&apd_state.header, &ipd_state.header),
     })
 }
@@ -1157,8 +1169,19 @@ pub(super) unsafe fn build_named_params_for_row(
                     // declaration implies. Staying `max` keeps the value intact
                     // until the bound is measurable on this path too
                     // (AB#47590).
-                    let declaration = if length_limit.is_some() {
-                        dae_streamed_declaration(bound_param.sql_type, bound_param.column_size)
+                    // Legacy declarations carry no length, so that guard does not apply.
+                    let declaration = if length_limit.is_some()
+                        || matches!(
+                            bound_param.sql_type,
+                            crate::api::odbc_types::SQL_LONGVARCHAR
+                                | crate::api::odbc_types::SQL_WLONGVARCHAR
+                                | crate::api::odbc_types::SQL_LONGVARBINARY
+                        ) {
+                        dae_streamed_declaration(
+                            bound_param.sql_type,
+                            bound_param.column_size,
+                            snapshot.long_as_max,
+                        )
                     } else {
                         Ok(None)
                     };
@@ -1185,6 +1208,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 length_limit,
                 bound_param,
                 snapshot.udt_names.clone(),
+                snapshot.long_as_max,
             ));
         } else {
             if bound_param.sql_type == SQL_SS_XML
@@ -1196,11 +1220,12 @@ pub(super) unsafe fn build_named_params_for_row(
                 });
             }
             unsafe { crate::conversion::param_convert::stamp_numeric_apd(&bound_param) };
-            let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
-                .map_err(|source| ParamRowBuildError::Conversion {
-                    parameter: i + 1,
-                    source,
-                })?;
+            let (param, outcome) =
+                unsafe { bound_param_to_rpc(name, &bound_param, udt_names, snapshot.long_as_max) }
+                    .map_err(|source| ParamRowBuildError::Conversion {
+                        parameter: i + 1,
+                        source,
+                    })?;
             if outcome == ConvOk::Truncated && dae_params.is_empty() {
                 fractional_truncated = true;
             }
@@ -1289,6 +1314,7 @@ pub(super) fn rebuild_deferred_params(
             dae.udt_names.as_deref(),
             bytes,
             *is_null,
+            dae.long_as_max,
         ) {
             Ok((param, outcome)) => {
                 *slot = param;
@@ -2960,6 +2986,22 @@ mod tests {
         assert!(snapshot_bound_params(stmt).is_err());
     }
 
+    /// A poisoned DBC must fail the snapshot rather than silently default the
+    /// LongAsMax policy to legacy declarations.
+    #[test]
+    fn snapshot_bound_params_fails_cleanly_on_a_poisoned_dbc() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dbc.inner.lock().unwrap();
+            panic!("poison the dbc lock");
+        }));
+        let snapshot = snapshot_bound_params(stmt);
+        dbc.inner.clear_poison();
+        assert!(matches!(snapshot, Err(SQL_ERROR)));
+    }
+
     #[test]
     fn build_named_params_zero_markers_yields_empty() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -3431,6 +3473,95 @@ mod tests {
                 narrowed, expect_narrowed,
                 "{c_type} -> {sql_type}: declaration narrowing must follow the bound"
             );
+        }
+    }
+
+    #[test]
+    fn long_dae_declaration_and_buffered_rebuild_keep_the_execution_policy() {
+        use crate::api::odbc_types::{
+            SQL_C_BINARY, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_WLONGVARCHAR,
+        };
+        use mssql_tds::test_client_support::rpc_parameter_declaration;
+
+        for (c_type, sql_type, legacy, max, wire) in [
+            (
+                SQL_C_CHAR,
+                SQL_LONGVARCHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
+            (
+                SQL_C_CHAR,
+                SQL_WLONGVARCHAR,
+                "ntext",
+                "nvarchar(MAX)",
+                "NVarcharMax",
+            ),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARBINARY,
+                "image",
+                "varbinary(MAX)",
+                "VarBinaryMax",
+            ),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARCHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
+        ] {
+            for long_as_max in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let mut indicator = SQL_DATA_AT_EXEC;
+                let mut snapshot = snap(BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type,
+                    sql_type,
+                    column_size: 8,
+                    decimal_digits: 0,
+                    app_precision: 0,
+                    app_scale: 0,
+                    parameter_value_ptr: std::ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: &raw mut indicator,
+                    octet_length_ptr: &raw mut indicator,
+                });
+                snapshot.as_mut().unwrap().long_as_max = long_as_max;
+                let mut state = stmt.inner.lock().unwrap();
+                state.bound_params.push(snapshot);
+                let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+                let expected = if long_as_max { max } else { legacy };
+                assert_eq!(
+                    rpc_parameter_declaration(&built.params[0]).unwrap(),
+                    expected
+                );
+                assert_eq!(built.dae_params[0].long_as_max, long_as_max);
+                if c_type == SQL_C_BINARY && sql_type == SQL_LONGVARCHAR {
+                    assert!(built.dae_params[0].length_limit.is_none());
+                    // Cross-family materialization is not implemented; this
+                    // case pins the streamed declaration without a length guard.
+                    continue;
+                }
+                state.bound_params[0].as_mut().unwrap().long_as_max = !long_as_max;
+                let (rebuilt, _) = rebuild_deferred_params(
+                    &mut state,
+                    built.params,
+                    &[(0, b"abc".to_vec(), false)],
+                    &built.dae_params,
+                    "test",
+                )
+                .unwrap();
+                assert_eq!(rpc_parameter_declaration(&rebuilt[0]).unwrap(), expected);
+                let framing = format!("{:?}", rebuilt[0]);
+                assert!(
+                    framing.contains(&format!("Materialized({wire}(")),
+                    "a rebuilt DAE value must keep PLP framing: {framing}"
+                );
+            }
         }
     }
 

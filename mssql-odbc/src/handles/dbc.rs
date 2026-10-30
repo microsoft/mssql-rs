@@ -74,9 +74,8 @@ unsafe impl Sync for DbcHandle {}
 ///   and the attribute is only a fallback (see `driver_connect`).
 ///
 /// So this is deliberately not a general "attributes beat keywords" rule -- it
-/// is per attribute, and each field here was confirmed by observing the
-/// resulting session in `sys.dm_exec_connections` rather than by reading a
-/// header.
+/// is per attribute, confirmed through effective session settings or parameter
+/// declarations rather than just the header constants.
 ///
 /// Values are normalized on the way in, matching msodbcsql: setting encrypt,
 /// trust, or integrated security to an out-of-range `7` and reading it back
@@ -84,6 +83,7 @@ unsafe impl Sync for DbcHandle {}
 /// than the caller's input. Multi-subnet failover instead rejects anything
 /// above `SQL_IS_ON` with `HY024`, as msodbcsql does. TNIR is not stored:
 /// off is a compatibility no-op, and on is unsupported.
+/// LongAsMax instead retains the raw value, matching msodbcsql's option store.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct VendorConnOverrides {
     /// `SQL_COPT_SS_ENCRYPT` (1223): `0` no, `1` yes, `2` strict.
@@ -94,6 +94,9 @@ pub(crate) struct VendorConnOverrides {
     pub(crate) integrated_security: Option<u32>,
     /// `SQL_COPT_SS_MULTISUBNET_FAILOVER` (1248): `0` or `1`.
     pub(crate) multi_subnet_failover: Option<u32>,
+    /// Raw pointer-sized attribute; only SQL_XL_ON enables MAX. Get returns
+    /// its low SQLUINTEGER, matching msodbcsql's dwOptions/GetParamValue pair.
+    pub(crate) long_as_max: Option<usize>,
 }
 
 /// Mutable state within a connection handle, protected by `inner`.
@@ -119,7 +122,7 @@ pub(crate) struct DbcState {
     /// Login timeout in seconds set via `SQL_ATTR_LOGIN_TIMEOUT`. Applied to the
     /// TDS login deadline at connect time. `Some(0)` means wait indefinitely.
     pub(crate) login_timeout: Option<u32>,
-    /// Pre-connect overrides from the `SQL_COPT_SS_*` attribute forms of
+    /// Explicit overrides from the `SQL_COPT_SS_*` attribute forms of
     /// connection-string keywords. `None` means "the caller did not set this
     /// attribute", which is what lets the keyword stand.
     pub(crate) vendor_overrides: VendorConnOverrides,
@@ -273,6 +276,17 @@ pub(crate) struct DbcState {
     /// only when the code page needs it to name `SQL_COLLATION_SEQ` (so modern
     /// collation connections never allocate here). Cleared on disconnect.
     pub(crate) last_char_set: Option<String>,
+}
+
+impl DbcState {
+    pub(crate) fn long_as_max(&self) -> usize {
+        (self.connection_state == ConnectionState::Connected)
+            .then_some(self.effective_vendor_settings.as_ref())
+            .flatten()
+            .and_then(|settings| settings.long_as_max)
+            .or(self.vendor_overrides.long_as_max)
+            .unwrap_or(crate::api::odbc_types::SQL_XL_OFF)
+    }
 }
 
 /// The connection identity that does not vary by database.
