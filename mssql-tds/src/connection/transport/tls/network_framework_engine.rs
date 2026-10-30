@@ -396,9 +396,25 @@ pub(crate) mod tests {
         assert_eq!(within(server).await.unwrap(), b"goodbye");
     }
 
+    /// Makes the server's end of `tcp` reset the connection when it is dropped.
+    fn reset_on_drop(tcp: &TcpStream) {
+        socket2::SockRef::from(tcp)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+    }
+
+    /// How a stalled stream's server ends the connection once released.
+    #[derive(Clone, Copy)]
+    enum Release {
+        Close,
+        Reset,
+    }
+
     /// A stream whose server stopped reading after the handshake, written to until
     /// it takes no more, along with a way to tell when its connection has ended.
-    async fn stalled_stream() -> (
+    async fn stalled_stream(
+        release_by: Release,
+    ) -> (
         NwStream,
         impl Fn() -> bool,
         oneshot::Sender<()>,
@@ -406,7 +422,11 @@ pub(crate) mod tests {
     ) {
         let (release, released) = oneshot::channel::<()>();
         let (listener, address) = listen().await;
-        let server = serve(listener, |tls| async move {
+        let server = serve_tcp(listener, move |tcp| async move {
+            if let Release::Reset = release_by {
+                reset_on_drop(&tcp);
+            }
+            let tls = acceptor().accept(tcp).await.expect("server handshake");
             let _ = released.await;
             drop(tls);
         });
@@ -448,7 +468,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dropping_a_stream_the_server_stopped_reading_still_ends_it() {
-        let (stream, ended, release, server) = stalled_stream().await;
+        let (stream, ended, release, server) = stalled_stream(Release::Close).await;
         drop(stream);
 
         ends_soon(ended).await;
@@ -458,7 +478,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn dropping_a_stream_after_a_stalled_shutdown_still_ends_it() {
-        let (mut stream, ended, release, server) = stalled_stream().await;
+        let (mut stream, ended, release, server) = stalled_stream(Release::Close).await;
         let shutdown = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
         assert!(shutdown.is_err(), "the shutdown should wait for the server");
         drop(stream);
@@ -466,6 +486,54 @@ pub(crate) mod tests {
         ends_soon(ended).await;
         release.send(()).unwrap();
         within(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_the_server_does_not_drain_times_out() {
+        let (mut stream, ended, release, server) = stalled_stream(Release::Close).await;
+
+        let error = within(stream.shutdown()).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        ends_soon(ended).await;
+        release.send(()).unwrap();
+        within(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_reports_written_data_the_server_reset_before_taking() {
+        let (mut stream, ended, release, server) = stalled_stream(Release::Reset).await;
+        release.send(()).unwrap();
+        within(server).await.unwrap();
+
+        let error = within(stream.shutdown()).await.unwrap_err();
+
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        ends_soon(ended).await;
+    }
+
+    // As with a socket or Secure Transport, closing a connection that has already
+    // failed succeeds when nothing written to it was lost.
+    #[tokio::test]
+    async fn an_idle_connection_the_server_reset_still_shuts_down() {
+        let (listener, address) = listen().await;
+        let (connected, client_connected) = oneshot::channel::<()>();
+        let server = serve_tcp(listener, |tcp| async move {
+            reset_on_drop(&tcp);
+            let tls = acceptor().accept(tcp).await.expect("server handshake");
+            client_connected.await.unwrap();
+            drop(tls);
+        });
+
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
+        connected.send(()).unwrap();
+        within(server).await.unwrap();
+        let error = within(stream.read_to_end(&mut Vec::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+
+        within(stream.shutdown()).await.unwrap();
     }
 
     #[tokio::test]
@@ -505,6 +573,7 @@ pub(crate) mod tests {
         assert_eq!(received, b"bye");
         assert!(stream.is_connection_dead());
         within(server).await.unwrap();
+        within(stream.shutdown()).await.unwrap();
     }
 
     // Network.framework reports a connection that ends without `close_notify` as a
@@ -529,6 +598,7 @@ pub(crate) mod tests {
 
         assert_eq!(received, b"partial");
         assert!(stream.is_connection_dead());
+        within(stream.shutdown()).await.unwrap();
     }
 
     #[tokio::test]

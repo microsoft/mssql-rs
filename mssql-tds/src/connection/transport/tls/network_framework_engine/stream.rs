@@ -6,8 +6,9 @@
 //! Network.framework reports everything by calling blocks on a queue of its own.
 //! [`Shared`] records what they report and the `poll_*` methods read it back,
 //! leaving a waker for the block to fire. No block holds the connection while it
-//! is open, so dropping [`NwStream`] closes the connection, within [`DRAIN_LIMIT`]
-//! even if the server has stopped reading, and releases all of it.
+//! is open, so dropping [`NwStream`] closes the connection and releases all of
+//! it. Closing ends the connection within [`DRAIN_LIMIT`], even if the server has
+//! stopped reading.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
@@ -46,7 +47,7 @@ const WRITE_CHUNK: usize = 64 * 1024;
 /// writers have to wait. Network.framework advises keeping few sends outstanding.
 const WRITE_WINDOW: usize = 256 * 1024;
 
-/// How long a dropped stream may go on delivering what was written to it before
+/// How long a closing stream may go on delivering what was written to it before
 /// its connection is cancelled regardless.
 const DRAIN_LIMIT: Duration = Duration::from_secs(1);
 
@@ -193,6 +194,20 @@ impl Phase {
     }
 }
 
+/// How far closing the connection has got.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Closing {
+    #[default]
+    NotStarted,
+    /// Waiting for earlier sends to go out before cancelling.
+    Draining,
+    /// Everything written went out before the connection was cancelled.
+    Drained,
+    /// Earlier sends had not gone out within [`DRAIN_LIMIT`], so the connection
+    /// was cancelled regardless.
+    Abandoned,
+}
+
 struct Chunk {
     data: MappedData,
     read: usize,
@@ -212,7 +227,7 @@ struct Inner {
 
     in_flight: usize,
     write_error: Option<Failure>,
-    closing: bool,
+    closing: Closing,
     write_waker: Option<Waker>,
 }
 
@@ -284,8 +299,50 @@ impl Inner {
     }
 
     fn write_failure(&self) -> Option<io::Error> {
-        self.connection_failure()
-            .or_else(|| self.closing.then(|| io::ErrorKind::BrokenPipe.into()))
+        self.connection_failure().or_else(|| {
+            (self.closing != Closing::NotStarted).then(|| io::ErrorKind::BrokenPipe.into())
+        })
+    }
+
+    /// What a shutdown reports, once it has something to report. It fails if
+    /// anything written to the stream did not go out.
+    fn shutdown_outcome(&self) -> Option<io::Result<()>> {
+        // Checked first, as cutting the close short fails the sends it was waiting on.
+        if self.closing == Closing::Abandoned {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the server did not take the data written before the close in time",
+            )));
+        }
+        if let Some(failure) = &self.write_error {
+            return Some(Err(failure.to_io_error()));
+        }
+        if !self.phase.is_terminal() {
+            return None;
+        }
+        // Sends outstanding when the connection ended fail, if they have not yet.
+        if self.in_flight > 0 {
+            return self
+                .phase
+                .failure()
+                .map(|failure| Err(failure.to_io_error()));
+        }
+        // A connection that failed once everything had gone out closes as a socket
+        // does, so closing a connection the server reset still succeeds.
+        Some(Ok(()))
+    }
+
+    fn finish_drain(&mut self) {
+        if self.closing == Closing::Draining {
+            self.closing = Closing::Drained;
+        }
+    }
+
+    /// Gives up on a close still waiting on a live connection for earlier sends.
+    fn abandon_drain(&mut self) {
+        if self.closing == Closing::Draining && matches!(self.phase, Phase::Ready) {
+            self.closing = Closing::Abandoned;
+        }
     }
 
     fn is_finished(&self) -> bool {
@@ -519,13 +576,16 @@ impl NwStream {
     /// Only cancelling makes a TLS connection send `close_notify`, and a cancel
     /// can discard the tail of the data sent just before it, even once those sends
     /// have completed. Sends are handled in order, so cancelling from the
-    /// completion of an empty one loses nothing.
+    /// completion of an empty one loses nothing. That send waits behind earlier
+    /// ones, which never complete if the server has stopped reading, so the
+    /// connection is cancelled regardless after [`DRAIN_LIMIT`].
     fn close(&self) {
         let ready = {
             let mut inner = self.shared.lock();
-            if mem::replace(&mut inner.closing, true) {
+            if inner.closing != Closing::NotStarted {
                 return;
             }
+            inner.closing = Closing::Draining;
             matches!(inner.phase, Phase::Ready)
         };
         // A send on a connection that is not ready may never complete.
@@ -534,13 +594,28 @@ impl NwStream {
         } else {
             None
         };
-        match barrier {
-            Some(barrier) => {
-                let connection = self.connection.clone();
-                self.send(&barrier, move |_| cancel(&connection));
+        let Some(barrier) = barrier else {
+            cancel(&self.connection);
+            return;
+        };
+        let drained = {
+            let connection = self.connection.clone();
+            let shared = Arc::clone(&self.shared);
+            move |_: Object| {
+                shared.lock().finish_drain();
+                cancel(&connection);
             }
-            None => cancel(&self.connection),
-        }
+        };
+        self.send(&barrier, drained);
+        let cancel_late = {
+            let connection = self.connection.clone();
+            let shared = Arc::clone(&self.shared);
+            RcBlock::new(move || {
+                shared.lock().abandon_drain();
+                cancel(&connection);
+            })
+        };
+        ffi::run_after(DRAIN_LIMIT, &self.queue, &cancel_late);
     }
 
     /// Sends `data` on the connection's one stream.
@@ -569,13 +644,6 @@ fn cancel(connection: &Handle<Nw>) {
 impl Drop for NwStream {
     fn drop(&mut self) {
         self.close();
-        // The close waits behind earlier sends, which never complete if the server
-        // has stopped reading, and nothing else is left to cancel the connection.
-        if matches!(self.shared.lock().phase, Phase::Ready) {
-            let connection = self.connection.clone();
-            let cancel_late = RcBlock::new(move || cancel(&connection));
-            ffi::run_after(DRAIN_LIMIT, &self.queue, &cancel_late);
-        }
     }
 }
 
@@ -670,16 +738,16 @@ impl AsyncWrite for NwStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        {
-            let mut inner = this.shared.lock();
-            if inner.phase.is_terminal() {
-                return Poll::Ready(Ok(()));
-            }
-            // Woken when the cancel completes, or when an earlier send does.
-            inner.write_waker = Some(cx.waker().clone());
-        }
         this.close();
-        Poll::Pending
+        let mut inner = this.shared.lock();
+        match inner.shutdown_outcome() {
+            Some(outcome) => Poll::Ready(outcome),
+            None => {
+                // Woken when the connection ends, or when an earlier send completes.
+                inner.write_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -1015,7 +1083,7 @@ mod tests {
         let mut inner = Inner::default();
         assert!(inner.write_failure().is_none());
 
-        inner.closing = true;
+        inner.closing = Closing::Draining;
         assert_eq!(
             inner.write_failure().unwrap().kind(),
             io::ErrorKind::BrokenPipe
@@ -1032,6 +1100,96 @@ mod tests {
             inner.connection_failure().unwrap().kind(),
             io::ErrorKind::TimedOut
         );
+    }
+
+    fn shutdown_error(inner: &Inner) -> io::ErrorKind {
+        match inner.shutdown_outcome() {
+            Some(Err(error)) => error.kind(),
+            Some(Ok(())) => panic!("the shutdown should fail"),
+            None => panic!("the shutdown should be over"),
+        }
+    }
+
+    #[test]
+    fn a_shutdown_succeeds_only_once_its_close_is_cancelled_cleanly() {
+        let mut inner = Inner::default();
+        inner.apply_state(STATE_READY, None);
+        assert!(inner.shutdown_outcome().is_none(), "not closed yet");
+
+        inner.closing = Closing::Draining;
+        assert!(inner.shutdown_outcome().is_none(), "still draining");
+
+        inner.finish_drain();
+        inner.apply_state(STATE_CANCELLED, None);
+        assert!(matches!(inner.shutdown_outcome(), Some(Ok(()))));
+    }
+
+    #[test]
+    fn a_shutdown_reports_a_failed_send_even_once_cancelled() {
+        let mut inner = Inner::default();
+        inner.apply_state(STATE_READY, None);
+        inner.closing = Closing::Draining;
+
+        inner.write_error = Some(Failure::os(libc::EPIPE));
+        assert_eq!(shutdown_error(&inner), io::ErrorKind::BrokenPipe);
+
+        inner.apply_state(STATE_CANCELLED, None);
+        assert_eq!(shutdown_error(&inner), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_connection_that_ends_with_sends_outstanding_fails_the_shutdown() {
+        let mut inner = Inner::default();
+        inner.apply_state(STATE_READY, None);
+        inner.closing = Closing::Draining;
+        inner.in_flight = 10;
+
+        inner.apply_state(STATE_FAILED, Some(Failure::os(libc::ECONNRESET)));
+        assert_eq!(shutdown_error(&inner), io::ErrorKind::ConnectionReset);
+
+        inner.phase = Phase::Cancelled;
+        assert_eq!(shutdown_error(&inner), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[test]
+    fn a_connection_that_failed_once_everything_went_out_shuts_down_cleanly() {
+        let mut inner = Inner::default();
+        inner.apply_state(STATE_READY, None);
+        inner.apply_state(STATE_FAILED, Some(Failure::os(libc::ECONNRESET)));
+        inner.closing = Closing::Draining;
+
+        assert!(matches!(inner.shutdown_outcome(), Some(Ok(()))));
+    }
+
+    #[test]
+    fn an_abandoned_close_is_a_timed_out_shutdown() {
+        let mut inner = Inner::default();
+        inner.apply_state(STATE_READY, None);
+        inner.closing = Closing::Draining;
+
+        inner.abandon_drain();
+        assert_eq!(inner.closing, Closing::Abandoned);
+        inner.finish_drain();
+        assert_eq!(inner.closing, Closing::Abandoned, "too late to finish");
+
+        inner.write_error = Some(Failure::os(libc::ECANCELED));
+        inner.apply_state(STATE_CANCELLED, None);
+        assert_eq!(shutdown_error(&inner), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn only_a_close_still_draining_a_live_connection_is_abandoned() {
+        let mut inner = Inner::default();
+        inner.apply_state(STATE_READY, None);
+        inner.closing = Closing::Draining;
+        inner.finish_drain();
+        inner.abandon_drain();
+        assert_eq!(inner.closing, Closing::Drained);
+
+        inner.closing = Closing::Draining;
+        inner.apply_state(STATE_FAILED, Some(Failure::os(libc::ECONNRESET)));
+        inner.abandon_drain();
+        assert_eq!(inner.closing, Closing::Draining);
     }
 
     #[test]

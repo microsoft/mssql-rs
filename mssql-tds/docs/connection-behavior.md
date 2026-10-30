@@ -163,10 +163,13 @@ every non-Strict mode) stay on a socket with Secure Transport.
   `server_certificate` pinning skips the chain and name checks, so it also
   accepts X.509 v1 certificates.
 - **Shutdown.** Closing the connection sends `close_notify` once earlier writes
-  have gone out. A dropped connection whose server has stopped reading is
-  cancelled after a second. A peer that closes the transport without
-  `close_notify` reads as a clean end of stream, as with Secure Transport; TDS
-  framing catches a truncated response.
+  have gone out. If the server stops reading, the connection is cancelled after
+  a second, whether it was closed or dropped, and `close_connection` fails with
+  `Error::Io` (`TimedOut`). Closing also fails if earlier writes failed or were
+  still unsent when the connection ended. Closing a connection that has already
+  ended with all writes sent succeeds, as on the socket path. A peer that
+  closes the transport without `close_notify` reads as a clean end of stream,
+  as with Secure Transport; TDS framing catches a truncated response.
 - **Errors.** All TLS engines report handshake failures as
   `Error::TlsHandshakeError`. The displayed host is the name used for TLS
   server identity validation, which can differ from the network destination.
