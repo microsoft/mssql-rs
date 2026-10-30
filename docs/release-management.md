@@ -12,27 +12,25 @@ mssql-rs repo (Rust)
 └── .pipeline/OneBranch/ ← Builds wheels, uploads them with twine
 
         │  builds 9 stable-ABI wheels (one per supported platform)
-        │  twine-uploads them as mssql-python-rs
-        ▼
-
-Azure Artifacts feed: public/mssql-rs_Public (PyPI index)
-  │  dev, nightly, and release wheels for pre-release CI validation
-        ▼
-
-PyPI: mssql-python-rs
-  │  standalone runtime dependency
-  │  exact version pinned by mssql-python
-        ▼
-
-PyPI: mssql-python
+        ├── Dev/nightly builds and optional official artifact publication
+        │     → Azure Artifacts feed: public/mssql-rs_Public (PyPI index)
+        │       exact prerelease versions for explicit CI/dev overrides
+        │
+        └── Selected official build artifacts → independent PyPI release
+              → PyPI: mssql-python-rs
+                standalone runtime dependency, exact released pin
+              → PyPI: mssql-python
 ```
 
-`mssql-python` does not embed or repackage `mssql_py_core`. Its build and test
-pipelines still download the wheel from the legacy NuGet package. Migrating that
-installer to `pip install` an exact version from the Azure Artifacts feed is a
-separate follow-up in the `mssql-python` repository. Public users install
-`mssql-python-rs` from PyPI through the exact runtime dependency declared by
-`mssql-python`.
+`mssql-python` does not embed or repackage `mssql_py_core`. The consumer design
+uses `eng/versions/mssql-python-rs.version` as the exact released PyPI pin.
+Build and test installation and package dependency metadata use the same
+effective version: the committed pin by default, or an explicit
+`MSSQL_PYTHON_RS_VERSION` override for nonofficial CI/dev validation.
+Prereleases use the Azure Artifacts PyPI index; stable versions use public PyPI.
+Official `mssql-python` releases must reject both an override and a prerelease
+pin. The legacy NuGet installer and pin are removed by the separate consumer
+repository migration; this producer worker manages only the released PyPI pin.
 
 Feed simple index (anonymous read):
 `https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/`
@@ -206,31 +204,19 @@ against `main`. The pull request always advances
 `eng/versions/mssql-python-rs.version` when the repository is behind the
 published release.
 
-This pipeline no longer publishes the `mssql-python-rs-wheels` NuGet package.
-Until the `mssql-python` installer migration lands, its NuGet pin remains the
-consumer-facing pin and cannot advance to feed-only releases. The release worker
-still checks for a legacy NuGet package so it can handle older or separately
-published packages; a missing package leaves the NuGet pin unchanged:
+The worker checks only the exact stable PyPI release. It does not query NuGet
+or the Azure Artifacts feed and does not read or update the legacy NuGet pin.
+Dev/nightly validation uses the explicit consumer override, not release-bump
+automation.
 
-- when it exists, `eng/versions/mssql-python-rs-nuget.version` is advanced too;
-- when it does not exist (including a 404 after NuGet retention), the NuGet pin
-  is left unchanged and the worker still advances the public PyPI pin;
-- prerelease `-dev` and `-nightly` packages never satisfy the check.
-
-The separate installer migration must also switch the release worker to check
-the Azure Artifacts PyPI feed and advance the pin consumed by `mssql-python`.
-Until that follow-up lands, the worker can update the public PyPI pin, but
-`mssql-python` continues using the legacy NuGet pin. Older release events never
-downgrade either pin on `main` or on the pending automation branch. An unrelated
-`main` change does not rebase a pending PR when its two managed pins already have
-the requested values. A branch containing maintainer commits is left untouched,
-and all automation-owned replacements use an exact `--force-with-lease`.
-
-If a newer PyPI release arrives while the pending automation PR already carries
-a higher legacy NuGet pin from an earlier run, the worker advances the PyPI pin
-and retains that higher pending NuGet pin. The regenerated issue and PR summaries
-show both transitions relative to `main`; a PyPI-only event never rolls back an
-already verified NuGet package.
+Older release events never downgrade the released pin on `main` or on the
+pending automation branch. When a higher version is already pending, regenerated
+issue and PR metadata describe that effective version and its transition from
+`main`. An unrelated `main` change does not rebase a pending PR when the managed
+pin already has the requested value. A branch containing maintainer commits is
+left untouched; a closed, unmerged maintainer branch requires manual cleanup.
+All automation-owned replacements use an exact `--force-with-lease` against the
+inspected commit.
 
 This YAML also requires a permanent pipeline definition after the change reaches
 `main`:
@@ -300,14 +286,14 @@ is no longer produced.
 4. Publish stage:
    - Validates wheel names, metadata, and ODBC payloads against the stamped version
    - twine-uploads the wheels to the public/mssql-rs_Public feed's PyPI index
-5. The feed contains the new nightly version. `mssql-python` CI continues using
-   its legacy NuGet pin until the installer migration follow-up lands.
+5. The feed contains the new nightly version. Nonofficial `mssql-python` CI can
+   select it explicitly with MSSQL_PYTHON_RS_VERSION; the released pin is unchanged.
 ```
 
-### mssql-python consumer migration
+### mssql-python consumer selection
 
-After the separate installer migration in the `mssql-python` repository,
-`mssql-python` can install an exact nightly from the feed:
+Set `MSSQL_PYTHON_RS_VERSION=0.3.0.dev20260217` in nonofficial consumer CI/dev
+validation to select an exact nightly. The consumer installer uses the feed:
 
 ```
 python -m pip install \
@@ -315,8 +301,9 @@ python -m pip install \
   mssql-python-rs==0.3.0.dev20260217
 ```
 
-The migration must also update the release-bump worker to check the feed and
-advance the pin consumed by `mssql-python`.
+Consumer dependency metadata must use the same effective version as installation.
+Without an override, installation and metadata use the committed stable PyPI pin.
+Official consumer releases forbid overrides and prereleases.
 
 ### Key properties
 
@@ -332,10 +319,10 @@ advance the pin consumed by `mssql-python`.
 
 **Purpose**: When a developer makes a change in `mssql-rs` and wants to test it in `mssql-python` *before* waiting for the nightly.
 
-### Flow: Push to main/development
+### Flow: Push to main
 
 ```
-1. Developer merges PR to main or development
+1. Developer merges PR to main
 2. CI trigger fires immediately
 3. Pipeline stamps {version}.devYYYYMMDD{BuildId} and builds 9 stable-ABI wheels
 4. Publish stage uploads: mssql-python-rs==0.3.0.dev20260217140071
@@ -356,20 +343,20 @@ advance the pin consumed by `mssql-python`.
 
 1. Note the version from the pipeline's `Compute wheel version` job or the feed
    (e.g., `0.3.0.dev20260217140071`)
-2. In the `mssql-python` build pipeline or local dev setup:
+2. Set the consumer override in the nonofficial `mssql-python` build pipeline or
+   local dev setup:
 
 ```powershell
-python -m pip install `
-  --index-url https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/ `
-  mssql-python-rs==0.3.0.dev20260217140071
-# Run mssql-python tests against the installed runtime
+$env:MSSQL_PYTHON_RS_VERSION = "0.3.0.dev20260217140071"
+# Run the consumer's normal install/build/test workflow with this effective version
 ```
 
-3. Once validated, the change flows to nightlies automatically after merge to `main`
+3. Once validated, clear the override. The change flows to nightlies automatically
+   after merge to `main`; the committed released pin stays unchanged.
 
 ### Key properties
 
-- Every push to `main`/`development` produces a unique dev version
+- Every push to `main` produces a unique dev version; `development` is not a CI trigger
 - BuildId guarantees no version collisions
 - Pin exact versions; see [Python distribution versions](#python-distribution-versions)
   for how dev and nightly versions sort
@@ -394,19 +381,20 @@ python -m pip install `
 
 ### Steps in mssql-python
 
-1. **Update the pinned version** installed from the feed:
+1. **Validate prereleases with an explicit override**, without changing the
+   committed released pin:
 
 ```yaml
-# In mssql-python's build pipeline
-- script: >
-    python -m pip install
-    --index-url https://pkgs.dev.azure.com/sqlclientdrivers/public/_packaging/mssql-rs_Public/pypi/simple/
-    mssql-python-rs==0.2.1.dev20260303
+# In a nonofficial mssql-python pipeline step using the consumer's normal installer
+env:
+  MSSQL_PYTHON_RS_VERSION: '0.2.1.dev20260303'
 ```
 
 2. **Update any Python-side bindings** if the native API changed (new functions, changed signatures)
 3. **Run mssql-python test suite** against the new wheels
-4. **Merge and release** mssql-python with the new native core
+4. **Adopt the stable PyPI release** through the automated draft PR updating
+   `eng/versions/mssql-python-rs.version`, then merge and release `mssql-python`.
+   Official releases forbid overrides and prerelease pins.
 
 ### Sprint example
 
@@ -450,10 +438,13 @@ Sprint end:
 ### Release build
 
 1. **Run the Official Python Wheels Build** for the source commit to release
-2. **Trigger the Official release pipeline** with that build selected and `publishToFeed: true`
+2. **Optionally trigger the Official release pipeline** with that build selected and `publishToFeed: true`
    - This uploads the clean-semver wheels `mssql-python-rs==0.2.1` to the Azure Artifacts PyPI feed via `twine`
    - OneBranch runs full SDL scanning (BinSkim, Clippy, AV)
    - Wheels are published to the `mssql-rs_Public` feed's PyPI index
+3. **Run `PyPI-Release` independently** with the selected official build artifacts
+   to publish the stable release to public PyPI. Feed publication is not a
+   prerequisite; public PyPI publication queues the consumer pin-update worker.
 
 ### Optional mssql-py-core source tag
 
@@ -475,10 +466,12 @@ Do not derive this tag or branch from the Python distribution version when the v
 
 ### Post-release in mssql-python
 
-1. Pin the clean release version from the feed: `mssql-python-rs==0.2.1`
+1. Merge the automated draft PR pinning the stable public PyPI release in
+   `eng/versions/mssql-python-rs.version`: `0.2.1`
 2. Run full test suite
 3. Update `mssql-python` version (e.g., bump to `1.4.0`)
-4. Publish to PyPI
+4. Publish to PyPI with no `MSSQL_PYTHON_RS_VERSION` override and no prerelease pin;
+   installed runtime and dependency metadata must both use the committed version
 
 ### Releasing existing Official Build artifacts
 

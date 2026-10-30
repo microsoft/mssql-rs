@@ -60,11 +60,10 @@ def response(payload, status=200):
     return value
 
 
-def target_repo(tmp_path, python="0.3.0", nuget="0.3.0"):
-    for path, value in ((bump.PYPI_PIN, python), (bump.NUGET_PIN, nuget)):
-        target = tmp_path / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(value, encoding="utf-8")
+def target_repo(tmp_path, python="0.3.0"):
+    target = tmp_path / bump.PYPI_PIN
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(python, encoding="utf-8")
     template = tmp_path / bump.PR_TEMPLATE
     template.parent.mkdir(parents=True, exist_ok=True)
     template.write_text(
@@ -88,54 +87,51 @@ def shell_script(step):
 
 
 @pytest.mark.parametrize(
-    ("current_python", "current_nuget", "available", "expected"),
+    ("current_python", "expected"),
     [
-        ("0.3.0", "0.3.0", True, {bump.PYPI_PIN, bump.NUGET_PIN}),
-        ("0.3.0", "0.3.0", False, {bump.PYPI_PIN}),
-        ("0.4.0", "0.3.0", True, {bump.NUGET_PIN}),
-        ("0.4.0", "0.3.0", False, set()),
-        ("0.5.0", "0.3.0", True, {bump.NUGET_PIN}),
-        ("0.5.0", "0.5.0", True, set()),
+        ("0.3.0", {bump.PYPI_PIN: ("0.3.0", "0.4.0")}),
+        ("0.4.0", {}),
+        ("0.5.0", {}),
     ],
 )
-def test_planned_changes(tmp_path, current_python, current_nuget, available, expected):
-    target_repo(tmp_path, current_python, current_nuget)
-    changes = bump.planned_changes(tmp_path, "0.4.0", available)
-    assert set(changes) == expected
+def test_planned_changes_without_legacy_pin(tmp_path, current_python, expected):
+    target_repo(tmp_path, current_python)
+    assert bump.planned_changes(tmp_path, "0.4.0") == expected
 
 
-def test_stale_release_never_downgrades_either_pin(tmp_path):
-    target_repo(tmp_path, "0.5.0", "0.6.0")
-    assert bump.planned_changes(tmp_path, "0.4.0", True) == {}
+def test_stale_release_never_downgrades_pin(tmp_path):
+    target_repo(tmp_path, "0.5.0")
+    assert bump.planned_changes(tmp_path, "0.4.0") == {}
 
 
-def test_release_state_requires_pypi_and_checks_exact_nuget_version():
+@pytest.mark.parametrize("version", ["0.4.0.dev1", "0.4.0rc1", "0.4.0.post1", "0.4"])
+def test_main_rejects_non_release_version_before_network_access(monkeypatch, version):
+    monkeypatch.setenv("RELEASED_VERSION", version)
+    with patch.object(bump, "fetch_json") as fetch, patch.object(bump, "git") as git:
+        with pytest.raises(ValueError, match="three-part release version"):
+            bump.main()
+    fetch.assert_not_called()
+    git.assert_not_called()
+
+
+def test_release_state_checks_only_exact_pypi_version():
     pypi = response({"info": {"version": "0.4.0"}})
-    nuget = response({"versions": ["0.3.0", "0.4.0-nightly.1", "0.4.0"]})
-    with patch.object(bump, "urlopen", side_effect=[pypi, nuget]):
-        assert bump.release_state("0.4.0") is True
+    with patch.object(bump, "urlopen", return_value=pypi) as call:
+        bump.release_state("0.4.0")
+    call.assert_called_once()
+    assert call.call_args.args[0].full_url == (
+        "https://pypi.org/pypi/mssql-python-rs/0.4.0/json"
+    )
 
 
-def test_release_state_does_not_treat_prerelease_nuget_as_clean_release():
+def test_release_state_rejects_mismatched_pypi_metadata():
     with patch.object(
         bump,
         "urlopen",
-        side_effect=[
-            response({"info": {"version": "0.4.0"}}),
-            response({"versions": ["0.4.0-nightly.20261016"]}),
-        ],
+        return_value=response({"info": {"version": "0.4.1"}}),
     ):
-        assert bump.release_state("0.4.0") is False
-
-
-def test_release_state_treats_missing_nuget_package_as_unavailable():
-    missing_nuget = HTTPError("https://pkgs.dev.azure.com", 404, "missing", {}, io.BytesIO())
-    with patch.object(
-        bump,
-        "urlopen",
-        side_effect=[response({"info": {"version": "0.4.0"}}), missing_nuget],
-    ):
-        assert bump.release_state("0.4.0") is False
+        with pytest.raises(ValueError, match="unexpected metadata"):
+            bump.release_state("0.4.0")
 
 
 def test_missing_pypi_release_fails_before_writing():
@@ -174,6 +170,10 @@ def test_pr_body_preserves_template_and_links_issue(tmp_path):
     assert "> AB#N/A" in body
     assert "> GitHub Issue: #42" in body
     assert "`eng/versions/mssql-python-rs.version`: `0.3.0` -> `0.4.0`" in body
+    assert "NuGet" not in body
+    assert "NuGet" not in bump.issue_body(
+        "0.4.0", {bump.PYPI_PIN: ("0.3.0", "0.4.0")}, "123"
+    )
 
 
 def test_reused_issue_title_tracks_the_latest_release():
@@ -214,7 +214,7 @@ def test_maintainer_owned_branch_is_not_modified(tmp_path):
     ), patch.object(
         bump,
         "remote_pin_versions",
-        return_value={bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+        return_value={bump.PYPI_PIN: "0.3.0"},
     ), patch.object(
         bump, "remote_branch_state", return_value=(True, "their-sha", False)
     ), patch.object(
@@ -247,7 +247,7 @@ def test_closed_unmerged_maintainer_branch_requires_cleanup(tmp_path):
     ), patch.object(
         bump,
         "remote_pin_versions",
-        return_value={bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+        return_value={bump.PYPI_PIN: "0.3.0"},
     ), patch.object(
         bump, "remote_branch_state", return_value=(True, "their-sha", False)
     ), patch.object(
@@ -288,8 +288,8 @@ def test_closed_merged_maintainer_branch_is_recreated(tmp_path):
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.3.0"},
         ],
     ), patch.object(
         bump,
@@ -331,7 +331,7 @@ def test_closed_pr_for_different_branch_sha_does_not_allow_recreation(tmp_path):
     ), patch.object(
         bump,
         "remote_pin_versions",
-        return_value={bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
+        return_value={bump.PYPI_PIN: "0.3.0"},
     ), patch.object(
         bump, "remote_branch_state", return_value=(True, "current-sha", False)
     ), patch.object(
@@ -372,7 +372,7 @@ def test_remote_branch_transport_failure_propagates(tmp_path):
             bump.remote_branch_state(tmp_path, "base")
 
 
-def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
+def test_stale_event_does_not_replace_newer_pending_pin(tmp_path):
     target_repo(tmp_path)
     with patch.object(
         bump,
@@ -387,8 +387,8 @@ def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.5.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.5.0"},
         ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
@@ -402,7 +402,6 @@ def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
             "0.4.0",
             {
                 bump.PYPI_PIN: ("0.3.0", "0.4.0"),
-                bump.NUGET_PIN: ("0.3.0", "0.4.0"),
             },
             "123",
         ) == 99
@@ -412,7 +411,7 @@ def test_stale_event_does_not_replace_newer_pending_pins(tmp_path):
     )
 
 
-def test_matching_pending_pins_do_not_rebase_for_unrelated_main_changes(tmp_path):
+def test_matching_pending_pin_does_not_rebase_for_unrelated_main_changes(tmp_path):
     target_repo(tmp_path)
     calls = []
 
@@ -428,8 +427,8 @@ def test_matching_pending_pins_do_not_rebase_for_unrelated_main_changes(tmp_path
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.4.0"},
         ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
@@ -463,8 +462,8 @@ def test_matching_branch_without_pull_request_creates_missing_pr(tmp_path):
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.4.0"},
         ],
     ), patch.object(
         bump, "github_paged", return_value=[]
@@ -503,8 +502,8 @@ def test_matching_branch_repairs_pr_metadata_after_failed_patch(tmp_path):
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.5.0"},
         ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
@@ -529,11 +528,10 @@ def test_matching_branch_repairs_pr_metadata_after_failed_patch(tmp_path):
     )
 
 
-def test_older_partial_match_keeps_newer_canonical_metadata(tmp_path):
+def test_older_release_keeps_newer_canonical_metadata(tmp_path):
     target_repo(tmp_path)
     effective = {
         bump.PYPI_PIN: ("0.3.0", "0.5.0"),
-        bump.NUGET_PIN: ("0.3.0", "0.4.0"),
     }
     canonical_title = "CHORE: Update mssql-python-rs dependency to 0.5.0"
     canonical_body = bump.pull_request_body(tmp_path, 42, "0.5.0", effective)
@@ -551,8 +549,8 @@ def test_older_partial_match_keeps_newer_canonical_metadata(tmp_path):
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.4.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.5.0"},
         ],
     ), patch.object(
         bump,
@@ -570,7 +568,6 @@ def test_older_partial_match_keeps_newer_canonical_metadata(tmp_path):
             "0.4.0",
             {
                 bump.PYPI_PIN: ("0.3.0", "0.4.0"),
-                bump.NUGET_PIN: ("0.3.0", "0.4.0"),
             },
             "older-build",
         ) == 99
@@ -578,7 +575,8 @@ def test_older_partial_match_keeps_newer_canonical_metadata(tmp_path):
     api.assert_not_called()
 
 
-def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):
+@pytest.mark.parametrize("exists", [True, False])
+def test_changed_pin_uses_exact_push_lease(tmp_path, exists):
     target_repo(tmp_path)
     calls = []
 
@@ -589,13 +587,15 @@ def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):
         return subprocess.CompletedProcess("git", 0, stdout="")
 
     with patch.object(bump, "git", side_effect=git_call), patch.object(
-        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
+        bump,
+        "remote_branch_state",
+        return_value=(exists, "pending-sha" if exists else None, True),
     ), patch.object(
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.4.0"},
         ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
@@ -606,23 +606,24 @@ def test_changed_pending_pins_use_inspected_sha_as_push_lease(tmp_path):
     ):
         bump.update_pull_request(
             tmp_path,
-            "0.4.0",
+            "0.5.0",
             {
-                bump.PYPI_PIN: ("0.3.0", "0.4.0"),
-                bump.NUGET_PIN: ("0.3.0", "0.4.0"),
+                bump.PYPI_PIN: ("0.3.0", "0.5.0"),
             },
             "123",
         )
     assert (
         "push",
-        f"--force-with-lease=refs/heads/{bump.BRANCH}:pending-sha",
+        f"--force-with-lease=refs/heads/{bump.BRANCH}:{'pending-sha' if exists else ''}",
         "origin",
         f"{bump.BRANCH}:refs/heads/{bump.BRANCH}",
     ) in calls
 
 
-def test_pypi_only_release_preserves_pending_clean_nuget_upgrade(tmp_path):
+def test_newer_release_advances_only_pypi_pin(tmp_path):
     target_repo(tmp_path)
+    legacy_pin = tmp_path / "eng" / "versions" / "mssql-python-rs-nuget.version"
+    legacy_pin.write_text("obsolete", encoding="utf-8")
     calls = []
 
     def git_call(root, *args, **kwargs):
@@ -637,8 +638,8 @@ def test_pypi_only_release_preserves_pending_clean_nuget_upgrade(tmp_path):
         bump,
         "remote_pin_versions",
         side_effect=[
-            {bump.PYPI_PIN: "0.3.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.4.0", bump.NUGET_PIN: "0.4.0"},
+            {bump.PYPI_PIN: "0.3.0"},
+            {bump.PYPI_PIN: "0.4.0"},
         ],
     ), patch.object(
         bump, "github_paged", return_value=[{"number": 99}]
@@ -656,55 +657,22 @@ def test_pypi_only_release_preserves_pending_clean_nuget_upgrade(tmp_path):
     effective = issue.call_args.args[1]
     assert effective == {
         bump.PYPI_PIN: ("0.3.0", "0.5.0"),
-        bump.NUGET_PIN: ("0.3.0", "0.4.0"),
     }
     assert (tmp_path / bump.PYPI_PIN).read_text() == "0.5.0"
-    assert (tmp_path / bump.NUGET_PIN).read_text() == "0.4.0"
+    assert legacy_pin.read_text() == "obsolete"
+    assert ("add", "--", bump.PYPI_PIN.as_posix()) in calls
 
 
-def test_delayed_nuget_release_advances_behind_newer_pending_pypi(tmp_path):
-    target_repo(tmp_path, "0.5.0", "0.3.0")
-    calls = []
-
-    def git_call(root, *args, **kwargs):
-        calls.append(args)
-        if args == ("rev-parse", "FETCH_HEAD"):
-            return subprocess.CompletedProcess("git", 0, stdout="base\n")
-        return subprocess.CompletedProcess("git", 0, stdout="")
-
-    with patch.object(bump, "git", side_effect=git_call), patch.object(
-        bump, "remote_branch_state", return_value=(True, "pending-sha", True)
-    ), patch.object(
+def test_remote_pin_versions_reads_only_pypi_pin(tmp_path):
+    with patch.object(
         bump,
-        "remote_pin_versions",
-        side_effect=[
-            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.3.0"},
-            {bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.3.0"},
-        ],
-    ), patch.object(
-        bump, "github_paged", return_value=[{"number": 99}]
-    ), patch.object(
-        bump, "ensure_issue", return_value=42
-    ) as issue, patch.object(
-        bump, "github_api", return_value=(200, {})
-    ):
-        bump.update_pull_request(
-            tmp_path,
-            "0.4.0",
-            {bump.NUGET_PIN: ("0.3.0", "0.4.0")},
-            "123",
-        )
-    assert issue.call_args.args[1] == {
-        bump.NUGET_PIN: ("0.3.0", "0.4.0"),
-    }
-    assert (tmp_path / bump.PYPI_PIN).read_text() == "0.5.0"
-    assert (tmp_path / bump.NUGET_PIN).read_text() == "0.4.0"
-    assert (
-        "push",
-        f"--force-with-lease=refs/heads/{bump.BRANCH}:pending-sha",
-        "origin",
-        f"{bump.BRANCH}:refs/heads/{bump.BRANCH}",
-    ) in calls
+        "git",
+        return_value=subprocess.CompletedProcess("git", 0, stdout="0.5.0\n"),
+    ) as git:
+        assert bump.remote_pin_versions(tmp_path, "sha") == {bump.PYPI_PIN: "0.5.0"}
+    git.assert_called_once_with(
+        tmp_path, "show", "sha:eng/versions/mssql-python-rs.version"
+    )
 
 
 def test_main_pin_change_during_planning_aborts_before_writing(tmp_path):
@@ -719,7 +687,7 @@ def test_main_pin_change_during_planning_aborts_before_writing(tmp_path):
     ), patch.object(
         bump,
         "remote_pin_versions",
-        return_value={bump.PYPI_PIN: "0.5.0", bump.NUGET_PIN: "0.5.0"},
+        return_value={bump.PYPI_PIN: "0.5.0"},
     ), patch.object(bump, "remote_branch_state") as branch, patch.object(
         bump, "github_paged"
     ) as pulls, patch.object(bump, "ensure_issue") as issue:
@@ -729,7 +697,6 @@ def test_main_pin_change_during_planning_aborts_before_writing(tmp_path):
                 "0.4.0",
                 {
                     bump.PYPI_PIN: ("0.3.0", "0.4.0"),
-                    bump.NUGET_PIN: ("0.3.0", "0.4.0"),
                 },
                 "123",
             )
