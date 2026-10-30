@@ -68,13 +68,6 @@ is installed in the agent's Windows trusted-root store. A Docker timeout reachin
 `https://ghcr.io/v2/` is separate: check registry connectivity and the Docker
 daemon's proxy/egress configuration on the failing agent pool.
 
-The OneBranch Linux x64 job starts with bounded GHCR/MCR DNS and HTTPS probes
-(default, IPv4, IPv6, and proxy bypass), Docker daemon proxy-presence checks,
-and a Docker CLI manifest lookup. Proxy values and authentication responses are
-not logged. Probe failures produce warnings without skipping the actual build;
-HTTP 401 from GHCR indicates successful unauthenticated HTTPS connectivity.
-The CLI lookup does not prove that the Docker daemon can pull images.
-
 OneBranch Linux wheel jobs use the `tdslibrs.azurecr.io` mirrors for building,
 driver injection, wheel repair, and clean-install checks. They install Azure CLI
 and reuse `azure-cli-login-template.yml` with the `ACR-Tdslibrs` service connection

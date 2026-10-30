@@ -339,53 +339,6 @@ stages:
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       pyCoreWheelVersion: $[ dependencies.ComputeWheelVersion.outputs['compute.pyCoreWheelVersion'] ]
     steps:
-    - bash: |
-        set -uo pipefail
-        echo "Agent: $AGENT_NAME; image: ${{ parameters.linuxImage }}"
-        for variable in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
-          if printenv "$variable" >/dev/null; then
-            echo "$variable is set (value omitted)"
-          else
-            echo "$variable is unset"
-          fi
-        done
-
-        for host in ghcr.io mcr.microsoft.com; do
-          echo "=== DNS: $host ==="
-          if ! timeout 10 getent ahosts "$host"; then
-            echo "##vso[task.logissue type=warning]DNS lookup failed or timed out for $host"
-          fi
-          for mode in default ipv4 ipv6 direct; do
-            options=()
-            case "$mode" in
-              ipv4) options=(-4) ;;
-              ipv6) options=(-6) ;;
-              direct) options=(--noproxy '*') ;;
-            esac
-            echo "=== HTTPS: $host ($mode); HTTP 401 is expected for unauthenticated GHCR ==="
-            curl --silent --output /dev/null --connect-timeout 5 --max-time 10 \
-              "${options[@]}" --write-out 'http=%{http_code} remote=%{remote_ip} dns=%{time_namelookup}s tcp=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s\n' \
-              "https://$host/v2/"
-            status=$?
-            if [ "$status" -ne 0 ]; then
-              echo "##vso[task.logissue type=warning]HTTPS probe failed for $host ($mode), curl exit $status"
-            fi
-          done
-        done
-
-        echo "=== Docker daemon and proxy presence (not proxy values) ==="
-        if ! timeout 10 docker info --format 'Server={{.ServerVersion}} HTTPProxy={{if .HTTPProxy}}set{{else}}unset{{end}} HTTPSProxy={{if .HTTPSProxy}}set{{else}}unset{{end}} NoProxy={{if .NoProxy}}set{{else}}unset{{end}}' 2>/dev/null; then
-          echo "##vso[task.logissue type=warning]Docker daemon is unavailable before dependency setup"
-        fi
-        echo "=== Docker CLI registry access (not a daemon pull) ==="
-        timeout 30 docker manifest inspect ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest >/dev/null 2>&1
-        status=$?
-        echo "Docker manifest inspect exit: $status"
-        if [ "$status" -ne 0 ]; then
-          echo "##vso[task.logissue type=warning]Docker CLI registry probe failed or timed out"
-        fi
-      displayName: 'Diagnose GHCR connectivity before Linux x64 setup'
-      timeoutInMinutes: 3
     - template: /.pipeline/templates/cargo-authenticate-template.yml
       parameters:
         osType: Linux
