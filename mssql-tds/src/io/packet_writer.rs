@@ -311,6 +311,11 @@ impl<'a> PacketWriter<'a> {
         self.code_page_conversion_loss
     }
 
+    /// An interrupted packet cannot be repaired with further protocol writes.
+    pub(crate) fn send_incomplete(&self) -> bool {
+        self.send_incomplete
+    }
+
     /// Detaches this writer's in-progress message state from the borrowed
     /// network writer so it can be parked as owned state (e.g. on the TDS
     /// client) across `await` points and multiple public calls, then later

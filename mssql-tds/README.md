@@ -55,8 +55,9 @@ results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
 Use `begin_transaction_with_options`, `commit_transaction_with_options`, and
 `rollback_transaction_with_options` to bound transaction requests with the same
-options. Their original counterparts remain unbounded. Commit and rollback never
-reconnect onto a different session.
+options. The timeout covers both sending the request and consuming its response.
+Their original counterparts remain unbounded. Commit and rollback never reconnect
+onto a different session.
 
 ## Connection policy and migration
 
@@ -86,6 +87,9 @@ values or resolve Always Encrypted keys.
 
 `close_query_with_options` can impose an additional drain timeout and cancellation
 handle without extending the active request's remaining timeout.
+
+Bulk-copy write timeouts retire the connection if a packet was interrupted;
+clean packet boundaries use normal cancellation recovery.
 
 ## Runtime behavior
 
