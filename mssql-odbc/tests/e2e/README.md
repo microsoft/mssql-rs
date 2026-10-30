@@ -580,6 +580,32 @@ Windows, Linux, and macOS). The profiles, the other `MSSQL_ODBC_MT_*`
 settings, and which tests can use which mode are in
 [multithreaded-testing-plan.md](../../docs/multithreaded-testing-plan.md).
 
+### Diagnostics gate
+
+`SharedStmt` observers share a writer-preferring diagnostics gate. Idle
+cancellation and explicit Driver Manager diagnostic cleanup stop new readers
+before waiting for in-flight reads to finish, so a busy observer loop cannot
+starve those operations. Observers still overlap outside that cleanup window;
+running-command cancellation remains concurrent with the executing call.
+
+The gate exists for two reasons. Released unixODBC (2.3.14 and earlier)
+corrupts a statement's diagnostic list when two threads use it
+([#243](https://github.com/lurcher/unixODBC/issues/243)). And the Driver
+Manager lets `SQLCancel` bypass its per-handle lock, so an idle cancel can
+overlap an observer's STMT diagnostic read inside the driver. msodbcsql holds
+its statement lock (`csStmt`) for that read and treats a cancel that cannot
+take the lock as cancelling work on another thread, so it skips the idle
+cursor close and the next command fails with `HY000` "Connection is busy".
+Without the gate this fails about 1 run in 8 at the PR size of 2 x 1. The Rust
+driver waits for the read and then closes the cursor, but both drivers take
+the gate so the parity legs run the same interleavings.
+
+`odbc_diagnostics_mutex_test` checks this gate without a driver or SQL Server:
+
+```powershell
+ctest --test-dir build -C Debug -R '^odbc_diagnostics_mutex_test$' --output-on-failure
+```
+
 ## How It Works
 
 Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
