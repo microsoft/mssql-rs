@@ -915,7 +915,7 @@ fn fetch_scroll_operation(
     // statement. The lock is released before any DESC lock (§7.1) and before
     // network I/O. The claim precedes every descriptor read so no rebind or
     // rowset setter (either spelling) can slip in between read and claim.
-    let (ard, column_count, trailing_utf16_plp, exhausted, text_output) = {
+    let (ard, column_count, trailing_utf16_plp, exhausted, text_output, bindings) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
             return SQL_ERROR;
@@ -958,6 +958,7 @@ fn fetch_scroll_operation(
             trailing_utf16_plp,
             stmt_state.result_set_exhausted,
             stmt_state.text_output,
+            std::mem::take(&mut stmt_state.fetch_bindings),
         )
     };
 
@@ -970,7 +971,7 @@ fn fetch_scroll_operation(
 
     // One ARD acquisition for the extent, bind type, bind offset and records,
     // so they are mutually consistent. An exhausted cursor needs no records.
-    let ard_read = read_ard(ard, !exhausted);
+    let ard_read = read_ard(stmt, ard, !exhausted, bindings);
 
     // Checked before the exhausted fast path, as it was when the bind type
     // lived on the statement.
@@ -1072,6 +1073,8 @@ fn fetch_scroll_operation(
     // fill loop still releases it.
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+        bindings.clear();
+        stmt_state.fetch_bindings = bindings;
     }
     debug!(?rc, "SQLFetchScroll returning");
     rc
@@ -1677,24 +1680,30 @@ struct ArdSnapshot {
 
 /// Reads the ARD resolved under a since-dropped STMT lock. A freed descriptor
 /// and a poisoned one are kept apart: only the latter is an internal failure.
-fn read_ard(ard: SqlHandle, with_bindings: bool) -> ArdRead {
-    // Narrows (does not close) the race with a concurrent free.
-    if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
+fn read_ard(
+    stmt: &StmtHandle,
+    ard: SqlHandle,
+    with_bindings: bool,
+    mut bindings: Vec<ColumnBinding>,
+) -> ArdRead {
+    // The implicit ARD lives with the statement. Explicit descriptors can be freed.
+    if ard != stmt.ard && crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
         return ArdRead::Gone;
     }
     let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
     let Ok(desc_state) = desc.inner.lock() else {
         return ArdRead::Poisoned;
     };
+    if with_bindings {
+        ColumnBinding::read_from_ard_state(&desc_state, &mut bindings);
+    } else {
+        bindings.clear();
+    }
     ArdRead::Read(ArdSnapshot {
         array_size: desc_state.header.array_size,
         bind_type: desc_state.header.bind_type,
         bind_offset_ptr: desc_state.header.bind_offset_ptr.cast(),
-        bindings: if with_bindings {
-            ColumnBinding::all_from_ard_state(&desc_state)
-        } else {
-            Vec::new()
-        },
+        bindings,
     })
 }
 
@@ -5030,6 +5039,97 @@ mod tests {
         assert!(state.buffered_get_data_row.is_none());
         drop(state);
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+    }
+
+    #[test]
+    fn fetch_reuses_binding_storage_but_rereads_descriptor_changes() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT rebound rows".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.wire.put_client_for_test(client);
+            state.wire.set_owner_for_test(Some(h.stmt));
+        }
+        let mut first = 0_i32;
+        let mut second = 0_i32;
+        let mut length: SqlLen = 0;
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut first as *mut i32).cast(),
+                    4,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!((first, length), (10, 4));
+        let allocation = {
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.fetch_bindings.is_empty());
+            assert!(state.fetch_bindings.capacity() >= 1);
+            state.fetch_bindings.as_ptr()
+        };
+        assert_eq!(
+            unsafe {
+                crate::api::set_desc_field::sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_DATA_PTR as SqlSmallInt,
+                    (&mut second as *mut i32).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!((first, second), (10, 20));
+        assert_eq!(
+            stmt.inner.lock().unwrap().fetch_bindings.as_ptr(),
+            allocation
+        );
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!((first, second), (10, 20));
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.fetch_bindings.is_empty());
+        assert_eq!(state.fetch_bindings.as_ptr(), allocation);
     }
 
     #[test]

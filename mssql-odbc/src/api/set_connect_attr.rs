@@ -408,7 +408,7 @@ unsafe fn sql_set_connect_attr_w_impl(
             }
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
-            // Statement cancellation reads this at entry and again when signalled.
+            // Publish to execution children here, not on every fetch/GetData call.
             // Zero selects the native driver's 120-second cancellation default.
             // General non-cancellation network-I/O timeout enforcement is separate.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
@@ -416,6 +416,16 @@ unsafe fn sql_set_connect_attr_w_impl(
             // warning rather than reusing msodbcsql's "Login timeout changed".
             let requested = value_ptr as usize as u64;
             dbc.set_connection_timeout(requested.min(MAX_LOGIN_TIMEOUT_SECS) as u32);
+            let mut poisoned = false;
+            for &raw in &state.statements {
+                // SAFETY: the DBC lock keeps each child alive during publication.
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                poisoned |= stmt.refresh_cancel_timeout().is_err();
+            }
+            if poisoned {
+                post_diag(&mut state, ERR_STATEMENT_UNUSABLE);
+                return SQL_ERROR;
+            }
             if requested > MAX_LOGIN_TIMEOUT_SECS {
                 post_diag(&mut state, WARN_CONNECTION_TIMEOUT_CHANGED);
                 SQL_SUCCESS_WITH_INFO

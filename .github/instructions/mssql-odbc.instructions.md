@@ -298,18 +298,26 @@ on the `master` branch.
   lands after its last read latches the client's token, so the call itself
   abandons the pending response and reports HY008 rather than leaking the
   cancellation into a later call.
-  Publish the operation's reserved trace execution under the same cancellation
-  lock as `active`, before token publication. SQLCancel binds its trace scope
+  Publish the operation's reserved trace execution under the cancellation
+  lock before setting the atomic active bit and publishing its token. SQLCancel binds its trace scope
   when it selects the target under that lock, not from an earlier FFI snapshot.
+  Uncontended, untraced calls may admit and complete through the atomic
+  operation state. Cancellers and queued operations must set its notification
+  bit under the cancellation mutex before checking activity; completion then
+  takes the mutex and wakes waiters instead of racing past their registration.
+  Keep that bit set across cancellation cleanup and queued-operation handoff.
   Notify the completion condition variable only when a canceller or queued
   operation can be waiting. Track both under the cancellation mutex: the
   canceller count alone cannot prevent missed operation wakeups. Unconditional
   notifications issue a Linux futex wake even on uncontended per-cell calls
   (AB#49498).
-  Read the connection's atomic timeout without taking its state mutex on each
-  call. It is the sole attribute value, not a second cache; configure the shared
-  cancellation budget before deriving execution children and refresh it before
-  signalling so existing children observe timeout changes.
+  Keep cancellation-timeout publication off per-cell admission. The connection
+  attribute setter updates existing execution budgets under the DBC and
+  cancellation locks, without taking STMT state locks. Configure the budget
+  before deriving new execution children and refresh it before signalling.
+  Read the connection's atomic timeout only after taking the cancellation lock,
+  so a waiting publisher cannot overwrite a newer budget with an older snapshot.
+  Timeout changes must not restart an already-latched settlement deadline.
 
 ### 7.1. Handle hierarchy and locking
 
@@ -598,8 +606,14 @@ For ODBC hot paths:
     offsets with wire-byte offsets.
   - Release the connection's active-statement claim only after its wire data is
     drained; completed empty results may release it during execute.
+    Keep the client in one heap allocation across wire leases: checkout and
+    restore must not copy the large client through every rowset's async state.
   - Bound fetch reuses descriptor snapshots and conversion storage across rows;
     do not add avoidable per-row allocation or metadata cloning.
+    Across fetch calls, retain only the empty binding vector's allocation and
+    rebuild its contents under the ARD lock. Descriptor writes, reassociation,
+    and unbinding must remain visible on the next fetch. Only the statement's
+    own implicit ARD can bypass the global descriptor-liveness lookup.
     Keep `RowIssue` and `RowOutcome` within two bytes: converters return the
     compact `ConvError`, mapped to a canonical diagnostic only on failure.
     Carrying a full diagnostic enlarges every successful column conversion

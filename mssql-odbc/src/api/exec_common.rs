@@ -167,6 +167,7 @@ fn finish_cancelled_dae_call(
 /// the drain of SQLFreeStmt(SQL_CLOSE) or SQLEndTran. msodbcsql sends ATTN in
 /// that window too (`sqlcmisc.cpp`, `pBatchCtx->Cancel` while `csStmt` is
 /// held), so the pending response is abandoned here, before SQLCancel returns.
+#[inline]
 pub(super) fn finish_operation(
     mut operation: StatementOperation<'_>,
     stmt: &StmtHandle,
@@ -180,6 +181,7 @@ pub(super) fn finish_operation(
     }
 }
 
+#[cold]
 fn settle_late_cancellation(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
