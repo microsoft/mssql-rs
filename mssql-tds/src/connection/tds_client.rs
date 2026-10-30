@@ -1826,12 +1826,16 @@ impl TdsClient {
         self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
         self.transport.reset_reader();
+        let send_started = self.request_timeout_start();
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout, cancel);
         let serialize_result = batch.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
         self.finish_send(serialize_result, message).await?;
+        if let Some(start) = send_started {
+            self.update_remaining_timeout(start);
+        }
         Ok(())
     }
 
@@ -20428,28 +20432,36 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unlimited_request_write_does_not_inherit_the_cancellation_budget() {
-        for timeout in [None, Some(0)] {
-            let mut cancel = CancelHandle::new();
-            cancel.set_cancel_timeout_secs(1);
-            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
-            transport.send_delay = Some(Duration::from_secs(2));
-            let mut client = create_test_client_with_transport(transport);
-            let started = tokio::time::Instant::now();
-            client
-                .commit_transaction_with_options(
-                    None,
-                    None,
-                    ExecuteOptions {
-                        timeout,
-                        cancel: Some(&cancel),
-                        ..ExecuteOptions::default()
-                    },
-                )
-                .await
-                .unwrap();
-            assert_eq!(started.elapsed(), Duration::from_secs(2));
-            assert!(!cancel.cancel_token.is_cancelled());
-            assert!(!client.is_connection_dead());
+        for operation in ["batch", "commit"] {
+            for timeout in [None, Some(0)] {
+                let mut cancel = CancelHandle::new();
+                cancel.set_cancel_timeout_secs(1);
+                let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+                transport.send_delay = Some(Duration::from_secs(2));
+                let mut client = create_test_client_with_transport(transport);
+                let started = tokio::time::Instant::now();
+                let options = ExecuteOptions {
+                    timeout,
+                    cancel: Some(&cancel),
+                    ..ExecuteOptions::default()
+                };
+                let result = match operation {
+                    "batch" => client
+                        .execute("SELECT 1".to_string(), options)
+                        .await
+                        .map(|_| ()),
+                    "commit" => {
+                        client
+                            .commit_transaction_with_options(None, None, options)
+                            .await
+                    }
+                    _ => unreachable!(),
+                };
+                result.unwrap();
+                assert_eq!(started.elapsed(), Duration::from_secs(2), "{operation}");
+                assert!(!cancel.cancel_token.is_cancelled());
+                assert!(!client.is_connection_dead());
+            }
         }
     }
 
@@ -20552,16 +20564,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_response_timeout_includes_request_send_time() {
-        for operation in ["begin", "commit", "rollback"] {
-            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+    async fn request_response_timeout_includes_send_time() {
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
+
+        for operation in ["batch", "reset", "begin", "commit", "rollback"] {
+            let tokens = if operation == "reset" {
+                vec![
+                    Tokens::EnvChange(EnvChangeToken {
+                        sub_type: EnvChangeTokenSubType::ResetConnection,
+                        change_type: EnvChangeContainer::from((0u32, 0u32)),
+                    }),
+                    done_no_more(),
+                ]
+            } else {
+                vec![done_no_more()]
+            };
+            let mut transport = TestTransport::with_tokens(tokens);
             transport.send_delay = Some(Duration::from_millis(750));
             transport.receive_delay = Some(Duration::from_millis(750));
             let read_timeouts = Arc::clone(&transport.receive_timeouts);
             let mut client = create_test_client_with_transport(transport);
+            if operation == "reset" {
+                client.prepare_reset_connection(false);
+            }
             let options = ExecuteOptions::new().timeout_secs(1);
             let started = Instant::now();
             let result = match operation {
+                "batch" | "reset" => client
+                    .execute(
+                        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
+                        options,
+                    )
+                    .await
+                    .map(|_| ()),
                 "begin" => {
                     client
                         .begin_transaction_with_options(

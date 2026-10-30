@@ -53,6 +53,9 @@ The server certificate must be trusted and match the hostname.
 cancellation, and other per-command settings. Use `advance()` for subsequent
 results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
+SQL-batch timeout accounting includes both sending the batch and reading its
+response.
+
 Use `begin_transaction_with_options`, `commit_transaction_with_options`, and
 `rollback_transaction_with_options` to bound transaction requests with the same
 options. The timeout covers both sending the request and consuming its response.
