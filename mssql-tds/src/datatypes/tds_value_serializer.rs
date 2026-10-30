@@ -1949,9 +1949,17 @@ impl TdsValueSerializer {
             )));
         }
 
-        // Compute total payload size
-        let dims = value.dimension_count();
+        // `data` is public, so a caller can bypass `try_from_*`; the USHORT dimension count and
+        // length prefix below would silently wrap for an oversized vector.
         let total_size = value.total_size();
+        if total_size > crate::datatypes::sqldatatypes::VECTOR_MAX_SIZE {
+            return Err(Error::UsageError(format!(
+                "Vector with base type {:?} and {} elements is not a valid vector value",
+                value.base_type,
+                value.element_count()
+            )));
+        }
+        let dims = value.dimension_count();
 
         // Length prefix (USHORT)
         writer.write_u16_async(total_size as u16).await?;
@@ -4196,6 +4204,38 @@ mod serializer_tests {
             let mut mock = MockNetworkWriter::new(64);
             let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
             let vector = SqlVector { base_type, data };
+            let result = block_on(TdsValueSerializer::serialize_value(
+                &mut w,
+                &ColumnValues::Vector(vector),
+                &vector_ctx(),
+            ));
+            assert!(
+                matches!(result, Err(crate::error::Error::UsageError(_))),
+                "{base_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_oversized_is_rejected_without_wrapping() {
+        use crate::datatypes::sql_vector::{SqlVector, VectorData};
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        // 65,538 elements wrap to 2 dimensions and a 12-byte size as u16.
+        let cases = [
+            (
+                VectorBaseType::Float16,
+                VectorData::Float16(vec![0.0; 65_538]),
+            ),
+            (
+                VectorBaseType::Float32,
+                VectorData::Float32(vec![0.0; 65_538]),
+            ),
+        ];
+        for (base_type, data) in cases {
+            let mut mock = MockNetworkWriter::new(64);
+            let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+            let vector = SqlVector { base_type, data };
+            assert_eq!(vector.dimension_count(), 2);
             let result = block_on(TdsValueSerializer::serialize_value(
                 &mut w,
                 &ColumnValues::Vector(vector),

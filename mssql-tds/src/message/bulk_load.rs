@@ -332,8 +332,8 @@ impl<'a> StreamingBulkLoadWriter<'a> {
                 )));
             }
             let dimensions = col_meta.vector_dimensions()?;
-            let actual_dimensions = vector.dimension_count();
-            if usize::from(actual_dimensions) != dimensions {
+            let actual_dimensions = vector.element_count();
+            if actual_dimensions != dimensions {
                 return Err(Error::TypeConversionError(format!(
                     "Vector dimension mismatch: declared {}, but vector has {}",
                     dimensions, actual_dimensions
@@ -1316,6 +1316,34 @@ mod vector_tests {
             assert!(matches!(
                 result,
                 Err(Error::TypeConversionError(message)) if message == expected
+            ));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_wrapped_dimension_count_rejected() {
+        use crate::datatypes::sql_vector::VectorData;
+
+        // 65,538 elements wrap to 2 as a u16 and a 12-byte total size.
+        for (base_type, data) in [
+            (
+                VectorBaseType::Float16,
+                VectorData::Float16(vec![0.0; 65_538]),
+            ),
+            (
+                VectorBaseType::Float32,
+                VectorData::Float32(vec![0.0; 65_538]),
+            ),
+        ] {
+            let value = SqlVector { base_type, data };
+            assert_eq!(value.dimension_count(), 2);
+            let (result, bytes) =
+                write_vector_column(base_type, 2, ColumnValues::Vector(value)).await;
+            assert!(matches!(
+                result,
+                Err(Error::TypeConversionError(message))
+                    if message == "Vector dimension mismatch: declared 2, but vector has 65538"
             ));
             assert!(bytes.is_empty());
         }

@@ -133,9 +133,14 @@ impl SqlVector {
 
     /// Returns the number of dimensions in this vector.
     pub fn dimension_count(&self) -> u16 {
+        self.element_count() as u16
+    }
+
+    /// Returns the number of elements without truncating to `u16`.
+    pub(crate) fn element_count(&self) -> usize {
         match &self.data {
-            VectorData::Float32(v) => v.len() as u16,
-            VectorData::Float16(v) => v.len() as u16,
+            VectorData::Float32(v) => v.len(),
+            VectorData::Float16(v) => v.len(),
         }
     }
 
@@ -158,10 +163,7 @@ impl SqlVector {
 
     /// Validates the vector dimensions (count and total size).
     fn validate_dimensions(&self) -> TdsResult<()> {
-        let dimension_count = match &self.data {
-            VectorData::Float32(v) => v.len(),
-            VectorData::Float16(v) => v.len(),
-        };
+        let dimension_count = self.element_count();
 
         if dimension_count == 0 {
             return Err(Error::ProtocolError(
