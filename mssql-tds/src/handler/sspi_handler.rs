@@ -26,7 +26,7 @@
 //!
 //! ```rust,ignore
 //! let config = context.integrated_auth_config();
-//! let mut handler = SspiAuthHandler::new(&config, "server.domain.com", 1433)?;
+//! let mut handler = SspiAuthHandler::new(&config, "server.domain.com", 1433, None)?;
 //!
 //! // Get initial token for Login7
 //! let initial_token = handler.get_initial_token()?;
@@ -40,7 +40,8 @@
 use crate::core::TdsResult;
 use crate::error::Error;
 use crate::security::{
-    IntegratedAuthConfig, SecurityContext, SecurityError, create_security_context,
+    IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityError,
+    create_security_context,
 };
 
 /// State machine for SSPI authentication
@@ -79,13 +80,22 @@ impl SspiAuthHandler {
     /// * `config` - The integrated authentication configuration
     /// * `server` - The server hostname or IP address
     /// * `port` - The server port
+    /// * `provider` - Custom context provider; `None` uses the platform one
     ///
     /// # Returns
     ///
     /// A new handler ready to generate the initial token, or an error
     /// if the security context could not be created.
-    pub(crate) fn new(config: &IntegratedAuthConfig, server: &str, port: u16) -> TdsResult<Self> {
-        let security_context = create_security_context(config, server, port)?;
+    pub(crate) fn new(
+        config: &IntegratedAuthConfig,
+        server: &str,
+        port: u16,
+        provider: Option<&dyn SecurityContextProvider>,
+    ) -> TdsResult<Self> {
+        let security_context = match provider {
+            Some(provider) => provider.create_context(config, server, port)?,
+            None => create_security_context(config, server, port)?,
+        };
         let target_spn = security_context.imported_name().to_string();
 
         Ok(Self {
@@ -270,5 +280,28 @@ mod tests {
 
         assert_eq!(handler.target_spn(), "MSSQLSvc/server:1433");
         assert!(!handler.package_name().is_empty());
+    }
+
+    struct MockProvider;
+
+    impl SecurityContextProvider for MockProvider {
+        fn create_context(
+            &self,
+            _config: &IntegratedAuthConfig,
+            _server: &str,
+            _port: u16,
+        ) -> Result<Box<dyn SecurityContext>, SecurityError> {
+            Ok(Box::new(MockSecurityContext::single_round(
+                b"custom".to_vec(),
+            )))
+        }
+    }
+
+    #[test]
+    fn test_sspi_handler_uses_custom_provider() {
+        let config = IntegratedAuthConfig::new();
+        let mut handler = SspiAuthHandler::new(&config, "host", 1433, Some(&MockProvider)).unwrap();
+
+        assert_eq!(handler.get_initial_token().unwrap(), b"custom");
     }
 }

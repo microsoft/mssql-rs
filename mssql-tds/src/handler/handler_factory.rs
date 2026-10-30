@@ -767,7 +767,7 @@ impl LoginHandler<'_> {
 
         // If using integrated security, create SSPI handler and get initial token
         let (sspi_token, sspi_handler) = if is_integrated_security {
-            let mut config = context.integrated_auth_config();
+            let mut config = context.integrated_auth_config_for(transport_context);
 
             // Bind the authentication exchange to the TLS channel (Extended
             // Protection for Authentication). The token is only present when
@@ -790,8 +790,11 @@ impl LoginHandler<'_> {
                 server, port
             );
 
-            let handler =
-                off_runtime_thread(move || SspiAuthHandler::new(&config, &server, port)).await?;
+            let provider = context.security_context_provider.clone();
+            let handler = off_runtime_thread(move || {
+                SspiAuthHandler::new(&config, &server, port, provider.as_deref())
+            })
+            .await?;
             self.login_stage
                 .record(connect_stage::SPN, handler.target_spn());
             let (handler, initial_token) = off_runtime_thread(move || {
