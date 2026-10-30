@@ -71,6 +71,15 @@ not logged. Probe failures produce warnings without skipping the actual build;
 HTTP 401 from GHCR indicates successful unauthenticated HTTPS connectivity.
 The CLI lookup does not prove that the Docker daemon can pull images.
 
+OneBranch Linux wheel jobs use the `tdslibrs.azurecr.io` mirrors for building,
+driver injection, wheel repair, and clean-install checks. They install Azure CLI
+and reuse `azure-cli-login-template.yml` with the `ACR-Tdslibrs` service connection
+before pulling images, as the SQLCMD jobs do. Shared wheel templates retain GHCR
+defaults for PR validation; only OneBranch callers select ACR. Image repositories,
+tags, architectures, and the unmodified consumer images used by install checks
+are unchanged. Both official and non-official pipeline definitions must be
+authorized to use the service connection.
+
 ### docker-cargo-run.sh
 
 Wraps `docker run` and forwards the `MSSQL_RS_PUBLIC` and `MSSQL_RS` Cargo feed

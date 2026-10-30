@@ -7,6 +7,9 @@ parameters:
   - Windows
 - name: architecture
   type: string
+- name: containerRegistry
+  type: string
+  default: ghcr.io/microsoft/mssql-rs
 # Windows and macOS only. Linux validates the fixed release matrix in
 # test-python-wheel-installs-linux.sh.
 - name: pythonVersions
@@ -29,7 +32,7 @@ steps:
         architecture='aarch64'
       fi
       bash "$(Build.SourcesDirectory)/scripts/test-python-wheel-installs-linux.sh" \
-        "$(ob_outputDirectory)/wheels" "$architecture"
+        "$(ob_outputDirectory)/wheels" "$architecture" '${{ parameters.containerRegistry }}'
     displayName: 'Clean-install final Linux wheels'
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 

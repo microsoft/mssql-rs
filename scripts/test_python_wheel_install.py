@@ -127,8 +127,28 @@ def test_wheel_version_rejects_wrong_distribution(tmp_path: Path) -> None:
 def test_linux_installs_use_mirrored_consumer_images() -> None:
     script = _LINUX_SCRIPT.read_text(encoding="utf-8")
 
-    assert "ghcr.io/microsoft/mssql-rs/import/python-build/" in script
+    assert 'registry="${3:-ghcr.io/microsoft/mssql-rs}"' in script
+    assert 'image="$registry/import/python-build/' in script
     assert "quay.io" not in script
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+@pytest.mark.parametrize("registry", [None, "tdslibrs.azurecr.io"])
+def test_linux_install_registry_selection(tmp_path, architecture, registry) -> None:
+    command = [
+        "bash", "-c",
+        'docker() { printf "%s\\n" "$*"; }; export -f docker; bash "$@"',
+        "test", str(_LINUX_SCRIPT), str(tmp_path), architecture,
+    ]
+    if registry:
+        command.append(registry)
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    expected_registry = registry or "ghcr.io/microsoft/mssql-rs"
+    for platform in ("manylinux_2_34", "manylinux_2_28", "musllinux_1_2"):
+        image = f"{expected_registry}/import/python-build/{platform}_{architecture}:latest"
+        assert f"pull {image}" in result.stdout
+        assert f"{image} bash /scripts/test-python-wheel-installs-linux.sh" in result.stdout
+    assert "_rust" not in result.stdout
 
 
 def test_linux_installs_cover_release_matrix() -> None:
