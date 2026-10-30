@@ -672,8 +672,8 @@ mod bulk_copy_variant_tests {
         if let Err(e) = result {
             let error_msg = e.to_string();
             assert!(
-                error_msg.contains("Unsupported data type"),
-                "Expected error message about unsupported type, got: {}",
+                error_msg.contains("Vector value cannot be written to non-vector column"),
+                "Expected error message about vector into non-vector column, got: {}",
                 error_msg
             );
         }

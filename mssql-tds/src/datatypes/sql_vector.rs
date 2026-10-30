@@ -53,6 +53,11 @@ impl SqlVector {
     ///
     /// # Arguments
     /// * `values` - The vector dimension values (passed as f32, but treated as Float16)
+    ///
+    /// Values are stored unchanged and are not validated against the binary16 range.
+    /// They are narrowed to binary16 only when serialized, where out-of-range
+    /// magnitudes (`>= 65520.0`) become infinity and tiny magnitudes (`<= 2^-25`)
+    /// become zero without error. See `serialize_vector` for the exact rules.
     pub fn try_from_f16(values: Vec<f32>) -> TdsResult<Self> {
         let vector = Self {
             base_type: VectorBaseType::Float16,
@@ -128,9 +133,14 @@ impl SqlVector {
 
     /// Returns the number of dimensions in this vector.
     pub fn dimension_count(&self) -> u16 {
+        self.element_count() as u16
+    }
+
+    /// Returns the number of elements without truncating to `u16`.
+    pub(crate) fn element_count(&self) -> usize {
         match &self.data {
-            VectorData::Float32(v) => v.len() as u16,
-            VectorData::Float16(v) => v.len() as u16,
+            VectorData::Float32(v) => v.len(),
+            VectorData::Float16(v) => v.len(),
         }
     }
 
@@ -153,10 +163,7 @@ impl SqlVector {
 
     /// Validates the vector dimensions (count and total size).
     fn validate_dimensions(&self) -> TdsResult<()> {
-        let dimension_count = match &self.data {
-            VectorData::Float32(v) => v.len(),
-            VectorData::Float16(v) => v.len(),
-        };
+        let dimension_count = self.element_count();
 
         if dimension_count == 0 {
             return Err(Error::ProtocolError(
@@ -305,5 +312,21 @@ mod tests {
         let values = vec![1.0, 2.0, 3.0];
         let vector = SqlVector::try_from_f32(values).unwrap();
         assert_eq!(vector.base_type(), VectorBaseType::Float32);
+    }
+
+    #[test]
+    fn test_from_f16_valid() {
+        let vector = SqlVector::try_from_f16(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(vector.base_type(), VectorBaseType::Float16);
+        assert_eq!(vector.dimension_count(), 3);
+        assert_eq!(vector.as_f32(), Some(&[1.0, 2.0, 3.0][..]));
+        assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 3 * 2);
+    }
+
+    #[test]
+    fn test_f16_allows_more_dimensions_than_f32() {
+        let values = vec![0.0f32; VectorBaseType::Float16.max_dimensions() as usize];
+        assert!(SqlVector::try_from_f16(values.clone()).is_ok());
+        assert!(SqlVector::try_from_f32(values).is_err());
     }
 }

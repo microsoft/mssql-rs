@@ -1887,6 +1887,7 @@ impl TdsClient {
         self.ensure_force_column_encryption_supported(named_params.iter())?;
         let (timeout_sec, request_timeout, database_collation) =
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
+        self.ensure_parameter_features_supported(named_params.iter())?;
 
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
@@ -1952,6 +1953,7 @@ impl TdsClient {
         self.transport.reset_reader();
 
         let database_collation = self.negotiated_settings.database_collation;
+        let vector_version = self.negotiated_settings.vector_version();
         let send_started = self.request_timeout_start();
         let rows = rows.into_iter();
         let mut packet_writer = PacketType::RpcRequest.create_packet_writer(
@@ -1975,6 +1977,9 @@ impl TdsClient {
                     continue;
                 };
                 RpcParameter::reject_data_at_exec(positional_params.iter())?;
+                for param in &positional_params {
+                    param.ensure_vector_version_supported(vector_version)?;
+                }
                 if positional_params
                     .iter()
                     .any(RpcParameter::force_column_encryption)
@@ -2357,6 +2362,7 @@ impl TdsClient {
         }
 
         self.current_command_ce_setting = column_encryption;
+
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
         let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
@@ -2394,6 +2400,9 @@ impl TdsClient {
 
         let (timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
+        self.ensure_parameter_features_supported(
+            materialized_params.iter().chain(streamed_params.iter()),
+        )?;
         let rpc = self.build_sp_executesql_rpc(
             sql,
             materialized_params,
@@ -3423,6 +3432,17 @@ impl TdsClient {
 
         // STEP 2: Send INSERT BULK command and consume response
         // Use the filtered metadata so the command only references mapped columns
+        if self.negotiated_settings.vector_version() < 2
+            && mapped_column_metadata.iter().any(|column| {
+                column.sql_type == crate::datatypes::bulk_copy_metadata::SqlDbType::Vector
+                    && column.scale == crate::datatypes::sqldatatypes::VectorBaseType::Float16 as u8
+            })
+        {
+            return Err(UsageError(format!(
+                "Vector float16 bulk copy requires negotiated vector version 2; current version is {}.",
+                self.negotiated_settings.vector_version()
+            )));
+        }
         let insert_bulk_command =
             build_insert_bulk_command(&table_name, &mapped_column_metadata, &options)?;
         self.send_batch_and_consume_response(insert_bulk_command, timeout_sec, cancel_handle)
@@ -3748,7 +3768,7 @@ impl TdsClient {
         // form of the call) and encrypt them in place before sending the real
         // stored-procedure RPC. Positional parameters are described under
         // synthetic names bound by position; named parameters bind by name.
-        self.ensure_force_column_encryption_supported(
+        self.ensure_parameter_features_supported(
             positional_parameters
                 .iter()
                 .flatten()
@@ -3902,6 +3922,7 @@ impl TdsClient {
         // statement's id so a later sp_execute can encrypt values without
         // describing again. sp_prepare itself sends no user parameter values, so
         // nothing is encrypted here.
+        self.ensure_parameter_features_supported(named_params.iter())?;
         let describe_for_cache = if self.should_encrypt_parameters() && !named_params.is_empty() {
             let has_output = named_params.iter().any(|p| p.is_output());
             let describe = self
@@ -4426,6 +4447,10 @@ impl TdsClient {
         let (mut timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
 
+        self.ensure_parameter_features_supported(
+            materialized_params.iter().chain(streamed_params.iter()),
+        )?;
+
         if orphaned.is_some_and(|id| !self.prepared_handles.contains_key(&id)) {
             *orphaned = None;
         }
@@ -4699,7 +4724,7 @@ impl TdsClient {
         // sending the real RPC. The `@params` declaration keeps each parameter's
         // original type; only the value is replaced with ciphertext plus cipher
         // metadata.
-        self.ensure_force_column_encryption_supported(named_params.iter())?;
+        self.ensure_parameter_features_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.pending_prepared_param_encryption = Some(
                 self.encrypt_parameters(
@@ -4866,7 +4891,7 @@ impl TdsClient {
         // the metadata captured when the statement was prepared, then send the
         // real RPC. sp_execute never describes — the metadata must already have
         // been cached by execute_sp_prepare on this connection.
-        self.ensure_force_column_encryption_supported(
+        self.ensure_parameter_features_supported(
             positional_parameters
                 .iter()
                 .flatten()
@@ -6246,6 +6271,20 @@ impl TdsClient {
             && self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Enabled
     }
 
+    /// Validate against the live session after recovery, before any RPC writes
+    /// (including an Always Encrypted describe request).
+    pub(in crate::connection) fn ensure_parameter_features_supported<'p>(
+        &self,
+        params: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> TdsResult<()> {
+        let vector_version = self.negotiated_settings.vector_version();
+        for param in params {
+            param.ensure_vector_version_supported(vector_version)?;
+            self.ensure_force_column_encryption_supported([param])?;
+        }
+        Ok(())
+    }
+
     /// Enforces the ForceColumnEncryption precondition: if any supplied parameter
     /// requires encryption but Always Encrypted is not enabled for this command,
     /// fail rather than sending it as plaintext. The per-parameter downgrade
@@ -6685,7 +6724,7 @@ impl TdsClient {
         // below and the trusted-master-key-path rejection in `decrypt_cek`. It is
         // deliberately distinct from the caller-misconfiguration case (the flag
         // set while Always Encrypted is off) that
-        // `ensure_force_column_encryption_supported` reports as a `UsageError`.
+        // `ensure_parameter_features_supported` reports as a `UsageError`.
         for index in 0..params.len() {
             if !params[index].force_column_encryption() {
                 continue;
@@ -10509,6 +10548,501 @@ mod tests {
             Vec::new(),
         );
         (client, sent)
+    }
+
+    fn set_vector_ack(client: &mut TdsClient, acknowledgement: Option<(u8, bool)>) {
+        use crate::message::features::vectorfeature::VectorFeature;
+        use crate::message::login::Feature;
+
+        client
+            .negotiated_settings
+            .session_settings
+            .supported_features
+            .clear();
+        if let Some((version, acknowledged)) = acknowledgement {
+            let mut feature = VectorFeature::default();
+            feature.deserialize(&[version]).unwrap();
+            feature.set_acknowledged(acknowledged);
+            client
+                .negotiated_settings
+                .session_settings
+                .supported_features
+                .push(Box::new(feature));
+        }
+    }
+
+    const VECTOR_RPC_ROUTES: [&str; 11] = [
+        "executesql",
+        "begin_atomic",
+        "begin_streamed",
+        "prepared_streamed_new",
+        "prepared_streamed_reused",
+        "stored_positional",
+        "stored_named",
+        "prepared_new",
+        "prepared_reused",
+        "execute_positional",
+        "prepare",
+    ];
+
+    async fn execute_vector_rpc(
+        client: &mut TdsClient,
+        route: &str,
+        param: RpcParameter,
+    ) -> TdsResult<()> {
+        match route {
+            "executesql" => client
+                .execute_sp_executesql("SELECT @v".to_string(), vec![param], ())
+                .await
+                .map(|_| ()),
+            "begin_atomic" => client
+                .begin_sp_executesql("SELECT @v".to_string(), vec![param], ())
+                .await
+                .map(|_| ()),
+            "begin_streamed" => {
+                client
+                    .begin_sp_executesql(
+                        "SELECT @v, @data".to_string(),
+                        vec![streamed_varbinary("@data"), param],
+                        (),
+                    )
+                    .await?;
+                client.write_streamed_null()?;
+                client.end_streamed_param().await.map(|_| ())
+            }
+            "prepared_streamed_new" | "prepared_streamed_reused" => {
+                let mut statement = PreparedStatement::new("SELECT @v, @data");
+                if route == "prepared_streamed_reused" {
+                    statement.id = Some(client.register_prepared_handle_for_test(7));
+                }
+                let mut orphaned = None;
+                client
+                    .begin_execute_prepared(
+                        &mut statement,
+                        vec![streamed_varbinary("@data"), param],
+                        &mut orphaned,
+                        (),
+                    )
+                    .await?;
+                client.write_streamed_null()?;
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .map(|_| ())
+            }
+            "stored_positional" => client
+                .execute_stored_procedure("dbo.p".to_string(), Some(vec![param]), None, ())
+                .await
+                .map(|_| ()),
+            "stored_named" => client
+                .execute_stored_procedure("dbo.p".to_string(), None, Some(vec![param]), ())
+                .await
+                .map(|_| ()),
+            "prepared_new" | "prepared_reused" => {
+                let mut statement = PreparedStatement::new("SELECT @v");
+                if route == "prepared_reused" {
+                    statement.id = Some(client.register_prepared_handle_for_test(7));
+                }
+                client
+                    .execute_prepared(&mut statement, vec![param], &mut None, ())
+                    .await
+                    .map(|_| ())
+            }
+            "execute_positional" => {
+                let id = client.register_prepared_handle_for_test(7);
+                client
+                    .execute_sp_execute(id, Some(vec![param]), None, false, ())
+                    .await
+                    .map(|_| ())
+            }
+            "prepare" => client
+                .execute_sp_prepare("SELECT @v".to_string(), vec![param], false, ())
+                .await
+                .map(|_| ()),
+            _ => unreachable!("unknown vector RPC route"),
+        }
+    }
+
+    #[tokio::test]
+    async fn float16_rpc_requires_acknowledged_version_two_before_writes() {
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for route in VECTOR_RPC_ROUTES {
+                for is_null in [false, true] {
+                    for flags in [StatusFlags::NONE, StatusFlags::BY_REF_VALUE] {
+                        let (mut client, sent) = create_capturing_client(vec![
+                            Tokens::ReturnValue(ae_return_value_token(
+                                "@handle",
+                                ColumnValues::Int(7),
+                                None,
+                            )),
+                            done_no_more(),
+                        ]);
+                        set_vector_ack(&mut client, acknowledgement);
+                        let value = if is_null {
+                            None
+                        } else {
+                            Some(SqlVector::try_from_f16(vec![1.0, -2.0]).unwrap())
+                        };
+                        let param = RpcParameter::new(
+                            Some("@v".to_string()),
+                            flags,
+                            SqlType::Vector(value, 2, VectorBaseType::Float16),
+                        );
+
+                        let result = execute_vector_rpc(&mut client, route, param).await;
+                        if acknowledgement == Some((2, true)) {
+                            result.unwrap_or_else(|e| panic!("{route}: {e}"));
+                            assert!(!sent.lock().unwrap().is_empty(), "{route}");
+                        } else {
+                            let err = result.expect_err(route);
+                            assert!(
+                                matches!(&err, UsageError(message) if message.contains("float16") && message.contains("version")),
+                                "{route}: {err}"
+                            );
+                            assert!(sent.lock().unwrap().is_empty(), "{route}");
+                            assert!(!client.has_open_batch(), "{route}");
+                            assert!(matches!(
+                                client.streamed_write_state,
+                                StreamedWriteState::Idle
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn float32_rpc_preserves_legacy_versions_and_off_behavior() {
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for route in VECTOR_RPC_ROUTES {
+                for is_null in [false, true] {
+                    let (mut client, sent) = create_capturing_client(vec![
+                        Tokens::ReturnValue(ae_return_value_token(
+                            "@handle",
+                            ColumnValues::Int(7),
+                            None,
+                        )),
+                        done_no_more(),
+                    ]);
+                    set_vector_ack(&mut client, acknowledgement);
+                    let value = if is_null {
+                        None
+                    } else {
+                        Some(SqlVector::try_from_f32(vec![1.0, -2.0]).unwrap())
+                    };
+                    let param = RpcParameter::new(
+                        Some("@v".to_string()),
+                        StatusFlags::NONE,
+                        SqlType::Vector(value, 2, VectorBaseType::Float32),
+                    );
+
+                    execute_vector_rpc(&mut client, route, param)
+                        .await
+                        .unwrap_or_else(|e| panic!("{route}: {e}"));
+                    assert!(!sent.lock().unwrap().is_empty(), "{route}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_tvp_checks_templates_and_cells_before_writes() {
+        use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        let float16 = SqlType::Vector(
+            Some(SqlVector::try_from_f16(vec![1.0, -2.0]).unwrap()),
+            2,
+            VectorBaseType::Float16,
+        );
+        let null16 = SqlType::Vector(None, 2, VectorBaseType::Float16);
+        let null32 = SqlType::Vector(None, 2, VectorBaseType::Float32);
+        let disguised16 = SqlType::Vector(
+            Some(SqlVector::try_from_f16(vec![1.0, -2.0]).unwrap()),
+            2,
+            VectorBaseType::Float32,
+        );
+        let cases = [
+            ("empty", null16.clone(), Vec::new()),
+            ("null_cell", null16.clone(), vec![vec![null16.clone()]]),
+            ("value", null16.clone(), vec![vec![float16.clone()]]),
+            ("cell_declaration", null32.clone(), vec![vec![null16]]),
+            (
+                "cell_payload",
+                null32.clone(),
+                vec![vec![disguised16.clone()]],
+            ),
+            ("template_payload", disguised16.clone(), Vec::new()),
+            (
+                "later_row",
+                null32.clone(),
+                vec![vec![null32], vec![disguised16]],
+            ),
+        ];
+
+        for (case, template, rows) in cases {
+            let param = RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::NONE,
+                SqlType::Table(
+                    TvpTypeName::new(Some("dbo".to_string()), "VectorTable".to_string()),
+                    Some(TvpTableData::new(
+                        vec![
+                            TvpColumnDef::new(SqlType::Int(None)),
+                            TvpColumnDef::new(template),
+                        ],
+                        rows.into_iter()
+                            .map(|mut row| {
+                                row.insert(0, SqlType::Int(Some(1)));
+                                row
+                            })
+                            .collect(),
+                    )),
+                ),
+            );
+            param.ensure_vector_version_supported(2).unwrap();
+            for acknowledgement in [None, Some((0, true)), Some((1, true)), Some((2, false))] {
+                for route in VECTOR_RPC_ROUTES {
+                    let (mut client, sent) = create_capturing_client(Vec::new());
+                    set_vector_ack(&mut client, acknowledgement);
+                    let err = execute_vector_rpc(&mut client, route, param.clone())
+                        .await
+                        .expect_err(case);
+                    assert!(
+                        matches!(&err, UsageError(message) if message.contains("float16") && message.contains("version")),
+                        "{case}/{route}: {err}"
+                    );
+                    assert!(sent.lock().unwrap().is_empty(), "{case}/{route}");
+                    assert!(!client.has_open_batch(), "{case}/{route}");
+                    assert!(matches!(
+                        client.streamed_write_state,
+                        StreamedWriteState::Idle
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_tvp_preserves_supported_and_null_tables() {
+        use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for base_type in [VectorBaseType::Float16, VectorBaseType::Float32] {
+                for row_count in [None, Some(0), Some(1), Some(2)] {
+                    if base_type == VectorBaseType::Float16
+                        && row_count.is_some()
+                        && acknowledgement != Some((2, true))
+                    {
+                        continue;
+                    }
+                    let template = SqlType::Vector(None, 2, base_type);
+                    let value = match base_type {
+                        VectorBaseType::Float16 => SqlVector::try_from_f16(vec![1.0, -2.0]),
+                        VectorBaseType::Float32 => SqlVector::try_from_f32(vec![1.0, -2.0]),
+                    }
+                    .unwrap();
+                    let param = RpcParameter::new(
+                        Some("@v".to_string()),
+                        StatusFlags::NONE,
+                        SqlType::Table(
+                            TvpTypeName::new(Some("dbo".to_string()), "VectorTable".to_string()),
+                            row_count.map(|count| {
+                                TvpTableData::new(
+                                    vec![TvpColumnDef::new(template.clone())],
+                                    [
+                                        vec![template.clone()],
+                                        vec![SqlType::Vector(Some(value), 2, base_type)],
+                                    ]
+                                    .into_iter()
+                                    .take(count)
+                                    .collect(),
+                                )
+                            }),
+                        ),
+                    );
+                    for route in VECTOR_RPC_ROUTES {
+                        let (mut client, sent) = create_capturing_client(vec![
+                            Tokens::ReturnValue(ae_return_value_token(
+                                "@handle",
+                                ColumnValues::Int(7),
+                                None,
+                            )),
+                            done_no_more(),
+                        ]);
+                        set_vector_ack(&mut client, acknowledgement);
+                        execute_vector_rpc(&mut client, route, param.clone())
+                            .await
+                            .unwrap_or_else(|e| panic!("{base_type:?}/{row_count:?}/{route}: {e}"));
+                        assert!(!sent.lock().unwrap().is_empty(), "{route}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_bulk_load_checks_negotiation_before_insert_bulk() {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::{VECTOR_HEADER_SIZE, VectorBaseType};
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for base_type in [VectorBaseType::Float16, VectorBaseType::Float32] {
+                for map_only_int in [false, true] {
+                    let (mut client, sent) =
+                        create_capturing_client(vec![done_no_more(), done_no_more()]);
+                    set_vector_ack(&mut client, acknowledgement);
+                    let length = (VECTOR_HEADER_SIZE + base_type.element_size_bytes()) as i32;
+                    let columns = vec![
+                        BulkCopyColumnMetadata::new(
+                            "v",
+                            SqlDbType::Vector,
+                            TdsDataType::Vector as u8,
+                        )
+                        .with_length(length, TypeLength::Variable(length))
+                        .with_scale(base_type as u8),
+                        BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                            .with_length(4, TypeLength::Fixed(4)),
+                    ];
+                    let mappings = if map_only_int {
+                        vec![ResolvedColumnMapping {
+                            source_index: 0,
+                            destination_index: 1,
+                            destination_name: "id".to_string(),
+                            destination_type: SqlDbType::Int,
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                    client.reconnect_elapsed_for_test = Some(Duration::ZERO);
+                    let result = client
+                        .execute_bulk_load_streaming_zerocopy(
+                            "#t".to_string(),
+                            columns,
+                            BulkCopyOptions::default(),
+                            None,
+                            None,
+                            std::iter::empty::<IntRow>(),
+                            &mappings,
+                        )
+                        .await;
+                    assert!(client.reconnect_elapsed_for_test.is_none());
+                    if base_type == VectorBaseType::Float16
+                        && !map_only_int
+                        && acknowledgement != Some((2, true))
+                    {
+                        assert!(matches!(result, Err(UsageError(message))
+                            if message.contains("float16 bulk copy requires negotiated vector version 2")));
+                        assert!(sent.lock().unwrap().is_empty());
+                        assert!(!client.has_open_batch());
+                    } else {
+                        assert_eq!(result.unwrap(), 0);
+                        assert!(!sent.lock().unwrap().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_validation_runs_after_recovery_check() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for route in [
+            "executesql",
+            "begin_atomic",
+            "begin_streamed",
+            "prepared_streamed_new",
+            "prepared_streamed_reused",
+            "stored_named",
+            "prepared_new",
+            "prepared_reused",
+            "prepare",
+        ] {
+            let (mut client, sent) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, Some((1, true)));
+            client.reconnect_elapsed_for_test = Some(Duration::ZERO);
+            let param = RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Vector(None, 2, VectorBaseType::Float16),
+            );
+            let err = execute_vector_rpc(&mut client, route, param)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, UsageError(_)), "{route}");
+            assert!(client.reconnect_elapsed_for_test.is_none(), "{route}");
+            assert!(sent.lock().unwrap().is_empty(), "{route}");
+        }
+    }
+
+    #[test]
+    fn parameter_feature_validation_uses_current_session_settings() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        let mut client = create_test_client();
+        let param = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Vector(None, 2, VectorBaseType::Float16),
+        );
+        set_vector_ack(&mut client, Some((2, true)));
+        client
+            .ensure_parameter_features_supported([&param])
+            .unwrap();
+        set_vector_ack(&mut client, Some((1, true)));
+        assert!(
+            client
+                .ensure_parameter_features_supported([&param])
+                .is_err()
+        );
+        set_vector_ack(&mut client, None);
+        assert!(
+            client
+                .ensure_parameter_features_supported([&param])
+                .is_err()
+        );
+
+        let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(7)))
+            .with_force_column_encryption(true);
+        let err = client
+            .ensure_parameter_features_supported([&param])
+            .unwrap_err();
+        assert!(matches!(err, UsageError(message) if message.contains("ForceColumnEncryption")));
     }
 
     /// Like [`create_capturing_client`], but shares the timeout each
@@ -18431,6 +18965,50 @@ mod tests {
             .expect_err("forced encryption is unsupported on the batch fast path");
         assert!(matches!(&error, UsageError(message) if message.contains("ForceColumnEncryption")));
         assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_rejects_float16_without_negotiated_vector_v2() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        let float16 = || {
+            RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Vector(None, 2, VectorBaseType::Float16),
+            )
+        };
+        let int = || RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(1)));
+
+        for ack in [Some((1, true)), None] {
+            // Reused handle: the first (and only) row carries the float16 value.
+            let (mut client, sent) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, ack);
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let error = client
+                .execute_sp_execute_batch_for_test(statement_id, vec![Ok((0, vec![float16()]))])
+                .await
+                .expect_err("float16 needs negotiated vector version 2");
+            assert!(
+                matches!(&error, UsageError(message) if message.contains("negotiated vector version 2")),
+                "{ack:?}"
+            );
+            assert!(sent.lock().unwrap().is_empty(), "{ack:?}");
+
+            // Fresh batch: a later row carries the float16 value.
+            let (mut client, _) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, ack);
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let rows = vec![Ok((0, vec![int()])), Ok((1, vec![float16()]))];
+            let error = client
+                .execute_sp_execute_batch_for_test(statement_id, rows)
+                .await
+                .expect_err("a later float16 row must be rejected too");
+            assert!(
+                matches!(&error, UsageError(message) if message.contains("negotiated vector version 2")),
+                "{ack:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ The tests require the following environment variables (typically set in `.env` f
 # Required for all tests
 DB_USERNAME=your_username
 SQL_PASSWORD=your_password
+DB_DATABASE=UserDb         # Only read by the float16 helper; other tests always use master
 
 # TCP tests
 DB_HOST=localhost           # Server hostname or IP
@@ -57,6 +58,47 @@ CERT_HOST_NAME=localhost   # Optional: hostname in certificate
 # Debugging
 ENABLE_TEST_TRACE=false         # Set to true for detailed logging
 ```
+
+### Float16 vector integration tests
+
+Float32 vector tests run normally. Every float16 live test (including mixed float32/float16
+cases and explicit V1 rejection tests) is ignored by default. Explicit opt-in requires both
+nextest `--run-ignored ignored-only` with the `test(vector16)` filter and `VECTOR16_TEST=1`.
+If selected without that exact environment value, the test returns early with a diagnostic;
+it does not attempt a connection or probe server support. With opt-in enabled, missing
+credentials, incorrect targets, unsupported features, and SQL errors fail the test rather
+than being treated as skips.
+
+Set an explicit `DB_DATABASE` and point `DB_HOST`/`DB_PORT` at a server with float16
+vector support. The helper verifies the current database matches that configuration.
+It does not require a particular developer instance or database name.
+
+Requirements:
+
+- Set `DB_DATABASE` explicitly. The general helper defaults to `master`; the float16
+   helper rejects an omitted or empty database before connecting.
+- Point `DB_HOST` and `DB_PORT` at the TCP endpoint of a float16-capable server. TCP uses
+   the explicit port; setting `DB_INSTANCE` alone does not select a named instance for TCP.
+- Optionally set `VECTOR16_EXPECTED_INSTANCE` to verify the instance name on each float16
+   connection. This safeguard accepts any configured instance name.
+- Set `DB_INSTANCE` for any Named Pipe/Shared Memory tests in the same run.
+- Have an administrator preprovision preview support in the target database on a server
+   build that supports float16 vectors and Vector feature V2. Tests never enable preview
+   features, change database configuration, set global flags, or issue `USE` statements.
+- Verify the actual instance name and current database with a read-only query before the
+   run. Temporary test tables/procedures are session-local; no persistent schema is created.
+
+All float16 live integration test names contain `vector16`, including the mixed-type cases.
+After setting the environment above, run:
+
+```bash
+cargo nextest run -p mssql-tds --test test_vector_type --test test_bulk_copy_vector --run-ignored ignored-only -E 'test(vector16)' --success-output immediate
+```
+
+Run the same two binaries without `--run-ignored ignored-only` and the filter to run float32
+regression tests while leaving float16 tests ignored. V1
+float16 RPC rejection tests cover both values and typed NULLs; they still require opt-in
+and the configured endpoint. Negotiation/wire unit tests do not need a live server.
 
 ## Running Tests
 

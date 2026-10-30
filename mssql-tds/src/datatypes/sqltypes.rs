@@ -1198,8 +1198,8 @@ impl SqlType {
                     "Vector base type mismatch: declared {base_type:?}, but vector has {actual_base_type:?}"
                 )));
             }
-            let actual_dimensions = vector.dimension_count();
-            if actual_dimensions != dimensions {
+            let actual_dimensions = vector.element_count();
+            if actual_dimensions != usize::from(dimensions) {
                 return Err(Error::TypeConversionError(format!(
                     "Vector dimension mismatch: declared {dimensions}, but vector has {actual_dimensions}"
                 )));
