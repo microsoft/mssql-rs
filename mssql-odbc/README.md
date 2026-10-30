@@ -51,11 +51,16 @@ flowchart TD
 ```
 
 User-visible performance behavior is recorded as data-path contracts in the
-[ODBC driver engineering guidelines](../.github/instructions/mssql-odbc.instructions.md#11-performance-and-ffi-data-movement).
+[ODBC driver engineering guidelines](https://github.com/microsoft/mssql-rs/blob/main/.github/instructions/mssql-odbc.instructions.md#11-performance-and-ffi-data-movement).
 The measurements and trade-offs behind each contract live beside the code that
 implements it, and deliberate departures from msodbcsql are recorded in the
 [parity registry](docs/parity-deviations.md). Subsystem design notes live in
 [`docs/`](docs/).
+
+Fetch reuses binding storage between calls while honoring descriptor changes on
+the next fetch. The connection retains one heap-allocated protocol client to
+avoid large client copies during result retrieval; cancellation and connection
+ownership behavior are unchanged.
 
 ### Connection defaults
 
