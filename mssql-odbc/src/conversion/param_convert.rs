@@ -210,6 +210,7 @@ pub(crate) unsafe fn bound_param_to_rpc(
     name: impl Into<Option<String>>,
     param: &BoundParam,
     udt_names: Option<&UdtNames>,
+    long_as_max: bool,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
     let ((value, type_metadata), outcome) =
         unsafe { bound_param_to_value_with_outcome(param, udt_names) }?;
@@ -220,6 +221,16 @@ pub(crate) unsafe fn bound_param_to_rpc(
         StatusFlags::BY_REF_VALUE
     } else {
         StatusFlags::NONE
+    };
+    let value = if long_as_max {
+        match value {
+            SqlType::Text(value) => SqlType::VarcharMax(value),
+            SqlType::NText(value) => SqlType::NVarcharMax(value),
+            SqlType::Image(value) => SqlType::VarBinaryMax(value),
+            other => other,
+        }
+    } else {
+        value
     };
     let parameter = RpcParameter::new(name.into(), status, value);
     let mut parameter = match type_metadata {
@@ -746,12 +757,16 @@ pub(crate) fn dae_length_limit(
 ///
 /// `is_null` carries a parameter that `SQLPutData` marked `SQL_NULL_DATA`, which
 /// must produce a typed NULL rather than an empty value.
+///
+/// LONG values keep the MAX/PLP framing they would have streamed with, as
+/// msodbcsql's `PutParamData` does; LongAsMax selects only their declaration.
 pub(crate) fn buffered_dae_to_rpc(
     name: String,
     binding: &BoundParam,
     udt_names: Option<&UdtNames>,
     buffer: &[u8],
     is_null: bool,
+    long_as_max: bool,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
     let mut indicator: SqlLen = if is_null {
         SQL_NULL_DATA
@@ -759,7 +774,18 @@ pub(crate) fn buffered_dae_to_rpc(
         SqlLen::try_from(buffer.len()).map_err(|_| ParamBuildError::StringTruncation)?
     };
     let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
-    unsafe { bound_param_to_rpc(name, &synthetic, udt_names) }
+    let (parameter, outcome) = unsafe { bound_param_to_rpc(name, &synthetic, udt_names, true) }?;
+    let declaration = match binding.sql_type {
+        SQL_LONGVARCHAR | SQL_WLONGVARCHAR | SQL_LONGVARBINARY => {
+            dae_streamed_declaration(binding.sql_type, binding.column_size, long_as_max)?
+        }
+        _ => None,
+    };
+    let parameter = match declaration {
+        Some(declaration) => parameter.with_streamed_declaration(declaration),
+        None => parameter,
+    };
+    Ok((parameter, outcome))
 }
 
 fn buffered_dae_binding(binding: &BoundParam, buffer: &[u8], indicator: &mut SqlLen) -> BoundParam {
@@ -840,12 +866,12 @@ pub(crate) fn dae_plan(
 /// `ColumnSize` names the `max` spelling and the declaration the streamed type
 /// already carries is right.
 ///
-/// The value body stays PLP-framed either way: only the variable it is assigned
-/// to narrows. `text`/`ntext`/`image` keep their `max` substitution for the same
-/// reason the materialized path does (AB#47592).
+/// The value body stays PLP-framed even for a legacy LOB declaration, matching
+/// msodbcsql's PutParamData substitution independently of LongAsMax.
 pub(crate) fn dae_streamed_declaration(
     sql_type: SqlSmallInt,
     column_size: usize,
+    long_as_max: bool,
 ) -> Result<Option<SqlType>, ParamBuildError> {
     Ok(match sql_type {
         SQL_VARCHAR => variable_length(column_size, SQL_PREC_BIGCHARBINARY)
@@ -854,7 +880,10 @@ pub(crate) fn dae_streamed_declaration(
             .map(|length| SqlType::NVarchar(None, length)),
         SQL_VARBINARY => variable_length(column_size, SQL_PREC_BIGCHARBINARY)
             .map(|length| SqlType::VarBinary(None, length)),
-        SQL_LONGVARCHAR | SQL_WLONGVARCHAR | SQL_LONGVARBINARY | SQL_SS_XML | SQL_SS_UDT => None,
+        SQL_LONGVARCHAR => (!long_as_max).then_some(SqlType::Text(None)),
+        SQL_WLONGVARCHAR => (!long_as_max).then_some(SqlType::NText(None)),
+        SQL_LONGVARBINARY => (!long_as_max).then_some(SqlType::Image(None)),
+        SQL_SS_XML | SQL_SS_UDT => None,
         other => return Err(ParamBuildError::UnsupportedSqlType(other)),
     })
 }
@@ -1267,13 +1296,8 @@ fn convert_character_sql(
         (SQL_VARCHAR, None) => SqlType::VarcharMax(value),
         (SQL_WVARCHAR, Some(length)) => SqlType::NVarchar(value, length),
         (SQL_WVARCHAR, None) => SqlType::NVarcharMax(value),
-        // `text` / `ntext` would be the msodbcsql default, but `mssql-tds`
-        // serializes them in bulk-copy ROW format and the server rejects the
-        // RPC (AB#47591). `max` is what msodbcsql itself sends under
-        // `SQL_COPT_SS_LONGASMAX`, and the `ColumnSize` bound above still
-        // applies, so only the declaration differs. Restoring it is AB#47592.
-        (SQL_LONGVARCHAR, _) => SqlType::VarcharMax(value),
-        (SQL_WLONGVARCHAR, _) => SqlType::NVarcharMax(value),
+        (SQL_LONGVARCHAR, _) => SqlType::Text(value),
+        (SQL_WLONGVARCHAR, _) => SqlType::NText(value),
         // Unreachable: the match above already rejected everything else.
         (other, _) => return Err(ParamBuildError::UnsupportedSqlType(other)),
     })
@@ -1371,11 +1395,7 @@ fn convert_binary_sql(
         (SQL_BINARY, Some(length)) => SqlType::Binary(Some(bytes), length),
         (SQL_VARBINARY, Some(length)) => SqlType::VarBinary(Some(bytes), length),
         (SQL_VARBINARY, None) => SqlType::VarBinaryMax(Some(bytes)),
-        // `image` would be the msodbcsql default; `mssql-tds` serializes it in
-        // bulk-copy ROW format and the server rejects the RPC, so `max` goes out
-        // instead - the same substitution `text`/`ntext` carry (AB#47592). The
-        // `ColumnSize` bound above still applies, so only the declaration differs.
-        (SQL_LONGVARBINARY, _) => SqlType::VarBinaryMax(Some(bytes)),
+        (SQL_LONGVARBINARY, _) => SqlType::Image(Some(bytes)),
         // Unreachable: the match above already rejected everything else.
         (other, _) => return Err(ParamBuildError::UnsupportedSqlType(other)),
     })
@@ -1976,21 +1996,19 @@ fn typed_null(
             Some(length) => SqlType::Varchar(None, length),
             None => SqlType::VarcharMax(None),
         },
-        // TODO: AB#47592
-        SQL_LONGVARCHAR => SqlType::VarcharMax(None),
+        SQL_LONGVARCHAR => SqlType::Text(None),
         SQL_WCHAR => SqlType::NChar(None, fixed_length(column_size, SQL_PREC_NCHAR)?),
         SQL_WVARCHAR => match variable_length(column_size, SQL_PREC_NCHAR) {
             Some(length) => SqlType::NVarchar(None, length),
             None => SqlType::NVarcharMax(None),
         },
-        // TODO: AB#47592
-        SQL_WLONGVARCHAR => SqlType::NVarcharMax(None),
+        SQL_WLONGVARCHAR => SqlType::NText(None),
         SQL_BINARY => SqlType::Binary(None, fixed_length(column_size, SQL_PREC_BIGCHARBINARY)?),
         SQL_VARBINARY => match variable_length(column_size, SQL_PREC_BIGCHARBINARY) {
             Some(length) => SqlType::VarBinary(None, length),
             None => SqlType::VarBinaryMax(None),
         },
-        SQL_LONGVARBINARY => SqlType::VarBinaryMax(None),
+        SQL_LONGVARBINARY => SqlType::Image(None),
         SQL_GUID => SqlType::Uuid(None),
         SQL_TYPE_DATE => SqlType::Date(None),
         SQL_TYPE_TIME | SQL_SS_TIME2 => {
@@ -2301,7 +2319,8 @@ mod tests {
                     })
                 );
                 let (parameter, outcome) =
-                    unsafe { bound_param_to_rpc(Some("@P1".into()), &binding, None) }.unwrap();
+                    unsafe { bound_param_to_rpc(Some("@P1".into()), &binding, None, false) }
+                        .unwrap();
                 assert_eq!(outcome, ConvOk::Exact);
                 assert_eq!(
                     rpc_parameter_declaration(&parameter).unwrap(),
@@ -4343,22 +4362,108 @@ mod tests {
     /// stays PLP; `ColumnSize` 0 is the `max` spelling and needs none.
     #[test]
     fn dae_streamed_declaration_narrows_only_a_bounded_parameter() {
-        assert_eq!(dae_streamed_declaration(SQL_VARCHAR, 0), Ok(None));
+        assert_eq!(dae_streamed_declaration(SQL_VARCHAR, 0, false), Ok(None));
         assert_eq!(
-            dae_streamed_declaration(SQL_VARCHAR, 10),
+            dae_streamed_declaration(SQL_VARCHAR, 10, false),
             Ok(Some(SqlType::Varchar(None, 10)))
         );
         assert_eq!(
-            dae_streamed_declaration(SQL_WVARCHAR, 10),
+            dae_streamed_declaration(SQL_WVARCHAR, 10, false),
             Ok(Some(SqlType::NVarchar(None, 10)))
         );
         assert_eq!(
-            dae_streamed_declaration(SQL_VARBINARY, 10),
+            dae_streamed_declaration(SQL_VARBINARY, 10, false),
             Ok(Some(SqlType::VarBinary(None, 10)))
         );
-        // `text`/`ntext`/`image` keep the `max` substitution they get on the
-        // materialized path (AB#47592).
-        assert_eq!(dae_streamed_declaration(SQL_LONGVARCHAR, 10), Ok(None));
+        for (sql_type, legacy) in [
+            (SQL_LONGVARCHAR, SqlType::Text(None)),
+            (SQL_WLONGVARCHAR, SqlType::NText(None)),
+            (SQL_LONGVARBINARY, SqlType::Image(None)),
+        ] {
+            assert_eq!(
+                dae_streamed_declaration(sql_type, 10, false),
+                Ok(Some(legacy))
+            );
+            assert_eq!(dae_streamed_declaration(sql_type, 10, true), Ok(None));
+        }
+    }
+
+    #[test]
+    fn long_as_max_controls_values_nulls_and_buffered_dae_without_changing_bounds() {
+        use mssql_tds::test_client_support::rpc_parameter_declaration;
+
+        for (sql_type, c_type, legacy, max, wire) in [
+            (
+                SQL_LONGVARCHAR,
+                SQL_C_CHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
+            (
+                SQL_WLONGVARCHAR,
+                SQL_C_CHAR,
+                "ntext",
+                "nvarchar(MAX)",
+                "NVarcharMax",
+            ),
+            (
+                SQL_LONGVARBINARY,
+                SQL_C_BINARY,
+                "image",
+                "varbinary(MAX)",
+                "VarBinaryMax",
+            ),
+        ] {
+            for long_as_max in [false, true] {
+                let expected = if long_as_max { max } else { legacy };
+                for length in [3, 0, SQL_NULL_DATA] {
+                    let mut bytes = *b"abc";
+                    let mut indicator = length;
+                    let mut binding = param(c_type, bytes.as_mut_ptr().cast(), &mut indicator);
+                    binding.sql_type = sql_type;
+                    binding.column_size = 3;
+                    let (rpc, _) = unsafe {
+                        bound_param_to_rpc(Some("@P1".into()), &binding, None, long_as_max)
+                    }
+                    .unwrap();
+                    assert_eq!(rpc_parameter_declaration(&rpc).unwrap(), expected);
+                    let data = if length == 0 {
+                        b"".as_slice()
+                    } else {
+                        b"abc".as_slice()
+                    };
+                    let (buffered, _) = buffered_dae_to_rpc(
+                        "@P1".into(),
+                        &binding,
+                        None,
+                        data,
+                        length == SQL_NULL_DATA,
+                        long_as_max,
+                    )
+                    .unwrap();
+                    assert_eq!(rpc_parameter_declaration(&buffered).unwrap(), expected);
+                    let framing = format!("{buffered:?}");
+                    assert!(
+                        framing.contains(&format!("Materialized({wire}(")),
+                        "buffered DAE must keep PLP framing: {framing}"
+                    );
+                }
+                let mut bytes = *b"abcd";
+                let mut indicator = 4;
+                let mut binding = param(c_type, bytes.as_mut_ptr().cast(), &mut indicator);
+                binding.sql_type = sql_type;
+                binding.column_size = 3;
+                assert!(matches!(
+                    unsafe { bound_param_to_rpc(None, &binding, None, long_as_max) },
+                    Err(ParamBuildError::StringTruncation)
+                ));
+                assert!(matches!(
+                    buffered_dae_to_rpc("@P1".into(), &binding, None, b"abcd", false, long_as_max),
+                    Err(ParamBuildError::StringTruncation)
+                ));
+            }
+        }
     }
 
     /// A UTF-8 sequence split across two chunks is reassembled rather than
@@ -5143,9 +5248,8 @@ mod tests {
         let value = convert_binary(SQL_VARBINARY, 0, &[1, 2]).unwrap();
         assert_eq!(value, SqlType::VarBinaryMax(Some(vec![1, 2])));
 
-        // `image` has no declared length; AB#47592 sends it as `max`.
         let value = convert_binary(SQL_LONGVARBINARY, 16, &[1, 2]).unwrap();
-        assert_eq!(value, SqlType::VarBinaryMax(Some(vec![1, 2])));
+        assert_eq!(value, SqlType::Image(Some(vec![1, 2])));
     }
 
     /// Overflow that is entirely `0x00` is padding and is dropped silently -
@@ -5163,7 +5267,7 @@ mod tests {
         // enforced bound is not, so the trim has to be asserted separately from
         // the declaration.
         let value = convert_binary(SQL_LONGVARBINARY, 2, &[1, 2, 0, 0]).unwrap();
-        assert_eq!(value, SqlType::VarBinaryMax(Some(vec![1, 2])));
+        assert_eq!(value, SqlType::Image(Some(vec![1, 2])));
     }
 
     /// Any non-zero byte past the declared length is data, so it is `22001`
@@ -5232,7 +5336,7 @@ mod tests {
         assert_eq!(value, SqlType::VarBinary(Some(Vec::new()), 4));
 
         let value = convert_binary(SQL_LONGVARBINARY, 0, &[]).unwrap();
-        assert_eq!(value, SqlType::VarBinaryMax(Some(Vec::new())));
+        assert_eq!(value, SqlType::Image(Some(Vec::new())));
     }
 
     /// `ColumnSize` past the non-`max` bound widens to `max` here, matching
@@ -5301,10 +5405,10 @@ mod tests {
         let cases: &[(SqlSmallInt, SqlType)] = &[
             (SQL_CHAR, SqlType::Char(None, 8)),
             (SQL_VARCHAR, SqlType::Varchar(None, 8)),
-            (SQL_LONGVARCHAR, SqlType::VarcharMax(None)),
+            (SQL_LONGVARCHAR, SqlType::Text(None)),
             (SQL_WCHAR, SqlType::NChar(None, 8)),
             (SQL_WVARCHAR, SqlType::NVarchar(None, 8)),
-            (SQL_WLONGVARCHAR, SqlType::NVarcharMax(None)),
+            (SQL_WLONGVARCHAR, SqlType::NText(None)),
         ];
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
             for (sql_type, expected) in cases {
@@ -5678,10 +5782,10 @@ mod tests {
         let cases: &[(SqlSmallInt, SqlType)] = &[
             (SQL_CHAR, SqlType::Char(None, 4)),
             (SQL_VARCHAR, SqlType::Varchar(None, 4)),
-            (SQL_LONGVARCHAR, SqlType::VarcharMax(None)),
+            (SQL_LONGVARCHAR, SqlType::Text(None)),
             (SQL_WCHAR, SqlType::NChar(None, 4)),
             (SQL_WVARCHAR, SqlType::NVarchar(None, 4)),
-            (SQL_WLONGVARCHAR, SqlType::NVarcharMax(None)),
+            (SQL_WLONGVARCHAR, SqlType::NText(None)),
         ];
         for (sql_type, expected) in cases {
             let got = convert_int_to_char(SQL_C_SLONG, 12, *sql_type, 4).unwrap();
@@ -6179,7 +6283,7 @@ mod tests {
             p.buffer_length = 8;
             assert!(unsafe { data_at_exec_indicator(&p) }.is_none());
             let (rpc, outcome) =
-                unsafe { bound_param_to_rpc(Some("@P1".into()), &p, None) }.unwrap();
+                unsafe { bound_param_to_rpc(Some("@P1".into()), &p, None, false) }.unwrap();
             assert!(
                 mssql_tds::test_client_support::rpc_parameter_status(&rpc)
                     .contains(StatusFlags::BY_REF_VALUE)
@@ -6211,7 +6315,7 @@ mod tests {
                 let mut p = param(SQL_C_CHAR, value.as_mut_ptr().cast(), &mut length);
                 p.input_output_type = direction;
                 p.sql_type = SQL_INTEGER;
-                let (rpc, _) = unsafe { bound_param_to_rpc(name, &p, None) }.unwrap();
+                let (rpc, _) = unsafe { bound_param_to_rpc(name, &p, None, false) }.unwrap();
                 assert_eq!(
                     rpc_parameter_status(&rpc).bits(),
                     expected.bits(),

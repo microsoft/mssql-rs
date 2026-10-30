@@ -136,6 +136,7 @@ fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
         },
         SqlType::Text(_) => ParameterMetadata::Scalar("text"),
         SqlType::NText(_) => ParameterMetadata::Scalar("ntext"),
+        SqlType::Image(_) => ParameterMetadata::Scalar("image"),
         SqlType::Json(_) => ParameterMetadata::Scalar("json"),
         SqlType::Xml(_) => ParameterMetadata::Scalar("xml"),
         SqlType::Uuid(_) => ParameterMetadata::Scalar("uniqueidentifier"),
@@ -905,11 +906,28 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tvp_table, rewrite_placeholders, tvp_column_definition};
+    use super::{
+        ParameterMetadata, build_tvp_table, rewrite_placeholders, sql_type_metadata,
+        tvp_column_definition,
+    };
     use crate::types::ParameterHint;
     use mssql_tds::datatypes::sqltypes::SqlType;
     use pyo3::types::PyAnyMethods;
     use pyo3::{IntoPyObject, Python};
+
+    #[test]
+    fn image_metadata_retains_its_legacy_declaration() {
+        for value in [None, Some(vec![]), Some(vec![0, 0xff])] {
+            assert_eq!(
+                sql_type_metadata(&SqlType::Image(value)),
+                ParameterMetadata::Scalar("image")
+            );
+        }
+        assert_ne!(
+            sql_type_metadata(&SqlType::Image(None)),
+            sql_type_metadata(&SqlType::VarBinaryMax(None))
+        );
+    }
 
     #[test]
     fn tvp_column_definitions_preserve_numeric_and_temporal_metadata() {

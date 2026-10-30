@@ -85,15 +85,18 @@ jobs:
     displayName: 'Install Docker'
   - template: /.pipeline/templates/install-host-dependency.yaml
     parameters:
+      installAzCli: true
       installDocker: true
+  # The build images are pulled from the 1P registry (SFI-AR1.2.7).
+  - template: /.pipeline/templates/azure-cli-login-template.yml
   - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
     parameters:
-      image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest'
+      image: 'tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest'
       target: x86_64-unknown-linux-gnu
       rid: linux-x64
   - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
     parameters:
-      image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest'
+      image: 'tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest'
       target: x86_64-unknown-linux-musl
       rid: linux-musl-x64
   - task: PublishPipelineArtifact@1
@@ -123,15 +126,18 @@ jobs:
     displayName: 'Install Docker'
   - template: /.pipeline/templates/install-host-dependency.yaml
     parameters:
+      installAzCli: true
       installDocker: true
+  # The build images are pulled from the 1P registry (SFI-AR1.2.7).
+  - template: /.pipeline/templates/azure-cli-login-template.yml
   - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
     parameters:
-      image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
+      image: 'tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest'
       target: aarch64-unknown-linux-gnu
       rid: linux-arm64
   - template: /.pipeline/templates/build-mssql-sqlcmd-linux-template.yml
     parameters:
-      image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest'
+      image: 'tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest'
       target: aarch64-unknown-linux-musl
       rid: linux-musl-arm64
   - task: PublishPipelineArtifact@1

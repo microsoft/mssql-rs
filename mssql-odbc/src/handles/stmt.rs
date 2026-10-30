@@ -850,6 +850,7 @@ pub(crate) struct DaeParam {
     /// The binding as of this execution, kept so a buffered value can be
     /// declared and converted from `ParameterType` when it closes.
     pub(crate) binding: BoundParam,
+    pub(crate) long_as_max: bool,
     /// The binding's UDT identity, owned here because the descriptor snapshot
     /// it came from does not outlive the execute that parks this sequence.
     pub(crate) udt_names: Option<Arc<UdtNames>>,
@@ -869,6 +870,7 @@ impl DaeParam {
         length_limit: Option<DaeLengthLimit>,
         binding: BoundParam,
         udt_names: Option<Arc<UdtNames>>,
+        long_as_max: bool,
     ) -> Self {
         Self {
             bound_index,
@@ -877,6 +879,7 @@ impl DaeParam {
             buffered,
             length_limit,
             binding,
+            long_as_max,
             udt_names,
             transcode: None,
         }
@@ -903,7 +906,7 @@ impl DaeParam {
             strlen_or_ind_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
         };
-        Self::new(bound_index, expected_len, false, None, binding, None)
+        Self::new(bound_index, expected_len, false, None, binding, None, false)
     }
 
     /// Same, with the binding's C and SQL types set, for the tests that depend

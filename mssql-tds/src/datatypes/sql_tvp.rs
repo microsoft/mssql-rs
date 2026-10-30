@@ -488,10 +488,13 @@ pub(crate) async fn write_tvp_column_metadata(
 
     for column in columns {
         // Legacy LOB types are not permitted in table types.
-        if matches!(column.column_type, SqlType::Text(_) | SqlType::NText(_)) {
+        if matches!(
+            column.column_type,
+            SqlType::Text(_) | SqlType::NText(_) | SqlType::Image(_)
+        ) {
             return Err(Error::UsageError(
-                "Legacy LOB types (text/ntext) are not allowed as TVP columns; \
-                 use varchar(max)/nvarchar(max) instead"
+                "Legacy LOB types (text/ntext/image) are not allowed as TVP columns; \
+                 use varchar(max)/nvarchar(max)/varbinary(max) instead"
                     .to_string(),
             ));
         }
@@ -1247,15 +1250,22 @@ mod tests {
         assert!(matches!(result, Err(Error::UsageError(_))));
     }
 
-    /// Legacy LOB types (`text`/`ntext`) are not valid TVP column types and are
+    /// Legacy LOB types (`text`/`ntext`/`image`) are not valid TVP column types and are
     /// rejected while writing column metadata.
     #[tokio::test]
     async fn test_write_tvp_column_metadata_lob_column_rejected() {
-        let columns = vec![TvpColumnDef::new(SqlType::Text(None))];
-        let mut mock = MockNetworkWriter::new(4096);
-        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        let result = write_tvp_column_metadata(&mut writer, &columns, &default_collation()).await;
-        assert!(matches!(result, Err(Error::UsageError(_))));
+        for value in [
+            SqlType::Text(None),
+            SqlType::NText(None),
+            SqlType::Image(None),
+        ] {
+            let columns = vec![TvpColumnDef::new(value)];
+            let mut mock = MockNetworkWriter::new(4096);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            let result =
+                write_tvp_column_metadata(&mut writer, &columns, &default_collation()).await;
+            assert!(matches!(result, Err(Error::UsageError(_))));
+        }
     }
 
     /// A row whose value count differs from the column count is rejected while
