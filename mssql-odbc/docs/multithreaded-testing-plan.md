@@ -94,9 +94,14 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
   during `SQLCancel`, whose DM diagnostic cleanup is not protected by unixODBC's
   `Threading=1`. The post-close invalid-state probes also hold
   `diagnostics_mutex_` until a harmless attribute read clears their DM-generated
-  errors. All other calls still overlap diagnostic reads, and no mode or
-  assertion is skipped. Rust cancellation tests cover driver-level statement
-  lock contention directly, without the unsafe DM overlap.
+  errors. The gate blocks new readers once exclusive cleanup is queued;
+  existing readers finish before cleanup starts. This avoids relying on
+  `std::shared_mutex` fairness under continuous diagnostic reads. The
+  driver-independent `odbc_diagnostics_mutex_test` covers reader overlap,
+  writer priority, exclusion, and progress under sustained readers. All other
+  calls still overlap diagnostic reads, and no mode or assertion is skipped.
+  Rust cancellation tests cover driver-level statement lock contention
+  directly, without the unsafe DM overlap.
 - There is no mode that runs the whole body on one shared STMT or descriptor.
   Bound buffers live on each body's stack, and even without bindings a STMT
   holds one cursor:

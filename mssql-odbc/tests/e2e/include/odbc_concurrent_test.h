@@ -931,7 +931,8 @@ inline bool CheckDiagnostics(SQLSMALLINT type, SQLHANDLE handle, std::string& er
 // thread reports it, so no thread writes the test's result while the owner
 // reads it. MSSQL_ODBC_MT_THREADS=1 runs the owner alone, which is how a
 // SharedStmt failure is told apart from a plain bug in the body.
-// CancelIdleStatement excludes observers only during SQLCancel, whose DM
+// CancelIdleStatement stops admitting diagnostic readers before waiting for
+// existing readers to leave, then excludes them during SQLCancel, whose DM
 // diagnostic-list cleanup is not protected by unixODBC's Threading=1.
 template <typename T>
 void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
@@ -948,7 +949,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     std::shared_mutex handles_mutex;
     SQLHSTMT observed_stmt = SQL_NULL_HSTMT;
     SQLHDBC observed_dbc = SQL_NULL_HDBC;
-    std::shared_mutex* observed_diagnostics_mutex = nullptr;
+    OdbcDiagnosticsMutex* observed_diagnostics_mutex = nullptr;
     std::atomic<bool> retracting{false};
     std::atomic<bool> stop{false};
     std::atomic<bool> observer_failed{false};
@@ -995,7 +996,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                         {
                             std::shared_lock<std::shared_mutex> lock(handles_mutex);
                             if (observed_stmt != SQL_NULL_HSTMT) {
-                                std::shared_lock<std::shared_mutex> diagnostics_lock(
+                                std::shared_lock<OdbcDiagnosticsMutex> diagnostics_lock(
                                     *observed_diagnostics_mutex);
                                 if (!CheckDiagnostics(SQL_HANDLE_STMT, observed_stmt, error) ||
                                     !CheckDiagnostics(SQL_HANDLE_DBC, observed_dbc, error)) {
@@ -1258,7 +1259,7 @@ bool Register(const char* suite, const char* name, const char* file, int line, u
         SQLHENV ConcurrentEnv() const { return env_; }                                         \
         SQLHDBC ConcurrentDbc() const { return dbc_; }                                         \
         SQLHSTMT ConcurrentStmt() const { return stmt_; }                                      \
-        std::shared_mutex& ConcurrentDiagnosticsMutex() { return diagnostics_mutex_; }        \
+        OdbcDiagnosticsMutex& ConcurrentDiagnosticsMutex() { return diagnostics_mutex_; }    \
                                                                                                \
        private:                                                                                \
         ::odbc_concurrency::Mode mode_;                                                        \

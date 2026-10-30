@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "odbc_diagnostics_mutex.h"
+
 #include <gtest/gtest.h>
 
 #ifdef _WIN32
@@ -258,7 +260,7 @@ protected:
     // remain concurrent with the executing call.
     SQLRETURN CancelIdleStatement() {
         const auto requested = std::chrono::steady_clock::now();
-        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+        std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
         const auto locked = std::chrono::steady_clock::now();
         const SQLRETURN rc = SQLCancel(stmt_);
         idle_cancel_lock_wait_ = locked - requested;
@@ -276,7 +278,7 @@ protected:
                " sqlcancel_ms=" +
                std::to_string(duration_cast<milliseconds>(idle_cancel_call_).count());
     }
-    std::shared_mutex diagnostics_mutex_;
+    OdbcDiagnosticsMutex diagnostics_mutex_;
 
 private:
     SQLHENV lent_env_ = SQL_NULL_HENV;

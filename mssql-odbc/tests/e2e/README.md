@@ -553,6 +553,17 @@ a concurrency failure never hides a parity verdict. Nothing to add in
 `CMakeLists.txt`; reconfigure after converting a file. Both entries pass
 `--gtest_filter`, which overrides a `GTEST_FILTER` environment variable.
 
+`SharedStmt` observers share a writer-preferring diagnostics gate. Idle
+cancellation and explicit Driver Manager diagnostic cleanup stop new readers
+before waiting for in-flight reads to finish, so a busy observer loop cannot
+starve those operations. Observers still overlap outside that cleanup window;
+running-command cancellation remains concurrent with the executing call.
+`odbc_diagnostics_mutex_test` checks this gate without a driver or SQL Server:
+
+```powershell
+ctest --test-dir build -C Debug -R '^odbc_diagnostics_mutex_test$' --output-on-failure
+```
+
 ```bash
 ctest --test-dir build -L mt                            # every concurrent variant, 2 x 1
 ./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt, gdb stacks
