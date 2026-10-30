@@ -763,7 +763,8 @@ template <typename T>
 bool RunSharedDbcIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
                            const std::string& tag, WorkerResult& result,
                            RetainedFixtures<T>& retained,
-                           std::chrono::steady_clock::time_point deadline) {
+                           std::chrono::steady_clock::time_point deadline,
+                           void (*wait)(std::chrono::microseconds) = nullptr) {
     std::minstd_rand rng(static_cast<unsigned>(worker) * 1000003u +
                          static_cast<unsigned>(iteration) + 1u);
     for (int attempt = 0;; ++attempt) {
@@ -781,16 +782,27 @@ bool RunSharedDbcIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int 
                 return false;
             case Outcome::kConflict:
                 ++result.conflicts;
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now < deadline) {
+                        const std::chrono::microseconds pause = (std::min)(
+                            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now),
+                            ConflictBackoff(attempt, rng));
+                        if (wait != nullptr) {
+                            wait(pause);
+                        } else {
+                            std::this_thread::sleep_for(pause);
+                        }
+                    }
+                }
+                // Checked after the wait: a wait clamped to the deadline must not
+                // start another attempt past it.
                 if (std::chrono::steady_clock::now() >= deadline) {
                     ADD_FAILURE() << tag << ": connection still busy after " << (attempt + 1)
                                   << " attempts, at the retry deadline; last: "
                                   << FirstMessage(parts);
                     return false;
                 }
-                std::this_thread::sleep_for((std::min)(
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        deadline - std::chrono::steady_clock::now()),
-                    ConflictBackoff(attempt, rng)));
                 break;
         }
     }
