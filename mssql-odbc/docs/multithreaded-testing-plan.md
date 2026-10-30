@@ -316,10 +316,17 @@ Measured 2026-10-08 on both drivers unless noted.
   that date (two bodies, each in four concurrency modes).
   A Linux unixODBC 2.3.9 standalone mock-driver probe reproduced malformed
   diagnostic records through the DM at `Threading=1`, without mssql-odbc or
-  SQL Server. Direct-driver observation avoided that DM corruption, but Windows
-  msodbcsql can treat cancellation overlapping its diagnostic lock as a no-op.
-  The e2e observer gate therefore excludes only those unsafe overlaps while
-  keeping the idle-close contract deterministic on both drivers.
+  SQL Server. Direct-driver observation avoided that unixODBC corruption. A
+  separate Windows msodbcsql issue is also present through the DM: the DM lets
+  `SQLCancel` bypass its per-handle lock, so idle cancellation can overlap a
+  STMT diagnostic read that holds msodbcsql's `csStmt`. If `SQLCancel` cannot
+  take that lock, msodbcsql follows its cross-thread path and skips the idle
+  cursor close; the next command then fails with `HY000` "Connection is busy".
+  This path is visible in msodbcsql's `ExportImp::SQLGetDiagRec`
+  (`sqlcerr.cpp`) and `ExportImp::SQLCancel` (`sqlcmisc.cpp:754`); the native
+  `ODBC Driver 18 for SQL Server` SharedStmt probe reproduced it in 37/300
+  no-gate runs at 2 x 1, versus 0/300 with the gate. The e2e observer gate
+  excludes those overlaps in both parity legs.
   Idle cancellation now abandons an owned pending response via ATTENTION,
   using `SQL_ATTR_CONNECTION_TIMEOUT` (zero selects 120 seconds) for settlement.
   It does not change the normal `SQLFreeStmt(SQL_CLOSE)` drain. The mock tests
