@@ -64,7 +64,14 @@ possible explanation, not a confirmed cause. `PIP_CERT` explicitly aligns pip
 with the agent's Windows trusted roots.
 
 If pip still reports `CERTIFICATE_VERIFY_FAILED`, check that the required issuer
-is installed in the agent's Windows trusted-root store. A Docker timeout reaching
+is installed in the agent's Windows trusted-root store. `PIP_CERT` replaces pip's
+bundled CA roots for subsequent pip calls in the job, including Windows PR
+validation. The export is a snapshot of roots already installed on the agent;
+it does not include roots Windows might retrieve later through automatic root
+updates. An endpoint whose issuer is missing from this snapshot can fail even
+if pip's bundled CA roots would have trusted it; there is no certifi fallback.
+
+A Docker timeout reaching
 `https://ghcr.io/v2/` is separate: check registry connectivity and the Docker
 daemon's proxy/egress configuration on the failing agent pool.
 
@@ -76,6 +83,10 @@ defaults for PR validation; only OneBranch callers select ACR. Image repositorie
 tags, architectures, and the unmodified consumer images used by install checks
 are unchanged. Both official and non-official pipeline definitions must be
 authorized to use the service connection.
+
+The manual `OneBranch/PublishFeeds-Sandbox.yml` pipeline still pulls its Python
+build images from GHCR on the same pools and may encounter the same connectivity
+failure. Migrating that sandbox to ACR is a separate follow-up.
 
 ### docker-cargo-run.sh
 
