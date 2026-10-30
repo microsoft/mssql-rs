@@ -79,6 +79,7 @@
 //  38.  RowReturningArrayTimeoutDuringNavigation - cancel and reuse
 
 #include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 #include "odbc_sql_server_types.h"
 
 // From msodbcsql.h, which this suite does not include: `SQL_COPT_SS_BASE_EX + 3`,
@@ -2564,7 +2565,7 @@ TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
 // before its first row returns SQL_SUCCESS_WITH_INFO; the fetch that meets a
 // set failing after its row returns SQL_NO_DATA; navigation that discards a
 // failed set's unread rest posts the error but returns SQL_SUCCESS.
-TEST_F(ParamArrayTest, SetErrorsAreReportedByTheCallThatReachesThem) {
+ODBC_TEST_F(ParamArrayTest, SetErrorsAreReportedByTheCallThatReachesThem) {
     SQLINTEGER values[3] = {1, 2, 3};
     SQLLEN indicators[3] = {};
     SQLUSMALLINT status[3] = {};
@@ -2630,11 +2631,15 @@ TEST_F(ParamArrayTest, SetErrorsAreReportedByTheCallThatReachesThem) {
 // msodbcsql 18.6.2.1 presents a set that fails before its first row, with no
 // status array bound, as an error result: no columns and no cursor to fetch
 // or close, while SQLMoreResults still reaches the later sets.
-TEST_F(ParamArrayTest, FailedSetWithoutStatusArrayIsAnErrorResult) {
+ODBC_TEST_F(ParamArrayTest, FailedSetWithoutStatusArrayIsAnErrorResult) {
     SQLINTEGER values[3] = {1, 2, 3};
     SQLLEN indicators[3] = {};
     SQLULEN processed = 0;
     const auto expect_error_result = [&](const char* fetch_state) {
+        // The Driver Manager may raise some of these errors itself; its list
+        // is cleaned up outside unixODBC's statement lock, so keep SharedStmt
+        // observers out until a non-mutating call has cleared it.
+        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
         SQLSMALLINT columns = -1;
         ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(0, columns);
@@ -2642,6 +2647,9 @@ TEST_F(ParamArrayTest, FailedSetWithoutStatusArrayIsAnErrorResult) {
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, fetch_state);
         EXPECT_EQ(SQL_ERROR, SQLCloseCursor(stmt_));
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+        SQLULEN timeout = 0;
+        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, &timeout, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
     };
 
     // SQLMoreResults positions on the failed second set.
@@ -2674,7 +2682,7 @@ TEST_F(ParamArrayTest, FailedSetWithoutStatusArrayIsAnErrorResult) {
 // msodbcsql 18.6.2.1 posts an error inside the rows SQLMoreResults discards
 // without failing the call, but an error from a later statement of the set,
 // after its row set ends, fails SQLMoreResults like any navigation error.
-TEST_F(ParamArrayTest, ErrorAfterTheRowSetFailsMoreResults) {
+ODBC_TEST_F(ParamArrayTest, ErrorAfterTheRowSetFailsMoreResults) {
     SQLINTEGER values[2] = {1, 2};
     SQLLEN indicators[2] = {};
     SQLUSMALLINT status[2] = {};

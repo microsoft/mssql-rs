@@ -244,8 +244,9 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
                 Err(rc) => rc,
             };
-            // A settled empty set that failed with no status array is an error
-            // result with no columns, as msodbcsql presents it.
+            // An empty set reached by a navigation that reports a set failure
+            // with no status array is an error result with no columns, as
+            // msodbcsql presents it, whichever set failed.
             let error_result = settled.is_some() && array_rc == SQL_ERROR;
             let metadata = if error_result { Vec::new() } else { metadata };
             let ird_ok = populate_ird(stmt, &metadata).is_ok();

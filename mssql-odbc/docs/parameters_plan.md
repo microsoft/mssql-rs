@@ -874,8 +874,10 @@ accept/store contract itself belongs to AB#46377 and is documented in
   like any navigation error. A successful set is never marked
   `SQL_PARAM_ERROR` merely for returning rows, and later results remain
   fetchable after a per-set error. Pending results keep the connection claimed
-  until they are navigated or closed. A set that fails before its first row
-  with no status array bound is an error result, not a cursor:
+  until they are navigated or closed. With no status array bound, a navigation
+  that reports a server-side set failure and lands on an empty set presents an
+  error result, not a cursor, whichever set failed (a set with rows stays a
+  cursor; a client-side conversion failure does not count):
   `SQLNumResultCols` reports zero columns, `SQLDescribeCol` returns `07005`,
   `SQLFetch` and `SQLCloseCursor` return `24000` (the batch stays open), and
   `SQLGetData` returns `HY010` until `SQLMoreResults` advances past it.

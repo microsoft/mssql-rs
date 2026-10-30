@@ -674,7 +674,15 @@ fn finish_parameter_array(
             Ok(done) => settled = done,
             Err(error) => {
                 error!(%error, "SQLExecute: parameter-array execution failed");
-                return fail_with_tds(dbc, stmt, statement_handle, client, &error);
+                return fail_parameter_array(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    client,
+                    result,
+                    batch,
+                    &error,
+                );
             }
         }
         if let Some(more) = client.take_prepared_batch_results() {
@@ -708,6 +716,7 @@ fn finish_parameter_array(
         return SQL_ERROR;
     };
     stmt_state.begin_batch(metadata);
+    let server_failure = result.rows.iter().any(|row| !row.errors.is_empty());
     let mut rc = report_parameter_array(
         &mut stmt_state,
         result,
@@ -724,9 +733,11 @@ fn finish_parameter_array(
     stmt_state.clear_exhaustion_state();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-    // A settled empty first set that failed with no status array is an error
-    // result with no columns, as msodbcsql presents it.
-    let error_result = cursor_open && settled.is_some() && rc == SQL_ERROR;
+    // msodbcsql presents an empty set reached by a navigation that reports a
+    // server-side set failure, with no status array, as an error result with
+    // no columns, whichever set failed (measured on 18.6.2.1). Client-side
+    // conversion failures never reached the server and do not.
+    let error_result = cursor_open && settled.is_some() && server_failure && rc == SQL_ERROR;
     if cursor_open {
         stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
         stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -757,6 +768,31 @@ fn finish_parameter_array(
         return SQL_ERROR;
     }
     rc
+}
+
+/// Fails an executed array whose first-row read failed, still publishing the
+/// sets the server completed before the failure, ahead of its diagnostic, in
+/// the order their tokens were read.
+fn fail_parameter_array(
+    dbc: &crate::handles::DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut client: WireLease,
+    result: PreparedBatchResult,
+    mut batch: BatchClientResults,
+    error: &TdsError,
+) -> SqlReturn {
+    let info_messages = client.take_info_messages();
+    super::exec_common::return_client_idle(dbc, statement_handle, client);
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        report_parameter_array(&mut stmt_state, result, &mut batch, None, false, None);
+        post_tds_error(&mut stmt_state, error, SQLSTATE_HY000);
+        post_tds_info_messages(&mut stmt_state, &info_messages);
+    } else {
+        error!("stmt mutex poisoned — could not post TDS error");
+    }
+    super::exec_common::clear_exec_started(stmt);
+    SQL_ERROR
 }
 
 #[derive(Debug)]

@@ -719,6 +719,10 @@ pub struct TdsClient {
     /// applied its drained control tokens while the transport remained live.
     interrupted_read_settled: bool,
 
+    /// Set while [`abandon_query`](Self::abandon_query) discards a response:
+    /// discarded output parameters are not decrypted, as on the ATTENTION path.
+    discarding_response: bool,
+
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
 
@@ -831,6 +835,7 @@ impl TdsClient {
             remaining_request_timeout: None,
             cancel_handle: None,
             interrupted_read_settled: false,
+            discarding_response: false,
             empty_metadata: Vec::new(),
             active_row_read_state: ActiveRowReadState::Idle,
             row_already_positioned: false,
@@ -3121,6 +3126,8 @@ impl TdsClient {
         // anything reads it -- but the contract the accessor documents is "the
         // most recently *sent* message", and only this order matches it.
         self.code_page_conversion_loss = message.code_page_conversion_loss();
+        // A dropped `abandon_query` must not hide this response's outputs.
+        self.discarding_response = false;
         Ok(())
     }
 
@@ -6397,8 +6404,9 @@ impl TdsClient {
         // disabled), consistent with how encrypted result columns are decoded.
         let crypto = match token.column_metadata.crypto_metadata.as_ref() {
             Some(crypto)
-                if self.effective_command_ce_setting()
-                    == ExecutionColumnEncryptionSetting::Enabled =>
+                if !self.discarding_response
+                    && self.effective_command_ce_setting()
+                        == ExecutionColumnEncryptionSetting::Enabled =>
             {
                 crypto
             }
@@ -8969,11 +8977,13 @@ impl TdsClient {
     /// settlement.
     pub async fn abandon_query(&mut self, timeout_secs: u32) -> TdsResult<()> {
         let reported = self.info_messages.len();
+        self.discarding_response = true;
         let result = if !self.has_open_batch() || self.transport.response_fully_received() {
             self.close_query().await
         } else {
             self.cancel_query(timeout_secs).await
         };
+        self.discarding_response = false;
         self.info_messages.truncate(reported);
         self.prepared_batch = None;
         match result {
@@ -18812,6 +18822,40 @@ mod tests {
             .collect();
         assert_eq!(messages, ["before close"]);
         assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+    }
+
+    /// Like the ATTENTION path, the local discard does not decrypt an
+    /// encrypted output it throws away, so a missing key cannot fail close.
+    #[tokio::test]
+    async fn abandon_query_discards_an_encrypted_output_without_decrypting() {
+        let mut transport = TestTransport::with_tokens(vec![
+            empty_col_metadata(),
+            done_count(CurrentCommand::Select, 0, true),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::FINAL,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+        ]);
+        transport.response_complete = true;
+        let mut client = create_test_client_with_transport(transport);
+        assert_eq!(
+            client.execute("SELECT 1".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+
+        client.abandon_query(1).await.unwrap();
+
+        assert!(!client.has_open_batch());
+        assert!(client.return_values.is_empty());
+        assert!(!client.discarding_response);
         assert!(!client.transport.connection_known_dead());
     }
 

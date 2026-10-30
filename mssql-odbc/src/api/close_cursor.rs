@@ -399,12 +399,23 @@ mod tests {
         statuses: Box<[u16; 2]>,
         processed: Box<usize>,
         _values: Box<[i32; 2]>,
+        _chars: Box<[[u8; 8]; 2]>,
         _indicators: Box<[isize; 2]>,
         execute_rc: SqlReturn,
     }
 
     impl ScriptedArray {
         fn execute(client: mssql_tds::connection::tds_client::TdsClient, status: bool) -> Self {
+            Self::execute_bound(client, status, None)
+        }
+
+        /// Binds `chars` as `SQL_C_CHAR` text for the integer parameter when
+        /// given, so a set can fail client-side conversion.
+        fn execute_bound(
+            client: mssql_tds::connection::tds_client::TdsClient,
+            status: bool,
+            chars: Option<[[u8; 8]; 2]>,
+        ) -> Self {
             use crate::api::odbc_types::*;
             use mssql_tds::connection::tds_client::PreparedStatement;
 
@@ -424,7 +435,8 @@ mod tests {
                 statuses: Box::new([SQL_PARAM_UNUSED; 2]),
                 processed: Box::new(0),
                 _values: Box::new([1, 2]),
-                _indicators: Box::new([0; 2]),
+                _chars: Box::new(chars.unwrap_or_default()),
+                _indicators: Box::new([if chars.is_some() { SQL_NTS as isize } else { 0 }; 2]),
                 execute_rc: SQL_ERROR,
             };
             let sql: Vec<u16> = "SELECT ?".encode_utf16().collect();
@@ -435,17 +447,22 @@ mod tests {
                     i16::try_from(sql.len()).unwrap(),
                 )
             });
+            let (c_type, buffer, length): (SqlSmallInt, SqlPointer, isize) = if chars.is_some() {
+                (SQL_C_CHAR, array._chars.as_mut_ptr().cast(), 8)
+            } else {
+                (SQL_C_LONG, array._values.as_mut_ptr().cast(), 4)
+            };
             assert_eq!(SQL_SUCCESS, unsafe {
                 crate::api::SQLBindParameter(
                     array.h.stmt,
                     1,
                     SQL_PARAM_INPUT,
-                    SQL_C_LONG,
+                    c_type,
                     SQL_INTEGER,
                     0,
                     0,
-                    array._values.as_mut_ptr().cast(),
-                    4,
+                    buffer,
+                    length,
                     array._indicators.as_mut_ptr(),
                 )
             });
@@ -732,6 +749,92 @@ mod tests {
             crate::api::SQLMoreResults(array.h.stmt)
         });
         assert_eq!(*array.processed, 2);
+
+        // msodbcsql also presents a successful empty set as an error result
+        // when the navigation that reaches it reports another set's failure.
+        let array = ScriptedArray::execute(
+            tds_client_from_tokens(vec![
+                sql_error(50000, 16, "rejected"),
+                return_status(0),
+                done_proc_in_batch_more(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ]),
+            false,
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        assert_eq!(array.last_diag_native(), Some(50000));
+        assert_error_result(&array);
+        assert_eq!(*array.processed, 2);
+    }
+
+    /// A client-side conversion failure never reached the server, so the
+    /// successful empty set `SQLExecute` positions on keeps its columns, as
+    /// msodbcsql's does (measured on 18.6.2.1).
+    #[test]
+    fn a_conversion_failure_leaves_an_empty_set_a_cursor() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_proc_no_more, int_columns, return_status,
+            tds_client_from_tokens,
+        };
+
+        let array = ScriptedArray::execute_bound(
+            tds_client_from_tokens(vec![
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ]),
+            false,
+            Some([*b"1\0\0\0\0\0\0\0", *b"x\0\0\0\0\0\0\0"]),
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(array.h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"22018"
+        );
+        let mut columns: SqlSmallInt = -1;
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLNumResultCols(array.h.stmt, &mut columns)
+        });
+        assert_eq!(columns, 1);
+        assert!(!stmt.inner.lock().unwrap().error_result);
+    }
+
+    /// A completed set's status survives a failed first-row read of the next.
+    #[test]
+    fn a_first_row_read_failure_publishes_completed_sets() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_proc_in_batch_more, int_columns, return_status,
+            tds_client_from_tokens,
+        };
+
+        let array = ScriptedArray::execute(
+            tds_client_from_tokens(vec![
+                return_status(0),
+                done_proc_in_batch_more(),
+                col_metadata(int_columns(1)),
+            ]),
+            true,
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        assert_eq!(array.outputs(), (1, [SQL_PARAM_SUCCESS, SQL_PARAM_UNUSED]));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(array.h.stmt) };
+        assert_ne!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            *b"01000"
+        );
     }
 
     /// msodbcsql's bound read-ahead stops at an ERROR token after the row, so
