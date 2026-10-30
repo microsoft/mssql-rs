@@ -932,8 +932,10 @@ inline bool CheckDiagnostics(SQLSMALLINT type, SQLHANDLE handle, std::string& er
 // reads it. MSSQL_ODBC_MT_THREADS=1 runs the owner alone, which is how a
 // SharedStmt failure is told apart from a plain bug in the body.
 // CancelIdleStatement stops admitting diagnostic readers before waiting for
-// existing readers to leave, then excludes them during SQLCancel, whose DM
-// diagnostic-list cleanup is not protected by unixODBC's Threading=1.
+// existing readers to leave, then excludes them during SQLCancel. See its
+// comment: unixODBC does not protect the DM's diagnostic cleanup, and
+// msodbcsql treats a cancel that overlaps a STMT diagnostic read as a
+// cross-thread cancel and leaves the idle cursor open.
 template <typename T>
 void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     const Config config = LoadConfig();

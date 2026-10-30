@@ -91,8 +91,12 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
   closes the open cursor on both drivers. Cross-thread cancel has its own test,
   `multithreaded_tests/cancel_test.cpp`.
 - Idle-cancel bodies use `CancelIdleStatement()` to exclude diagnostic observers
-  during `SQLCancel`, whose DM diagnostic cleanup is not protected by unixODBC's
-  `Threading=1`. The post-close invalid-state probes also hold
+  during `SQLCancel` for two reasons: unixODBC's `Threading=1` does not protect
+  the DM's diagnostic cleanup, and on Windows the DM lets cancellation overlap
+  a STMT diagnostic read. msodbcsql's `TryEnter` on `csStmt` then takes the
+  cross-thread path and skips the idle cursor close (see Driver Manager facts
+  below). Both drivers use the gate so the parity legs run the same
+  interleavings. The post-close invalid-state probes also hold
   `diagnostics_mutex_` until a harmless attribute read clears their DM-generated
   errors. The gate blocks new readers once exclusive cleanup is queued;
   existing readers finish before cleanup starts. This avoids relying on
