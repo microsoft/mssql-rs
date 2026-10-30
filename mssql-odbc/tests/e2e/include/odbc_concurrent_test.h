@@ -1261,7 +1261,7 @@ bool Register(const char* suite, const char* name, const char* file, int line, u
         SQLHENV ConcurrentEnv() const { return env_; }                                         \
         SQLHDBC ConcurrentDbc() const { return dbc_; }                                         \
         SQLHSTMT ConcurrentStmt() const { return stmt_; }                                      \
-        OdbcDiagnosticsMutex& ConcurrentDiagnosticsMutex() { return diagnostics_mutex_; }    \
+        OdbcDiagnosticsMutex& ConcurrentDiagnosticsMutex() { return diagnostics_mutex_; }      \
                                                                                                \
        private:                                                                                \
         ::odbc_concurrency::Mode mode_;                                                        \
