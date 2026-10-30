@@ -139,6 +139,22 @@ void ODBCTest::ExecDirectIgnoreError(const std::string& sql) {
                   SQL_NTS);
 }
 
+bool ODBCTest::ServerSupportsNativeJson() {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT CAST(N'{}' AS JSON)");
+    const bool ok =
+        SQL_SUCCEEDED(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+    if (!ok) {
+        SQLINTEGER native = 0;
+        SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, nullptr, &native, nullptr, 0, nullptr);
+        if (native != 243) {
+            ADD_FAILURE() << "json probe: "
+                          << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        }
+    }
+    SQLCloseCursor(stmt_);
+    return ok;
+}
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
