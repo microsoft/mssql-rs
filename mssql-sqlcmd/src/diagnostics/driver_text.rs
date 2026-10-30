@@ -13,28 +13,26 @@
 //! reports another one after its own retries and fallbacks (a timeout for a
 //! refused port, a named-pipe error for a name that does not resolve), the
 //! record says what happened, in the driver's wording for it.
+//!
+//! That wording is the driver's own, from its resources, not sqlcmd's: these
+//! lines are the en-US driver's, verbatim, in every locale (literals, not
+//! catalog messages), so they read exactly as the en-US driver prints them.
+//! Matching a localized driver's resources is out of scope. Only sqlcmd's
+//! own prefix around them (`Sqlcmd: Error: ...`) follows the report's locale.
 
 use super::target::Protocol;
-use super::{Check, CheckId, Encrypt, ErrorRecord};
+use super::{Check, CheckId, Encrypt, ErrorRecord, LocalizedText};
 
 /// The client that made the connection attempt, as sqlcmd's error lines name it.
 pub const CLIENT: &str = "mssql-tds";
 
-const TCP_PROVIDER: &str = "TCP Provider: ";
-const SSL_PROVIDER: &str = "SSL Provider: ";
-const NAMED_PIPES_PROVIDER: &str = "Named Pipes Provider: ";
-/// Shared memory opens a named pipe; SNI reports its errors as this provider's.
-const SHARED_MEMORY_PROVIDER: &str = "Shared Memory Provider: ";
-const NETWORK_INTERFACES: &str = "SQL Server Network Interfaces: ";
 /// SNI error 26, with the status SNI shows when SQL Server Browser gives no port.
-const ERROR_LOCATING_SERVER: &str = "Error Locating Server/Instance Specified [xFFFFFFFF]. ";
-/// SNI error 40.
-const COULD_NOT_OPEN: &str = "Could not open a connection to SQL Server";
+const ERROR_LOCATING_SERVER: &str =
+    "SQL Server Network Interfaces: Error Locating Server/Instance Specified [xFFFFFFFF]. ";
 /// The driver's HYT00 and 08001 summaries.
 const LOGIN_TIMEOUT_EXPIRED: &str = "Login timeout expired";
 const CLIENT_UNABLE: &str = "Client unable to establish connection";
-const CLIENT_UNABLE_ENCRYPTION: &str = "Client unable to establish connection. For solutions \
-     related to encryption errors, see https://go.microsoft.com/fwlink/?linkid=2226722";
+const ENCRYPTION_ERRORS_LINK: &str = "https://go.microsoft.com/fwlink/?linkid=2226722";
 
 /// Windows error codes, which the driver reports on every platform.
 const WAIT_TIMEOUT: i32 = 258;
@@ -50,13 +48,25 @@ const WSAHOST_NOT_FOUND: i32 = 11001;
 const WSATRY_AGAIN: i32 = 11002;
 const WSANO_DATA: i32 = 11004;
 
-fn network_related(server: &str) -> String {
-    format!(
+/// The driver's text, the same in every locale.
+fn driver(text: impl Into<String>) -> LocalizedText {
+    LocalizedText::literal(text)
+}
+
+fn network_related(server: &str) -> LocalizedText {
+    driver(format!(
         "A network-related or instance-specific error has occurred while establishing a \
-         connection to {server}. Server is not found or not accessible. Check if instance name \
-         is correct and if SQL Server is configured to allow remote connections. For more \
-         information see SQL Server Books Online."
-    )
+         connection to {server}. Server is not found or not accessible. Check if instance \
+         name is correct and if SQL Server is configured to allow remote connections. For \
+         more information see SQL Server Books Online."
+    ))
+}
+
+fn client_unable_encryption() -> LocalizedText {
+    driver(format!(
+        "Client unable to establish connection. For solutions related to encryption errors, \
+         see {ENCRYPTION_ERRORS_LINK}"
+    ))
 }
 
 /// The connection's encryption settings (`-N`, `-C`), which decide the
@@ -193,11 +203,11 @@ fn order_server_errors(errors: &mut [ErrorRecord]) {
 }
 
 /// The driver's text for one record, when the driver has an equivalent.
-fn text(record: &ErrorRecord, protocol: Option<Protocol>, windows: bool) -> Option<String> {
-    let tcp = |code: i32| format!("{TCP_PROVIDER}{}", system_text(code, windows));
+fn text(record: &ErrorRecord, protocol: Option<Protocol>, windows: bool) -> Option<LocalizedText> {
+    let tcp = |code: i32| driver(format!("TCP Provider: {}", system_text(code, windows)));
     match (record.source, record.check) {
         ("sqlServer", _) => Some(record.message.clone()),
-        ("sqlBrowser", _) => Some(format!("{NETWORK_INTERFACES}{ERROR_LOCATING_SERVER}")),
+        ("sqlBrowser", _) => Some(driver(ERROR_LOCATING_SERVER)),
         ("os", CheckId::NameResolution) => dns_code(record, windows).map(tcp),
         ("os", CheckId::TcpConnect) if protocol.is_none_or(Protocol::uses_tcp) => {
             tcp_code(record, windows).map(tcp)
@@ -205,25 +215,28 @@ fn text(record: &ErrorRecord, protocol: Option<Protocol>, windows: bool) -> Opti
         // SNI opens a LocalDB instance as a plain named pipe, reported as
         // the named-pipe provider's.
         ("os", _) if matches!(protocol, Some(Protocol::NamedPipe | Protocol::LocalDb)) => {
-            pipe_text(NAMED_PIPES_PROVIDER, record)
+            pipe_text("Named Pipes Provider: ", record)
         }
         ("os", _) if protocol == Some(Protocol::SharedMemory) => {
-            pipe_text(SHARED_MEMORY_PROVIDER, record)
+            pipe_text("Shared Memory Provider: ", record)
         }
         ("os", _) if protocol.is_none_or(Protocol::uses_tcp) => tcp_code(record, windows).map(tcp),
-        ("tls", _) => tls_text(&record.message, windows).map(|t| format!("{SSL_PROVIDER}{t}")),
+        ("tls", _) => tls_text(&record.message.render("en-US"), windows)
+            .map(|t| driver(format!("SSL Provider: {t}"))),
         _ => None,
     }
 }
 
 /// SNI's text for a pipe that did not open (error 40), named pipes' or shared
-/// memory's (`provider`): the operating system's code, or for one the time
+/// memory's (`prefix`): the operating system's code, or for one the time
 /// limit abandoned the code `WaitNamedPipe` gives when its time-out elapses.
-fn pipe_text(provider: &str, record: &ErrorRecord) -> Option<String> {
+fn pipe_text(prefix: &str, record: &ErrorRecord) -> Option<LocalizedText> {
     let code = record
         .os_error
         .or_else(|| (record.code.as_deref() == Some("timedOut")).then_some(ERROR_SEM_TIMEOUT))?;
-    Some(format!("{provider}{COULD_NOT_OPEN} [{code}]. "))
+    Some(driver(format!(
+        "{prefix}Could not open a connection to SQL Server [{code}]. "
+    )))
 }
 
 /// The Windows code for a failed name lookup.
@@ -255,20 +268,27 @@ fn tcp_code(record: &ErrorRecord, windows: bool) -> Option<i32> {
     }
 }
 
-/// The text the driver shows for a Windows error code: the operating
-/// system's message on Windows, `Error code 0x...` elsewhere. The system's
-/// message ends its line in the driver's output, so sqlcmd's closing period
-/// follows it there; without its own period it reads the same on one line.
+/// The text the driver shows for a Windows error code after a provider's
+/// prefix: the operating system's message (in the system's language) on
+/// Windows, `Error code 0x...` elsewhere.
 fn system_text(code: i32, windows: bool) -> String {
     if windows {
-        let text = std::io::Error::from_raw_os_error(code).to_string();
-        let suffix = format!(" (os error {code})");
-        let text = text.strip_suffix(&suffix).unwrap_or(&text).trim();
-        text.strip_suffix('.').unwrap_or(text).to_string()
+        os_message(code)
     } else {
         // The driver writes the code's bits in hex, as Windows does.
         format!("Error code 0x{:X}", code.cast_unsigned())
     }
+}
+
+/// The operating system's message for an error code, without Rust's
+/// ` (os error N)`. The message ends its line in the driver's output, so
+/// sqlcmd's closing period follows it there; without its own period it
+/// reads the same on one line.
+fn os_message(code: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    let suffix = format!(" (os error {code})");
+    let text = text.strip_suffix(&suffix).unwrap_or(&text).trim();
+    text.strip_suffix('.').unwrap_or(text).to_string()
 }
 
 /// The driver's text for a failed TLS handshake. On Windows: the system's
@@ -280,11 +300,11 @@ fn tls_text(message: &str, windows: bool) -> Option<String> {
         if let Some(at) = message.find("status=0x") {
             let hex = message.get(at + 9..at + 17)?;
             let status = u32::from_str_radix(hex, 16).ok()?;
-            return Some(system_text(status.cast_signed(), true));
+            return Some(os_message(status.cast_signed()));
         }
         return message
             .contains("peer closed connection during TLS handshake")
-            .then(|| system_text(WSAECONNRESET, true));
+            .then(|| os_message(WSAECONNRESET));
     }
     let rest = &message[message.find("error:")? + "error:".len()..];
     let mut parts = rest.splitn(5, ':');
@@ -330,9 +350,10 @@ fn add_summaries(
             .iter()
             .any(|e| e.check == check && e.source == source && e.text.is_some())
     };
-    let summary = |code: &str, text: String| {
-        let mut record = ErrorRecord::new("client", check, text.clone());
+    let summary = |code: &str, text: LocalizedText| {
+        let mut record = ErrorRecord::new("client", check, String::new());
         record.code = Some(code.to_string());
+        record.message = text.clone();
         record.text = Some(text);
         record
     };
@@ -358,7 +379,7 @@ fn add_summaries(
     // operating-system or provider message to word still gets the line, as
     // the driver prints it for any login that runs out of time.
     if timed_out && (network || check == CheckId::ConnectionAttempt) {
-        let expired = summary("loginTimeoutExpired", LOGIN_TIMEOUT_EXPIRED.to_string());
+        let expired = summary("loginTimeoutExpired", driver(LOGIN_TIMEOUT_EXPIRED));
         if windows {
             errors.push(expired);
         } else {
@@ -376,14 +397,11 @@ fn add_summaries(
         // gets the timeout instead), the summary follows the connection's
         // settings, not which TLS error it was.
         let text = if encryption.links_the_encryption_guide() {
-            CLIENT_UNABLE_ENCRYPTION
+            client_unable_encryption()
         } else {
-            CLIENT_UNABLE
+            driver(CLIENT_UNABLE)
         };
-        errors.push(summary(
-            "clientUnableToEstablishConnection",
-            text.to_string(),
-        ));
+        errors.push(summary("clientUnableToEstablishConnection", text));
     }
 }
 
@@ -417,7 +435,11 @@ mod tests {
     fn texts(errors: &[ErrorRecord]) -> Vec<String> {
         errors
             .iter()
-            .map(|e| e.text.clone().unwrap_or_else(|| format!("<{}>", e.message)))
+            .map(|e| {
+                e.text
+                    .as_ref()
+                    .map_or_else(|| format!("<{}>", e.message), |t| t.render("en-US"))
+            })
             .collect()
     }
 
@@ -582,14 +604,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn on_windows_the_system_message_is_used() {
-        assert_eq!(
-            system_text(WAIT_TIMEOUT, true),
-            "The wait operation timed out"
-        );
-        assert_eq!(
-            system_text(WSAHOST_NOT_FOUND, true),
-            "No such host is known"
-        );
+        assert_eq!(os_message(WAIT_TIMEOUT), "The wait operation timed out");
+        assert_eq!(os_message(WSAHOST_NOT_FOUND), "No such host is known");
         assert_eq!(
             tls_text(
                 "Schannel TLS handshake failed: InitializeSecurityContextW failed: \
@@ -642,7 +658,7 @@ mod tests {
             [
                 "SSL Provider: [error:0A000086:SSL routines::certificate verify failed:self-signed \
                  certificate]",
-                CLIENT_UNABLE_ENCRYPTION,
+                client_unable_encryption().render("en-US").as_str(),
             ]
         );
     }
@@ -705,15 +721,11 @@ mod tests {
                     windows,
                 );
                 let expected = if linked {
-                    CLIENT_UNABLE_ENCRYPTION
+                    client_unable_encryption().render("en-US")
                 } else {
-                    CLIENT_UNABLE
+                    CLIENT_UNABLE.to_string()
                 };
-                assert_eq!(
-                    texts(&errors).last().map(String::as_str),
-                    Some(expected),
-                    "{encryption:?}"
-                );
+                assert_eq!(texts(&errors).last(), Some(&expected), "{encryption:?}");
                 assert_eq!(errors.len(), 2, "{encryption:?}");
             }
         }
@@ -901,10 +913,8 @@ mod tests {
                 "{protocol:?}"
             );
             assert_eq!(
-                errors[0].text.as_deref(),
-                Some(
-                    format!("{provider}Could not open a connection to SQL Server [121]. ").as_str()
-                )
+                texts(&errors)[0],
+                format!("{provider}Could not open a connection to SQL Server [121]. ")
             );
         }
     }
@@ -948,11 +958,8 @@ mod tests {
                     "{protocol:?} {os_error:?}"
                 );
                 assert_eq!(
-                    errors[0].text.as_deref(),
-                    Some(
-                        format!("{provider}Could not open a connection to SQL Server [121]. ")
-                            .as_str()
-                    ),
+                    texts(&errors)[0],
+                    format!("{provider}Could not open a connection to SQL Server [121]. "),
                     "{protocol:?} {os_error:?}"
                 );
             }
@@ -986,7 +993,7 @@ mod tests {
                 [Some("timedOut"), Some("loginTimeoutExpired")],
                 "windows: {windows}"
             );
-            assert_eq!(errors[1].text.as_deref(), Some(LOGIN_TIMEOUT_EXPIRED));
+            assert_eq!(texts(&errors)[1], LOGIN_TIMEOUT_EXPIRED);
         }
 
         let mut errors = vec![record(
@@ -1061,6 +1068,57 @@ mod tests {
                 .skip(2)
                 .all(|e| e.check == CheckId::ConnectionAttempt)
         );
+    }
+
+    /// The driver's lines are the en-US driver's in every locale: a
+    /// translated report does not paraphrase them, and SQL Server's own text
+    /// is passed through as it is.
+    #[test]
+    fn the_driver_wording_stays_the_en_us_drivers_in_every_locale() {
+        let mut errors = vec![
+            os(CheckId::TcpConnect, "timedOut", None, "a: no answer"),
+            record(
+                "tls",
+                CheckId::TcpConnect,
+                "error:0A000086:SSL routines:x:certificate verify failed",
+            ),
+        ];
+        let checks = [failed(CheckId::TcpConnect)];
+        apply_for(&mut errors, &checks, Some(Protocol::Tcp), "db01", false);
+        let mut pipe = vec![os(CheckId::TcpConnect, "failed", Some(2), "not found")];
+        apply_for(
+            &mut pipe,
+            &checks,
+            Some(Protocol::SharedMemory),
+            "lpc:localhost",
+            true,
+        );
+        let mut browser = vec![record("sqlBrowser", CheckId::InstanceResolution, "x")];
+        browser[0].code = Some("noAnswer".to_string());
+        apply_for(
+            &mut browser,
+            &[failed(CheckId::InstanceResolution)],
+            Some(Protocol::Tcp),
+            "db01\\i",
+            true,
+        );
+        let all: Vec<&ErrorRecord> = errors.iter().chain(&pipe).chain(&browser).collect();
+        assert!(
+            all.iter().filter(|e| e.text.is_some()).count() >= 6,
+            "{all:#?}"
+        );
+        for error in all {
+            let Some(text) = &error.text else { continue };
+            let english = text.render("en-US");
+            for locale in ["qps-ploc", "de-DE", "ja-JP"] {
+                assert_eq!(text.render(locale), english, "{locale}");
+            }
+            assert!(!english.contains("[!!!"), "{english}");
+        }
+
+        let login = server(18456, 14, "Login failed for user 'sa'.");
+        let login = text(&login, Some(Protocol::Tcp), true).unwrap();
+        assert_eq!(login.render("qps-ploc"), "Login failed for user 'sa'.");
     }
 
     #[test]

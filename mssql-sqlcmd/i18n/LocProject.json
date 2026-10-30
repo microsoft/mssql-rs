@@ -1,0 +1,19 @@
+{
+    "Projects": [
+        {
+            "LanguageSet": "AzureKatal_Languages",
+            "LocItems": [
+                {
+                    "SourceFile": "mssql-sqlcmd\\i18n\\locales\\en-US\\sqlcmd.json",
+                    "CopyOption": "LangIDOnPath",
+                    "Languages": "cs-CZ;de-DE;es-ES;fr-FR;it-IT;ja-JP;ko-KR;pl-PL;pt-BR;ru-RU;tr-TR;zh-CN;zh-TW",
+                    "LssFiles": [
+                        "mssql-sqlcmd\\i18n\\P306PairNamesToProcess.lss"
+                    ],
+                    "LclFile": "mssql-sqlcmd\\i18n\\LCL\\{Lang}\\sqlcmd.json.lcl",
+                    "OutputPath": "mssql-sqlcmd\\i18n\\localized"
+                }
+            ]
+        }
+    ]
+}

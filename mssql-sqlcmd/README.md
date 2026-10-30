@@ -57,6 +57,16 @@ returns `MSSQL_SQLCMD_UNSUPPORTED`.
 See the [diagnose reference](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/diagnose.md)
 for the depths, the report, the exit codes and what is shown or labelled.
 
+## Localization
+
+The diagnose text report follows the locale native sqlcmd resolved (passed
+through `mssql_sqlcmd_set_locale`) or the environment, in the 13 languages
+native sqlcmd's `SQLCMD.rll` is translated into; any other language falls back
+to `en-US`. The JSON document stays in canonical en-US.
+
+See the [localization guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/localization.md)
+for how sqlcmd's text is translated end to end: the message catalogs, how translations reach the package and native sqlcmd, how the language is chosen, and what is not localized.
+
 ## Build from source
 
 From the repository root:
