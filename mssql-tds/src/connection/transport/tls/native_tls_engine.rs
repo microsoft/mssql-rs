@@ -145,11 +145,8 @@ impl TlsEngine for NativeTlsEngine {
                     std::env::consts::OS,
                 );
                 Err(crate::error::Error::TlsHandshakeError {
-                    source: e,
+                    source: Box::new(e),
                     expected_host: params.host_name.to_string(),
-                    cert_sans:
-                        "(unavailable - handshake failed before certificate could be retrieved)"
-                            .to_string(),
                 })
             }
         }

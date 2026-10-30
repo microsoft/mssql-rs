@@ -63,10 +63,11 @@ impl TlsEngine for SchannelEngine {
         base_stream.tls_handshake_starting();
 
         let kind = pick_cred_kind(params.validation, params.server_certificate_path.is_some());
-        let cred = cred::get_or_acquire(kind).map_err(|e| {
-            crate::error::Error::ImplementationError(format!(
-                "Schannel AcquireCredentialsHandle failed: {e}"
-            ))
+        let cred = cred::get_or_acquire(kind).map_err(|source| {
+            crate::error::Error::TlsHandshakeError {
+                source: Box::new(source),
+                expected_host: params.host_name.to_string(),
+            }
         })?;
 
         info!(
@@ -90,9 +91,10 @@ impl TlsEngine for SchannelEngine {
                     "Schannel TLS handshake FAILED: host_name={}, server_host_name={}, error={:?}",
                     params.host_name, params.server_host_name, e,
                 );
-                return Err(crate::error::Error::ImplementationError(format!(
-                    "Schannel TLS handshake failed: {e}"
-                )));
+                return Err(crate::error::Error::TlsHandshakeError {
+                    source: Box::new(e),
+                    expected_host: params.host_name.to_string(),
+                });
             }
         };
 
@@ -214,7 +216,7 @@ mod tests {
         assert!(result.is_err(), "expected handshake failure on peer drop");
         assert!(matches!(
             result,
-            Err(crate::error::Error::ImplementationError(_))
+            Err(crate::error::Error::TlsHandshakeError { .. })
         ));
 
         server.await.unwrap();

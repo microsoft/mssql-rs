@@ -111,6 +111,79 @@ every form of DNS outage can be recovered within the login timeout.
 The deliberate differences from msodbcsql's eager cache are recorded in the
 [ODBC parity registry](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/parity-deviations.md).
 
+## TLS on macOS
+
+SQL Server negotiates TLS 1.3 only for TDS 8.0 (`Encrypt=Strict`), where the
+handshake runs directly on the connection. Secure Transport, which `native-tls`
+uses on macOS, stops at TLS 1.2 and has no post-quantum key exchange. With the
+default `tls-network-framework-on-macos` feature, Strict TCP connections are
+therefore opened by Apple's Network.framework, which keeps all cryptography in
+the operating system. Handshakes tunneled through PreLogin packets (TDS 7.x,
+every non-Strict mode) stay on a socket with Secure Transport.
+
+- **Protocols and groups.** TLS 1.3 and 1.2 with ALPN `tds/8.0`; TLS 1.0 and 1.1
+  are not offered. On macOS 26 and later the ClientHello carries `X25519MLKEM768`
+  and X25519 key shares, so a server without post-quantum support, including
+  current SQL Server, completes with X25519 and no extra round trip.
+  Network.framework offers no way to inspect or force the group; the log records
+  the negotiated version, cipher suite, and ALPN protocol. Session resumption is
+  off, so every connection presents a certificate to validate or pin.
+- **Connection.** Network.framework cannot take over an existing socket, so it
+  makes the TCP connection itself. The driver still resolves the name and walks
+  or races the addresses as described under
+  [Connection policy and migration](#connection-policy-and-migration); each
+  attempt is a Network.framework connection to one address with `TCP_NODELAY`,
+  the configured keep-alive in whole seconds, and system proxies avoided, as on
+  the socket path. On loopback, Strict reads ran within about 10% of the
+  tunneled Secure Transport path.
+- **Timeouts and failover.** An attempt completes when both TCP and TLS do, so
+  the connect timeout covers the handshake: for each address when they are
+  tried in turn, and for the whole race under MSF, which goes to the first
+  address that finishes both. A server that accepts the connection but stalls
+  the handshake is given up at the connect timeout instead of holding the
+  attempt until the login deadline. In turn, the next address is tried, and
+  the last one fails with `Error::Io` (`TimedOut`); under MSF, the race fails
+  with `Error::TimeoutError`. An address that refuses or cannot be reached
+  fails with the same `Error::Io` as the socket path, and the next address is
+  tried. A server that is reached but fails the handshake or certificate
+  checks ends the attempt, as when the handshake follows the TCP connect.
+- **Connect stages.** Each attempt's `tcp` stage covers the handshake. An address
+  that fails the handshake records a successful `tcp` stage, then a failed
+  `tls` stage; after a successful attempt, the `tls` stage records success and
+  takes no time. TLS options that contradict each other fail a `tls` stage
+  before any address is tried, after the `dns` stage when addresses are tried
+  in turn, so a diagnostic connection can still stop after resolution. A
+  connection Network.framework cannot set up counts as a socket that cannot be
+  created: in turn, it fails that address's `tcp` stage and ends the attempt;
+  under MSF, the race moves on. A diagnostic connection's extra connects to the
+  remaining addresses are TCP-only, as on the socket path.
+- **Trust.** Security.framework evaluates the chain under Apple's TLS server
+  policy, so keychain roots, administrator-installed CAs, and trust settings
+  decide which servers are trusted. The expected name is `host_name_in_cert`,
+  else the server name. The policy matches it against the subject alternative
+  names, DNS names and IP addresses alike, and ignores the common name. It also
+  requires the `serverAuth` extended key usage and rejects overly long validity
+  periods; a ten-year certificate fails where an 825-day one passes.
+  `TrustServerCertificate` is ignored in Strict mode, as on every platform.
+  `server_certificate` pinning skips the chain and name checks, so it also
+  accepts X.509 v1 certificates.
+- **Shutdown.** Closing the connection sends `close_notify` once earlier writes
+  have gone out. If the server stops reading, the connection is cancelled after
+  a second, whether it was closed or dropped, and `close_connection` fails with
+  `Error::Io` (`TimedOut`). Closing also fails if earlier writes failed or were
+  still unsent when the connection ended. Closing a connection that has already
+  ended with all writes sent succeeds, as on the socket path. A peer that
+  closes the transport without `close_notify` reads as a clean end of stream,
+  as with Secure Transport; TDS framing catches a truncated response.
+- **Errors.** All TLS engines report handshake failures as
+  `Error::TlsHandshakeError`. The displayed host is the name used for TLS
+  server identity validation, which can differ from the network destination.
+  A pin mismatch is `Error::CertificateMismatch` on every platform.
+
+`default-features = false` removes the Network.framework path and its `block2`
+dependency, which hands Objective-C blocks to Network.framework, so Strict
+connections use a socket and Secure Transport (TLS 1.2 maximum).
+
 ## Execution stack usage
 
 Command execution keeps session-recovery state in a separately boxed future,
