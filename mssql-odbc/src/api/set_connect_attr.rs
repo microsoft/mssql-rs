@@ -1375,7 +1375,7 @@ mod tests {
     #[test]
     fn setting_the_current_isolation_level_again_is_a_no_op() {
         // Matches the same-value short-circuit autocommit uses
-        // (`sqlcmisc.cpp:1720`): no cursor sweep and no round trip.
+        // (`sqlcmisc.cpp:1720`): no round trip.
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         h.mark_dbc_connected();
