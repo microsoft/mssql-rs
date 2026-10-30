@@ -592,11 +592,12 @@ def test_odbc_runner_forwards_deselected_tests(tmp_path, env, expected):
     assert deselected == expected
 
 
-def test_mssql_python_odbc_job_deselects_only_timing_flaky_tests():
+def test_mssql_python_odbc_job_deselects_only_tracked_tests():
     template = load_template("test-mssql-python-odbc-template.yml")
     params = {p["name"]: p["default"] for p in template["parameters"]}
     assert params["pytestDeselect"] == [
         "tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release",
+        "tests/test_009_pooling.py::test_pool_checkout_validation_timeout",
     ]
     step = next(
         step for step in template["steps"]
