@@ -327,10 +327,13 @@ Measured 2026-10-08 on both drivers unless noted.
   take that lock, msodbcsql follows its cross-thread path and skips the idle
   cursor close; the next command then fails with `HY000` "Connection is busy".
   This path is visible in msodbcsql's `ExportImp::SQLGetDiagRec`
-  (`sqlcerr.cpp`) and `ExportImp::SQLCancel` (`sqlcmisc.cpp:754`); the native
-  `ODBC Driver 18 for SQL Server` SharedStmt probe reproduced it in 37/300
-  no-gate runs at 2 x 1, versus 0/300 with the gate. The e2e observer gate
-  excludes those overlaps in both parity legs.
+  (`sqlcerr.cpp`) and `ExportImp::SQLCancel` (`sqlcmisc.cpp:754`). Measured on
+  Windows on 2026-10-30 with the locally installed native
+  `ODBC Driver 18 for SQL Server` build (`SQL_DRIVER_VER=18.07.0001`): the
+  SharedStmt probe reproduced it in 37/300 no-gate runs at 2 x 1, versus 0/300
+  with the gate. This local measurement is not a result for the CI-pinned
+  msodbcsql build. The e2e observer gate excludes those overlaps in both parity
+  legs.
   Idle cancellation now abandons an owned pending response via ATTENTION,
   using `SQL_ATTR_CONNECTION_TIMEOUT` (zero selects 120 seconds) for settlement.
   It does not change the normal `SQLFreeStmt(SQL_CLOSE)` drain. The mock tests
