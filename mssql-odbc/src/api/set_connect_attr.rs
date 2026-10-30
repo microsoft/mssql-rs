@@ -409,8 +409,9 @@ unsafe fn sql_set_connect_attr_w_impl(
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
             // Publish to execution children here, not on every fetch/GetData call.
-            // Zero selects the native driver's 120-second cancellation default.
-            // General non-cancellation network-I/O timeout enforcement is separate.
+            // Connection operations also use this for request I/O and cancellation.
+            // Zero leaves requests unlimited and selects the native driver's
+            // 120-second default for explicit statement cancellation.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
             // warning rather than reusing msodbcsql's "Login timeout changed".

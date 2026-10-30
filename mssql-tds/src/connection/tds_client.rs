@@ -8881,6 +8881,35 @@ impl TdsClient {
         }
     }
 
+    /// Drains the current response with an additional timeout or cancellation
+    /// handle. A positive timeout can shorten, but never extend, the remaining
+    /// request budget; zero leaves that budget unchanged.
+    pub async fn close_query_with_options<'a>(
+        &mut self,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
+        let ExecuteOptions {
+            timeout,
+            cancel,
+            on_error,
+            ..
+        } = options.into();
+        Self::note_on_error_ignored(on_error);
+        if self.has_open_batch() {
+            if let Some(seconds) = timeout.filter(|seconds| *seconds != 0) {
+                let timeout = Duration::from_secs(u64::from(seconds));
+                self.remaining_request_timeout = Some(
+                    self.remaining_request_timeout
+                        .map_or(timeout, |remaining| remaining.min(timeout)),
+                );
+            }
+            if let Some(cancel) = cancel {
+                self.cancel_handle = Some(cancel.child_handle());
+            }
+        }
+        self.close_query().await
+    }
+
     /// Drains all remaining result sets and resets the client for the next request.
     ///
     /// Any unread rows and result sets are consumed so the TDS stream is left in
@@ -9126,38 +9155,14 @@ impl TdsClient {
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
         }
-        let ExecuteOptions {
-            timeout,
-            cancel,
-            on_error,
-            ..
-        } = options.into();
-        Self::note_on_error_ignored(on_error);
-
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
-        let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
-        let resolved = budget.into_timeout()?;
-        let timeout_sec = resolved.seconds();
-        self.remaining_request_timeout = resolved.duration();
-        self.cancel_handle = cancel.map(|handle| handle.child_handle());
-
-        let transaction_params = TransactionManagementType::Begin(CreateTxnParams {
-            level: isolation_level,
-            name,
-        });
-        let transaction =
-            TransactionManagementRequest::new(transaction_params, &self.execution_context);
-        let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
-        let sent = transaction.serialize(&mut packet_writer).await;
-        let message = packet_writer.suspend();
-        drop(transaction);
-        self.finish_send(sent, message).await?;
-
-        self.consume_transaction_response().await?;
-
-        Ok(())
+        self.execute_transaction_request(
+            TransactionManagementType::Begin(CreateTxnParams {
+                level: isolation_level,
+                name,
+            }),
+            options.into(),
+        )
+        .await
     }
 
     /// Create a savepoint within the current transaction.
@@ -9189,64 +9194,127 @@ impl TdsClient {
     ///
     /// If `create_txn_params` is provided, a new transaction begins immediately
     /// after the commit (atomic commit-and-begin).
+    /// Runs unbounded; use [`commit_transaction_with_options`](Self::commit_transaction_with_options)
+    /// to supply a timeout or cancellation handle.
     #[instrument(skip(self), level = "info")]
     pub async fn commit_transaction(
         &mut self,
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
+        self.commit_transaction_with_options(name, create_txn_params, ())
+            .await
+    }
+
+    /// Commits with a request timeout and cancellation budget supplied through
+    /// `options`. Transaction completion never reconnects onto a new session.
+    pub async fn commit_transaction_with_options<'a>(
+        &mut self,
+        name: Option<String>,
+        create_txn_params: Option<CreateTxnParams>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
         if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot commit transaction while another batch is executing.".to_string(),
             ));
         }
-        self.begin_command();
-        let transaction = TransactionManagementRequest::new(
+        self.execute_transaction_request(
             TransactionManagementType::Commit {
                 name,
                 create_txn_params,
             },
-            &self.execution_context,
-        );
-        let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), None, None);
-        transaction.serialize(&mut packet_writer).await?;
-
-        self.consume_transaction_response().await?;
-
-        Ok(())
+            options.into(),
+        )
+        .await
     }
 
     /// Roll back the current transaction, or roll back to a named savepoint.
     ///
     /// If `create_txn_params` is provided, a new transaction begins immediately
     /// after the rollback.
+    /// Runs unbounded; use [`rollback_transaction_with_options`](Self::rollback_transaction_with_options)
+    /// to supply a timeout or cancellation handle.
     #[instrument(skip(self), level = "info")]
     pub async fn rollback_transaction(
         &mut self,
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
+        self.rollback_transaction_with_options(name, create_txn_params, ())
+            .await
+    }
+
+    /// Rolls back with a request timeout and cancellation budget supplied through
+    /// `options`. Transaction completion never reconnects onto a new session.
+    pub async fn rollback_transaction_with_options<'a>(
+        &mut self,
+        name: Option<String>,
+        create_txn_params: Option<CreateTxnParams>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
         if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot rollback transaction while another batch is executing.".to_string(),
             ));
         }
-        self.begin_command();
-        let transaction = TransactionManagementRequest::new(
+        self.execute_transaction_request(
             TransactionManagementType::Rollback {
                 name,
                 create_txn_params,
             },
-            &self.execution_context,
-        );
-        let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), None, None);
-        transaction.serialize(&mut packet_writer).await?;
+            options.into(),
+        )
+        .await
+    }
 
-        self.consume_transaction_response().await?;
+    async fn execute_transaction_request(
+        &mut self,
+        transaction_params: TransactionManagementType,
+        options: ExecuteOptions<'_>,
+    ) -> TdsResult<()> {
+        let ExecuteOptions {
+            timeout,
+            cancel,
+            on_error,
+            ..
+        } = options;
+        Self::note_on_error_ignored(on_error);
 
-        Ok(())
+        self.begin_command();
+        let reconnect_elapsed = if matches!(transaction_params, TransactionManagementType::Begin(_))
+        {
+            self.check_and_reconnect(timeout, cancel).await?
+        } else {
+            if self.is_connection_dead() {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "Cannot complete a transaction on a closed connection".to_string(),
+                ));
+            }
+            Duration::ZERO
+        };
+        let resolved = Self::deduct_timeout(timeout, reconnect_elapsed).into_timeout()?;
+        self.remaining_request_timeout = resolved.duration();
+        self.cancel_handle = cancel.map(|handle| handle.child_handle());
+
+        let result = async {
+            let transaction =
+                TransactionManagementRequest::new(transaction_params, &self.execution_context);
+            let mut packet_writer = transaction.create_packet_writer(
+                self.transport.as_writer(),
+                resolved.seconds(),
+                cancel,
+            );
+            let sent = transaction.serialize(&mut packet_writer).await;
+            let message = packet_writer.suspend();
+            drop(transaction);
+            self.finish_send(sent, message).await?;
+            self.consume_transaction_response().await
+        }
+        .await;
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        result
     }
 
     /// Retrieve the DTC (Distributed Transaction Coordinator) network address from the server.
@@ -20157,35 +20225,156 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn transaction_begin_cancellation_bounds_and_retires_a_stalled_write() {
+    async fn transaction_requests_cancellation_bounds_and_retires_stalled_writes() {
+        for operation in ["begin", "commit", "rollback"] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(1);
+            let mut transport = TestTransport::new();
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            let sent = Arc::clone(&transport.sent);
+            let closes = Arc::clone(&transport.close_calls);
+            let mut client = create_test_client_with_transport(transport);
+            let start = tokio::time::Instant::now();
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                let options = ExecuteOptions::new().cancel(&cancel);
+                match operation {
+                    "begin" => {
+                        client
+                            .begin_transaction_with_options(
+                                TransactionIsolationLevel::NoChange,
+                                None,
+                                options,
+                            )
+                            .await
+                    }
+                    "commit" => {
+                        client
+                            .commit_transaction_with_options(None, None, options)
+                            .await
+                    }
+                    "rollback" => {
+                        client
+                            .rollback_transaction_with_options(None, None, options)
+                            .await
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(1), "{operation}");
+            assert!(client.is_connection_dead(), "{operation}");
+            assert!(!client.has_active_transaction());
+            assert_eq!(sent.lock().unwrap().len(), 8, "{operation}");
+            assert_eq!(
+                closes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{operation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_options_bound_reads_without_leaking_into_later_requests() {
+        let transport =
+            TestTransport::with_tokens(vec![done_no_more(), done_no_more(), done_no_more()]);
+        let timeouts = Arc::clone(&transport.receive_timeouts);
+        let mut client = create_test_client_with_transport(transport);
         let mut cancel = CancelHandle::new();
         cancel.set_cancel_timeout_secs(1);
-        let mut transport = TestTransport::new();
-        transport.cancel_during_send = Some(cancel.cancel_token.clone());
-        let sent = Arc::clone(&transport.sent);
-        let closes = Arc::clone(&transport.close_calls);
-        let mut client = create_test_client_with_transport(transport);
-        let start = tokio::time::Instant::now();
-        let error = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.begin_transaction_with_options(
-                TransactionIsolationLevel::NoChange,
+        client
+            .commit_transaction_with_options(
                 None,
-                ExecuteOptions::new().cancel(&cancel),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+                None,
+                ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        assert!(timeouts.lock().unwrap()[0].is_some_and(|timeout| {
+            timeout > Duration::ZERO && timeout <= Duration::from_secs(1)
+        }));
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+
+        client.rollback_transaction(None, None).await.unwrap();
+        assert_eq!(timeouts.lock().unwrap()[1], None);
+        cancel.cancel();
+        let error = client
+            .rollback_transaction_with_options(
+                None,
+                None,
+                ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             crate::error::Error::OperationCancelledError(_)
         ));
-        assert_eq!(start.elapsed(), Duration::from_secs(1));
-        assert!(client.is_connection_dead());
-        assert!(!client.has_active_transaction());
-        assert_eq!(sent.lock().unwrap().len(), 8);
-        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+        client.save_transaction("next".to_string()).await.unwrap();
+        assert_eq!(timeouts.lock().unwrap()[2], None);
+    }
+
+    #[tokio::test]
+    async fn transaction_completion_never_writes_or_reconnects_a_retired_session() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client.mark_connection_dead();
+        for commit in [false, true] {
+            let options = ExecuteOptions::new().timeout_secs(1);
+            let result = if commit {
+                client
+                    .commit_transaction_with_options(None, None, options)
+                    .await
+            } else {
+                client
+                    .rollback_transaction_with_options(None, None, options)
+                    .await
+            };
+            assert!(matches!(
+                result,
+                Err(crate::error::Error::ConnectionClosed(_))
+            ));
+            assert!(sent.lock().unwrap().is_empty());
+            assert_eq!(client.connection_recovery_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_query_options_only_shorten_the_active_request_budget() {
+        for (original, seconds, expected) in [
+            (None, 1, Some(1)),
+            (Some(5), 1, Some(1)),
+            (Some(1), 5, Some(1)),
+            (Some(1), 0, Some(1)),
+            (None, 0, None),
+        ] {
+            let transport = TestTransport::with_tokens(vec![done_no_more()]);
+            let timeouts = Arc::clone(&transport.receive_timeouts);
+            let mut client = create_test_client_with_transport(transport);
+            client.execution_context.set_has_open_batch(true);
+            client.current_result_set_has_been_read_till_end = true;
+            client.remaining_request_timeout = original.map(Duration::from_secs);
+            client
+                .close_query_with_options(ExecuteOptions::new().timeout_secs(seconds))
+                .await
+                .unwrap();
+            let observed = timeouts.lock().unwrap()[0];
+            match expected {
+                Some(seconds) => assert!(observed.is_some_and(|timeout| {
+                    timeout > Duration::ZERO && timeout <= Duration::from_secs(seconds)
+                })),
+                None => assert_eq!(observed, None),
+            }
+            assert!(!client.has_open_batch());
+            assert!(client.remaining_request_timeout.is_none());
+        }
     }
 
     #[tokio::test]

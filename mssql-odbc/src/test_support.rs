@@ -349,6 +349,7 @@ impl Drop for OtherConnection {
 /// wait" from "the server just answered quickly": the server can independently
 /// delay a response for seconds while the DBC-side call is timed.
 pub(crate) struct MockServer {
+    address: std::net::SocketAddr,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     server_handle: Option<tokio::task::JoinHandle<()>>,
     server_runtime: tokio::runtime::Runtime,
@@ -357,6 +358,10 @@ pub(crate) struct MockServer {
 }
 
 impl MockServer {
+    pub(crate) fn local_addr(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
     /// The number of logins the server has accepted, including the one
     /// [`connect_mock_server`] made for the DBC.
     pub(crate) fn connection_count(&self) -> usize {
@@ -536,6 +541,7 @@ pub(crate) fn connect_mock_server_with_trailing_info(
     }
 
     MockServer {
+        address: server_addr,
         shutdown_tx: Some(shutdown_tx),
         server_handle: Some(server_handle),
         server_runtime,

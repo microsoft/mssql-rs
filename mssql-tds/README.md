@@ -53,6 +53,11 @@ The server certificate must be trusted and match the hostname.
 cancellation, and other per-command settings. Use `advance()` for subsequent
 results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
+Use `begin_transaction_with_options`, `commit_transaction_with_options`, and
+`rollback_transaction_with_options` to bound transaction requests with the same
+options. Their original counterparts remain unbounded. Commit and rollback never
+reconnect onto a different session.
+
 ## Connection policy and migration
 
 See the [connection behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
@@ -78,6 +83,9 @@ Drain a response with `close_query()` before reuse, or call
 acknowledgement. Zero uses the transport default; failed cancellation settlement
 retires the connection. Discarding rows during cancellation does not decode
 values or resolve Always Encrypted keys.
+
+`close_query_with_options` can impose an additional drain timeout and cancellation
+handle without extending the active request's remaining timeout.
 
 ## Runtime behavior
 
