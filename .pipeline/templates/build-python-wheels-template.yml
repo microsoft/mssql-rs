@@ -182,6 +182,8 @@ steps:
 
 # Native builds for Windows
 - ${{ if eq(parameters.osType, 'Windows') }}:
+  - template: configure-python-certificates-windows.yml
+
   - task: UsePythonVersion@0
     displayName: 'Use Python ${{ parameters.pythonVersions[0] }} to build abi3 wheel'
     inputs:

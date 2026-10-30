@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
+import ssl
+import subprocess
 import sys
 import types
 import zipfile
@@ -28,6 +31,76 @@ _SPEC = importlib.util.spec_from_file_location("wheel_install", _SCRIPT)
 assert _SPEC and _SPEC.loader
 wheel_install = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(wheel_install)
+
+_TEMPLATES = _WHEEL_INSTALL_TEMPLATE.parent
+_CERTIFICATE_TEMPLATE = "configure-python-certificates-windows.yml"
+_POWERSHELL = shutil.which("pwsh") or shutil.which("powershell.exe")
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["build-python-wheels-template.yml", "test-python-wheel-installs-template.yml"],
+)
+def test_windows_python_configures_certificates_before_selection(template) -> None:
+    source = yaml.safe_load((_TEMPLATES / template).read_text(encoding="utf-8"))
+    branches = {
+        key: value
+        for step in source["steps"]
+        for key, value in step.items()
+        if key.startswith("${{ if eq(parameters.osType,")
+    }
+    windows = branches["${{ if eq(parameters.osType, 'Windows') }}"]
+    assert windows[0] == {"template": _CERTIFICATE_TEMPLATE}
+    for branch, steps in branches.items():
+        if branch != "${{ if eq(parameters.osType, 'Windows') }}":
+            assert _CERTIFICATE_TEMPLATE not in str(steps)
+
+
+@pytest.mark.skipif(_POWERSHELL is None, reason="PowerShell is required")
+@pytest.mark.parametrize("empty_store", [False, True])
+def test_windows_python_certificate_bundle(empty_store) -> None:
+    source = yaml.safe_load(
+        (_TEMPLATES / _CERTIFICATE_TEMPLATE).read_text(encoding="utf-8")
+    )
+    step = source["steps"][0]
+    script = step["pwsh"]
+    # Keep filesystem paths native to the shell, including Windows PowerShell from WSL.
+    stub = r"""
+    $env:AGENT_TEMPDIRECTORY = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
+    New-Item -ItemType Directory -Path $env:AGENT_TEMPDIRECTORY | Out-Null
+    $certificate = [pscustomobject]@{Thumbprint = 'test-root'; RawData = [byte[]](1, 2, 3)}
+    function Get-ChildItem {
+      param($Path)
+      if (($Path -join ',') -cne 'Cert:\LocalMachine\Root,Cert:\CurrentUser\Root') {
+        throw 'Unexpected certificate stores'
+      }
+    """
+    if not empty_store:
+        stub += "$certificate; $certificate\n"
+    stub += "}\ntry {\n" + script + r"""
+      Get-Content -Raw (Join-Path $env:AGENT_TEMPDIRECTORY 'python-ca-bundle.pem')
+    } finally {
+      Remove-Item -Recurse -Force -LiteralPath $env:AGENT_TEMPDIRECTORY
+    }
+    """
+    result = subprocess.run(
+        [_POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", stub],
+        capture_output=True, text=True,
+    )
+    if empty_store:
+        assert result.returncode != 0
+        assert "No Windows trusted root certificates found for pip." in result.stderr
+        assert "##vso[task.setvariable" not in result.stdout
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "##vso[task.setvariable variable=PIP_CERT]" in result.stdout
+        assert result.stdout.count("-----BEGIN CERTIFICATE-----") == 1
+        pem = re.search(
+            r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            result.stdout, re.DOTALL,
+        )
+        assert pem
+        assert ssl.PEM_cert_to_DER_cert(pem[0]) == b"\x01\x02\x03"
 
 
 def write_wheel(path: Path, name: str = "mssql_python_rs") -> Path:

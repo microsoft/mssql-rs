@@ -34,6 +34,8 @@ steps:
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if eq(parameters.osType, 'Windows') }}:
+  - template: configure-python-certificates-windows.yml
+
   - ${{ each pythonVersion in parameters.pythonVersions }}:
     - task: UsePythonVersion@0
       displayName: 'Use Python ${{ pythonVersion }} for install test'
