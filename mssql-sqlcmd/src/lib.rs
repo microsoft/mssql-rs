@@ -9,6 +9,12 @@
 //!
 //! - [`formatter`] renders results in a structured format. JSON
 //!   (`--format json`) is the first one.
+//! - [`diagnostics`] checks a connection stage by stage for
+//!   `sqlcmd diagnose`, and reports it as text or JSON. It is built for 64-bit
+//!   targets only, as is `mssql-tds`, which its connection checks use: 32-bit
+//!   builds leave it out.
 
+#[cfg(target_pointer_width = "64")]
+pub mod diagnostics;
 pub mod ffi;
 pub mod formatter;
