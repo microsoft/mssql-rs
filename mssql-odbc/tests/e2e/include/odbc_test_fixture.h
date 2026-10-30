@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "odbc_diagnostics_mutex.h"
+
 #include <gtest/gtest.h>
 
 #ifdef _WIN32
@@ -255,10 +257,16 @@ protected:
     }
 
     // Only idle cancellation uses this gate; running-command cancellation must
-    // remain concurrent with the executing call.
+    // remain concurrent with the executing call. The Driver Manager lets
+    // SQLCancel through its per-handle lock, so without the gate it can overlap
+    // an observer's STMT diagnostic read inside the driver. msodbcsql holds
+    // csStmt for that read, and SQLCancel decides idle vs cross-thread with
+    // TryEnter on csStmt (sqlcmisc.cpp:754), so the idle cancel leaves the
+    // cursor open and the next command finds the connection busy. Both drivers
+    // take the gate so the legs run the same interleavings.
     SQLRETURN CancelIdleStatement() {
         const auto requested = std::chrono::steady_clock::now();
-        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+        std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
         const auto locked = std::chrono::steady_clock::now();
         const SQLRETURN rc = SQLCancel(stmt_);
         idle_cancel_lock_wait_ = locked - requested;
@@ -276,7 +284,7 @@ protected:
                " sqlcancel_ms=" +
                std::to_string(duration_cast<milliseconds>(idle_cancel_call_).count());
     }
-    std::shared_mutex diagnostics_mutex_;
+    OdbcDiagnosticsMutex diagnostics_mutex_;
 
 private:
     SQLHENV lent_env_ = SQL_NULL_HENV;
