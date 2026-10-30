@@ -34,6 +34,7 @@ fi
 
 wheel_dir="${1:?wheel directory is required}"
 architecture="${2:?architecture is required}"
+registry="${3:-ghcr.io/microsoft/mssql-rs}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 case "$architecture" in
@@ -50,7 +51,7 @@ case "$architecture" in
 esac
 
 for platform_tag in "${PLATFORM_TAGS[@]}"; do
-    image="ghcr.io/microsoft/mssql-rs/import/python-build/${platform_tag}_${image_arch}:latest"
+    image="$registry/import/python-build/${platform_tag}_${image_arch}:latest"
     docker pull "$image"
     docker run --rm \
         -v "$wheel_dir:/wheels:ro" \

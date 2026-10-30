@@ -48,6 +48,46 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts
 
+### Windows Python certificate bootstrap
+
+The shared Windows wheel build and install-test templates run
+`configure-python-certificates-windows.yml` before selecting Python. It exports
+the machine and current user's trusted roots to a PEM bundle in
+`Agent.TempDirectory` and sets `PIP_CERT` for subsequent tasks. This lets older
+bundled pip versions validate HTTPS using the agent's trusted roots during
+`UsePythonVersion`'s pip upgrade, without disabling certificate verification.
+The failures occurred with pip 23.0.1 on Python 3.10 and pip 24.0 on Python 3.11,
+which do not use the Windows trust store by default. The logs show a missing
+trusted issuer, not an outdated CA bundle or a Python EOL/download problem.
+The presented certificate chain was not inspected, so a corporate CA is a
+possible explanation, not a confirmed cause. `PIP_CERT` explicitly aligns pip
+with the agent's Windows trusted roots.
+
+If pip still reports `CERTIFICATE_VERIFY_FAILED`, check that the required issuer
+is installed in the agent's Windows trusted-root store. `PIP_CERT` replaces pip's
+bundled CA roots for subsequent pip calls in the job, including Windows PR
+validation. The export is a snapshot of roots already installed on the agent;
+it does not include roots Windows might retrieve later through automatic root
+updates. An endpoint whose issuer is missing from this snapshot can fail even
+if pip's bundled CA roots would have trusted it; there is no certifi fallback.
+
+A Docker timeout reaching
+`https://ghcr.io/v2/` is separate: check registry connectivity and the Docker
+daemon's proxy/egress configuration on the failing agent pool.
+
+OneBranch Linux wheel jobs use the `tdslibrs.azurecr.io` mirrors for building,
+driver injection, wheel repair, and clean-install checks. They install Azure CLI
+and reuse `azure-cli-login-template.yml` with the `ACR-Tdslibrs` service connection
+before pulling images, as the SQLCMD jobs do. Shared wheel templates retain GHCR
+defaults for PR validation; only OneBranch callers select ACR. Image repositories,
+tags, architectures, and the unmodified consumer images used by install checks
+are unchanged. Both official and non-official pipeline definitions must be
+authorized to use the service connection.
+
+The manual `OneBranch/PublishFeeds-Sandbox.yml` pipeline still pulls its Python
+build images from GHCR on the same pools and may encounter the same connectivity
+failure. Migrating that sandbox to ACR is a separate follow-up.
+
 ### docker-cargo-run.sh
 
 Wraps `docker run` and forwards the `MSSQL_RS_PUBLIC` and `MSSQL_RS` Cargo feed
