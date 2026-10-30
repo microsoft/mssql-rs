@@ -150,8 +150,13 @@ every non-Strict mode) stay on a socket with Secure Transport.
 - **Connect stages.** Each attempt's `tcp` stage covers the handshake. An address
   that fails the handshake records a successful `tcp` stage, then a failed
   `tls` stage; after a successful attempt, the `tls` stage records success and
-  takes no time. A diagnostic connection's extra connects to the remaining
-  addresses are TCP-only, as on the socket path.
+  takes no time. TLS options that contradict each other fail a `tls` stage
+  before any address is tried, after the `dns` stage when addresses are tried
+  in turn, so a diagnostic connection can still stop after resolution. A
+  connection Network.framework cannot set up counts as a socket that cannot be
+  created: in turn, it fails that address's `tcp` stage and ends the attempt;
+  under MSF, the race moves on. A diagnostic connection's extra connects to the
+  remaining addresses are TCP-only, as on the socket path.
 - **Trust.** Security.framework evaluates the chain under Apple's TLS server
   policy, so keychain roots, administrator-installed CAs, and trust settings
   decide which servers are trusted. The expected name is `host_name_in_cert`,

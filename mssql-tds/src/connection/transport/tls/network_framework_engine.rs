@@ -18,6 +18,8 @@
 //! in for the socket connect in the sequential and MultiSubnetFailover address
 //! walks, and tells an address that could not be reached, which the walk moves
 //! past, from a server that was reached but failed the handshake, which ends it.
+//! A connection it cannot set up fails before the server is tried, as a socket
+//! that cannot be created does.
 //!
 //! Handshakes tunneled through PreLogin packets (TDS 7.x) cannot use TLS 1.3, and
 //! their transport is a framing layer rather than a connection Network.framework
@@ -29,6 +31,7 @@ mod verify;
 
 use std::error::Error as StdError;
 use std::future::Future;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,18 +80,32 @@ impl Connector {
         }))
     }
 
-    /// Connects to `address` and completes the TLS handshake on it.
+    /// Starts connecting to `address`, giving the connect and TLS handshake to
+    /// await, or the error that kept the connection from being set up, in which
+    /// case the server was never tried, as when a socket cannot be created.
+    pub(crate) fn start(
+        &self,
+        address: SocketAddr,
+    ) -> io::Result<impl Future<Output = Result<Box<dyn Stream>, AttemptError>> + Send + 'static>
+    {
+        let target = Arc::clone(&self.0);
+        let (stream, verifier) = target.start(address)?;
+        Ok(async move { target.finish(address, stream, verifier).await })
+    }
+
+    /// [`start`](Self::start) as one attempt of a race, to which a connection
+    /// that cannot be set up is unreachable, as a socket that cannot be created is.
     pub(crate) fn connect(
         &self,
         address: SocketAddr,
     ) -> impl Future<Output = Result<Box<dyn Stream>, AttemptError>> + Send + 'static {
-        let target = Arc::clone(&self.0);
-        async move { target.connect(address).await }
+        let started = self.start(address);
+        async move { started?.await }
     }
 }
 
 impl Target {
-    async fn connect(&self, address: SocketAddr) -> Result<Box<dyn Stream>, AttemptError> {
+    fn start(&self, address: SocketAddr) -> io::Result<(NwStream, Arc<Verifier>)> {
         info!(
             "Starting TLS handshake to {} at {} using host {}",
             self.server_host_name, address, self.host_name
@@ -104,9 +121,18 @@ impl Target {
             alpn: TDS_8_ALPN_PROTOCOL,
             keep_alive: self.keep_alive,
         };
-        let stream =
-            NwStream::start(&options, Arc::clone(&verifier)).map_err(|e| self.rejected(e))?;
+        let stream = NwStream::start(&options, Arc::clone(&verifier)).inspect_err(|e| {
+            error!("Could not set up a Network.framework connection to {address}: {e}")
+        })?;
+        Ok((stream, verifier))
+    }
 
+    async fn finish(
+        &self,
+        address: SocketAddr,
+        stream: NwStream,
+        verifier: Arc<Verifier>,
+    ) -> Result<Box<dyn Stream>, AttemptError> {
         if let Err(failure) = stream.established().await {
             if let Some(reason) = verifier.take_failure() {
                 return Err(self.rejected(reason));
@@ -152,12 +178,13 @@ impl Target {
 }
 
 /// The name to send as SNI, which RFC 6066 limits to DNS host names: no literal
-/// addresses, and no trailing dot.
+/// addresses, no trailing dot, and no NUL. Without one, the certificate check
+/// alone judges the name.
 fn sni_host_name(host: &str) -> Option<&str> {
     let host = host.trim_end_matches('.');
     let usable = !host.is_empty()
         && host.is_ascii()
-        && !host.contains(':')
+        && !host.contains([':', '\0'])
         && host.parse::<Ipv4Addr>().is_err();
     usable.then_some(host)
 }
@@ -791,10 +818,34 @@ pub(crate) mod tests {
             ("[::1]", None),
             ("fe80::1%en0", None),
             ("bücher.example", None),
+            ("sql\0.example", None),
             ("", None),
             (".", None),
         ] {
             assert_eq!(sni_host_name(host), expected, "{host:?}");
         }
+    }
+
+    /// A NUL could not be passed on as SNI, but leaving SNI out still lets the
+    /// connection be set up, so it reaches the server for the certificate
+    /// check to judge the name.
+    #[tokio::test]
+    async fn a_host_name_sni_cannot_carry_still_reaches_the_server() {
+        let (listener, address) = listen().await;
+        let server = serve(listener, until_the_client_leaves);
+        let validation = trusting();
+        let params = TlsConnectParams {
+            validation: &validation,
+            host_name: "sql\0.example",
+            server_host_name: HOST,
+            server_certificate_path: None,
+        };
+
+        let stream = within(Connector::new(&params, 30_000, 1_000).connect(address))
+            .await
+            .unwrap();
+
+        drop(stream);
+        within(server).await.unwrap();
     }
 }

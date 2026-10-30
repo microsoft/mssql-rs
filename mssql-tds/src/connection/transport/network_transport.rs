@@ -996,14 +996,19 @@ async fn create_network_framework_transport(
         server_host_name: transport_context.get_server_name().to_string(),
         encryption_options,
     };
-    let connector = {
-        let (validation, host_name) =
-            ssl_handler.tls_validation(NegotiatedEncryptionSetting::Strict)?;
-        Connector::new(
-            &ssl_handler.connect_params(&validation, host_name),
-            keep_alive_in_ms,
-            keep_alive_interval_in_ms,
-        )
+    // The socket path checks the TLS options once connected, in its `tls` stage,
+    // so a sequential diagnostic resolves, and can stop, before they are checked.
+    let connector = || {
+        ssl_handler
+            .tls_validation(NegotiatedEncryptionSetting::Strict)
+            .map(|(validation, host_name)| {
+                Connector::new(
+                    &ssl_handler.connect_params(&validation, host_name),
+                    keep_alive_in_ms,
+                    keep_alive_interval_in_ms,
+                )
+            })
+            .inspect_err(|e| connect_stage::record_error(&tls_stage(), e))
     };
 
     let (stream, resolution) = if multi_subnet_failover {
@@ -1011,6 +1016,7 @@ async fn create_network_framework_transport(
             "Connecting to TCP transport with TLS (parallel/MultiSubnetFailover): {}:{}",
             host, port
         );
+        let connector = connector()?;
         let (result, resolution) = race_to_connect(host, port, connect_timeout_ms, |address| {
             connector.connect(address)
         })
@@ -1027,6 +1033,7 @@ async fn create_network_framework_transport(
         );
         let (resolution, addresses) =
             resolve_sequential(ipaddress_preference, host, port, diagnosis).await?;
+        let connector = connector()?;
         let stream = connect_in_order_with(
             addresses,
             host,
@@ -1035,7 +1042,7 @@ async fn create_network_framework_transport(
             keep_alive_interval_in_ms,
             connect_timeout_ms,
             diagnosis,
-            |address| Ok(connector.connect(address)),
+            |address| connector.start(address),
         )
         .await?;
         (stream, resolution)
@@ -7701,6 +7708,50 @@ mod extra_connect_tests {
         assert_eq!(tls.field(connect_stage::OK), Some("false"));
         assert!(tls.field(connect_stage::ERROR).is_some(), "{tls:#?}");
     }
+
+    /// A connect that cannot be set up ends before the address is tried: its
+    /// `tcp` stage fails, and the addresses after it are not connected to.
+    #[test]
+    fn an_address_whose_connect_cannot_be_set_up_ends_the_connect_unreached() {
+        let (_extra, extra) = listener();
+        let log = StageLog::default();
+        let result = tracing::subscriber::with_default(log.clone(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let diagnosis = Diagnosis::new(None);
+                    let result = connect_in_order_with(
+                        vec![closed_port(), extra],
+                        "test",
+                        0,
+                        30_000,
+                        1_000,
+                        5_000,
+                        Some(&diagnosis),
+                        |_| {
+                            Err::<std::future::Ready<Result<(), AttemptError>>, _>(
+                                std::io::Error::other("no connection object"),
+                            )
+                        },
+                    )
+                    .await;
+                    diagnosis.finish_extra_connects(0).await;
+                    result
+                })
+        });
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::Io(e)) if e.kind() == std::io::ErrorKind::Other
+        ));
+        let tcp = log.named(connect_stage::TCP);
+        assert_eq!(tcp.len(), 1, "{tcp:#?}");
+        assert_eq!(tcp[0].field(connect_stage::OK), Some("false"), "{tcp:#?}");
+        assert!(tcp[0].field(connect_stage::ERROR).is_some(), "{tcp:#?}");
+        assert!(log.named(connect_stage::TLS).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -7966,16 +8017,25 @@ mod network_framework_stage_tests {
         multi_subnet_failover: bool,
         diagnosis: Option<&Diagnosis>,
     ) -> (TdsResult<NetworkTransport>, StageLog) {
+        let options = EncryptionOptions {
+            server_certificate: Some(fixture(pin)),
+            ..EncryptionOptions::new()
+        };
+        connect_with(address, options, multi_subnet_failover, diagnosis).await
+    }
+
+    async fn connect_with(
+        address: SocketAddr,
+        options: EncryptionOptions,
+        multi_subnet_failover: bool,
+        diagnosis: Option<&Diagnosis>,
+    ) -> (TdsResult<NetworkTransport>, StageLog) {
         let log = StageLog::default();
         let _recording = tracing::subscriber::set_default(log.clone());
         let context = TransportContext::Tcp {
             host: address.ip().to_string(),
             port: address.port(),
             instance_name: None,
-        };
-        let options = EncryptionOptions {
-            server_certificate: Some(fixture(pin)),
-            ..EncryptionOptions::new()
         };
         let connecting = create_transport(
             IPAddressPreference::IPv4First,
@@ -8095,5 +8155,62 @@ mod network_framework_stage_tests {
             log.named(connect_stage::DNS)[0].field(connect_stage::OK),
             Some("true")
         );
+    }
+
+    /// Options the socket path rejects in its `tls` stage, once connected.
+    fn contradictory_tls_options() -> EncryptionOptions {
+        EncryptionOptions {
+            server_certificate: Some(fixture("valid_cert.pem")),
+            host_name_in_cert: Some("sql.example.com".to_string()),
+            ..EncryptionOptions::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_diagnostic_connect_stops_after_resolution_before_checking_the_tls_options() {
+        let diagnosis = Diagnosis::new(Some(DiagnosticStop::Resolution));
+
+        let (result, log) = connect_with(
+            refusing_address().await,
+            contradictory_tls_options(),
+            false,
+            Some(&diagnosis),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(names(&log), [connect_stage::DNS]);
+    }
+
+    #[tokio::test]
+    async fn contradictory_tls_options_fail_the_tls_stage_without_connecting() {
+        for multi_subnet_failover in [false, true] {
+            let (result, log) = connect_with(
+                refusing_address().await,
+                contradictory_tls_options(),
+                multi_subnet_failover,
+                None,
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(Error::UsageError(_))),
+                "{:?}",
+                result.as_ref().err()
+            );
+            let expected = if multi_subnet_failover {
+                vec![connect_stage::TLS]
+            } else {
+                vec![connect_stage::DNS, connect_stage::TLS]
+            };
+            assert_eq!(names(&log), expected);
+            let tls = &log.named(connect_stage::TLS)[0];
+            assert_eq!(tls.field(connect_stage::OK), Some("false"));
+            assert!(tls.field(connect_stage::ERROR).is_some(), "{tls:#?}");
+        }
     }
 }
