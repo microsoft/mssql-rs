@@ -552,12 +552,11 @@ on; these guarantees were verified against msodbcsql's behavior.
     connect races) go under `tests/e2e/tests/multithreaded_tests/`.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
     than loosen the assertion or the mode.
-  - For idle `SQLCancel`, use `CancelIdleStatement()` so `SharedStmt` diagnostic
-    observers cannot race the DM's unprotected cancellation cleanup. If a body
-    deliberately produces DM errors, hold `diagnostics_mutex_` through those
-    probes and a non-mutating call that clears the DM errors. Keep assertions
-    and the other observer overlaps; pin driver-level cancellation contention
-    in Rust tests rather than relying on this unsafe DM overlap.
+  - Call idle `SQLCancel` directly; do not add a harness diagnostics mutex around
+    cancellation or DM-error probes. Unix runner profiles skip `SharedStmt`
+    until CI adopts the unixODBC diagnostic-list fix (AB#49575). Opt back into
+    that mode only with a patched Driver Manager; retain the handle-lifetime
+    publication/retraction lock.
 - Every new `SQLXxx` function must have at least:
   - A success-path test.
   - A null-output-handle test.
