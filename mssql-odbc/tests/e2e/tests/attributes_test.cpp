@@ -437,6 +437,7 @@ ODBC_TEST_F(AttributesTest, AccessModeReadOnlyHintAllowsDml) {
 ODBC_TEST_F(AttributesTest, AccessModeInvalidValuePreservesMode) {
     ASSERT_SQL_OK(SetAccessMode(dbc_, SQL_MODE_READ_ONLY),
                   SQL_HANDLE_DBC, dbc_);
+    std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
     EXPECT_EQ(SQL_ERROR, SetAccessMode(dbc_, 2));
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY024");
     EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(dbc_));

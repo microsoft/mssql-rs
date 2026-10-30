@@ -35,9 +35,9 @@
 //                without a statement, so an ENV-only fixture must leave this
 //                mode out with ODBC_TEST_F_MODES rather than register it.
 //                The Driver Manager serializes calls per handle (Windows, and
-//                unixODBC at the Threading=1 run_e2e.sh sets), so only the DBC
-//                reads overlap the owner's calls in the driver; STMT reads run
-//                between them.
+//                unixODBC at the Threading=1 run_e2e.sh sets) except
+//                SQLCancel, so STMT reads run between the owner's calls; the
+//                fixture's diagnostics gate keeps them out of idle SQLCancel.
 //
 // Worker() and Iteration() identify the run (0, 0 when single-threaded).
 // WorkerToken() derives a value unique to the run, so a result delivered to
@@ -931,6 +931,9 @@ inline bool CheckDiagnostics(SQLSMALLINT type, SQLHANDLE handle, std::string& er
 // thread reports it, so no thread writes the test's result while the owner
 // reads it. MSSQL_ODBC_MT_THREADS=1 runs the owner alone, which is how a
 // SharedStmt failure is told apart from a plain bug in the body.
+// CancelIdleStatement stops admitting diagnostic readers before waiting for
+// existing readers to leave, then excludes them during SQLCancel, whose DM
+// diagnostic-list cleanup is not protected by unixODBC's Threading=1.
 template <typename T>
 void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     const Config config = LoadConfig();
@@ -946,6 +949,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     std::shared_mutex handles_mutex;
     SQLHSTMT observed_stmt = SQL_NULL_HSTMT;
     SQLHDBC observed_dbc = SQL_NULL_HDBC;
+    OdbcDiagnosticsMutex* observed_diagnostics_mutex = nullptr;
     std::atomic<bool> retracting{false};
     std::atomic<bool> stop{false};
     std::atomic<bool> observer_failed{false};
@@ -992,6 +996,8 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                         {
                             std::shared_lock<std::shared_mutex> lock(handles_mutex);
                             if (observed_stmt != SQL_NULL_HSTMT) {
+                                std::shared_lock<OdbcDiagnosticsMutex> diagnostics_lock(
+                                    *observed_diagnostics_mutex);
                                 if (!CheckDiagnostics(SQL_HANDLE_STMT, observed_stmt, error) ||
                                     !CheckDiagnostics(SQL_HANDLE_DBC, observed_dbc, error)) {
                                     record_observer_error(observer, error);
@@ -1042,6 +1048,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                         std::unique_lock<std::shared_mutex> lock(handles_mutex);
                         observed_stmt = test->ConcurrentStmt();
                         observed_dbc = test->ConcurrentDbc();
+                        observed_diagnostics_mutex = &test->ConcurrentDiagnosticsMutex();
                         reads_before = reads.load();
                     }
                     RunPhase("the test body", [&] { test->ConcurrentBody(); });
@@ -1055,6 +1062,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                         std::unique_lock<std::shared_mutex> lock(handles_mutex);
                         observed_stmt = SQL_NULL_HSTMT;
                         observed_dbc = SQL_NULL_HDBC;
+                        observed_diagnostics_mutex = nullptr;
                     }
                     retracting.store(false);
                 }
@@ -1251,6 +1259,7 @@ bool Register(const char* suite, const char* name, const char* file, int line, u
         SQLHENV ConcurrentEnv() const { return env_; }                                         \
         SQLHDBC ConcurrentDbc() const { return dbc_; }                                         \
         SQLHSTMT ConcurrentStmt() const { return stmt_; }                                      \
+        OdbcDiagnosticsMutex& ConcurrentDiagnosticsMutex() { return diagnostics_mutex_; }    \
                                                                                                \
        private:                                                                                \
         ::odbc_concurrency::Mode mode_;                                                        \
