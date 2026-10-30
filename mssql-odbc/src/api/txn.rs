@@ -745,11 +745,22 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         Ok(())
     } else {
         let timeout = ConnectionTimeout::new(dbc);
-        dbc.runtime.block_on(client.begin_transaction_with_options(
+        let result = dbc.runtime.block_on(client.begin_transaction_with_options(
             TransactionIsolationLevel::NoChange,
             None,
             timeout.options(),
-        ))
+        ));
+        if result.is_err()
+            && client.has_active_transaction()
+            && !client.is_connection_dead()
+            && let Err(error) = dbc
+                .runtime
+                .block_on(client.rollback_transaction_with_options(None, None, timeout.options()))
+        {
+            error!(%error, "{op}: rollback after a failed transaction begin failed");
+            client.mark_connection_dead();
+        }
+        result
     };
     release_dbc_client_and_publish(dbc, client, op, |state| {
         if let Err(e) = result {
@@ -1073,9 +1084,7 @@ fn finish_post_connect_txn_settings(
     op: &str,
 ) -> SqlReturn {
     match release_dbc_client_and_publish(dbc, client, op, |state| {
-        if isolation_applied {
-            state.server_isolation_unknown = false;
-        }
+        state.server_isolation_unknown = !isolation_applied;
         if let Some((error, message)) = failure {
             if state
                 .wire
@@ -1139,6 +1148,29 @@ mod tests {
             SQL_SUCCESS
         );
         value
+    }
+
+    fn connect_to_mock(h: &TestHandles, server: &MockServer) -> SqlReturn {
+        let address = server.local_addr();
+        let connection_string = crate::test_support::cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused-by-the-mock-server;\
+             Encrypt=No;TrustServerCertificate=Yes;ConnectRetryCount=0",
+            address.ip(),
+            address.port()
+        ));
+        let connection_string: Vec<u16> = connection_string.encode_utf16().collect();
+        unsafe {
+            crate::api::SQLDriverConnectW(
+                h.dbc,
+                std::ptr::null_mut(),
+                connection_string.as_ptr(),
+                connection_string.len().try_into().unwrap(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                crate::api::odbc_types::SQL_DRIVER_NOPROMPT,
+            )
+        }
     }
 
     fn timeout_fixture(query: &str) -> (TestHandles, MockServer) {
@@ -1413,28 +1445,8 @@ mod tests {
             set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
             SQL_SUCCESS
         );
-        let address = server.local_addr();
-        let connection_string = crate::test_support::cs(&format!(
-            "Server=tcp:{},{};UID=sa;<PW>=unused-by-the-mock-server;\
-             Encrypt=No;TrustServerCertificate=Yes;ConnectRetryCount=0",
-            address.ip(),
-            address.port()
-        ));
-        let connection_string: Vec<u16> = connection_string.encode_utf16().collect();
-        let connect = || unsafe {
-            crate::api::SQLDriverConnectW(
-                h.dbc,
-                std::ptr::null_mut(),
-                connection_string.as_ptr(),
-                connection_string.len().try_into().unwrap(),
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                crate::api::odbc_types::SQL_DRIVER_NOPROMPT,
-            )
-        };
         let started = Instant::now();
-        assert_eq!(connect(), SQL_ERROR);
+        assert_eq!(connect_to_mock(&h, &server), SQL_ERROR);
         assert!(started.elapsed() < Duration::from_secs(3));
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
@@ -1447,11 +1459,231 @@ mod tests {
 
         server.set_tm_begin_delay(Duration::ZERO);
         server.register_query(ATTENTION_DELAY_KEY, QueryResponse::select_one());
-        assert_eq!(connect(), SQL_SUCCESS);
+        assert_eq!(connect_to_mock(&h, &server), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.connection_state, ConnectionState::Connected);
         assert!(state.wire.client().unwrap().has_active_transaction());
         assert!(!state.autocommit);
+    }
+
+    #[test]
+    fn failed_preconnect_isolation_is_retried_even_when_the_requested_value_matches() {
+        let server_handles = TestHandles::with_env_dbc();
+        let server_dbc = unsafe { handle_from_raw::<DbcHandle>(server_handles.dbc) };
+        let server = connect_mock_server(
+            server_dbc,
+            ISOLATION_SQL,
+            QueryResponse::new(Vec::new(), Vec::new()).with_delay(SLOW_RESPONSE),
+        );
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 1), SQL_SUCCESS);
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE),
+            SQL_SUCCESS
+        );
+        assert_eq!(connect_to_mock(&h, &server), SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.diag_records()[0].sql_state, *b"01000");
+            assert!(state.server_isolation_unknown);
+            assert!(!state.wire.client().unwrap().is_connection_dead());
+        }
+
+        server.register_query(
+            ISOLATION_SQL,
+            QueryResponse::error_only(mssql_mock_tds::TerminalError::new(
+                50001,
+                16,
+                "isolation retry reached the server",
+            )),
+        );
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE),
+            SQL_ERROR
+        );
+        assert!(
+            dbc.inner.lock().unwrap().diag_records()[0]
+                .message
+                .contains("isolation retry reached the server")
+        );
+        server.register_query(ISOLATION_SQL, QueryResponse::new(Vec::new(), Vec::new()));
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE),
+            SQL_SUCCESS
+        );
+        assert!(!dbc.inner.lock().unwrap().server_isolation_unknown);
+    }
+
+    #[test]
+    fn failed_manual_mode_begin_rolls_back_or_retires_the_started_transaction() {
+        use mssql_mock_tds::protocol::{
+            TM_BEGIN_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
+            build_prelogin_response_with_fedauth, build_transaction_manager_response,
+            parse_transaction_manager_request,
+        };
+        use mssql_mock_tds::server::ConnectionProcessor;
+        use mssql_tds::connection::client_context::ClientContext;
+        use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+        use mssql_tds::core::EncryptionSetting;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn response_packet(payload: &[u8], final_packet: bool, id: u8) -> Vec<u8> {
+            let length = u16::try_from(8 + payload.len()).unwrap().to_be_bytes();
+            let mut packet = vec![4, u8::from(final_packet), length[0], length[1], 0, 0, id, 0];
+            packet.extend_from_slice(payload);
+            packet
+        }
+
+        for rollback_stalls in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let server_runtime = tokio::runtime::Runtime::new().unwrap();
+            let rollbacks = Arc::new(AtomicUsize::new(0));
+            let observed_rollbacks = Arc::clone(&rollbacks);
+            let (address, server) = server_runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let task = tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(10), async move {
+                        let (mut socket, peer) = listener.accept().await.unwrap();
+                        let registry =
+                            Arc::new(tokio::sync::Mutex::new(mssql_mock_tds::QueryRegistry::new()));
+                        let mut processor = ConnectionProcessor::new(0, peer, registry, None);
+                        let mut pending_tail = None;
+                        let mut transaction_open = false;
+                        loop {
+                            let mut header = [0u8; 8];
+                            if let Err(error) = socket.read_exact(&mut header).await {
+                                assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                                break;
+                            }
+                            let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+                            let mut body = vec![0; length - header.len()];
+                            socket.read_exact(&mut body).await.unwrap();
+                            if header[0] == 0x12 {
+                                socket
+                                    .write_all(&build_prelogin_response_with_fedauth(false, true))
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
+                            if header[0] == 0x0e {
+                                let request = parse_transaction_manager_request(&body).unwrap();
+                                match request {
+                                    TM_BEGIN_XACT => {
+                                        transaction_open = true;
+                                        let tokens = build_transaction_manager_response(request);
+                                        let split = tokens.len() - build_done_token(0).len();
+                                        socket
+                                            .write_all(&response_packet(&tokens[..split], false, 1))
+                                            .await
+                                            .unwrap();
+                                        pending_tail =
+                                            Some(response_packet(&tokens[split..], true, 2));
+                                    }
+                                    TM_ROLLBACK_XACT => {
+                                        rollbacks.fetch_add(1, Ordering::SeqCst);
+                                        if rollback_stalls {
+                                            pending_tail = Some(Vec::new());
+                                        } else {
+                                            transaction_open = false;
+                                            socket
+                                                .write_all(&response_packet(
+                                                    &build_transaction_manager_response(request),
+                                                    true,
+                                                    1,
+                                                ))
+                                                .await
+                                                .unwrap();
+                                        }
+                                    }
+                                    _ => panic!("unexpected transaction request {request}"),
+                                }
+                                continue;
+                            }
+                            if header[0] == 6 {
+                                let tail = pending_tail.take().unwrap();
+                                socket.write_all(&tail).await.unwrap();
+                                socket
+                                    .write_all(&build_attention_ack_packet())
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
+                            if header[0] == 1 {
+                                assert!(
+                                    !transaction_open,
+                                    "autocommit must not inherit the failed BEGIN"
+                                );
+                            }
+                            processor.buffer_mut().extend_from_slice(&header);
+                            processor.buffer_mut().extend_from_slice(&body);
+                            if let Some(response) =
+                                processor.process_packet(&mut socket).await.unwrap()
+                            {
+                                socket.write_all(&response).await.unwrap();
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+                (address, task)
+            });
+            let mut context = ClientContext::default();
+            context.user_name = "sa".to_string();
+            context.password = "unused-by-the-mock-server".to_string();
+            context.database = "master".to_string();
+            context.encryption_options.mode = EncryptionSetting::PreferOff;
+            context.encryption_options.trust_server_certificate = true;
+            let client = dbc
+                .runtime
+                .block_on(TdsConnectionProvider {}.create_client(
+                    context,
+                    &format!("tcp:{},{}", address.ip(), address.port()),
+                    None,
+                ))
+                .unwrap();
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.wire.install(client);
+                state.connection_state = ConnectionState::Connected;
+            }
+            assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 1), SQL_SUCCESS);
+            let started = Instant::now();
+            assert_eq!(
+                set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+                SQL_ERROR
+            );
+            assert!(started.elapsed() < Duration::from_secs(4));
+            {
+                let state = dbc.inner.lock().unwrap();
+                assert_eq!(state.diag_records()[0].sql_state, *b"HYT00");
+                assert!(state.autocommit);
+                assert!(!state.local_tran_started);
+                let client = state.wire.client().unwrap();
+                assert_eq!(client.is_connection_dead(), rollback_stalls);
+                if !rollback_stalls {
+                    assert!(!client.has_active_transaction());
+                }
+            }
+            assert_eq!(observed_rollbacks.load(Ordering::SeqCst), 1);
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap())
+                },
+                if rollback_stalls {
+                    SQL_ERROR
+                } else {
+                    SQL_SUCCESS
+                }
+            );
+            server.abort();
+        }
     }
 
     #[test]

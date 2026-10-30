@@ -141,11 +141,8 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(CANCEL_TIMEOUT_SECS as u64)
 
 /// Budget for the ignore packet itself, strictly below [`CANCEL_TIMEOUT`].
 ///
-/// `PacketWriter` checks this only after a write returns, so it can fire only
-/// while the stream is still intact — which yields the graceful arm, closing the
-/// transport normally. The outer deadline instead drops the write future and
-/// forces retirement without a shutdown, so a merely slow peer should reach this
-/// one first. Only the ordering matters; the exact value does not.
+/// A timed-out write may leave a partial packet, so its suspended state directs
+/// the caller to retire the transport without another write or TLS shutdown.
 const CANCEL_WRITE_TIMEOUT_SECS: u32 = CANCEL_TIMEOUT_SECS / 2;
 
 #[derive(Debug)]
@@ -2944,10 +2941,8 @@ impl TdsClient {
                 .without_cancellation(),
             self.transport.as_writer(),
         );
-        // `PacketWriter` only checks its budget once a write returns, so the
-        // ignore packet needs an outer deadline too. Reaching that one means the
-        // write never came back, so the future is dropped mid-record and the
-        // transport is retired without being written to again.
+        // A configured cancellation deadline replaces the writer's request
+        // budget. Either deadline must retire a write abandoned mid-record.
         let ignored = tokio::time::timeout_at(
             deadline.unwrap_or_else(|| tokio::time::Instant::now() + CANCEL_TIMEOUT),
             packet_writer.cancel_current_message(),
@@ -9813,6 +9808,7 @@ mod tests {
         /// When set, `send` never returns, so a test can drive a write deadline
         /// without a real stalled peer.
         send_should_hang: Arc<std::sync::atomic::AtomicBool>,
+        send_prefix_before_hang: bool,
         /// Fires after the first successful send, allowing a multi-packet
         /// request to be cancelled while the server holds its first packet.
         cancel_after_send: Option<tokio_util::sync::CancellationToken>,
@@ -9820,6 +9816,7 @@ mod tests {
         cancel_during_send: Option<tokio_util::sync::CancellationToken>,
         sends_before_cancel: usize,
         send_delay: Option<Duration>,
+        send_completion_delay: Option<Duration>,
         /// Attentions requested, so a test can tell the cancel-a-sent-request
         /// path from the withdraw-a-partial-one path.
         attentions: Arc<std::sync::atomic::AtomicUsize>,
@@ -9854,11 +9851,13 @@ mod tests {
                 plp_read_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                send_prefix_before_hang: false,
                 cancel_after_send: None,
                 cancel_on_writer_creation: None,
                 cancel_during_send: None,
                 sends_before_cancel: 0,
                 send_delay: None,
+                send_completion_delay: None,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
                 receive_error: None,
@@ -10063,6 +10062,9 @@ mod tests {
                 .send_should_hang
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
+                if self.send_prefix_before_hang {
+                    self.sent.lock().unwrap().extend_from_slice(&data[..8]);
+                }
                 std::future::pending::<()>().await;
             }
             if self.sends_before_cancel == 0
@@ -10074,6 +10076,10 @@ mod tests {
             }
             self.sends_before_cancel = self.sends_before_cancel.saturating_sub(1);
             self.sent.lock().unwrap().extend_from_slice(data);
+            if let Some(delay) = self.send_completion_delay.take() {
+                // Model a completed send winning the deadline race without yielding.
+                std::thread::sleep(delay);
+            }
             if let Some(cancel) = self.cancel_after_send.take() {
                 cancel.cancel();
             }
@@ -20062,7 +20068,7 @@ mod tests {
         for delayed_send in [false, true] {
             let mut transport = TestTransport::new();
             if delayed_send {
-                transport.send_delay = Some(Duration::from_millis(2100));
+                transport.send_completion_delay = Some(Duration::from_millis(2100));
             }
             let sent = Arc::clone(&transport.sent);
             let attentions = Arc::clone(&transport.attentions);
@@ -20222,6 +20228,94 @@ mod tests {
         assert!(!client.prepared_handles.contains_key(&id));
         assert_eq!(sent.lock().unwrap().len(), 8);
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_write_timeout_retires_a_stalled_send_without_external_cancellation() {
+        for configured_cancel in [false, true] {
+            for operation in ["batch", "begin", "commit", "rollback"] {
+                let mut cancel = CancelHandle::new();
+                cancel.set_cancel_timeout_secs(1);
+                let mut transport = TestTransport::new();
+                transport
+                    .send_should_hang
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                transport.send_prefix_before_hang = true;
+                let sent = Arc::clone(&transport.sent);
+                let closes = Arc::clone(&transport.close_calls);
+                let attentions = Arc::clone(&transport.attentions);
+                let mut client = create_test_client_with_transport(transport);
+                let start = tokio::time::Instant::now();
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut options = ExecuteOptions::new().timeout_secs(1);
+                    if configured_cancel {
+                        options = options.cancel(&cancel);
+                    }
+                    match operation {
+                        "batch" => client
+                            .execute("SELECT 1".to_string(), options)
+                            .await
+                            .map(|_| ()),
+                        "begin" => {
+                            client
+                                .begin_transaction_with_options(
+                                    TransactionIsolationLevel::NoChange,
+                                    None,
+                                    options,
+                                )
+                                .await
+                        }
+                        "commit" => {
+                            client
+                                .commit_transaction_with_options(None, None, options)
+                                .await
+                        }
+                        "rollback" => {
+                            client
+                                .rollback_transaction_with_options(None, None, options)
+                                .await
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await
+                .expect("the request's write deadline must fire before the watchdog");
+                assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+                assert_eq!(start.elapsed(), Duration::from_secs(1), "{operation}");
+                assert!(!cancel.cancel_token.is_cancelled());
+                assert!(client.is_connection_dead(), "{operation}");
+                assert_eq!(sent.lock().unwrap().len(), 8, "{operation}");
+                assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_request_write_does_not_inherit_the_cancellation_budget() {
+        for timeout in [None, Some(0)] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(1);
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.send_delay = Some(Duration::from_secs(2));
+            let mut client = create_test_client_with_transport(transport);
+            let started = tokio::time::Instant::now();
+            client
+                .commit_transaction_with_options(
+                    None,
+                    None,
+                    ExecuteOptions {
+                        timeout,
+                        cancel: Some(&cancel),
+                        ..ExecuteOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(started.elapsed(), Duration::from_secs(2));
+            assert!(!cancel.cancel_token.is_cancelled());
+            assert!(!client.is_connection_dead());
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -21164,10 +21258,8 @@ mod tests {
         );
     }
 
-    /// `PacketWriter` only checks its budget once a write returns, so a stalled
-    /// peer would block the withdrawal forever. The deadline must fire, and the
-    /// transport must be retired rather than reused - dropping a write future
-    /// mid-flight is only safe because nothing writes to that stream again.
+    /// A stalled withdrawal must time out and retire the transport: dropping a
+    /// write mid-flight is safe only when nothing writes to that stream again.
     #[tokio::test(start_paused = true)]
     async fn the_ignore_packet_gives_up_on_a_stalled_peer() {
         let transport = TestTransport::new();

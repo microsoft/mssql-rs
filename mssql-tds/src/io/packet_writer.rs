@@ -8,7 +8,8 @@ use crate::error::TimeoutErrorType;
 use crate::message::messages::{PacketStatusFlags, PacketType, ResetConnectionMode};
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
-use std::time::Instant;
+use std::time::Duration;
+use tokio::time::Instant;
 use tracing::event;
 
 /// Optimized batch write operations with manual overflow control.
@@ -491,6 +492,15 @@ impl<'a> PacketWriter<'a> {
         if handle.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
             return Err(OperationCancelledError("Request was cancelled".to_string()));
         }
+        let deadline = self
+            .max_timeout_sec
+            .map(|seconds| self.start_time + Duration::from_secs(u64::from(seconds)));
+        let elapsed = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         let send_data_fut = async {
             self.send_attempted = true;
             self.send_incomplete = true;
@@ -515,6 +525,21 @@ impl<'a> PacketWriter<'a> {
                         "Cancellation timed out completing the current packet".to_string(),
                     ))??;
                 }
+                () = elapsed => {
+                    // The write may have stopped inside a packet or TLS record.
+                    // Keep send_incomplete set so the caller retires the stream.
+                    return Err(TimeoutError(TimeoutErrorType::String(
+                        "Timeout expired".to_string(),
+                    )));
+                }
+            }
+        } else if deadline.is_some() {
+            tokio::select! {
+                biased;
+                result = CancelHandle::run_until_cancelled(handle, send_data_fut) => result?,
+                () = elapsed => return Err(TimeoutError(TimeoutErrorType::String(
+                    "Timeout expired".to_string(),
+                ))),
             }
         } else {
             CancelHandle::run_until_cancelled(handle, send_data_fut).await?;
@@ -539,14 +564,11 @@ impl<'a> PacketWriter<'a> {
             self.network_writer.note_reset_dispatched();
         }
 
-        // Check timeout after the write completes.
-        if let Some(max_timeout) = self.max_timeout_sec {
-            let elapsed = self.start_time.elapsed().as_secs();
-            if elapsed > max_timeout as u64 {
-                return Err(TimeoutError(TimeoutErrorType::String(
-                    "Timeout expired".to_string(),
-                )));
-            }
+        // A ready send wins the race; account for its bytes before reporting expiry.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(TimeoutError(TimeoutErrorType::String(
+                "Timeout expired".to_string(),
+            )));
         }
 
         event!(
@@ -1891,8 +1913,8 @@ pub(crate) mod tests {
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
     }
 
-    /// The budget is checked after the write, so `finalize`'s terminating packet
-    /// is on the wire before it can fail. Such a message needs cancelling, not
+    /// A ready send can finish before expiry is observed, leaving `finalize`'s
+    /// terminating packet on the wire. Such a message needs cancelling, not
     /// withdrawing: a second `EOM | IGNORE` would leave the server owing two
     /// responses and the extra DONE for the next command.
     #[test]
@@ -1916,7 +1938,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// The write budget is checked *after* the packet lands, so this error path
+    /// A ready write can finish before expiry is observed, so this error path
     /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
     /// the flushed flag can tell the caller the server is mid-message, and
     /// getting it wrong means the request is dropped instead of withdrawn.
