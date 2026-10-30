@@ -2639,7 +2639,7 @@ ODBC_TEST_F(ParamArrayTest, FailedSetWithoutStatusArrayIsAnErrorResult) {
         // The Driver Manager may raise some of these errors itself; its list
         // is cleaned up outside unixODBC's statement lock, so keep SharedStmt
         // observers out until a non-mutating call has cleared it.
-        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+        std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
         SQLSMALLINT columns = -1;
         ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(0, columns);
