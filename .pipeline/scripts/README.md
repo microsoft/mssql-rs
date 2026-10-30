@@ -215,13 +215,6 @@ it fails without a GIL or driver regression
 ([#762](https://github.com/microsoft/mssql-rs/issues/762)). Remove it once the
 upstream test checks GIL release directly instead of a speedup ratio.
 
-The list also temporarily excludes all 15 variants of
-`tests/test_009_pooling.py::test_pool_checkout_validation_timeout` to unblock
-release CI. The rest of the pooling suite remains enabled. Remove this exclusion
-and pass all 15 variants without weakening their assertions when
-[AB#49673](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49673)
-fixes connection-timeout enforcement during pool checkout.
-
 The macOS job owns the locally built Rust and source-matched ODBC wheels and
 installs upstream editable with `--no-deps`. Its `requirements.txt` supplies
 third-party dependencies. Before SQL startup, `verify-mssql-python.py` runs as a
