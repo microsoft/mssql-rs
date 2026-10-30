@@ -87,6 +87,15 @@ validation until connect; a successful cached set is not driver acceptance.
 [shared connection policy and migration guide](../mssql-tds/README.md#connection-policy-and-migration)
 for the full precedence and applicability rules.
 
+### Connection-operation timeouts
+
+`SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-scoped network requests,
+including pooled reset, isolation and autocommit changes, transaction completion,
+and cursor draining for those operations. Zero leaves request I/O unlimited.
+Cancellation settlement and a pool's replacement login can add time; this is not
+an end-to-end pool-checkout deadline. A connection that cannot finish cancellation
+is retired rather than returned with an unsynchronized response stream.
+
 ### Data-at-execution parameters
 
 PLP-capable values supplied through `SQLParamData`/`SQLPutData` are streamed to

@@ -24,8 +24,9 @@ use super::odbc_types::{
 };
 use super::sqlstate::{
     ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_DOES_NOT_EXIST, ERR_INVALID_ATTRIBUTE_VALUE,
-    ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_08S01, SQLSTATE_01000, SQLSTATE_08007,
-    SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, claim_error_diag, post_diag, post_tds_error,
+    ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_08S01, SQLSTATE_01000, SQLSTATE_08001,
+    SQLSTATE_08007, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, claim_error_diag, post_diag,
+    post_tds_error,
 };
 use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
@@ -171,6 +172,31 @@ pub(super) fn fail_lost_session(dbc: &DbcHandle, op: &str) -> SqlReturn {
     SQL_ERROR
 }
 
+struct ConnectionTimeout {
+    seconds: u32,
+    cancel: Option<CancelHandle>,
+}
+
+impl ConnectionTimeout {
+    fn new(dbc: &DbcHandle) -> Self {
+        let seconds = dbc.connection_timeout();
+        let cancel = (seconds != 0).then(|| {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(seconds);
+            cancel
+        });
+        Self { seconds, cancel }
+    }
+
+    fn options(&self) -> ExecuteOptions<'_> {
+        ExecuteOptions {
+            timeout: Some(self.seconds),
+            cancel: self.cancel.as_ref(),
+            ..ExecuteOptions::default()
+        }
+    }
+}
+
 /// Runs `sql` as a language batch on an already-claimed client and drains the
 /// response. Draining matters: the TDS layer refuses a transaction-manager
 /// request while a batch is still open.
@@ -179,8 +205,9 @@ pub(super) fn exec_batch(
     client: &mut TdsClient,
     sql: &str,
 ) -> Result<(), mssql_tds::error::Error> {
+    let timeout = ConnectionTimeout::new(dbc);
     dbc.runtime.block_on(async {
-        client.execute(sql.to_string(), ()).await?;
+        client.execute(sql.to_string(), timeout.options()).await?;
         client.close_query().await
     })
 }
@@ -277,11 +304,16 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     // or a raw T-SQL ROLLBACK), in which case the flag is stale and the TM
     // request would fail. msodbcsql guards the same way via FIsLocalTranActive.
     let result = if client.has_active_transaction() {
+        let timeout = ConnectionTimeout::new(dbc);
         dbc.runtime.block_on(async {
             if commit {
-                client.commit_transaction(None, None).await
+                client
+                    .commit_transaction_with_options(None, None, timeout.options())
+                    .await
             } else {
-                client.rollback_transaction(None, None).await
+                client
+                    .rollback_transaction_with_options(None, None, timeout.options())
+                    .await
             }
         })
     } else {
@@ -572,8 +604,9 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // session. The ODBC flag can be stale, hence the descriptor guard.
     let result = if started && client.has_active_transaction() {
         debug!("{OP}: rolling back live local transaction before reset");
+        let timeout = ConnectionTimeout::new(dbc);
         dbc.runtime
-            .block_on(client.rollback_transaction(None, None))
+            .block_on(client.rollback_transaction_with_options(None, None, timeout.options()))
     } else {
         Ok(())
     };
@@ -646,13 +679,15 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
             return SQL_ERROR;
         }
     };
+    let timeout = ConnectionTimeout::new(dbc);
     let result = if had_user_txn && client.has_active_transaction() {
         debug!("{op}: committing user transaction");
-        dbc.runtime.block_on(client.commit_transaction(None, None))
+        dbc.runtime
+            .block_on(client.commit_transaction_with_options(None, None, timeout.options()))
     } else if client.has_active_transaction() {
         debug!("{op}: rolling back driver-begun transaction");
         dbc.runtime
-            .block_on(client.rollback_transaction(None, None))
+            .block_on(client.rollback_transaction_with_options(None, None, timeout.options()))
     } else {
         Ok(())
     };
@@ -709,8 +744,23 @@ fn switch_to_manual_commit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     let result = if client.has_active_transaction() {
         Ok(())
     } else {
-        dbc.runtime
-            .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))
+        let timeout = ConnectionTimeout::new(dbc);
+        let result = dbc.runtime.block_on(client.begin_transaction_with_options(
+            TransactionIsolationLevel::NoChange,
+            None,
+            timeout.options(),
+        ));
+        if result.is_err()
+            && client.has_active_transaction()
+            && !client.is_connection_dead()
+            && let Err(error) = dbc
+                .runtime
+                .block_on(client.rollback_transaction_with_options(None, None, timeout.options()))
+        {
+            error!(%error, "{op}: rollback after a failed transaction begin failed");
+            client.mark_connection_dead();
+        }
+        result
     };
     release_dbc_client_and_publish(dbc, client, op, |state| {
         if let Err(e) = result {
@@ -803,10 +853,11 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // the autocommit switch establishes. Rolling back loses nothing because
     // there is nothing in it.
     let reopen = client.has_active_transaction();
+    let timeout = ConnectionTimeout::new(dbc);
     let mut result = if reopen {
         debug!("{OP}: rolling back empty driver-begun transaction to apply isolation");
         dbc.runtime
-            .block_on(client.rollback_transaction(None, None))
+            .block_on(client.rollback_transaction_with_options(None, None, timeout.options()))
     } else {
         Ok(())
     };
@@ -814,16 +865,19 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         result = exec_batch(dbc, &mut client, tsql);
     }
     if result.is_ok() && reopen {
-        result = dbc
-            .runtime
-            .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None));
+        result = dbc.runtime.block_on(client.begin_transaction_with_options(
+            TransactionIsolationLevel::NoChange,
+            None,
+            timeout.options(),
+        ));
     }
     release_dbc_client_and_publish(dbc, client, OP, |state| {
         if let Err(e) = result {
-            // A failed SET leaves the server's level unknown, so the flag stays set
-            // and the next attempt emits again. If the failure was an armed reset
+            // The SET may have run before its drain or transaction reopen failed.
+            // Keep the cache unknown so the next attempt emits again. An armed reset
             // going unacknowledged, `TdsClient` has already marked the connection
             // dead and `post_tds_error` maps it to 08S01 so the pool discards it.
+            state.server_isolation_unknown = true;
             error!(%e, "{OP}: could not apply isolation level");
             post_tds_error(state, &e, SQLSTATE_HY000);
             return SQL_ERROR;
@@ -893,12 +947,13 @@ fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: b
     // (AB#47510). Skipping costs nothing the exit does not already cost: this
     // transaction carries no user work, and the server rolls it back when the
     // socket closes — the same fallback the cursor-sweep bail-out above takes.
+    let timeout = ConnectionTimeout::new(dbc);
     if process_is_shutting_down {
         debug!("{OP}: process is exiting — the server will roll back on disconnect");
     } else if client.has_active_transaction()
         && let Err(e) = dbc
             .runtime
-            .block_on(client.rollback_transaction(None, None))
+            .block_on(client.rollback_transaction_with_options(None, None, timeout.options()))
     {
         error!(%e, "{OP}: rollback failed; the server will roll back on disconnect");
     }
@@ -945,10 +1000,8 @@ fn settle_isolation_invalidation(state: &mut DbcState, captured_generation: u64)
 /// Applies transaction attributes that were set before `SQLDriverConnect` and so
 /// could not reach the server. Called once the login completes.
 ///
-/// A settings failure leaves the session usable, so it returns
-/// `SQL_SUCCESS_WITH_INFO` with a diagnostic. A stale lease means the session
-/// was torn down while the settings ran; that returns `SQL_ERROR` / `08003`
-/// because the successful login no longer represents a usable connection.
+/// A settings failure on a usable session returns `SQL_SUCCESS_WITH_INFO`.
+/// A retired connection or stale lease fails the connect instead.
 #[must_use]
 pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
     const OP: &str = "SQLDriverConnectW(transaction settings)";
@@ -988,30 +1041,36 @@ pub(super) fn apply_post_connect_txn_settings(dbc: &DbcHandle) -> SqlReturn {
         }
     };
 
-    let mut failure: Option<String> = None;
+    let mut failure = None;
 
     if isolation != SQL_TXN_READ_COMMITTED
         && let Some(tsql) = txn_isolation_to_tsql(isolation)
         && let Err(e) = exec_batch(dbc, &mut client, tsql)
     {
         error!(%e, "{OP}: could not apply pre-connect isolation level");
-        failure = Some(format!(
+        let message = format!(
             "The transaction isolation level set before connecting could not be \
              applied to the session: {e}"
-        ));
+        );
+        failure = Some((e, message));
     }
     let isolation_applied = failure.is_none();
+    let timeout = ConnectionTimeout::new(dbc);
 
     if !autocommit
+        && !client.is_connection_dead()
         && !client.has_active_transaction()
-        && let Err(e) = dbc
-            .runtime
-            .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))
+        && let Err(e) = dbc.runtime.block_on(client.begin_transaction_with_options(
+            TransactionIsolationLevel::NoChange,
+            None,
+            timeout.options(),
+        ))
     {
         error!(%e, "{OP}: could not begin transaction for manual-commit mode");
-        failure.get_or_insert_with(|| {
-            format!("The manual-commit transaction could not be started: {e}")
-        });
+        if client.is_connection_dead() || failure.is_none() {
+            let message = format!("The manual-commit transaction could not be started: {e}");
+            failure = Some((e, message));
+        }
     }
 
     finish_post_connect_txn_settings(dbc, client, isolation_applied, failure, OP)
@@ -1021,14 +1080,21 @@ fn finish_post_connect_txn_settings(
     dbc: &DbcHandle,
     client: WireLease,
     isolation_applied: bool,
-    failure: Option<String>,
+    failure: Option<(mssql_tds::error::Error, String)>,
     op: &str,
 ) -> SqlReturn {
     match release_dbc_client_and_publish(dbc, client, op, |state| {
-        if isolation_applied {
-            state.server_isolation_unknown = false;
-        }
-        if let Some(message) = failure {
+        state.server_isolation_unknown = !isolation_applied;
+        if let Some((error, message)) = failure {
+            if state
+                .wire
+                .client()
+                .is_some_and(|client| client.is_connection_dead())
+            {
+                super::disconnect::clear_session(dbc, state);
+                post_tds_error(state, &error, SQLSTATE_08001);
+                return SQL_ERROR;
+            }
             post_sql_error(state, SQLSTATE_01000, 0, &message);
             SQL_SUCCESS_WITH_INFO
         } else {
@@ -1042,6 +1108,583 @@ fn finish_post_connect_txn_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::odbc_types::{
+        SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD, SQL_ATTR_CONNECTION_TIMEOUT,
+        SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_CD_TRUE, SQL_COMMIT, SQL_HANDLE_DBC,
+        SQL_ROLLBACK, SqlInteger, SqlPointer,
+    };
+    use crate::test_support::{MockServer, TestHandles, connect_mock_server};
+    use mssql_mock_tds::{
+        ATTENTION_DELAY_KEY, QueryResponse, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
+    };
+    use std::time::{Duration, Instant};
+
+    const ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+    const SLOW_RESPONSE: Duration = Duration::from_secs(4);
+
+    fn set_attr(h: &TestHandles, attribute: SqlInteger, value: u32) -> SqlReturn {
+        unsafe {
+            crate::api::SQLSetConnectAttrW(
+                h.dbc,
+                attribute,
+                usize::try_from(value).unwrap() as SqlPointer,
+                0,
+            )
+        }
+    }
+
+    fn get_attr(h: &TestHandles, attribute: SqlInteger) -> u32 {
+        let mut value = u32::MAX;
+        assert_eq!(
+            unsafe {
+                crate::api::SQLGetConnectAttrW(
+                    h.dbc,
+                    attribute,
+                    std::ptr::from_mut(&mut value).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        value
+    }
+
+    fn connect_to_mock(h: &TestHandles, server: &MockServer) -> SqlReturn {
+        let address = server.local_addr();
+        let connection_string = crate::test_support::cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused-by-the-mock-server;\
+             Encrypt=No;TrustServerCertificate=Yes;ConnectRetryCount=0",
+            address.ip(),
+            address.port()
+        ));
+        let connection_string: Vec<u16> = connection_string.encode_utf16().collect();
+        unsafe {
+            crate::api::SQLDriverConnectW(
+                h.dbc,
+                std::ptr::null_mut(),
+                connection_string.as_ptr(),
+                connection_string.len().try_into().unwrap(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                crate::api::odbc_types::SQL_DRIVER_NOPROMPT,
+            )
+        }
+    }
+
+    fn timeout_fixture(query: &str) -> (TestHandles, MockServer) {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let server = connect_mock_server(
+            dbc,
+            query,
+            QueryResponse::new(Vec::new(), Vec::new()).with_delay(SLOW_RESPONSE),
+        );
+        assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 1), SQL_SUCCESS);
+        assert_eq!(get_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT), 1);
+        (h, server)
+    }
+
+    fn assert_timed_out(h: &TestHandles, operation: impl FnOnce() -> SqlReturn) {
+        let started = Instant::now();
+        assert_eq!(operation(), SQL_ERROR);
+        let elapsed = started.elapsed();
+        assert!(
+            (Duration::from_millis(500)..Duration::from_secs(3)).contains(&elapsed),
+            "connection timeout did not bound the operation: {elapsed:?}"
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records()[0].sql_state, *b"HYT00");
+        assert!(state.wire.client().is_some());
+        assert!(state.wire.owner().is_none());
+    }
+
+    fn begin_user_transaction(h: &TestHandles) {
+        assert_eq!(
+            set_attr(h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+            SQL_SUCCESS
+        );
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap())
+        });
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_CLOSE)
+        });
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert!(state.local_tran_started);
+        assert!(state.wire.client().unwrap().has_active_transaction());
+    }
+
+    #[test]
+    fn connection_timeout_bounds_isolation_and_allows_retry_after_ack() {
+        let (h, server) = timeout_fixture(ISOLATION_SQL);
+        assert_timed_out(&h, || {
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE)
+        });
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
+            assert!(state.server_isolation_unknown);
+            assert!(!state.wire.client().unwrap().is_connection_dead());
+        }
+        server.register_query(ISOLATION_SQL, QueryResponse::new(Vec::new(), Vec::new()));
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE),
+            SQL_SUCCESS
+        );
+        assert_eq!(get_attr(&h, SQL_ATTR_TXN_ISOLATION), SQL_TXN_SERIALIZABLE);
+        assert!(!dbc.inner.lock().unwrap().server_isolation_unknown);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_missing_attention_ack_and_retires_connection() {
+        let (h, server) = timeout_fixture(ISOLATION_SQL);
+        server.register_query(
+            ATTENTION_DELAY_KEY,
+            QueryResponse::select_one().with_delay(SLOW_RESPONSE),
+        );
+        assert_timed_out(&h, || {
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE)
+        });
+        assert_eq!(get_attr(&h, SQL_ATTR_CONNECTION_DEAD), SQL_CD_TRUE);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_the_pool_reset_carrier() {
+        let (h, _server) = timeout_fixture("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_RESET_CONNECTION, SQL_RESET_CONNECTION_YES),
+            SQL_SUCCESS
+        );
+        assert_timed_out(&h, || {
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_READ_COMMITTED)
+        });
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(dbc.inner.lock().unwrap().server_isolation_unknown);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_autocommit_begin_and_zero_restores_unlimited_io() {
+        let (h, server) = timeout_fixture(ISOLATION_SQL);
+        server.set_tm_begin_delay(SLOW_RESPONSE);
+        assert_timed_out(&h, || set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF));
+        assert_eq!(get_attr(&h, SQL_ATTR_AUTOCOMMIT), SQL_AUTOCOMMIT_ON);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(
+            !dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .client()
+                .unwrap()
+                .has_active_transaction()
+        );
+
+        assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 0), SQL_SUCCESS);
+        assert_eq!(get_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT), 0);
+        server.set_tm_begin_delay(Duration::from_millis(1200));
+        let started = Instant::now();
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+            SQL_SUCCESS
+        );
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(get_attr(&h, SQL_ATTR_AUTOCOMMIT), SQL_AUTOCOMMIT_OFF);
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON),
+            SQL_SUCCESS
+        );
+    }
+
+    #[test]
+    fn connection_timeout_bounds_commit_and_rollback_without_stranding_the_wire() {
+        for commit in [false, true] {
+            let (h, server) = timeout_fixture(ISOLATION_SQL);
+            begin_user_transaction(&h);
+            let key = if commit {
+                TM_COMMIT_DELAY_KEY
+            } else {
+                TM_ROLLBACK_DELAY_KEY
+            };
+            server.register_query(key, QueryResponse::select_one().with_delay(SLOW_RESPONSE));
+            assert_timed_out(&h, || unsafe {
+                crate::api::SQLEndTran(
+                    SQL_HANDLE_DBC,
+                    h.dbc,
+                    if commit { SQL_COMMIT } else { SQL_ROLLBACK },
+                )
+            });
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            assert!(!dbc.inner.lock().unwrap().local_tran_started);
+            server.register_query(key, QueryResponse::select_one());
+            assert_eq!(
+                set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON),
+                SQL_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn connection_timeout_bounds_both_autocommit_on_transaction_paths() {
+        for user_work in [false, true] {
+            let (h, server) = timeout_fixture(ISOLATION_SQL);
+            if user_work {
+                begin_user_transaction(&h);
+            } else {
+                assert_eq!(
+                    set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+                    SQL_SUCCESS
+                );
+            }
+            server.register_query(
+                if user_work {
+                    TM_COMMIT_DELAY_KEY
+                } else {
+                    TM_ROLLBACK_DELAY_KEY
+                },
+                QueryResponse::select_one().with_delay(SLOW_RESPONSE),
+            );
+            assert_timed_out(&h, || set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON));
+            assert_eq!(get_attr(&h, SQL_ATTR_AUTOCOMMIT), SQL_AUTOCOMMIT_OFF);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            assert!(!dbc.inner.lock().unwrap().local_tran_started);
+        }
+    }
+
+    #[test]
+    fn connection_timeout_during_reset_rollback_preserves_uncertain_transaction_state() {
+        let (h, server) = timeout_fixture(ISOLATION_SQL);
+        begin_user_transaction(&h);
+        server.register_query(
+            TM_ROLLBACK_DELAY_KEY,
+            QueryResponse::select_one().with_delay(SLOW_RESPONSE),
+        );
+        assert_timed_out(&h, || {
+            set_attr(&h, SQL_ATTR_RESET_CONNECTION, SQL_RESET_CONNECTION_YES)
+        });
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(dbc.inner.lock().unwrap().local_tran_started);
+        assert_eq!(get_attr(&h, SQL_ATTR_CONNECTION_DEAD), SQL_CD_TRUE);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_isolation_rollback_and_reopen() {
+        let (h, server) = timeout_fixture(ISOLATION_SQL);
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+            SQL_SUCCESS
+        );
+        server.register_query(
+            TM_ROLLBACK_DELAY_KEY,
+            QueryResponse::select_one().with_delay(SLOW_RESPONSE),
+        );
+        assert_timed_out(&h, || {
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE)
+        });
+
+        server.register_query(TM_ROLLBACK_DELAY_KEY, QueryResponse::select_one());
+        server.register_query(ISOLATION_SQL, QueryResponse::new(Vec::new(), Vec::new()));
+        server.set_tm_begin_delay(SLOW_RESPONSE);
+        assert_timed_out(&h, || {
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE)
+        });
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.server_isolation_unknown);
+            assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
+        }
+        server.set_tm_begin_delay(Duration::ZERO);
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_READ_COMMITTED),
+            SQL_SUCCESS
+        );
+        assert!(!dbc.inner.lock().unwrap().server_isolation_unknown);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_disconnect_rollback() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let server = connect_mock_server(
+            dbc,
+            TM_ROLLBACK_DELAY_KEY,
+            QueryResponse::select_one().with_delay(SLOW_RESPONSE),
+        );
+        assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 1), SQL_SUCCESS);
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+            SQL_SUCCESS
+        );
+        let started = Instant::now();
+        assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_SUCCESS);
+        let elapsed = started.elapsed();
+        assert!((Duration::from_millis(500)..Duration::from_secs(3)).contains(&elapsed));
+        assert_eq!(get_attr(&h, SQL_ATTR_CONNECTION_DEAD), SQL_CD_TRUE);
+        drop(server);
+    }
+
+    #[test]
+    fn connection_timeout_during_post_connect_does_not_return_a_dead_session() {
+        let server_handles = TestHandles::with_env_dbc();
+        let server_dbc = unsafe { handle_from_raw::<DbcHandle>(server_handles.dbc) };
+        let server = connect_mock_server(server_dbc, ISOLATION_SQL, QueryResponse::select_one());
+        server.set_tm_begin_delay(SLOW_RESPONSE);
+        server.register_query(
+            ATTENTION_DELAY_KEY,
+            QueryResponse::select_one().with_delay(SLOW_RESPONSE),
+        );
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 1), SQL_SUCCESS);
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+            SQL_SUCCESS
+        );
+        let started = Instant::now();
+        assert_eq!(connect_to_mock(&h, &server), SQL_ERROR);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.diag_records()[0].sql_state, *b"HYT00");
+            assert_eq!(state.connection_state, ConnectionState::Disconnected);
+            assert!(state.wire.client().is_none());
+            assert!(state.effective_vendor_settings.is_none());
+        }
+
+        server.set_tm_begin_delay(Duration::ZERO);
+        server.register_query(ATTENTION_DELAY_KEY, QueryResponse::select_one());
+        assert_eq!(connect_to_mock(&h, &server), SQL_SUCCESS);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.connection_state, ConnectionState::Connected);
+        assert!(state.wire.client().unwrap().has_active_transaction());
+        assert!(!state.autocommit);
+    }
+
+    #[test]
+    fn failed_preconnect_isolation_is_retried_even_when_the_requested_value_matches() {
+        let server_handles = TestHandles::with_env_dbc();
+        let server_dbc = unsafe { handle_from_raw::<DbcHandle>(server_handles.dbc) };
+        let server = connect_mock_server(
+            server_dbc,
+            ISOLATION_SQL,
+            QueryResponse::new(Vec::new(), Vec::new()).with_delay(SLOW_RESPONSE),
+        );
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 1), SQL_SUCCESS);
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE),
+            SQL_SUCCESS
+        );
+        assert_eq!(connect_to_mock(&h, &server), SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.diag_records()[0].sql_state, *b"01000");
+            assert!(state.server_isolation_unknown);
+            assert!(!state.wire.client().unwrap().is_connection_dead());
+        }
+
+        server.register_query(
+            ISOLATION_SQL,
+            QueryResponse::error_only(mssql_mock_tds::TerminalError::new(
+                50001,
+                16,
+                "isolation retry reached the server",
+            )),
+        );
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE),
+            SQL_ERROR
+        );
+        assert!(
+            dbc.inner.lock().unwrap().diag_records()[0]
+                .message
+                .contains("isolation retry reached the server")
+        );
+        server.register_query(ISOLATION_SQL, QueryResponse::new(Vec::new(), Vec::new()));
+        assert_eq!(
+            set_attr(&h, SQL_ATTR_TXN_ISOLATION, SQL_TXN_SERIALIZABLE),
+            SQL_SUCCESS
+        );
+        assert!(!dbc.inner.lock().unwrap().server_isolation_unknown);
+    }
+
+    #[test]
+    fn failed_manual_mode_begin_rolls_back_or_retires_the_started_transaction() {
+        use mssql_mock_tds::protocol::{
+            TM_BEGIN_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
+            build_prelogin_response_with_fedauth, build_transaction_manager_response,
+            parse_transaction_manager_request,
+        };
+        use mssql_mock_tds::server::ConnectionProcessor;
+        use mssql_tds::connection::client_context::ClientContext;
+        use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+        use mssql_tds::core::EncryptionSetting;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn response_packet(payload: &[u8], final_packet: bool, id: u8) -> Vec<u8> {
+            let length = u16::try_from(8 + payload.len()).unwrap().to_be_bytes();
+            let mut packet = vec![4, u8::from(final_packet), length[0], length[1], 0, 0, id, 0];
+            packet.extend_from_slice(payload);
+            packet
+        }
+
+        for rollback_stalls in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let server_runtime = tokio::runtime::Runtime::new().unwrap();
+            let rollbacks = Arc::new(AtomicUsize::new(0));
+            let observed_rollbacks = Arc::clone(&rollbacks);
+            let (address, server) = server_runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let task = tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(10), async move {
+                        let (mut socket, peer) = listener.accept().await.unwrap();
+                        let registry =
+                            Arc::new(tokio::sync::Mutex::new(mssql_mock_tds::QueryRegistry::new()));
+                        let mut processor = ConnectionProcessor::new(0, peer, registry, None);
+                        let mut pending_tail = None;
+                        let mut transaction_open = false;
+                        loop {
+                            let mut header = [0u8; 8];
+                            if let Err(error) = socket.read_exact(&mut header).await {
+                                assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                                break;
+                            }
+                            let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+                            let mut body = vec![0; length - header.len()];
+                            socket.read_exact(&mut body).await.unwrap();
+                            if header[0] == 0x12 {
+                                socket
+                                    .write_all(&build_prelogin_response_with_fedauth(false, true))
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
+                            if header[0] == 0x0e {
+                                let request = parse_transaction_manager_request(&body).unwrap();
+                                match request {
+                                    TM_BEGIN_XACT => {
+                                        transaction_open = true;
+                                        let tokens = build_transaction_manager_response(request);
+                                        let split = tokens.len() - build_done_token(0).len();
+                                        socket
+                                            .write_all(&response_packet(&tokens[..split], false, 1))
+                                            .await
+                                            .unwrap();
+                                        pending_tail =
+                                            Some(response_packet(&tokens[split..], true, 2));
+                                    }
+                                    TM_ROLLBACK_XACT => {
+                                        rollbacks.fetch_add(1, Ordering::SeqCst);
+                                        if rollback_stalls {
+                                            pending_tail = Some(Vec::new());
+                                        } else {
+                                            transaction_open = false;
+                                            socket
+                                                .write_all(&response_packet(
+                                                    &build_transaction_manager_response(request),
+                                                    true,
+                                                    1,
+                                                ))
+                                                .await
+                                                .unwrap();
+                                        }
+                                    }
+                                    _ => panic!("unexpected transaction request {request}"),
+                                }
+                                continue;
+                            }
+                            if header[0] == 6 {
+                                let tail = pending_tail.take().unwrap();
+                                socket.write_all(&tail).await.unwrap();
+                                socket
+                                    .write_all(&build_attention_ack_packet())
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
+                            if header[0] == 1 {
+                                assert!(
+                                    !transaction_open,
+                                    "autocommit must not inherit the failed BEGIN"
+                                );
+                            }
+                            processor.buffer_mut().extend_from_slice(&header);
+                            processor.buffer_mut().extend_from_slice(&body);
+                            if let Some(response) =
+                                processor.process_packet(&mut socket).await.unwrap()
+                            {
+                                socket.write_all(&response).await.unwrap();
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+                (address, task)
+            });
+            let mut context = ClientContext::default();
+            context.user_name = "sa".to_string();
+            context.password = "unused-by-the-mock-server".to_string();
+            context.database = "master".to_string();
+            context.encryption_options.mode = EncryptionSetting::PreferOff;
+            context.encryption_options.trust_server_certificate = true;
+            let client = dbc
+                .runtime
+                .block_on(TdsConnectionProvider {}.create_client(
+                    context,
+                    &format!("tcp:{},{}", address.ip(), address.port()),
+                    None,
+                ))
+                .unwrap();
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.wire.install(client);
+                state.connection_state = ConnectionState::Connected;
+            }
+            assert_eq!(set_attr(&h, SQL_ATTR_CONNECTION_TIMEOUT, 1), SQL_SUCCESS);
+            let started = Instant::now();
+            assert_eq!(
+                set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF),
+                SQL_ERROR
+            );
+            assert!(started.elapsed() < Duration::from_secs(4));
+            {
+                let state = dbc.inner.lock().unwrap();
+                assert_eq!(state.diag_records()[0].sql_state, *b"HYT00");
+                assert!(state.autocommit);
+                assert!(!state.local_tran_started);
+                let client = state.wire.client().unwrap();
+                assert_eq!(client.is_connection_dead(), rollback_stalls);
+                if !rollback_stalls {
+                    assert!(!client.has_active_transaction());
+                }
+            }
+            assert_eq!(observed_rollbacks.load(Ordering::SeqCst), 1);
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), sql.len().try_into().unwrap())
+                },
+                if rollback_stalls {
+                    SQL_ERROR
+                } else {
+                    SQL_SUCCESS
+                }
+            );
+            server.abort();
+        }
+    }
 
     #[test]
     fn implicit_begin_records_server_transaction_even_when_its_response_fails() {
@@ -1171,7 +1814,10 @@ mod tests {
                 dbc,
                 client,
                 true,
-                Some("old session warning".to_string()),
+                Some((
+                    mssql_tds::error::Error::ProtocolError("old session error".to_string()),
+                    "old session warning".to_string(),
+                )),
                 "test",
             ),
             SQL_ERROR

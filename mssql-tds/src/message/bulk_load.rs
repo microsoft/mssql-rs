@@ -497,6 +497,10 @@ impl<'a> StreamingBulkLoadWriter<'a> {
         self.packet_writer.code_page_conversion_loss()
     }
 
+    pub(crate) fn send_incomplete(&self) -> bool {
+        self.packet_writer.send_incomplete()
+    }
+
     /// End streaming - write DONE token and finalize packet.
     ///
     /// This consumes the writer and returns the number of rows written.
@@ -510,6 +514,11 @@ impl<'a> StreamingBulkLoadWriter<'a> {
     /// Returns an error if:
     /// - Network errors occur during transmission
     pub async fn end(mut self) -> TdsResult<u64> {
+        self.finish().await
+    }
+
+    /// Retains access to packet state so the caller can choose safe error cleanup.
+    pub(crate) async fn finish(&mut self) -> TdsResult<u64> {
         if !self.metadata_written {
             return Err(Error::ProtocolError(
                 "Must call begin() before end()".to_string(),
