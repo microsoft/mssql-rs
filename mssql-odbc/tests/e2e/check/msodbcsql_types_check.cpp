@@ -34,6 +34,9 @@ constexpr long kCaSsUdtCatalogName = SQL_CA_SS_UDT_CATALOG_NAME;
 constexpr long kCaSsUdtSchemaName = SQL_CA_SS_UDT_SCHEMA_NAME;
 constexpr long kCaSsUdtTypeName = SQL_CA_SS_UDT_TYPE_NAME;
 constexpr long kCaSsUdtAssemblyTypeName = SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME;
+constexpr long kCoptSsLongAsMax = SQL_COPT_SS_LONGASMAX;
+constexpr long kXlOff = SQL_XL_OFF;
+constexpr long kXlOn = SQL_XL_ON;
 }  // namespace ours
 
 #undef SQL_C_TYPES_EXTENDED
@@ -49,6 +52,9 @@ constexpr long kCaSsUdtAssemblyTypeName = SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME;
 #undef SQL_CA_SS_UDT_SCHEMA_NAME
 #undef SQL_CA_SS_UDT_TYPE_NAME
 #undef SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+#undef SQL_COPT_SS_LONGASMAX
+#undef SQL_XL_OFF
+#undef SQL_XL_ON
 
 #include <msodbcsql.h>
 
@@ -67,6 +73,12 @@ static_assert(ours::kCaSsUdtSchemaName == SQL_CA_SS_UDT_SCHEMA_NAME, "SQL_CA_SS_
 static_assert(ours::kCaSsUdtTypeName == SQL_CA_SS_UDT_TYPE_NAME, "SQL_CA_SS_UDT_TYPE_NAME");
 static_assert(ours::kCaSsUdtAssemblyTypeName == SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME,
               "SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME");
+// The Linux 18.6 msodbcsql.h stops at SQL_COPT_SS_BASE_ADD + 2.
+#ifdef SQL_COPT_SS_LONGASMAX
+static_assert(ours::kCoptSsLongAsMax == SQL_COPT_SS_LONGASMAX, "SQL_COPT_SS_LONGASMAX");
+#endif
+static_assert(ours::kXlOff == SQL_XL_OFF, "SQL_XL_OFF");
+static_assert(ours::kXlOn == SQL_XL_ON, "SQL_XL_ON");
 
 // Same size, and every member at the same offset with the same type.
 #define ODBC_CHECK_MEMBER(Struct, member)                                                \

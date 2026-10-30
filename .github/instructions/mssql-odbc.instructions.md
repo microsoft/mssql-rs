@@ -390,6 +390,11 @@ on; these guarantees were verified against msodbcsql's behavior.
 
 ### 7.3. Prepared parameter definitions
 
+- `LongAsMax` defaults off. Snapshot it with the execution's bindings so
+  materialized, streamed, and buffered DAE parameters agree. Preserve cached
+  declarations when the connection option changes: msodbcsql changes subsequent
+  wire values but does not invalidate the prepared handle. A new prepare selects
+  the new declaration. Keep DAE payloads PLP-framed even for legacy declarations.
 - Compare SQL definitions during IPD mutation, not APD addresses or conversion
   metadata on every execute. Preserve plans for equivalent `SQLBindParameter`
   calls and APD-only changes. `DESC_CONSISTENT` in msodbcsql controls validation,
@@ -558,8 +563,14 @@ on; these guarantees were verified against msodbcsql's behavior.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
     than loosen the assertion or the mode.
   - For idle `SQLCancel`, use `CancelIdleStatement()` so `SharedStmt` diagnostic
-    observers cannot race the DM's unprotected cancellation cleanup. If a body
-    deliberately produces DM errors, hold `diagnostics_mutex_` through those
+    observers cannot race unixODBC's unprotected DM diagnostic cleanup or make
+    msodbcsql skip the idle cursor close. On Windows the DM lets `SQLCancel`
+    bypass its per-handle lock; if a STMT diagnostic read holds `csStmt`,
+    msodbcsql's `TryEnter` takes the cross-thread path instead of closing the
+    cursor. Keep the gate for both drivers so the parity legs run the same
+    interleavings; see `CancelIdleStatement`'s comment and the
+    [Driver and Driver Manager facts](../../mssql-odbc/docs/multithreaded-testing-plan.md#driver-and-driver-manager-facts).
+    If a body deliberately produces DM errors, hold `diagnostics_mutex_` through those
     probes and a non-mutating call that clears the DM errors. Keep assertions
     and the other observer overlaps; pin driver-level cancellation contention
     in Rust tests rather than relying on this unsafe DM overlap.

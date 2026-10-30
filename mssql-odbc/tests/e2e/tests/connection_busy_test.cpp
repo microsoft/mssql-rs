@@ -54,7 +54,7 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelReleasesConnectionLikeFreeStmtClos
             {
                 // These errors live in the DM's list, whose next-call cleanup
                 // occurs before unixODBC takes its statement lock.
-                std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+                std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
                 SQLSMALLINT columns = -1;
                 EXPECT_EQ(SQL_ERROR, SQLNumResultCols(stmt_, &columns));
                 EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));

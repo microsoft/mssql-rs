@@ -103,6 +103,10 @@ pub struct GssapiContext {
     /// The SPN being used for authentication
     spn: String,
 
+    /// The name handed to `gss_import_name`: `spn` as given, or converted to
+    /// `service@host` for a generated SPN.
+    imported_name: String,
+
     /// GSSAPI context handle
     ctx_handle: GssCtxHandle,
 
@@ -190,10 +194,12 @@ impl GssapiContext {
 
         // Import the SPN as a GSSAPI name
         // Only convert auto-generated SPNs; user-provided SPNs are used as-is
+        let imported_name = gssapi_name(&spn, is_user_provided);
         let target_name = import_name(&spn, is_user_provided)?;
 
         Ok(Self {
             spn,
+            imported_name,
             ctx_handle: GssCtxHandle::default(),
             target_name: GssNameHandle(target_name),
             is_complete: false,
@@ -213,6 +219,7 @@ impl GssapiContext {
         let spn = format!("HTTP@{host}");
         let target_name = import_name(&spn, true)?;
         Ok(Self {
+            imported_name: spn.clone(),
             spn,
             ctx_handle: GssCtxHandle::default(),
             target_name: GssNameHandle(target_name),
@@ -358,6 +365,10 @@ impl SecurityContext for GssapiContext {
     fn spn(&self) -> &str {
         &self.spn
     }
+
+    fn imported_name(&self) -> &str {
+        &self.imported_name
+    }
 }
 
 /// # Login Flow
@@ -405,20 +416,14 @@ fn import_name(spn: &str, user_provided: bool) -> Result<GssNameT, SecurityError
     let mut minor_status: GssOmUint32 = 0;
     let mut target_name: GssNameT = ptr::null_mut();
 
-    // For user-provided SPNs, use as-is; for auto-generated, convert to GSSAPI format
-    let gssapi_name = if user_provided {
-        spn.to_string()
-    } else {
-        let converted = convert_spn_to_gssapi_format(spn);
-        if converted != spn {
-            tracing::debug!(
-                "Converted auto-generated SPN '{}' to GSSAPI format '{}'",
-                spn,
-                converted
-            );
-        }
-        converted
-    };
+    let gssapi_name = gssapi_name(spn, user_provided);
+    if !user_provided && gssapi_name != spn {
+        tracing::debug!(
+            "Converted auto-generated SPN '{}' to GSSAPI format '{}'",
+            spn,
+            gssapi_name
+        );
+    }
     let mut name_buffer = GssBufferDesc::from_str(&gssapi_name);
 
     // Use GSS_C_NT_HOSTBASED_SERVICE for "service@host" format
@@ -444,6 +449,16 @@ fn import_name(spn: &str, user_provided: bool) -> Result<GssNameT, SecurityError
     Ok(target_name)
 }
 
+/// The name imported for `spn`: as given when user-provided, otherwise in
+/// GSSAPI host-based service format.
+fn gssapi_name(spn: &str, user_provided: bool) -> String {
+    if user_provided {
+        spn.to_string()
+    } else {
+        convert_spn_to_gssapi_format(spn)
+    }
+}
+
 /// Converts a Windows-style SPN to GSSAPI host-based service format.
 ///
 /// Windows SPNs use the format `MSSQLSvc/host:port` or `MSSQLSvc/host:instance`,
@@ -464,8 +479,10 @@ fn convert_spn_to_gssapi_format(spn: &str) -> String {
         let service = &spn[..slash_pos];
         let rest = &spn[slash_pos + 1..];
 
-        // Extract host (everything before the colon, or the whole string if no colon)
-        let host = if let Some(colon_pos) = rest.find(':') {
+        // Extract host: everything before the last colon, which starts the
+        // port or instance (an IPv6 host has colons of its own), or the whole
+        // string if there is no colon
+        let host = if let Some(colon_pos) = rest.rfind(':') {
             &rest[..colon_pos]
         } else {
             rest
@@ -491,6 +508,7 @@ mod tests {
         // but should at least not panic
         if let Ok(ctx) = result {
             assert_eq!(ctx.spn(), "MSSQLSvc/server.contoso.com:1433");
+            assert_eq!(ctx.imported_name(), "MSSQLSvc@server.contoso.com");
             assert!(!ctx.is_complete());
         }
     }
@@ -500,7 +518,21 @@ mod tests {
         let config = IntegratedAuthConfig::with_spn("MSSQLSvc/custom:5000".to_string());
         if let Ok(ctx) = GssapiContext::new(&config, "server", 1433) {
             assert_eq!(ctx.spn(), "MSSQLSvc/custom:5000");
+            assert_eq!(ctx.imported_name(), "MSSQLSvc/custom:5000");
         }
+    }
+
+    #[test]
+    fn the_imported_name_is_the_one_gssapi_receives() {
+        // A generated SPN is converted to service@host; an explicit one is not.
+        assert_eq!(
+            gssapi_name("MSSQLSvc/server.contoso.com:1433", false),
+            "MSSQLSvc@server.contoso.com"
+        );
+        assert_eq!(
+            gssapi_name("MSSQLSvc/server.contoso.com:1433", true),
+            "MSSQLSvc/server.contoso.com:1433"
+        );
     }
 
     #[test]
@@ -593,6 +625,16 @@ mod tests {
         assert_eq!(
             convert_spn_to_gssapi_format("MSSQLSvc/server"),
             "MSSQLSvc@server"
+        );
+
+        // An IPv6 host keeps its colons; only the port is dropped.
+        assert_eq!(
+            convert_spn_to_gssapi_format("MSSQLSvc/::1:1433"),
+            "MSSQLSvc@::1"
+        );
+        assert_eq!(
+            convert_spn_to_gssapi_format("MSSQLSvc/fe80::1:INST"),
+            "MSSQLSvc@fe80::1"
         );
     }
 }

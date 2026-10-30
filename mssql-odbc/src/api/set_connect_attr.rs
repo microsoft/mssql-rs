@@ -22,11 +22,11 @@ use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
     SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
     SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
-    SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_MULTISUBNET_FAILOVER,
-    SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TNIR, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT,
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_LONGASMAX,
+    SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TNIR,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 #[cfg(not(windows))]
 use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
@@ -340,6 +340,16 @@ unsafe fn sql_set_connect_attr_w_impl(
                 attribute,
                 value, "SQLSetConnectAttrW: vendor override stored"
             );
+            SQL_SUCCESS
+        }
+        SQL_COPT_SS_LONGASMAX => {
+            let value = value_ptr.addr();
+            state.vendor_overrides.long_as_max = Some(value);
+            if let Some(settings) = state.effective_vendor_settings.as_mut() {
+                settings.long_as_max = Some(value);
+            }
+            // Existing prepared handles retain their declarations, as in
+            // msodbcsql. New executions snapshot this setting for their values.
             SQL_SUCCESS
         }
         // Settable at any time, before or after connect: it changes only how the

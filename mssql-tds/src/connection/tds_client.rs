@@ -955,6 +955,7 @@ impl TdsClient {
                         &reconnect_ctx,
                         &transport_context,
                         Some(Box::new((*snapshot).clone())),
+                        None,
                     ),
                 ),
             )

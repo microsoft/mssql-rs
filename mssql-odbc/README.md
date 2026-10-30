@@ -105,6 +105,23 @@ parameters remain, subsequent PLP values stream normally. Validation that
 depends on the completed value can occur during `SQLPutData` or when
 `SQLParamData` closes the parameter rather than at bind time.
 
+### Legacy LOB parameters
+
+`SQL_LONGVARCHAR`, `SQL_WLONGVARCHAR`, and `SQL_LONGVARBINARY` parameters use
+`text`, `ntext`, and `image` by default, including typed NULLs. Set
+`LongAsMax=Yes` in the connection string, or set `SQL_COPT_SS_LONGASMAX` to
+`SQL_XL_ON`, to use `varchar(max)`, `nvarchar(max)`, and `varbinary(max)`.
+Explicit connection attributes take precedence over the keyword.
+
+**Migration note:** earlier alpha builds always substituted MAX types. Use
+`LongAsMax=Yes` to retain that behavior. `ColumnSize` bounds still apply to
+LONG bindings in either mode; use the ordinary variable-length SQL types with
+`ColumnSize=0` for explicitly unbounded MAX parameters.
+
+An already-executed prepared statement retains its server-side declaration
+when the option changes; prepare it again to select a new declaration. DAE
+parameters remain chunked in both modes.
+
 ## Platform artifacts
 
 | Platform | Driver Manager | Library |

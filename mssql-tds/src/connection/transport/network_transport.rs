@@ -3,14 +3,17 @@
 
 use crate::connection::bulk_copy_state::ATTENTION_TIMEOUT_SECONDS;
 use crate::connection::client_context::{IPAddressPreference, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::dns_cache::{self, Resolution};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{
-    ParallelConnectConfig, parallel_connect_resolving,
+    MAX_PARALLEL_IPS, ParallelConnectConfig, parallel_connect_resolving,
 };
 use crate::connection::transport::ssl_handler::SslHandler;
-use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
+use crate::connection_provider::tds_connection_provider::{
+    Diagnosis, DiagnosticStop, PARSER_REGISTRY,
+};
 use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
 };
@@ -192,6 +195,7 @@ pub(crate) const PRE_NEGOTIATED_PACKET_SIZE: u32 = 4096;
 /// * `keep_alive_interval_in_ms` - TCP keep-alive interval in milliseconds
 /// * `multi_subnet_failover` - If true, enables parallel connection mode for TCP
 /// * `connect_timeout_ms` - Connection timeout in milliseconds
+/// * `diagnosis` - What a diagnostic connection does besides (`None` for a normal one)
 async fn create_base_stream(
     ipaddress_preference: IPAddressPreference,
     transport_context: &TransportContext,
@@ -199,11 +203,14 @@ async fn create_base_stream(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
+    diagnosis: Option<&Diagnosis>,
 ) -> TdsResult<(Box<dyn Stream>, Option<Resolution>)> {
     match transport_context {
         TransportContext::Tcp { host, port, .. } => {
             let (stream, resolution) = if multi_subnet_failover {
-                // Use parallel connection mode for MultiSubnetFailover
+                // Resolving is part of the parallel connect; a diagnostic
+                // attempt cannot stop between the two, which
+                // `diagnose_client` refuses up front.
                 create_base_stream_parallel(
                     host,
                     *port,
@@ -221,6 +228,7 @@ async fn create_base_stream(
                     keep_alive_in_ms,
                     keep_alive_interval_in_ms,
                     connect_timeout_ms,
+                    diagnosis,
                 )
                 .await?
             };
@@ -236,9 +244,23 @@ async fn create_base_stream(
                 ));
             }
             info!("Connecting to Named Pipe: {}", pipe_name);
+            if let Some(diagnosis) = diagnosis {
+                diagnosis.check_stop(DiagnosticStop::Resolution)?;
+            }
 
+            // A LocalDB instance's pipe, once resolved, is connected to as a
+            // named pipe.
+            let kind = if pipe_name
+                .as_bytes()
+                .windows(LOCALDB_PIPE.len())
+                .any(|part| part.eq_ignore_ascii_case(LOCALDB_PIPE))
+            {
+                connect_stage::KIND_LOCALDB
+            } else {
+                connect_stage::KIND_NAMED_PIPE
+            };
             // Open Named Pipe with retry logic for ERROR_PIPE_BUSY
-            let pipe_client = open_named_pipe_with_retry(pipe_name).await?;
+            let pipe_client = open_pipe_stage(kind, pipe_name).await?;
 
             info!("Connected to Named Pipe: {}", pipe_name);
             Ok((Box::new(pipe_client), None))
@@ -279,9 +301,13 @@ async fn create_base_stream(
             let pipe_name = format!(r"\\.\pipe\SQLLocal\{actual_instance}");
 
             info!("Connecting to Shared Memory pipe: {}", pipe_name);
+            if let Some(diagnosis) = diagnosis {
+                diagnosis.check_stop(DiagnosticStop::Resolution)?;
+            }
 
             // Open Named Pipe with retry logic for ERROR_PIPE_BUSY
-            let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
+            let pipe_client =
+                open_pipe_stage(connect_stage::KIND_SHARED_MEMORY, &pipe_name).await?;
 
             info!("Connected to Shared Memory (LPC-over-NP): {}", pipe_name);
             Ok((Box::new(pipe_client), None))
@@ -312,14 +338,45 @@ async fn create_base_stream(
             let pipe_name = resolve_localdb_instance(instance_name).await?;
 
             info!("LocalDB instance resolved to pipe: {}", pipe_name);
+            if let Some(diagnosis) = diagnosis {
+                diagnosis.check_stop(DiagnosticStop::Resolution)?;
+            }
 
             // Connect to the named pipe
-            let pipe_client = open_named_pipe_with_retry(&pipe_name).await?;
+            let pipe_client = open_pipe_stage(connect_stage::KIND_LOCALDB, &pipe_name).await?;
 
             info!("Connected to LocalDB instance: {}", instance_name);
             Ok((Box::new(pipe_client), None))
         }
     }
+}
+
+/// What the pipe of a LocalDB instance has in its path.
+#[cfg(windows)]
+const LOCALDB_PIPE: &[u8] = b"\\pipe\\localdb#";
+
+/// Opens the pipe `pipe_name` (with retry logic for ERROR_PIPE_BUSY) as a
+/// `pipe` connect stage of `kind`.
+#[cfg(windows)]
+async fn open_pipe_stage(
+    kind: &'static str,
+    pipe_name: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    let stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::PIPE,
+        kind = kind,
+        pipe = %pipe_name,
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
+    let pipe_client = open_named_pipe_with_retry(pipe_name)
+        .await
+        .inspect_err(|e| connect_stage::record_io_error(&stage, e))?;
+    stage.record(connect_stage::OK, true);
+    Ok(pipe_client)
 }
 
 /// Stably sorts resolved addresses per `ipaddress_preference`, keeping the
@@ -346,8 +403,116 @@ fn sort_by_ip_preference(
     }
 }
 
+/// The `tcp` connect stage for a connect to `address`.
+fn tcp_stage(address: &SocketAddr) -> tracing::Span {
+    tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::TCP,
+        address = %connect_stage::ScopedIp(address),
+        port = address.port(),
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        timed_out = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    )
+}
+
+/// A TCP socket for `address`, with the client's keep-alive settings.
+fn new_tcp_socket(
+    address: SocketAddr,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+) -> std::io::Result<net::TcpSocket> {
+    let socket = if address.is_ipv6() {
+        net::TcpSocket::new_v6()?
+    } else {
+        net::TcpSocket::new_v4()?
+    };
+
+    // The defaults for the SQL Server clients are at
+    // https://learn.microsoft.com/en-us/sql/tools/configuration-manager/client-protocols-tcp-ip-properties-protocol-tab?view=sql-server-ver16
+    let keep_alive_settings = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_millis(keep_alive_in_ms as u64))
+        .with_interval(Duration::from_millis(keep_alive_interval_in_ms as u64));
+
+    let socket2_socket = socket2::SockRef::from(&socket);
+    socket2_socket.set_tcp_keepalive(&keep_alive_settings)?;
+    socket2_socket.set_nodelay(true)?;
+    Ok(socket)
+}
+
+/// Connects `socket` to `address` within `connect_timeout_ms`, recording the
+/// result on `stage`, as the connect to the address used does.
+async fn connect_tcp_socket(
+    socket: net::TcpSocket,
+    address: SocketAddr,
+    connect_timeout_ms: u64,
+    stage: &tracing::Span,
+) -> std::io::Result<TcpStream> {
+    // Apply connection timeout to each connection attempt
+    let connect_future = socket.connect(address);
+    let result = match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            stage.record(connect_stage::TIMED_OUT, true);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Connection to {} timed out after {}ms",
+                    address, connect_timeout_ms
+                ),
+            ))
+        }
+    };
+    match &result {
+        Ok(_) => {
+            stage.record(connect_stage::OK, true);
+        }
+        Err(e) => connect_stage::record_io_error(stage, e),
+    }
+    result
+}
+
+/// For a diagnostic connection: connects to the addresses after the one the
+/// connection uses, each in a task of its own and within `connect_timeout_ms`,
+/// as the connect to each address before it had, closing each connection at
+/// once. At most [`MAX_PARALLEL_IPS`] are tried, the most a MultiSubnetFailover
+/// connect tries at once, so a long resolver answer cannot exhaust sockets.
+fn spawn_extra_connects(
+    addresses: impl Iterator<Item = SocketAddr>,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+    connect_timeout_ms: u64,
+    diagnosis: &Diagnosis,
+) {
+    let mut addresses = addresses.peekable();
+    for address in addresses.by_ref().take(MAX_PARALLEL_IPS) {
+        // Opened here, so the stage is recorded by the subscriber of the
+        // connection attempt, whatever thread the task runs on.
+        let stage = tcp_stage(&address);
+        diagnosis.spawn_extra_connect(async move {
+            match new_tcp_socket(address, keep_alive_in_ms, keep_alive_interval_in_ms) {
+                Ok(socket) => {
+                    let _ = connect_tcp_socket(socket, address, connect_timeout_ms, &stage).await;
+                }
+                Err(e) => connect_stage::record_io_error(&stage, &e),
+            }
+        });
+    }
+    if addresses.peek().is_some() {
+        debug!(
+            "Not trying {} more addresses: at most {} are tried after the one used",
+            addresses.count(),
+            MAX_PARALLEL_IPS
+        );
+    }
+}
+
 /// Creates a TCP stream using sequential connection mode.
-/// Tries each resolved IP address one at a time until one succeeds.
+/// Tries each resolved IP address one at a time until one succeeds. A
+/// diagnostic connection then connects to the addresses after it too, without
+/// waiting for them.
 async fn create_base_stream_sequential(
     ipaddress_preference: IPAddressPreference,
     host: &str,
@@ -355,6 +520,7 @@ async fn create_base_stream_sequential(
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
+    diagnosis: Option<&Diagnosis>,
 ) -> TdsResult<(Box<dyn Stream>, Resolution)> {
     info!(
         "Connecting to TCP transport (sequential): {}:{}",
@@ -365,39 +531,141 @@ async fn create_base_stream_sequential(
     // `std::net::ToSocketAddrs::to_socket_addrs`) awaits the resolution instead of
     // blocking the calling thread, so a slow or stuck resolver stays subject to the
     // `timeout()`/deadline machinery in the retry loop above this call instead of
-    // silently escaping it. A failed resolution falls back to the DNS cache.
-    let resolution = dns_cache::lookup_host(host, port).await?;
+    // silently escaping it. A failed resolution falls back to the DNS cache, for a
+    // diagnostic connection too: the cache is only read once the resolver has
+    // failed, so it never hides what the resolver answered, and the stage records
+    // both.
+    let dns_stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::DNS,
+        host = %host,
+        addresses = tracing::field::Empty,
+        source = tracing::field::Empty,
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
+    let mut fell_back = false;
+    let resolution = dns_cache::lookup_host(host, port, |e| {
+        fell_back = true;
+        connect_stage::record_dns_fallback(&dns_stage, e);
+    })
+    .await
+    .inspect_err(|e| connect_stage::record_io_error(&dns_stage, e))?;
+    if !fell_back {
+        dns_stage.record(connect_stage::SOURCE, connect_stage::SOURCE_RESOLVER);
+    }
     // Sorted as a copy, so the cache keeps the resolver's order.
     let mut socket_addresses = resolution.addresses().to_vec();
 
     sort_by_ip_preference(&mut socket_addresses, ipaddress_preference);
 
     info!("Socket addresses: {:?}", socket_addresses);
+    if !dns_stage.is_disabled() {
+        dns_stage.record(
+            connect_stage::ADDRESSES,
+            connect_stage::address_list(&socket_addresses),
+        );
+    }
+    dns_stage.record(connect_stage::OK, !socket_addresses.is_empty());
+    drop(dns_stage);
+    if let Some(diagnosis) = diagnosis
+        && !socket_addresses.is_empty()
+    {
+        diagnosis.check_stop(DiagnosticStop::Resolution)?;
+    }
 
-    let stream = sequential_connect_with(&socket_addresses, connect_timeout_ms, |socket_address| {
-        let socket = if socket_address.is_ipv6() {
-            net::TcpSocket::new_v6()?
-        } else {
-            net::TcpSocket::new_v4()?
-        };
-
-        // The defaults for the SQL Server clients are at
-        // https://learn.microsoft.com/en-us/sql/tools/configuration-manager/client-protocols-tcp-ip-properties-protocol-tab?view=sql-server-ver16
-        let keep_alive_settings = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_millis(keep_alive_in_ms as u64))
-            .with_interval(Duration::from_millis(keep_alive_interval_in_ms as u64));
-
-        let socket2_socket = socket2::SockRef::from(&socket);
-        socket2_socket.set_tcp_keepalive(&keep_alive_settings)?;
-        socket2_socket.set_nodelay(true)?;
-
-        Ok(socket.connect(socket_address))
-    })
+    let stream = connect_in_order(
+        socket_addresses,
+        host,
+        port,
+        keep_alive_in_ms,
+        keep_alive_interval_in_ms,
+        connect_timeout_ms,
+        diagnosis,
+    )
     .await?;
-    info!("Connected to TCP transport: {}:{}", host, port);
-    Ok((Box::new(stream), resolution))
+    Ok((stream, resolution))
 }
 
+/// Connects to each of `socket_addresses` in turn, each within
+/// `connect_timeout_ms`, until one accepts; for a diagnostic connection, then
+/// starts the connects to the addresses after it.
+async fn connect_in_order(
+    socket_addresses: Vec<SocketAddr>,
+    host: &str,
+    port: u16,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+    connect_timeout_ms: u64,
+    diagnosis: Option<&Diagnosis>,
+) -> TdsResult<Box<dyn Stream>> {
+    let mut last_error = None;
+    let mut tcp_stream = None;
+
+    let mut remaining = socket_addresses.into_iter();
+    for socket_address in remaining.by_ref() {
+        let tcp_stage = tcp_stage(&socket_address);
+        let socket = new_tcp_socket(socket_address, keep_alive_in_ms, keep_alive_interval_in_ms)
+            .inspect_err(|e| connect_stage::record_io_error(&tcp_stage, e))?;
+
+        // Apply connection timeout to each connection attempt
+        let connect_future = socket.connect(socket_address);
+        tcp_stream = match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await
+        {
+            Ok(Ok(stream)) => {
+                info!("Connected to TCP transport: {}:{}", host, port);
+                tcp_stage.record(connect_stage::OK, true);
+                Some(stream)
+            }
+            Ok(Err(e)) => {
+                connect_stage::record_io_error(&tcp_stage, &e);
+                last_error = Some(e);
+                None
+            }
+            Err(_elapsed) => {
+                let e = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Connection to {} timed out after {}ms",
+                        socket_address, connect_timeout_ms
+                    ),
+                );
+                tcp_stage.record(connect_stage::TIMED_OUT, true);
+                connect_stage::record_io_error(&tcp_stage, &e);
+                last_error = Some(e);
+                None
+            }
+        };
+        if tcp_stream.is_some() {
+            break;
+        }
+    }
+
+    // We don't have a valid TCP stream, so we need to return the last error.
+    if let Some(stream) = tcp_stream {
+        if let Some(diagnosis) = diagnosis {
+            spawn_extra_connects(
+                remaining,
+                keep_alive_in_ms,
+                keep_alive_interval_in_ms,
+                connect_timeout_ms,
+                diagnosis,
+            );
+        }
+        Ok(Box::new(stream))
+    } else {
+        Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("Failed to connect to {host}:{port}"),
+            )
+        })))
+    }
+}
+
+#[cfg(test)]
 async fn sequential_connect_with<C, F>(
     addresses: &[SocketAddr],
     connect_timeout_ms: u64,
@@ -451,7 +719,45 @@ async fn create_base_stream_parallel(
         keep_alive_interval_in_ms,
     };
 
-    let (result, resolution) = parallel_connect_resolving(host, port, &config).await?;
+    let tcp_stage = tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::TCP,
+        address = tracing::field::Empty,
+        port = port,
+        source = tracing::field::Empty,
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        error = tracing::field::Empty,
+        resolver_os_error = tracing::field::Empty,
+        resolver_io_kind = tracing::field::Empty,
+        resolver_error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    );
+    // Where the addresses came from is recorded once the host resolved, before
+    // the race, so a race that fails keeps it.
+    let fell_back = std::sync::atomic::AtomicBool::new(false);
+    let (result, resolution) = parallel_connect_resolving(
+        host,
+        port,
+        &config,
+        |e| {
+            fell_back.store(true, std::sync::atomic::Ordering::Relaxed);
+            connect_stage::record_resolver_fallback(&tcp_stage, e);
+        },
+        || {
+            if !fell_back.load(std::sync::atomic::Ordering::Relaxed) {
+                tcp_stage.record(connect_stage::SOURCE, connect_stage::SOURCE_RESOLVER);
+            }
+        },
+    )
+    .await
+    .inspect_err(|e| connect_stage::record_error(&tcp_stage, e))?;
+    tcp_stage.record(
+        connect_stage::ADDRESS,
+        tracing::field::display(connect_stage::ScopedIp(&result.connected_address)),
+    );
+    tcp_stage.record(connect_stage::OK, true);
+    drop(tcp_stage);
 
     info!(
         "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
@@ -460,7 +766,6 @@ async fn create_base_stream_parallel(
 
     Ok((Box::new(result.stream), resolution))
 }
-
 /// Creates a NetworkTransport configured for the specified TDS version.
 /// This function applies TDS version-specific logic uniformly across all transport types.
 async fn create_transport_for_version(
@@ -493,9 +798,20 @@ async fn create_transport_for_version(
             // Enable TLS immediately for TDS 8.0 (before any TDS packets are exchanged)
             info!("Creating NetworkTransport for TDS 8.0 with immediate TLS");
 
+            let tls_stage = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                os_error = tracing::field::Empty,
+                io_kind = tracing::field::Empty,
+                error = tracing::field::Empty,
+                ok = tracing::field::Empty
+            );
             let encrypted_stream = ssl_handler
                 .enable_ssl_async(stream, NegotiatedEncryptionSetting::Strict)
-                .await?;
+                .await
+                .inspect_err(|e| connect_stage::record_error(&tls_stage, e))?;
+            tls_stage.record(connect_stage::OK, true);
+            drop(tls_stage);
 
             Ok(NetworkTransport::new(
                 encrypted_stream,
@@ -524,6 +840,7 @@ async fn create_transport_for_version(
 /// * `keep_alive_interval_in_ms` - TCP keep-alive interval in milliseconds
 /// * `multi_subnet_failover` - If true, enables parallel connection mode for TCP
 /// * `connect_timeout_ms` - Connection timeout in milliseconds
+/// * `diagnosis` - What a diagnostic connection does besides (`None` for a normal one)
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_transport(
     ipaddress_preference: IPAddressPreference,
@@ -534,6 +851,7 @@ pub(crate) async fn create_transport(
     keep_alive_interval_in_ms: u32,
     multi_subnet_failover: bool,
     connect_timeout_ms: u64,
+    diagnosis: Option<&Diagnosis>,
 ) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
     let encryption_mode = encryption_options.mode;
 
@@ -545,6 +863,7 @@ pub(crate) async fn create_transport(
         keep_alive_interval_in_ms,
         multi_subnet_failover,
         connect_timeout_ms,
+        diagnosis,
     )
     .await?;
 
@@ -5897,6 +6216,7 @@ pub(crate) mod tests {
             30_000,
             1_000,
             200,
+            None,
         )
         .await;
 
@@ -5930,6 +6250,7 @@ pub(crate) mod tests {
             1_000,
             multi_subnet_failover,
             5_000,
+            None,
         )
         .await
         .expect("connects with the cached address");
@@ -7024,5 +7345,315 @@ pub(crate) mod tests {
             !is_known_dead(&transport),
             "draining the active PLP reached DONE_ATTN"
         );
+    }
+}
+
+#[cfg(test)]
+mod extra_connect_tests {
+    use super::*;
+    use crate::connection::connect_stage::tests::{Recorded, StageLog};
+
+    /// Connects in order to `addresses` as a diagnostic connection and waits
+    /// for the connects to the addresses after the one used. Gives the `tcp`
+    /// stages recorded and how long that wait took.
+    fn connect_to_all(
+        addresses: Vec<SocketAddr>,
+        connect_timeout_ms: u64,
+    ) -> (Vec<Recorded>, Duration) {
+        let log = StageLog::default();
+        let waited = tracing::subscriber::with_default(log.clone(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let diagnosis = Diagnosis::new(None);
+                    let stream = connect_in_order(
+                        addresses,
+                        "test",
+                        0,
+                        30_000,
+                        1_000,
+                        connect_timeout_ms,
+                        Some(&diagnosis),
+                    )
+                    .await
+                    .expect("an address accepts");
+                    let started = std::time::Instant::now();
+                    diagnosis.finish_extra_connects(0).await;
+                    drop(stream);
+                    started.elapsed()
+                })
+        });
+        (log.named(connect_stage::TCP), waited)
+    }
+
+    fn listener() -> (std::net::TcpListener, SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        (listener, address)
+    }
+
+    /// A port nothing listens on.
+    fn closed_port() -> SocketAddr {
+        listener().1
+    }
+
+    /// An earlier address that takes the whole connect timeout leaves each
+    /// connect to an address after the one used its own connect timeout, not
+    /// what is left of a shared one. Windows retries a refused connect for
+    /// about two seconds, so there a closed port times out; elsewhere it is
+    /// refused at once.
+    #[test]
+    fn each_extra_connect_has_its_own_connect_timeout() {
+        const TIMEOUT_MS: u64 = 500;
+        let (_used, used) = listener();
+        let (_listening, listening) = listener();
+
+        let (tcp, waited) = connect_to_all(
+            vec![closed_port(), used, closed_port(), listening],
+            TIMEOUT_MS,
+        );
+
+        assert_eq!(tcp.len(), 4, "{tcp:#?}");
+        assert_eq!(tcp[0].field(connect_stage::OK), Some("false"), "{tcp:#?}");
+        assert_eq!(tcp[1].field(connect_stage::OK), Some("true"), "{tcp:#?}");
+        assert_eq!(tcp[2].field(connect_stage::OK), Some("false"), "{tcp:#?}");
+        assert_eq!(tcp[3].field(connect_stage::OK), Some("true"), "{tcp:#?}");
+        if tcp[2].field(connect_stage::TIMED_OUT).is_some() {
+            assert!(
+                waited >= Duration::from_millis(TIMEOUT_MS * 4 / 5),
+                "the extra connect timed out after {waited:?}"
+            );
+        }
+    }
+
+    /// However many addresses the resolver gives, at most `MAX_PARALLEL_IPS`
+    /// after the one used are tried.
+    #[test]
+    fn the_extra_connects_are_capped() {
+        let (_used, used) = listener();
+        let (_extra, extra) = listener();
+        let mut addresses = vec![used];
+        addresses.extend(std::iter::repeat_n(extra, MAX_PARALLEL_IPS + 6));
+
+        let (tcp, _) = connect_to_all(addresses, 5_000);
+
+        assert_eq!(tcp.len(), 1 + MAX_PARALLEL_IPS, "{tcp:#?}");
+        assert!(tcp.iter().all(|attempt| attempt.closed), "{tcp:#?}");
+    }
+}
+
+#[cfg(test)]
+mod dns_stage_tests {
+    use super::*;
+    use crate::connection::connect_stage::tests::StageLog;
+    use crate::connection::dns_cache::{DnsCache, Resolution};
+
+    /// Runs `connect` to completion with a subscriber recording the stages.
+    fn recording<T>(connect: impl std::future::Future<Output = T>) -> (T, StageLog) {
+        let log = StageLog::default();
+        let output = tracing::subscriber::with_default(log.clone(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(connect)
+        });
+        (output, log)
+    }
+
+    /// A diagnostic connect falls back to the DNS cache as a normal one does,
+    /// since the cache is only read once the resolver has failed. Its `dns`
+    /// stage keeps the resolver's error, says the addresses came from the
+    /// cache, and the stop after resolution follows those addresses.
+    #[test]
+    fn a_diagnostic_dns_fallback_records_the_resolver_error_and_the_cache() {
+        let host = "diagnosis.dns-cache.invalid";
+        let cached: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![cached]), true);
+        let diagnosis = Diagnosis::new(Some(DiagnosticStop::Resolution));
+
+        let (result, log) = recording(create_base_stream_sequential(
+            IPAddressPreference::IPv4First,
+            host,
+            1433,
+            30_000,
+            1_000,
+            1_000,
+            Some(&diagnosis),
+        ));
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        let dns = log.named(connect_stage::DNS);
+        assert_eq!(dns.len(), 1, "{dns:#?}");
+        let dns = &dns[0];
+        assert_eq!(dns.field(connect_stage::HOST), Some(host));
+        assert_eq!(dns.field(connect_stage::ADDRESSES), Some("127.0.0.1"));
+        assert_eq!(
+            dns.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_FALLBACK_CACHE)
+        );
+        assert_eq!(dns.field(connect_stage::IO_KIND), Some("NotFound"));
+        assert!(dns.field(connect_stage::ERROR).is_some(), "{dns:#?}");
+        assert_eq!(dns.field(connect_stage::OK), Some("true"));
+        assert!(dns.closed);
+        assert!(log.named(connect_stage::TCP).is_empty());
+    }
+
+    /// Addresses the resolver answered with are recorded as such, without an
+    /// error.
+    #[test]
+    fn a_resolved_host_records_the_resolver_as_the_source() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (result, log) = recording(create_base_stream_sequential(
+            IPAddressPreference::IPv4First,
+            "127.0.0.1",
+            port,
+            30_000,
+            1_000,
+            5_000,
+            None,
+        ));
+
+        let (_stream, resolution) = result.expect("connects");
+        assert_eq!(
+            resolution.addresses(),
+            &[SocketAddr::from(([127, 0, 0, 1], port))]
+        );
+        let dns = &log.named(connect_stage::DNS)[0];
+        assert_eq!(
+            dns.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_RESOLVER)
+        );
+        assert_eq!(dns.field(connect_stage::ERROR), None);
+        assert_eq!(dns.field(connect_stage::OK), Some("true"));
+    }
+
+    /// With MultiSubnetFailover the `tcp` stage covers resolving, so it
+    /// records the fallback to the DNS cache, in the resolver's own fields.
+    #[test]
+    fn a_multi_subnet_failover_dns_fallback_is_recorded_on_the_tcp_stage() {
+        let host = "parallel-stage.dns-cache.invalid";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![address]), true);
+
+        let (result, log) = recording(create_base_stream_parallel(
+            host,
+            address.port(),
+            30_000,
+            1_000,
+            5_000,
+        ));
+
+        result.expect("connects with the cached address");
+        assert!(log.named(connect_stage::DNS).is_empty());
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(
+            tcp.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_FALLBACK_CACHE)
+        );
+        assert_eq!(tcp.field(connect_stage::RESOLVER_IO_KIND), Some("NotFound"));
+        assert!(
+            tcp.field(connect_stage::RESOLVER_ERROR).is_some(),
+            "{tcp:#?}"
+        );
+        assert_eq!(tcp.field(connect_stage::IO_KIND), None);
+        assert_eq!(tcp.field(connect_stage::ERROR), None);
+        assert_eq!(tcp.field(connect_stage::ADDRESS), Some("127.0.0.1"));
+        assert_eq!(tcp.field(connect_stage::OK), Some("true"));
+    }
+
+    /// With MultiSubnetFailover, when the DNS cache supplied the addresses and
+    /// none of them accepts, the `tcp` stage's error is the connect's, and
+    /// the resolver's error stays in its own fields.
+    #[test]
+    fn a_failed_multi_subnet_failover_connect_keeps_the_resolver_error_apart() {
+        let host = "parallel-refused.dns-cache.invalid";
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        DnsCache::global().apply_verdict(&Resolution::new(host, vec![refused]), true);
+
+        let (result, log) = recording(create_base_stream_parallel(
+            host,
+            refused.port(),
+            30_000,
+            1_000,
+            5_000,
+        ));
+
+        assert!(result.is_err(), "nothing listens on {refused}");
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(tcp.field(connect_stage::OK), Some("false"));
+        assert_eq!(
+            tcp.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_FALLBACK_CACHE)
+        );
+        assert_eq!(tcp.field(connect_stage::RESOLVER_IO_KIND), Some("NotFound"));
+        let error = tcp
+            .field(connect_stage::ERROR)
+            .expect("the connect's error");
+        assert_ne!(
+            Some(error),
+            tcp.field(connect_stage::RESOLVER_ERROR),
+            "{tcp:#?}"
+        );
+        assert_ne!(
+            tcp.field(connect_stage::IO_KIND),
+            Some("NotFound"),
+            "{tcp:#?}"
+        );
+    }
+
+    /// With MultiSubnetFailover, a host the resolver answered for keeps
+    /// `source: resolver` on the `tcp` stage even when no address accepts.
+    #[test]
+    fn a_refused_multi_subnet_failover_connect_keeps_the_resolver_as_the_source() {
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let (result, log) = recording(create_base_stream_parallel(
+            "127.0.0.1",
+            refused.port(),
+            30_000,
+            1_000,
+            5_000,
+        ));
+
+        assert!(result.is_err(), "nothing listens on {refused}");
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(tcp.field(connect_stage::OK), Some("false"));
+        assert_eq!(
+            tcp.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_RESOLVER),
+            "{tcp:#?}"
+        );
+        assert_eq!(tcp.field(connect_stage::RESOLVER_ERROR), None);
+        assert!(tcp.field(connect_stage::ERROR).is_some(), "{tcp:#?}");
+    }
+
+    /// With MultiSubnetFailover, a host that does not resolve, and has no
+    /// cached addresses, records no source.
+    #[test]
+    fn an_unresolved_multi_subnet_failover_host_records_no_source() {
+        let (result, log) = recording(create_base_stream_parallel(
+            "parallel-unresolved.no-cache.invalid",
+            1433,
+            30_000,
+            1_000,
+            5_000,
+        ));
+
+        assert!(result.is_err());
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(tcp.field(connect_stage::OK), Some("false"));
+        assert_eq!(tcp.field(connect_stage::SOURCE), None, "{tcp:#?}");
     }
 }

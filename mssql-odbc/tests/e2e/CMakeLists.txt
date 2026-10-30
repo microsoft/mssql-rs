@@ -228,6 +228,9 @@ endfunction()
 # ---------------------------------------------------------------------------
 enable_testing()
 
+add_odbc_test(odbc_diagnostics_mutex_test tests/odbc_diagnostics_mutex_test.cpp)
+set_tests_properties(odbc_diagnostics_mutex_test PROPERTIES TIMEOUT 30)
+
 add_odbc_test(smoke_test         tests/smoke_test.cpp)
 add_odbc_test(alloc_env_test     tests/alloc_env_test.cpp)
 add_odbc_test(alloc_dbc_test     tests/alloc_dbc_test.cpp)
@@ -277,6 +280,7 @@ add_odbc_test(execute_test       tests/execute_test.cpp)
 add_odbc_test(param_char_conversions_test tests/param_char_conversions_test.cpp)
 add_odbc_test(param_conversions_test tests/param_conversions_test.cpp)
 add_odbc_test(param_binary_conversions_test tests/param_binary_conversions_test.cpp)
+add_odbc_test(long_params_test tests/long_params_test.cpp)
 add_odbc_test(describe_param_test tests/describe_param_test.cpp)
 add_odbc_test(escape_sequence_test tests/escape_sequence_test.cpp)
 add_odbc_test(api_contract_test tests/api_contract_test.cpp)

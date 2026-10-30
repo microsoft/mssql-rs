@@ -527,12 +527,7 @@ mod rpc_datatypes {
         }
     }
 
-    // TEXT/NTEXT RPC serialization is not yet fully implemented in the TDS
-    // protocol layer; the server rejects the stream. These tests are kept as
-    // ignored placeholders so they can be enabled once TEXT/NTEXT support lands.
-
     #[tokio::test]
-    #[ignore = "TEXT RPC serialization not yet implemented"]
     async fn text_roundtrip() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
         let val = SqlString::from_utf8_string("Hello text world".to_string());
@@ -546,7 +541,6 @@ mod rpc_datatypes {
     }
 
     #[tokio::test]
-    #[ignore = "NTEXT RPC serialization not yet implemented"]
     async fn ntext_roundtrip() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
         let val = SqlString::from_utf8_string("Hello ntext 日本語".to_string());
@@ -560,7 +554,6 @@ mod rpc_datatypes {
     }
 
     #[tokio::test]
-    #[ignore = "TEXT NULL RPC serialization not yet implemented"]
     async fn text_null_roundtrip() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
         let row = roundtrip_params(&mut client, vec![("t", SqlType::Text(None))])
@@ -570,13 +563,54 @@ mod rpc_datatypes {
     }
 
     #[tokio::test]
-    #[ignore = "NTEXT NULL RPC serialization not yet implemented"]
     async fn ntext_null_roundtrip() {
         let mut client = begin_connection(&build_tcp_datasource()).await;
         let row = roundtrip_params(&mut client, vec![("t", SqlType::NText(None))])
             .await
             .unwrap();
         assert_eq!(row[0], ColumnValues::Null);
+    }
+
+    #[tokio::test]
+    async fn image_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        for bytes in [Some(vec![0, 0xff, 7]), Some(vec![]), None] {
+            let row = roundtrip_params(
+                &mut client,
+                vec![
+                    ("image", SqlType::Image(bytes.clone())),
+                    ("tail", SqlType::Int(Some(7))),
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                row[0],
+                bytes.map_or(ColumnValues::Null, ColumnValues::Bytes)
+            );
+            assert_eq!(row[1], ColumnValues::Int(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_legacy_text_roundtrip() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+        for value in [
+            SqlType::Text(Some(SqlString::from_utf8_string(String::new()))),
+            SqlType::NText(Some(SqlString::from_utf8_string(String::new()))),
+        ] {
+            let row = roundtrip_params(
+                &mut client,
+                vec![("lob", value), ("tail", SqlType::Int(Some(7)))],
+            )
+            .await
+            .unwrap();
+            match &row[0] {
+                ColumnValues::String(value) => assert!(value.to_utf8_string().is_empty()),
+                other => panic!("Expected an empty legacy string, got {other:?}"),
+            }
+            assert_eq!(row[1], ColumnValues::Int(7));
+        }
     }
 
     #[tokio::test]

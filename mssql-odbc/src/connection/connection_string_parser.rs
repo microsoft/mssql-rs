@@ -72,7 +72,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "usefmtonly",
     "clientkey",
     "replication",
-    "longasmax",
     "getdataextensions",
     "retryexec",
     "concatnullyieldsnull",
@@ -148,6 +147,7 @@ enum ConnAttrKey {
     PacketSize,
     HostNameInCert,
     ServerCertificate,
+    LongAsMax,
     Count,
 }
 
@@ -220,6 +220,7 @@ pub(crate) struct ConnectionParams {
     pub(crate) packet_size: Option<u32>,
     pub(crate) host_name_in_certificate: Option<String>,
     pub(crate) server_certificate: Option<String>,
+    pub(crate) long_as_max: Option<usize>,
 }
 
 impl ConnectionParams {
@@ -310,6 +311,12 @@ impl ConnectionParams {
                 quote_odbc_value(server_certificate)
             ));
         }
+        if let Some(long_as_max) = self.long_as_max {
+            parts.push(format!(
+                "LongAsMax={}",
+                if long_as_max == 1 { "yes" } else { "no" }
+            ));
+        }
 
         parts.join(";")
     }
@@ -357,6 +364,7 @@ impl fmt::Debug for ConnectionParams {
             .field("packet_size", &self.packet_size)
             .field("host_name_in_certificate", &self.host_name_in_certificate)
             .field("server_certificate", &self.server_certificate)
+            .field("long_as_max", &self.long_as_max)
             .finish()
     }
 }
@@ -420,6 +428,7 @@ const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
     ("packetsize", ConnAttrKey::PacketSize),
     ("hostnameincertificate", ConnAttrKey::HostNameInCert),
     ("servercertificate", ConnAttrKey::ServerCertificate),
+    ("longasmax", ConnAttrKey::LongAsMax),
 ];
 
 fn classify_key(lower: &str) -> KeyClass {
@@ -530,6 +539,10 @@ fn assign_value(
         }
         ConnAttrKey::ServerCertificate => {
             params.server_certificate = Some(value.to_string());
+        }
+        ConnAttrKey::LongAsMax => {
+            // Like msodbcsql's checkbox keyword, only "yes" enables the option.
+            params.long_as_max = Some(usize::from(is_yes(value)));
         }
         ConnAttrKey::Count => {}
     }
@@ -818,6 +831,30 @@ fn parse_uint_in_range(
 mod tests {
     use super::*;
     use crate::test_support::cs;
+
+    #[test]
+    fn long_as_max_is_case_insensitive_first_wins_and_only_yes_enables() {
+        for (text, expected) in [
+            ("Server=h", None),
+            ("Server=h;LongAsMax=Yes", Some(1)),
+            ("Server=h;lOnGaSmAx=yEs", Some(1)),
+            ("Server=h;LongAsMax=No", Some(0)),
+            ("Server=h;LongAsMax=bogus", Some(0)),
+            ("Server=h;LongAsMax=Yes;LongAsMax=No", Some(1)),
+        ] {
+            let (params, warning) = parse_connection_string(text).unwrap();
+            assert!(!warning, "{text}");
+            assert_eq!(params.long_as_max, expected, "{text}");
+            if let Some(value) = expected {
+                let rendered = params.fmt_as_odbc_conn_str();
+                assert!(rendered.contains(if value == 1 {
+                    "LongAsMax=yes"
+                } else {
+                    "LongAsMax=no"
+                }));
+            }
+        }
+    }
 
     #[test]
     fn basic_connection_string() {

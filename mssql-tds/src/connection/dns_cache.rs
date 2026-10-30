@@ -73,12 +73,32 @@ impl DnsCache {
     }
 
     /// Resolves `host` with `lookup`, falling back to the addresses a server
-    /// allowed when that fails.
+    /// allowed when that fails. Production code uses
+    /// [`Self::resolve_reporting`], which also reports the fallback; this is
+    /// for tests and the `test-util` helpers.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn resolve<F, Fut>(
         &self,
         host: &str,
         port: u16,
         lookup: F,
+    ) -> io::Result<Resolution>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
+    {
+        self.resolve_reporting(host, port, lookup, |_| {}).await
+    }
+
+    /// Resolves `host` with `lookup`, falling back to the addresses a server
+    /// allowed when that fails, and hands `fell_back` the resolver's error
+    /// when the allowed addresses are used instead.
+    pub(crate) async fn resolve_reporting<F, Fut>(
+        &self,
+        host: &str,
+        port: u16,
+        lookup: F,
+        fell_back: impl FnOnce(&io::Error),
     ) -> io::Result<Resolution>
     where
         F: FnOnce() -> Fut,
@@ -96,6 +116,7 @@ impl DnsCache {
                     ?addresses,
                     "DNS resolution failed; connecting with cached addresses"
                 );
+                fell_back(&error);
                 addresses
             }
         };
@@ -135,10 +156,16 @@ impl DnsCache {
     }
 }
 
-/// Resolves `host` for a TCP connect through the process-wide DNS cache.
-pub(crate) async fn lookup_host(host: &str, port: u16) -> io::Result<Resolution> {
+/// Resolves `host` for a TCP connect through the process-wide DNS cache,
+/// handing `fell_back` the resolver's error when the connect falls back to the
+/// cached addresses.
+pub(crate) async fn lookup_host(
+    host: &str,
+    port: u16,
+    fell_back: impl FnOnce(&io::Error),
+) -> io::Result<Resolution> {
     DnsCache::global()
-        .resolve(host, port, || system_lookup(host, port))
+        .resolve_reporting(host, port, || system_lookup(host, port), fell_back)
         .await
 }
 
