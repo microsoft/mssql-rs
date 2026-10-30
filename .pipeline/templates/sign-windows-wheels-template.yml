@@ -166,6 +166,8 @@ steps:
       itemPattern: 'wheel-unpacked/**'
       targetPath: '$(Agent.TempDirectory)\signed-wheel-contents'
 
+  - template: configure-python-certificates-windows.yml
+
   - task: UsePythonVersion@0
     displayName: 'Use Python ${{ parameters.pythonVersion }} to repack signed wheels'
     inputs:
