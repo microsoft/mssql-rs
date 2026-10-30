@@ -73,12 +73,13 @@ class FailsFirstAttempt {
 template <typename T>
 bool RunOneIteration(WorkerResult& result,
                      std::chrono::steady_clock::time_point deadline =
-                         std::chrono::steady_clock::now() + std::chrono::seconds(60)) {
+                         std::chrono::steady_clock::now() + std::chrono::seconds(60),
+                     void (*wait)(std::chrono::microseconds) = nullptr) {
     T::counts = {};
     RetainedFixtures<T> retained;
     return RunSharedDbcIteration<T>(SQL_NULL_HENV, SQL_NULL_HDBC, odbc_concurrency::kSharedDbc,
                                     0, 0, "SharedDbc worker=0 iteration=0", result, retained,
-                                    deadline);
+                                    deadline, wait);
 }
 
 // Busy on every attempt, up to a bound so a missing deadline check fails the
@@ -90,7 +91,7 @@ class AlwaysBusy {
     explicit AlwaysBusy(odbc_concurrency::Mode) {}
     void ConcurrentSetUp(SQLHENV, SQLHDBC, int, int) {}
     void ConcurrentBody() {
-        if (++counts.attempts < 50) {
+        if (++counts.attempts < 1000) {
             ADD_FAILURE() << kBusy;
         }
     }
@@ -140,6 +141,25 @@ TEST(ConcurrentHarnessTest, ABusyAttemptPastTheDeadlineFailsWithoutARetry) {
     EXPECT_FALSE(ok);
     EXPECT_EQ(1, AlwaysBusy::counts.attempts);
     EXPECT_EQ(1, result.conflicts);
+}
+
+// A wait that reaches the deadline must end the iteration; another attempt
+// started after it could run into the watchdog. The injected wait always
+// overruns, so exactly one attempt may run.
+TEST(ConcurrentHarnessTest, NoAttemptStartsAfterABackoffReachesTheDeadline) {
+    static std::chrono::steady_clock::time_point deadline;
+    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    WorkerResult result;
+    bool ok = true;
+    EXPECT_NONFATAL_FAILURE(
+        ok = RunOneIteration<AlwaysBusy>(
+            result, deadline,
+            [](std::chrono::microseconds) {
+                std::this_thread::sleep_until(deadline + std::chrono::milliseconds(1));
+            }),
+        "at the retry deadline");
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(1, AlwaysBusy::counts.attempts);
 }
 
 // A fixed short wait livelocked long bodies at 8 x 20 on Linux; the wait has
