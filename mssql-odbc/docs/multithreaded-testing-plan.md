@@ -198,29 +198,39 @@ more chances to be hit. AB#49225 reproduced reliably at 8x20 but not at 4x2.
 | `MSSQL_ODBC_MT_THREADS` | 2 | Threads running at once |
 | `MSSQL_ODBC_MT_ITERS` | 1 | Runs of the body per thread |
 | `MSSQL_ODBC_MT_TIMEOUT_SECONDS` | 300 | Hang watchdog for each phase of a concurrent variant: fixture `SetUp`, the run, fixture `TearDown` |
-| `MSSQL_ODBC_MT_DUMP_DIR` | working directory | Where the watchdog writes a Windows minidump |
+| `MSSQL_ODBC_MT_DUMP_DIR` | working directory | Where Windows minidumps go: the watchdog's for a hang, and in stress runs a crash's or `abort()`'s |
+| `MSSQL_ODBC_MT_SKIP_MODES` | none | Comma-separated modes reported as skipped instead of run, e.g. `SharedDbc`; `none` skips nothing, an unknown name fails every concurrent variant |
+| `MSSQL_ODBC_MT_GDB` | 0 | Unix: `1` runs each `<name>_mt` entry under gdb, which prints every thread's stack if the process dies |
+| `MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER` | 0 | `1` lets the watchdog end a traced process; set with `MSSQL_ODBC_MT_GDB` |
 
-Select variants with a gtest filter, on the command line or through
-`GTEST_FILTER` (which also reaches every executable under `ctest` and
-`run_e2e`). Match the mode suffixes, not every `/`: `TEST_P` names contain `/`
-too.
+ctest runs each converted executable as two entries: `<name>` (single-threaded
+tests) and `<name>_mt` (the concurrent variants, label `mt`), so a concurrency
+failure never hides a parity verdict. CMake registers the pair for any test
+source with an `ODBC_TEST_F` or `ODBC_TEST_F_MODES` line; nothing to maintain.
+Both entries pass `--gtest_filter` on the command line, which overrides a
+`GTEST_FILTER` environment variable, so select by entry instead:
 
 ```bash
-# Single-threaded only
-./get_data_test --gtest_filter='-*/CrossThread:*/SharedEnv:*/SharedStmt:*/SharedDbc'
+ctest -R '^get_data_test$'       # single-threaded only
+ctest -L mt                      # every concurrent variant
+./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt
+./run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 50, Windows
 
-# Multithreaded only, at stress size
+# One executable by hand
 MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
   ./get_data_test --gtest_filter='*/CrossThread:*/SharedEnv:*/SharedStmt:*/SharedDbc'
 ```
+
+Match the mode suffixes, not every `/`: `TEST_P` names contain `/` too.
 
 - Failures name their run, e.g. `SharedEnv worker=2 iteration=7` or
   `CrossThread body thread`. The first failure stops all workers.
 - On a hang the watchdog prints each worker's completed iterations, then
   writes a minidump of every thread and exits with 124 on Windows, or calls
-  `abort()` for a core dump elsewhere. It leaves a process alone when a
-  debugger is attached (detected on Windows, Linux, and macOS) or when it
-  cannot tell.
+  `abort()` elsewhere (which gdb turns into every thread's stack in a stress
+  run). It leaves a process alone when a debugger is attached (detected on
+  Windows, Linux, and macOS) or when it cannot tell, unless
+  `MSSQL_ODBC_MT_TERMINATE_UNDER_DEBUGGER=1`.
 - To tell a race from a plain bug, filter one variant and set
   `MSSQL_ODBC_MT_THREADS=1 MSSQL_ODBC_MT_ITERS=1` (one worker, or the
   `SharedStmt` owner with no observers).
@@ -262,11 +272,22 @@ Measured 2026-10-08 on both drivers unless noted.
 - **unixODBC `Threading`:** 0 none, 1 per handle (a STMT call locks that
   STMT, a DBC call that DBC), 2 per DBC, 3 global (which
   also locks `SQLCancel`). unixODBC master defaults to 0 when odbcinst.ini does
-  not set it; `run_e2e.sh` sets 1 for both legs. At 0, unixODBC's own
-  per-handle diagnostic list is unlocked: `/SharedStmt` crashed inside
-  `libodbc` (under `SQLGetDiagField`) with either driver loaded, in 7 of 10
-  runs at 2 x 1 (WSL, unixODBC 2.3.9), and in none of 60 at 1. macOS CI hit
-  it first; Linux CI passed by luck.
+  not set it; `run_e2e.sh` sets 1 for both legs. No level fully protects a
+  handle's diagnostic list in released unixODBC (2.3.14 and earlier): every call frees it in
+  `function_entry()` before taking the handle lock, so a `SharedStmt`
+  observer's `SQLGetDiagField` can follow a freed record
+  ([unixODBC #243](https://github.com/lurcher/unixODBC/issues/243); fixed on
+  master in `ea454e49`, listed under 2.3.15pre, unreleased). At 0
+  `/SharedStmt` crashed inside `libodbc` in 7 of 10 runs at 2 x 1 (WSL,
+  unixODBC 2.3.9) and in none of 60 at 1; level 1 narrows the window but
+  Alpine CI still crashed there. Until the pipelines test against a unixODBC
+  build with the fix (AB#49575), all Unix runner profiles, including PR,
+  skip `/SharedStmt` for both drivers. Windows keeps every mode, and Unix
+  keeps single-threaded tests, `/CrossThread`, `/SharedEnv`, and `/SharedDbc`.
+  This temporarily removes same-statement diagnostic-observer coverage;
+  `MSSQL_ODBC_MT_SKIP_MODES=none` opts back in for patched Driver Manager
+  validation. The two GetData streaming tests that crashed most also remain
+  unregistered on non-Windows by #758.
 - Every non-diagnostic call clears the handle's diagnostics, including an idle
   `SQLCancel`, `SQLGetStmtAttr`, and `SQLNumResultCols`. Cross-thread
   `SQLCancel` preserves the interrupted call's diagnostics.
@@ -353,9 +374,9 @@ Measured 2026-10-08 on both drivers unless noted.
    parameters, and parameterized errors that stay on their STMT. TVPs, `vector`
    and UDT parameters, and output or data-at-execution parameters in arrays wait
    for driver support.
-3. **Shared DBC** (`SharedDbc`): opt in the eligible tests from 1 and 2 once
-   AB#49263 runs the mode nightly only. Array DML stays out until a busy retry
-   cannot duplicate rows.
+3. **Shared DBC** (`SharedDbc`): opt in the eligible tests from 1 and 2; PR and
+   stress runs both run the mode (AB#49225 was fixed by #710). Array DML stays
+   out until a busy retry cannot duplicate rows.
 4. **Shared STMT diagnostics** (`SharedStmt`): every converted test, especially
    those that post warnings and errors. Concurrent in the driver on the DBC
    only (see Driver Manager facts); same-STMT races are scenario 8.
@@ -369,7 +390,7 @@ Purpose-built workloads using the same settings, start gate, and watchdog.
 
 7. **Handle churn:** threads allocate ENV/DBC/STMT trees, connect, query,
    disconnect, and free; every iteration completes.
-8. **One STMT shared across threads** (nightly only). Values are checkable only
+8. **One STMT shared across threads** (stress runs only). Values are checkable only
    when threads do not execute or fetch.
    - **8a. Unbound races (build first):** threads race `SQLExecDirect`,
      `SQLExecute`, `SQLFetch`, `SQLGetData`, `SQLMoreResults`, `SQLCloseCursor`,
@@ -401,21 +422,35 @@ Purpose-built workloads using the same settings, start gate, and watchdog.
     parity.
 
 Scenarios 8 and 9 need same-handle calls to reach the driver concurrently. No
-Driver Manager provides that safely: Windows serializes them, and unixODBC at
-`Threading=0` corrupts its own diagnostic list. So they call the driver
+Driver Manager provides that safely: Windows serializes them, and released
+unixODBC corrupts its own diagnostic list at any `Threading` level. So they call the driver
 library directly, without a Driver Manager, which is also the
 ThreadSanitizer target (AB#49259).
 
 ## Stress Profiles
 
-| Profile | Driver | Threads x iterations | Runs | Platforms |
-|---|---|---|---|---|
-| PR | both | 2 x 1 | `Single`, `CrossThread`, `SharedEnv`, `SharedStmt` | Windows, Linux, macOS |
-| Nightly | mssql-odbc | 8 x 20 | All concurrent modes, scenarios 7-10 | Windows, Linux, macOS; scenarios 8-9 without a Driver Manager |
-| Nightly | msodbcsql | 2 x 1 | All concurrent modes | Windows, Linux |
-| Weekly soak | mssql-odbc | 16 x 50 or time-bound | Same as nightly | Same as nightly |
+| Profile | Where | Driver | Threads x iterations | Modes run | Retries |
+|---|---|---|---|---|---|
+| PR | validation pipeline, every PR | both | 2 x 1 | all; unixODBC skips `SharedStmt` | 3 |
+| Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
+| Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
+| Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
 
-unixODBC runs use `Threading=1` (see Driver Manager facts).
+- Stress legs: Windows x64 (Debug build, Windows DM), Ubuntu 24.04 (glibc) and
+  Alpine 3.21 (musl) release drops through unixODBC `Threading=1`. They run
+  only the `<name>_mt` entries. `run_e2e.sh --mt-profile` and
+  `run_e2e.ps1 -MtProfile` apply a profile; a variable already set in the
+  environment wins.
+- The nightly run exists to flush out obvious races while suites convert.
+  Remove its schedule two to three weeks after it starts, once its findings
+  are fixed; PR and weekly remain.
+- PRs do not hunt races: the 2 x 1 run catches tests unfit for concurrency
+  (fixed object names, process-wide settings) in the PR that adds them.
+- msodbcsql is the reference: its stress-leg run checks that tests suit the
+  concurrent modes, not its thread safety.
+- Scenarios 7-10 join the stress run as their suites land (AB#49261,
+  AB#49259).
+- Nightly failures need a named triage owner.
 
 Measured on `get_data_test` with 22 converted tests (66 concurrent variants),
 local SQL Server:
@@ -432,51 +467,73 @@ local SQL Server:
   on every run. For about 700 converted tests that extrapolates to roughly an
   hour per driver per platform, so it is weekly. 8 x 20 is a fifth of that and
   reproduced AB#49225.
-- msodbcsql is the reference: its runs check that tests suit concurrent modes,
-  not its thread safety.
-- PRs do not hunt races; their smoke run catches tests unfit for concurrency
-  (fixed object names, process-wide settings) in the PR that adds them.
-- Register each executable twice in CTest, filtered to single-threaded and
-  concurrent variants, so concurrency failures do not hide parity results.
-  Shard executables across parallel jobs.
-- Until AB#49263 adds those filters, every registered variant runs in PR CI, so
-  no test opts into `SharedDbc`.
-- Nightly failures need a named triage owner.
 
 ## Validation
 
 - Compare independent-connection outcomes with msodbcsql; compare shared-handle
   scenarios by invariants, not interleavings.
 - Sanitizer builds must instrument both the Rust driver and the C++ harness.
-- Hangs produce dumps automatically. Crashes do not on Windows by default: gtest
-  turns off Windows Error Reporting when it catches exceptions
-  (`SetErrorMode(SEM_NOGPFAULTERRORBOX)`), so nightly runs with
-  `--gtest_catch_exceptions=0` and WER LocalDumps; Linux enables core dumps.
-  That flag also lets a C++ exception from a test terminate the process
-  instead of failing the test. A Debug build then stops at the CRT's modal
-  `abort()` dialog until the watchdog dumps it, so nightly Windows runs use a
-  Release build (observed locally).
+- **Windows evidence.** ctest starts each test with
+  `SEM_NOGPFAULTERRORBOX` inside a job object that kills a process on an
+  unhandled exception, so Windows Error Reporting LocalDumps never fire under
+  it (measured). The harness writes its own minidumps instead: stress runs set
+  `GTEST_CATCH_EXCEPTIONS=0` and `MSSQL_ODBC_MT_DUMP_DIR`, and the process
+  then dumps on an unhandled exception or `abort()` (CRT reports go to stderr,
+  not a modal dialog) as well as on a hang. The dumps are published as the
+  `OdbcMtDumps_Windows_*` artifact, with the Rust driver and each `<name>_mt`
+  executable and their PDBs under `symbols\`. `__fastfail` exits (`/GS` failures, a Rust
+  abort) bypass every handler and leave only the exit code `0xC0000409`.
+- **Unix evidence.** Stress runs start each `<name>_mt` entry under gdb
+  (`run_mt_test.sh`), which prints every thread's stack into the test log on a
+  crash, `abort()`, or watchdog timeout, and keeps the test's exit code.
+  Docker's default seccomp profile allows this; no extra capability is needed
+  (measured in Ubuntu 24.04 and Alpine 3.21 containers). The stress drops keep
+  the release driver's symbols and line tables (`keepDebugInfo`), so driver
+  frames are named.
+- **Assertion failures leave no dump or stack.** A slow or wrong result needs
+  the driver's side instead: rerun the stress pipeline manually with
+  `driverTrace` on, which sets `MSSQL_TDS_TRACE*` for the Rust driver on every
+  leg and publishes the files as `OdbcDriverTraces_*`. Scheduled runs keep it
+  off because tracing changes timing. Idle-cancel timing assertions report
+  how long `CancelIdleStatement` waited for `/SharedStmt` observers to release
+  the diagnostics lock separately from the time spent in `SQLCancel`.
+- **Agent load.** Every stress leg samples the agent once a second and
+  publishes the samples as `OdbcLoad_*`: total CPU, processor queue length,
+  available memory and `sqlservr` CPU on Windows (`typeperf`; `sqlservr` is
+  summed across cores, and `agent.txt` records the core count); CPU busy,
+  runnable threads, load average, available memory and per-container
+  `docker stats` on Linux (`.pipeline/scripts/sample-load.sh`). Line a slow
+  iteration's log timestamp up with them to tell agent starvation from a
+  driver delay without a rerun.
+- A skipped mode reports a gtest skip; an entry whose variants are all skipped
+  exits 77, so ctest and the parity report show it as skipped, not passed.
 - msodbcsql has failed or exited without a result a few times at 8 x 20 or more
   (one `0xC0000409` in 41 runs; a chunk-fill failure and a silent exit in about
   16 runs at 16 x 50), none reproducible on demand. Dumps will tell a harness
   bug from a reference-driver one.
+- `check/msodbcsql_types_check.cpp` compiles `include/odbc_sql_server_types.h`
+  against Microsoft's `msodbcsql.h` where the build finds it (the Windows SDK,
+  or `/opt/microsoft/msodbcsql18/include` from the Linux msodbcsql18 package)
+  and fails the build on a differing constant, struct size, member offset, or
+  member type.
 
 ## Known failures
 
 - Fixed by AB#49386: idle `SQLCancel` now closes an open cursor and releases the
   connection rather than leaving it busy. This is not a deliberate deviation.
 - Fixed: AB#49220 (empty `IMAGE` read as NULL), by PR #700; AB#49219 (`run_e2e`
-  auto-detect used `sa` with no password), in this PR; AB#49225 (a busy shared
+  auto-detect used `sa` with no password), by PR #709; AB#49225 (a busy shared
   DBC reported `HY000` "No active TDS client"), by PR #710.
 
 ## Migration
 
 Tracked under AB#49256:
 
-1. **AB#49257 (this PR):** the harness with all five modes; the
+1. **AB#49257 (PR #709, merged):** the harness with all five modes; the
    `get_data_test.cpp` pilot (five converted tests, one worker-token test,
    fourteen chunk-fill tests); empty-value, NULL, and parameterized-`THROW` tests.
-2. **AB#49263:** CTest split, PR filter, nightly and weekly profiles, dumps.
+2. **AB#49263 (this PR):** CTest split, PR filter, nightly (temporary) and
+   weekly profiles, crash and hang evidence, `msodbcsql.h` type check.
 3. **AB#49260:** fetch and GetData suites, plus worker-token tests.
 4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
    remaining cancel cases `cancel_test.cpp` does not cover, added to it

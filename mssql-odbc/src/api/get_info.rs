@@ -879,14 +879,9 @@ fn sql_get_info_w_safe(
     buffer_length: SqlSmallInt,
     string_length_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
-    // `SQL_USER_NAME` is the one information type whose value can require a
-    // server round trip, and the DBC mutex must not be held across one. It is
-    // resolved between two short critical sections rather than inside the single
-    // one the other types share: the first does the entry-point bookkeeping
-    // every ODBC call owes — clearing the previous call's diagnostics and
-    // zeroing the output length — and rejects an invalid buffer before anything
-    // reaches the wire; the second writes the answer.
-    if info_type == SQL_USER_NAME {
+    // Validate buffers and clear diagnostics before these lookups release the
+    // DBC mutex for I/O; acquire it again only to write the answer.
+    if matches!(info_type, SQL_USER_NAME | SQL_DATA_SOURCE_READ_ONLY) {
         {
             let Ok(mut state) = dbc.inner.lock() else {
                 error!("SQLGetInfoW: dbc mutex poisoned");
@@ -904,7 +899,15 @@ fn sql_get_info_w_safe(
             }
         }
 
-        let value = database_user_name(dbc);
+        let value = if info_type == SQL_USER_NAME {
+            database_user_name(dbc)
+        } else {
+            match super::database_read_only::database_read_only(dbc) {
+                Ok(true) => "Y".to_string(),
+                Ok(false) => "N".to_string(),
+                Err(ret) => return ret,
+            }
+        };
 
         let Ok(mut state) = dbc.inner.lock() else {
             error!("SQLGetInfoW: dbc mutex poisoned");
@@ -1211,16 +1214,6 @@ fn sql_get_info_w_safe(
                 "Y",
             )
         }
-        // msodbcsql queries DATABASEPROPERTYEX and caches the answer. This
-        // driver has no internal metadata-query facility yet, so exact
-        // read-only-database parity is deferred to AB#47996.
-        SQL_DATA_SOURCE_READ_ONLY => write_wide_str(
-            &mut state,
-            info_value_ptr,
-            buffer_length,
-            string_length_ptr,
-            "N",
-        ),
         SQL_PARAM_ARRAY_ROW_COUNTS => {
             write_u32(info_value_ptr, SQL_PARC_NO_BATCH, string_length_ptr)
         }
@@ -1327,7 +1320,7 @@ fn database_user_name(dbc: &DbcHandle) -> String {
         // There is no statement here to take `SQL_ATTR_QUERY_TIMEOUT` from:
         // `SQLGetInfo` is a connection-level call, and msodbcsql reaches for
         // the connection timeout for exactly that reason.
-        (stale, state.connection_timeout)
+        (stale, dbc.connection_timeout())
     };
 
     // The claim returns the cache entry with the client, read under its own
@@ -2914,7 +2907,7 @@ mod tests {
 
         let (h, server) = user_name_fixture(user_name_row("dbo").with_delay(RESPONSE_DELAY));
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().connection_timeout = TIMEOUT_SECS;
+        dbc.set_connection_timeout(TIMEOUT_SECS);
 
         let started = Instant::now();
         let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
@@ -2996,7 +2989,7 @@ mod tests {
         let (h, _server) =
             user_name_fixture(user_name_row("dbo").with_delay(Duration::from_secs(4)));
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().connection_timeout = 1;
+        dbc.set_connection_timeout(1);
 
         // Leave a record behind from an earlier call.
         let mut small = [0u16; 2];

@@ -314,7 +314,7 @@ fn drain_and_release_inner(
             WireOwner::Statement(statement_handle),
             ClaimPolicy::IdleOrOwn,
         ) {
-            Ok(lease) => (lease, dbc_state.cancel_timeout_secs()),
+            Ok(lease) => (lease, dbc.cancel_timeout_secs()),
             Err(ClaimError::Busy(owner)) if owner != WireOwner::Statement(statement_handle) => {
                 return DrainOutcome::Clean;
             }

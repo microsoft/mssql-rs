@@ -165,7 +165,18 @@ impl TestHandles {
 
     /// Allocate ENV + DBC + STMT.
     pub(crate) fn with_env_dbc_stmt() -> Self {
+        Self::with_env_dbc_stmt_encoding(crate::conversion::client_encoding::ClientEncoding::UTF8)
+    }
+
+    pub(crate) fn with_env_dbc_stmt_encoding(
+        encoding: crate::conversion::client_encoding::ClientEncoding,
+    ) -> Self {
         let mut h = Self::with_env_dbc();
+        unsafe { handle_from_raw::<DbcHandle>(h.dbc) }
+            .inner
+            .lock()
+            .unwrap()
+            .client_encoding = encoding;
         let mut stmt: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_STMT, h.dbc, &mut stmt) },

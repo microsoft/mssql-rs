@@ -223,6 +223,7 @@ fn switch_catalog(dbc: &DbcHandle, name: String, sql: String) -> SqlReturn {
         // ENVCHANGE the client tracks, matching msodbcsql, which flags the refresh
         // from both this path and the token (`sqlctokn.cpp:2881`).
         state.database_user_name = None;
+        state.database_read_only = None;
         if post_tds_info_messages(state, &info_messages) {
             return SQL_SUCCESS_WITH_INFO;
         }

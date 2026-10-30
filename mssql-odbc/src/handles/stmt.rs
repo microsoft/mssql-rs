@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use tracing::error;
@@ -390,8 +390,9 @@ impl ColumnBinding {
     /// order — the fetch loop's input, derived fresh from the ARD each fetch
     /// rather than cached, so a descriptor-field bind and a `SQLBindCol` bind
     /// are indistinguishable to it.
-    pub(crate) fn all_from_ard_state(ard_state: &DescState) -> Vec<Self> {
-        let mut bindings = Vec::with_capacity(ard_state.records.len());
+    pub(crate) fn read_from_ard_state(ard_state: &DescState, bindings: &mut Vec<Self>) {
+        bindings.clear();
+        bindings.reserve(ard_state.records.len());
         bindings.extend(
             ard_state
                 .records
@@ -402,6 +403,12 @@ impl ColumnBinding {
                     Self::from_record(column_number, record)
                 }),
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_from_ard_state(ard_state: &DescState) -> Vec<Self> {
+        let mut bindings = Vec::new();
+        Self::read_from_ard_state(ard_state, &mut bindings);
         bindings
     }
 }
@@ -446,6 +453,8 @@ pub(crate) struct StmtHandle {
     /// Independent of `inner` so SQLCancel never waits for the executing call.
     /// Replaced under the execution claim; retained for the whole batch lifetime.
     cancel: Mutex<StatementCancellation>,
+    // Zero admits an untraced call without locking; NOTIFY reserves the slow path.
+    operation_state: AtomicU8,
     operation_finished: Condvar,
     pub(crate) inner: Mutex<StmtState>,
 }
@@ -454,6 +463,8 @@ pub(crate) struct StmtHandle {
 #[derive(Debug)]
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
+    /// Empty storage reused for a fresh ARD snapshot, not cached bindings.
+    pub(crate) fetch_bindings: Vec<ColumnBinding>,
     pub(crate) text_output: TextOutput,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
@@ -839,6 +850,7 @@ pub(crate) struct DaeParam {
     /// The binding as of this execution, kept so a buffered value can be
     /// declared and converted from `ParameterType` when it closes.
     pub(crate) binding: BoundParam,
+    pub(crate) long_as_max: bool,
     /// The binding's UDT identity, owned here because the descriptor snapshot
     /// it came from does not outlive the execute that parks this sequence.
     pub(crate) udt_names: Option<Arc<UdtNames>>,
@@ -858,6 +870,7 @@ impl DaeParam {
         length_limit: Option<DaeLengthLimit>,
         binding: BoundParam,
         udt_names: Option<Arc<UdtNames>>,
+        long_as_max: bool,
     ) -> Self {
         Self {
             bound_index,
@@ -866,6 +879,7 @@ impl DaeParam {
             buffered,
             length_limit,
             binding,
+            long_as_max,
             udt_names,
             transcode: None,
         }
@@ -892,7 +906,7 @@ impl DaeParam {
             strlen_or_ind_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
         };
-        Self::new(bound_index, expected_len, false, None, binding, None)
+        Self::new(bound_index, expected_len, false, None, binding, None, false)
     }
 
     /// Same, with the binding's C and SQL types set, for the tests that depend
@@ -1595,20 +1609,26 @@ unsafe impl Sync for StmtHandle {}
 #[derive(Debug, Default)]
 struct StatementCancellation {
     handle: CancelHandle,
-    active: bool,
     trace_execution: Option<u64>,
     requested: bool,
     waiters: usize,
+    operation_waiters: usize,
     cancelling: bool,
 }
 
+const OPERATION_ACTIVE: u8 = 1;
+const OPERATION_NOTIFY: u8 = 2;
+
 impl StatementCancellation {
-    fn replace_handle(&mut self) {
-        let timeout_secs = self.handle.cancel_timeout_secs();
-        self.handle = CancelHandle::new();
-        if let Some(seconds) = timeout_secs {
-            self.handle.set_cancel_timeout_secs(seconds);
+    fn notify_waiters(&self, finished: &Condvar) {
+        if self.waiters != 0 || self.operation_waiters != 0 {
+            finished.notify_all();
         }
+    }
+
+    fn replace_handle(&mut self, timeout_secs: u32) {
+        self.handle = CancelHandle::new();
+        self.handle.set_cancel_timeout_secs(timeout_secs);
     }
 }
 
@@ -1618,26 +1638,53 @@ pub(crate) struct StatementOperation<'a> {
 }
 
 impl StatementOperation<'_> {
-    /// Atomically finish a DAE call if cancellation did not arrive. Otherwise
-    /// retain ownership while its buffered/parked request is unwound.
+    /// Finish an unsignalled call, retaining ownership when cancellation needs settling.
+    #[inline]
     pub(crate) fn finish_unless_cancelled(&mut self) -> Result<bool, odbc_types::SqlReturn> {
-        let Ok(mut state) = self.stmt.cancel.lock() else {
+        if self.finish_uncontended() {
+            return Ok(true);
+        }
+        self.finish_unless_cancelled_slow()
+    }
+
+    #[inline]
+    fn finish_uncontended(&mut self) -> bool {
+        // A canceller or queued operation sets NOTIFY before checking ACTIVE,
+        // so a successful exchange needs neither the mutex nor a wakeup.
+        if !self.stmt.cancel.is_poisoned()
+            && self
+                .stmt
+                .operation_state
+                .compare_exchange(OPERATION_ACTIVE, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.active = false;
+            return true;
+        }
+        false
+    }
+
+    #[cold]
+    fn finish_unless_cancelled_slow(&mut self) -> Result<bool, odbc_types::SqlReturn> {
+        let Ok(state) = self.stmt.cancel.lock() else {
             error!("finishing DAE operation: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
         if state.requested {
             return Ok(false);
         }
-        state.active = false;
+        self.stmt
+            .operation_state
+            .store(OPERATION_NOTIFY, Ordering::Release);
         self.active = false;
-        self.stmt.operation_finished.notify_all();
+        state.notify_waiters(&self.stmt.operation_finished);
         Ok(true)
     }
 }
 
 impl Drop for StatementOperation<'_> {
     fn drop(&mut self) {
-        if !self.active {
+        if !self.active || self.finish_uncontended() {
             return;
         }
         match self.stmt.cancel.lock() {
@@ -1645,10 +1692,12 @@ impl Drop for StatementOperation<'_> {
                 // This call settled the signal; the latched token must not
                 // reach a later call that reuses the statement's handle.
                 if state.requested {
-                    state.replace_handle();
+                    state.replace_handle(self.stmt.parent_dbc().cancel_timeout_secs());
                 }
-                state.active = false;
-                self.stmt.operation_finished.notify_all();
+                self.stmt
+                    .operation_state
+                    .store(OPERATION_NOTIFY, Ordering::Release);
+                state.notify_waiters(&self.stmt.operation_finished);
             }
             Err(_) => error!("finishing statement operation: cancel mutex poisoned"),
         }
@@ -1666,7 +1715,7 @@ impl Drop for StatementCancel<'_> {
             Ok(mut state) => {
                 state.waiters -= 1;
                 state.cancelling = false;
-                self.stmt.operation_finished.notify_all();
+                state.notify_waiters(&self.stmt.operation_finished);
             }
             Err(_) => error!("finishing cancellation: cancel mutex poisoned"),
         }
@@ -1677,26 +1726,43 @@ impl StmtHandle {
     #[cfg(test)]
     pub(crate) fn cancellation_state_for_test(&self) -> (bool, bool) {
         let state = self.cancel.lock().unwrap();
-        (state.active, state.requested)
-    }
-
-    fn cancel_timeout_secs(&self) -> Result<u32, odbc_types::SqlReturn> {
-        let Ok(state) = self.parent_dbc().inner.lock() else {
-            error!("reading cancellation timeout: dbc mutex poisoned");
-            return Err(odbc_types::SQL_ERROR);
-        };
-        Ok(state.cancel_timeout_secs())
+        (
+            self.operation_state.load(Ordering::Acquire) & OPERATION_ACTIVE != 0,
+            state.requested,
+        )
     }
 
     /// Track the whole call, including its final client hand-back and state
     /// updates. The guard holds no mutex across I/O.
+    #[inline]
     pub(crate) fn begin_operation(&self) -> Result<StatementOperation<'_>, odbc_types::SqlReturn> {
-        let timeout_secs = self.cancel_timeout_secs()?;
+        if self.trace.is_none()
+            && !self.cancel.is_poisoned()
+            && self
+                .operation_state
+                .compare_exchange(0, OPERATION_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(StatementOperation {
+                stmt: self,
+                active: true,
+            });
+        }
+        self.begin_operation_slow()
+    }
+
+    #[cold]
+    fn begin_operation_slow(&self) -> Result<StatementOperation<'_>, odbc_types::SqlReturn> {
         let Ok(mut state) = self.cancel.lock() else {
             error!("starting statement operation: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
-        while state.active || state.waiters != 0 {
+        self.operation_state
+            .fetch_or(OPERATION_NOTIFY, Ordering::AcqRel);
+        while self.operation_state.load(Ordering::Acquire) & OPERATION_ACTIVE != 0
+            || state.waiters != 0
+        {
+            state.operation_waiters += 1;
             state = match self.operation_finished.wait(state) {
                 Ok(state) => state,
                 Err(_) => {
@@ -1704,14 +1770,22 @@ impl StmtHandle {
                     return Err(odbc_types::SQL_ERROR);
                 }
             };
+            state.operation_waiters -= 1;
         }
         state.trace_execution = self
             .trace
             .as_ref()
             .and_then(|trace| trace.operation_execution());
-        state.active = true;
         state.requested = false;
-        state.handle.set_cancel_timeout_secs(timeout_secs);
+        self.operation_state.store(
+            OPERATION_ACTIVE
+                | if state.operation_waiters != 0 {
+                    OPERATION_NOTIFY
+                } else {
+                    0
+                },
+            Ordering::Release,
+        );
         Ok(StatementOperation {
             stmt: self,
             active: true,
@@ -1721,12 +1795,15 @@ impl StmtHandle {
     /// Signal before waiting, and keep a new call from entering until this
     /// cancellation has finished inspecting any parked DAE state.
     pub(crate) fn cancel_operation(&self) -> Result<StatementCancel<'_>, odbc_types::SqlReturn> {
-        let timeout_secs = self.cancel_timeout_secs()?;
         let Ok(mut state) = self.cancel.lock() else {
             error!("cancelling statement operation: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
-        let interrupted = state.active;
+        let interrupted = self
+            .operation_state
+            .fetch_or(OPERATION_NOTIFY, Ordering::AcqRel)
+            & OPERATION_ACTIVE
+            != 0;
         if let Some(trace) = &self.trace {
             trace.correlate_cancellation(if interrupted {
                 state.trace_execution
@@ -1734,13 +1811,17 @@ impl StmtHandle {
                 trace.last_execution()
             });
         }
-        state.handle.set_cancel_timeout_secs(timeout_secs);
+        state
+            .handle
+            .set_cancel_timeout_secs(self.parent_dbc().cancel_timeout_secs());
         if interrupted {
             state.requested = true;
             state.handle.cancel();
         }
         state.waiters += 1;
-        while state.active || state.cancelling {
+        while self.operation_state.load(Ordering::Acquire) & OPERATION_ACTIVE != 0
+            || state.cancelling
+        {
             state = match self.operation_finished.wait(state) {
                 Ok(state) => state,
                 Err(_) => {
@@ -1756,6 +1837,18 @@ impl StmtHandle {
         })
     }
 
+    /// Publish an attribute change to existing execution children, without taking `inner`.
+    pub(crate) fn refresh_cancel_timeout(&self) -> Result<(), odbc_types::SqlReturn> {
+        let Ok(mut cancel) = self.cancel.lock() else {
+            error!("updating cancellation timeout: cancel mutex poisoned");
+            return Err(odbc_types::SQL_ERROR);
+        };
+        cancel
+            .handle
+            .set_cancel_timeout_secs(self.parent_dbc().cancel_timeout_secs());
+        Ok(())
+    }
+
     /// Publish while holding `inner`, before setting EXEC_STARTED. Cancellation
     /// and replacement serialize on `cancel`, so an old signal cannot reach a
     /// subsequent execution.
@@ -1764,7 +1857,7 @@ impl StmtHandle {
             error!("starting execution: cancel mutex poisoned");
             return Err(odbc_types::SQL_ERROR);
         };
-        cancel.replace_handle();
+        cancel.replace_handle(self.parent_dbc().cancel_timeout_secs());
         if cancel.requested {
             cancel.handle.cancel();
         }
@@ -1829,9 +1922,11 @@ impl StmtHandle {
                 parent_dbc,
             ))),
             cancel: Mutex::new(StatementCancellation::default()),
+            operation_state: AtomicU8::new(0),
             operation_finished: Condvar::new(),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
+                fetch_bindings: Vec::new(),
                 text_output: TextOutput::UTF8,
                 column_metadata: Vec::new(),
                 result_generation: 0,
@@ -1917,23 +2012,259 @@ impl Drop for StmtHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::odbc_types::{SQL_ATTR_CONNECTION_TIMEOUT, SQL_SUCCESS};
+    use crate::api::set_connect_attr::sql_set_connect_attr_w;
+
+    #[test]
+    fn uncontended_operations_do_not_lock_cancellation_state() {
+        use std::time::Duration;
+
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt.trace.is_none());
+        assert!(
+            stmt.begin_operation()
+                .unwrap()
+                .finish_unless_cancelled()
+                .unwrap()
+        );
+        std::thread::scope(|scope| {
+            let state = stmt.cancel.lock().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                for _ in 0..1000 {
+                    let mut operation = stmt.begin_operation().unwrap();
+                    assert!(operation.finish_unless_cancelled().unwrap());
+                    drop(stmt.begin_operation().unwrap());
+                }
+                tx.send(()).unwrap();
+            });
+            let completed = rx.recv_timeout(Duration::from_secs(2));
+            drop(state);
+            completed.unwrap();
+        });
+    }
+
+    #[test]
+    fn cancellation_racing_fast_completion_keeps_the_winning_outcome() {
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        for _ in 0..128 {
+            let mut operation = stmt.begin_operation().unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let barrier = &barrier;
+                let cancel = scope.spawn(move || {
+                    barrier.wait();
+                    stmt.cancel_operation().unwrap().interrupted
+                });
+                barrier.wait();
+                let completed = operation.finish_unless_cancelled().unwrap();
+                drop(operation);
+                assert_eq!(cancel.join().unwrap(), !completed);
+            });
+            let mut next = stmt.begin_operation().unwrap();
+            assert!(!stmt.cancel.lock().unwrap().requested);
+            assert!(next.finish_unless_cancelled().unwrap());
+        }
+    }
+
+    #[test]
+    fn fast_operations_reject_poisoned_cancellation_state() {
+        for active in [false, true] {
+            let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut operation = stmt.begin_operation().unwrap();
+            if !active {
+                assert!(operation.finish_unless_cancelled().unwrap());
+            }
+            std::thread::scope(|scope| {
+                assert!(
+                    scope
+                        .spawn(|| {
+                            let _state = stmt.cancel.lock().unwrap();
+                            panic!("poison cancellation state");
+                        })
+                        .join()
+                        .is_err()
+                );
+            });
+            if active {
+                assert_eq!(
+                    operation.finish_unless_cancelled(),
+                    Err(odbc_types::SQL_ERROR)
+                );
+            } else {
+                assert!(matches!(stmt.begin_operation(), Err(odbc_types::SQL_ERROR)));
+            }
+        }
+    }
+
+    #[test]
+    fn operation_completion_wakes_queued_operations_without_cancellers() {
+        use std::time::{Duration, Instant};
+
+        for finish_explicitly in [false, true] {
+            let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut operation = stmt.begin_operation().unwrap();
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                for _ in 0..3 {
+                    let tx = tx.clone();
+                    scope.spawn(move || {
+                        let mut next = stmt.begin_operation().unwrap();
+                        if finish_explicitly {
+                            assert!(next.finish_unless_cancelled().unwrap());
+                        }
+                        drop(next);
+                        tx.send(()).unwrap();
+                    });
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while stmt.cancel.lock().unwrap().operation_waiters != 3 {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                assert_eq!(stmt.cancel.lock().unwrap().waiters, 0);
+                assert!(rx.try_recv().is_err());
+                if finish_explicitly {
+                    assert!(operation.finish_unless_cancelled().unwrap());
+                }
+                drop(operation);
+                for _ in 0..3 {
+                    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+            });
+            let state = stmt.cancel.lock().unwrap();
+            assert_eq!(
+                stmt.operation_state.load(Ordering::Acquire) & OPERATION_ACTIVE,
+                0
+            );
+            assert_eq!(state.operation_waiters, 0);
+        }
+    }
 
     #[test]
     fn connection_timeout_reaches_existing_execution_children() {
         let h = crate::test_support::TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
-        let operation = stmt.begin_operation().unwrap();
+        let mut operation = stmt.begin_operation().unwrap();
         let child = stmt.new_execution_cancel().unwrap();
         assert_eq!(child.cancel_timeout_secs(), Some(120));
-        drop(operation);
-        stmt.parent_dbc().inner.lock().unwrap().connection_timeout = 2;
-        let fetch = stmt.begin_operation().unwrap();
+        assert!(operation.finish_unless_cancelled().unwrap());
+        assert_eq!(stmt.operation_state.load(Ordering::Acquire), 0);
+        for (requested, effective) in [(2, 2), (3, 3), (0, 120)] {
+            assert_eq!(
+                unsafe {
+                    sql_set_connect_attr_w(
+                        h.dbc,
+                        SQL_ATTR_CONNECTION_TIMEOUT,
+                        requested as SqlPointer,
+                        0,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(child.cancel_timeout_secs(), Some(effective));
+            assert_eq!(stmt.operation_state.load(Ordering::Acquire), 0);
+            let state = stmt.cancel.lock().unwrap();
+            let mut fetch = stmt.begin_operation().unwrap();
+            assert!(fetch.finish_unless_cancelled().unwrap());
+            drop(state);
+        }
+        let fresh = stmt.new_execution_cancel().unwrap();
+        assert_eq!(fresh.cancel_timeout_secs(), Some(120));
+    }
+
+    #[test]
+    fn timeout_publication_does_not_wait_for_statement_state() {
+        use std::time::Duration;
+
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let operation = stmt.begin_operation().unwrap();
+        let child = stmt.new_execution_cancel().unwrap();
+        std::thread::scope(|scope| {
+            let state = stmt.inner.lock().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let rc = unsafe {
+                    sql_set_connect_attr_w(
+                        stmt.parent_dbc,
+                        SQL_ATTR_CONNECTION_TIMEOUT,
+                        2usize as SqlPointer,
+                        0,
+                    )
+                };
+                tx.send(rc).unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            drop(state);
+            assert_eq!(result.unwrap(), SQL_SUCCESS);
+        });
         assert_eq!(child.cancel_timeout_secs(), Some(2));
-        drop(fetch);
-        stmt.parent_dbc().inner.lock().unwrap().connection_timeout = 3;
-        let cancel = stmt.cancel_operation().unwrap();
-        assert_eq!(child.cancel_timeout_secs(), Some(3));
-        drop(cancel);
+        drop(operation);
+    }
+
+    #[test]
+    fn timeout_publication_updates_healthy_statements_after_poison() {
+        let mut h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let extra = h.alloc_extra_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let healthy = unsafe { crate::handles::handle_from_raw::<StmtHandle>(extra) };
+        let child = healthy.new_execution_cancel().unwrap();
+        std::thread::scope(|scope| {
+            assert!(
+                scope
+                    .spawn(|| {
+                        let _state = stmt.cancel.lock().unwrap();
+                        panic!("poison cancellation state");
+                    })
+                    .join()
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            unsafe {
+                sql_set_connect_attr_w(h.dbc, SQL_ATTR_CONNECTION_TIMEOUT, 7usize as SqlPointer, 0)
+            },
+            odbc_types::SQL_ERROR
+        );
+        assert_eq!(child.cancel_timeout_secs(), Some(7));
+        assert_eq!(stmt.parent_dbc().connection_timeout(), 7);
+        assert!(
+            !stmt
+                .parent_dbc()
+                .inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .is_empty()
+        );
+        stmt.cancel.clear_poison();
+    }
+
+    #[test]
+    fn cancellation_bookkeeping_does_not_wait_for_connection_state() {
+        use std::time::Duration;
+
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        std::thread::scope(|scope| {
+            let dbc_state = stmt.parent_dbc().inner.lock().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let mut operation = stmt.begin_operation().unwrap();
+                assert!(operation.finish_unless_cancelled().unwrap());
+                drop(operation);
+                drop(stmt.cancel_operation().unwrap());
+                tx.send(()).unwrap();
+            });
+            let completed = rx.recv_timeout(Duration::from_secs(2));
+            drop(dbc_state);
+            completed.unwrap();
+        });
     }
 
     #[test]
@@ -1965,6 +2296,10 @@ mod tests {
                 let _next = stmt.begin_operation().unwrap();
                 tx.send(2).unwrap();
             });
+            while stmt.cancel.lock().unwrap().operation_waiters != 1 {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
             drop(operation);
             let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(first < 2);

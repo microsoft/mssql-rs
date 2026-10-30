@@ -22,11 +22,11 @@ use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
     SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
     SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
-    SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_MULTISUBNET_FAILOVER,
-    SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TNIR, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT,
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_LONGASMAX,
+    SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TNIR,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 #[cfg(not(windows))]
 use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
@@ -193,6 +193,9 @@ unsafe fn sql_set_connect_attr_w_impl(
     // The transaction attributes talk to the server, which must not happen while
     // the DBC mutex is held, so they manage their own locking.
     match attribute {
+        SQL_ATTR_ACCESS_MODE => {
+            return super::database_read_only::set_access_mode(dbc, value_ptr as usize as u32);
+        }
         SQL_ATTR_AUTOCOMMIT => return set_autocommit(dbc, value_ptr as usize as u64),
         // Both spellings drive the same session setting. The vendor attribute is
         // the only one that can carry SQL_TXN_SS_SNAPSHOT, because the Driver
@@ -339,6 +342,16 @@ unsafe fn sql_set_connect_attr_w_impl(
             );
             SQL_SUCCESS
         }
+        SQL_COPT_SS_LONGASMAX => {
+            let value = value_ptr.addr();
+            state.vendor_overrides.long_as_max = Some(value);
+            if let Some(settings) = state.effective_vendor_settings.as_mut() {
+                settings.long_as_max = Some(value);
+            }
+            // Existing prepared handles retain their declarations, as in
+            // msodbcsql. New executions snapshot this setting for their values.
+            SQL_SUCCESS
+        }
         // Settable at any time, before or after connect: it changes only how the
         // driver reports a substitution, never how the connection is made.
         //
@@ -404,20 +417,25 @@ unsafe fn sql_set_connect_attr_w_impl(
                 SQL_SUCCESS
             }
         }
-        // Access mode remains stored-only; packet size is a login setting.
-        SQL_ATTR_ACCESS_MODE => {
-            state.access_mode = value_ptr as usize as u32;
-            SQL_SUCCESS
-        }
         SQL_ATTR_CONNECTION_TIMEOUT => {
-            // Statement cancellation reads this at entry and again when signalled.
+            // Publish to execution children here, not on every fetch/GetData call.
             // Zero selects the native driver's 120-second cancellation default.
             // General non-cancellation network-I/O timeout enforcement is separate.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
             // warning rather than reusing msodbcsql's "Login timeout changed".
             let requested = value_ptr as usize as u64;
-            state.connection_timeout = requested.min(MAX_LOGIN_TIMEOUT_SECS) as u32;
+            dbc.set_connection_timeout(requested.min(MAX_LOGIN_TIMEOUT_SECS) as u32);
+            let mut poisoned = false;
+            for &raw in &state.statements {
+                // SAFETY: the DBC lock keeps each child alive during publication.
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                poisoned |= stmt.refresh_cancel_timeout().is_err();
+            }
+            if poisoned {
+                post_diag(&mut state, ERR_STATEMENT_UNUSABLE);
+                return SQL_ERROR;
+            }
             if requested > MAX_LOGIN_TIMEOUT_SECS {
                 post_diag(&mut state, WARN_CONNECTION_TIMEOUT_CHANGED);
                 SQL_SUCCESS_WITH_INFO
@@ -1000,7 +1018,7 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        assert_eq!(dbc.inner.lock().unwrap().connection_timeout, 0);
+        assert_eq!(dbc.connection_timeout(), 0);
     }
 
     #[test]
@@ -1085,7 +1103,7 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc.inner.lock().unwrap();
-        assert_eq!(state.connection_timeout, MAX_LOGIN_TIMEOUT_SECS as u32);
+        assert_eq!(dbc.connection_timeout(), MAX_LOGIN_TIMEOUT_SECS as u32);
 
         let record = &state.diag_records()[0];
         assert_eq!(record.sql_state, SQLSTATE_01S02);
@@ -1261,7 +1279,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.access_mode, 1);
-        assert_eq!(state.connection_timeout, 30);
+        assert_eq!(dbc.connection_timeout(), 30);
         assert_eq!(state.packet_size, 16384);
     }
 

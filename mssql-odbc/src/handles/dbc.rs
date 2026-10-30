@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tracing::error;
@@ -30,8 +31,9 @@ pub(crate) enum ConnectionState {
 /// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`.
 /// Holds a back-pointer to the parent environment and connection-level state.
 ///
-/// Thread-safety: The `inner` mutex protects mutable state, mirroring
-/// msodbcsql's connection-level critical section.
+/// Thread-safety: The `inner` mutex protects mutable state except the atomic
+/// connection timeout. Cancellation paths read it while holding STMT or
+/// cancellation locks, so reads must not acquire `inner` and invert lock ordering.
 #[derive(Debug)]
 pub(crate) struct DbcHandle {
     pub(crate) trace: Arc<mssql_tds::trace_context::ConnectionTrace>,
@@ -41,6 +43,11 @@ pub(crate) struct DbcHandle {
     pub(crate) parent_env: *mut c_void,
     /// Shared Tokio runtime from the parent ENV.
     pub(crate) runtime: Arc<SharedRuntime>,
+    /// `SQL_ATTR_CONNECTION_TIMEOUT`, shared by internal metadata queries and
+    /// cancellation. Zero means unlimited for queries and 120 seconds for cancel.
+    /// Native: GetNetIOTimeOut/GetCancelTimeoutValue (sqlcprot.h:1605,1625);
+    /// broader connection-scoped timeout enforcement remains follow-up work.
+    connection_timeout: AtomicU32,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -48,7 +55,7 @@ pub(crate) struct DbcHandle {
 // We assert these are safe because `parent_env` is set once at construction
 // and never mutated. The parent ENV is guaranteed alive because the DM
 // ensures all DBCs are freed before calling SQLFreeEnv.
-// All mutable state is Mutex-protected.
+// Mutable state is Mutex-protected or atomic.
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
@@ -67,9 +74,8 @@ unsafe impl Sync for DbcHandle {}
 ///   and the attribute is only a fallback (see `driver_connect`).
 ///
 /// So this is deliberately not a general "attributes beat keywords" rule -- it
-/// is per attribute, and each field here was confirmed by observing the
-/// resulting session in `sys.dm_exec_connections` rather than by reading a
-/// header.
+/// is per attribute, confirmed through effective session settings or parameter
+/// declarations rather than just the header constants.
 ///
 /// Values are normalized on the way in, matching msodbcsql: setting encrypt,
 /// trust, or integrated security to an out-of-range `7` and reading it back
@@ -77,6 +83,7 @@ unsafe impl Sync for DbcHandle {}
 /// than the caller's input. Multi-subnet failover instead rejects anything
 /// above `SQL_IS_ON` with `HY024`, as msodbcsql does. TNIR is not stored:
 /// off is a compatibility no-op, and on is unsupported.
+/// LongAsMax instead retains the raw value, matching msodbcsql's option store.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct VendorConnOverrides {
     /// `SQL_COPT_SS_ENCRYPT` (1223): `0` no, `1` yes, `2` strict.
@@ -87,6 +94,9 @@ pub(crate) struct VendorConnOverrides {
     pub(crate) integrated_security: Option<u32>,
     /// `SQL_COPT_SS_MULTISUBNET_FAILOVER` (1248): `0` or `1`.
     pub(crate) multi_subnet_failover: Option<u32>,
+    /// Raw pointer-sized attribute; only SQL_XL_ON enables MAX. Get returns
+    /// its low SQLUINTEGER, matching msodbcsql's dwOptions/GetParamValue pair.
+    pub(crate) long_as_max: Option<usize>,
 }
 
 /// Mutable state within a connection handle, protected by `inner`.
@@ -112,7 +122,7 @@ pub(crate) struct DbcState {
     /// Login timeout in seconds set via `SQL_ATTR_LOGIN_TIMEOUT`. Applied to the
     /// TDS login deadline at connect time. `Some(0)` means wait indefinitely.
     pub(crate) login_timeout: Option<u32>,
-    /// Pre-connect overrides from the `SQL_COPT_SS_*` attribute forms of
+    /// Explicit overrides from the `SQL_COPT_SS_*` attribute forms of
     /// connection-string keywords. `None` means "the caller did not set this
     /// attribute", which is what lets the keyword stand.
     pub(crate) vendor_overrides: VendorConnOverrides,
@@ -121,8 +131,7 @@ pub(crate) struct DbcState {
     /// resolved by one connection is never reused as an explicit attribute on
     /// the next connection attempt.
     pub(crate) effective_vendor_settings: Option<VendorConnOverrides>,
-    /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
-    /// does not yet vary its behaviour on it.
+    /// Requested `SQL_ATTR_ACCESS_MODE`; a read-only database overrides it on get.
     pub(crate) access_mode: u32,
     /// `SQL_COPT_SS_WARN_ON_CP_ERROR`. When `true`, a value carrying a character
     /// the narrow encoding it is sent in could not represent — substituted with
@@ -147,15 +156,6 @@ pub(crate) struct DbcState {
     /// retrieval (`sqlcdata.h:1297,1310`); retaining our input-parameter warning
     /// is the remaining deviation in parity-deviations entry 23 (AB#47598).
     pub(crate) warn_on_cp_error: bool,
-    /// `SQL_ATTR_CONNECTION_TIMEOUT` in seconds. `0` is the ODBC default and
-    /// means "no timeout". Honored only by the driver's own internal
-    /// connection-scoped queries — the `SQL_USER_NAME` and alias-type lookups —
-    /// which is the attribute msodbcsql bounds its combined lookup with
-    /// (`GetNetIOTimeOut`, `sqlcprot.h:1605` over `sqlccmd.cpp:10369`).
-    /// Application statements take their deadline from `SQL_ATTR_QUERY_TIMEOUT`
-    /// instead; extending this attribute to the rest of the connection-scoped
-    /// paths is residual work.
-    pub(crate) connection_timeout: u32,
     /// `SQL_ATTR_PACKET_SIZE` in bytes: the app-set attribute (or default),
     /// surviving `SQLDisconnect` so the next connect attempt on this handle
     /// starts from it again. Never overwritten with a resolved or negotiated
@@ -255,6 +255,9 @@ pub(crate) struct DbcState {
     /// with the client's database-change count so a `USE` the driver did not
     /// issue — including a `USE [X]` while already in `X` — still invalidates.
     pub(crate) database_user_name: Option<CachedDatabaseUserName>,
+    /// Actual database updateability, shared by the access-mode attributes and
+    /// `SQL_DATA_SOURCE_READ_ONLY`. Invalidated by database and session changes.
+    pub(crate) database_read_only: Option<Box<CachedDatabaseReadOnly>>,
     /// Alias type names (`sp_addtype`, `CREATE TYPE ... FROM`) for
     /// `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME`, read lazily on the
     /// first description of an alias-typed column. Cleared when the session
@@ -276,12 +279,13 @@ pub(crate) struct DbcState {
 }
 
 impl DbcState {
-    pub(crate) fn cancel_timeout_secs(&self) -> u32 {
-        if self.connection_timeout == 0 {
-            120
-        } else {
-            self.connection_timeout
-        }
+    pub(crate) fn long_as_max(&self) -> usize {
+        (self.connection_state == ConnectionState::Connected)
+            .then_some(self.effective_vendor_settings.as_ref())
+            .flatten()
+            .and_then(|settings| settings.long_as_max)
+            .or(self.vendor_overrides.long_as_max)
+            .unwrap_or(crate::api::odbc_types::SQL_XL_OFF)
     }
 }
 
@@ -339,6 +343,13 @@ pub(crate) struct CachedDatabaseUserName {
     pub(crate) value: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedDatabaseReadOnly {
+    pub(crate) catalog: String,
+    pub(crate) database_change_count: u64,
+    pub(crate) read_only: bool,
+}
+
 /// A [`DbcState::alias_types`] entry: `systypes` names keyed by the
 /// database-scoped `UserType` that `COLMETADATA` reports for a column, valid
 /// only for the session state they were read in.
@@ -390,12 +401,28 @@ impl HasDiagnostics for DbcState {
 }
 
 impl DbcHandle {
+    pub(crate) fn connection_timeout(&self) -> u32 {
+        self.connection_timeout.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_connection_timeout(&self, seconds: u32) {
+        self.connection_timeout.store(seconds, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cancel_timeout_secs(&self) -> u32 {
+        match self.connection_timeout() {
+            0 => 120,
+            seconds => seconds,
+        }
+    }
+
     pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
             trace: Arc::default(),
             object_type: HandleType::Dbc,
             parent_env,
             runtime,
+            connection_timeout: AtomicU32::new(0),
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
                 client_encoding: ClientEncoding::system_default(),
@@ -409,7 +436,6 @@ impl DbcHandle {
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
                 warn_on_cp_error: false,
-                connection_timeout: 0,
                 packet_size: DEFAULT_PACKET_SIZE,
                 effective_packet_size: None,
                 autocommit: true,
@@ -422,6 +448,7 @@ impl DbcHandle {
                 identity: ConnectionIdentity::default(),
                 session_generation: 0,
                 database_user_name: None,
+                database_read_only: None,
                 alias_types: None,
                 last_collation_code_page: None,
                 last_char_set: None,
@@ -495,10 +522,10 @@ mod tests {
     fn cancellation_timeout_uses_default_only_for_zero() {
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let mut state = dbc.inner.lock().unwrap();
         for (configured, expected) in [(0, 120), (1, 1), (30, 30), (u32::MAX, u32::MAX)] {
-            state.connection_timeout = configured;
-            assert_eq!(state.cancel_timeout_secs(), expected);
+            dbc.set_connection_timeout(configured);
+            assert_eq!(dbc.connection_timeout(), configured);
+            assert_eq!(dbc.cancel_timeout_secs(), expected);
         }
     }
 

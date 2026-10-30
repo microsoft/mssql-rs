@@ -1,11 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::connection::client_context::{ClientContext, TransportContext};
+use crate::connection::connect_stage;
 use crate::connection::connection_actions::{
     ActionOutcome, ConnectionAction, ConnectionActionChain, ExecutionContext,
 };
@@ -48,6 +53,99 @@ type ConnectionParts = (
 
 /// Factory for establishing TDS connections and producing [`TdsClient`] instances.
 pub struct TdsConnectionProvider;
+
+/// Where a diagnostic connection attempt ([`TdsConnectionProvider::diagnose_client`])
+/// stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticStop {
+    /// After the name or instance is resolved: SQL Server Browser asked, the
+    /// TCP host resolved, a LocalDB instance's pipe found; before anything
+    /// is connected to. A local named instance without a protocol prefix is
+    /// tried over shared memory first (Windows), so there it stops before
+    /// shared memory is opened, without a Browser lookup.
+    Resolution,
+    /// After the transport opened (a TCP connection, or a pipe), before
+    /// pre-login. With strict encryption (TDS 8.0) the TLS handshake is part
+    /// of opening the transport.
+    Transport,
+}
+
+/// What a diagnostic connection attempt does beyond a normal one, and whether
+/// it stopped, passed down the connect path as `Option<&Diagnosis>`: every
+/// normal connection passes `None`.
+pub(crate) struct Diagnosis {
+    stop_after: Option<DiagnosticStop>,
+    /// Whether the attempt stopped where it was asked to.
+    stopped: AtomicBool,
+    /// The connects to the addresses after the one used. Dropping the set, as
+    /// canceling the attempt does, aborts them.
+    extra_connects: Mutex<JoinSet<()>>,
+}
+
+impl Diagnosis {
+    pub(crate) fn new(stop_after: Option<DiagnosticStop>) -> Self {
+        Self {
+            stop_after,
+            stopped: AtomicBool::new(false),
+            extra_connects: Mutex::new(JoinSet::new()),
+        }
+    }
+
+    /// Fails, after noting it, when the attempt stops at `stop`. The error is
+    /// not transient, so neither a retry nor another transport follows it.
+    pub(crate) fn check_stop(&self, stop: DiagnosticStop) -> TdsResult<()> {
+        if self.stops_at(stop) {
+            Err(Self::stop_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether the attempt stops at `stop`; if so, notes it. The caller then
+    /// fails with [`Self::stop_error`].
+    pub(crate) fn stops_at(&self, stop: DiagnosticStop) -> bool {
+        let stops = self.stop_after == Some(stop);
+        if stops {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+        stops
+    }
+
+    /// The error a diagnostic stop unwinds the attempt with.
+    pub(crate) fn stop_error() -> Error {
+        OperationCancelledError("diagnostic stop".to_string())
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Runs the connect to an address after the one used, kept to wait for.
+    pub(crate) fn spawn_extra_connect(&self, connect: impl Future<Output = ()> + Send + 'static) {
+        self.extra_connects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .spawn(connect);
+    }
+
+    /// Waits for the connects to the other addresses, at most `bound_ms`
+    /// (0: no bound); those still running then are aborted, as they are if
+    /// this is dropped while waiting.
+    pub(crate) async fn finish_extra_connects(&self, bound_ms: u64) {
+        let mut connects = std::mem::take(
+            &mut *self
+                .extra_connects
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let all = async { while connects.join_next().await.is_some() {} };
+        if bound_ms == 0 {
+            all.await;
+        } else {
+            let _ = timeout(Duration::from_millis(bound_ms), all).await;
+        }
+    }
+}
 
 impl Default for TdsConnectionProvider {
     fn default() -> Self {
@@ -116,6 +214,73 @@ impl TdsConnectionProvider {
         datasource: &str,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
+        let action_chain = Self::action_chain(&mut context, datasource)?;
+
+        // ODBC polls this on the application's stack. Keep the connection
+        // state out of its block_on frames, leaving room for native TLS and
+        // client construction on musl's 128 KiB threads.
+        Box::pin(self.execute_action_chain(&context, action_chain, cancel_handle, None)).await
+    }
+
+    /// [`create_client`](Self::create_client) for connection diagnostics: the
+    /// same connection attempt, observed through its connect-stage spans
+    /// ([`connect_stage`](crate::connection::connect_stage)), stopped after
+    /// `stop_after` when given. A diagnostic attempt does not use or update
+    /// the instance cache, so a named instance is looked up whenever the
+    /// attempt reaches SQL Server Browser, and that lookup counts resolving
+    /// the server against the lookup's time limit. As the client does, it
+    /// tries a local named instance without a protocol prefix over shared
+    /// memory first (Windows) and asks SQL Server Browser only if that does
+    /// not connect; a [`DiagnosticStop::Resolution`] stop on that path
+    /// happens before shared memory is opened, without a Browser lookup.
+    /// Over TCP without MultiSubnetFailover, once an
+    /// address accepts the connection, it also connects to the addresses
+    /// after it (at most 64, as MultiSubnetFailover tries), at the same time
+    /// and each within the connect timeout, closing each connection at once,
+    /// so each address is reported; the connection used is the first one, so
+    /// the login does not wait. With MultiSubnetFailover it cannot stop after
+    /// resolution, since resolving is part of the parallel connect.
+    ///
+    /// Gives `Some(client)` once the attempt has logged in, `None` once it
+    /// stopped where asked, and returns only when the connects to the other
+    /// addresses have ended too (each is bounded by the connect timeout). To
+    /// cancel it, drop the future.
+    pub async fn diagnose_client(
+        &self,
+        mut context: ClientContext,
+        datasource: &str,
+        stop_after: Option<DiagnosticStop>,
+    ) -> TdsResult<Option<TdsClient>> {
+        let action_chain = Self::action_chain(&mut context, datasource)?;
+        if stop_after == Some(DiagnosticStop::Resolution)
+            && context
+                .multi_subnet_failover_policy()
+                .is_some_and(|policy| policy.enabled)
+        {
+            return Err(Error::UsageError(
+                "A diagnostic attempt with MultiSubnetFailover cannot stop after resolution: \
+                 resolving is part of the parallel connect."
+                    .to_string(),
+            ));
+        }
+        let diagnosis = Diagnosis::new(stop_after);
+        let bound_ms = u64::from(context.connect_timeout) * 1000;
+        let result =
+            Box::pin(self.execute_action_chain(&context, action_chain, None, Some(&diagnosis)))
+                .await;
+        diagnosis.finish_extra_connects(bound_ms).await;
+        if diagnosis.stopped() {
+            return Ok(None);
+        }
+        result.map(Some)
+    }
+
+    /// Parses `datasource`, validates `context` for it, and gives the
+    /// connection strategy.
+    fn action_chain(
+        context: &mut ClientContext,
+        datasource: &str,
+    ) -> TdsResult<ConnectionActionChain> {
         // Parse the datasource to get the action chain
         let parsed = context.prepare_datasource(datasource)?;
 
@@ -134,10 +299,7 @@ impl TdsConnectionProvider {
 
         debug!("Connection strategy:\n{}", action_chain.describe());
 
-        // ODBC polls this on the application's stack. Keep the connection
-        // state out of its block_on frames, leaving room for native TLS and
-        // client construction on musl's 128 KiB threads.
-        Box::pin(self.execute_action_chain(&context, action_chain, cancel_handle)).await
+        Ok(action_chain)
     }
 
     /// Execute an action chain to create a client
@@ -149,6 +311,7 @@ impl TdsConnectionProvider {
         context: &ClientContext,
         action_chain: ConnectionActionChain,
         cancel_handle: Option<&CancelHandle>,
+        diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<TdsClient> {
         CancelHandle::run_until_cancelled(cancel_handle, async move {
             // Resolve SSRP (SQL Browser) if the action chain requires it.
@@ -158,11 +321,13 @@ impl TdsConnectionProvider {
 
             // Compute the overall login deadline up front. It bounds the
             // shared-memory shortcut below and the connect/retry loop — the phases
-            // that run the TDS/auth handshake. Name resolution is bounded
-            // separately and is not covered by this deadline: SSRP uses its own
-            // `ssrp_timeout_ms` (default 1s) and LocalDB resolution is a local pipe
-            // lookup. `login_timeout` falls back to `connect_timeout` for callers
-            // that only set the historical single knob; `0` means "no deadline".
+            // that run the TDS/auth handshake. Name resolution is not covered by
+            // this deadline: SSRP uses its own `ssrp_timeout_ms` (default 1s), and
+            // LocalDB resolution, which starts an instance that is not running, has
+            // no limit of its own and ends early only when the caller cancels the
+            // connect or times it out. `login_timeout` falls back to
+            // `connect_timeout` for callers that only set the historical single
+            // knob; `0` means "no deadline".
             // `connect_timeout` still bounds each individual TCP-connect attempt,
             // so an unreachable host fails fast even when the login budget is large
             // (e.g. interactive sign-in).
@@ -175,7 +340,8 @@ impl TdsConnectionProvider {
 
             // Try Shared Memory before SSRP for local named instances (Windows only).
             // SM doesn't need instance resolution — it uses the name directly.
-            // If SM succeeds, we skip SSRP entirely. This matches ODBC/SNI behavior.
+            // If SM succeeds, we skip SSRP entirely. This matches ODBC/SNI behavior,
+            // and a diagnostic connection follows it as the real connection does.
             #[cfg(windows)]
             if action_chain.requires_ssrp()
                 && let Some(sm_transport) = action_chain.first_shared_memory_transport()
@@ -188,7 +354,7 @@ impl TdsConnectionProvider {
                 let timeout_duration =
                     deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
                 let connect_future =
-                    Self::connect_with_transport_context(context, &sm_transport, None);
+                    Self::connect_with_transport_context(context, &sm_transport, None, diagnosis);
                 let sm_result = match timeout_duration.as_ref() {
                     Some(duration) => match timeout(*duration, connect_future).await {
                         Ok(result) => result,
@@ -200,7 +366,7 @@ impl TdsConnectionProvider {
                 };
                 // A route received over shared memory is followed over TCP like
                 // any other, instead of surfacing as a permanent failure below.
-                match Self::follow_redirects(context, sm_result, deadline, &mut redirect_count).await {
+                match Self::follow_redirects(context, sm_result, deadline, &mut redirect_count, diagnosis).await {
                     Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                         debug!("Shared Memory connection succeeded, skipping SSRP");
                         let mut client = TdsClient::new(
@@ -250,7 +416,10 @@ impl TdsConnectionProvider {
                         )
                     })?;
 
-                if action_chain.uses_cache() {
+                // A diagnostic connection that gets here asks SQL Server
+                // Browser even on a cache hit, and does not leave its answer
+                // in the cache.
+                if action_chain.uses_cache() && diagnosis.is_none() {
                     if let Some(cached) = InstanceCache::global().get(server, instance)? {
                         debug!(?cached, server, instance, "SSRP cache hit");
                         exec_context.store_outcome(ActionOutcome::CacheHit {
@@ -260,11 +429,11 @@ impl TdsConnectionProvider {
                         });
                     } else {
                         debug!(server, instance, "SSRP cache miss");
-                        Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                        Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms, diagnosis.is_some()).await?;
                         cache_key = Some((server.to_string(), instance.to_string()));
                     }
                 } else {
-                    Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                    Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms, diagnosis.is_some()).await?;
                 }
             }
 
@@ -374,7 +543,7 @@ impl TdsConnectionProvider {
                         ));
                     }
 
-                    let connect_future = Self::connect_with_transport_context(&context, transport_ctx, None);
+                    let connect_future = Self::connect_with_transport_context(&context, transport_ctx, None, diagnosis);
 
                     // Recompute remaining time budget before each timeout call
                     let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
@@ -390,7 +559,7 @@ impl TdsConnectionProvider {
                         None => connect_future.await,
                     };
 
-                    match Self::follow_redirects(&context, connection_result, deadline, &mut redirect_count).await {
+                    match Self::follow_redirects(&context, connection_result, deadline, &mut redirect_count, diagnosis).await {
                         Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                             debug!("Connection successful via action chain");
                             let mut client = TdsClient::new(
@@ -429,10 +598,14 @@ impl TdsConnectionProvider {
     }
 
     /// Query SQL Browser (SSRP) to resolve the TCP port or named pipe path for a named instance.
+    /// A diagnostic attempt (`bound_resolution`) has resolving the server count
+    /// against `ssrp_timeout_ms` too, so a slow resolver cannot outlast the
+    /// limit reported for the lookup.
     async fn resolve_ssrp(
         action_chain: &ConnectionActionChain,
         exec_context: &mut ExecutionContext,
         ssrp_timeout_ms: u64,
+        bound_resolution: bool,
     ) -> TdsResult<()> {
         let (server, instance) = action_chain
             .actions()
@@ -456,17 +629,54 @@ impl TdsConnectionProvider {
         };
         debug!(server = %server, instance = %instance, timeout_ms, "Executing SSRP query");
 
-        let instance_info =
-            ssrp::get_instance_info_ext(&server, &instance, ssrp::SSRP_PORT, timeout_ms)
-                .await
-                .map_err(|e| {
-                    Error::ConnectionError(format!(
-                        "Error Locating Server/Instance Specified [{}\\{}]. \
+        let stage = tracing::info_span!(
+            target: connect_stage::TARGET,
+            connect_stage::INSTANCE_LOOKUP,
+            server = %server,
+            instance = %instance,
+            addresses = tracing::field::Empty,
+            port = tracing::field::Empty,
+            pipe = tracing::field::Empty,
+            result = tracing::field::Empty,
+            os_error = tracing::field::Empty,
+            error = tracing::field::Empty,
+            ok = tracing::field::Empty
+        );
+        let instance_info = ssrp::query_instance(
+            &server,
+            &instance,
+            ssrp::SSRP_PORT,
+            timeout_ms,
+            bound_resolution,
+            |addresses| {
+                if !stage.is_disabled() {
+                    stage.record(
+                        connect_stage::ADDRESSES,
+                        connect_stage::address_list(addresses),
+                    );
+                }
+            },
+        )
+        .await
+        .map_err(|lookup| {
+            if !stage.is_disabled() {
+                stage.record(connect_stage::RESULT, lookup.code());
+                if let Some(code) = lookup.os_error() {
+                    stage.record(connect_stage::OS_ERROR, code);
+                }
+                if let Some(detail) = lookup.detail() {
+                    stage.record(connect_stage::ERROR, detail);
+                }
+                stage.record(connect_stage::OK, false);
+            }
+            let e = Error::from(lookup);
+            Error::ConnectionError(format!(
+                "Error Locating Server/Instance Specified [{}\\{}]. \
                      Ensure the instance name is correct and SQL Server Browser \
                      service is running on the host. ({})",
-                        server, instance, e
-                    ))
-                })?;
+                server, instance, e
+            ))
+        })?;
 
         let transports = ssrp::build_transport_list(instance_info, &server, &instance);
 
@@ -484,6 +694,15 @@ impl TdsConnectionProvider {
         });
 
         if tcp_port.is_none() {
+            #[cfg(windows)]
+            let no_endpoint = pipe_path.is_none();
+            #[cfg(not(windows))]
+            let no_endpoint = true;
+            if no_endpoint {
+                stage.record(connect_stage::RESULT, connect_stage::NO_ENDPOINT);
+                stage.record(connect_stage::OK, false);
+            }
+
             #[cfg(windows)]
             if pipe_path.is_none() {
                 return Err(Error::ConnectionError(format!(
@@ -503,6 +722,7 @@ impl TdsConnectionProvider {
 
         if let Some(port) = tcp_port {
             debug!(port, "SSRP resolved TCP port");
+            stage.record(connect_stage::PORT, port);
             exec_context.store_outcome(ActionOutcome::SsrpResolved { port });
         }
 
@@ -512,9 +732,11 @@ impl TdsConnectionProvider {
             // This avoids SMB round-trips and "Access is denied" errors.
             let pipe = crate::connection::transport::named_pipes::localize_pipe_path(&pipe);
             debug!(pipe = %pipe, "SSRP resolved named pipe path");
+            stage.record(connect_stage::PIPE_PATH, pipe.as_str());
             exec_context.store_outcome(ActionOutcome::SsrpResolvedPipe { pipe_path: pipe });
         }
 
+        stage.record(connect_stage::OK, true);
         Ok(())
     }
 
@@ -528,6 +750,7 @@ impl TdsConnectionProvider {
         mut result: TdsResult<ConnectionParts>,
         deadline: Option<Instant>,
         redirect_count: &mut u32,
+        diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<ConnectionParts> {
         while let Err(Error::Redirection {
             host,
@@ -559,6 +782,7 @@ impl TdsConnectionProvider {
                 routed_context.as_deref().unwrap_or(context),
                 &tcp_transport_context,
                 None,
+                diagnosis,
             );
             // Recompute remaining time budget for redirected connect
             let remaining = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
@@ -584,6 +808,7 @@ impl TdsConnectionProvider {
         context: &ClientContext,
         transport_context: &TransportContext,
         recovery_data: Option<Box<SessionRecoveryData>>,
+        diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<ConnectionParts> {
         if let Some(trace) = &context.connection_trace {
             trace.begin_transport_attempt();
@@ -607,8 +832,15 @@ impl TdsConnectionProvider {
                 })?
                 .enabled,
             connect_timeout_ms,
+            diagnosis,
         )
         .await?;
+
+        if diagnosis.is_some_and(|diagnosis| diagnosis.stops_at(DiagnosticStop::Transport)) {
+            // Dropping the transport closes it at once; nothing was sent on it.
+            drop(transport);
+            return Err(Diagnosis::stop_error());
+        }
 
         let factory = HandlerFactory {
             context: context.clone(),
@@ -767,6 +999,7 @@ mod tests {
                         &context,
                         &context.transport_context,
                         None,
+                        None,
                     ));
                 assert!(result.is_err());
                 assert_eq!(trace.client_connection_id(), Some(established));
@@ -830,6 +1063,89 @@ mod tests {
                 "should not fall through: {err}"
             );
         }
+    }
+
+    // ── Diagnosis tests ──
+
+    #[tokio::test]
+    async fn dropping_the_diagnosis_aborts_the_extra_connects() {
+        let diagnosis = Diagnosis::new(None);
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        diagnosis.spawn_extra_connect(async move {
+            let _finished = finished;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        running.await.unwrap();
+
+        drop(diagnosis);
+
+        // The task's end drops its sender, which completes `done` with an error.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), done)
+                .await
+                .expect("the task was not aborted")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn canceling_the_wait_for_extra_connects_aborts_them() {
+        let diagnosis = Diagnosis::new(None);
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        diagnosis.spawn_extra_connect(async move {
+            let _finished = finished;
+            std::future::pending::<()>().await;
+        });
+
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(50),
+            diagnosis.finish_extra_connects(0),
+        )
+        .await;
+        assert!(waiting.is_err(), "the wait has no bound of its own");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), done)
+                .await
+                .expect("the task was left running")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wait_for_extra_connects_ends_at_its_bound_and_aborts_them() {
+        let diagnosis = Diagnosis::new(None);
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        diagnosis.spawn_extra_connect(async move {
+            let _finished = finished;
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), diagnosis.finish_extra_connects(50))
+            .await
+            .expect("the wait ends at its bound");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), done)
+                .await
+                .expect("the task was left running")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_subnet_failover_cannot_stop_after_resolution() {
+        let context = ClientContext {
+            multi_subnet_failover: Some(true),
+            ..Default::default()
+        };
+        let error = TdsConnectionProvider::new()
+            .diagnose_client(context, "tcp:127.0.0.1,1", Some(DiagnosticStop::Resolution))
+            .await
+            .expect_err("the combination is refused");
+        assert!(matches!(error, Error::UsageError(_)), "{error}");
     }
 
     // ── Connection retry tests ──
@@ -977,5 +1293,324 @@ mod tests {
             elapsed.as_secs() < 6,
             "Should respect timeout deadline; took {elapsed:?}"
         );
+    }
+
+    // ── Diagnostic connections ──
+
+    mod diagnostic {
+        use super::*;
+        use crate::connection::connect_stage::{self as stage, tests::StageLog};
+        use std::future::Future;
+
+        /// Runs `attempt` on a current-thread runtime, as connection
+        /// diagnostics do, recording its connect stages.
+        fn observe<F: Future>(attempt: impl FnOnce() -> F) -> (F::Output, StageLog) {
+            let log = StageLog::default();
+            let output = tracing::subscriber::with_default(log.clone(), || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(attempt())
+            });
+            (output, log)
+        }
+
+        fn context() -> ClientContext {
+            let mut context = ClientContext {
+                connect_timeout: 2,
+                login_timeout: Some(2),
+                connect_retry_count: 0,
+                ssrp_timeout_ms: 300,
+                // These tests follow the sequential connect, one stage per
+                // address; MultiSubnetFailover is on by default otherwise.
+                multi_subnet_failover: Some(false),
+                ..Default::default()
+            };
+            context.encryption_options.mode = crate::core::EncryptionSetting::PreferOff;
+            context
+        }
+
+        fn diagnose(
+            datasource: &str,
+            stop_after: Option<DiagnosticStop>,
+        ) -> (TdsResult<Option<TdsClient>>, StageLog) {
+            diagnose_with(context(), datasource, stop_after)
+        }
+
+        fn diagnose_with(
+            context: ClientContext,
+            datasource: &str,
+            stop_after: Option<DiagnosticStop>,
+        ) -> (TdsResult<Option<TdsClient>>, StageLog) {
+            observe(|| async move {
+                TdsConnectionProvider::new()
+                    .diagnose_client(context, datasource, stop_after)
+                    .await
+            })
+        }
+
+        fn stopped(result: &TdsResult<Option<TdsClient>>) -> bool {
+            matches!(result, Ok(None))
+        }
+
+        /// Accepts connections on 127.0.0.1 and closes each at once.
+        fn closing_listener() -> (std::net::TcpListener, u16) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            (listener, port)
+        }
+
+        fn accepted(listener: &std::net::TcpListener) -> usize {
+            std::iter::from_fn(|| listener.accept().ok()).count()
+        }
+
+        #[test]
+        fn a_resolution_stop_connects_to_nothing() {
+            let (listener, port) = closing_listener();
+            let (result, log) = diagnose(
+                &format!("tcp:127.0.0.1,{port}"),
+                Some(DiagnosticStop::Resolution),
+            );
+            assert!(stopped(&result));
+            let dns = log.named(stage::DNS);
+            assert_eq!(dns.len(), 1);
+            assert_eq!(dns[0].field(stage::HOST), Some("127.0.0.1"));
+            assert_eq!(dns[0].field(stage::ADDRESSES), Some("127.0.0.1"));
+            assert_eq!(dns[0].field(stage::OK), Some("true"));
+            assert!(log.named(stage::TCP).is_empty(), "{:#?}", log.stages());
+            assert_eq!(accepted(&listener), 0);
+        }
+
+        #[test]
+        fn a_transport_stop_closes_the_connection_before_prelogin() {
+            let (listener, port) = closing_listener();
+            let (result, log) = diagnose(
+                &format!("tcp:127.0.0.1,{port}"),
+                Some(DiagnosticStop::Transport),
+            );
+            assert!(stopped(&result));
+            let tcp = log.named(stage::TCP);
+            assert_eq!(tcp.len(), 1, "{:#?}", log.stages());
+            assert_eq!(tcp[0].field(stage::ADDRESS), Some("127.0.0.1"));
+            assert_eq!(tcp[0].field(stage::PORT), Some(port.to_string().as_str()));
+            assert_eq!(tcp[0].field(stage::OK), Some("true"));
+            assert!(log.named(stage::PRELOGIN).is_empty(), "{:#?}", log.stages());
+            assert_eq!(accepted(&listener), 1);
+        }
+
+        /// Without a stop, a server that closes the connection fails the
+        /// pre-login, which records that it failed and with what.
+        #[test]
+        fn a_failed_stage_records_ok_false_and_its_error() {
+            let (listener, port) = closing_listener();
+            listener.set_nonblocking(false).unwrap();
+            let server = std::thread::spawn(move || drop(listener.accept()));
+            let (result, log) = diagnose(&format!("tcp:127.0.0.1,{port}"), None);
+            server.join().unwrap();
+            assert!(result.is_err());
+            let prelogin = log.named(stage::PRELOGIN);
+            assert_eq!(prelogin.len(), 1, "{:#?}", log.stages());
+            assert_eq!(prelogin[0].field(stage::OK), Some("false"));
+            assert!(prelogin[0].field(stage::ERROR).is_some());
+            assert!(log.named(stage::LOGIN).is_empty());
+            assert!(log.stages().iter().all(|s| s.closed));
+        }
+
+        /// A server that never answers: the time limit drops the pre-login,
+        /// which closes without `ok`, abandoned rather than failed.
+        #[test]
+        fn a_stage_the_time_limit_drops_is_abandoned_not_failed() {
+            let (_listener, port) = closing_listener();
+            let (result, log) = diagnose(&format!("tcp:127.0.0.1,{port}"), None);
+            assert!(matches!(result, Err(Error::TimeoutError(_))));
+            let prelogin = log.named(stage::PRELOGIN);
+            assert_eq!(prelogin.len(), 1, "{:#?}", log.stages());
+            assert!(prelogin[0].closed);
+            assert_eq!(prelogin[0].field(stage::OK), None, "{prelogin:#?}");
+        }
+
+        /// A port nothing listens on: the TCP stage records the refusal.
+        #[test]
+        fn a_refused_connect_records_what_the_operating_system_said() {
+            let (listener, port) = closing_listener();
+            drop(listener);
+            // Windows retries a refused connect for about two seconds.
+            let mut patient = context();
+            patient.connect_timeout = 10;
+            patient.login_timeout = Some(10);
+            let (result, log) = diagnose_with(patient, &format!("tcp:127.0.0.1,{port}"), None);
+            assert!(result.is_err());
+            let tcp = &log.named(stage::TCP)[0];
+            assert_eq!(tcp.field(stage::OK), Some("false"));
+            assert_eq!(tcp.field(stage::IO_KIND), Some("ConnectionRefused"));
+            assert!(tcp.field(stage::OS_ERROR).is_some());
+            assert!(tcp.field(stage::TIMED_OUT).is_none());
+        }
+
+        /// Every address after the one connected to is tried too, each in its
+        /// own `tcp` stage, while the connection goes on; a normal connection
+        /// tries none of them.
+        #[test]
+        fn the_addresses_after_the_one_used_are_tried_in_their_own_stages() {
+            let resolved: Vec<std::net::SocketAddr> =
+                std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))
+                    .unwrap()
+                    .collect();
+            let listener = std::net::TcpListener::bind((resolved[0].ip(), 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut listeners = vec![listener];
+            for address in &resolved[1..] {
+                if let Ok(listener) = std::net::TcpListener::bind((address.ip(), port)) {
+                    listeners.push(listener);
+                }
+            }
+            if resolved.len() < 2 || listeners.len() < 2 {
+                // This computer gives localhost one address: nothing to try.
+                return;
+            }
+            let (result, log) = diagnose(
+                &format!("tcp:localhost,{port}"),
+                Some(DiagnosticStop::Transport),
+            );
+            assert!(stopped(&result));
+            let tcp = log.named(stage::TCP);
+            assert_eq!(tcp.len(), resolved.len(), "{:#?}", log.stages());
+            for attempt in &tcp {
+                assert_eq!(attempt.field(stage::OK), Some("true"), "{attempt:#?}");
+                assert!(attempt.closed, "waited for: {attempt:#?}");
+            }
+
+            let (result, log) = observe(|| async move {
+                TdsConnectionProvider::new()
+                    .create_client(context(), &format!("tcp:localhost,{port}"), None)
+                    .await
+            });
+            assert!(result.is_err());
+            assert_eq!(log.named(stage::TCP).len(), 1, "{:#?}", log.stages());
+        }
+
+        /// The diagnostic lookup asks SQL Server Browser past the instance
+        /// cache, and records why it failed; a normal connection
+        /// fails with the same message as before.
+        #[test]
+        fn the_instance_lookup_is_recorded_and_its_message_kept() {
+            let instance = "NoSuchDiagnoseInstance";
+            InstanceCache::global()
+                .insert("127.0.0.1", instance, Some(1), None)
+                .unwrap();
+            let datasource = format!("tcp:127.0.0.1\\{instance}");
+            let (result, log) = diagnose(&datasource, Some(DiagnosticStop::Resolution));
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("the lookup cannot succeed: {:#?}", log.stages()),
+            };
+            let lookup = log.named(stage::INSTANCE_LOOKUP);
+            assert_eq!(lookup.len(), 1, "{:#?}", log.stages());
+            assert_eq!(lookup[0].field(stage::SERVER), Some("127.0.0.1"));
+            assert_eq!(lookup[0].field(stage::INSTANCE), Some(instance));
+            assert_eq!(lookup[0].field(stage::ADDRESSES), Some("127.0.0.1"));
+            assert_eq!(lookup[0].field(stage::OK), Some("false"));
+            assert!(lookup[0].field(stage::RESULT).is_some(), "{lookup:#?}");
+            assert!(
+                error.to_string().contains(&format!(
+                    "Error Locating Server/Instance Specified [127.0.0.1\\{instance}]. \
+                     Ensure the instance name is correct and SQL Server Browser service \
+                     is running on the host. ("
+                )),
+                "{error}"
+            );
+        }
+
+        /// A local named instance without a protocol prefix is tried over
+        /// shared memory first, as the client does: a resolution stop comes
+        /// before shared memory is opened and asks no Browser, and SQL Server
+        /// Browser is asked only once shared memory has failed.
+        #[cfg(windows)]
+        #[test]
+        fn a_local_named_instance_tries_shared_memory_before_the_browser() {
+            let datasource = r".\NoSuchDiagnoseInstance";
+            let (result, log) = diagnose(datasource, Some(DiagnosticStop::Resolution));
+            assert!(stopped(&result), "{:#?}", log.stages());
+            assert!(log.stages().is_empty(), "{:#?}", log.stages());
+
+            for stop_after in [Some(DiagnosticStop::Transport), None] {
+                let (result, log) = diagnose(datasource, stop_after);
+                assert!(result.is_err(), "{stop_after:?}: {:#?}", log.stages());
+                let stages = log.stages();
+                let shared_memory = stages
+                    .iter()
+                    .position(|s| {
+                        s.name == stage::PIPE
+                            && s.field(stage::KIND) == Some(stage::KIND_SHARED_MEMORY)
+                    })
+                    .unwrap_or_else(|| panic!("{stop_after:?}: {stages:#?}"));
+                assert_eq!(
+                    stages[shared_memory].field(stage::OK),
+                    Some("false"),
+                    "{stop_after:?}: {stages:#?}"
+                );
+                let lookup = stages
+                    .iter()
+                    .position(|s| s.name == stage::INSTANCE_LOOKUP)
+                    .unwrap_or_else(|| panic!("{stop_after:?}: {stages:#?}"));
+                assert!(shared_memory < lookup, "{stop_after:?}: {stages:#?}");
+                assert_eq!(
+                    stages[lookup].field(stage::INSTANCE),
+                    Some("NoSuchDiagnoseInstance")
+                );
+            }
+        }
+
+        /// A pipe stops before it is opened, and records how its opening
+        /// failed.
+        #[cfg(windows)]
+        #[test]
+        fn a_pipe_is_a_stage_of_its_own() {
+            let pipe = r"\\.\pipe\NoSuchDiagnosePipe\sql\query";
+            let (result, log) = diagnose(&format!("np:{pipe}"), Some(DiagnosticStop::Resolution));
+            assert!(stopped(&result));
+            assert!(log.stages().is_empty(), "{:#?}", log.stages());
+
+            let (result, log) = diagnose(&format!("np:{pipe}"), None);
+            assert!(result.is_err());
+            let opened = log.named(stage::PIPE);
+            assert_eq!(opened.len(), 1, "{:#?}", log.stages());
+            assert_eq!(opened[0].field(stage::KIND), Some(stage::KIND_NAMED_PIPE));
+            assert_eq!(opened[0].field(stage::PIPE_PATH), Some(pipe));
+            assert_eq!(opened[0].field(stage::OK), Some("false"));
+            assert_eq!(opened[0].field(stage::OS_ERROR), Some("2"));
+
+            let (result, log) = diagnose("lpc:.", Some(DiagnosticStop::Resolution));
+            assert!(stopped(&result));
+            assert!(log.stages().is_empty(), "{:#?}", log.stages());
+        }
+
+        /// A normal connection is not stopped and tries no other address; a
+        /// diagnosis stops only where it is asked to.
+        #[test]
+        fn a_normal_connection_is_not_diagnosed() {
+            let (_listener, port) = closing_listener();
+            let (result, log) = observe(|| async move {
+                TdsConnectionProvider::new()
+                    .create_client(context(), &format!("tcp:127.0.0.1,{port}"), None)
+                    .await
+            });
+            assert!(result.is_err());
+            assert_eq!(log.named(stage::TCP).len(), 1);
+            assert_eq!(log.named(stage::PRELOGIN).len(), 1);
+
+            let diagnosis = Diagnosis::new(Some(DiagnosticStop::Resolution));
+            assert!(diagnosis.check_stop(DiagnosticStop::Transport).is_ok());
+            assert!(!diagnosis.stopped());
+            assert!(diagnosis.check_stop(DiagnosticStop::Resolution).is_err());
+            assert!(diagnosis.stopped());
+            assert!(
+                Diagnosis::new(None)
+                    .check_stop(DiagnosticStop::Transport)
+                    .is_ok()
+            );
+        }
     }
 }

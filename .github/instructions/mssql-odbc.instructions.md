@@ -293,9 +293,26 @@ on the `master` branch.
   lands after its last read latches the client's token, so the call itself
   abandons the pending response and reports HY008 rather than leaking the
   cancellation into a later call.
-  Publish the operation's reserved trace execution under the same cancellation
-  lock as `active`, before token publication. SQLCancel binds its trace scope
+  Publish the operation's reserved trace execution under the cancellation
+  lock before setting the atomic active bit and publishing its token. SQLCancel binds its trace scope
   when it selects the target under that lock, not from an earlier FFI snapshot.
+  Uncontended, untraced calls may admit and complete through the atomic
+  operation state. Cancellers and queued operations must set its notification
+  bit under the cancellation mutex before checking activity; completion then
+  takes the mutex and wakes waiters instead of racing past their registration.
+  Keep that bit set across cancellation cleanup and queued-operation handoff.
+  Notify the completion condition variable only when a canceller or queued
+  operation can be waiting. Track both under the cancellation mutex: the
+  canceller count alone cannot prevent missed operation wakeups. Unconditional
+  notifications issue a Linux futex wake even on uncontended per-cell calls
+  (AB#49498).
+  Keep cancellation-timeout publication off per-cell admission. The connection
+  attribute setter updates existing execution budgets under the DBC and
+  cancellation locks, without taking STMT state locks. Configure the budget
+  before deriving new execution children and refresh it before signalling.
+  Read the connection's atomic timeout only after taking the cancellation lock,
+  so a waiting publisher cannot overwrite a newer budget with an older snapshot.
+  Timeout changes must not restart an already-latched settlement deadline.
 
 ### 7.1. Handle hierarchy and locking
 
@@ -368,6 +385,11 @@ on; these guarantees were verified against msodbcsql's behavior.
 
 ### 7.3. Prepared parameter definitions
 
+- `LongAsMax` defaults off. Snapshot it with the execution's bindings so
+  materialized, streamed, and buffered DAE parameters agree. Preserve cached
+  declarations when the connection option changes: msodbcsql changes subsequent
+  wire values but does not invalidate the prepared handle. A new prepare selects
+  the new declaration. Keep DAE payloads PLP-framed even for legacy declarations.
 - Compare SQL definitions during IPD mutation, not APD addresses or conversion
   metadata on every execute. Preserve plans for equivalent `SQLBindParameter`
   calls and APD-only changes. `DESC_CONSISTENT` in msodbcsql controls validation,
@@ -528,9 +550,9 @@ on; these guarantees were verified against msodbcsql's behavior.
     cannot detect that.
   - Opt into `/SharedDbc` with `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
     only when the body changes no connection attributes or transactions, gives
-    temporary objects per-worker names, and is safe to rerun after a busy retry.
-    Do not opt in until CI runs that mode
-    nightly only (AB#49263).
+    temporary objects per-worker names (including `#temp` tables and
+    procedures, which workers on one DBC share), and is safe to rerun after a
+    busy retry. PR and stress runs execute the mode.
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
     connect races) go under `tests/e2e/tests/multithreaded_tests/`.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
@@ -584,8 +606,22 @@ For ODBC hot paths:
     offsets with wire-byte offsets.
   - Release the connection's active-statement claim only after its wire data is
     drained; completed empty results may release it during execute.
+    Keep the client in one heap allocation across wire leases: checkout and
+    restore must not copy the large client through every rowset's async state.
   - Bound fetch reuses descriptor snapshots and conversion storage across rows;
     do not add avoidable per-row allocation or metadata cloning.
+    Across fetch calls, retain only the empty binding vector's allocation and
+    rebuild its contents under the ARD lock. Descriptor writes, reassociation,
+    and unbinding must remain visible on the next fetch. Only the statement's
+    own implicit ARD can bypass the global descriptor-liveness lookup.
+    Keep `RowIssue` and `RowOutcome` within two bytes: converters return the
+    compact `ConvError`, mapped to a canonical diagnostic only on failure.
+    Carrying a full diagnostic enlarges every successful column conversion
+    just to preserve a rare error message (AB#49498).
+  - Client encoding is fixed at DBC allocation and inherited by each statement.
+    Fetch uses that statement value instead of locking the DBC to refresh it on
+    every rowset. The independently mutable warning setting still follows the
+    connection setter's statement fan-out.
   - Parameter-array rowsets remain visible in parameter-set order through
     fetch and `SQLMoreResults`; defer final processed/status reporting until
     each set completes, and drain unread results on cursor close without

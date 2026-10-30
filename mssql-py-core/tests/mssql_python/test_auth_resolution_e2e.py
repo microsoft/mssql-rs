@@ -831,7 +831,6 @@ class TestBulkcopyContextBuilding:
         _ensure_table(cur)
 
         captured = {}
-        original_pycore = __import__("mssql_py_core")
 
         class SpyPyCoreConnection:
             def __init__(self, ctx, **kwargs):
@@ -841,7 +840,11 @@ class TestBulkcopyContextBuilding:
             def cursor(self):
                 pass
 
-        with patch.object(original_pycore, "PyCoreConnection", SpyPyCoreConnection):
+        # Older drivers use the package export; newer ones import the native module.
+        with (
+            patch("mssql_py_core.mssql_py_core.PyCoreConnection", SpyPyCoreConnection),
+            patch("mssql_py_core.PyCoreConnection", SpyPyCoreConnection, create=True),
+        ):
             with pytest.raises(RuntimeError, match="Spy: captured context"):
                 cur.bulkcopy(_BULKCOPY_TABLE, [(1, "test")], timeout=30)
 
@@ -877,8 +880,6 @@ class TestBulkcopyContextBuilding:
         # Mock AADAuth.get_raw_token to return a fake token
         with patch("mssql_python.auth.AADAuth.get_raw_token", return_value="fake.jwt.token"):
             captured = {}
-            original_pycore = __import__("mssql_py_core")
-            OrigPyCoreConn = original_pycore.PyCoreConnection
 
             class SpyPyCoreConnection:
                 def __init__(self, ctx, **kwargs):
@@ -889,7 +890,10 @@ class TestBulkcopyContextBuilding:
                 def cursor(self):
                     pass
 
-            with patch.object(original_pycore, "PyCoreConnection", SpyPyCoreConnection):
+            with (
+                patch("mssql_py_core.mssql_py_core.PyCoreConnection", SpyPyCoreConnection),
+                patch("mssql_py_core.PyCoreConnection", SpyPyCoreConnection, create=True),
+            ):
                 with pytest.raises(RuntimeError, match="Spy: captured context"):
                     cur.bulkcopy(_BULKCOPY_TABLE, [(1, "test")], timeout=30)
 
@@ -928,8 +932,6 @@ class TestBulkcopyTokenAcquisition:
         conn._auth_type = auth_type
 
         with patch("mssql_python.auth.AADAuth.get_raw_token", return_value="fake.jwt") as mock_get:
-            original_pycore = __import__("mssql_py_core")
-
             class SpyPyCoreConnection:
                 def __init__(self, ctx, **kwargs):
                     raise RuntimeError("Spy stop")
@@ -937,7 +939,10 @@ class TestBulkcopyTokenAcquisition:
                 def cursor(self):
                     pass
 
-            with patch.object(original_pycore, "PyCoreConnection", SpyPyCoreConnection):
+            with (
+                patch("mssql_py_core.mssql_py_core.PyCoreConnection", SpyPyCoreConnection),
+                patch("mssql_py_core.PyCoreConnection", SpyPyCoreConnection, create=True),
+            ):
                 with pytest.raises(RuntimeError, match="Spy stop"):
                     cur.bulkcopy(_BULKCOPY_TABLE, [(1, "test")], timeout=30)
 

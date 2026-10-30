@@ -86,8 +86,10 @@
 #include "odbc_concurrent_test.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
+#include <random>
 #include <vector>
 #include <string>
 
@@ -155,6 +157,77 @@ constexpr SQLINTEGER kMarsEnabledAttr = 1224;
 // faults the process. This driver must refuse it cleanly instead. The get path
 // is safe on both and answers HY010 there, so it is asserted on both drivers.
 constexpr SQLINTEGER kCekeystoreDataAttr = 1252;
+
+SQLRETURN SetAccessMode(SQLHDBC dbc, SQLUINTEGER mode) {
+    return SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE,
+                             reinterpret_cast<SQLPOINTER>(
+                                 static_cast<uintptr_t>(mode)), 0);
+}
+
+// Reads into an SQLULEN: before connect the Windows Driver Manager answers
+// itself and writes 8 bytes once the application has set the attribute.
+SQLUINTEGER GetAccessMode(SQLHDBC dbc) {
+    SQLULEN mode = 0xdeadbeef;
+    EXPECT_SQL_OK(SQLGetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, &mode,
+                                    sizeof(mode), nullptr),
+                  SQL_HANDLE_DBC, dbc);
+    return static_cast<SQLUINTEGER>(mode);
+}
+
+std::string GetDataSourceReadOnly(SQLHDBC dbc) {
+    SQLTCHAR value[2] = {};
+    SQLSMALLINT length = -1;
+    EXPECT_SQL_OK(SQLGetInfo(dbc, SQL_DATA_SOURCE_READ_ONLY, value,
+                             sizeof(value), &length),
+                  SQL_HANDLE_DBC, dbc);
+    EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLTCHAR)), length);
+    return ODBCTestUtils::ToNarrow(SqlTString(value));
+}
+
+SQLRETURN ExecAccessModeSql(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
+    return SQLExecDirect(stmt, text.data(), SQL_NTS);
+}
+
+struct AccessModeConnection {
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+
+    ~AccessModeConnection() {
+        if (stmt != SQL_NULL_HSTMT) SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        if (dbc != SQL_NULL_HDBC) {
+            SQLDisconnect(dbc);
+            SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+        }
+    }
+};
+
+// Only a successfully created, randomly named database is ever dropped.
+struct AccessModeDatabase {
+    SQLHSTMT admin;
+    std::string name;
+    bool created = false;
+
+    explicit AccessModeDatabase(SQLHSTMT stmt) : admin(stmt) {
+        std::random_device rd;
+        std::mt19937_64 generator(rd());
+        char suffix[17] = {};
+        std::snprintf(suffix, sizeof(suffix), "%016llx",
+                      static_cast<unsigned long long>(generator()));
+        name = "odbc_access_mode_" + std::string(suffix);
+    }
+
+    ~AccessModeDatabase() {
+        if (!created) return;
+        SQLFreeStmt(admin, SQL_CLOSE);
+        EXPECT_SQL_OK(ExecAccessModeSql(admin, "USE [master]"),
+                      SQL_HANDLE_STMT, admin);
+        SQLFreeStmt(admin, SQL_CLOSE);
+        EXPECT_SQL_OK(ExecAccessModeSql(admin, "DROP DATABASE [" + name + "]"),
+                      SQL_HANDLE_STMT, admin);
+        SQLFreeStmt(admin, SQL_CLOSE);
+    }
+};
 
 } // namespace
 
@@ -294,7 +367,231 @@ protected:
         SQLCloseCursor(stmt_);
         return rows;
     }
+
+    void CheckReadOnlyDatabaseAndRawUse(bool streaming);
+
+    void CheckAccessModeDuringStream(bool infoFirst, const std::string& token) {
+        ASSERT_SQL_OK(ExecAccessModeSql(stmt_, "USE [tempdb]"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SetAccessMode(dbc_, SQL_MODE_READ_ONLY),
+                      SQL_HANDLE_DBC, dbc_);
+        ASSERT_SQL_OK(ExecAccessModeSql(
+                          stmt_, "WITH access_rows(n) AS (SELECT 1 UNION ALL "
+                                 "SELECT n + 1 FROM access_rows WHERE n < 256) "
+                                 "SELECT n, '" + token +
+                                     "', REPLICATE(CAST('x' AS varchar(max)), 8000) "
+                                     "FROM access_rows OPTION (MAXRECURSION 0)"),
+                      SQL_HANDLE_STMT, stmt_);
+        if (infoFirst) {
+            EXPECT_EQ("N", GetDataSourceReadOnly(dbc_));
+            EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(dbc_));
+        } else {
+            EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(dbc_));
+            EXPECT_EQ("N", GetDataSourceReadOnly(dbc_));
+        }
+        for (SQLINTEGER expected = 1; expected <= 256; ++expected) {
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            SQLINTEGER row = 0;
+            SQLLEN length = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &row,
+                                     sizeof(row), &length),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(expected, row);
+            SQLCHAR value[128] = {};
+            ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, value,
+                                     sizeof(value), &length),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(token, reinterpret_cast<const char*>(value));
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
 };
+
+ODBC_TEST_F(AttributesTest, AccessModeReadOnlyHintAllowsDml) {
+    ASSERT_SQL_OK(SetAccessMode(dbc_, SQL_MODE_READ_ONLY),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(dbc_));
+    EXPECT_EQ("N", GetDataSourceReadOnly(dbc_));
+
+    const std::string token = WorkerToken("access-mode");
+    ASSERT_SQL_OK(ExecAccessModeSql(
+                      stmt_, "SET NOCOUNT ON; CREATE TABLE #access_mode_hint "
+                             "(value varchar(128)); INSERT INTO #access_mode_hint "
+                             "VALUES ('before'); UPDATE #access_mode_hint SET value = '" +
+                                 token + "'"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(token, ScalarString("SELECT value FROM #access_mode_hint"));
+    ASSERT_SQL_OK(ExecAccessModeSql(
+                      stmt_, "DELETE FROM #access_mode_hint; DROP TABLE #access_mode_hint"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SetAccessMode(dbc_, SQL_MODE_READ_WRITE),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(SQL_MODE_READ_WRITE, GetAccessMode(dbc_));
+    EXPECT_EQ("N", GetDataSourceReadOnly(dbc_));
+}
+
+ODBC_TEST_F(AttributesTest, AccessModeInvalidValuePreservesMode) {
+    ASSERT_SQL_OK(SetAccessMode(dbc_, SQL_MODE_READ_ONLY),
+                  SQL_HANDLE_DBC, dbc_);
+    std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+    EXPECT_EQ(SQL_ERROR, SetAccessMode(dbc_, 2));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY024");
+    EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(dbc_));
+}
+
+// Benefits-from-mock-tds: pin the secondary metadata connection and absence of
+// metadata SQL on the occupied session; live E2E proves uninterrupted fetching.
+ODBC_TEST_F(AttributesTest, AccessModeColdGetPreservesStreamingCursor) {
+    // SpawnConnection omits the session's trust settings (deviation 31).
+    SKIP_IF_COMPARING_MSODBCSQL();
+    CheckAccessModeDuringStream(false, WorkerToken("access-attr"));
+}
+
+// Benefits-from-mock-tds: pin that SQLGetInfo and SQLGetConnectAttr share one
+// database-read-only lookup rather than opening two secondary connections.
+ODBC_TEST_F(AttributesTest, AccessModeColdGetInfoPreservesStreamingCursor) {
+    // SpawnConnection omits the session's trust settings (deviation 31).
+    SKIP_IF_COMPARING_MSODBCSQL();
+    CheckAccessModeDuringStream(true, WorkerToken("access-info"));
+}
+
+// Connect/disconnect scenarios deliberately stay out of ODBC_TEST_F modes.
+TEST_F(AttributesTest, AccessModePreConnectRoundTripsAndSurvivesConnect) {
+    for (SQLUINTEGER mode : {SQL_MODE_READ_WRITE, SQL_MODE_READ_ONLY}) {
+        SCOPED_TRACE(mode);
+        AccessModeConnection connection;
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &connection.dbc),
+                      SQL_HANDLE_ENV, env_);
+        EXPECT_EQ(SQL_MODE_READ_WRITE, GetAccessMode(connection.dbc));
+        ASSERT_SQL_OK(SetAccessMode(connection.dbc, mode),
+                      SQL_HANDLE_DBC, connection.dbc);
+        EXPECT_EQ(mode, GetAccessMode(connection.dbc));
+        SqlTString connstr = ODBCTestUtils::BuildConnectionString();
+        ASSERT_SQL_OK(SQLDriverConnect(connection.dbc, nullptr, connstr.data(),
+                                       SQL_NTS, nullptr, 0, nullptr,
+                                       SQL_DRIVER_NOPROMPT),
+                      SQL_HANDLE_DBC, connection.dbc);
+        EXPECT_EQ(mode, GetAccessMode(connection.dbc));
+        EXPECT_EQ("N", GetDataSourceReadOnly(connection.dbc));
+    }
+}
+
+// Creates only a private database, and skips when provisioning is unavailable.
+// Connection and database guards unwind on fatal assertions as well as skips.
+void AttributesTest::CheckReadOnlyDatabaseAndRawUse(bool streaming) {
+    const auto& config = ODBCTestConfig::Instance();
+    if (config.HasConnStr() || config.HasDSN()) {
+        GTEST_SKIP() << "Read-only login probe needs generated DSN-less settings";
+    }
+    ASSERT_SQL_OK(ExecAccessModeSql(stmt_, "USE [master]"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    AccessModeDatabase database(stmt_);
+    SQLRETURN rc = ExecAccessModeSql(stmt_, "CREATE DATABASE [" + database.name + "]");
+    if (!SQL_SUCCEEDED(rc)) {
+        const std::string reason = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+        GTEST_SKIP() << "CREATE DATABASE unavailable: " << reason;
+    }
+    database.created = true;
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    rc = ExecAccessModeSql(stmt_, "ALTER DATABASE [" + database.name + "] SET READ_ONLY");
+    if (!SQL_SUCCEEDED(rc)) {
+        const std::string reason = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+        GTEST_SKIP() << "Private READ_ONLY database unavailable: " << reason;
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    std::string base = ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString());
+    const size_t start = base.find("Database=");
+    ASSERT_NE(std::string::npos, start);
+    const size_t end = base.find(';', start);
+    ASSERT_NE(std::string::npos, end);
+    base.replace(start, end - start, "Database=" + database.name);
+
+    for (SQLUINTEGER requested : {SQL_MODE_READ_WRITE, SQL_MODE_READ_ONLY}) {
+        SCOPED_TRACE(requested);
+        AccessModeConnection connection;
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &connection.dbc),
+                      SQL_HANDLE_ENV, env_);
+        ASSERT_SQL_OK(SetAccessMode(connection.dbc, requested),
+                      SQL_HANDLE_DBC, connection.dbc);
+        EXPECT_EQ(requested, GetAccessMode(connection.dbc));
+        SqlTString connstr = ODBCTestUtils::ToSqlTStr(base);
+        ASSERT_SQL_OK(SQLDriverConnect(connection.dbc, nullptr, connstr.data(),
+                                       SQL_NTS, nullptr, 0, nullptr,
+                                       SQL_DRIVER_NOPROMPT),
+                      SQL_HANDLE_DBC, connection.dbc);
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, connection.dbc, &connection.stmt),
+                      SQL_HANDLE_DBC, connection.dbc);
+        if (streaming) {
+            ASSERT_SQL_OK(ExecAccessModeSql(
+                              connection.stmt,
+                              "WITH access_rows(n) AS (SELECT 1 UNION ALL "
+                              "SELECT n + 1 FROM access_rows WHERE n < 256) "
+                              "SELECT n, REPLICATE(CAST('x' AS varchar(max)), 8000) "
+                              "FROM access_rows OPTION (MAXRECURSION 0)"),
+                          SQL_HANDLE_STMT, connection.stmt);
+        }
+        if (requested == SQL_MODE_READ_WRITE) {
+            EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(connection.dbc));
+            EXPECT_EQ("Y", GetDataSourceReadOnly(connection.dbc));
+        } else {
+            EXPECT_EQ("Y", GetDataSourceReadOnly(connection.dbc));
+            EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(connection.dbc));
+        }
+        if (streaming) {
+            for (SQLINTEGER expected = 1; expected <= 256; ++expected) {
+                ASSERT_EQ(SQL_SUCCESS, SQLFetch(connection.stmt));
+                SQLINTEGER row = 0;
+                SQLLEN length = 0;
+                ASSERT_SQL_OK(SQLGetData(connection.stmt, 1, SQL_C_SLONG, &row,
+                                         sizeof(row), &length),
+                              SQL_HANDLE_STMT, connection.stmt);
+                EXPECT_EQ(expected, row);
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(connection.stmt));
+            ASSERT_SQL_OK(SQLFreeStmt(connection.stmt, SQL_CLOSE),
+                          SQL_HANDLE_STMT, connection.stmt);
+        }
+        EXPECT_EQ(SQL_ERROR, SetAccessMode(connection.dbc, SQL_MODE_READ_WRITE));
+        EXPECT_SQLSTATE(SQL_HANDLE_DBC, connection.dbc, "HY024");
+        EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(connection.dbc));
+
+        ASSERT_SQL_OK(ExecAccessModeSql(connection.stmt, "USE [master]"),
+                      SQL_HANDLE_STMT, connection.stmt);
+        ASSERT_SQL_OK(SQLFreeStmt(connection.stmt, SQL_CLOSE),
+                      SQL_HANDLE_STMT, connection.stmt);
+        EXPECT_EQ(requested, GetAccessMode(connection.dbc));
+        EXPECT_EQ("N", GetDataSourceReadOnly(connection.dbc));
+
+        ASSERT_SQL_OK(ExecAccessModeSql(connection.stmt, "USE [" + database.name + "]"),
+                      SQL_HANDLE_STMT, connection.stmt);
+        ASSERT_SQL_OK(SQLFreeStmt(connection.stmt, SQL_CLOSE),
+                      SQL_HANDLE_STMT, connection.stmt);
+        EXPECT_EQ("Y", GetDataSourceReadOnly(connection.dbc));
+        EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(connection.dbc));
+        ASSERT_SQL_OK(SetAccessMode(connection.dbc, SQL_MODE_READ_ONLY),
+                      SQL_HANDLE_DBC, connection.dbc);
+    }
+}
+
+TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseAndRawUse) {
+    CheckReadOnlyDatabaseAndRawUse(false);
+}
+
+// Benefits-from-mock-tds: verify the cold secondary lookup targets the read-only
+// catalog without sending metadata SQL on the original streaming session.
+TEST_F(AttributesTest, AccessModeTracksReadOnlyDatabaseDuringStream) {
+    // Keep idle-session and USE coverage on both legs; isolate deviation 31.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    CheckReadOnlyDatabaseAndRawUse(true);
+}
 
 TEST_F(AttributesTest, ClientConnectionIdIsAStringAndStableWithinTheConnection) {
     constexpr SQLINTEGER clientConnectionId = 1233;

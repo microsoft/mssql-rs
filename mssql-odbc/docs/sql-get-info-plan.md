@@ -87,6 +87,41 @@ stay `0` through `SQLGetConnectAttr`/`SQLGetInfo` while disconnected, and only
 `ClientContext` (which cannot hold a literal `0`) resolves to its own default
 at connect time.
 
+## Database read-only state
+
+`SQL_DATA_SOURCE_READ_ONLY` is database-scoped, not a constant capability:
+it returns `"Y"` for an actually read-only current database and `"N"` for
+a writable one, independently of `SQL_ATTR_ACCESS_MODE`. A read-only access
+hint on a writable database still reports `"N"` and does not prohibit DML.
+Conversely, requesting read/write before login does not reject a read-only
+database: its connected access-mode getter reports read-only and its
+information value is `"Y"`.
+
+Source reference: `sqlcinfo.cpp`, `SQLGetInfoW` / `ExecOption`'s database
+read-only branch, together with `sqlcmisc.cpp`'s `IsDataBaseReadOnly`
+path in the connection-attribute setter/getter. Runtime evidence for this
+contract is retail **18.7.1.1**, `SQL_DRIVER_VER=18.07.0001`, against SQL
+Server **16.0.4305.5**, separately from the 18.6.2.1 information-type sweep
+above.
+
+The implementation uses a scalar `CASE` over
+`DATABASEPROPERTYEX(DB_NAME(), 'Updateability')`, returning `N'Y'` or `N'N'`.
+This matches the measured API results, not a claim of byte-for-byte query
+parity with msodbcsql. Lookup failures propagate; missing, NULL, or invalid
+scalar answers explicitly return `SQL_ERROR` / `HY000`, not a writable default.
+
+The shared database-state cache is keyed by catalog and
+`database_change_count`, invalidated on catalog switches including raw `USE`,
+and cleared on connect, disconnect, and reset. Idle lookups use the original
+session. Cold lookups during a streaming cursor use a secondary context
+without consuming or closing the original result. The access-mode regression
+cases in `tests/e2e/tests/attributes_test.cpp` cover both getter orders with
+an active large result, independence from the hint, and actual read-only state
+across catalog switches. See the [access-mode contract](attributes_plan.md#access-mode-hint-versus-database-state)
+for test names, parity invocation, and safe private-database provisioning
+requirements. The existing fixed `"N"` row in `get_info_test.cpp` assumes
+the suite's usual writable database; it is not the read-only-database contract.
+
 ## Capability ledger
 
 Capability masks describe this driver rather than copying features that only
@@ -128,7 +163,7 @@ a durable owner:
 | Information type | Difference | Owner |
 |---|---|---|
 | `SQL_USER_NAME` while the connection is **busy** and the cached value is not current | Both drivers report `USER_NAME()` and resolve it lazily, caching per database. They differ whenever a refresh is needed while a cursor is streaming — either because nothing has been cached yet, or because the cached entry was invalidated since (a `USE B; SELECT ...` batch applies the ENVCHANGE and then leaves a cursor open, so the entry is keyed to the previous database). msodbcsql spawns a second connection to run the lookup (`RefreshShilohUDTCache`, `sqlccmd.cpp` bug #656241) and reports the current database's principal; this driver reports what it holds — the empty string when nothing was cached, otherwise the previous database's principal — and re-resolves on the next call that finds the connection idle. Neither fails, neither disturbs the cursor, and they agree again once the refresh lands. | AB#48942 decided it; AB#47996 owns residual SQLGetInfo parity and carries the gap once this closes. Spawning an internal connection — a second login, TLS handshake and auth — is out of proportion to the gap; `WorksWithAnOpenCursorAndLeavesItUsable` pins the shared contract that the call still succeeds and leaves the cursor usable. The alias-type lookup (AB#48044) does log in separately while a cursor is open, because a column is usually first described then; `SQL_USER_NAME` stays off that path because a separate session's `USER_NAME()` need not be this session's principal (`EXECUTE AS`, application roles). |
-| `SQL_ATTR_CONNECTION_TIMEOUT` coverage | msodbcsql applies it to every driver-issued round trip (`GetNetIOTimeOut`, `sqlcprot.h:1605`). This driver currently honors it only for its own internal lookups, `SQL_USER_NAME` and alias type names (AB#48044); the other connection-scoped batches (`SQL_ATTR_CURRENT_CATALOG`'s `USE`, the isolation and autocommit SETs) still run unbounded. | AB#47996 owns residual parity. Called out here because `SQL_USER_NAME` is the first information type that can issue a round trip at all, so the attribute's reach became observable with AB#48942. |
+| `SQL_ATTR_CONNECTION_TIMEOUT` coverage | msodbcsql applies it to every driver-issued round trip (`GetNetIOTimeOut`, `sqlcprot.h:1605`). This driver currently honors it only for its own internal lookups, `SQL_USER_NAME`, alias type names (AB#48044), and database updateability (AB#49297); secondary logins share the connection-timeout deadline (deviation 32). The other connection-scoped batches (`SQL_ATTR_CURRENT_CATALOG`'s `USE`, the isolation and autocommit SETs) still run unbounded. | AB#47996 owns residual parity. Called out here because `SQL_USER_NAME` is the first information type that can issue a round trip at all, so the attribute's reach became observable with AB#48942. |
 | `SQL_PARAM_ARRAY_ROW_COUNTS` | This driver reports `SQL_PARC_NO_BATCH`; retail msodbcsql reports `SQL_PARC_BATCH`. | Execution semantics and measurement are recorded in `docs/parameters_plan.md`. |
 | Invalid/reserved ID `65000` | Both driver cores return `HY096`. The Windows Driver Manager instead answers `SQL_SUCCESS` before exposing either driver's result; Unix forwards `HY096`. | Residual validation belongs to AB#47996; the Rust unit test pins the driver core and `ReservedInfoTypeFollowsDriverManagerContract` pins the public surface. |
 | `SQL_MAX_STATEMENT_LEN`, `SQL_MAX_CHAR_LITERAL_LEN`, `SQL_MAX_BINARY_LITERAL_LEN` with an explicit `PacketSize=` over an encrypted connection | Measured against retail msodbcsql18 18.6.2.1: requesting `PacketSize=16384` reports back 16192 (`SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE)` and the derived `128*x` limits both reflect the reduced number), a TLS-driven reduction not visible in the static source reading above. mssql-odbc always reports the requested/configured size, never a negotiated one. | AB#47996 owns residual SQLGetInfo parity; `MaxLengthsUseTheConnectionStringPacketSize` is skipped on the msodbcsql comparison leg (`SKIP_IF_COMPARING_MSODBCSQL`) rather than asserting a value retail doesn't guarantee. |

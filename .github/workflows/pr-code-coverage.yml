@@ -37,6 +37,7 @@ on:
     paths-ignore:
       - 'docs/**'
       - '.github/**'
+      - '**/*.md'
       - 'README.md'
       - 'CHANGELOG.md'
       - 'CONTRIBUTING.md'

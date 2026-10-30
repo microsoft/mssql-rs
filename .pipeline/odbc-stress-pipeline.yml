@@ -1,0 +1,278 @@
+# Scheduled multithreaded stress runs of the mssql-odbc C++ e2e suite (AB#49263).
+#
+# PR validation runs the ODBC_TEST_F concurrent variants once at 2 threads x 1
+# iteration, which catches tests unfit for concurrency but rarely a race. This
+# pipeline reruns only those variants (the <name>_mt ctest entries) at stress
+# size, without retries, so an intermittent failure is reported rather than
+# retried away:
+#
+#   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
+#   weekly  16 x 50, the same modes
+#
+# Legs: Windows x64 (debug driver, Windows Driver Manager, msodbcsql parity leg
+# at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21 (musl), both running the
+# release drops through unixODBC. /SharedStmt is left out on unixODBC because
+# its releases up to 2.3.14 corrupt their own diagnostic list when two threads
+# use one statement (unixODBC #243, fixed on master in ea454e49); see
+# mssql-odbc/tests/e2e/run_e2e.sh.
+#
+# Evidence: Windows hangs and crashes leave minidumps, with the matching driver,
+# test executables and PDBs, in the OdbcMtDumps_Windows artifact; Linux legs run
+# each entry under gdb and print every thread's stack into the test log, from a
+# release driver built with symbols and line tables. Test results are published
+# per leg. A manual run can also enable driver tracing (driverTrace), published
+# as the OdbcDriverTraces_* artifacts. Every leg samples agent load once a
+# second into the OdbcLoad_* artifacts.
+#
+# Plan: mssql-odbc/docs/multithreaded-testing-plan.md, "Stress Profiles". The
+# schedule targets GitHub main; this definition lives only in the mssql-rs
+# project, so the pool names below are that project's. Each job generates its
+# own SQL_PASSWORD (sql-setup-template.yml, test-matrix-odbc-template.yml), so
+# the definition needs no secret variable.
+# The Linux legs run mssql-odbc only; the msodbcsql parity leg is Windows-only.
+name: mssql-odbc multithreaded stress
+trigger: none
+pr: none
+
+schedules:
+# Temporary: the nightly run is there to flush out the obvious races while the
+# converted suites settle. Remove this entry once the bugs it finds are fixed
+# (planned for two to three weeks after it starts); the weekly run and PR
+# validation remain.
+- cron: '0 2 * * 1-6'
+  displayName: Nightly ODBC stress
+  branches:
+    include:
+    - main
+  always: true
+- cron: '0 2 * * 0'
+  displayName: Weekly ODBC stress
+  branches:
+    include:
+    - main
+  always: true
+
+parameters:
+- name: profile
+  displayName: Stress profile (auto takes it from the schedule; a manual run gets nightly)
+  type: string
+  values:
+  - auto
+  - nightly
+  - weekly
+  default: auto
+
+- name: linuxImage
+  displayName: Agent image for x64 Linux jobs
+  type: string
+  default: RUST-AZL3
+
+# Off on scheduled runs: tracing adds per-call work that changes timing, so it
+# can hide a race or fail a timing assertion. Turn it on for a manual rerun of a
+# failure that needs the driver's side. Traces can contain SQL text.
+- name: driverTrace
+  displayName: Driver trace (manual diagnosis only; changes timing)
+  type: boolean
+  default: false
+
+- name: driverTraceLevel
+  displayName: Driver trace filter (MSSQL_TDS_TRACE_LEVEL)
+  type: string
+  default: warn,mssqlodbc=debug
+
+variables:
+  # Same pinned reference driver as validation-pipeline.yml.
+  msodbcsqlVersion: '18.6.2.1'
+  # Resolved when the run starts: the schedule that fired it, or the manual choice.
+  odbcMtProfile: $[ iif(eq('${{ parameters.profile }}', 'auto'), iif(eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'), 'weekly', 'nightly'), '${{ parameters.profile }}') ]
+
+stages:
+- stage: Build_Linux_Drops
+  displayName: Build Linux ODBC drops
+  jobs:
+  - job: Build_Odbc_Linux
+    displayName: Build driver and e2e binaries (glibc, musl)
+    timeoutInMinutes: 90
+    pool:
+      name: RUST-X64-WUS3
+      demands:
+        - imageOverride -equals ${{ parameters.linuxImage }}
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+    - template: templates/cargo-authenticate-template.yml
+      parameters:
+        osType: Linux
+    - task: DockerInstaller@0
+      inputs:
+        dockerVersion: '29.0.0'
+      displayName: Install Docker
+    - template: templates/install-host-dependency.yaml
+      parameters:
+        installDocker: true
+    # As in build-template-container.yml: the build images do not fit the OS
+    # disk alongside each other, so keep Docker and containerd on the work disk.
+    - script: |
+        set -euo pipefail
+        WORK_DISK="$(Agent.WorkFolder)"
+        sudo systemctl stop docker docker.socket containerd || true
+        sudo mkdir -p "$WORK_DISK/.docker-data" /etc/docker "$WORK_DISK/.containerd-data" /etc/containerd
+        echo "{\"data-root\": \"$WORK_DISK/.docker-data\"}" | sudo tee /etc/docker/daemon.json
+        sudo containerd config default \
+          | sed -E "s|root = ['\"]?/var/lib/containerd['\"]?|root = '$WORK_DISK/.containerd-data'|" \
+          | sudo tee /etc/containerd/config.toml > /dev/null
+        sudo systemctl start containerd
+        sudo systemctl start docker
+        df -h "$WORK_DISK"
+      displayName: Relocate Docker storage to work folder disk
+    - template: templates/build-odbc-template.yml
+      parameters:
+        architecture: x64
+        artifactName: 'Odbc_Linux_x64'
+        keepDebugInfo: true
+    - template: templates/build-odbc-alpine-template.yml
+      parameters:
+        architecture: x64
+        artifactName: 'Odbc_Musl_x64'
+        keepDebugInfo: true
+
+- stage: Stress_Linux
+  displayName: Stress Linux (unixODBC)
+  dependsOn: Build_Linux_Drops
+  jobs:
+  - template: templates/test-matrix-odbc-template.yml
+    parameters:
+      poolName: RUST-X64-WUS3
+      poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
+      artifactName: 'Odbc_Linux_x64'
+      nameSuffix: _glibc_stress
+      jobDisplayName: ODBC stress Linux (glibc)
+      mtProfile: $(odbcMtProfile)
+      retries: 0
+      timeoutInMinutes: 120
+      driverTrace: ${{ parameters.driverTrace }}
+      driverTraceLevel: ${{ parameters.driverTraceLevel }}
+      collectLoad: true
+      matrix:
+        Ubuntu24:
+          container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+          entry: odbc-e2e-deb.sh
+  - template: templates/test-matrix-odbc-template.yml
+    parameters:
+      poolName: RUST-X64-WUS3
+      poolImageOverride: imageOverride -equals ${{ parameters.linuxImage }}
+      artifactName: 'Odbc_Musl_x64'
+      nameSuffix: _musl_stress
+      jobDisplayName: ODBC stress Linux (musl)
+      mtProfile: $(odbcMtProfile)
+      retries: 0
+      timeoutInMinutes: 120
+      driverTrace: ${{ parameters.driverTrace }}
+      driverTraceLevel: ${{ parameters.driverTraceLevel }}
+      collectLoad: true
+      matrix:
+        Alpine3_21:
+          container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+          entry: odbc-e2e-alpine.sh
+
+- stage: Stress_Windows
+  displayName: Stress Windows
+  dependsOn: []
+  jobs:
+  - job: Stress_Windows
+    displayName: ODBC stress Windows x64
+    timeoutInMinutes: 120
+    pool:
+      name: RUST-X64-WUS3
+      demands:
+        - imageOverride -equals RUST-W22-SQL25
+    variables:
+      # See https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+    steps:
+    - template: templates/sql-setup-template.yml
+      parameters:
+        buildTarget: Windows
+    - template: templates/cargo-authenticate-template.yml
+      parameters:
+        osType: Windows
+    - template: templates/install-dependencies.yml
+      parameters:
+        osType: Windows
+    - task: PowerShell@2
+      displayName: Install msodbcsql $(msodbcsqlVersion) (parity reference driver)
+      inputs:
+        pwsh: true
+        filePath: $(Build.SourcesDirectory)/.pipeline/scripts/install-msodbcsql.ps1
+        arguments: -Version '$(msodbcsqlVersion)'
+    - pwsh: |
+        $env:ODBC_TEST_SERVER     = 'localhost'
+        $env:ODBC_TEST_UID        = 'sa'
+        $env:ODBC_TEST_PWD        = $env:SQL_PASSWORD
+        $env:ODBC_TEST_TRUST_CERT = 'Yes'
+        # Agent load once a second, so a slow or failed test can be lined up
+        # against CPU starvation. SQL Server shares this agent with the workers.
+        # A process that is not running leaves its column blank.
+        $loadDir = "$(Build.ArtifactStagingDirectory)/odbc-load"
+        New-Item -ItemType Directory -Force -Path $loadDir | Out-Null
+        # sqlservr % Processor Time is summed across cores (0-100 x cpus).
+        "cpus=$([Environment]::ProcessorCount)" | Set-Content "$loadDir/agent.txt"
+        $sampler = Start-Process typeperf -PassThru -NoNewWindow `
+          -RedirectStandardOutput "$loadDir/typeperf.out" -ArgumentList @(
+            '"\Processor(_Total)\% Processor Time"', '"\System\Processor Queue Length"',
+            '"\Memory\Available MBytes"', '"\Process(sqlservr)\% Processor Time"',
+            '-si', '1', '-f', 'CSV', '-o', "`"$loadDir/agent-load.csv`"", '-y')
+        try {
+          ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
+            -MtProfile '$(odbcMtProfile)' `
+            -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
+        } finally {
+          if (-not $sampler.HasExited) { Stop-Process -Id $sampler.Id }
+        }
+      displayName: Run ODBC stress ($(odbcMtProfile)) with msodbcsql parity leg
+      env:
+        SQL_PASSWORD: $(SQL_PASSWORD)
+        RUST_BACKTRACE: full
+        ${{ if parameters.driverTrace }}:
+          # Read only by the Rust driver, so the msodbcsql leg is unaffected.
+          MSSQL_TDS_TRACE: 'true'
+          MSSQL_TDS_TRACE_DIR: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
+          ${{ if ne(parameters.driverTraceLevel, '') }}:
+            MSSQL_TDS_TRACE_LEVEL: ${{ parameters.driverTraceLevel }}
+    - task: PublishTestResults@2
+      displayName: Publish ODBC stress results (Windows)
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+        testRunTitle: ODBC stress Windows ($(odbcMtProfile))
+    - task: PublishTestResults@2
+      displayName: Publish ODBC stress results (Windows, msodbcsql reference)
+      condition: succeededOrFailed()
+      continueOnError: true
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
+        testRunTitle: ODBC stress Windows msodbcsql ($(odbcMtProfile))
+    - task: PublishPipelineArtifact@1
+      displayName: Publish hang and crash dumps
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/odbc-mt-dumps
+        artifact: OdbcMtDumps_Windows_$(System.JobAttempt)
+    - task: PublishPipelineArtifact@1
+      displayName: Publish agent load samples
+      condition: always()
+      continueOnError: true
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)/odbc-load
+        artifact: OdbcLoad_Windows_$(System.JobAttempt)
+    - ${{ if parameters.driverTrace }}:
+      - task: PublishPipelineArtifact@1
+        displayName: Publish driver traces
+        condition: always()
+        continueOnError: true
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
+          artifact: OdbcDriverTraces_Windows_$(System.JobAttempt)

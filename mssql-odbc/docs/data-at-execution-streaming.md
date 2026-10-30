@@ -21,21 +21,29 @@ SQLParamData    → SQL_NEED_DATA  (if more DAE params) or SQL_SUCCESS (done)
 
 ## Supported Types
 
-Streamability is decided by the **C type** alone. The bound SQL type is not
-consulted: every streamed parameter is declared `varchar(max)`,
-`nvarchar(max)`, or `varbinary(max)` on the wire, and the server converts to the
-column's own type on assignment.
+The bound **SQL type** determines whether data streams as PLP chunks or is
+buffered for conversion. `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` are
+accepted according to the parameter conversion matrix. Character transcoding
+retains incomplete encoded units between chunks.
 
-| C Type         | Declared as        | Wire encoding    |
-|----------------|--------------------|------------------|
-| `SQL_C_CHAR`   | `varchar(max)`     | UTF-8 bytes      |
-| `SQL_C_WCHAR`  | `nvarchar(max)`    | UTF-16LE bytes   |
-| `SQL_C_BINARY` | `varbinary(max)`   | raw bytes        |
+| SQL type | Default declaration | PLP payload |
+|----------|---------------------|-------------|
+| `SQL_VARCHAR` / `SQL_WVARCHAR` / `SQL_VARBINARY` | Bounded type, or MAX at `ColumnSize=0` | Corresponding MAX type |
+| `SQL_LONGVARCHAR` | `text` | `varchar(max)` |
+| `SQL_WLONGVARCHAR` | `ntext` | `nvarchar(max)` |
+| `SQL_LONGVARBINARY` | `image` | `varbinary(max)` |
+| `SQL_SS_XML` / `SQL_SS_UDT` | XML / declared UDT | XML / UDT PLP |
 
-So the fixed-width SQL types (`SQL_CHAR`, `SQL_WCHAR`, `SQL_BINARY`) stream just
-as the MAX ones do, as do `SQL_VARCHAR` / `SQL_WVARCHAR` / `SQL_VARBINARY` and
-their `LONG` variants — any SQL type the conversion matrix pairs with one of the
-three C types above.
+`LongAsMax=Yes` changes LONG declarations to their MAX equivalents, not their
+streaming strategy or `ColumnSize` bounds. The option is captured when execution
+starts so deferred, buffered parameters use the same policy. Fixed-width SQL
+types such as `SQL_CHAR`, `SQL_WCHAR`, and `SQL_BINARY` are buffered for ordinary
+conversion rather than sent with an incompatible PLP header. A mixed sequence
+can also buffer an earlier PLP-capable parameter until a later buffered value
+becomes available.
+
+Bounded variable declarations are narrowed only where their length can be
+enforced; legacy type selection does not depend on that narrowing guard.
 
 Other C types (numeric, date/time) and Always Encrypted parameters are not yet
 supported via DAE — use the normal bound-value path for those.
@@ -49,12 +57,13 @@ Set `StrLen_or_IndPtr` to point to a `SQLLEN` whose value is:
 - `SQL_DATA_AT_EXEC` — the data will be supplied via `SQLPutData`, with no
   declared total length.
 - `SQL_LEN_DATA_AT_EXEC(length)` — same, but declares the total byte count.
-  This driver **enforces** the declaration: the bytes accumulated across the
+  For a positive `length`, this driver **enforces** the declaration: the bytes accumulated across the
   parameter's `SQLPutData` calls must equal `length` exactly. Over-sending
   fails the offending `SQLPutData` and under-sending fails the `SQLParamData`
   that closes the parameter, both with `22026` (string data, length mismatch),
   and both abandon the execution. Pass `SQL_DATA_AT_EXEC` when the total is not
-  known up front.
+  known up front. A zero declared byte count is also treated as unspecified;
+  it is separate from the binding's `ColumnSize`.
 
 The `ParameterValuePtr` field is used as an opaque application token: it is
 written to `*ValuePtrPtr` by `SQLParamData` so the application can identify
@@ -108,7 +117,7 @@ SQLPrepare(hstmt, "INSERT INTO docs(content) VALUES (?)", SQL_NTS);
 SQLBindParameter(
     hstmt,
     1, SQL_PARAM_INPUT,
-    SQL_C_CHAR, SQL_LONGVARCHAR,
+    SQL_C_CHAR, SQL_VARCHAR,
     0, 0,
     token,          /* ParameterValuePtr — returned by SQLParamData */
     0,
@@ -146,7 +155,7 @@ SQLPrepare(hstmt, "INSERT INTO docs(name, body) VALUES (?, ?)", SQL_NTS);
 SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
                  0, 0, name_buf, sizeof(name_buf), &ind_name);
 /* @P2 = body — data-at-execution */
-SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR,
+SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
                  0, 0, body_token, 0, &ind_body);
 
 rc = SQLExecute(hstmt);   /* → SQL_NEED_DATA */

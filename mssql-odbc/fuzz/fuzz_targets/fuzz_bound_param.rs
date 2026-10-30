@@ -10,7 +10,8 @@
 //! reads.
 //!
 //! First bytes pick the C type, SQL type, indicator mode, column size, and
-//! scale; the rest is the parameter value buffer.
+//! scale; the indicator byte's high bit selects LongAsMax. The rest is the
+//! parameter value buffer.
 //!
 //! Run: RUSTFLAGS="--cfg fuzzing" cargo +nightly fuzz run fuzz_bound_param
 

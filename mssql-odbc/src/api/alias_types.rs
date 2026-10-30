@@ -24,16 +24,14 @@
 //! be the session's principal.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
-use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
-use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::column_values::ColumnValues;
-use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
+use mssql_tds::error::Error as TdsError;
 use tracing::{debug, error};
 
+use super::secondary_lookup::{Route, cache_is_current, read_on_secondary, select_route};
 use super::txn::try_claim_idle_dbc_client;
 use crate::handles::StmtHandle;
 use crate::handles::dbc::{AliasTypeCache, ConnectionState, DbcHandle};
@@ -51,19 +49,6 @@ const MIN_ALIAS_USER_TYPE: u32 = 256;
 /// the batch returns.
 const ALIAS_TYPE_QUERY: &str = "EXEC sp_executesql N'SET IMPLICIT_TRANSACTIONS OFF; \
                                 SELECT usertype, name FROM systypes WHERE usertype >= 256'";
-
-/// Where the lookup runs.
-enum Route {
-    /// The application's own session, which has no results pending.
-    Session,
-    /// A separate login, because the session has results pending. The names
-    /// are keyed to the session's state when the login was decided on.
-    Secondary {
-        context: Box<ClientContext>,
-        catalog: String,
-        database_change_count: u64,
-    },
-}
 
 /// A handle mutex poisoned by an earlier panic, which the entry point reports
 /// as `SQL_ERROR` like any other lock failure.
@@ -123,8 +108,7 @@ pub(super) fn alias_type_name_for_column(
 }
 
 fn is_current(cache: &AliasTypeCache, client: &TdsClient) -> bool {
-    client.database() == cache.catalog
-        && client.database_change_count() == cache.database_change_count
+    cache_is_current(&cache.catalog, cache.database_change_count, client)
 }
 
 /// Reads the alias type names unless the cache is current for the session.
@@ -152,20 +136,9 @@ fn refresh_alias_types(dbc: &DbcHandle) {
         }
         // msodbcsql queries the session itself unless results are pending on
         // it, and only then logs in separately.
-        let route = if state.wire.statement_owner().is_none() {
-            Route::Session
-        } else {
-            match client.secondary_client_context() {
-                Some(context) if !prompts_for_sign_in(&context) => Route::Secondary {
-                    context: Box::new(context),
-                    catalog: client.database().to_owned(),
-                    database_change_count: client.database_change_count(),
-                },
-                _ => {
-                    debug!("alias-type lookup: no silent secondary login; using base type names");
-                    return;
-                }
-            }
+        let Some(route) = select_route(&state, client) else {
+            debug!("alias-type lookup: no silent secondary login; using base type names");
+            return;
         };
         // The connection timeout bounds the whole lookup on either route,
         // including the secondary login. msodbcsql bounds its read on the
@@ -173,7 +146,7 @@ fn refresh_alias_types(dbc: &DbcHandle) {
         // connection it reads that connection's timeout, which is unset, so
         // its lookup can wait forever behind the session's own uncommitted
         // type change (parity-deviations entry 32).
-        (state.session_generation, state.connection_timeout, route)
+        (state.session_generation, dbc.connection_timeout(), route)
     };
 
     match route {
@@ -203,9 +176,12 @@ fn refresh_alias_types(dbc: &DbcHandle) {
             catalog,
             database_change_count,
         } => {
-            let names = dbc
-                .runtime
-                .block_on(read_on_secondary(context, timeout_secs));
+            let names = dbc.runtime.block_on(read_on_secondary(
+                context,
+                timeout_secs,
+                "alias-type lookup timed out",
+                read_alias_types,
+            ));
             let lookup = names.map(|names| AliasTypeCache {
                 catalog,
                 database_change_count,
@@ -242,50 +218,6 @@ fn publish(
         Ok(cache) => state.alias_types = Some(cache),
         Err(e) => debug!(%e, "alias-type lookup failed; using base type names"),
     }
-}
-
-/// msodbcsql's `SpawnConnection` (`sqlcinfo.cpp`) does not copy the session's
-/// `Authentication` keyword, so its secondary login raises no sign-in prompt
-/// mid-call. Methods that may prompt are not replayed.
-fn prompts_for_sign_in(context: &ClientContext) -> bool {
-    matches!(
-        context.tds_authentication_method,
-        TdsAuthenticationMethod::ActiveDirectoryInteractive
-            | TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow
-    )
-}
-
-/// One deadline covers the login and the read. Without one, the login keeps
-/// the login timeout it inherits, which `SpawnConnection` also copies.
-///
-/// The caller polls this on the application's thread, so the login and read
-/// are boxed, as `create_client` boxes its connection, to leave room on small
-/// application stacks such as musl's 128 KiB threads.
-async fn read_on_secondary(
-    context: Box<ClientContext>,
-    timeout_secs: u32,
-) -> TdsResult<HashMap<u32, String>> {
-    let lookup = Box::pin(async move {
-        let data_source = context.data_source.clone();
-        let mut client = TdsConnectionProvider::new()
-            .create_client(*context, &data_source, None)
-            .await?;
-        debug!(
-            client_connection_id = %client.client_connection_id(),
-            "alias-type lookup: logged in separately"
-        );
-        read_alias_types(&mut client, 0).await
-    });
-    if timeout_secs == 0 {
-        return lookup.await;
-    }
-    tokio::time::timeout(Duration::from_secs(timeout_secs.into()), lookup)
-        .await
-        .unwrap_or_else(|_| {
-            Err(TdsError::TimeoutError(TimeoutErrorType::String(
-                "alias-type lookup timed out".to_string(),
-            )))
-        })
 }
 
 /// Runs the lookup and leaves no batch open, even when it fails part-way, for
@@ -363,6 +295,7 @@ mod tests {
     use mssql_mock_tds::{
         ColumnDefinition, ColumnValue, LeadingError, QueryResponse, Row, SqlDataType,
     };
+    use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
     use mssql_tds::test_client_support::int_columns;
 
     use super::*;
@@ -371,6 +304,7 @@ mod tests {
         SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_TYPE_NAME, SQL_ERROR, SQL_SUCCESS, SqlHandle,
         SqlPointer, SqlSmallInt, SqlUSmallInt,
     };
+    use crate::api::secondary_lookup::prompts_for_sign_in;
     use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_INDEX;
     use crate::api::txn::release_dbc_client;
     use crate::handles::handle_from_raw;
@@ -707,7 +641,7 @@ mod tests {
             ALIAS_TYPE_QUERY,
             lookup_response(&[(257, "phone_number")]).with_delay(Duration::from_secs(10)),
         );
-        dbc.inner.lock().unwrap().connection_timeout = 1;
+        dbc.set_connection_timeout(1);
         describe_columns(&h, &[257]);
 
         let started = Instant::now();
@@ -737,7 +671,7 @@ mod tests {
             if let Some(delay) = login_delay {
                 server.set_login_delay(delay);
             }
-            dbc.inner.lock().unwrap().connection_timeout = 1;
+            dbc.set_connection_timeout(1);
             describe_columns(&h, &[257]);
 
             let started = Instant::now();
@@ -779,7 +713,12 @@ mod tests {
     #[test]
     fn secondary_lookup_future_stays_small() {
         const MAX: usize = 4096;
-        let size = std::mem::size_of_val(&read_on_secondary(Box::default(), 1));
+        let size = std::mem::size_of_val(&read_on_secondary(
+            Box::default(),
+            1,
+            "alias-type lookup timed out",
+            read_alias_types,
+        ));
         assert!(
             size <= MAX,
             "secondary lookup future is {size} B, expected <= {MAX} B"
