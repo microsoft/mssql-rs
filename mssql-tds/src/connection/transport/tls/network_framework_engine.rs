@@ -1,162 +1,154 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! The macOS [`TlsEngine`]: Network.framework for direct TDS 8.0 handshakes,
-//! native-tls for the rest.
+//! Strict (TDS 8.0) connections on macOS, made by Network.framework.
 //!
 //! SQL Server negotiates TLS 1.3 only on TDS 8.0 (Strict) connections, where the
-//! handshake runs straight on the socket. `native-tls` on macOS wraps Secure
-//! Transport, which stops at TLS 1.2 and has no post-quantum key exchange, so
-//! those handshakes run in Network.framework instead. Apple's TLS stack
+//! TLS handshake starts as soon as TCP connects. `native-tls` on macOS wraps
+//! Secure Transport, which stops at TLS 1.2 and has no post-quantum key exchange,
+//! so those connections are made by Network.framework instead. Apple's TLS stack
 //! negotiates TLS 1.3 and, on macOS 26 and later, the `X25519MLKEM768` hybrid
 //! group, with no cryptography from outside the operating system. Certificate
 //! chains are evaluated by Security.framework (see [`verify`]), so the system
 //! trust store keeps deciding which servers are trusted.
 //!
-//! Network.framework cannot be handed a socket or any other byte stream, only an
-//! endpoint to connect to. The engine therefore points it at a private Unix
-//! domain socket and relays the TLS records between that socket and the transport
-//! the connection layer established (see [`bridge`]). The cost is one extra hop
-//! through the kernel in each direction.
+//! Network.framework cannot take over a socket someone else connected, so it
+//! makes the TCP connection too, to one resolved address at a time, with the
+//! options the socket transport sets on its own sockets. A [`Connector`] stands
+//! in for the socket connect in the sequential and MultiSubnetFailover address
+//! walks, and tells an address that could not be reached, which the walk moves
+//! past, from a server that was reached but failed the handshake, which ends it.
 //!
 //! Handshakes tunneled through PreLogin packets (TDS 7.x) cannot use TLS 1.3, and
-//! their transport is a framing layer rather than a socket Network.framework
-//! could reach, so they stay on native-tls.
+//! their transport is a framing layer rather than a connection Network.framework
+//! could make, so they stay on native-tls.
 
-mod bridge;
 mod ffi;
 mod stream;
 mod verify;
 
 use std::error::Error as StdError;
-use std::net::Ipv4Addr;
+use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
-use self::bridge::{Bridge, Health, spawn_pump};
-use self::stream::{Failure, NwStream, Options};
+use self::stream::{KeepAlive, NwStream, Options};
 use self::verify::Verifier;
-use super::native_tls_engine::NATIVE_TLS_ENGINE;
-use super::{TlsConnectParams, TlsEngine};
+use super::{TlsConnectParams, TlsValidationConfig};
 use crate::connection::transport::certificate_validator;
 use crate::connection::transport::network_transport::Stream;
-use crate::core::{TDS_8_ALPN_PROTOCOL, TdsResult};
+use crate::connection::transport::parallel_connect::AttemptError;
+use crate::core::TDS_8_ALPN_PROTOCOL;
 use crate::error::Error;
-
-/// Zero-sized engine type. There is exactly one instance, the static
-/// [`NETWORK_FRAMEWORK_ENGINE`], referenced from [`super::default_engine`].
-#[derive(Debug)]
-pub(crate) struct NetworkFrameworkEngine;
-
-pub(crate) static NETWORK_FRAMEWORK_ENGINE: NetworkFrameworkEngine = NetworkFrameworkEngine;
 
 type BoxedError = Box<dyn StdError + Send + Sync>;
 
-/// Turns a handshake failure into the error surfaced to callers.
-fn handshake_error(source: impl Into<BoxedError>, host: &str) -> Error {
-    Error::TlsHandshakeError {
-        source: source.into(),
-        expected_host: host.to_string(),
+/// Makes Strict connections to one server, one address at a time.
+#[derive(Clone)]
+pub(crate) struct Connector(Arc<Target>);
+
+struct Target {
+    validation: TlsValidationConfig,
+    host_name: String,
+    server_host_name: String,
+    server_certificate_path: Option<PathBuf>,
+    keep_alive: KeepAlive,
+}
+
+impl Connector {
+    pub(crate) fn new(
+        params: &TlsConnectParams<'_>,
+        keep_alive_in_ms: u32,
+        keep_alive_interval_in_ms: u32,
+    ) -> Self {
+        Self(Arc::new(Target {
+            validation: params.validation.clone(),
+            host_name: params.host_name.to_owned(),
+            server_host_name: params.server_host_name.to_owned(),
+            server_certificate_path: params.server_certificate_path.cloned(),
+            keep_alive: KeepAlive {
+                idle: Duration::from_millis(keep_alive_in_ms.into()),
+                interval: Duration::from_millis(keep_alive_interval_in_ms.into()),
+            },
+        }))
+    }
+
+    /// Connects to `address` and completes the TLS handshake on it.
+    pub(crate) fn connect(
+        &self,
+        address: SocketAddr,
+    ) -> impl Future<Output = Result<Box<dyn Stream>, AttemptError>> + Send + 'static {
+        let target = Arc::clone(&self.0);
+        async move { target.connect(address).await }
     }
 }
 
-#[async_trait]
-impl TlsEngine for NetworkFrameworkEngine {
-    async fn connect(
-        &self,
-        mut base_stream: Box<dyn Stream>,
-        params: TlsConnectParams<'_>,
-    ) -> TdsResult<Box<dyn Stream>> {
-        // `use_alpn` is set exactly for the direct TDS 8.0 (Strict) handshake.
-        if !params.validation.use_alpn {
-            return NATIVE_TLS_ENGINE.connect(base_stream, params).await;
-        }
-
-        base_stream.tls_handshake_starting();
-
+impl Target {
+    async fn connect(&self, address: SocketAddr) -> Result<Box<dyn Stream>, AttemptError> {
         info!(
-            "Starting TLS handshake to {} using host {}",
-            params.server_host_name, params.host_name
+            "Starting TLS handshake to {} at {} using host {}",
+            self.server_host_name, address, self.host_name
         );
         let verifier = Arc::new(Verifier::new(
-            params.validation,
-            params.host_name,
-            params.server_certificate_path.is_some(),
+            &self.validation,
+            &self.host_name,
+            self.server_certificate_path.is_some(),
         ));
-        let stream = handshake(base_stream, &params, &verifier)
-            .await
-            .map_err(|e| {
-                error!(
-                    "TLS handshake FAILED: host_name={}, server_host_name={}, error={:?}",
-                    params.host_name, params.server_host_name, e,
-                );
-                handshake_error(e, params.host_name)
-            })?;
+        let options = Options {
+            address,
+            server_name: sni_host_name(&self.host_name),
+            alpn: TDS_8_ALPN_PROTOCOL,
+            keep_alive: self.keep_alive,
+        };
+        let stream =
+            NwStream::start(&options, Arc::clone(&verifier)).map_err(|e| self.rejected(e))?;
+
+        if let Err(failure) = stream.established().await {
+            if let Some(reason) = verifier.take_failure() {
+                return Err(self.rejected(reason));
+            }
+            if failure.is_unreachable() {
+                debug!("Could not reach {}: {}", address, failure);
+                return Err(AttemptError::Unreachable(failure.to_io_error()));
+            }
+            return Err(self.rejected(failure));
+        }
 
         match stream.negotiated() {
             Some(negotiated) => info!("TLS handshake complete: {negotiated}"),
             None => info!("TLS handshake complete"),
         }
 
-        if let Some(cert_path) = params.server_certificate_path {
+        if let Some(cert_path) = &self.server_certificate_path {
             info!("Validating server certificate using: {cert_path:?}");
 
-            let leaf = verifier.take_leaf().ok_or(Error::NoServerCertificate)?;
-            certificate_validator::validate_server_certificate(cert_path, &leaf)?;
+            let leaf = verifier
+                .take_leaf()
+                .ok_or(AttemptError::Rejected(Error::NoServerCertificate))?;
+            certificate_validator::validate_server_certificate(cert_path, &leaf)
+                .map_err(AttemptError::Rejected)?;
 
             info!("Server certificate validation successful");
         }
 
-        // The relay owns the transport now, and no transport's completion hook does anything.
         Ok(Box::new(stream))
     }
-}
 
-async fn handshake(
-    base_stream: Box<dyn Stream>,
-    params: &TlsConnectParams<'_>,
-    verifier: &Arc<Verifier>,
-) -> Result<NwStream, BoxedError> {
-    let bridge = Bridge::bind()?;
-    let health = Arc::new(Health::default());
-    let socket_path = bridge.socket_path();
-    let mut stream = NwStream::start(
-        &Options {
-            socket_path: &socket_path,
-            server_name: sni_host_name(params.host_name),
-            alpn: TDS_8_ALPN_PROTOCOL,
-        },
-        Arc::clone(verifier),
-        Arc::clone(&health),
-    )?;
-
-    // Network.framework connects before anything has been sent, so only a failure
-    // to do so can end the wait for it.
-    let socket = tokio::select! {
-        accepted = bridge.accept() => accepted?,
-        failure = stream.failed() => return Err(cause(failure, verifier, &health)),
-    };
-    stream.attach_pump(spawn_pump(socket, base_stream, Arc::clone(&health)));
-
-    stream
-        .established()
-        .await
-        .map_err(|failure| cause(failure, verifier, &health))?;
-    Ok(stream)
-}
-
-/// The most specific reason a handshake failed: a rejected certificate, then the
-/// transport failing, then whatever Network.framework reported.
-fn cause(failure: Failure, verifier: &Verifier, health: &Health) -> BoxedError {
-    if let Some(reason) = verifier.take_failure() {
-        return reason.into();
+    fn rejected(&self, source: impl Into<BoxedError>) -> AttemptError {
+        let source = source.into();
+        error!(
+            "TLS handshake FAILED: host_name={}, server_host_name={}, error={:?}",
+            self.host_name, self.server_host_name, source,
+        );
+        AttemptError::Rejected(Error::TlsHandshakeError {
+            source,
+            expected_host: self.host_name.clone(),
+        })
     }
-    if let Some(error) = health.error() {
-        return error.into();
-    }
-    failure.into()
 }
 
 /// The name to send as SNI, which RFC 6066 limits to DNS host names: no literal
@@ -171,28 +163,21 @@ fn sni_host_name(host: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::future::Future;
+pub(crate) mod tests {
     use std::io;
-    use std::path::{Path, PathBuf};
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll};
-    use std::time::Duration;
+    use std::path::Path;
 
-    use tokio::io::{
-        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
-    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
     use tokio_native_tls::{TlsAcceptor, TlsStream};
 
     use super::*;
-    use crate::connection::transport::tls::TlsValidationConfig;
+    use crate::connection::transport::parallel_connect::parallel_connect_with;
 
     const HOST: &str = "localhost";
     const TIMEOUT: Duration = Duration::from_secs(30);
-    const PIPE_CAPACITY: usize = 64 * 1024;
     const MEGABYTE: usize = 1024 * 1024;
 
     async fn within<T>(future: impl Future<Output = T>) -> T {
@@ -201,7 +186,7 @@ mod tests {
             .expect("timed out")
     }
 
-    fn fixture(name: &str) -> PathBuf {
+    pub(crate) fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("test_certificates")
@@ -217,16 +202,44 @@ mod tests {
         TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap())
     }
 
-    fn serve<F, Fut, T>(io: DuplexStream, session: F) -> JoinHandle<T>
+    pub(crate) async fn listen() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        (listener, address)
+    }
+
+    /// Accepts one connection, running `session` on it as raw TCP.
+    fn serve_tcp<F, Fut, T>(listener: TcpListener, session: F) -> JoinHandle<T>
     where
-        F: FnOnce(TlsStream<DuplexStream>) -> Fut + Send + 'static,
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send,
         T: Send + 'static,
     {
         tokio::spawn(async move {
-            let tls = acceptor().accept(io).await.expect("server handshake");
+            let (tcp, _) = listener.accept().await.unwrap();
+            session(tcp).await
+        })
+    }
+
+    /// Accepts one connection, running `session` on it once TLS is up.
+    pub(crate) fn serve<F, Fut, T>(listener: TcpListener, session: F) -> JoinHandle<T>
+    where
+        F: FnOnce(TlsStream<TcpStream>) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send,
+        T: Send + 'static,
+    {
+        serve_tcp(listener, |tcp| async move {
+            let tls = acceptor().accept(tcp).await.expect("server handshake");
             session(tls).await
         })
+    }
+
+    /// Holds a server's connection until the client ends it.
+    ///
+    /// Network.framework can fail a handshake whose server hangs up right behind
+    /// its last flight, so a server must not close before the client is connected.
+    pub(crate) async fn until_the_client_leaves(mut tls: TlsStream<TcpStream>) {
+        let _ = tls.read(&mut [0]).await;
     }
 
     fn trusting() -> TlsValidationConfig {
@@ -245,118 +258,51 @@ mod tests {
         }
     }
 
-    async fn connect(
-        transport: impl Stream + 'static,
-        validation: &TlsValidationConfig,
-        pin: Option<&PathBuf>,
-    ) -> TdsResult<Box<dyn Stream>> {
+    fn connector(validation: &TlsValidationConfig, pin: Option<&PathBuf>) -> Connector {
         let params = TlsConnectParams {
             validation,
             host_name: HOST,
             server_host_name: HOST,
             server_certificate_path: pin,
         };
-        within(NETWORK_FRAMEWORK_ENGINE.connect(Box::new(transport), params)).await
+        Connector::new(&params, 30_000, 1_000)
     }
 
-    async fn connect_failure(
-        transport: impl Stream + 'static,
+    async fn connect(
+        address: SocketAddr,
+        validation: &TlsValidationConfig,
+        pin: Option<&PathBuf>,
+    ) -> Result<Box<dyn Stream>, AttemptError> {
+        within(connector(validation, pin).connect(address)).await
+    }
+
+    async fn rejection(
+        address: SocketAddr,
         validation: &TlsValidationConfig,
         pin: Option<&PathBuf>,
     ) -> Error {
-        match connect(transport, validation, pin).await {
-            Ok(_) => panic!("the handshake should have failed"),
-            Err(error) => error,
+        match connect(address, validation, pin).await {
+            Err(AttemptError::Rejected(error)) => error,
+            Err(error) => panic!("expected a rejection, got {error:?}"),
+            Ok(_) => panic!("the connection should have failed"),
         }
+    }
+
+    /// An address nothing listens on.
+    pub(crate) async fn refusing_address() -> SocketAddr {
+        let (listener, address) = listen().await;
+        drop(listener);
+        address
     }
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
-    /// Counts how often the transport is told a handshake is starting.
-    struct Probe {
-        inner: DuplexStream,
-        announced: Arc<AtomicUsize>,
-    }
-
-    impl AsyncRead for Probe {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.inner).poll_read(cx, buf)
-        }
-    }
-
-    impl AsyncWrite for Probe {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.inner).poll_write(cx, buf)
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.inner).poll_flush(cx)
-        }
-
-        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.inner).poll_shutdown(cx)
-        }
-    }
-
-    impl Stream for Probe {
-        fn tls_handshake_starting(&mut self) {
-            self.announced.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn tls_handshake_completed(&mut self) {}
-    }
-
-    /// A transport that has already failed.
-    struct Broken;
-
-    impl AsyncRead for Broken {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
-        }
-    }
-
-    impl AsyncWrite for Broken {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl Stream for Broken {
-        fn tls_handshake_starting(&mut self) {}
-
-        fn tls_handshake_completed(&mut self) {}
-    }
-
     #[tokio::test]
-    async fn echoes_after_a_direct_handshake() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |mut tls| async move {
+    async fn echoes_over_a_direct_connection() {
+        let (listener, address) = listen().await;
+        let server = serve(listener, |mut tls| async move {
             let mut request = [0; 5];
             tls.read_exact(&mut request).await.unwrap();
             tls.write_all(&request).await.unwrap();
@@ -366,7 +312,7 @@ mod tests {
             trailing
         });
 
-        let mut stream = connect(client_io, &trusting(), None).await.unwrap();
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
         stream.write_all(b"hello").await.unwrap();
         stream.flush().await.unwrap();
         let mut reply = [0; 5];
@@ -380,8 +326,8 @@ mod tests {
 
     #[tokio::test]
     async fn transfers_large_payloads_in_both_directions() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |tls| async move {
+        let (listener, address) = listen().await;
+        let server = serve(listener, |tls| async move {
             let (mut read, mut write) = tokio::io::split(tls);
             let upload = async {
                 let mut received = vec![0; MEGABYTE];
@@ -398,7 +344,7 @@ mod tests {
             received
         });
 
-        let stream = connect(client_io, &trusting(), None).await.unwrap();
+        let stream = connect(address, &trusting(), None).await.unwrap();
         let (mut read, mut write) = tokio::io::split(stream);
         let upload = async {
             write.write_all(&pattern(MEGABYTE)).await.unwrap();
@@ -418,14 +364,14 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_delivers_everything_written_before_it() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |mut tls| async move {
+        let (listener, address) = listen().await;
+        let server = serve(listener, |mut tls| async move {
             let mut received = Vec::new();
             tls.read_to_end(&mut received).await.unwrap();
             received
         });
 
-        let mut stream = connect(client_io, &trusting(), None).await.unwrap();
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
         stream.write_all(&pattern(MEGABYTE)).await.unwrap();
         within(stream.shutdown()).await.unwrap();
 
@@ -436,29 +382,101 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_stream_closes_the_connection() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |mut tls| async move {
+        let (listener, address) = listen().await;
+        let server = serve(listener, |mut tls| async move {
             let mut received = Vec::new();
             tls.read_to_end(&mut received).await.unwrap();
             received
         });
 
-        let mut stream = connect(client_io, &trusting(), None).await.unwrap();
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
         stream.write_all(b"goodbye").await.unwrap();
         drop(stream);
 
         assert_eq!(within(server).await.unwrap(), b"goodbye");
     }
 
+    /// A stream whose server stopped reading after the handshake, written to until
+    /// it takes no more, along with a way to tell when its connection has ended.
+    async fn stalled_stream() -> (
+        NwStream,
+        impl Fn() -> bool,
+        oneshot::Sender<()>,
+        JoinHandle<()>,
+    ) {
+        let (release, released) = oneshot::channel::<()>();
+        let (listener, address) = listen().await;
+        let server = serve(listener, |tls| async move {
+            let _ = released.await;
+            drop(tls);
+        });
+        let options = Options {
+            address,
+            server_name: Some(HOST),
+            alpn: TDS_8_ALPN_PROTOCOL,
+            keep_alive: KeepAlive {
+                idle: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+            },
+        };
+        let verifier = Arc::new(Verifier::new(&trusting(), HOST, false));
+        let mut stream = NwStream::start(&options, verifier).unwrap();
+        within(stream.established()).await.unwrap();
+        let chunk = vec![0; 64 * 1024];
+        within(async {
+            while let Ok(written) =
+                tokio::time::timeout(Duration::from_millis(250), stream.write(&chunk)).await
+            {
+                written.unwrap();
+            }
+        })
+        .await;
+        let ended = stream.end_probe();
+        (stream, ended, release, server)
+    }
+
+    async fn ends_soon(ended: impl Fn() -> bool) {
+        let wait = async {
+            while !ended() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the connection was never cancelled");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stream_the_server_stopped_reading_still_ends_it() {
+        let (stream, ended, release, server) = stalled_stream().await;
+        drop(stream);
+
+        ends_soon(ended).await;
+        release.send(()).unwrap();
+        within(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stream_after_a_stalled_shutdown_still_ends_it() {
+        let (mut stream, ended, release, server) = stalled_stream().await;
+        let shutdown = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+        assert!(shutdown.is_err(), "the shutdown should wait for the server");
+        drop(stream);
+
+        ends_soon(ended).await;
+        release.send(()).unwrap();
+        within(server).await.unwrap();
+    }
+
     #[tokio::test]
     async fn operations_after_shutdown_report_the_closed_connection() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |mut tls| async move {
+        let (listener, address) = listen().await;
+        let server = serve(listener, |mut tls| async move {
             let mut received = Vec::new();
             tls.read_to_end(&mut received).await.unwrap();
         });
 
-        let mut stream = connect(client_io, &trusting(), None).await.unwrap();
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
         within(stream.shutdown()).await.unwrap();
         within(stream.shutdown()).await.unwrap();
 
@@ -471,13 +489,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_clean_server_close_is_the_end_of_the_stream() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |mut tls| async move {
+        let (listener, address) = listen().await;
+        let (connected, client_connected) = oneshot::channel::<()>();
+        let server = serve(listener, |mut tls| async move {
+            client_connected.await.unwrap();
             tls.write_all(b"bye").await.unwrap();
             tls.shutdown().await.unwrap();
         });
 
-        let mut stream = connect(client_io, &trusting(), None).await.unwrap();
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
+        connected.send(()).unwrap();
         let mut received = Vec::new();
         within(stream.read_to_end(&mut received)).await.unwrap();
 
@@ -486,19 +507,22 @@ mod tests {
         within(server).await.unwrap();
     }
 
-    // Network.framework reports a transport that ends without `close_notify` as a
+    // Network.framework reports a connection that ends without `close_notify` as a
     // clean end of stream, as `security-framework` does for the native-tls engine.
     // It is the TDS framing that notices a message cut short.
     #[tokio::test]
     async fn a_close_without_close_notify_ends_the_stream() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |mut tls| async move {
+        let (listener, address) = listen().await;
+        let (connected, client_connected) = oneshot::channel::<()>();
+        let server = serve(listener, |mut tls| async move {
+            client_connected.await.unwrap();
             tls.write_all(b"partial").await.unwrap();
             tls.flush().await.unwrap();
-            // Dropped without `shutdown`, so the peer sees the transport end instead.
+            // Dropped without `shutdown`, so the peer sees TCP end instead.
         });
 
-        let mut stream = connect(client_io, &trusting(), None).await.unwrap();
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
+        connected.send(()).unwrap();
         within(server).await.unwrap();
         let mut received = Vec::new();
         within(stream.read_to_end(&mut received)).await.unwrap();
@@ -508,11 +532,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_an_untrusted_certificate_when_validating() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = tokio::spawn(async move { acceptor().accept(server_io).await.is_err() });
+    async fn an_idle_connection_notices_the_server_hanging_up() {
+        let (listener, address) = listen().await;
+        let (hang_up, hung_up) = oneshot::channel::<()>();
+        let server = serve(listener, |mut tls| async move {
+            tls.write_all(b"ready").await.unwrap();
+            tls.flush().await.unwrap();
+            hung_up.await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
 
-        let error = connect_failure(client_io, &validating(), None).await;
+        let mut stream = connect(address, &trusting(), None).await.unwrap();
+        let mut ready = [0; 5];
+        within(stream.read_exact(&mut ready)).await.unwrap();
+        assert!(!stream.is_connection_dead());
+
+        hang_up.send(()).unwrap();
+        within(server).await.unwrap();
+        within(async {
+            while !stream.is_connection_dead() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_unreachable_as_a_socket_reports_it() {
+        let address = refusing_address().await;
+
+        let error = match connect(address, &trusting(), None).await {
+            Err(AttemptError::Unreachable(error)) => error,
+            Err(error) => panic!("expected an unreachable address, got {error:?}"),
+            Ok(_) => panic!("nothing listens there"),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+        assert!(Error::from(error).is_transient_connect_error());
+    }
+
+    #[tokio::test]
+    async fn the_race_moves_past_an_address_that_refuses() {
+        let refused = refusing_address().await;
+        let (listener, live) = listen().await;
+        let server = serve(listener, |mut tls| async move {
+            let mut received = Vec::new();
+            tls.read_to_end(&mut received).await.unwrap();
+        });
+        let connector = connector(&trusting(), None);
+
+        let result = within(parallel_connect_with(
+            vec![refused, live],
+            TIMEOUT.as_millis() as u64,
+            |address| connector.connect(address),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(result.connected_address, live);
+        assert_eq!(result.total_addresses, 2);
+
+        let mut stream = result.stream;
+        within(stream.shutdown()).await.unwrap();
+        within(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_an_untrusted_certificate_when_validating() {
+        let (listener, address) = listen().await;
+        let server = serve_tcp(listener, |tcp| async move {
+            acceptor().accept(tcp).await.is_err()
+        });
+
+        let error = rejection(address, &validating(), None).await;
 
         let Error::TlsHandshakeError {
             source,
@@ -529,14 +621,14 @@ mod tests {
     #[tokio::test]
     async fn accepts_a_certificate_matching_the_pin() {
         for name in ["valid_cert.der", "valid_cert.pem"] {
-            let (client_io, server_io) = duplex(PIPE_CAPACITY);
-            let server = serve(server_io, |mut tls| async move {
+            let (listener, address) = listen().await;
+            let server = serve(listener, |mut tls| async move {
                 let mut received = Vec::new();
                 tls.read_to_end(&mut received).await.unwrap();
             });
 
             let pin = fixture(name);
-            let mut stream = connect(client_io, &trusting(), Some(&pin)).await.unwrap();
+            let mut stream = connect(address, &trusting(), Some(&pin)).await.unwrap();
             within(stream.shutdown()).await.unwrap();
             within(server).await.unwrap();
         }
@@ -550,12 +642,10 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), tampered).unwrap();
 
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = tokio::spawn(async move {
-            let _ = acceptor().accept(server_io).await;
-        });
+        let (listener, address) = listen().await;
+        let server = serve(listener, until_the_client_leaves);
 
-        let error = connect_failure(client_io, &trusting(), Some(&file.path().to_path_buf())).await;
+        let error = rejection(address, &trusting(), Some(&file.path().to_path_buf())).await;
 
         assert!(matches!(error, Error::CertificateMismatch), "{error:?}");
         within(server).await.unwrap();
@@ -563,13 +653,11 @@ mod tests {
 
     #[tokio::test]
     async fn reports_a_missing_pin_file() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = tokio::spawn(async move {
-            let _ = acceptor().accept(server_io).await;
-        });
+        let (listener, address) = listen().await;
+        let server = serve(listener, until_the_client_leaves);
 
-        let error = connect_failure(
-            client_io,
+        let error = rejection(
+            address,
             &trusting(),
             Some(&fixture("no_such_certificate.pem")),
         )
@@ -584,20 +672,19 @@ mod tests {
 
     #[tokio::test]
     async fn fails_when_the_peer_does_not_speak_tls() {
-        let (client_io, mut server_io) = duplex(PIPE_CAPACITY);
-        let server = tokio::spawn(async move {
+        let (listener, address) = listen().await;
+        let server = serve_tcp(listener, |mut tcp| async move {
             let mut hello = [0; 5];
-            server_io.read_exact(&mut hello).await.unwrap();
-            server_io
-                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            tcp.read_exact(&mut hello).await.unwrap();
+            tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
                 .await
                 .unwrap();
             // Held open, so the failure has to come from what was received.
             let mut rest = Vec::new();
-            let _ = server_io.read_to_end(&mut rest).await;
+            let _ = tcp.read_to_end(&mut rest).await;
         });
 
-        let error = connect_failure(client_io, &trusting(), None).await;
+        let error = rejection(address, &trusting(), None).await;
 
         assert!(
             matches!(error, Error::TlsHandshakeError { .. }),
@@ -608,84 +695,18 @@ mod tests {
 
     #[tokio::test]
     async fn fails_when_the_peer_hangs_up_during_the_handshake() {
-        let (client_io, mut server_io) = duplex(PIPE_CAPACITY);
-        let server = tokio::spawn(async move {
+        let (listener, address) = listen().await;
+        let server = serve_tcp(listener, |mut tcp| async move {
             let mut hello = [0; 5];
-            server_io.read_exact(&mut hello).await.unwrap();
+            tcp.read_exact(&mut hello).await.unwrap();
         });
 
-        let error = connect_failure(client_io, &trusting(), None).await;
+        let error = rejection(address, &trusting(), None).await;
 
         assert!(
             matches!(error, Error::TlsHandshakeError { .. }),
             "{error:?}"
         );
-        within(server).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn blames_the_transport_when_it_fails() {
-        let error = connect_failure(Broken, &trusting(), None).await;
-
-        let Error::TlsHandshakeError { source, .. } = error else {
-            panic!("expected a TLS handshake error, got {error:?}");
-        };
-        let cause = source
-            .downcast_ref::<io::Error>()
-            .expect("the transport's error");
-        assert_eq!(cause.kind(), io::ErrorKind::ConnectionReset);
-    }
-
-    #[tokio::test]
-    async fn announces_the_handshake_to_the_transport_once() {
-        for use_alpn in [true, false] {
-            let (client_io, server_io) = duplex(PIPE_CAPACITY);
-            let server = serve(server_io, |mut tls| async move {
-                let mut received = Vec::new();
-                tls.read_to_end(&mut received).await.unwrap();
-            });
-            let announced = Arc::new(AtomicUsize::new(0));
-            let transport = Probe {
-                inner: client_io,
-                announced: Arc::clone(&announced),
-            };
-
-            let validation = TlsValidationConfig {
-                use_alpn,
-                ..trusting()
-            };
-            let mut stream = connect(transport, &validation, None).await.unwrap();
-            within(stream.shutdown()).await.unwrap();
-
-            assert_eq!(announced.load(Ordering::SeqCst), 1, "use_alpn={use_alpn}");
-            within(server).await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn tunneled_handshakes_are_left_to_native_tls() {
-        let (client_io, server_io) = duplex(PIPE_CAPACITY);
-        let server = serve(server_io, |mut tls| async move {
-            let mut request = [0; 4];
-            tls.read_exact(&mut request).await.unwrap();
-            tls.write_all(&request).await.unwrap();
-            tls.flush().await.unwrap();
-            let mut trailing = Vec::new();
-            tls.read_to_end(&mut trailing).await.unwrap();
-        });
-
-        let validation = TlsValidationConfig {
-            use_alpn: false,
-            ..trusting()
-        };
-        let mut stream = connect(client_io, &validation, None).await.unwrap();
-        stream.write_all(b"ping").await.unwrap();
-        stream.flush().await.unwrap();
-        let mut reply = [0; 4];
-        within(stream.read_exact(&mut reply)).await.unwrap();
-        assert_eq!(&reply, b"ping");
-
-        within(stream.shutdown()).await.unwrap();
         within(server).await.unwrap();
     }
 

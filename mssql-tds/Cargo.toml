@@ -29,15 +29,14 @@ tls-schannel-direct = []
 # unconditionally — useful as an escape hatch if the rewrite needs to
 # be temporarily disabled in production.
 tls-schannel-direct-on-windows = ["tls-schannel-direct"]
-# Use the Network.framework TLS engine on macOS (macOS-only effect: the engine
-# and its dependencies are not built on other targets) for direct TDS 8.0
-# (Strict) handshakes. Secure Transport, which native-tls uses on macOS, cannot
-# negotiate TLS 1.3 or post-quantum key exchange. TDS 7.x handshakes stay on
-# native-tls.
+# Open TDS 8.0 (Strict) TCP connections through Apple's Network.framework on
+# macOS (no effect on other targets), adding TLS 1.3 and post-quantum key
+# exchange, neither of which Secure Transport (native-tls on macOS) supports.
+# TDS 7.x handshakes stay on native-tls.
 tls-network-framework = ["dep:block2"]
-# Default-on bundle that routes the dispatcher to the Network.framework engine
-# on macOS. Disable with `default-features = false` to fall back to native-tls
-# (Secure Transport, TLS 1.2 maximum).
+# Default-on bundle for `tls-network-framework`. Disable with
+# `default-features = false` to fall back to a socket and native-tls (Secure
+# Transport, TLS 1.2 maximum).
 tls-network-framework-on-macos = ["tls-network-framework"]
 # Exposes in-process test helpers used only by tests and tooling: key
 # provisioning (RSA generation / PKCS#8 export, `RsaKeyStoreProvider`) and

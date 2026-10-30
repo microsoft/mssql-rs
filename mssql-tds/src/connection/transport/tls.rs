@@ -5,13 +5,15 @@
 //!
 //! The [`TlsEngine`] trait separates *which* TLS implementation runs the
 //! handshake from the surrounding TDS plumbing (prelogin framing,
-//! connection-state callbacks, certificate-pinning hooks). There are three
-//! implementations: [`native_tls_engine::NativeTlsEngine`], the Schannel-direct
-//! engine in `win_tls` on Windows, and the Network.framework engine on macOS.
-//! [`default_engine`] picks Schannel-direct on Windows and Network.framework on
-//! macOS when the `tls-schannel-direct` / `tls-network-framework` feature is
-//! enabled (the default), and native-tls everywhere else. The macOS engine only
-//! takes over direct TDS 8.0 handshakes and hands the rest to native-tls.
+//! connection-state callbacks, certificate-pinning hooks). There are two
+//! implementations: [`native_tls_engine::NativeTlsEngine`], and on Windows the
+//! Schannel-direct engine in `win_tls`. [`default_engine`] picks Schannel-direct
+//! on Windows when the `tls-schannel-direct` feature is enabled (the default)
+//! and native-tls everywhere else.
+//!
+//! On macOS, with the `tls-network-framework` feature (the default), Strict
+//! connections over TCP bypass the engines: Network.framework makes the whole
+//! connection, TCP included (see `network_framework_engine`).
 
 pub(crate) mod native_tls_engine;
 #[cfg(all(target_os = "macos", feature = "tls-network-framework"))]
@@ -66,13 +68,9 @@ pub(crate) trait TlsEngine: Send + Sync {
 /// Returns the default TLS engine for this platform.
 ///
 /// On Windows, returns the in-tree Schannel-direct engine
-/// when the `tls-schannel-direct` feature is enabled (default). On macOS,
-/// returns the Network.framework engine when the `tls-network-framework`
-/// feature is enabled (default). It runs direct TDS 8.0 handshakes, the only
-/// ones SQL Server negotiates TLS 1.3 on, and defers the PreLogin-tunneled
-/// handshakes to `native-tls`, because Secure Transport cannot negotiate TLS 1.3
-/// or post-quantum key exchange. On all other platforms and when the feature is
-/// disabled, returns the `native-tls`-backed engine.
+/// when the `tls-schannel-direct` feature is enabled (default). On all
+/// other platforms and when the feature is disabled, returns the
+/// `native-tls`-backed engine.
 ///
 /// The Schannel-direct engine fixes two Windows-only TLS bugs that
 /// produced the bulkcopy timeout regression observed in production:
@@ -85,10 +83,6 @@ pub(crate) fn default_engine() -> &'static dyn TlsEngine {
     #[cfg(all(windows, feature = "tls-schannel-direct"))]
     {
         return &crate::connection::transport::win_tls::engine::SCHANNEL_ENGINE;
-    }
-    #[cfg(all(target_os = "macos", feature = "tls-network-framework"))]
-    {
-        return &network_framework_engine::NETWORK_FRAMEWORK_ENGINE;
     }
     #[allow(unreachable_code)]
     {

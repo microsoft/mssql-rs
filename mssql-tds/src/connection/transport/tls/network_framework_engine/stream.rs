@@ -6,26 +6,25 @@
 //! Network.framework reports everything by calling blocks on a queue of its own.
 //! [`Shared`] records what they report and the `poll_*` methods read it back,
 //! leaving a waker for the block to fire. No block holds the connection while it
-//! is open, so dropping [`NwStream`] closes the connection and releases all of it.
+//! is open, so dropping [`NwStream`] closes the connection, within [`DRAIN_LIMIT`]
+//! even if the server has stopped reading, and releases all of it.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::future::poll_fn;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 use std::{fmt, io, mem, ptr};
 
 use block2::RcBlock;
 use core_foundation::base::TCFType;
 use core_foundation::error::CFError;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_util::sync::DropGuard;
 
-use super::bridge::Health;
 use super::ffi::{
     self, BlockBool, Dispatch, ERROR_DOMAIN_POSIX, ERROR_DOMAIN_TLS, Handle, MappedData, Nw,
     Object, STATE_CANCELLED, STATE_FAILED, STATE_READY, STATE_WAITING, Sec, TLS_1_2, TLS_1_3,
@@ -47,6 +46,10 @@ const WRITE_CHUNK: usize = 64 * 1024;
 /// writers have to wait. Network.framework advises keeping few sends outstanding.
 const WRITE_WINDOW: usize = 256 * 1024;
 
+/// How long a dropped stream may go on delivering what was written to it before
+/// its connection is cancelled regardless.
+const DRAIN_LIMIT: Duration = Duration::from_secs(1);
+
 // Secure Transport status codes, which Network.framework reports in its TLS domain.
 const ERR_SSL_CLOSED_GRACEFUL: i32 = -9805;
 const ERR_SSL_CLOSED_ABORT: i32 = -9806;
@@ -57,6 +60,7 @@ const ERR_SSL_CLOSED_NO_NOTIFY: i32 = -9816;
 pub(super) struct Failure {
     kind: io::ErrorKind,
     message: String,
+    os_error: Option<i32>,
 }
 
 impl Failure {
@@ -64,6 +68,18 @@ impl Failure {
         Self {
             kind,
             message: message.into(),
+            os_error: None,
+        }
+    }
+
+    /// A failure the operating system reported as `code`, described exactly as a
+    /// socket reporting it would be.
+    fn os(code: i32) -> Self {
+        let error = io::Error::from_raw_os_error(code);
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+            os_error: Some(code),
         }
     }
 
@@ -82,14 +98,38 @@ impl Failure {
                 ffi::nw_error_get_error_code(error),
             )
         };
+        if domain == ERROR_DOMAIN_POSIX {
+            return Self::os(code);
+        }
         // SAFETY: per the contract.
         let message = unsafe { describe(error) }
             .unwrap_or_else(|| format!("Network.framework error {code} in domain {domain}"));
         Self::new(error_kind(domain, code), message)
     }
 
-    fn to_io_error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
+    /// Whether the failure means the server could not be reached at all, as
+    /// opposed to failing once it was.
+    pub(super) fn is_unreachable(&self) -> bool {
+        matches!(
+            self.os_error,
+            Some(
+                libc::ECONNREFUSED
+                    | libc::ETIMEDOUT
+                    | libc::EHOSTUNREACH
+                    | libc::EHOSTDOWN
+                    | libc::ENETUNREACH
+                    | libc::ENETDOWN
+                    | libc::EADDRNOTAVAIL
+                    | libc::EAFNOSUPPORT
+            )
+        )
+    }
+
+    pub(super) fn to_io_error(&self) -> io::Error {
+        match self.os_error {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(self.kind, self.message.clone()),
+        }
     }
 }
 
@@ -103,7 +143,6 @@ impl std::error::Error for Failure {}
 
 fn error_kind(domain: u32, code: i32) -> io::ErrorKind {
     match (domain, code) {
-        (ERROR_DOMAIN_POSIX, code) => io::Error::from_raw_os_error(code).kind(),
         (ERROR_DOMAIN_TLS, ERR_SSL_CLOSED_GRACEFUL | ERR_SSL_CLOSED_NO_NOTIFY) => {
             io::ErrorKind::UnexpectedEof
         }
@@ -351,34 +390,36 @@ impl fmt::Display for Negotiated {
 
 /// How to reach and configure the connection.
 pub(super) struct Options<'a> {
-    /// The socket [`super::bridge::Bridge`] listens on.
-    pub(super) socket_path: &'a Path,
+    pub(super) address: SocketAddr,
     /// Sent to the server as SNI.
     pub(super) server_name: Option<&'a str>,
     pub(super) alpn: &'a str,
+    pub(super) keep_alive: KeepAlive,
+}
+
+/// TCP keep-alive timing, to the second, as for sockets.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct KeepAlive {
+    pub(super) idle: Duration,
+    pub(super) interval: Duration,
 }
 
 /// A TLS connection driven by Network.framework.
 pub(super) struct NwStream {
     connection: Handle<Nw>,
+    /// The serial queue the connection's blocks run on.
+    queue: Handle<Dispatch>,
     shared: Arc<Shared>,
-    health: Arc<Health>,
-    // Stops relaying the real transport when the stream goes away.
-    pump: Option<DropGuard>,
 }
 
 impl NwStream {
-    /// Starts connecting. The handshake only gets going once something relays the
-    /// socket's bytes to the server, so this returns before it completes.
-    pub(super) fn start(
-        options: &Options<'_>,
-        verifier: Arc<Verifier>,
-        health: Arc<Health>,
-    ) -> io::Result<Self> {
+    /// Starts connecting to the server, returning before the connection, let alone
+    /// the handshake, has completed.
+    pub(super) fn start(options: &Options<'_>, verifier: Arc<Verifier>) -> io::Result<Self> {
         let server_name = options.server_name.map(c_string).transpose()?;
         let alpn = c_string(options.alpn)?;
-        let endpoint = unix_endpoint(options.socket_path)?;
-        let parameters = tls_parameters(server_name, alpn, verifier)?;
+        let endpoint = address_endpoint(options.address)?;
+        let parameters = tls_parameters(server_name, alpn, verifier, options.keep_alive)?;
         let queue = ffi::new_serial_queue()
             .ok_or_else(|| io::Error::other("failed to create a dispatch queue"))?;
 
@@ -406,29 +447,9 @@ impl NwStream {
 
         Ok(Self {
             connection,
+            queue,
             shared,
-            health,
-            pump: None,
         })
-    }
-
-    pub(super) fn attach_pump(&mut self, pump: DropGuard) {
-        self.pump = Some(pump);
-    }
-
-    /// Resolves when the connection fails or is cancelled, never when it succeeds.
-    pub(super) async fn failed(&self) -> Failure {
-        poll_fn(|cx| {
-            let mut inner = self.shared.lock();
-            match inner.phase.failure() {
-                Some(failure) => Poll::Ready(failure),
-                None => {
-                    inner.phase_waker = Some(cx.waker().clone());
-                    Poll::Pending
-                }
-            }
-        })
-        .await
     }
 
     /// Resolves once the handshake has completed or failed.
@@ -471,6 +492,13 @@ impl NwStream {
                     .then(|| CStr::from_ptr(alpn).to_string_lossy().into_owned()),
             })
         }
+    }
+
+    /// Reports whether the connection has ended, even once the stream is gone.
+    #[cfg(test)]
+    pub(super) fn end_probe(&self) -> impl Fn() -> bool + Send + use<> {
+        let shared = Arc::clone(&self.shared);
+        move || shared.lock().phase.is_terminal()
     }
 
     fn receive(&self) {
@@ -541,6 +569,13 @@ fn cancel(connection: &Handle<Nw>) {
 impl Drop for NwStream {
     fn drop(&mut self) {
         self.close();
+        // The close waits behind earlier sends, which never complete if the server
+        // has stopped reading, and nothing else is left to cancel the connection.
+        if matches!(self.shared.lock().phase, Phase::Ready) {
+            let connection = self.connection.clone();
+            let cancel_late = RcBlock::new(move || cancel(&connection));
+            ffi::run_after(DRAIN_LIMIT, &self.queue, &cancel_late);
+        }
     }
 }
 
@@ -568,9 +603,7 @@ impl AsyncRead for NwStream {
             return Poll::Ready(Err(failure.to_io_error()));
         }
         if inner.eof {
-            drop(inner);
-            // The end of the stream is only clean if the real transport ended cleanly.
-            return Poll::Ready(this.health.error().map_or(Ok(()), Err));
+            return Poll::Ready(Ok(()));
         }
         match &inner.phase {
             Phase::Failed(failure) => return Poll::Ready(Err(failure.to_io_error())),
@@ -655,10 +688,10 @@ impl Stream for NwStream {
 
     fn tls_handshake_completed(&mut self) {}
 
-    // The real transport belongs to the pump, which is the only thing that can
-    // tell whether the server hung up.
+    // A read keeps a receive outstanding even while the stream is idle, so a
+    // server hanging up shows up here without anyone reading.
     fn is_connection_dead(&self) -> bool {
-        self.health.is_closed() || self.shared.lock().is_finished()
+        self.shared.lock().is_finished()
     }
 }
 
@@ -667,34 +700,56 @@ fn c_string(value: &str) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "value contains a NUL byte"))
 }
 
-fn unix_endpoint(path: &Path) -> io::Result<Handle<Nw>> {
-    let bytes = path.as_os_str().as_bytes();
-    // SAFETY: `sockaddr_un` is plain old data, for which all zeroes is valid.
-    let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
-    if bytes.len() >= address.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the TLS socket path is too long",
-        ));
-    }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    address.sun_len = (mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len()) as u8;
-    for (to, from) in address.sun_path.iter_mut().zip(bytes) {
-        *to = *from as libc::c_char;
-    }
-    // SAFETY: `address` is a complete socket address, which the call copies.
-    unsafe {
-        Handle::from_owned(ffi::nw_endpoint_create_address(
-            ptr::from_ref(&address).cast(),
-        ))
-    }
-    .ok_or_else(|| io::Error::other("failed to create a Network.framework endpoint"))
+fn sockaddr_in(address: &SocketAddrV4) -> libc::sockaddr_in {
+    // SAFETY: `sockaddr_in` is plain old data, for which all zeroes is valid.
+    let mut raw: libc::sockaddr_in = unsafe { mem::zeroed() };
+    raw.sin_len = mem::size_of::<libc::sockaddr_in>() as u8;
+    raw.sin_family = libc::AF_INET as libc::sa_family_t;
+    raw.sin_port = address.port().to_be();
+    raw.sin_addr.s_addr = u32::from_ne_bytes(address.ip().octets());
+    raw
+}
+
+fn sockaddr_in6(address: &SocketAddrV6) -> libc::sockaddr_in6 {
+    // SAFETY: `sockaddr_in6` is plain old data, for which all zeroes is valid.
+    let mut raw: libc::sockaddr_in6 = unsafe { mem::zeroed() };
+    raw.sin6_len = mem::size_of::<libc::sockaddr_in6>() as u8;
+    raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    raw.sin6_port = address.port().to_be();
+    raw.sin6_flowinfo = address.flowinfo();
+    raw.sin6_addr.s6_addr = address.ip().octets();
+    raw.sin6_scope_id = address.scope_id();
+    raw
+}
+
+fn address_endpoint(address: SocketAddr) -> io::Result<Handle<Nw>> {
+    // SAFETY: each address is complete, with its length set, and the call copies it.
+    let endpoint = unsafe {
+        match &address {
+            SocketAddr::V4(v4) => {
+                let raw = sockaddr_in(v4);
+                ffi::nw_endpoint_create_address(ptr::from_ref(&raw).cast())
+            }
+            SocketAddr::V6(v6) => {
+                let raw = sockaddr_in6(v6);
+                ffi::nw_endpoint_create_address(ptr::from_ref(&raw).cast())
+            }
+        }
+    };
+    // SAFETY: the endpoint is null or owned (+1).
+    unsafe { Handle::from_owned(endpoint) }
+        .ok_or_else(|| io::Error::other("failed to create a Network.framework endpoint"))
+}
+
+fn whole_seconds(duration: Duration) -> u32 {
+    u32::try_from(duration.as_secs()).unwrap_or(u32::MAX)
 }
 
 fn tls_parameters(
     server_name: Option<CString>,
     alpn: CString,
     verifier: Arc<Verifier>,
+    keep_alive: KeepAlive,
 ) -> io::Result<Handle<Nw>> {
     let configured = Arc::new(AtomicBool::new(false));
     let configure = {
@@ -705,17 +760,34 @@ fn tls_parameters(
             }
         })
     };
-    // SAFETY: the block runs before the call returns. The default configuration is
-    // the framework's own constant.
+    let configure_tcp = RcBlock::new(move |options: Object| configure_tcp(options, keep_alive));
+    // SAFETY: both blocks run before the call returns.
     let parameters = unsafe {
         Handle::<Nw>::from_owned(ffi::nw_parameters_create_secure_tcp(
             &configure,
-            ffi::default_configuration(),
+            &configure_tcp,
         ))
     };
     match parameters {
-        Some(parameters) if configured.load(Ordering::Acquire) => Ok(parameters),
+        Some(parameters) if configured.load(Ordering::Acquire) => {
+            // A socket would not go through a proxy either.
+            // SAFETY: `parameters` is live.
+            unsafe { ffi::nw_parameters_set_prefer_no_proxy(parameters.as_ptr(), true) };
+            Ok(parameters)
+        }
         _ => Err(io::Error::other("failed to configure TLS")),
+    }
+}
+
+/// Runs inside Network.framework's configure block, setting what the socket
+/// transport sets on its sockets.
+fn configure_tcp(options: Object, keep_alive: KeepAlive) {
+    // SAFETY: `options` is live TCP options for the duration of the configure block.
+    unsafe {
+        ffi::nw_tcp_options_set_no_delay(options, true);
+        ffi::nw_tcp_options_set_enable_keepalive(options, true);
+        ffi::nw_tcp_options_set_keepalive_idle_time(options, whole_seconds(keep_alive.idle));
+        ffi::nw_tcp_options_set_keepalive_interval(options, whole_seconds(keep_alive.interval));
     }
 }
 
@@ -779,12 +851,36 @@ mod tests {
     }
 
     #[test]
-    fn posix_errors_keep_their_meaning() {
-        let kind = |code| error_kind(ERROR_DOMAIN_POSIX, code);
+    fn posix_errors_read_as_a_socket_would_report_them() {
+        let failure = Failure::os(libc::ECONNREFUSED);
+        let socket = io::Error::from_raw_os_error(libc::ECONNREFUSED);
 
-        assert_eq!(kind(libc::ECONNRESET), io::ErrorKind::ConnectionReset);
-        assert_eq!(kind(libc::EPIPE), io::ErrorKind::BrokenPipe);
-        assert_eq!(kind(libc::ETIMEDOUT), io::ErrorKind::TimedOut);
+        assert_eq!(failure.kind, io::ErrorKind::ConnectionRefused);
+        assert_eq!(failure.to_string(), socket.to_string());
+        let error = failure.to_io_error();
+        assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+        assert_eq!(error.to_string(), socket.to_string());
+    }
+
+    #[test]
+    fn only_failing_to_reach_the_server_is_unreachable() {
+        for code in [
+            libc::ECONNREFUSED,
+            libc::ETIMEDOUT,
+            libc::EHOSTUNREACH,
+            libc::EHOSTDOWN,
+            libc::ENETUNREACH,
+            libc::ENETDOWN,
+            libc::EADDRNOTAVAIL,
+            libc::EAFNOSUPPORT,
+        ] {
+            assert!(Failure::os(code).is_unreachable(), "os error {code}");
+        }
+        for code in [libc::ECONNRESET, libc::EPIPE, libc::ENOTCONN] {
+            assert!(!Failure::os(code).is_unreachable(), "os error {code}");
+        }
+        assert!(!Failure::new(io::ErrorKind::InvalidData, "bad certificate").is_unreachable());
+        assert!(!Failure::unknown().is_unreachable());
     }
 
     #[test]
@@ -801,6 +897,40 @@ mod tests {
     fn errors_from_other_domains_are_generic() {
         assert_eq!(error_kind(2, -65554), io::ErrorKind::Other);
         assert_eq!(error_kind(0, 0), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn socket_addresses_are_laid_out_as_the_kernel_expects() {
+        let v4 = sockaddr_in(&SocketAddrV4::new([192, 0, 2, 1].into(), 1433));
+        assert_eq!(usize::from(v4.sin_len), mem::size_of::<libc::sockaddr_in>());
+        assert_eq!(i32::from(v4.sin_family), libc::AF_INET);
+        assert_eq!(u16::from_be(v4.sin_port), 1433);
+        assert_eq!(v4.sin_addr.s_addr.to_ne_bytes(), [192, 0, 2, 1]);
+
+        let ip = "2001:db8::1".parse().unwrap();
+        let v6 = sockaddr_in6(&SocketAddrV6::new(ip, 1434, 7, 3));
+        assert_eq!(
+            usize::from(v6.sin6_len),
+            mem::size_of::<libc::sockaddr_in6>()
+        );
+        assert_eq!(i32::from(v6.sin6_family), libc::AF_INET6);
+        assert_eq!(u16::from_be(v6.sin6_port), 1434);
+        assert_eq!(v6.sin6_addr.s6_addr, ip.octets());
+        assert_eq!(v6.sin6_flowinfo, 7);
+        assert_eq!(v6.sin6_scope_id, 3);
+    }
+
+    #[test]
+    fn every_address_family_makes_an_endpoint() {
+        assert!(address_endpoint(SocketAddr::from(([127, 0, 0, 1], 1433))).is_ok());
+        assert!(address_endpoint("[::1]:1433".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn keep_alive_timing_is_truncated_to_whole_seconds() {
+        assert_eq!(whole_seconds(Duration::from_millis(30_999)), 30);
+        assert_eq!(whole_seconds(Duration::from_millis(999)), 0);
+        assert_eq!(whole_seconds(Duration::from_secs(u64::MAX)), u32::MAX);
     }
 
     #[test]
@@ -990,15 +1120,5 @@ mod tests {
             c_string("tds\0").unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
-    }
-
-    #[test]
-    fn a_socket_path_must_fit_a_socket_address() {
-        let long = Path::new("/").join("a".repeat(200));
-
-        let error = unix_endpoint(&long).err().unwrap();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(unix_endpoint(Path::new("/tmp/s")).is_ok());
     }
 }

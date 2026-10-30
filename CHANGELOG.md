@@ -87,12 +87,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   (AB#49295).
 
 - `mssql-tds`: TLS 1.3 and the post-quantum `X25519MLKEM768` key exchange on
-  macOS for TDS 8.0 (Strict) connections. Direct handshakes run on Apple's
-  Network.framework, with certificates still evaluated by Security.framework, so
-  keychain roots and trust settings apply. The post-quantum group needs macOS 26
-  and a server that offers it; current SQL Server negotiates X25519. TDS 7.x
-  handshakes remain on Secure Transport (TLS 1.2 maximum). The default-on
-  `tls-network-framework-on-macos` feature controls this;
+  macOS for TDS 8.0 (Strict) connections. Strict TCP connections are opened
+  through Apple's Network.framework, with certificates still evaluated by
+  Security.framework, so keychain roots and trust settings apply. The connect
+  timeout covers the TLS handshake on this path. The post-quantum group needs
+  macOS 26 and a server that offers it; current SQL Server negotiates X25519.
+  TDS 7.x handshakes remain on Secure Transport (TLS 1.2 maximum). The
+  default-on `tls-network-framework-on-macos` feature controls this;
   `default-features = false` restores native-tls throughout. Handshake failures
   surface as `Error::TlsHandshakeError` on every engine.
 

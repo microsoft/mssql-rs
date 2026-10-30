@@ -68,11 +68,36 @@ impl Default for ParallelConnectConfig {
     }
 }
 
+/// Why connecting to one address failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AttemptError {
+    /// The address could not be reached, so another address may still connect.
+    #[error(transparent)]
+    Unreachable(#[from] std::io::Error),
+    /// The server was reached but the connection still failed, such as on a
+    /// certificate it could not prove, which no other address would fix.
+    #[error(transparent)]
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "tls-network-framework")),
+        allow(dead_code)
+    )]
+    Rejected(Error),
+}
+
+impl From<AttemptError> for Error {
+    fn from(error: AttemptError) -> Self {
+        match error {
+            AttemptError::Unreachable(error) => Error::from(error),
+            AttemptError::Rejected(error) => error,
+        }
+    }
+}
+
 /// Result of a parallel connection attempt.
 #[derive(Debug)]
-pub struct ParallelConnectResult {
-    /// The successfully connected TCP stream.
-    pub stream: TcpStream,
+pub struct ParallelConnectResult<S = TcpStream> {
+    /// The successfully connected stream.
+    pub stream: S,
     /// The address that was successfully connected to.
     pub connected_address: SocketAddr,
     /// Number of addresses that were attempted.
@@ -123,32 +148,51 @@ pub async fn parallel_connect(
     port: u16,
     config: &ParallelConnectConfig,
 ) -> TdsResult<ParallelConnectResult> {
-    parallel_connect_resolving(host, port, config, |_| {}, || {})
-        .await
-        .map(|(result, _)| result)
+    let (keep_alive_in_ms, keep_alive_interval_in_ms) =
+        (config.keep_alive_in_ms, config.keep_alive_interval_in_ms);
+    parallel_connect_resolving_with(
+        host,
+        port,
+        config.timeout_ms,
+        |_| {},
+        || {},
+        |_| {},
+        move |addr| connect_with_keepalive(addr, keep_alive_in_ms, keep_alive_interval_in_ms),
+    )
+    .await
+    .map(|(result, _)| result)
 }
 
-/// [`parallel_connect`], also returning what `host` resolved to, which the
-/// connection's login DNS caching verdict applies to. It hands
-/// `dns_fell_back` the resolver's error when the DNS cache supplied the
-/// addresses instead, and calls `resolved` once the host has resolved, before
-/// the race, so a caller can record where the addresses came from even when
-/// no address then accepts.
-pub(crate) async fn parallel_connect_resolving(
+/// [`parallel_connect`] with the per-address connect supplied by the caller,
+/// also returning what `host` resolved to, which the connection's login DNS
+/// caching verdict applies to. It hands `dns_fell_back` the resolver's error
+/// when the DNS cache supplied the addresses instead, and calls `resolved`
+/// once the host has resolved, before the race, so a caller can record where
+/// the addresses came from even when no address then accepts. An address that
+/// rejects the connection ends the race, and is handed to `rejected`.
+pub(crate) async fn parallel_connect_resolving_with<S, C, F, E>(
     host: &str,
     port: u16,
-    config: &ParallelConnectConfig,
+    timeout_ms: u64,
     dns_fell_back: impl FnOnce(&std::io::Error),
     resolved: impl FnOnce(),
-) -> TdsResult<(ParallelConnectResult, Resolution)> {
+    rejected: impl FnOnce(SocketAddr),
+    connect: C,
+) -> TdsResult<(ParallelConnectResult<S>, Resolution)>
+where
+    S: Send + 'static,
+    C: Fn(SocketAddr) -> F,
+    F: Future<Output = Result<S, E>> + Send + 'static,
+    E: Into<AttemptError>,
+{
     info!(
         "Starting parallel connection to {}:{} with timeout {}ms",
-        host, port, config.timeout_ms
+        host, port, timeout_ms
     );
 
     // `timeout_ms` is documented as the overall budget for this call, so it
     // must cover DNS resolution too, not just the connection race below.
-    let deadline = Instant::now() + Duration::from_millis(config.timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     // Resolve DNS to get all IP addresses. `lookup_host` awaits the resolution
     // instead of blocking the calling thread (unlike `std::net::ToSocketAddrs`),
@@ -165,7 +209,7 @@ pub(crate) async fn parallel_connect_resolving(
         Err(_elapsed) => {
             warn!(
                 "DNS resolution for {}:{} timed out after {}ms",
-                host, port, config.timeout_ms
+                host, port, timeout_ms
             );
             return Err(Error::TimeoutError(crate::error::TimeoutErrorType::String(
                 format!("Connection timeout: DNS resolution for {host}:{port} timed out"),
@@ -188,13 +232,11 @@ pub(crate) async fn parallel_connect_resolving(
         .enumerate()
         .map(|(idx, addr)| {
             let addr = *addr;
-            let keep_alive_in_ms = config.keep_alive_in_ms;
-            let keep_alive_interval_in_ms = config.keep_alive_interval_in_ms;
+            let attempt = connect(addr);
             async move {
                 trace!("Attempting connection {} to {}", idx, addr);
-                match connect_with_keepalive(addr, keep_alive_in_ms, keep_alive_interval_in_ms)
-                    .await
-                {
+                let result: Result<S, AttemptError> = attempt.await.map_err(Into::into);
+                match result {
                     Ok(stream) => {
                         info!("Connection {} to {} succeeded", idx, addr);
                         Ok((stream, addr, idx))
@@ -232,7 +274,11 @@ pub(crate) async fn parallel_connect_resolving(
                 resolution,
             ))
         }
-        Ok(Err(last_error)) => {
+        Ok(Err(RaceLost::Rejected(error, address))) => {
+            rejected(address);
+            Err(error)
+        }
+        Ok(Err(RaceLost::Unreachable(last_error))) => {
             warn!(
                 "All {} parallel connections failed. Last error: {}",
                 total_addresses, last_error
@@ -243,7 +289,7 @@ pub(crate) async fn parallel_connect_resolving(
             )))
         }
         Err(_) => {
-            warn!("Parallel connection timeout after {}ms", config.timeout_ms);
+            warn!("Parallel connection timeout after {}ms", timeout_ms);
             Err(Error::TimeoutError(crate::error::TimeoutErrorType::String(
                 "Connection timeout: Connection attempt timed out".to_string(),
             )))
@@ -279,14 +325,16 @@ pub async fn parallel_connect_to_addresses(
 
 /// [`parallel_connect_to_addresses`] with the per-address connect supplied by
 /// the caller, so tests can stand in for an address that never answers.
-async fn parallel_connect_with<C, F>(
+pub(crate) async fn parallel_connect_with<S, C, F, E>(
     addresses: Vec<SocketAddr>,
     timeout_ms: u64,
     connect: C,
-) -> TdsResult<ParallelConnectResult>
+) -> TdsResult<ParallelConnectResult<S>>
 where
+    S: Send + 'static,
     C: Fn(SocketAddr) -> F,
-    F: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
+    F: Future<Output = Result<S, E>> + Send + 'static,
+    E: Into<AttemptError>,
 {
     validate_address_count(addresses.len())?;
 
@@ -305,7 +353,8 @@ where
             let attempt = connect(addr);
             async move {
                 trace!("Attempting connection {} to {}", idx, addr);
-                match attempt.await {
+                let result: Result<S, AttemptError> = attempt.await.map_err(Into::into);
+                match result {
                     Ok(stream) => {
                         info!("Connection {} to {} succeeded", idx, addr);
                         Ok((stream, addr, idx))
@@ -339,7 +388,8 @@ where
                 failed_attempts,
             })
         }
-        Ok(Err(last_error)) => {
+        Ok(Err(RaceLost::Rejected(error, _))) => Err(error),
+        Ok(Err(RaceLost::Unreachable(last_error))) => {
             warn!(
                 "All {} parallel connections failed. Last error: {}",
                 total_addresses, last_error
@@ -379,7 +429,7 @@ fn validate_address_count(count: usize) -> TdsResult<()> {
 }
 
 /// Connects to a single address with TCP keep-alive settings.
-async fn connect_with_keepalive(
+pub(crate) async fn connect_with_keepalive(
     addr: SocketAddr,
     keep_alive_in_ms: u32,
     keep_alive_interval_in_ms: u32,
@@ -402,21 +452,29 @@ async fn connect_with_keepalive(
     socket.connect(addr).await
 }
 
+/// How a race of connection attempts ended without a connection.
+enum RaceLost {
+    /// The address rejected the connection, which ends the race.
+    Rejected(Error, SocketAddr),
+    /// No address could be reached; the last error.
+    Unreachable(std::io::Error),
+}
+
 /// Races multiple connection futures and returns the first successful one.
 ///
 /// Each attempt runs as a task in a `JoinSet`, which aborts every attempt still
-/// pending when the race returns or is dropped. A win, or the login deadline
-/// cancelling the race, therefore closes the other sockets instead of leaving
-/// them to the OS connect timeout. If all connections fail, returns the last
-/// error.
-async fn race_connections(
+/// pending when the race returns or is dropped. A win, a rejection, or the login
+/// deadline cancelling the race therefore closes the other connections instead
+/// of leaving them to the OS connect timeout. If all connections fail, returns
+/// the last error.
+async fn race_connections<S: Send + 'static>(
     connect_futures: Vec<
         impl std::future::Future<
-            Output = Result<(TcpStream, SocketAddr, usize), (std::io::Error, SocketAddr, usize)>,
+            Output = Result<(S, SocketAddr, usize), (AttemptError, SocketAddr, usize)>,
         > + Send
         + 'static,
     >,
-) -> Result<(TcpStream, SocketAddr, usize, usize), std::io::Error> {
+) -> Result<(S, SocketAddr, usize, usize), RaceLost> {
     let mut attempts = tokio::task::JoinSet::new();
     for fut in connect_futures {
         attempts.spawn(crate::trace_context::propagate_future(fut));
@@ -431,9 +489,12 @@ async fn race_connections(
     while let Some(attempt) = attempts.join_next().await {
         match attempt {
             Ok(Ok((stream, addr, idx))) => return Ok((stream, addr, idx, failed_attempts)),
-            Ok(Err((e, _addr, _idx))) => {
+            Ok(Err((AttemptError::Unreachable(e), _addr, _idx))) => {
                 failed_attempts += 1;
                 last_error = e;
+            }
+            Ok(Err((AttemptError::Rejected(error), addr, _idx))) => {
+                return Err(RaceLost::Rejected(error, addr));
             }
             Err(join_error) => {
                 failed_attempts += 1;
@@ -442,13 +503,15 @@ async fn race_connections(
         }
     }
 
-    Err(last_error)
+    Err(RaceLost::Unreachable(last_error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -461,7 +524,9 @@ mod tests {
             let recorded = attempted.clone();
             let result = parallel_connect_with(addresses, 1_000, move |_| {
                 recorded.fetch_add(1, Ordering::SeqCst);
-                async { Err::<TcpStream, _>(std::io::ErrorKind::ConnectionRefused.into()) }
+                async {
+                    Err::<TcpStream, std::io::Error>(std::io::ErrorKind::ConnectionRefused.into())
+                }
             })
             .await;
             assert!(result.is_err());
@@ -502,7 +567,6 @@ mod tests {
     #[test]
     fn parallel_attempt_tasks_inherit_context_without_leaking_it() {
         use crate::trace_context::{self, ConnectionTrace, Context, Snapshot, snapshot};
-        use std::sync::Arc;
 
         trace_context::enable();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -521,17 +585,18 @@ mod tests {
                 tokio::task::yield_now().await;
                 assert_eq!(snapshot(), expected);
                 Err((
-                    std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                    AttemptError::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
                     SocketAddr::from(([127, 0, 0, 1], 0)),
                     index,
                 ))
             })
             .collect();
-        let result = runtime.block_on(race_connections(attempts));
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::ConnectionRefused
-        );
+        let result = runtime.block_on(race_connections::<TcpStream>(attempts));
+        assert!(matches!(
+            result,
+            Err(RaceLost::Unreachable(error))
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+        ));
         assert_eq!(snapshot(), expected);
         let worker_context = runtime
             .block_on(runtime.spawn(async { snapshot() }))
@@ -543,15 +608,6 @@ mod tests {
     /// connecting must go with it rather than keep its socket open.
     #[tokio::test]
     async fn a_dropped_race_aborts_every_pending_attempt() {
-        use std::sync::Arc;
-
-        struct Pending(Arc<AtomicUsize>);
-        impl Drop for Pending {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-
         let pending = Arc::new(AtomicUsize::new(3));
         let attempts = (0..3)
             .map(|_| {
@@ -559,7 +615,7 @@ mod tests {
                 async move {
                     let _guard = guard;
                     std::future::pending::<
-                        Result<(TcpStream, SocketAddr, usize), (std::io::Error, SocketAddr, usize)>,
+                        Result<(TcpStream, SocketAddr, usize), (AttemptError, SocketAddr, usize)>,
                     >()
                     .await
                 }
@@ -568,13 +624,82 @@ mod tests {
 
         let raced = timeout(Duration::from_millis(50), race_connections(attempts)).await;
         assert!(raced.is_err(), "no attempt ever finishes");
+        all_dropped(&pending).await;
+    }
+
+    /// A server that was reached but rejected the connection ends the race at
+    /// once, rather than waiting on addresses that may never answer.
+    #[tokio::test]
+    async fn a_rejected_attempt_ends_the_race() {
+        let pending = Arc::new(AtomicUsize::new(1));
+        let silent = {
+            let guard = Pending(Arc::clone(&pending));
+            async move {
+                let _guard = guard;
+                std::future::pending::<
+                    Result<(TcpStream, SocketAddr, usize), (AttemptError, SocketAddr, usize)>,
+                >()
+                .await
+            }
+            .boxed()
+        };
+        let rejected = async {
+            Err((
+                AttemptError::Rejected(Error::CertificateMismatch),
+                SocketAddr::from(([127, 0, 0, 1], 1)),
+                1,
+            ))
+        }
+        .boxed();
+
+        let raced = timeout(
+            Duration::from_secs(5),
+            race_connections(vec![silent, rejected]),
+        )
+        .await
+        .expect("a rejection does not wait for the silent attempt");
+        assert!(matches!(
+            raced,
+            Err(RaceLost::Rejected(Error::CertificateMismatch, address))
+                if address == SocketAddr::from(([127, 0, 0, 1], 1))
+        ));
+        all_dropped(&pending).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_connect_reports_a_rejection_as_it_is() {
+        let mut rejected_at = None;
+        let result = parallel_connect_resolving_with(
+            "127.0.0.1",
+            1,
+            5_000,
+            |_| {},
+            || {},
+            |address| rejected_at = Some(address),
+            |_| async { Err::<TcpStream, _>(AttemptError::Rejected(Error::CertificateMismatch)) },
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::CertificateMismatch)));
+        assert_eq!(rejected_at, Some(SocketAddr::from(([127, 0, 0, 1], 1))));
+    }
+
+    struct Pending(Arc<AtomicUsize>);
+
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn all_dropped(pending: &AtomicUsize) {
         timeout(Duration::from_secs(5), async {
             while pending.load(Ordering::SeqCst) > 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("dropping the race aborts every attempt");
+        .expect("ending the race aborts every attempt");
     }
 
     /// Regression coverage for AB#47704: `parallel_connect` used to resolve

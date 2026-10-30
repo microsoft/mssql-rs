@@ -11,6 +11,7 @@
 use std::ffi::{c_char, c_void};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::time::Duration;
 
 use block2::Block;
 use security_framework_sys::trust::SecTrustRef;
@@ -27,6 +28,7 @@ pub(super) type SendCompletion = Block<dyn Fn(Object)>;
 pub(super) type ConfigureProtocol = Block<dyn Fn(Object)>;
 pub(super) type VerifyComplete = Block<dyn Fn(BlockBool)>;
 pub(super) type VerifyHandler = Block<dyn Fn(Object, Object, *mut VerifyComplete)>;
+pub(super) type Task = Block<dyn Fn()>;
 
 pub(super) const STATE_WAITING: u32 = 1;
 pub(super) const STATE_READY: u32 = 3;
@@ -42,10 +44,11 @@ pub(super) const TLS_1_3: u16 = 0x0304;
 /// `QOS_CLASS_USER_INITIATED`.
 const QOS_USER_INITIATED: isize = 0x19;
 
+const DISPATCH_TIME_NOW: u64 = 0;
+
 #[link(name = "Network", kind = "framework")]
 unsafe extern "C" {
     static _nw_content_context_default_stream: Object;
-    static _nw_parameters_configure_protocol_default_configuration: *const c_void;
 
     fn nw_retain(object: Object) -> Object;
     fn nw_release(object: Object);
@@ -54,8 +57,13 @@ unsafe extern "C" {
 
     pub(super) fn nw_parameters_create_secure_tcp(
         configure_tls: &ConfigureProtocol,
-        configure_tcp: *const c_void,
+        configure_tcp: &ConfigureProtocol,
     ) -> Object;
+    pub(super) fn nw_parameters_set_prefer_no_proxy(parameters: Object, prefer_no_proxy: bool);
+    pub(super) fn nw_tcp_options_set_no_delay(options: Object, no_delay: bool);
+    pub(super) fn nw_tcp_options_set_enable_keepalive(options: Object, enable_keepalive: bool);
+    pub(super) fn nw_tcp_options_set_keepalive_idle_time(options: Object, seconds: u32);
+    pub(super) fn nw_tcp_options_set_keepalive_interval(options: Object, seconds: u32);
     pub(super) fn nw_tls_copy_sec_protocol_options(options: Object) -> Object;
     pub(super) fn nw_tls_copy_sec_protocol_metadata(metadata: Object) -> Object;
     pub(super) fn nw_protocol_copy_tls_definition() -> Object;
@@ -131,6 +139,8 @@ unsafe extern "C" {
 
     fn dispatch_queue_create(label: *const c_char, attr: Object) -> Object;
     fn dispatch_get_global_queue(identifier: isize, flags: usize) -> Object;
+    fn dispatch_time(when: u64, delta: i64) -> u64;
+    fn dispatch_after(when: u64, queue: Object, block: &Task);
     fn dispatch_data_create(
         buffer: *const c_void,
         size: usize,
@@ -269,12 +279,6 @@ pub(super) fn stream_context() -> Object {
     unsafe { _nw_content_context_default_stream }
 }
 
-/// `NW_PARAMETERS_DEFAULT_CONFIGURATION`.
-pub(super) fn default_configuration() -> *const c_void {
-    // SAFETY: an immutable block pointer the framework initializes at load time.
-    unsafe { _nw_parameters_configure_protocol_default_configuration }
-}
-
 /// A new serial queue, so that one connection's callbacks never wait on another's.
 pub(super) fn new_serial_queue() -> Option<Handle<Dispatch>> {
     // SAFETY: a null attribute makes the queue serial; the result is owned (+1).
@@ -291,6 +295,16 @@ pub(super) fn new_serial_queue() -> Option<Handle<Dispatch>> {
 pub(super) fn verification_queue() -> Option<Handle<Dispatch>> {
     // SAFETY: global queues are immortal, so retaining one is harmless.
     unsafe { Handle::from_borrowed(dispatch_get_global_queue(QOS_USER_INITIATED, 0)) }
+}
+
+/// Runs `task` on `queue` once `delay` has passed.
+pub(super) fn run_after(delay: Duration, queue: &Handle<Dispatch>, task: &Task) {
+    let delta = i64::try_from(delay.as_nanos()).unwrap_or(i64::MAX);
+    // SAFETY: the queue is live, and the call retains it and copies the block.
+    unsafe {
+        let when = dispatch_time(DISPATCH_TIME_NOW, delta);
+        dispatch_after(when, queue.as_ptr(), task);
+    }
 }
 
 /// Copies `bytes` into a dispatch data object the framework can hold on to.

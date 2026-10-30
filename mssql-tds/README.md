@@ -65,7 +65,7 @@ migration, timeouts, and DNS caching.
 |---|---|---|
 | `integrated-auth` | On | Enables `sspi` (Windows) and `gssapi` (Unix Kerberos). |
 | `tls-schannel-direct-on-windows` | On | Enables `tls-schannel-direct`: the in-tree Windows Schannel TLS engine. |
-| `tls-network-framework-on-macos` | On | Enables `tls-network-framework`: the in-tree macOS TLS engine on Apple's Network.framework for direct TDS 8.0 (Strict) handshakes, adding TLS 1.3 and the `X25519MLKEM768` post-quantum key exchange. |
+| `tls-network-framework-on-macos` | On | Enables `tls-network-framework`: on macOS, TDS 8.0 (Strict) TCP connections are opened through Apple's Network.framework, adding TLS 1.3 and the `X25519MLKEM768` post-quantum key exchange. |
 
 Set `default-features = false` to omit integrated authentication and use
 `native-tls` on all platforms. Individual auth and TLS features can be enabled
