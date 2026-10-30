@@ -157,6 +157,36 @@ def test_release_defaults_are_safe():
     assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
 
 
+@pytest.mark.parametrize("probe_exit", [0, 7, 28])
+def test_linux_wheel_network_diagnostics_are_bounded_and_nonblocking(probe_exit):
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    job = next(
+        job for job in expand(source, _stage_flags())["stages"][0]["jobs"]
+        if job["job"] == "Linux_x64"
+    )
+    step = job["steps"][0]
+    assert step["displayName"] == "Diagnose GHCR connectivity before Linux x64 setup"
+    assert step["timeoutInMinutes"] == 3
+    script = step["bash"]
+    assert "--connect-timeout 5 --max-time 10" in script
+    assert "timeout 10 getent" in script
+    assert "timeout 30 docker manifest inspect" in script
+    assert "--noproxy '*'" in script
+    stub = f"""
+    export AGENT_NAME=test-agent
+    export HTTPS_PROXY=https://secret-proxy-value.invalid
+    timeout() {{ return {probe_exit}; }}
+    curl() {{ return {probe_exit}; }}
+    """
+    result = subprocess.run(
+        ["bash", "-c", stub + script], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "secret-proxy-value" not in result.stdout + result.stderr
+    assert "HTTPS_PROXY is set (value omitted)" in result.stdout
+    assert ("task.logissue type=warning" in result.stdout) == (probe_exit != 0)
+
+
 @pytest.mark.parametrize("is_official", [False, True])
 @pytest.mark.parametrize("build_products", [False, True])
 def test_cpp_codeql_build_is_official_only(is_official, build_products):
