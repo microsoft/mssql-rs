@@ -35,6 +35,11 @@ _BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
 _WHEEL_INSTALL_TEMPLATE = (
     _ROOT / ".pipeline" / "templates" / "test-python-wheel-installs-template.yml"
 )
+_SIGN_WINDOWS_WHEELS_TEMPLATE = (
+    _ROOT / ".pipeline" / "templates" / "sign-windows-wheels-template.yml"
+)
+_SIGN_WINDOWS_WHEELS_REF = "/.pipeline/templates/sign-windows-wheels-template.yml"
+_ESRP_GROUP = "ESRP Federated Creds (AME)"
 _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
 _VERIFY_WHEELS_SCRIPT = _ROOT / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
 _SQLCMD_PACK_SCRIPT = _ROOT / ".pipeline" / "scripts" / "pack-mssql-sqlcmd.ps1"
@@ -53,6 +58,8 @@ def evaluate(expression, parameters, succeeded=True):
     expression = re.sub(r"\bor\(", "any_(", expression)
 
     def visit(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
         if isinstance(node, ast.Name):
             return {"true": True, "false": False}[node.id.lower()]
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
@@ -1150,11 +1157,13 @@ def test_crate_templates_resolve_in_self_repository():
         ),
     ],
 )
+@pytest.mark.parametrize("is_official", [False, True])
 def test_python_wheel_install_gate_precedes_artifact_publication(
     job_name: str,
     os_type: str,
     architecture: str,
     python_versions: list[str],
+    is_official: bool,
 ) -> None:
     source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
     install_template = yaml.safe_load(
@@ -1171,12 +1180,16 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
         buildOdbcNative=True,
         buildRustCrates=False,
         testPythonWheelInstalls=True,
-        isOfficial=True,
+        isOfficial=is_official,
         publishToFeed=False,
     )
     pipeline = expand(source, flags)
     build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
-    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    # Official Windows wheels are install-tested only after ESRP signing, in
+    # the job that repacks them.
+    signed = is_official and os_type == "Windows"
+    tested_job = f"{job_name}_Finalize" if signed else job_name
+    job = next(job for job in build["jobs"] if job.get("job") == tested_job)
     steps = job["steps"]
     install_steps = [
         (index, step)
@@ -1199,14 +1212,18 @@ def test_python_wheel_install_gate_precedes_artifact_publication(
     assert install_index < publish_index
 
     # The gate only proves anything if it runs after every step that mutates the
-    # wheel it installs - ODBC injection and (on Linux) the glibc/glibc-2.28
-    # auditwheel repair - otherwise it can pass while install-testing a wheel
-    # with no driver in it.
+    # wheel it installs - ODBC injection, (on Linux) the glibc/glibc-2.28
+    # auditwheel repair, and (official Windows) the signed-wheel repack -
+    # otherwise it can pass while install-testing a wheel with no driver in it.
     transform_indices = [
         index
         for index, step in enumerate(steps)
         if "Inject ODBC driver into" in str(step.get("displayName", ""))
         or "Repair glibc" in str(step.get("displayName", ""))
+        or (
+            step.get("template") == _SIGN_WINDOWS_WHEELS_REF
+            and step["parameters"]["phase"] == "repack"
+        )
     ]
     assert transform_indices, "expected a wheel-transforming step in this job"
     assert max(transform_indices) < install_index
@@ -1255,21 +1272,263 @@ def test_windows_and_macos_install_matrix_tracks_release_python_tags() -> None:
     )
     pipeline = expand(source, flags)
     build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
-    arm64_job = next(job for job in build["jobs"] if job.get("job") == "Windows_ARM64")
+    jobs = {job["job"]: job for job in build["jobs"] if "job" in job}
 
     # win_arm64 excludes the floor version today (limited hosted-agent
-    # support for it, per the comment in stages.yml), nothing else.
+    # support for it, per the comment in stages.yml), nothing else. Official
+    # wheels are install-tested in the job that repacks them after signing.
     expected_arm64_versions = set(default_versions) - {floor}
-    for template_name in (
-        "build-python-wheels-template.yml",
-        "test-python-wheel-installs-template.yml",
+    for job_name, template_name in (
+        ("Windows_ARM64", "build-python-wheels-template.yml"),
+        ("Windows_ARM64_Finalize", "test-python-wheel-installs-template.yml"),
     ):
         step = next(
             step
-            for step in arm64_job["steps"]
+            for step in jobs[job_name]["steps"]
             if step.get("template") == f"/.pipeline/templates/{template_name}"
         )
         assert set(step["parameters"]["pythonVersions"]) == expected_arm64_versions
+
+    repack = next(
+        step
+        for step in jobs["Windows_ARM64_Finalize"]["steps"]
+        if step.get("template") == _SIGN_WINDOWS_WHEELS_REF
+    )
+    assert repack["parameters"]["phase"] == "repack"
+    assert repack["parameters"]["pythonVersion"] in expected_arm64_versions
+
+
+def _build_jobs(**overrides) -> dict[str, dict]:
+    source = yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8"))
+    flags = _stage_flags(
+        **{
+            "buildAllTargets": True,
+            "buildPythonWheels": True,
+            "buildOdbcNative": True,
+            "buildRustCrates": False,
+            "testPythonWheelInstalls": True,
+            "publishToFeed": False,
+            **overrides,
+        }
+    )
+    pipeline = expand(source, flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    return {job["job"]: job for job in build["jobs"] if "job" in job}
+
+
+def _job_variables(job: dict) -> dict[str, str]:
+    variables = job.get("variables", [])
+    if isinstance(variables, dict):
+        return variables
+    return {item["name"]: item["value"] for item in variables if "name" in item}
+
+
+def _onebranch_artifact_name(job: dict) -> str:
+    """The name the governed Windows/Linux job templates require (custom jobs)
+    or publish ob_outputDirectory under (managed jobs)."""
+    variables = _job_variables(job)
+    base = variables.get("ob_artifactBaseName") or f"drop_Build_{job['job']}"
+    return base + variables.get("ob_artifactSuffix", "")
+
+
+def _published_artifacts(job: dict) -> list[str]:
+    return [
+        step["inputs"]["artifact"]
+        for step in job["steps"]
+        if str(step.get("task", "")).startswith("PublishPipelineArtifact@")
+    ]
+
+
+def _is_custom_pool(job: dict) -> bool:
+    pool = job.get("pool")
+    return isinstance(pool, dict) and pool.get("isCustom") is True
+
+
+def _sign_template_steps(job: dict, phase: str) -> list[tuple[int, dict]]:
+    return [
+        (index, step)
+        for index, step in enumerate(job["steps"])
+        if step.get("template") == _SIGN_WINDOWS_WHEELS_REF
+        and step["parameters"]["phase"] == phase
+    ]
+
+
+def _referenced_template_files(steps: list, including_file: Path) -> set[Path]:
+    """Step templates reachable from `steps`, following nested references."""
+    pending = [
+        (step["template"], including_file)
+        for step in steps
+        if isinstance(step, dict) and "template" in step
+    ]
+    found: set[Path] = set()
+    while pending:
+        reference, origin = pending.pop()
+        reference = reference.split("@", 1)[0]
+        path = (
+            _ROOT / reference.removeprefix("/")
+            if reference.startswith("/")
+            else origin.parent / reference
+        ).resolve()
+        if path in found:
+            continue
+        found.add(path)
+        text = path.read_text(encoding="utf-8")
+        pending.extend(
+            (match, path)
+            for match in re.findall(r"^\s*-?\s*template:\s*['\"]?([^'\"\s#]+)", text, re.M)
+        )
+    return found
+
+
+_WINDOWS_SIGNED_BUILDS = {
+    "Windows_x64": "_windows_x64",
+    "Windows_ARM64": "_windows_arm64",
+}
+
+
+@pytest.mark.parametrize("is_official", [False, True])
+def test_custom_build_jobs_publish_the_onebranch_artifact_name(is_official: bool) -> None:
+    """The governed custom-job template fails compilation when a
+    PublishPipelineArtifact name differs from ob_artifactBaseName+Suffix."""
+    for name, job in _build_jobs(isOfficial=is_official).items():
+        if _is_custom_pool(job):
+            for artifact in _published_artifacts(job):
+                assert artifact == _onebranch_artifact_name(job), name
+
+
+@pytest.mark.parametrize("is_official", [False, True])
+def test_esrp_never_runs_on_custom_vnet_pools(is_official: bool) -> None:
+    """IcM 49675: ESRP must be called from IPs with approved service tags. The
+    custom RUST-* pools egress through our VNet NAT gateway, which is not
+    one, so ESRP may only run in managed OneBranch jobs."""
+    for name, job in _build_jobs(isOfficial=is_official).items():
+        if not _is_custom_pool(job):
+            continue
+        assert _ESRP_GROUP not in json.dumps(job.get("variables", [])), name
+        assert "Esrp" not in json.dumps(job["steps"]), name
+        assert not _sign_template_steps(job, "sign"), name
+        for template in _referenced_template_files(job["steps"], _BUILD_STAGES):
+            if template == _SIGN_WINDOWS_WHEELS_TEMPLATE.resolve():
+                continue  # Its ESRP tasks are confined to phase 'sign' (checked above).
+            assert not re.search(
+                r"task:\s*Esrp", template.read_text(encoding="utf-8")
+            ), f"{name} -> {template.relative_to(_ROOT)}"
+
+
+def test_official_windows_wheels_are_signed_by_managed_jobs() -> None:
+    jobs = _build_jobs(isOfficial=True)
+
+    for build_name, final_suffix in _WINDOWS_SIGNED_BUILDS.items():
+        builder = jobs[build_name]
+        sign = jobs[f"{build_name}_Sign"]
+        finalize = jobs[f"{build_name}_Finalize"]
+
+        # Build (custom VNet pool): publish only unpacked, unsigned contents,
+        # unpacked after the driver is injected so the driver gets signed too.
+        unsigned = f"drop_Build_{build_name}_unsigned"
+        assert _published_artifacts(builder) == [unsigned]
+        [(unpack_index, _)] = _sign_template_steps(builder, "unpack")
+        inject_index = next(
+            index
+            for index, step in enumerate(builder["steps"])
+            if "Inject ODBC driver into" in str(step.get("displayName", ""))
+        )
+        publish_index = next(
+            index
+            for index, step in enumerate(builder["steps"])
+            if str(step.get("task", "")).startswith("PublishPipelineArtifact@")
+        )
+        assert inject_index < unpack_index < publish_index
+        # Official Guardian CodeSign validation breaks the build; the unsigned
+        # intermediate tree is validated after signing instead.
+        assert (
+            _job_variables(builder)["ob_sdl_codeSignValidation_excludes"]
+            == r"-|**\wheel-unpacked\**"
+        )
+
+        # Sign (managed OneBranch pool, approved egress): the only ESRP caller.
+        assert sign["pool"] == {"type": "windows"}
+        assert sign["dependsOn"] == build_name
+        assert {"group": _ESRP_GROUP} in sign["variables"]
+        [(_, sign_step)] = _sign_template_steps(sign, "sign")
+        assert sign_step["parameters"]["artifactName"] == unsigned
+
+        # Finalize (same native pool as the build): repack the signed tree,
+        # install-test it and publish the final artifact name.
+        assert _is_custom_pool(finalize)
+        assert finalize["pool"] == builder["pool"]
+        assert finalize["dependsOn"] == f"{build_name}_Sign"
+        [(_, repack_step)] = _sign_template_steps(finalize, "repack")
+        assert repack_step["parameters"]["artifactName"] == _onebranch_artifact_name(sign)
+        final_name = f"drop_Build_{build_name}{final_suffix}"
+        assert _onebranch_artifact_name(finalize) == final_name
+        assert _published_artifacts(finalize) == [final_name]
+
+
+def test_non_official_windows_wheels_skip_signing() -> None:
+    jobs = _build_jobs(isOfficial=False)
+
+    for build_name, final_suffix in _WINDOWS_SIGNED_BUILDS.items():
+        assert f"{build_name}_Sign" not in jobs
+        assert f"{build_name}_Finalize" not in jobs
+        builder = jobs[build_name]
+        assert not any(
+            step.get("template") == _SIGN_WINDOWS_WHEELS_REF for step in builder["steps"]
+        )
+        assert "ob_sdl_codeSignValidation_excludes" not in _job_variables(builder)
+        assert _published_artifacts(builder) == [f"drop_Build_{build_name}{final_suffix}"]
+
+
+def test_sign_windows_wheels_template_confines_esrp_to_sign_phase() -> None:
+    template = yaml.safe_load(_SIGN_WINDOWS_WHEELS_TEMPLATE.read_text(encoding="utf-8"))
+    defaults = {
+        parameter["name"]: parameter.get("default", "")
+        for parameter in template["parameters"]
+    }
+
+    for phase in ("unpack", "sign", "repack"):
+        steps = expand(
+            template["steps"],
+            {**defaults, "phase": phase, "architecture": "x64", "artifactName": "drop"},
+        )
+        esrp_tasks = [
+            step["task"] for step in steps if str(step.get("task", "")).startswith("Esrp")
+        ]
+        if phase != "sign":
+            assert esrp_tasks == [], phase
+            continue
+
+        assert esrp_tasks == ["EsrpMalwareScanning@6", "EsrpCodeSigning@6"]
+        for step in steps:
+            if str(step.get("task", "")).startswith("Esrp"):
+                inputs = step["inputs"]
+                assert inputs["FolderPath"] == r"$(ob_outputDirectory)\wheel-unpacked"
+                assert inputs["Pattern"].split() == ["**/*.pyd", "**/*.dll"]
+        signing = next(step for step in steps if step.get("task") == "EsrpCodeSigning@6")
+        operations = json.loads(signing["inputs"]["inlineOperation"])
+        assert [op["OperationCode"] for op in operations] == ["SigntoolSign", "SigntoolVerify"]
+        assert {op["KeyCode"] for op in operations} == {"CP-230012"}
+
+
+def test_sign_windows_wheels_template_never_publishes_unsigned_wheels() -> None:
+    template = yaml.safe_load(_SIGN_WINDOWS_WHEELS_TEMPLATE.read_text(encoding="utf-8"))
+    defaults = {
+        parameter["name"]: parameter.get("default", "")
+        for parameter in template["parameters"]
+    }
+
+    def script(phase: str) -> str:
+        steps = expand(
+            template["steps"],
+            {**defaults, "phase": phase, "architecture": "x64", "artifactName": "drop"},
+        )
+        return "\n".join(str(step.get("pwsh", "")) for step in steps)
+
+    # The Publish stage and PyPIRelease.yml collect every *.whl from the build
+    # artifacts, so the unsigned wheels must not survive the unpack phase.
+    assert "Remove-Item -Recurse -Force $wheelsDir" in script("unpack")
+    assert "Get-AuthenticodeSignature" in script("repack")
+    assert "$signature.Status -ne 'Valid'" in script("repack")
 
 
 def test_macos_wheel_install_gate_verifies_both_architectures() -> None:
