@@ -56,8 +56,12 @@ the machine and current user's trusted roots to a PEM bundle in
 `Agent.TempDirectory` and sets `PIP_CERT` for subsequent tasks. This lets older
 bundled pip versions validate HTTPS using the agent's trusted roots during
 `UsePythonVersion`'s pip upgrade, without disabling certificate verification.
-Python 3.10's bundled pip predates built-in system trust-store support, so
-enabling `truststore` alone does not solve its bootstrap failure.
+The failures occurred with pip 23.0.1 on Python 3.10 and pip 24.0 on Python 3.11,
+which do not use the Windows trust store by default. The logs show a missing
+trusted issuer, not an outdated CA bundle or a Python EOL/download problem.
+The presented certificate chain was not inspected, so a corporate CA is a
+possible explanation, not a confirmed cause. `PIP_CERT` explicitly aligns pip
+with the agent's Windows trusted roots.
 
 If pip still reports `CERTIFICATE_VERIFY_FAILED`, check that the required issuer
 is installed in the agent's Windows trusted-root store. A Docker timeout reaching
