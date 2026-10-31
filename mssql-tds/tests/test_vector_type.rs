@@ -4,16 +4,18 @@
 //! Integration tests for SQL Server Vector data type
 //! These tests require SQL Server 2025 or later with Vector support enabled.
 //!
-//! Note: These tests will fail if connecting to a SQL Server version that doesn't support
-//! the Vector data type (prior to SQL Server 2025). In the future, these tests should be
-//! conditionally enabled based on server version detection.
+//! Float16 tests are ignored by default. Select them with nextest --run-ignored ignored-only
+//! and the test(vector16) filter, set VECTOR16_TEST=1, and use a preprovisioned database
+//! endpoint with preview features enabled and native Vector v2 support.
 
 #[cfg(test)]
 mod common;
 
 #[cfg(test)]
 mod vector_integration_tests {
-    use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
+    use crate::common::{
+        begin_connection, begin_vector16_connection, build_tcp_datasource, init_tracing,
+    };
     use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
@@ -66,48 +68,32 @@ mod vector_integration_tests {
         }
     }
 
-    /// Test basic vector16 deserialization with a simple 3-dimensional vector
+    /// Test basic vector16 deserialization with a simple 3-dimensional float16 vector
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "Not supported in pipeline currently so skipping"]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_vector16_basic_deserialization() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
-        // Enable preview features before testing
-        // TODO: disable once v16 is available in sql server
-        client
-            .execute("USE UserDatabase;".to_string(), ())
-            .await
-            .unwrap();
-        client
-            .execute(
-                "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                (),
-            )
-            .await
-            .unwrap();
-
-        // Query a simple 3-dimensional float16 vector
         let query = "SELECT CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)) AS VectorColumn";
+
         client.execute(query.to_string(), ()).await.unwrap();
 
         if client.on_rows() {
-            // Verify metadata
             let columns = client.get_metadata();
             assert_eq!(columns.len(), 1);
             assert_eq!(columns[0].column_name, "VectorColumn");
 
-            // Read the row
             let mut row_count = 0;
             while let Some(row) = client.next_row().await.unwrap() {
                 row_count += 1;
                 assert_eq!(row.len(), 1);
-
-                // Verify the vector data
                 match &row[0] {
                     ColumnValues::Vector(vector) => {
                         assert_eq!(vector.dimension_count(), 3);
                         assert_eq!(vector.base_type(), VectorBaseType::Float16);
-                        let values = vector.as_f32().expect("Should unpack to f32 vector slice");
+                        let values = vector.as_f32().expect("Float16 should decode to f32");
                         assert_eq!(values.len(), 3);
                         assert!((values[0] - 1.0).abs() < 0.001);
                         assert!((values[1] - 2.0).abs() < 0.001);
@@ -166,24 +152,13 @@ mod vector_integration_tests {
 
     /// Test vector16 column metadata via get_metadata(): type, length, scale, flags
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "Not supported in pipeline currently so skipping"]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_vector16_metadata_fields() {
         use mssql_tds::datatypes::sqldatatypes::{TdsDataType, VECTOR_HEADER_SIZE, VectorBaseType};
 
-        let mut client = begin_connection(&build_tcp_datasource()).await;
-
-        // TODO: disable once v16 is available in sql server
-        client
-            .execute("USE UserDatabase;".to_string(), ())
-            .await
-            .unwrap();
-        client
-            .execute(
-                "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                (),
-            )
-            .await
-            .unwrap();
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         let query = "SELECT
             CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)) AS NonNullVec,
@@ -287,22 +262,11 @@ mod vector_integration_tests {
 
     /// Test vector16 with maximum dimensions (3996)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "Not supported in pipeline currently so skipping"]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_vector16_max_dimensions() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
-
-        // TODO: disable once v16 is available in sql server
-        client
-            .execute("USE UserDatabase;".to_string(), ())
-            .await
-            .unwrap();
-        client
-            .execute(
-                "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                (),
-            )
-            .await
-            .unwrap();
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         // Create a vector with 3996 dimensions (max supported for float16)
         let vector_values: Vec<String> = (0..3996).map(|i| format!("{}.0", i)).collect();
@@ -314,6 +278,7 @@ mod vector_integration_tests {
 
         client.execute(query, ()).await.unwrap();
 
+        assert!(client.on_rows(), "Expected a float16 result set");
         if client.on_rows() {
             let mut row_count = 0;
             while let Some(row) = client.next_row().await.unwrap() {
@@ -525,27 +490,26 @@ mod vector_integration_tests {
 
     /// Test vector16 NULL value
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "Not supported in pipeline currently so skipping"]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_vector16_null_value() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
-
-        // TODO: disable once v16 is available in sql server
-        client
-            .execute("USE UserDatabase;".to_string(), ())
-            .await
-            .unwrap();
-        client
-            .execute(
-                "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                (),
-            )
-            .await
-            .unwrap();
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         let query = "SELECT CAST(NULL AS VECTOR(3, float16)) AS NullVector";
 
         client.execute(query.to_string(), ()).await.unwrap();
 
+        assert!(client.on_rows(), "Expected a float16 result set");
+        assert_eq!(
+            client.get_metadata()[0].data_type,
+            mssql_tds::datatypes::sqldatatypes::TdsDataType::Vector,
+            "Expected native vector metadata, not a downlevel fallback"
+        );
+        assert_eq!(
+            client.get_metadata()[0].get_scale(),
+            Some(VectorBaseType::Float16 as u8)
+        );
         if client.on_rows() {
             let mut row_count = 0;
             while let Some(row) = client.next_row().await.unwrap() {
@@ -563,22 +527,11 @@ mod vector_integration_tests {
 
     /// Test both float32 and float16 vectors in a table with multiple rows
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "Not supported in pipeline currently so skipping"]
-    async fn test_vector_mixed_types_multiple_rows() {
-        let mut client = begin_connection(&build_tcp_datasource()).await;
-
-        // TODO: disable once v16 is available in sql server
-        client
-            .execute("USE UserDatabase;".to_string(), ())
-            .await
-            .unwrap();
-        client
-            .execute(
-                "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;".to_string(),
-                (),
-            )
-            .await
-            .unwrap();
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_mixed_types_multiple_rows() {
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
 
         // Create temp table with both vector column types
         let setup = "
@@ -1256,5 +1209,802 @@ mod vector_integration_tests {
             }
             _ => panic!("Expected Vector output parameter"),
         }
+    }
+
+    /// Test sending a float16 Vector as a query parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_parameter_basic() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let vector = SqlVector::try_from_f16(vec![1.0f32, 2.0f32, 3.0f32]).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), 3, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_sp_executesql("SELECT @p1 AS ReturnedVector".to_string(), vec![param], ())
+            .await
+            .unwrap();
+
+        assert!(client.on_rows(), "Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = client.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(returned_vector) => {
+                    assert_eq!(returned_vector.dimension_count(), 3);
+                    assert_eq!(returned_vector.base_type(), VectorBaseType::Float16);
+                    let values = returned_vector.as_f32().unwrap();
+                    assert!((values[0] - 1.0).abs() < 0.001);
+                    assert!((values[1] - 2.0).abs() < 0.001);
+                    assert!((values[2] - 3.0).abs() < 0.001);
+                }
+                _ => panic!("Expected Vector column value, got: {:?}", row[0]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test NULL float16 Vector parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_parameter_null() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(None, 10, VectorBaseType::Float16),
+        );
+
+        let query = "SELECT @p1 AS NullVector, CASE WHEN @p1 IS NULL THEN 1 ELSE 0 END AS IsNull";
+
+        client
+            .execute_sp_executesql(query.to_string(), vec![param], ())
+            .await
+            .unwrap();
+
+        assert!(client.on_rows(), "Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = client.next_row().await.unwrap() {
+            row_count += 1;
+            assert!(matches!(row[0], ColumnValues::Null));
+            match &row[1] {
+                ColumnValues::Int(val) => assert_eq!(*val, 1, "Expected IsNull to be 1"),
+                _ => panic!("Expected Int(1), got: {:?}", row[1]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test float16 Vector parameter in a WHERE clause against a float16 column
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_parameter_in_where_clause() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let create_table = "
+            CREATE TABLE #Vector16Test (
+                id INT,
+                vec VECTOR(3, float16)
+            );
+            INSERT INTO #Vector16Test VALUES (1, CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)));
+            INSERT INTO #Vector16Test VALUES (2, CAST('[4.0, 5.0, 6.0]' AS VECTOR(3, float16)));
+            INSERT INTO #Vector16Test VALUES (3, CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)));
+        ";
+
+        client.execute(create_table.to_string(), ()).await.unwrap();
+
+        while client.advance_to_rows().await.unwrap() {}
+
+        let vector = SqlVector::try_from_f16(vec![1.0f32, 2.0f32, 3.0f32]).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), 3, VectorBaseType::Float16),
+        );
+
+        let query = "SELECT id FROM #Vector16Test WHERE VECTOR_DISTANCE('cosine', vec, @p1) < 1e-6";
+
+        client
+            .execute_sp_executesql(query.to_string(), vec![param], ())
+            .await
+            .unwrap();
+
+        assert!(client.on_rows(), "Expected a result set");
+        let mut found_ids = vec![];
+        while let Some(row) = client.next_row().await.unwrap() {
+            match &row[0] {
+                ColumnValues::Int(id) => found_ids.push(*id),
+                _ => panic!("Expected Int column, got: {:?}", row[0]),
+            }
+        }
+
+        assert_eq!(found_ids.len(), 2, "Expected 2 matching rows");
+        assert!(found_ids.contains(&1), "Expected to find id 1");
+        assert!(found_ids.contains(&3), "Expected to find id 3");
+    }
+
+    /// Test float16 Vector parameter at the maximum dimension count (3996)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_parameter_max_dimensions() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let dims = VectorBaseType::Float16.max_dimensions();
+        // Keep values within f16's exactly-representable integer range (<= 2048).
+        let values: Vec<f32> = (0..dims).map(|i| (i % 2048) as f32).collect();
+        let vector = SqlVector::try_from_f16(values.clone()).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), dims, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_sp_executesql("SELECT @p1 AS MaxVector".to_string(), vec![param], ())
+            .await
+            .unwrap();
+
+        assert!(client.on_rows(), "Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = client.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(returned_vector) => {
+                    assert_eq!(returned_vector.dimension_count(), dims);
+                    assert_eq!(returned_vector.base_type(), VectorBaseType::Float16);
+                    let returned = returned_vector.as_f32().unwrap();
+                    assert_eq!(returned, values.as_slice());
+                }
+                _ => panic!("Expected Vector column value, got: {:?}", row[0]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test that float16 narrowing is lossy but round-trips through the server
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_parameter_precision_loss() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        // 0.1 and 1/3 are not representable in f16; the server must return the
+        // same narrowed values the client sent.
+        let sent = vec![0.1f32, 1.0f32 / 3.0f32, -0.1f32];
+        let expected: Vec<f32> = sent
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let vector = SqlVector::try_from_f16(sent).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), 3, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_sp_executesql("SELECT @p1 AS Narrowed".to_string(), vec![param], ())
+            .await
+            .unwrap();
+
+        assert!(client.on_rows(), "Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = client.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(returned_vector) => {
+                    assert_eq!(returned_vector.base_type(), VectorBaseType::Float16);
+                    assert_eq!(returned_vector.as_f32().unwrap(), expected.as_slice());
+                }
+                _ => panic!("Expected Vector column value, got: {:?}", row[0]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test mixing float32 and float16 Vector parameters in one call
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_mixed_base_type_parameters() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let vec32 = SqlVector::try_from_f32(vec![1.0f32, 2.0f32, 3.0f32]).unwrap();
+        let vec16 = SqlVector::try_from_f16(vec![4.0f32, 5.0f32, 6.0f32]).unwrap();
+
+        let params = vec![
+            RpcParameter::new(
+                Some("@p1".to_string()),
+                StatusFlags::NONE,
+                SqlType::Vector(Some(vec32), 3, VectorBaseType::Float32),
+            ),
+            RpcParameter::new(
+                Some("@p2".to_string()),
+                StatusFlags::NONE,
+                SqlType::Vector(Some(vec16), 3, VectorBaseType::Float16),
+            ),
+        ];
+
+        client
+            .execute_sp_executesql("SELECT @p1 AS Vec32, @p2 AS Vec16".to_string(), params, ())
+            .await
+            .unwrap();
+
+        assert!(client.on_rows(), "Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = client.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(v) => {
+                    assert_eq!(v.base_type(), VectorBaseType::Float32);
+                    assert_eq!(v.as_f32().unwrap(), &[1.0, 2.0, 3.0]);
+                }
+                _ => panic!("Expected Vector for first column"),
+            }
+            match &row[1] {
+                ColumnValues::Vector(v) => {
+                    assert_eq!(v.base_type(), VectorBaseType::Float16);
+                    assert_eq!(v.as_f32().unwrap(), &[4.0, 5.0, 6.0]);
+                }
+                _ => panic!("Expected Vector for second column"),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test float16 Vector as output parameter from a stored procedure
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_output_parameter() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let create_proc = "
+            CREATE PROCEDURE #TestVector16Output
+                @OutputVector VECTOR(3, float16) OUTPUT
+            AS
+            BEGIN
+                SET @OutputVector = CAST('[7.0, 8.0, 9.0]' AS VECTOR(3, float16));
+            END
+        ";
+
+        client.execute(create_proc.to_string(), ()).await.unwrap();
+
+        while client.advance_to_rows().await.unwrap() {}
+
+        let output_param = RpcParameter::new(
+            Some("@OutputVector".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Vector(None, 3, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_stored_procedure(
+                "#TestVector16Output".to_string(),
+                None,
+                Some(vec![output_param]),
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.advance_to_rows().await.unwrap();
+        let output_params = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
+
+        match &output_params[0].value {
+            ColumnValues::Vector(vector) => {
+                assert_eq!(vector.dimension_count(), 3);
+                assert_eq!(vector.base_type(), VectorBaseType::Float16);
+                let values = vector.as_f32().unwrap();
+                assert!((values[0] - 7.0).abs() < 0.001);
+                assert!((values[1] - 8.0).abs() < 0.001);
+                assert!((values[2] - 9.0).abs() < 0.001);
+            }
+            _ => panic!(
+                "Expected Vector output parameter, got: {:?}",
+                output_params[0].value
+            ),
+        }
+    }
+
+    /// Test float16 Vector as both input and output parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_input_output_parameter() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let create_proc = "
+            CREATE PROCEDURE #TestVector16InOut
+                @InputVector VECTOR(3, float16),
+                @OutputVector VECTOR(3, float16) OUTPUT
+            AS
+            BEGIN
+                SET @OutputVector = @InputVector;
+            END
+        ";
+
+        client.execute(create_proc.to_string(), ()).await.unwrap();
+
+        while client.advance_to_rows().await.unwrap() {}
+
+        // 10.5 / 20.5 / 30.5 are exactly representable in f16.
+        let input_vector = SqlVector::try_from_f16(vec![10.5f32, 20.5f32, 30.5f32]).unwrap();
+        let params = vec![
+            RpcParameter::new(
+                Some("@InputVector".to_string()),
+                StatusFlags::NONE,
+                SqlType::Vector(Some(input_vector), 3, VectorBaseType::Float16),
+            ),
+            RpcParameter::new(
+                Some("@OutputVector".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Vector(None, 3, VectorBaseType::Float16),
+            ),
+        ];
+
+        client
+            .execute_stored_procedure("#TestVector16InOut".to_string(), None, Some(params), ())
+            .await
+            .unwrap();
+
+        client.advance_to_rows().await.unwrap();
+        let output_params = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
+
+        match &output_params[0].value {
+            ColumnValues::Vector(vector) => {
+                assert_eq!(vector.base_type(), VectorBaseType::Float16);
+                assert_eq!(vector.as_f32().unwrap(), &[10.5, 20.5, 30.5]);
+            }
+            _ => panic!(
+                "Expected Vector output parameter, got: {:?}",
+                output_params[0].value
+            ),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_multiple_parameters() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+        let inputs = [vec![42.5], vec![0.0001, -0.1, 65505.0]];
+        let mut params = Vec::new();
+        for (index, values) in inputs.iter().enumerate() {
+            params.push(RpcParameter::new(
+                Some(format!("@p{}", index + 1)),
+                StatusFlags::NONE,
+                SqlType::Vector(
+                    Some(SqlVector::try_from_f16(values.clone()).unwrap()),
+                    values.len() as u16,
+                    VectorBaseType::Float16,
+                ),
+            ));
+        }
+        client
+            .execute_sp_executesql("SELECT @p1, @p2".to_string(), params, ())
+            .await
+            .unwrap();
+        let (metadata, row) = crate::common::get_first_row(&mut client).await.unwrap();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(row.len(), 2);
+        for (value, input) in row.iter().zip(inputs.iter()) {
+            let ColumnValues::Vector(vector) = value else {
+                panic!("Expected float16 vector, got {value:?}");
+            };
+            assert_eq!(vector.base_type(), VectorBaseType::Float16);
+            assert_eq!(vector.dimension_count(), input.len() as u16);
+            let expected: Vec<f32> = input
+                .iter()
+                .map(|value| half::f16::from_f32(*value).to_f32())
+                .collect();
+            assert_eq!(vector.as_f32().unwrap(), expected.as_slice());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_output_parameter_max_dimensions() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+        let dims = VectorBaseType::Float16.max_dimensions();
+        let expected: Vec<f32> = (0..dims).map(|i| (i % 2048) as f32).collect();
+        let literal = expected
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        client
+            .execute(
+                format!(
+                    "CREATE PROCEDURE #Vector16OutputMax @v VECTOR({dims}, float16) OUTPUT \
+                     AS SET @v = CAST('[{literal}]' AS VECTOR({dims}, float16))"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        while client.advance_to_rows().await.unwrap() {}
+        let param = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Vector(None, dims, VectorBaseType::Float16),
+        );
+        client
+            .execute_stored_procedure(
+                "#Vector16OutputMax".to_string(),
+                None,
+                Some(vec![param]),
+                (),
+            )
+            .await
+            .unwrap();
+        while client.advance_to_rows().await.unwrap() {}
+        let output = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(output.len(), 1);
+        let ColumnValues::Vector(vector) = &output[0].value else {
+            panic!("Expected float16 output vector, got {:?}", output[0].value);
+        };
+        assert_eq!(vector.base_type(), VectorBaseType::Float16);
+        assert_eq!(vector.dimension_count(), dims);
+        assert_eq!(vector.as_f32().unwrap(), expected.as_slice());
+    }
+
+    async fn assert_vector16_v1_parameter_rejected(is_null: bool) {
+        use mssql_tds::connection::client_context::VectorVersion;
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::error::Error;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(Some(VectorVersion::V1)).await else {
+            return;
+        };
+        let vector = if is_null {
+            None
+        } else {
+            Some(SqlVector::try_from_f16(vec![1.0, 2.0, 3.0]).unwrap())
+        };
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(vector, 3, VectorBaseType::Float16),
+        );
+        let error = client
+            .execute_sp_executesql("SELECT @p1".to_string(), vec![param], ())
+            .await
+            .expect_err("V1 must reject float16 RPC parameters, including typed NULLs");
+        assert!(
+            matches!(&error, Error::UsageError(_) | Error::ProtocolError(_)),
+            "Expected client-side vector-version rejection, got {error:?}"
+        );
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("float16") && (message.contains("version") || message.contains("v2")),
+            "Expected a float16 vector-version diagnostic, got {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_parameter_v1_rejected() {
+        assert_vector16_v1_parameter_rejected(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_parameter_null_v1_rejected() {
+        assert_vector16_v1_parameter_rejected(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_cursor_roundtrip() {
+        use mssql_tds::connection::cursor_ops::CursorClient;
+        use mssql_tds::cursor::{CursorConcurrency, CursorScrollOption, FetchDirection};
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+        client
+            .execute(
+                "CREATE TABLE #Vector16Cursor (id INT); INSERT INTO #Vector16Cursor VALUES (1)"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        client.close_query().await.unwrap();
+        let values = [0.1, -2.5, 65504.0];
+        let expected: Vec<f32> = values
+            .iter()
+            .map(|value| half::f16::from_f32(*value).to_f32())
+            .collect();
+        let parameter = |is_null| {
+            RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::NONE,
+                SqlType::Vector(
+                    if is_null {
+                        None
+                    } else {
+                        Some(SqlVector::try_from_f16(values.to_vec()).unwrap())
+                    },
+                    3,
+                    VectorBaseType::Float16,
+                ),
+            )
+        };
+        let query = "SELECT @v AS v FROM #Vector16Cursor";
+        for is_null in [false, true] {
+            let opened = client
+                .cursor_open_with_params(
+                    query,
+                    vec![parameter(is_null)],
+                    CursorScrollOption::STATIC,
+                    CursorConcurrency::READONLY,
+                    0,
+                    Some(30),
+                    None,
+                )
+                .await
+                .unwrap();
+            let prepared = client
+                .cursor_prepexec(
+                    query,
+                    vec![parameter(is_null)],
+                    CursorScrollOption::STATIC,
+                    CursorConcurrency::READONLY,
+                    0,
+                    Some(30),
+                    None,
+                )
+                .await
+                .unwrap();
+            let executed = client
+                .cursor_execute(
+                    prepared.prepared_handle,
+                    vec![parameter(is_null)],
+                    CursorScrollOption::STATIC,
+                    CursorConcurrency::READONLY,
+                    0,
+                    Some(30),
+                    None,
+                )
+                .await
+                .unwrap();
+            for cursor_id in [
+                opened.cursor_id,
+                prepared.cursor.cursor_id,
+                executed.cursor_id,
+            ] {
+                client
+                    .cursor_fetch(cursor_id, FetchDirection::NEXT, 0, 1, Some(30), None)
+                    .await
+                    .unwrap();
+                let (row, _) = client.next_cursor_row().await.unwrap().unwrap();
+                assert_eq!(row.len(), 1);
+                if is_null {
+                    assert!(matches!(row[0], ColumnValues::Null));
+                } else {
+                    let ColumnValues::Vector(vector) = &row[0] else {
+                        panic!("Expected float16 cursor value, got {:?}", row[0]);
+                    };
+                    assert_eq!(vector.base_type(), VectorBaseType::Float16);
+                    assert_eq!(vector.dimension_count(), 3);
+                    assert_eq!(vector.as_f32().unwrap(), expected.as_slice());
+                }
+                assert!(client.next_cursor_row().await.unwrap().is_none());
+                client.close_query().await.unwrap();
+                client
+                    .cursor_close(cursor_id, Some(30), None)
+                    .await
+                    .unwrap();
+            }
+            client
+                .cursor_unprepare(prepared.prepared_handle, Some(30), None)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_cursor_v1_rejected_and_connection_reusable() {
+        use mssql_tds::connection::client_context::VectorVersion;
+        use mssql_tds::connection::cursor_ops::CursorClient;
+        use mssql_tds::cursor::{CursorConcurrency, CursorOperation, CursorScrollOption};
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::error::Error;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(Some(VectorVersion::V1)).await else {
+            return;
+        };
+        for is_null in [false, true] {
+            for route in 0..4 {
+                let params = vec![RpcParameter::new(
+                    Some("@v".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Vector(
+                        if is_null {
+                            None
+                        } else {
+                            Some(SqlVector::try_from_f16(vec![1.0]).unwrap())
+                        },
+                        1,
+                        VectorBaseType::Float16,
+                    ),
+                )];
+                let result = match route {
+                    0 => client
+                        .cursor_open_with_params(
+                            "SELECT @v",
+                            params,
+                            CursorScrollOption::STATIC,
+                            CursorConcurrency::READONLY,
+                            0,
+                            Some(30),
+                            None,
+                        )
+                        .await
+                        .map(|_| ()),
+                    1 => client
+                        .cursor_prepexec(
+                            "SELECT @v",
+                            params,
+                            CursorScrollOption::STATIC,
+                            CursorConcurrency::READONLY,
+                            0,
+                            Some(30),
+                            None,
+                        )
+                        .await
+                        .map(|_| ()),
+                    2 => client
+                        .cursor_execute(
+                            1,
+                            params,
+                            CursorScrollOption::STATIC,
+                            CursorConcurrency::READONLY,
+                            0,
+                            Some(30),
+                            None,
+                        )
+                        .await
+                        .map(|_| ()),
+                    3 => {
+                        client
+                            .perform_cursor_operation(
+                                1,
+                                CursorOperation::UPDATE,
+                                1,
+                                "",
+                                params,
+                                Some(30),
+                                None,
+                            )
+                            .await
+                    }
+                    _ => unreachable!(),
+                };
+                assert!(matches!(result, Err(Error::UsageError(message))
+                    if message.contains("require negotiated vector version 2")));
+                client.execute("SELECT 1".to_string(), ()).await.unwrap();
+                assert_eq!(
+                    crate::common::get_scalar_value(&mut client).await.unwrap(),
+                    Some(ColumnValues::Int(1))
+                );
+            }
+        }
+    }
+
+    /// Test NULL float16 Vector as output parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
+    async fn test_vector16_output_parameter_null() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+
+        let create_proc = "
+            CREATE PROCEDURE #TestVector16OutputNull
+                @OutputVector VECTOR(5, float16) OUTPUT
+            AS
+            BEGIN
+                SET @OutputVector = NULL;
+            END
+        ";
+
+        client.execute(create_proc.to_string(), ()).await.unwrap();
+
+        while client.advance_to_rows().await.unwrap() {}
+
+        let output_param = RpcParameter::new(
+            Some("@OutputVector".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Vector(None, 5, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_stored_procedure(
+                "#TestVector16OutputNull".to_string(),
+                None,
+                Some(vec![output_param]),
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.advance_to_rows().await.unwrap();
+        let output_params = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
+        assert!(matches!(output_params[0].value, ColumnValues::Null));
     }
 }

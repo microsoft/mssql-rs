@@ -291,6 +291,36 @@ impl RpcParameter {
         matches!(self.value, RpcValue::Streamed(_))
     }
 
+    pub(crate) fn ensure_vector_version_supported(&self, version: u8) -> TdsResult<()> {
+        fn contains_float16(value: &SqlType) -> bool {
+            match value {
+                SqlType::Vector(value, _, base_type) => {
+                    *base_type == VectorBaseType::Float16
+                        || value
+                            .as_ref()
+                            .is_some_and(|v| v.base_type() == VectorBaseType::Float16)
+                }
+                SqlType::Table(_, Some(table)) => table
+                    .columns
+                    .iter()
+                    .map(|column| &column.column_type)
+                    .chain(table.rows.iter().flatten())
+                    .any(contains_float16),
+                _ => false,
+            }
+        }
+
+        if let RpcValue::Materialized(value) = &self.value
+            && version < 2
+            && contains_float16(value)
+        {
+            return Err(Error::UsageError(format!(
+                "Vector float16 parameters require negotiated vector version 2; current version is {version}."
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_streamed_configuration(&self) -> TdsResult<()> {
         if self.is_data_at_exec() && self.narrow_string_byte_limit.is_some() {
             return Err(Error::UsageError(
