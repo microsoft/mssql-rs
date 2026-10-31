@@ -63,12 +63,16 @@ export interface RawColumnInfo {
 }
 
 /** Decoded result set. */
-export interface RawResult {
+export interface RawResult<T = unknown[]> {
   columns: RawColumnInfo[];
-  rows: unknown[][];
+  rows: T[];
   rowCount: number;
   rowsAffected: number;
 }
+
+type RowProjectorFactory<T> = (
+  columns: RawColumnInfo[],
+) => (values: unknown[]) => T;
 
 /**
  * Decode a binary buffer produced by `Connection.queryRaw()`.
@@ -78,6 +82,22 @@ export interface RawResult {
  * JS representations as the existing NapiRowWriter + transformer pipeline.
  */
 export function decodeRawResult(buf: Buffer): RawResult {
+  return decodeResult(buf, () => (values) => values, false);
+}
+
+/** The projector must not retain the borrowed, reusable values array. */
+export function decodeProjectedResult<T>(
+  buf: Buffer,
+  createProjector: RowProjectorFactory<T>,
+): RawResult<T> {
+  return decodeResult(buf, createProjector, true);
+}
+
+function decodeResult<T>(
+  buf: Buffer,
+  createProjector: RowProjectorFactory<T>,
+  reuseRow: boolean,
+): RawResult<T> {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   let pos = 0;
 
@@ -169,10 +189,12 @@ export function decodeRawResult(buf: Buffer): RawResult {
   }
 
   // --- Row data ---
-  const rows: unknown[][] = [];
+  const project = createProjector(columns);
+  const scratch = reuseRow ? new Array<unknown>(colCount) : undefined;
+  const rows: T[] = [];
 
   for (let r = 0; r < rowCount; r++) {
-    const row: unknown[] = new Array(colCount);
+    const row: unknown[] = scratch ?? new Array(colCount);
     for (let c = 0; c < colCount; c++) {
       const tag = view.getUint8(pos);
       pos += 1;
@@ -370,7 +392,7 @@ export function decodeRawResult(buf: Buffer): RawResult {
           throw new Error(`Unknown cell tag ${tag} at offset ${pos - 1}`);
       }
     }
-    rows.push(row);
+    rows.push(project(row));
   }
 
   return { columns, rows, rowCount, rowsAffected };
