@@ -44,7 +44,9 @@ pub const DNS: &str = "dns";
 /// [`RESOLVER_ERROR`], so [`OS_ERROR`], [`IO_KIND`] and [`ERROR`] describe
 /// only the connect. A diagnostic connection that asks for every
 /// address also connects to the addresses after the one that answered, each
-/// in a span of its own.
+/// in a span of its own. On macOS, a Strict (TDS 8.0) connect negotiates TLS
+/// too, so its span covers the handshake, and an address that rejects the
+/// handshake was reached: its span succeeds and the connect ends.
 pub const TCP: &str = "tcp";
 
 /// The SQL Server Browser lookup of a named instance. Fields: [`SERVER`],
@@ -66,7 +68,9 @@ pub const PIPE: &str = "pipe";
 /// failure [`OS_ERROR`] and [`ERROR`].
 pub const PRELOGIN: &str = "prelogin";
 
-/// The TLS handshake. On failure: [`OS_ERROR`] and [`ERROR`].
+/// The TLS handshake. On failure: [`OS_ERROR`] and [`ERROR`]. On macOS, a
+/// Strict (TDS 8.0) handshake runs within its [`TCP`] stage; the `tls` span
+/// that follows that stage records the handshake's result and takes no time.
 pub const TLS: &str = "tls";
 
 /// LOGIN7 and the server's response, up to a successful login. Fields:

@@ -63,11 +63,12 @@ impl SslHandler {
         }
     }
 
-    pub(crate) async fn enable_ssl_async(
+    /// Resolves how the server's certificate is to be validated and the name it
+    /// must carry, rejecting option combinations that contradict each other.
+    pub(crate) fn tls_validation(
         &self,
-        base_stream: Box<dyn Stream>,
         negotiated_encryption: NegotiatedEncryptionSetting,
-    ) -> TdsResult<Box<dyn Stream>> {
+    ) -> TdsResult<(TlsValidationConfig, &str)> {
         // Check if ServerCertificate and TrustServerCertificate are both specified
         if self.encryption_options.server_certificate.is_some()
             && self.encryption_options.trust_server_certificate
@@ -124,14 +125,31 @@ impl SslHandler {
             self.server_host_name,
         );
 
-        let params = TlsConnectParams {
-            validation: &validation,
+        Ok((validation, host_name))
+    }
+
+    pub(crate) fn connect_params<'a>(
+        &'a self,
+        validation: &'a TlsValidationConfig,
+        host_name: &'a str,
+    ) -> TlsConnectParams<'a> {
+        TlsConnectParams {
+            validation,
             host_name,
             server_host_name: &self.server_host_name,
             server_certificate_path: self.encryption_options.server_certificate.as_ref(),
-        };
+        }
+    }
 
-        default_engine().connect(base_stream, params).await
+    pub(crate) async fn enable_ssl_async(
+        &self,
+        base_stream: Box<dyn Stream>,
+        negotiated_encryption: NegotiatedEncryptionSetting,
+    ) -> TdsResult<Box<dyn Stream>> {
+        let (validation, host_name) = self.tls_validation(negotiated_encryption)?;
+        default_engine()
+            .connect(base_stream, self.connect_params(&validation, host_name))
+            .await
     }
 }
 

@@ -178,17 +178,13 @@ pub enum Error {
     #[error("TLS Error: {0}")]
     TlsError(#[from] native_tls::Error),
 
-    /// TLS handshake failed with host/SAN details.
-    #[error(
-        "TLS handshake failed while connecting to '{expected_host}': {source}. Certificate SANs: {cert_sans}"
-    )]
+    /// A TLS engine could not complete its handshake.
+    #[error("TLS handshake failed for '{expected_host}': {source}")]
     TlsHandshakeError {
-        /// Inner TLS error.
-        source: native_tls::Error,
-        /// Hostname the client tried to connect to.
+        /// Engine-specific cause of the failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+        /// Hostname used for TLS server identity validation.
         expected_host: String,
-        /// Subject Alternative Names found on the certificate.
-        cert_sans: String,
     },
 
     /// Operation exceeded its deadline.
@@ -439,6 +435,27 @@ impl Error {
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn tls_handshake_error_displays_host_and_preserves_source() {
+        let error = Error::TlsHandshakeError {
+            source: Box::new(io::Error::other("peer rejected handshake")),
+            expected_host: "db.example.com".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "TLS handshake failed for 'db.example.com': peer rejected handshake"
+        );
+        let source = std::error::Error::source(&error).expect("TLS source");
+        assert_eq!(
+            source
+                .downcast_ref::<io::Error>()
+                .expect("original I/O error")
+                .to_string(),
+            "peer rejected handshake"
+        );
+    }
 
     #[test]
     fn test_timeout_error_type_string() {

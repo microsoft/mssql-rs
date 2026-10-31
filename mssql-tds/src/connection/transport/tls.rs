@@ -10,8 +10,14 @@
 //! Schannel-direct engine in `win_tls`. [`default_engine`] picks Schannel-direct
 //! on Windows when the `tls-schannel-direct` feature is enabled (the default)
 //! and native-tls everywhere else.
+//!
+//! On macOS, with the `tls-network-framework` feature (the default), Strict
+//! connections over TCP bypass the engines: Network.framework makes the whole
+//! connection, TCP included (see `network_framework_engine`).
 
 pub(crate) mod native_tls_engine;
+#[cfg(all(target_os = "macos", feature = "tls-network-framework"))]
+pub(crate) mod network_framework_engine;
 
 use crate::connection::transport::network_transport::Stream;
 use crate::core::TdsResult;
