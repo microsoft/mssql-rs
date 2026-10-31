@@ -26,8 +26,9 @@ pub mod tds_tls_wrapper;
 pub mod tls_helper;
 
 pub use query_response::{
-    ColumnDefinition, ColumnValue, InfoMessage, LOGIN_DELAY_KEY, LeadingError, QueryRegistry,
-    QueryResponse, RPC_DELAY_KEY, Row, SqlDataType, TM_BEGIN_DELAY_KEY, TerminalError,
+    ATTENTION_DELAY_KEY, ColumnDefinition, ColumnValue, InfoMessage, LOGIN_DELAY_KEY, LeadingError,
+    QueryRegistry, QueryResponse, RPC_DELAY_KEY, Row, SqlDataType, TM_BEGIN_DELAY_KEY,
+    TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY, TerminalError,
 };
 pub use server::{ConnectionInfo, ConnectionStore, MockTdsServer, RedirectionConfig};
 pub use tds_tls_wrapper::TdsTlsWrapper;

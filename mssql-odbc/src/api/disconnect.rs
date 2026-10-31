@@ -13,7 +13,7 @@ use crate::api::txn::rollback_before_disconnect;
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
-use crate::handles::dbc::{ConnectionIdentity, ConnectionState};
+use crate::handles::dbc::{ConnectionIdentity, ConnectionState, DbcState};
 use crate::handles::desc::DescHandle;
 use crate::handles::{HandleType, free_handle, handle_from_raw};
 
@@ -149,8 +149,14 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         unsafe { free_handle::<DescHandle>(desc_ptr) };
     }
 
-    // Drop the TDS client (closes the connection) and clear the wire; a lease
-    // still out is now stale and closes its client when returned.
+    clear_session(dbc, &mut state);
+    debug!("SQLDisconnect: disconnected successfully");
+    SQL_SUCCESS
+}
+
+/// Clears a disconnected session without changing connection attributes or diagnostics.
+pub(super) fn clear_session(dbc: &DbcHandle, state: &mut DbcState) {
+    // An outstanding lease becomes stale and closes its client when returned.
     drop(state.wire.uninstall());
     state.effective_vendor_settings = None;
     state.effective_packet_size = None;
@@ -162,9 +168,6 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     state.last_collation_code_page = None;
     state.last_char_set = None;
     state.connection_state = ConnectionState::Disconnected;
-
-    debug!("SQLDisconnect: disconnected successfully");
-    SQL_SUCCESS
 }
 
 #[cfg(test)]

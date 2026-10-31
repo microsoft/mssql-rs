@@ -7,6 +7,7 @@
 //! connection-level "busy" claim, allowing other statements on the same DBC
 //! to execute.
 
+use mssql_tds::connection::tds_client::ExecuteOptions;
 use std::sync::MutexGuard;
 use tracing::{debug, error};
 
@@ -169,6 +170,7 @@ pub(super) fn free_stmt_close_locked(
             statement_handle,
             process_is_shutting_down(),
             cancel_pending,
+            None,
         )
     } else {
         DrainOutcome::Clean
@@ -223,7 +225,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
-    let pending_fetch_error = {
+    let (pending_fetch_error, cancel) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
@@ -232,12 +234,26 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
         if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
             return SQL_SUCCESS;
         }
+        let cancel = match stmt.execution_cancel() {
+            Ok(cancel) => cancel,
+            Err(rc) => return rc,
+        };
         let pending_fetch_error = stmt_state.pending_fetch_error.take();
         reset_cursor_state(&mut stmt_state);
-        pending_fetch_error
+        (pending_fetch_error, cancel)
     };
 
-    let outcome = drain_and_release(stmt, handle);
+    let outcome = drain_and_release_inner(
+        stmt,
+        handle,
+        process_is_shutting_down(),
+        false,
+        Some(
+            ExecuteOptions::new()
+                .timeout_secs(stmt.parent_dbc().connection_timeout())
+                .cancel(&cancel),
+        ),
+    );
     if let Some(e) = pending_fetch_error
         && let Ok(mut stmt_state) = stmt.inner.lock()
     {
@@ -282,7 +298,13 @@ pub(super) enum DrainOutcome {
 /// that surfaced server INFO messages, and — importantly — from a drain failure,
 /// which must not be reported to the app as success.
 pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> DrainOutcome {
-    drain_and_release_inner(stmt, statement_handle, process_is_shutting_down(), false)
+    drain_and_release_inner(
+        stmt,
+        statement_handle,
+        process_is_shutting_down(),
+        false,
+        None,
+    )
 }
 
 /// The body of [`drain_and_release`], with the loader's shutdown flag passed in
@@ -294,6 +316,7 @@ fn drain_and_release_inner(
     statement_handle: SqlHandle,
     process_is_shutting_down: bool,
     cancel_pending: bool,
+    options: Option<ExecuteOptions<'_>>,
 ) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
@@ -345,6 +368,9 @@ fn drain_and_release_inner(
 
     let close_result = if cancel_pending && client.has_open_batch() {
         dbc.runtime.block_on(client.cancel_query(cancel_timeout))
+    } else if let Some(options) = options {
+        dbc.runtime
+            .block_on(client.close_query_with_options(options))
     } else {
         dbc.runtime.block_on(client.close_query())
     };
@@ -756,6 +782,7 @@ mod tests {
             h.stmt,
             true,
             false,
+            None,
         );
 
         assert!(
@@ -803,6 +830,7 @@ mod tests {
             h.stmt,
             false,
             false,
+            None,
         );
 
         let ds = dbc.inner.lock().unwrap();
