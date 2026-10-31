@@ -18,6 +18,11 @@
 # Build jobs and the wheel Publish job use custom 1ES pools (Rust, Docker,     #
 # Python pre-installed). The mssql-sqlcmd NuGet Publish job uses the managed   #
 # OneBranch pool with ob_nugetPublishing_enabled.                              #
+# ESRP must be called from IPs with approved service tags, which the custom    #
+# pools' VNet egress is not. Official Windows wheels are therefore published   #
+# unsigned+unpacked by Windows_<arch>, ESRP-signed by the managed              #
+# Windows_<arch>_Sign job, and repacked/install-tested by the native           #
+# Windows_<arch>_Finalize job (see sign-windows-wheels-template.yml).          #
 # Artifact publishing on custom pools requires explicit                        #
 # PublishPipelineArtifact@1 (governed template rewrites to                     #
 # 1ES.PublishPipelineArtifact@1).                                              #
@@ -156,7 +161,6 @@ stages:
         - imageOverride -equals RUST-W22-SQL25
     variables:
     - ${{ if eq(parameters.isOfficial, true) }}:
-      - group: 'ESRP Federated Creds (AME)'
       - name: Codeql.Enabled
         value: true
       - name: Codeql.Language
@@ -165,8 +169,16 @@ stages:
         value: mssql_odbc_cpp
     - name: ob_outputDirectory
       value: '$(Build.ArtifactStagingDirectory)'
+    # Official wheels are signed by the managed Windows_x64_Sign job, so this
+    # job publishes only their unsigned, unpacked contents.
     - name: ob_artifactSuffix
-      value: '_windows_x64'
+      ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+        value: '_unsigned'
+      ${{ else }}:
+        value: '_windows_x64'
+    - ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+      - name: ob_sdl_codeSignValidation_excludes
+        value: '-|**\wheel-unpacked\**'
     - name: CARGO_TARGET_DIR
       value: C:\cargo_target_dir
     - name: pyCoreWheelVersion
@@ -207,7 +219,6 @@ stages:
           osType: Windows
           architecture: x64
           publishArtifacts: false
-          signWindowsWheels: ${{ parameters.isOfficial }}
           wheelVersion: $(pyCoreWheelVersion)
     - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
       - template: /.pipeline/templates/build-odbc-windows-template.yml
@@ -215,7 +226,6 @@ stages:
           architecture: x64
           artifactName: 'Odbc_Windows_x64'
           publishArtifacts: false
-          signDriver: ${{ parameters.isOfficial }}
       - pwsh: |
           $ErrorActionPreference = 'Stop'
           $drivers = "$(Build.SourcesDirectory)\drivers\windows\x64"
@@ -224,7 +234,12 @@ stages:
           python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
         displayName: 'Inject ODBC driver into wheels (Windows x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-    - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+    - ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/sign-windows-wheels-template.yml
+        parameters:
+          phase: unpack
+          architecture: x64
+    - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true), ne(parameters.isOfficial, true)) }}:
       - template: /.pipeline/templates/test-python-wheel-installs-template.yml
         parameters:
           osType: Windows
@@ -233,8 +248,67 @@ stages:
       displayName: 'Publish Windows x64 Artifacts'
       inputs:
         targetPath: '$(ob_outputDirectory)'
-        artifact: 'drop_Build_Windows_x64_windows_x64'
+        ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+          artifact: 'drop_Build_Windows_x64_unsigned'
+        ${{ else }}:
+          artifact: 'drop_Build_Windows_x64_windows_x64'
         publishLocation: 'pipeline'
+
+  # ESRP must be called from IPs with approved service tags, which the custom
+  # RUST-* pools (VNet NAT egress) are not, so official signing runs in a
+  # managed OneBranch job and the wheels are repacked on a native agent.
+  - ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+    - job: Windows_x64_Sign
+      displayName: 'Windows x64 ESRP signing'
+      dependsOn: Windows_x64
+      pool:
+        type: windows
+      variables:
+      - group: 'ESRP Federated Creds (AME)'
+      - name: ob_outputDirectory
+        value: '$(Build.ArtifactStagingDirectory)'
+      steps:
+      - template: /.pipeline/templates/sign-windows-wheels-template.yml
+        parameters:
+          phase: sign
+          architecture: x64
+          artifactName: 'drop_Build_Windows_x64_unsigned'
+
+    - job: Windows_x64_Finalize
+      displayName: 'Windows x64 signed wheels'
+      dependsOn: Windows_x64_Sign
+      pool:
+        type: windows
+        isCustom: true
+        name: RUST-X64-WUS3
+        demands:
+          - imageOverride -equals RUST-W22-SQL25
+      variables:
+      - name: ob_outputDirectory
+        value: '$(Build.ArtifactStagingDirectory)'
+      # Keep the final artifact name the unsigned flow has always published.
+      - name: ob_artifactBaseName
+        value: 'drop_Build_Windows_x64'
+      - name: ob_artifactSuffix
+        value: '_windows_x64'
+      steps:
+      - template: /.pipeline/templates/sign-windows-wheels-template.yml
+        parameters:
+          phase: repack
+          architecture: x64
+          artifactName: 'drop_Build_Windows_x64_Sign'
+          pythonVersion: '3.10'
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true)) }}:
+        - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+          parameters:
+            osType: Windows
+            architecture: x64
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Windows x64 Artifacts'
+        inputs:
+          targetPath: '$(ob_outputDirectory)'
+          artifact: 'drop_Build_Windows_x64_windows_x64'
+          publishLocation: 'pipeline'
 
   #########################################################################
   # Windows ARM64
@@ -250,12 +324,18 @@ stages:
         demands:
           - imageOverride -equals RUST-WINSRV-ARM
       variables:
-      - ${{ if eq(parameters.isOfficial, true) }}:
-        - group: 'ESRP Federated Creds (AME)'
       - name: ob_outputDirectory
         value: '$(Build.ArtifactStagingDirectory)'
+      # Official wheels are signed by the managed Windows_ARM64_Sign job, so
+      # this job publishes only their unsigned, unpacked contents.
       - name: ob_artifactSuffix
-        value: '_windows_arm64'
+        ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+          value: '_unsigned'
+        ${{ else }}:
+          value: '_windows_arm64'
+      - ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+        - name: ob_sdl_codeSignValidation_excludes
+          value: '-|**\wheel-unpacked\**'
       - name: CARGO_TARGET_DIR
         value: C:\cargo_target_dir
       - name: pyCoreWheelVersion
@@ -281,7 +361,6 @@ stages:
             osType: Windows
             architecture: arm64
             publishArtifacts: false
-            signWindowsWheels: ${{ parameters.isOfficial }}
             wheelVersion: $(pyCoreWheelVersion)
             # Python 3.10 excluded - limited ARM64 support
             pythonVersions:
@@ -295,7 +374,6 @@ stages:
             architecture: ARM64
             artifactName: 'Odbc_Windows_ARM64'
             publishArtifacts: false
-            signDriver: ${{ parameters.isOfficial }}
         - pwsh: |
             $ErrorActionPreference = 'Stop'
             $drivers = "$(Build.SourcesDirectory)\drivers\windows\arm64"
@@ -304,7 +382,12 @@ stages:
             python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
           displayName: 'Inject ODBC driver into wheels (Windows ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/sign-windows-wheels-template.yml
+          parameters:
+            phase: unpack
+            architecture: arm64
+      - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true), ne(parameters.isOfficial, true)) }}:
         - template: /.pipeline/templates/test-python-wheel-installs-template.yml
           parameters:
             osType: Windows
@@ -318,8 +401,75 @@ stages:
         displayName: 'Publish Windows ARM64 Artifacts'
         inputs:
           targetPath: '$(ob_outputDirectory)'
-          artifact: 'drop_Build_Windows_ARM64_windows_arm64'
+          ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+            artifact: 'drop_Build_Windows_ARM64_unsigned'
+          ${{ else }}:
+            artifact: 'drop_Build_Windows_ARM64_windows_arm64'
           publishLocation: 'pipeline'
+
+    # Official ARM64 signing: same managed ESRP job + native repack as x64.
+    - ${{ if and(eq(parameters.isOfficial, true), eq(parameters.buildPythonWheels, true)) }}:
+      - job: Windows_ARM64_Sign
+        displayName: 'Windows ARM64 ESRP signing'
+        dependsOn: Windows_ARM64
+        pool:
+          type: windows
+        variables:
+        - group: 'ESRP Federated Creds (AME)'
+        - name: ob_outputDirectory
+          value: '$(Build.ArtifactStagingDirectory)'
+        steps:
+        - template: /.pipeline/templates/sign-windows-wheels-template.yml
+          parameters:
+            phase: sign
+            architecture: arm64
+            artifactName: 'drop_Build_Windows_ARM64_unsigned'
+
+      - job: Windows_ARM64_Finalize
+        displayName: 'Windows ARM64 signed wheels'
+        dependsOn: Windows_ARM64_Sign
+        pool:
+          type: windows
+          isCustom: true
+          name: RUST-ARM64-WUS3
+          demands:
+            - imageOverride -equals RUST-WINSRV-ARM
+        variables:
+        - name: ob_outputDirectory
+          value: '$(Build.ArtifactStagingDirectory)'
+        # Keep the final artifact name the unsigned flow has always published.
+        - name: ob_artifactBaseName
+          value: 'drop_Build_Windows_ARM64'
+        - name: ob_artifactSuffix
+          value: '_windows_arm64'
+        steps:
+        # Node.js workaround for ARM64 ADO tasks
+        - pwsh: ./scripts/setup-nodejs-path.ps1
+          displayName: 'Add Node.js to PATH for ADO tasks'
+        - pwsh: ./scripts/install-nodejs-to-agent.ps1
+          displayName: 'Install Node.js to agent externals folder'
+        - template: /.pipeline/templates/sign-windows-wheels-template.yml
+          parameters:
+            phase: repack
+            architecture: arm64
+            artifactName: 'drop_Build_Windows_ARM64_Sign'
+            pythonVersion: '3.11'
+        - ${{ if and(eq(parameters.testPythonWheelInstalls, true), eq(parameters.buildOdbcNative, true)) }}:
+          - template: /.pipeline/templates/test-python-wheel-installs-template.yml
+            parameters:
+              osType: Windows
+              architecture: arm64
+              pythonVersions:
+              - '3.11'
+              - '3.12'
+              - '3.13'
+              - '3.14'
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish Windows ARM64 Artifacts'
+          inputs:
+            targetPath: '$(ob_outputDirectory)'
+            artifact: 'drop_Build_Windows_ARM64_windows_arm64'
+            publishLocation: 'pipeline'
 
   #########################################################################
   # Linux x64
