@@ -700,6 +700,15 @@ pub fn done_proc_no_more() -> ScriptedToken {
     }))
 }
 
+/// A `DONEPROC` ending one RPC of a batched request, with another RPC to follow.
+pub fn done_proc_in_batch_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneProc(DoneToken {
+        status: DoneStatus::MORE | DoneStatus::RPC_IN_BATCH,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
 /// An RPC output parameter returned before the terminal `DONEPROC`.
 pub fn return_value(value: crate::query::result::ReturnValue) -> ScriptedToken {
     ScriptedToken(Tokens::ReturnValue(
