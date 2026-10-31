@@ -1687,12 +1687,8 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
-    fn diagnose_of_an_unparsable_server_renders_as_text_and_json() {
-        let (server, user, password) = (
-            utf16("tcp:127.0.0.1,99999"),
-            utf16("sa"),
-            utf16("not-shown"),
-        );
+    fn diagnose_of_a_refused_connection_renders_as_text_and_json() {
+        let (server, user, password) = (utf16("tcp:127.0.0.1,1"), utf16("sa"), utf16("not-shown"));
         let request = diagnostics_request(&server, &user, &password);
 
         let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_TEXT);
@@ -1700,12 +1696,12 @@ mod tests {
         assert_eq!(exit_code, 1, "issue detected");
         assert!(
             rendered.starts_with(
-                "Diagnostic output may contain unobfuscated server names, host names, and IP addresses. Review the output before sharing it.\n\nsqlcmd diagnose: tcp:127.0.0.1,99999\n"
+                "Diagnostic output may contain unobfuscated server names, host names, and IP addresses. Review the output before sharing it.\n\nsqlcmd diagnose: tcp:127.0.0.1,1\n"
             ),
             "{rendered}"
         );
         assert!(
-            rendered.contains("Connection input      DIAGNOSED"),
+            rendered.contains("TCP connect           DIAGNOSED"),
             "{rendered}"
         );
         assert!(!rendered.contains("not-shown"));
