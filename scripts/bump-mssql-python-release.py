@@ -15,15 +15,7 @@ from urllib.request import Request, urlopen
 
 API_ROOT = "https://api.github.com"
 PYPI_NAME = "mssql-python-rs"
-NUGET_NAME = "mssql-python-rs-wheels"
-NUGET_INDEX = (
-    "https://pkgs.dev.azure.com/SqlClientDrivers/"
-    "904996cc-6198-4d39-8540-eca72bdf0b7b/_packaging/"
-    "376106a7-58f4-4fec-82bd-05b84bbea288/nuget/v3/flat2/"
-    f"{NUGET_NAME}/index.json"
-)
 PYPI_PIN = Path("eng/versions/mssql-python-rs.version")
-NUGET_PIN = Path("eng/versions/mssql-python-rs-nuget.version")
 PR_TEMPLATE = Path(".github/PULL_REQUEST_TEMPLATE.MD")
 BRANCH = "automation/update-mssql-python-rs"
 ISSUE_LABEL = "automation:dependency-version-bump"
@@ -64,14 +56,6 @@ def release_state(version):
         raise ValueError(f"{PYPI_NAME} {version} is not available on PyPI")
     if pypi.get("info", {}).get("version") != version:
         raise ValueError(f"PyPI returned unexpected metadata for {PYPI_NAME} {version}")
-
-    nuget = fetch_json(NUGET_INDEX, missing_is_none=True)
-    if nuget is None:
-        return False
-    versions = nuget.get("versions")
-    if not isinstance(versions, list) or not all(isinstance(item, str) for item in versions):
-        raise ValueError(f"{NUGET_NAME}: invalid NuGet version index")
-    return version in versions
 
 
 def github_api(method, path, payload=None, allow_status=()):
@@ -168,29 +152,15 @@ def write_pin(root, path, version):
     target.write_text(version + suffix, encoding="utf-8")
 
 
-def planned_changes(root, released_version, nuget_available):
+def planned_changes(root, released_version):
     released = version_tuple(released_version)
     python_current = read_pin(root, PYPI_PIN)
-    nuget_current = read_pin(root, NUGET_PIN)
     changes = {}
 
     if version_tuple(python_current) < released:
         changes[PYPI_PIN] = (python_current, released_version)
     elif version_tuple(python_current) > released:
-        print(
-            f"Leaving newer {PYPI_PIN} {python_current} unchanged while checking "
-            f"the independently published NuGet package."
-        )
-
-    if nuget_available and version_tuple(nuget_current) < released:
-        changes[NUGET_PIN] = (nuget_current, released_version)
-    elif version_tuple(nuget_current) > released:
-        print(f"Leaving newer {NUGET_PIN} {nuget_current} unchanged.")
-    elif not nuget_available:
-        print(
-            f"{NUGET_NAME} {released_version} is not available; leaving "
-            f"{NUGET_PIN} at {nuget_current}."
-        )
+        print(f"Leaving newer {PYPI_PIN} {python_current} unchanged.")
     return changes
 
 
@@ -201,12 +171,8 @@ def issue_body(version, changes, _source_build_id):
     )
     return (
         f"{ISSUE_MARKER}\n\n"
-        f"Update the `{PYPI_NAME}` dependency pins to the canonical released "
-        f"artifact set headed by version {version}.\n\n"
-        f"{lines}\n\n"
-        f"`{NUGET_PIN.as_posix()}` advances only to a clean `{NUGET_NAME}` "
-        "version verified by this run, or retains a higher clean version already "
-        "pending on the automation branch.\n"
+        f"Update the `{PYPI_NAME}` dependency pin to released version {version}.\n\n"
+        f"{lines}\n"
     )
 
 
@@ -269,11 +235,9 @@ def pull_request_body(root, issue_number, version, changes):
     if placeholder not in template:
         raise ValueError(f"{PR_TEMPLATE}: summary placeholder not found")
     detail = (
-        f"Update released `{PYPI_NAME}` dependency pins to version `{version}`.\n\n"
+        f"Update released `{PYPI_NAME}` dependency pin to version `{version}`.\n\n"
         f"{summary}\n\n"
-        f"The NuGet pin advances only when `{NUGET_NAME} {version}` is available, "
-        "or retains a higher clean version already pending in this draft. This "
-        "draft does not publish or merge anything."
+        "This draft does not publish or merge anything."
     )
     return template.replace(placeholder, f"{placeholder}\n\n{detail}", 1)
 
@@ -330,19 +294,16 @@ def closed_pull_request_merged(repo, base, owner, branch, branch_commit):
 
 
 def remote_pin_versions(root, commit):
-    versions = {}
-    for path in (PYPI_PIN, NUGET_PIN):
-        value = git(root, "show", f"{commit}:{path.as_posix()}").stdout.strip()
-        version_tuple(value)
-        versions[path] = value
-    return versions
+    value = git(root, "show", f"{commit}:{PYPI_PIN.as_posix()}").stdout.strip()
+    version_tuple(value)
+    return {PYPI_PIN: value}
 
 
 def update_pull_request(root, version, changes, source_build_id):
     repo = repository()
     base = os.environ.get("DEFAULT_BRANCH", "main")
     owner = repo.split("/", 1)[0]
-    planned_from = {path: read_pin(root, path) for path in (PYPI_PIN, NUGET_PIN)}
+    planned_from = {PYPI_PIN: read_pin(root, PYPI_PIN)}
     git(root, "fetch", "--quiet", "origin", base)
     base_sha = git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
     base_versions = remote_pin_versions(root, base_sha)
@@ -435,7 +396,7 @@ def update_pull_request(root, version, changes, source_build_id):
 def main():
     version = os.environ.get("RELEASED_VERSION", "").strip()
     version_tuple(version)
-    nuget_available = release_state(version)
+    release_state(version)
     source_build_id = os.environ.get("SOURCE_BUILD_ID", "").strip()
 
     with tempfile.TemporaryDirectory(prefix="mssql-python-release-") as directory:
@@ -448,7 +409,7 @@ def main():
             f"https://github.com/{repository()}.git",
             str(root),
         )
-        changes = planned_changes(root, version, nuget_available)
+        changes = planned_changes(root, version)
         if not changes:
             print(f"No mssql-python dependency changes are needed for {version}.")
             return
