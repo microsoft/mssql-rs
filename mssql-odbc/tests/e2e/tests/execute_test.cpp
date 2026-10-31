@@ -3,6 +3,7 @@
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <algorithm>
@@ -111,14 +112,15 @@ protected:
 };
 
 // SQLExecute on a statement that was never prepared is a sequence error.
-TEST_F(PrepareExecuteLiveTest, ExecuteWithoutPrepareReturnsHy010) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecuteWithoutPrepareReturnsHy010,
+                  odbc_concurrency::kAllModes) {
     SQLRETURN rc = SQLExecute(stmt_);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
 }
 
 // Prepare + execute with no parameters.
-TEST_F(PrepareExecuteLiveTest, PrepareExecuteNoParams) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, PrepareExecuteNoParams, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT 1"), SQL_HANDLE_STMT, stmt_);
 
     SQLRETURN rc = SQLExecute(stmt_);
@@ -137,7 +139,7 @@ TEST_F(PrepareExecuteLiveTest, PrepareExecuteNoParams) {
 
 // A single character parameter flows through sp_prepare/sp_execute and is
 // returned verbatim.
-TEST_F(PrepareExecuteLiveTest, SingleCharParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, SingleCharParam, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> value = {'h', 'e', 'l', 'l', 'o', '\0'};
@@ -160,7 +162,8 @@ TEST_F(PrepareExecuteLiveTest, SingleCharParam) {
 // actually carried three parameters, that the streamed one was declared
 // varchar(max), and that its PLP chunks were framed between the two
 // materialized values rather than merely resolving correctly by name.
-TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> first = {'a', '\0'};
@@ -201,7 +204,8 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsReported) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsReported,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -250,7 +254,8 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsReported)
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsNotReported) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsNotReported,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ':' + CONVERT(VARCHAR(32), ?) AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -303,7 +308,8 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsNotReporte
 // bind order, as msodbcsql offers them; the RPC opens as soon as no parameter
 // still to be visited needs collecting, so the PLP-capable one bound after it
 // streams rather than being held in memory.
-TEST_F(PrepareExecuteLiveTest, MixedDataAtExecutionPreservesBindOrderAndValues) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, MixedDataAtExecutionPreservesBindOrderAndValues,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS a, ? AS b"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
@@ -379,7 +385,8 @@ TEST_F(PrepareExecuteLiveTest, MixedDataAtExecutionPreservesBindOrderAndValues) 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, DataAtExecutionLoopsOverMultipleStreamedParams) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionLoopsOverMultipleStreamedParams,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> bound_first = {'p', '\0'};
@@ -458,7 +465,8 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionLoopsOverMultipleStreamedParams) {
 // Benefits-from-mock-tds: the values only prove each execute ran. A mock TDS
 // server could assert the first execute was sp_prepexec and the next two were
 // sp_execute against the same handle, which is the actual claim here.
-TEST_F(PrepareExecuteLiveTest, DataAtExecutionKeepsStatementPreparedAcrossExecutes) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionKeepsStatementPreparedAcrossExecutes,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> buffer(16, 0);
@@ -517,7 +525,8 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionKeepsStatementPreparedAcrossExecut
 //
 // Executed twice: the first call prepares (sp_prepexec), only the second runs
 // against the cached handle, which is the case under test.
-TEST_F(PrepareExecuteLiveTest, DataAtExecutionKeepsParamOrderOnCachedPlan) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionKeepsParamOrderOnCachedPlan,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     char first[] = "A";
@@ -566,7 +575,7 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionKeepsParamOrderOnCachedPlan) {
 // A mock TDS server could assert the parameter was declared varbinary(max) and
 // that both chunks were emitted as separate PLP chunk headers under an
 // unknown-length opener, rather than coalesced into one.
-TEST_F(PrepareExecuteLiveTest, DataAtExecutionBinaryParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionBinaryParam, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(varchar(20), ?, 2) AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -604,7 +613,8 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionBinaryParam) {
 // RPC is retracted at the protocol level, so the connection survives and the
 // statement can simply be executed again -- see `cancel_streamed_write` in
 // mssql-tds.
-TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -649,7 +659,8 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDeferredDataAtExecutionSequence) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, SQLCancelAbandonsDeferredDataAtExecutionSequence,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
@@ -685,7 +696,8 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDeferredDataAtExecutionSequence)
 // retraction: msodbcsql takes BATCHCTX::Cancel's STATE_BATCH_PARTIALCMDSENT arm
 // and this driver takes `cancel_streamed_write`. The test above cancels after
 // seven bytes, which never leave the local buffer. AB#47687.
-TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -729,7 +741,7 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
 
 // Benefits-from-mock-tds: values and reuse cannot prove superseded handles were
 // released. The prepared-stream ownership unit tests check the unprepare RPC.
-TEST_F(PrepareExecuteLiveTest, RebindAfterCancelledStreamReleasesPriorHandle) {
+ODBC_TEST_F(PrepareExecuteLiveTest, RebindAfterCancelledStreamReleasesPriorHandle) {
     SQLTCHAR driver_version[64] = {};
     ASSERT_SQL_OK(SQLGetInfo(dbc_, SQL_DRIVER_VER, driver_version,
                             sizeof(driver_version), nullptr),
@@ -813,7 +825,8 @@ TEST_F(PrepareExecuteLiveTest, RebindAfterCancelledStreamReleasesPriorHandle) {
 
 // Benefits-from-mock-tds: the shared TDS ownership tests check actual release;
 // this pins the deferred SQLParamData caller's plan restoration across rebinds.
-TEST_F(PrepareExecuteLiveTest, RebindAfterDeferredStreamReleasesPriorHandle) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, RebindAfterDeferredStreamReleasesPriorHandle,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
     SQLCHAR buffered_token = 0, streamed_token = 0;
     SQLLEN buffered_ind = SQL_DATA_AT_EXEC, streamed_ind = SQL_DATA_AT_EXEC;
@@ -856,7 +869,7 @@ TEST_F(PrepareExecuteLiveTest, RebindAfterDeferredStreamReleasesPriorHandle) {
 // TDS server could assert the parameter was serialized as PLP_NULL rather than
 // as an unknown-length opener with an immediate terminator, which is the
 // distinction this test cannot draw.
-TEST_F(PrepareExecuteLiveTest, DataAtExecutionNullParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionNullParam, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT COALESCE(?, 'was-null') AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -882,7 +895,8 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionNullParam) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, BufferedNullPrecedesAStreamedValue) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, BufferedNullPrecedesAStreamedValue,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT COALESCE(CONVERT(VARCHAR(16), ?), 'was-null')"
                           " + '/' + ? AS v"),
                   SQL_HANDLE_STMT, stmt_);
@@ -921,7 +935,8 @@ TEST_F(PrepareExecuteLiveTest, BufferedNullPrecedesAStreamedValue) {
 
 // A parameter marked NULL cannot then receive value bytes: PLP_NULL is already
 // committed for it, so the chunk has nowhere to go.
-TEST_F(PrepareExecuteLiveTest, DataAtExecutionChunkAfterNullReturnsHY020) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionChunkAfterNullReturnsHY020,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -967,7 +982,8 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionChunkAfterNullReturnsHY020) {
 // Unlike SQLExecute this runs ad-hoc sp_executesql with no prepared plan, which
 // is the case SQLParamData has to complete without one. Two streamed parameters
 // so the SQLParamData loop actually iterates on this path as well.
-TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundParams) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundParams,
+                  odbc_concurrency::kAllModes) {
     std::vector<SQLCHAR> bound_first = {'a', '\0'};
     std::vector<SQLCHAR> bound_second = {'c', '\0'};
     SQLLEN bound_first_ind = SQL_NTS;
@@ -1028,7 +1044,9 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundPara
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationBeforeDataAtExecutionIsReported) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest,
+                  ExecDirectNumericTruncationBeforeDataAtExecutionIsReported,
+                  odbc_concurrency::kAllModes) {
     SQL_NUMERIC_STRUCT numeric = {};
     numeric.precision = 3;
     numeric.scale = 2;
@@ -1070,7 +1088,9 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationBeforeDataAtExecutionI
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationAfterDataAtExecutionIsNotReported) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest,
+                  ExecDirectNumericTruncationAfterDataAtExecutionIsNotReported,
+                  odbc_concurrency::kAllModes) {
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
     SQLCHAR streamed_token = 0;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
@@ -1108,7 +1128,8 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationAfterDataAtExecutionIs
 // Completing a direct-execution streaming sequence must leave the statement
 // reusable. SQLParamData restores the prepared plan it parked, which is absent
 // here -- a statement wrongly left marked prepared or busy would fail this.
-TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionStatementIsReusable) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecDirectDataAtExecutionStatementIsReusable,
+                  odbc_concurrency::kAllModes) {
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
     SQLCHAR streamed_token = 0;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
@@ -1141,7 +1162,8 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionStatementIsReusable) {
 // In the Need Data state only SQLPutData / SQLParamData / SQLCancel are legal,
 // so a second SQLExecDirect is a sequence error rather than the cursor-state
 // error a merely-busy statement gets.
-TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010,
+                  odbc_concurrency::kAllModes) {
     // Deliberate divergence, not a driver-death workaround: msodbcsql parks the
     // half-written RPC under STMT_ST_EXECSTARTED (sqlccmd.cpp:1701), and
     // SQLExecDirectW tests that bit in the same branch as an open cursor
@@ -1175,7 +1197,8 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
 //
 // msodbcsql has always supported this pairing, so the parity run is no longer
 // skipped here.
-TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
@@ -1222,7 +1245,9 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTrans
 // aborted before the actual units were logged. Either way the parity run
 // compares outcomes, not cause, so this divergence has to opt out rather
 // than turn the build red.
-TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest,
+                  NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -1270,7 +1295,8 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTrans
 // collation-correct narrow encoding in one test: the narrow-to-wide
 // direction above produces wide UTF-16LE output, which never touches
 // collation encoding at all, so it cannot cover that half of the fix.
-TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
@@ -1328,7 +1354,8 @@ TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTrans
 // convention, which the materialized path already follows; it is not specific
 // to the streamed path this test covers. Only visible under a non-UTF8
 // collation -- under a UTF8 one, transcode and passthrough are byte-identical.
-TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -1384,7 +1411,8 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionTra
 // with HY019. Its ValidatePutDataLength does raise IDS_HY_019 from an
 // IsFixedSqlType arm, but SQL_INTEGER does not reach that arm at runtime --
 // probed rather than inferred from the source.)
-TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionConvertsToInteger,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? + 1"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
@@ -1424,7 +1452,8 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
 // ColumnSize must be a real length: 0 is the `max` sentinel for SQL_VARCHAR but
 // invalid for the long types on both drivers (HY104), as
 // ZeroColumnSizeIsRejectedForFixedLengthCharTypes pins.
-TEST_F(PrepareExecuteLiveTest, LongVarcharDataAtExecutionStreams) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, LongVarcharDataAtExecutionStreams,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
@@ -1448,7 +1477,7 @@ TEST_F(PrepareExecuteLiveTest, LongVarcharDataAtExecutionStreams) {
 }
 
 // A wide-character parameter binds as nvarchar and round-trips.
-TEST_F(PrepareExecuteLiveTest, WideCharParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, WideCharParam, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     // UTF-16 "wide" + NUL terminator.
@@ -1468,7 +1497,8 @@ TEST_F(PrepareExecuteLiveTest, WideCharParam) {
 // A wide-char parameter bound with an explicit byte-length indicator (not
 // SQL_NTS) sends exactly that many bytes. The indicator is a byte count per the
 // ODBC spec, so 8 bytes == 4 UTF-16 units.
-TEST_F(PrepareExecuteLiveTest, ExplicitLengthWideCharParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExplicitLengthWideCharParam,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     // "wider" (no NUL) with an indicated length of 8 bytes → only "wide".
@@ -1492,7 +1522,8 @@ TEST_F(PrepareExecuteLiveTest, ExplicitLengthWideCharParam) {
 // Benefits-from-mock-tds: a mock TDS server could assert the RPC parameter was
 // declared varchar with a single-byte payload; the round-tripped text alone
 // cannot show which C type the driver resolved.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeNarrowCharParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DefaultCTypeNarrowCharParam,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> value = {'p', 'l', 'a', 'i', 'n', '\0'};
@@ -1517,7 +1548,7 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeNarrowCharParam) {
 // Benefits-from-mock-tds: a mock TDS server could assert the RPC parameter was
 // declared nvarchar carrying the full UTF-16 payload, which is the deviation
 // itself; the round-tripped ASCII text alone cannot show it.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DefaultCTypeWideCharParam, odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -1541,7 +1572,7 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert @P1 is declared an
 // integer rather than nvarchar(max); SQL Server implicit-converts either way.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DefaultCTypeIntegerParam, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLINTEGER value = 42;
@@ -1564,7 +1595,8 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParam) {
 // Benefits-from-mock-tds: a mock TDS server could assert the declared type
 // actually changes across the four binds; the round-tripped text is "7" for all
 // of them, and for the pre-P3 nvarchar(max) behaviour too.
-TEST_F(PrepareExecuteLiveTest, IntegerParamAcceptsEveryIntegerTargetType) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, IntegerParamAcceptsEveryIntegerTargetType,
+                  odbc_concurrency::kAllModes) {
     const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
     for (SQLSMALLINT sql_type : sql_types) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -1585,7 +1617,8 @@ TEST_F(PrepareExecuteLiveTest, IntegerParamAcceptsEveryIntegerTargetType) {
 
 // A value the target type cannot hold is a conversion error at execute, not a
 // silently wrapped wire value: 300 does not fit tinyint.
-TEST_F(PrepareExecuteLiveTest, IntegerParamOutOfRangeForTargetIs22003) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, IntegerParamOutOfRangeForTargetIs22003,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLINTEGER value = 300;
@@ -1602,7 +1635,8 @@ TEST_F(PrepareExecuteLiveTest, IntegerParamOutOfRangeForTargetIs22003) {
 // HYC00 ("optional feature not implemented") rather than a conversion failure.
 // msodbcsql's IsValidSqlType returns IDS_S1_C00 for the whole interval range
 // before IsValidSQLConversion is reached, so both drivers agree here.
-TEST_F(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00,
+                  odbc_concurrency::kAllModes) {
     SQL_INTERVAL_STRUCT value = {};
     SQLLEN ind = 0;
     SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
@@ -1619,7 +1653,8 @@ TEST_F(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00) {
 // Benefits-from-mock-tds: a mock TDS server could assert the typed NULL carries
 // the ParameterType's TYPE_INFO; a fetched NULL looks the same whatever it was
 // declared as.
-TEST_F(PrepareExecuteLiveTest, ExplicitIntegerParamAcceptsNull) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExplicitIntegerParamAcceptsNull,
+                  odbc_concurrency::kAllModes) {
     const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
     for (SQLSMALLINT sql_type : sql_types) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -1647,7 +1682,8 @@ TEST_F(PrepareExecuteLiveTest, ExplicitIntegerParamAcceptsNull) {
 //
 // Benefits-from-mock-tds: as above - only a mock server can show the two
 // spellings produce the same declaration.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParamAcceptsNull) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DefaultCTypeIntegerParamAcceptsNull,
+                  odbc_concurrency::kAllModes) {
     const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
     for (SQLSMALLINT sql_type : sql_types) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -1672,7 +1708,8 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParamAcceptsNull) {
 // ODBC never promises an aligned application buffer, so the driver reads
 // parameter values unaligned. Binding from an odd offset is the only test that
 // would fault if that ever regressed to an aligned load.
-TEST_F(PrepareExecuteLiveTest, UnalignedIntegerParamBufferIsRead) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, UnalignedIntegerParamBufferIsRead,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     alignas(8) unsigned char backing[16] = {0};
@@ -1700,7 +1737,8 @@ TEST_F(PrepareExecuteLiveTest, UnalignedIntegerParamBufferIsRead) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert the smallint payload
 // on the wire, rather than inferring it from the rendered text.
-TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsSignedButUtinyintIsNot) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, TinyintCTypeIsSignedButUtinyintIsNot,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         SQLSMALLINT c_type;
         const char* expected;
@@ -1733,7 +1771,8 @@ TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsSignedButUtinyintIsNot) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert the declared tinyint
 // payload on the wire, rather than inferring it from the rendered text.
-TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsUnsignedAgainstTinyintParameter) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, TinyintCTypeIsUnsignedAgainstTinyintParameter,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     unsigned char raw = 0xFF;
@@ -1753,7 +1792,8 @@ TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsUnsignedAgainstTinyintParameter) {
 // SQL_C_TINYINT rather than range-checked as signed. msodbcsql never even
 // reaches its converter here - sqlcdata.cpp maps the tinyint column to
 // SQL_C_UTINYINT and clears fConvNeeded - so the byte arrives intact.
-TEST_F(PrepareExecuteLiveTest, TinyintColumnAbove127FetchesIntoTinyintCType) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, TinyintColumnAbove127FetchesIntoTinyintCType,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(200 AS tinyint) AS v"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -1774,7 +1814,8 @@ TEST_F(PrepareExecuteLiveTest, TinyintColumnAbove127FetchesIntoTinyintCType) {
 // SQL_PREC_UNLIMITED is 0, so a fixed-length declaration cannot use it - but the
 // variable-length types read 0 as the `max` spelling and accept it. The error is
 // HY104 at bind, not at execute, and it applies whether or not the value is NULL.
-TEST_F(PrepareExecuteLiveTest, ZeroColumnSizeIsRejectedForFixedLengthCharTypes) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ZeroColumnSizeIsRejectedForFixedLengthCharTypes,
+                  odbc_concurrency::kAllModes) {
     struct Case {
         SQLSMALLINT c_type;
         SQLSMALLINT sql_type;
@@ -1806,7 +1847,8 @@ TEST_F(PrepareExecuteLiveTest, ZeroColumnSizeIsRejectedForFixedLengthCharTypes) 
 
 // SQL_C_UBIGINT is the one C type whose range exceeds every SQL Server integer
 // target, so a value above i64::MAX is 22003 rather than a wrapped negative.
-TEST_F(PrepareExecuteLiveTest, UbigintAboveBigintMaxIs22003) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, UbigintAboveBigintMaxIs22003,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLUBIGINT value = 9223372036854775808ULL;  // i64::MAX + 1
@@ -1824,7 +1866,8 @@ TEST_F(PrepareExecuteLiveTest, UbigintAboveBigintMaxIs22003) {
 // consults the indicator only for non-fixed C types (`!IsFixedCType(...) &&
 // cbValue > 0`, sqlccmd.cpp:4128 and :4539) and likewise overrides BufferLength
 // for them at bind (sqlcdesc.cpp:2507).
-TEST_F(PrepareExecuteLiveTest, StrayIndicatorIsIgnoredForFixedWidthCTypes) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, StrayIndicatorIsIgnoredForFixedWidthCTypes,
+                  odbc_concurrency::kAllModes) {
     // -7 is HY090 on a character binding and ignored here; 999 would overread a
     // 4-byte buffer if it were ever honoured as a length.
     for (SQLLEN stray : {static_cast<SQLLEN>(-7), static_cast<SQLLEN>(0),
@@ -1848,7 +1891,8 @@ TEST_F(PrepareExecuteLiveTest, StrayIndicatorIsIgnoredForFixedWidthCTypes) {
 // SQLBindParameter: "If StrLen_or_IndPtr is a null pointer, the driver assumes
 // that all input parameter values are non-NULL and that character and binary
 // data is null-terminated." So this is SQL_NTS, not a NULL parameter.
-TEST_F(PrepareExecuteLiveTest, NullIndicatorPointerMeansNullTerminated) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, NullIndicatorPointerMeansNullTerminated,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> value = {'a', 'b', 'c', '\0'};
@@ -1865,7 +1909,7 @@ TEST_F(PrepareExecuteLiveTest, NullIndicatorPointerMeansNullTerminated) {
 }
 
 // A NULL-indicator parameter produces a SQL NULL result.
-TEST_F(PrepareExecuteLiveTest, NullParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, NullParam, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> value = {'i', 'g', 'n', 'o', 'r', 'e', 'd', '\0'};
@@ -1884,7 +1928,7 @@ TEST_F(PrepareExecuteLiveTest, NullParam) {
 
 // Multiple parameters are bound in order and substituted positionally,
 // including a NULL-indicator parameter mixed in with non-NULL ones.
-TEST_F(PrepareExecuteLiveTest, MultipleParams) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, MultipleParams, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS INT) + CAST(? AS INT) AS s, ? AS n"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -1908,7 +1952,7 @@ TEST_F(PrepareExecuteLiveTest, MultipleParams) {
 }
 
 // A parameter used in a WHERE clause filters rows correctly.
-TEST_F(PrepareExecuteLiveTest, ParamInWhereClause) {
+ODBC_TEST_F(PrepareExecuteLiveTest, ParamInWhereClause) {
     ExecDirect("CREATE TABLE #people (id INT, name VARCHAR(50))");
     ExecDirect("INSERT INTO #people VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')");
 
@@ -1930,7 +1974,7 @@ TEST_F(PrepareExecuteLiveTest, ParamInWhereClause) {
 // Re-executing a prepared statement with a changed parameter buffer reuses the
 // cached server handle (sp_execute) and reflects the new value. The buffer is
 // read by reference at each SQLExecute.
-TEST_F(PrepareExecuteLiveTest, ReExecuteWithNewParamValue) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ReExecuteWithNewParamValue, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     // Fixed-capacity buffer so its address is stable across re-execute — the
@@ -1958,7 +2002,7 @@ TEST_F(PrepareExecuteLiveTest, ReExecuteWithNewParamValue) {
 // Prepare once, execute many times with different parameter values. The plan is
 // prepared on the first execute (sp_prepexec) and reused via sp_execute on every
 // subsequent call; the bound buffer is re-read by reference each time.
-TEST_F(PrepareExecuteLiveTest, PrepareOnceExecuteMany) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, PrepareOnceExecuteMany, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS INT) * 2 AS v"), SQL_HANDLE_STMT, stmt_);
 
     // Fixed-capacity buffer bound once; its address must stay stable across the
@@ -1990,7 +2034,8 @@ TEST_F(PrepareExecuteLiveTest, PrepareOnceExecuteMany) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert sp_unprepare +
 // sp_prepexec actually fired, which the returned value alone cannot.
-TEST_F(PrepareExecuteLiveTest, RebindReleasesPriorHandleAndReprepares) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, RebindReleasesPriorHandleAndReprepares,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> first = {'f', 'i', 'r', 's', 't', '\0'};
@@ -2019,7 +2064,8 @@ TEST_F(PrepareExecuteLiveTest, RebindReleasesPriorHandleAndReprepares) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert the prior handle's
 // sp_unprepare / piggybacked @handle drop actually fired.
-TEST_F(PrepareExecuteLiveTest, ReprepareReleasesPriorHandle) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ReprepareReleasesPriorHandle,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT 1 AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2043,16 +2089,23 @@ TEST_F(PrepareExecuteLiveTest, ReprepareReleasesPriorHandle) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert the drain + sp_unprepare
 // RPCs fired, not just the healthy-connection outcome.
-TEST_F(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKeepsConnection) {
+//
+// Calls on the private statement carry its diagnostic, so in /SharedDbc a busy
+// connection is retried rather than failed.
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKeepsConnection,
+                  odbc_concurrency::kAllModes) {
     SQLHSTMT s = SQL_NULL_HSTMT;
     ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &s));
 
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 7 AS v");
     ASSERT_EQ(SQL_SUCCESS,
-              SQLPrepare(s, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
-    ASSERT_EQ(SQL_SUCCESS, SQLExecute(s));
+              SQLPrepare(s, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(s))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
     // Fetch a row but deliberately leave the cursor open.
-    ASSERT_EQ(SQL_SUCCESS, SQLFetch(s));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(s))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
 
     // Free with the cursor still open — the driver must drain + unprepare.
     ASSERT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, s));
@@ -2081,14 +2134,18 @@ TEST_F(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKeepsConnectio
 // Benefits-from-mock-tds: a mock TDS server could assert the half-written RPC
 // was retracted (attention or IGNORE) rather than left dangling, which the
 // healthy-connection outcome only implies.
-TEST_F(PrepareExecuteLiveTest,
-       FreeStatementMidDataAtExecutionIsRejectedUntilCancelled) {
+//
+// Calls on the private statement carry its diagnostic, so in /SharedDbc a busy
+// connection is retried rather than failed.
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FreeStatementMidDataAtExecutionIsRejectedUntilCancelled,
+                  odbc_concurrency::kAllModes) {
     SQLHSTMT s = SQL_NULL_HSTMT;
     ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &s));
 
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
     ASSERT_EQ(SQL_SUCCESS,
-              SQLPrepare(s, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+              SQLPrepare(s, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
 
     std::vector<SQLCHAR> buffer(16, 0);
     SQLLEN ind = SQL_DATA_AT_EXEC;
@@ -2100,10 +2157,13 @@ TEST_F(PrepareExecuteLiveTest,
     // Suspend the statement mid-sequence: the client is parked and the first
     // chunk is already on the wire, so the request is half-written.
     SQLPOINTER value_ptr = nullptr;
-    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(s));
-    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(s, &value_ptr));
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(s))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(s, &value_ptr))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
     const char chunk[] = "partial";
-    ASSERT_EQ(SQL_SUCCESS, SQLPutData(s, const_cast<char*>(chunk), 7));
+    ASSERT_EQ(SQL_SUCCESS, SQLPutData(s, const_cast<char*>(chunk), 7))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
 
     // Free without ever completing the sequence: rejected, handle still valid.
     EXPECT_EQ(SQL_ERROR, SQLFreeHandle(SQL_HANDLE_STMT, s));
@@ -2123,7 +2183,8 @@ TEST_F(PrepareExecuteLiveTest,
 }
 
 // A '?' inside a string literal is not a parameter marker.
-TEST_F(PrepareExecuteLiveTest, LiteralQuestionMarkIsNotAParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, LiteralQuestionMarkIsNotAParam,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT '?' AS v"), SQL_HANDLE_STMT, stmt_);
 
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2135,7 +2196,8 @@ TEST_F(PrepareExecuteLiveTest, LiteralQuestionMarkIsNotAParam) {
 
 // Re-executing while the cursor is still open is a cursor-state error, but the
 // same statement re-executes cleanly once the cursor is closed.
-TEST_F(PrepareExecuteLiveTest, ReExecuteWhileCursorOpenReturns24000) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ReExecuteWhileCursorOpenReturns24000,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT 1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     // Fetch a row so the cursor is firmly open in the DM's state machine.
@@ -2157,7 +2219,7 @@ TEST_F(PrepareExecuteLiveTest, ReExecuteWhileCursorOpenReturns24000) {
 
 // SQLExecDirect with a bound parameter executes directly (sp_executesql) and
 // substitutes the value, with no persistent prepared handle.
-TEST_F(PrepareExecuteLiveTest, ExecDirectWithParam) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecDirectWithParam, odbc_concurrency::kAllModes) {
     std::vector<SQLCHAR> value = {'d', 'i', 'r', 'e', 'c', 't', '\0'};
     SQLLEN ind = SQL_NTS;
     ASSERT_SQL_OK(BindChar(1, value, ind), SQL_HANDLE_STMT, stmt_);
@@ -2172,7 +2234,8 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectWithParam) {
 
 // SQLExecDirect substitutes multiple bound parameters positionally, including a
 // NULL-indicator parameter.
-TEST_F(PrepareExecuteLiveTest, ExecDirectWithMultipleParams) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecDirectWithMultipleParams,
+                  odbc_concurrency::kAllModes) {
     std::vector<SQLCHAR> a = {'5', '\0'};
     std::vector<SQLCHAR> b = {'6', '\0'};
     std::vector<SQLCHAR> c = {'i', 'g', 'n', 'o', 'r', 'e', 'd', '\0'};
@@ -2196,7 +2259,8 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectWithMultipleParams) {
 }
 
 // SQLExecDirect with a marker but no bound parameter fails with 07002.
-TEST_F(PrepareExecuteLiveTest, ExecDirectUnboundMarkerReturns07002) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecDirectUnboundMarkerReturns07002,
+                  odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     EXPECT_EQ(SQL_ERROR, rc);
@@ -2204,7 +2268,7 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectUnboundMarkerReturns07002) {
 }
 
 // A prepared statement with an unbound marker fails at execute time.
-TEST_F(PrepareExecuteLiveTest, UnboundMarkerReturns07002) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, UnboundMarkerReturns07002, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLRETURN rc = SQLExecute(stmt_);
@@ -2213,7 +2277,7 @@ TEST_F(PrepareExecuteLiveTest, UnboundMarkerReturns07002) {
 }
 
 // SQL_RESET_PARAMS drops bindings; a subsequent execute sees an unbound marker.
-TEST_F(PrepareExecuteLiveTest, ResetParamsClearsBindings) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ResetParamsClearsBindings, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> value = {'x', '\0'};
@@ -2228,7 +2292,8 @@ TEST_F(PrepareExecuteLiveTest, ResetParamsClearsBindings) {
 }
 
 // ParameterNumber 0 is invalid.
-TEST_F(PrepareExecuteLiveTest, BindParameterNumberZeroReturns07009) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, BindParameterNumberZeroReturns07009,
+                  odbc_concurrency::kAllModes) {
     std::vector<SQLCHAR> value = {'x', '\0'};
     SQLLEN ind = SQL_NTS;
     SQLRETURN rc = SQLBindParameter(stmt_, 0, SQL_PARAM_INPUT, SQL_C_CHAR,
@@ -2241,7 +2306,7 @@ TEST_F(PrepareExecuteLiveTest, BindParameterNumberZeroReturns07009) {
 // Output parameters bind successfully since AB#48049; the value is delivered
 // once the procedure's result sets are consumed (see escape_sequence_test).
 // Streamed output stays unimplemented, and that refusal is mssql-odbc-specific.
-TEST_F(PrepareExecuteLiveTest, OutputParameterBinds) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, OutputParameterBinds, odbc_concurrency::kAllModes) {
     std::vector<SQLCHAR> value = {'x', '\0'};
     SQLLEN ind = SQL_NTS;
     EXPECT_EQ(SQL_SUCCESS,
@@ -2250,7 +2315,8 @@ TEST_F(PrepareExecuteLiveTest, OutputParameterBinds) {
                                static_cast<SQLLEN>(value.size()), &ind));
 }
 
-TEST_F(PrepareExecuteLiveTest, StreamedOutputParametersAreRejected) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, StreamedOutputParametersAreRejected,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     for (SQLSMALLINT direction :
          {SQL_PARAM_OUTPUT_STREAM, SQL_PARAM_INPUT_OUTPUT_STREAM}) {
@@ -2279,7 +2345,8 @@ TEST_F(PrepareExecuteLiveTest, StreamedOutputParametersAreRejected) {
 // clears `hPrepDropDeferred` before dispatch and never restores it on failure
 // (PrepOrPrepExecQuery, sqlccmd.cpp). Had the driver re-armed the handle, the
 // next sp_prepexec would re-drop it and fail with HY000/8179 (handle not found).
-TEST_F(PrepareExecuteLiveTest, FailedReprepareKeepsStatementUsable) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FailedReprepareKeepsStatementUsable,
+                  odbc_concurrency::kAllModes) {
     // Prepare + execute a valid plan so a server handle is cached.
     ASSERT_SQL_OK(Prepare("SELECT 1 AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2306,7 +2373,7 @@ TEST_F(PrepareExecuteLiveTest, FailedReprepareKeepsStatementUsable) {
 // parameterized prepared test is a SELECT; this is the only one that drives the
 // no-result-set finish path (drain + prepared-handle capture at DDL/DML finish)
 // with parameters.
-TEST_F(PrepareExecuteLiveTest, PreparedParamDmlReusesHandle) {
+ODBC_TEST_F(PrepareExecuteLiveTest, PreparedParamDmlReusesHandle) {
     ExecDirect("CREATE TABLE #nums (v INT)");
 
     ASSERT_SQL_OK(Prepare("INSERT INTO #nums (v) VALUES (CAST(? AS INT))"),
@@ -2337,7 +2404,8 @@ TEST_F(PrepareExecuteLiveTest, PreparedParamDmlReusesHandle) {
 // release it via sp_unprepare before running the batch. Every other ExecDirect
 // test runs on a fresh statement where the pending drop is empty, so this is the
 // only path that exercises that release actually firing.
-TEST_F(PrepareExecuteLiveTest, ExecDirectReleasesOrphanedPreparedHandle) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ExecDirectReleasesOrphanedPreparedHandle,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     std::vector<SQLCHAR> first = {'f', 'i', 'r', 's', 't', '\0'};
     SQLLEN ind1 = SQL_NTS;
@@ -2365,7 +2433,7 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectReleasesOrphanedPreparedHandle) {
 // A prepared parameterized SELECT that matches multiple rows exercises the fetch
 // loop under a cached plan; a re-execute with a narrower bound value reuses the
 // handle (sp_execute) and returns fewer rows.
-TEST_F(PrepareExecuteLiveTest, PreparedParamSelectMultipleRows) {
+ODBC_TEST_F(PrepareExecuteLiveTest, PreparedParamSelectMultipleRows) {
     ExecDirect("CREATE TABLE #ids (id INT)");
     ExecDirect("INSERT INTO #ids VALUES (1), (2), (3)");
 
@@ -2404,7 +2472,8 @@ TEST_F(PrepareExecuteLiveTest, PreparedParamSelectMultipleRows) {
 // Before a prepare has ever executed, the IRD stays empty
 // (get_desc_field_test.cpp's ImpRowDescRecordPastCountReturnsNoData) — this
 // is the complementary "after execute" case.
-TEST_F(PrepareExecuteLiveTest, ImpRowDescMatchesDescribeColAfterExecute) {
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, ImpRowDescMatchesDescribeColAfterExecute,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS INT) AS i, "
                              "CAST('abc' AS VARCHAR(10)) AS v"),
                   SQL_HANDLE_STMT, stmt_);
@@ -2442,4 +2511,149 @@ TEST_F(PrepareExecuteLiveTest, ImpRowDescMatchesDescribeColAfterExecute) {
         EXPECT_EQ(nullable, ird_nullable) << "column " << col;
     }
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Every bound value is derived from the run and rewritten between executes of
+// one prepared statement, so under the concurrent modes a value from another
+// worker's binding, or left from this statement's previous execute, fails here.
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, RunUniquePreparedParametersFollowEachExecute,
+                  odbc_concurrency::kAllModes) {
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS INT), CAST(? AS VARCHAR(64)), "
+                          "CAST(? AS NVARCHAR(64)), CAST(? AS VARBINARY(64))"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER id = 0;
+    SQLCHAR narrow[64] = {};
+    SQLWCHAR wide[64] = {};
+    SQLCHAR bytes[64] = {};
+    SQLLEN id_ind = 0, narrow_ind = SQL_NTS, wide_ind = SQL_NTS, bytes_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &id, 0, &id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 64, 0,
+                                   narrow, sizeof(narrow), &narrow_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 64, 0,
+                                   wide, sizeof(wide), &wide_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 4, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 64, 0,
+                                   bytes, sizeof(bytes), &bytes_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        const std::string token = WorkerToken("prepared") + "-r" + std::to_string(round);
+        id = (Worker() * 1000 + Iteration() % 1000) * 10 + round;
+        std::fill(std::begin(narrow), std::end(narrow), SQLCHAR{0});
+        std::memcpy(narrow, token.data(), token.size());
+        std::fill(std::begin(wide), std::end(wide), SQLWCHAR{0});
+        std::copy(token.begin(), token.end(), wide);
+        std::fill(std::begin(bytes), std::end(bytes), SQLCHAR{0});
+        std::memcpy(bytes, token.data(), token.size());
+        bytes_ind = static_cast<SQLLEN>(token.size());
+
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER got_id = -1;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &got_id, 0, nullptr), SQL_HANDLE_STMT,
+                      stmt_);
+        EXPECT_EQ(id, got_id);
+        EXPECT_EQ(token, GetColumnChar(2));
+        SQLWCHAR got_wide[128] = {};
+        SQLLEN wide_length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_WCHAR, got_wide, sizeof(got_wide), &wide_length),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(static_cast<SQLLEN>(token.size() * sizeof(SQLWCHAR)), wide_length);
+        EXPECT_TRUE(std::equal(token.begin(), token.end(), got_wide)) << "nvarchar";
+        SQLCHAR got_bytes[128] = {};
+        SQLLEN bytes_length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 4, SQL_C_BINARY, got_bytes, sizeof(got_bytes),
+                                 &bytes_length),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(static_cast<SQLLEN>(token.size()), bytes_length);
+        EXPECT_EQ(token, std::string(reinterpret_cast<const char*>(got_bytes), token.size()));
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// Two run-unique values far larger than a network packet stream through
+// SQLPutData in chunks, so under the concurrent modes a chunk delivered into
+// another worker's statement, lost, or reordered fails here.
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, RunUniqueDataAtExecutionStreamsArriveWhole,
+                  odbc_concurrency::kAllModes) {
+    constexpr size_t kSize = 20000;
+    constexpr size_t kChunk = 3000;
+    const std::string token = WorkerToken("streamed");
+    std::string text;
+    while (text.size() < kSize) {
+        text += token + ":" + std::to_string(text.size()) + "|";
+    }
+    text.resize(kSize);
+    const std::string bytes(text.rbegin(), text.rend());
+
+    ASSERT_SQL_OK(Prepare("SELECT CAST(? AS VARCHAR(MAX)), CAST(? AS VARBINARY(MAX))"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLCHAR text_slot = 0;
+    SQLCHAR bytes_slot = 0;
+    SQLLEN text_ind = SQL_DATA_AT_EXEC;
+    SQLLEN bytes_ind = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR,
+                                   kSize, 0, &text_slot, 0, &text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY,
+                                   kSize, 0, &bytes_slot, 0, &bytes_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    SQLPOINTER slot = nullptr;
+    SQLRETURN rc;
+    int streamed = 0;
+    while ((rc = SQLParamData(stmt_, &slot)) == SQL_NEED_DATA) {
+        ASSERT_LT(++streamed, 3) << "SQLParamData did not terminate";
+        ASSERT_TRUE(slot == &text_slot || slot == &bytes_slot);
+        const std::string& value = slot == &text_slot ? text : bytes;
+        for (size_t at = 0; at < value.size(); at += kChunk) {
+            const SQLLEN length = static_cast<SQLLEN>((std::min)(kChunk, value.size() - at));
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(value.data() + at), length),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+    }
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, streamed);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    auto read_whole = [&](SQLUSMALLINT column, SQLSMALLINT type) {
+        std::string value;
+        char buffer[4096];
+        const size_t chunk = type == SQL_C_CHAR ? sizeof(buffer) - 1 : sizeof(buffer);
+        for (int calls = 0;; ++calls) {
+            SQLLEN length = 0;
+            const SQLRETURN got =
+                SQLGetData(stmt_, column, type, buffer, sizeof(buffer), &length);
+            if (got == SQL_NO_DATA) {
+                break;
+            }
+            EXPECT_TRUE(SQL_SUCCEEDED(got))
+                << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+            if (!SQL_SUCCEEDED(got) || calls > 100) {
+                break;
+            }
+            value.append(buffer,
+                         got == SQL_SUCCESS_WITH_INFO ? chunk : static_cast<size_t>(length));
+        }
+        return value;
+    };
+    auto expect_same = [](const std::string& expected, const std::string& actual,
+                          const char* what) {
+        const auto diverge = std::mismatch(expected.begin(), expected.end(), actual.begin(),
+                                           actual.end());
+        EXPECT_TRUE(diverge.first == expected.end() && diverge.second == actual.end())
+            << what << ": " << actual.size() << " bytes, first difference at "
+            << (diverge.first - expected.begin());
+    };
+    expect_same(text, read_whole(1, SQL_C_CHAR), "varchar(max)");
+    expect_same(bytes, read_whole(2, SQL_C_BINARY), "varbinary(max)");
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }

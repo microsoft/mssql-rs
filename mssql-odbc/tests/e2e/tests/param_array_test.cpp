@@ -78,6 +78,7 @@
 //  37.  RowReturningArrayDrainsPartialLobOnAdvance - streaming cleanup
 //  38.  RowReturningArrayTimeoutDuringNavigation - cancel and reuse
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
 
@@ -117,6 +118,15 @@ bool ComparingMsodbcsql() {
 }
 
 } // namespace
+
+// Not /SharedStmt (nor /SharedDbc): with an explicit descriptor associated with
+// the statement, the Windows Driver Manager deadlocks between SQLSetStmtAttr on
+// it and a concurrent SQLGetDiagField on the same connection (odbc32!LockDescStmt
+// waits for the statement lock while SQLGetDiagField waits in EnterDbcCS), as in
+// fetch_scroll_test.cpp. Measured on msodbcsql at 2 x 1, neither driver on the
+// blocked stacks.
+constexpr unsigned kExplicitDescriptorModes =
+    odbc_concurrency::kSingle | odbc_concurrency::kCrossThread | odbc_concurrency::kSharedEnv;
 
 class ParamArrayTest : public ODBCTest {
 protected:
@@ -214,7 +224,7 @@ protected:
 // A driver that executed only the first set would pass a COUNT check
 // against 1 but fail this one.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayInsertWritesEveryParameterSet) {
+ODBC_TEST_F(ParamArrayTest, ArrayInsertWritesEveryParameterSet) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -244,7 +254,7 @@ TEST_F(ParamArrayTest, ArrayInsertWritesEveryParameterSet) {
 // SQL_ATTR_PARAMSET_SIZE. This spelling must drive execution, not merely
 // round-trip through SQLGetDescField.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, DescriptorArraySizeExecutesEveryParameterSet) {
+ODBC_TEST_F(ParamArrayTest, DescriptorArraySizeExecutesEveryParameterSet) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -282,7 +292,8 @@ TEST_F(ParamArrayTest, DescriptorArraySizeExecutesEveryParameterSet) {
 // so both directions are pinned, as is the row side staying put: it is
 // a different descriptor and must not move with the parameter side.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ParamsetSizeAndDescriptorArraySizeAgree) {
+ODBC_TEST_F_MODES(ParamArrayTest, ParamsetSizeAndDescriptorArraySizeAgree,
+                  odbc_concurrency::kAllModes) {
     SQLHDESC apd = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
                   SQL_HANDLE_STMT, stmt_);
@@ -313,7 +324,8 @@ TEST_F(ParamArrayTest, ParamsetSizeAndDescriptorArraySizeAgree) {
 // descriptor can be associated with several statements at once, so there
 // is no single statement field to mirror it into.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ExplicitAppParamDescCarriesItsOwnArraySize) {
+ODBC_TEST_F_MODES(ParamArrayTest, ExplicitAppParamDescCarriesItsOwnArraySize,
+                  kExplicitDescriptorModes) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -377,7 +389,7 @@ TEST_F(ParamArrayTest, ExplicitAppParamDescCarriesItsOwnArraySize) {
 //     every platform, SQL_ERROR here. That is the real, observable
 //     divergence, and it is what this case pins.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArraySizeZeroIsRejected) {
+ODBC_TEST_F_MODES(ParamArrayTest, ArraySizeZeroIsRejected, odbc_concurrency::kAllModes) {
     SQLHDESC apd = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
                   SQL_HANDLE_STMT, stmt_);
@@ -454,7 +466,8 @@ TEST_F(ParamArrayTest, ArraySizeZeroIsRejected) {
 // `row_array_size_clamps_but_paramset_size_stores_verbatim` pins the
 // diagnostic at the driver boundary, where it is unambiguous.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, OverlargeParamsetSizeIsStoredVerbatim) {
+ODBC_TEST_F_MODES(ParamArrayTest, OverlargeParamsetSizeIsStoredVerbatim,
+                  odbc_concurrency::kAllModes) {
     const SQLULEN over = static_cast<SQLULEN>(INT32_MAX) + 1000;
     EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, over))
         << "PARAMSET_SIZE has no upper clamp on either driver";
@@ -486,7 +499,7 @@ TEST_F(ParamArrayTest, OverlargeParamsetSizeIsStoredVerbatim) {
 // 1g. AB#49060: a row-wise batch driven only through the APD/IPD descriptor
 // fields (bind type, bind offset, status array, processed count).
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, DescriptorSpellingsDriveARowWiseBatch) {
+ODBC_TEST_F(ParamArrayTest, DescriptorSpellingsDriveARowWiseBatch) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -551,7 +564,7 @@ TEST_F(ParamArrayTest, DescriptorSpellingsDriveARowWiseBatch) {
 // SQL_DESC_ARRAY_STATUS_PTR skips ignored sets. Only the rows that reach the
 // server are asserted: msodbcsql mis-indexes the status array (11b).
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, DescriptorOperationArraySkipsIgnoredSets) {
+ODBC_TEST_F(ParamArrayTest, DescriptorOperationArraySkipsIgnoredSets) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -586,7 +599,8 @@ TEST_F(ParamArrayTest, DescriptorOperationArraySkipsIgnoredSets) {
 // 1i. AB#49060: each parameter-side attribute and its descriptor field are
 // one value, in both directions.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ParameterAttributesAndDescriptorFieldsAgree) {
+ODBC_TEST_F_MODES(ParamArrayTest, ParameterAttributesAndDescriptorFieldsAgree,
+                  odbc_concurrency::kAllModes) {
     SQLHDESC apd = SQL_NULL_HDESC;
     SQLHDESC ipd = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
@@ -643,7 +657,8 @@ TEST_F(ParamArrayTest, ParameterAttributesAndDescriptorFieldsAgree) {
 // 1j. An explicit APD shared by two statements is one header: the size set
 // through one is the batch the other executes.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ASharedExplicitApdCarriesItsSizeToTheOtherStatement) {
+ODBC_TEST_F_MODES(ParamArrayTest, ASharedExplicitApdCarriesItsSizeToTheOtherStatement,
+                  kExplicitDescriptorModes) {
     ExecDirect(kGuardTable);
     SQLHSTMT writer = AllocStmt();
     SQLHDESC shared = SQL_NULL_HDESC;
@@ -679,7 +694,7 @@ TEST_F(ParamArrayTest, ASharedExplicitApdCarriesItsSizeToTheOtherStatement) {
 // -------------------------------------------------------------------
 // 1k. The APD's bind-offset pointer is read at every execute.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, RepointingTheApdBindOffsetMovesTheNextExecute) {
+ODBC_TEST_F(ParamArrayTest, RepointingTheApdBindOffsetMovesTheNextExecute) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, 0)");
     SQLINTEGER ids[4] = {10, 20, 30, 40};
@@ -710,7 +725,7 @@ TEST_F(ParamArrayTest, RepointingTheApdBindOffsetMovesTheNextExecute) {
 // 1l. A single-set execute publishes its processed count through the IPD
 // spelling of the pointer.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ScalarExecutePublishesProcessedThroughTheIpdSpelling) {
+ODBC_TEST_F(ParamArrayTest, ScalarExecutePublishesProcessedThroughTheIpdSpelling) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, 1)");
     SQLINTEGER id = 5;
@@ -733,7 +748,7 @@ TEST_F(ParamArrayTest, ScalarExecutePublishesProcessedThroughTheIpdSpelling) {
 // 1m. With a cursor open the statement is not executing, so the descriptor
 // writes gated mid-execute must succeed and drive the next batch.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ParameterControlsCanChangeWhileACursorIsOpen) {
+ODBC_TEST_F(ParamArrayTest, ParameterControlsCanChangeWhileACursorIsOpen) {
     ExecDirect(kGuardTable);
     ExecDirect("SELECT 1 UNION ALL SELECT 2");  // leaves a cursor open on stmt_
 
@@ -773,7 +788,7 @@ TEST_F(ParamArrayTest, ParameterControlsCanChangeWhileACursorIsOpen) {
 // set's count. msodbcsql accumulates into `rowsaffected` for the whole
 // bulk operation (sqlctokn.cpp:2246).
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayInsertAggregatesRowCount) {
+ODBC_TEST_F(ParamArrayTest, ArrayInsertAggregatesRowCount) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -800,7 +815,7 @@ TEST_F(ParamArrayTest, ArrayInsertAggregatesRowCount) {
 // value array, so NULLs must land on exactly the rows that asked for
 // them.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayHandlesMixedNullAndNonNull) {
+ODBC_TEST_F(ParamArrayTest, ArrayHandlesMixedNullAndNonNull) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -831,7 +846,7 @@ TEST_F(ParamArrayTest, ArrayHandlesMixedNullAndNonNull) {
 // type's width. A driver using a fixed width here would read every row
 // from the wrong offset.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayHandlesVariableWidthBuffers) {
+ODBC_TEST_F(ParamArrayTest, ArrayHandlesVariableWidthBuffers) {
     ExecDirect("CREATE TABLE #pa_v (id int, s varchar(20), b varbinary(8))");
     Prepare("INSERT INTO #pa_v (id, s, b) VALUES (?, ?, ?)");
 
@@ -889,7 +904,7 @@ TEST_F(ParamArrayTest, ArrayHandlesVariableWidthBuffers) {
 // this attribute only on the retrieval direction, so it returns plain
 // SQL_SUCCESS for a parameter however the attribute is set.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayUnmappableCharacterWarnsWhenAsked) {
+ODBC_TEST_F(ParamArrayTest, ArrayUnmappableCharacterWarnsWhenAsked) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     const std::string collation =
@@ -962,7 +977,7 @@ TEST_F(ParamArrayTest, ArrayUnmappableCharacterWarnsWhenAsked) {
 // side, each with its own width. Getting one stride wrong corrupts only
 // that column, which a single-type test would miss.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayHandlesMultipleTypesTogether) {
+ODBC_TEST_F(ParamArrayTest, ArrayHandlesMultipleTypesTogether) {
     ExecDirect("CREATE TABLE #pa_m (id int, big bigint, d float, s nvarchar(20), "
                "ts datetime2(3), g uniqueidentifier)");
     Prepare("INSERT INTO #pa_m (id, big, d, s, ts, g) VALUES (?, ?, ?, ?, ?, ?)");
@@ -1042,7 +1057,7 @@ TEST_F(ParamArrayTest, ArrayHandlesMultipleTypesTogether) {
 // A driver that kept the previous array size would read past the scalar
 // buffers on the next execute. This is the regression that guards it.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ScalarExecuteAfterArrayUsesOneRow) {
+ODBC_TEST_F(ParamArrayTest, ScalarExecuteAfterArrayUsesOneRow) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1084,7 +1099,7 @@ TEST_F(ParamArrayTest, ScalarExecuteAfterArrayUsesOneRow) {
 // 7. PARAMSET_SIZE = 1 is the default and must stay byte-for-byte the
 // scalar path — the array machinery must not engage.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArraySizeOneMatchesScalarExecute) {
+ODBC_TEST_F(ParamArrayTest, ArraySizeOneMatchesScalarExecute) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1124,7 +1139,7 @@ TEST_F(ParamArrayTest, ArraySizeOneMatchesScalarExecute) {
 // including through SQLExecDirect and for a statement with no parameter
 // markers at all - msodbcsql writes 1 at sqlccmd.cpp:3493 even then.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ScalarExecuteWritesParamsProcessed) {
+ODBC_TEST_F(ParamArrayTest, ScalarExecuteWritesParamsProcessed) {
     ExecDirect(kGuardTable);
 
     SQLULEN processed = 0xDEAD;
@@ -1162,7 +1177,7 @@ TEST_F(ParamArrayTest, ScalarExecuteWritesParamsProcessed) {
 // parameter array execution"). Row 2 violates the CHECK constraint; rows
 // 1 and 3 must still be written, and the failure must be reported.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, MiddleRowFailureStillRunsLaterRows) {
+ODBC_TEST_F(ParamArrayTest, MiddleRowFailureStillRunsLaterRows) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1194,7 +1209,7 @@ TEST_F(ParamArrayTest, MiddleRowFailureStillRunsLaterRows) {
 // from SQL_ERROR to SQL_SUCCESS_WITH_INFO. The identical batch without
 // the array stays SQL_ERROR (Variation 8).
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, StatusArrayDowngradesReturnCode) {
+ODBC_TEST_F(ParamArrayTest, StatusArrayDowngradesReturnCode) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1235,7 +1250,7 @@ TEST_F(ParamArrayTest, StatusArrayDowngradesReturnCode) {
 // drivers, because nothing reaches the wire and no set runs. The status
 // array is still written - see case 26b.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, EverySetFailingServerSideStillDowngradesWithAStatusArray) {
+ODBC_TEST_F(ParamArrayTest, EverySetFailingServerSideStillDowngradesWithAStatusArray) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1271,7 +1286,7 @@ TEST_F(ParamArrayTest, EverySetFailingServerSideStillDowngradesWithAStatusArray)
 // 10. SQL_ATTR_PARAMS_PROCESSED_PTR ends at the number of sets the
 // driver walked, which is the full array on a clean run.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ParamsProcessedCountsEverySet) {
+ODBC_TEST_F(ParamArrayTest, ParamsProcessedCountsEverySet) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1305,7 +1320,7 @@ TEST_F(ParamArrayTest, ParamsProcessedCountsEverySet) {
 // array reporting is asserted separately in Variation 11b because
 // msodbcsql mis-indexes it.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, IgnoredParameterSetsAreSkipped) {
+ODBC_TEST_F(ParamArrayTest, IgnoredParameterSetsAreSkipped) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1348,7 +1363,7 @@ TEST_F(ParamArrayTest, IgnoredParameterSetsAreSkipped) {
 // status down one slot. Measured against the installed driver, hence the
 // skip on the comparison leg: this asserts the *fixed* contract.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, IgnoredSetStatusesAreReportedPerSet) {
+ODBC_TEST_F(ParamArrayTest, IgnoredSetStatusesAreReportedPerSet) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ExecDirect(kGuardTable);
@@ -1426,7 +1441,7 @@ TEST_F(ParamArrayTest, IgnoredSetStatusesAreReportedPerSet) {
 // so a garbage entry proceeds instead of failing the set. Measured on
 // both drivers, hence no skip: this is parity, not a deviation.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, UnknownOperationValueProceedsLikeProceed) {
+ODBC_TEST_F(ParamArrayTest, UnknownOperationValueProceedsLikeProceed) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1467,7 +1482,7 @@ TEST_F(ParamArrayTest, UnknownOperationValueProceedsLikeProceed) {
 // than 0. Both offset and stride must be honoured, and the offset is
 // read at execute time.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, BindOffsetShiftsTheWholeArray) {
+ODBC_TEST_F(ParamArrayTest, BindOffsetShiftsTheWholeArray) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1500,7 +1515,7 @@ TEST_F(ParamArrayTest, BindOffsetShiftsTheWholeArray) {
 // strides by it. msodbcsql implements this as
 // `dwOffset = pADesc->dwBindType` (sqlcfunc.cpp BindOffset).
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, RowWiseBindingWalksStructures) {
+ODBC_TEST_F(ParamArrayTest, RowWiseBindingWalksStructures) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1544,7 +1559,7 @@ TEST_F(ParamArrayTest, RowWiseBindingWalksStructures) {
 // drives it (mssql-python's executemany always prepares first), and
 // running only the first set would lose the rest silently.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ExecDirectParameterArrayIsRefused) {
+ODBC_TEST_F(ParamArrayTest, ExecDirectParameterArrayIsRefused) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(kGuardTable);
 
@@ -1573,7 +1588,7 @@ TEST_F(ParamArrayTest, ExecDirectParameterArrayIsRefused) {
 // statement runs PARAMSET_SIZE times there. Executing it once here would
 // drop the other sets with no diagnostic - refuse instead.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ExecDirectArrayWithNoMarkersIsRefused) {
+ODBC_TEST_F(ParamArrayTest, ExecDirectArrayWithNoMarkersIsRefused) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(kGuardTable);
     ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 3));
@@ -1590,7 +1605,7 @@ TEST_F(ParamArrayTest, ExecDirectArrayWithNoMarkersIsRefused) {
 // 15. Under manual commit every parameter set joins the same
 // transaction, so a rollback discards the whole batch.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayRollsBackWithTheTransaction) {
+ODBC_TEST_F(ParamArrayTest, ArrayRollsBackWithTheTransaction) {
     ExecDirect("CREATE TABLE #pa_txn (id int)");
     ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_AUTOCOMMIT,
                                     reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF),
@@ -1624,7 +1639,7 @@ TEST_F(ParamArrayTest, ArrayRollsBackWithTheTransaction) {
 // before a failing one are durable. This is the flip side of Variation
 // 8 and is what makes partial failure observable to the application.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayCommitsEveryRowUnderAutocommit) {
+ODBC_TEST_F(ParamArrayTest, ArrayCommitsEveryRowUnderAutocommit) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -1645,7 +1660,8 @@ TEST_F(ParamArrayTest, ArrayCommitsEveryRowUnderAutocommit) {
     EXPECT_EQ(2, ScalarInt("SELECT COUNT(*) FROM #pa"));
 }
 
-TEST_F(ParamArrayTest, SelectArrayPreservesEmptyAndNullResults) {
+ODBC_TEST_F_MODES(ParamArrayTest, SelectArrayPreservesEmptyAndNullResults,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT value FROM (VALUES (CAST(? AS int))) AS source(value) "
             "WHERE value IS NULL OR value > 0");
     SQLINTEGER values[3] = {0, 7, 9};
@@ -1690,7 +1706,7 @@ TEST_F(ParamArrayTest, SelectArrayPreservesEmptyAndNullResults) {
 // (SQLExecuteMany_wrap in ddbc_bindings.cpp), so this combination is
 // unreachable from the Python driver.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, DataAtExecutionWithArrayIsRefused) {
+ODBC_TEST_F(ParamArrayTest, DataAtExecutionWithArrayIsRefused) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ExecDirect("CREATE TABLE #pa_dae (s varchar(20))");
@@ -1714,7 +1730,7 @@ TEST_F(ParamArrayTest, DataAtExecutionWithArrayIsRefused) {
 // must stop partway with HYT00; a driver that restarted the budget per
 // set would run all five and report success.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, QueryTimeoutBoundsTheWholeArray) {
+ODBC_TEST_F(ParamArrayTest, QueryTimeoutBoundsTheWholeArray) {
     ExecDirect("CREATE TABLE #pa_slow (v int)");
     Prepare("INSERT INTO #pa_slow (v) VALUES (?); WAITFOR DELAY '00:00:01'");
 
@@ -1741,7 +1757,7 @@ TEST_F(ParamArrayTest, QueryTimeoutBoundsTheWholeArray) {
 // the indicator pointer by sizeof(SQLLEN) per set would turn that null
 // into a wild pointer.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ColumnWiseArrayWithNullIndicatorPointers) {
+ODBC_TEST_F(ParamArrayTest, ColumnWiseArrayWithNullIndicatorPointers) {
     ExecDirect("CREATE TABLE #pa_ni (id int, s char(1))");
     Prepare("INSERT INTO #pa_ni (id, s) VALUES (?, ?)");
 
@@ -1776,7 +1792,7 @@ TEST_F(ParamArrayTest, ColumnWiseArrayWithNullIndicatorPointers) {
 // while leaving the others plausible - which the single-type row-wise
 // case (Variation 13) cannot catch.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, RowWiseArrayWalksMixedTypeStructures) {
+ODBC_TEST_F(ParamArrayTest, RowWiseArrayWalksMixedTypeStructures) {
     ExecDirect("CREATE TABLE #pa_rw (c1 int, c2 char(1), c3 date, c4 real, "
                "c5 time(0))");
     Prepare("INSERT INTO #pa_rw (c1, c2, c3, c4, c5) VALUES (?, ?, ?, ?, ?)");
@@ -1872,9 +1888,9 @@ TEST_F(ParamArrayTest, RowWiseArrayWalksMixedTypeStructures) {
 // remainder: the counter stops at the failing set, the sets after it are
 // left SQL_PARAM_UNUSED, and only the sets before it are written.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ParamsProcessedCountsTheFailingSet) {
-    ExecDirect("CREATE TABLE #pa_nan (val real NOT NULL, "
-               "CONSTRAINT CK_NoNaN CHECK (val = val))");
+ODBC_TEST_F(ParamArrayTest, ParamsProcessedCountsTheFailingSet) {
+    // Unnamed: a constraint name is tempdb-wide, so concurrent sessions would collide.
+    ExecDirect("CREATE TABLE #pa_nan (val real NOT NULL CHECK (val = val))");
     // Prepared, not SQLExecDirect: arrays are refused on that path (case 14),
     // which would mask the batch-abort behaviour this case exists to pin down.
     Prepare("INSERT INTO #pa_nan (val) VALUES (?)");
@@ -1941,7 +1957,7 @@ TEST_F(ParamArrayTest, ParamsProcessedCountsTheFailingSet) {
 // (BindOffset uses cbValueMax verbatim) and is asserted here so the
 // inherited quirk is a decision on record rather than an accident.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayWithZeroBufferLengthAliasesOneValue) {
+ODBC_TEST_F(ParamArrayTest, ArrayWithZeroBufferLengthAliasesOneValue) {
     ExecDirect("CREATE TABLE #pa_z (s varchar(10))");
     Prepare("INSERT INTO #pa_z (s) VALUES (?)");
 
@@ -1966,7 +1982,7 @@ TEST_F(ParamArrayTest, ArrayWithZeroBufferLengthAliasesOneValue) {
 // row instead of sliding into the gap. Ported from PR #512's
 // ParameterArrayRowWiseHonorsIgnore.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, RowWiseArrayHonorsIgnoreForSkippedSets) {
+ODBC_TEST_F(ParamArrayTest, RowWiseArrayHonorsIgnoreForSkippedSets) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -2044,7 +2060,7 @@ TEST_F(ParamArrayTest, RowWiseArrayHonorsIgnoreForSkippedSets) {
 // Retail msodbcsql 18.6.2.1 (SQL_DRIVER_VER 18.06.0002) delivers all
 // three result sets. Bookkeeping is deferred until navigation completes.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, RowReturningArrayOnThePreparedPath) {
+ODBC_TEST_F(ParamArrayTest, RowReturningArrayOnThePreparedPath) {
     ExecDirect("CREATE TABLE #pa_out2 (id int)");
     Prepare("INSERT INTO #pa_out2 (id) OUTPUT inserted.id VALUES (?)");
 
@@ -2105,7 +2121,7 @@ TEST_F(ParamArrayTest, RowReturningArrayOnThePreparedPath) {
 // rows: a caller that reads it as "nothing ran" and retries double-inserts.
 // Recorded in AB#47945.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ConversionFailureIsReportedPerSetWhereverItSits) {
+ODBC_TEST_F(ParamArrayTest, ConversionFailureIsReportedPerSetWhereverItSits) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("CREATE TABLE #pa_cv (v int)");
 
@@ -2171,7 +2187,7 @@ TEST_F(ParamArrayTest, ConversionFailureIsReportedPerSetWhereverItSits) {
 // justified by "no per-set detail to report"; it is justified by nothing
 // having executed.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, EverySetFailingToConvertIsError) {
+ODBC_TEST_F(ParamArrayTest, EverySetFailingToConvertIsError) {
     ExecDirect("CREATE TABLE #pa_cv_all (v int)");
     Prepare("INSERT INTO #pa_cv_all (v) VALUES (?)");
 
@@ -2224,7 +2240,7 @@ TEST_F(ParamArrayTest, EverySetFailingToConvertIsError) {
 // unnoticed. An aggregate over a NULL needs no trigger, so the case also
 // keeps every object session-scoped like the rest of the suite.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, AnInfoMessageDegradesTheBatchOnBothDrivers) {
+ODBC_TEST_F(ParamArrayTest, AnInfoMessageDegradesTheBatchOnBothDrivers) {
     ExecDirect("CREATE TABLE #pa_info (v int)");
     // SUM over a NULL raises 01003 "Null value is eliminated by an aggregate"
     // once per execution. A trigger would do too, but SQL Server refuses
@@ -2271,7 +2287,7 @@ TEST_F(ParamArrayTest, AnInfoMessageDegradesTheBatchOnBothDrivers) {
 //
 // Every assertion here holds on both drivers; measured on msodbcsql 18.6.2.1.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ArrayOfAThousandSetsWritesEveryRowInOrder) {
+ODBC_TEST_F(ParamArrayTest, ArrayOfAThousandSetsWritesEveryRowInOrder) {
     constexpr int kSets = 1000;
     ExecDirect("CREATE TABLE #pa_big (seq int IDENTITY(1,1) NOT NULL, id int NOT NULL)");
     Prepare("INSERT INTO #pa_big (id) VALUES (?)");
@@ -2324,7 +2340,7 @@ TEST_F(ParamArrayTest, ArrayOfAThousandSetsWritesEveryRowInOrder) {
 //
 // Every assertion here holds on both drivers; measured on msodbcsql 18.6.2.1.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
+ODBC_TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
     constexpr int kSets = 1000;
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
@@ -2384,7 +2400,7 @@ TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
 // 30. SQLMoreResults skips unread rows, and closing before the final
 // result releases the connection without executing any parameter set twice.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
+ODBC_TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
     ExecDirect("CREATE TABLE #pa_out3 (id int)");
     Prepare("INSERT INTO #pa_out3 (id) OUTPUT inserted.id VALUES (?)");
 
@@ -2410,7 +2426,8 @@ TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
     EXPECT_EQ(6, ScalarInt("SELECT COUNT(*) FROM #pa_out3"));
 }
 
-TEST_F(ParamArrayTest, PendingArrayResultKeepsConnectionBusy) {
+ODBC_TEST_F_MODES(ParamArrayTest, PendingArrayResultKeepsConnectionBusy,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int)");
     SQLINTEGER values[2] = {1, 2};
     SQLLEN indicators[2] = {};
@@ -2433,7 +2450,8 @@ TEST_F(ParamArrayTest, PendingArrayResultKeepsConnectionBusy) {
     FreeStmt(probe);
 }
 
-TEST_F(ParamArrayTest, ClosingArrayCursorReleasesConnection) {
+ODBC_TEST_F_MODES(ParamArrayTest, ClosingArrayCursorReleasesConnection,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int)");
     SQLINTEGER values[2] = {1, 2};
     SQLLEN indicators[2] = {};
@@ -2454,7 +2472,7 @@ TEST_F(ParamArrayTest, ClosingArrayCursorReleasesConnection) {
     FreeStmt(probe);
 }
 
-TEST_F(ParamArrayTest, ProcedureArrayDeliversEveryResultSet) {
+ODBC_TEST_F(ParamArrayTest, ProcedureArrayDeliversEveryResultSet) {
     ExecDirect("CREATE PROCEDURE #pa_results @value int AS "
                "BEGIN SET NOCOUNT ON; SELECT @value; SELECT @value + 10; END");
     Prepare("EXEC #pa_results ?");
@@ -2476,7 +2494,8 @@ TEST_F(ParamArrayTest, ProcedureArrayDeliversEveryResultSet) {
     }
 }
 
-TEST_F(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClose) {
+ODBC_TEST_F_MODES(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClose,
+                  odbc_concurrency::kAllModes) {
     Prepare("DECLARE @value int = ?; IF @value = 1 PRINT 'first set info'; SELECT @value");
     SQLINTEGER values[3] = {1, 2, 3};
     SQLLEN indicators[3] = {};
@@ -2505,7 +2524,7 @@ TEST_F(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClose) {
     }
 }
 
-TEST_F(ParamArrayTest, RowReturningArraySkipsIgnoredSets) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArraySkipsIgnoredSets, odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int)");
     SQLINTEGER values[4] = {1, 2, 3, 4};
     SQLLEN indicators[4] = {};
@@ -2520,7 +2539,8 @@ TEST_F(ParamArrayTest, RowReturningArraySkipsIgnoredSets) {
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
 }
 
-TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArrayContinuesAfterASetError,
+                  odbc_concurrency::kAllModes) {
     Prepare("DECLARE @value int = ?; IF @value = 2 "
             "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");
     SQLINTEGER values[3] = {1, 2, 3};
@@ -2558,7 +2578,8 @@ TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
-TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors,
+                  odbc_concurrency::kAllModes) {
     Prepare("DECLARE @value int = ?; IF @value = 2 "
             "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");
     SQLINTEGER values[3] = {1, 2, 3};
@@ -2590,7 +2611,8 @@ TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
-TEST_F(ParamArrayTest, RowReturningArrayDrainsPartialLobOnAdvance) {
+ODBC_TEST_F_MODES(ParamArrayTest, RowReturningArrayDrainsPartialLobOnAdvance,
+                  odbc_concurrency::kAllModes) {
     Prepare("SELECT CAST(? AS int), REPLICATE(CAST('x' AS varchar(max)), 1048576)");
     SQLINTEGER values[2] = {1, 2};
     SQLLEN indicators[2] = {};
@@ -2613,7 +2635,10 @@ TEST_F(ParamArrayTest, RowReturningArrayDrainsPartialLobOnAdvance) {
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
-TEST_F(ParamArrayTest, RowReturningArrayTimeoutDuringNavigation) {
+// Not /SharedDbc: each attempt holds the shared connection for its 2 s query
+// timeout, so at 8 x 20 the other workers reach the busy-retry deadline, even
+// with backoff (both drivers, about 1,750 attempts each).
+ODBC_TEST_F(ParamArrayTest, RowReturningArrayTimeoutDuringNavigation) {
     Prepare("SELECT CAST(? AS int); "
             "RAISERROR ('result available', 0, 1) WITH NOWAIT; "
             "WAITFOR DELAY '00:00:04'");
@@ -2646,7 +2671,7 @@ TEST_F(ParamArrayTest, RowReturningArrayTimeoutDuringNavigation) {
 //
 // Every assertion here holds on both drivers; measured on msodbcsql 18.6.2.1.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, PreparedStatementReExecutesAtDifferentArraySizes) {
+ODBC_TEST_F(ParamArrayTest, PreparedStatementReExecutesAtDifferentArraySizes) {
     ExecDirect(kGuardTable);
     Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
 
@@ -2720,7 +2745,7 @@ TEST_F(ParamArrayTest, PreparedStatementReExecutesAtDifferentArraySizes) {
 // onto set 0 here until the stride was corrected, inserting one value N
 // times under SQL_SUCCESS with no diagnostic.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, TimestampoffsetArrayStridesByItsStructSize) {
+ODBC_TEST_F(ParamArrayTest, TimestampoffsetArrayStridesByItsStructSize) {
     ExecDirect("CREATE TABLE #pa_dto (id int NOT NULL, v datetimeoffset(0) NOT NULL)");
     Prepare("INSERT INTO #pa_dto (id, v) VALUES (?, ?)");
 
@@ -2784,7 +2809,7 @@ TEST_F(ParamArrayTest, TimestampoffsetArrayStridesByItsStructSize) {
 //
 // Measured on both drivers.
 // -------------------------------------------------------------------
-TEST_F(ParamArrayTest, Time2ArrayStridesByItsStructSize) {
+ODBC_TEST_F(ParamArrayTest, Time2ArrayStridesByItsStructSize) {
     ExecDirect("CREATE TABLE #pa_t2 (id int NOT NULL, v time(0) NOT NULL)");
     Prepare("INSERT INTO #pa_t2 (id, v) VALUES (?, ?)");
 
@@ -2818,4 +2843,61 @@ TEST_F(ParamArrayTest, Time2ArrayStridesByItsStructSize) {
     EXPECT_EQ("10,11,12",
               ScalarString("SELECT STRING_AGG(CONVERT(varchar(2), DATEPART(hour, v)), ',') "
                            "WITHIN GROUP (ORDER BY id) FROM #pa_t2"));
+}
+
+// Fifty run-unique parameter sets each answer with their own result, so under the
+// concurrent modes a set or result delivered to another worker's statement,
+// skipped, or out of order fails here. It writes nothing, so a busy retry in
+// /SharedDbc repeats no work.
+ODBC_TEST_F_MODES(ParamArrayTest, RunUniqueParameterSetsAnswerInOrder,
+                  odbc_concurrency::kAllModes) {
+    constexpr SQLULEN kSets = 50;
+    const std::string token = WorkerToken("set");
+    const SQLINTEGER base = (Worker() * 1000 + Iteration() % 1000) * 100;
+    SQLINTEGER ids[kSets] = {};
+    SQLLEN id_ind[kSets] = {};
+    char text[kSets][48] = {};
+    SQLLEN text_ind[kSets] = {};
+    SQLUSMALLINT status[kSets] = {};
+    SQLULEN processed = 0;
+    for (SQLULEN i = 0; i < kSets; ++i) {
+        ids[i] = base + static_cast<SQLINTEGER>(i);
+        const std::string value = token + "-" + std::to_string(i);
+        std::memcpy(text[i], value.c_str(), value.size() + 1);
+        text_ind[i] = SQL_NTS;
+    }
+    Prepare("SELECT CAST(? AS INT), CAST(? AS VARCHAR(48))");
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   ids, 0, id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 47, 0,
+                                   text, sizeof(text[0]), text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, kSets));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, &processed));
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    for (SQLULEN i = 0; i < kSets; ++i) {
+        SCOPED_TRACE(i);
+        if (i > 0) {
+            ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_))
+                << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER id = -1;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, nullptr), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(ids[i], id);
+        char value[64] = {};
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, value, sizeof(value), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_STREQ(text[i], value);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(kSets, processed);
+    for (SQLULEN i = 0; i < kSets; ++i) {
+        EXPECT_EQ(SQL_PARAM_SUCCESS, status[i]) << "set " << i;
+    }
 }
