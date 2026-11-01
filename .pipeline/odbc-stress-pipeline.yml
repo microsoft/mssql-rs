@@ -9,15 +9,16 @@
 #   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
 #   weekly  16 x 50, the same modes
 #
-# Legs: Windows x64 (debug driver, Windows Driver Manager, msodbcsql parity leg
-# at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21 (musl), both running the
-# release drops through unixODBC. /SharedStmt is left out on unixODBC because
+# Legs: Windows x64 (four parallel suite groups, debug driver, Windows Driver
+# Manager, msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21
+# (musl), both running the release drops through unixODBC. /SharedStmt is left
+# out on unixODBC because
 # its releases up to 2.3.14 corrupt their own diagnostic list when two threads
 # use one statement (unixODBC #243, fixed on master in ea454e49); see
 # mssql-odbc/tests/e2e/run_e2e.sh.
 #
 # Evidence: Windows hangs and crashes leave minidumps, with the matching driver,
-# test executables and PDBs, in the OdbcMtDumps_Windows artifact; Linux legs run
+# test executables and PDBs, in the OdbcMtDumps_Windows_* artifacts; Linux legs run
 # each entry under gdb and print every thread's stack into the test log, from a
 # release driver built with symbols and line tables. Test results are published
 # per leg. A manual run can also enable driver tracing (driverTrace), published
@@ -180,8 +181,27 @@ stages:
   dependsOn: []
   jobs:
   - job: Stress_Windows
-    displayName: ODBC stress Windows x64
+    displayName: ODBC stress Windows x64 ($(suiteGroup))
     timeoutInMinutes: 120
+    strategy:
+      matrix:
+        Fetch:
+          suiteGroup: Fetch
+          filterTests: '^(get_data|fetch_scroll|binary_fetch|bin_to_char|fetch_error_semantics)_test_mt$'
+          excludeTests: ''
+        Parameters:
+          suiteGroup: Parameters
+          filterTests: '^(param_.*|long_params|describe_param|output_params)_test_mt$'
+          excludeTests: ''
+        Metadata:
+          suiteGroup: Metadata
+          filterTests: '^(describe_col|col_attribute|get_diag_.*|get_desc_.*|set_desc_.*|num_result_cols|get_type_info|get_info|catalog)_test_mt$'
+          excludeTests: ''
+        Other:
+          suiteGroup: Other
+          filterTests: ''
+          # Complement of the named groups: newly converted suites stay covered.
+          excludeTests: '^(get_data|fetch_scroll|binary_fetch|bin_to_char|fetch_error_semantics|param_.*|long_params|describe_param|output_params|describe_col|col_attribute|get_diag_.*|get_desc_.*|set_desc_.*|num_result_cols|get_type_info|get_info|catalog)_test_mt$'
     pool:
       name: RUST-X64-WUS3
       demands:
@@ -225,11 +245,12 @@ stages:
         try {
           ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
             -MtProfile '$(odbcMtProfile)' `
+            -FilterTests '$(filterTests)' -ExcludeTests '$(excludeTests)' `
             -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
         } finally {
           if (-not $sampler.HasExited) { Stop-Process -Id $sampler.Id }
         }
-      displayName: Run ODBC stress ($(odbcMtProfile)) with msodbcsql parity leg
+      displayName: Run ODBC stress $(suiteGroup) ($(odbcMtProfile)) with msodbcsql parity leg
       env:
         SQL_PASSWORD: $(SQL_PASSWORD)
         RUST_BACKTRACE: full
@@ -245,7 +266,7 @@ stages:
       inputs:
         testResultsFormat: JUnit
         testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
-        testRunTitle: ODBC stress Windows ($(odbcMtProfile))
+        testRunTitle: ODBC stress Windows $(suiteGroup) ($(odbcMtProfile))
     - task: PublishTestResults@2
       displayName: Publish ODBC stress results (Windows, msodbcsql reference)
       condition: succeededOrFailed()
@@ -253,21 +274,21 @@ stages:
       inputs:
         testResultsFormat: JUnit
         testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
-        testRunTitle: ODBC stress Windows msodbcsql ($(odbcMtProfile))
+        testRunTitle: ODBC stress Windows $(suiteGroup) msodbcsql ($(odbcMtProfile))
     - task: PublishPipelineArtifact@1
       displayName: Publish hang and crash dumps
       condition: always()
       continueOnError: true
       inputs:
         targetPath: $(Build.ArtifactStagingDirectory)/odbc-mt-dumps
-        artifact: OdbcMtDumps_Windows_$(System.JobAttempt)
+        artifact: OdbcMtDumps_Windows_$(suiteGroup)_$(System.JobAttempt)
     - task: PublishPipelineArtifact@1
       displayName: Publish agent load samples
       condition: always()
       continueOnError: true
       inputs:
         targetPath: $(Build.ArtifactStagingDirectory)/odbc-load
-        artifact: OdbcLoad_Windows_$(System.JobAttempt)
+        artifact: OdbcLoad_Windows_$(suiteGroup)_$(System.JobAttempt)
     - ${{ if parameters.driverTrace }}:
       - task: PublishPipelineArtifact@1
         displayName: Publish driver traces
@@ -275,4 +296,4 @@ stages:
         continueOnError: true
         inputs:
           targetPath: $(Build.ArtifactStagingDirectory)/odbc-driver-traces
-          artifact: OdbcDriverTraces_Windows_$(System.JobAttempt)
+          artifact: OdbcDriverTraces_Windows_$(suiteGroup)_$(System.JobAttempt)
