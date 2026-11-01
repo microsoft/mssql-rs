@@ -551,8 +551,11 @@ on; these guarantees were verified against msodbcsql's behavior.
   - Opt into `/SharedDbc` with `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
     only when the body changes no connection attributes or transactions, gives
     temporary objects per-worker names (including `#temp` tables and
-    procedures, which workers on one DBC share), and is safe to rerun after a
-    busy retry. PR and stress runs execute the mode.
+    procedures, which workers on one DBC share), reads no connection-level
+    diagnostics (another worker's call on the DBC clears them), and is safe to
+    rerun after a busy retry. A bare assertion on a statement other than
+    `stmt_` must stream that statement's diagnostic, so a busy connection is
+    retried rather than failed. PR and stress runs execute the mode.
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
     connect races) go under `tests/e2e/tests/multithreaded_tests/`.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // SQLDescribeParam parity and mssql-python NULL binding tests.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <array>
@@ -36,9 +37,14 @@ protected:
             FAIL() << "No connection configured - set ODBC_TEST_SERVER or "
                       "ODBC_TEST_CONNSTR";
         }
-        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
-                                    reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
-                      SQL_HANDLE_ENV, env_);
+        // ODBCTest::SetUp already sets ODBC 3.80. Setting it again on a shared
+        // ENV that already has connections fails HY010, so only a subclass that
+        // asks for another version sets it (and stays out of SharedEnv).
+        if (OdbcVersion() != SQL_OV_ODBC3_80) {
+            ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                        reinterpret_cast<SQLPOINTER>(OdbcVersion()), 0),
+                          SQL_HANDLE_ENV, env_);
+        }
         Connect();
     }
 
@@ -81,6 +87,8 @@ protected:
     }
 };
 
+// Single-threaded only: the parameter is the ENV's ODBC version, which cannot
+// change on an ENV that other workers have connections on.
 class DescribeParamOdbcVersionLiveTest
     : public DescribeParamLiveTest,
       public ::testing::WithParamInterface<SQLUINTEGER> {
@@ -112,14 +120,14 @@ INSTANTIATE_TEST_SUITE_P(Odbc3And38, DescribeParamOdbcVersionLiveTest,
                          ::testing::Values(static_cast<SQLUINTEGER>(SQL_OV_ODBC3),
                                            static_cast<SQLUINTEGER>(SQL_OV_ODBC3_80)));
 
-TEST_F(DescribeParamLiveTest, IsAdvertised) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, IsAdvertised, odbc_concurrency::kAllModes) {
     SQLUSMALLINT supported = SQL_FALSE;
     ASSERT_SQL_OK(SQLGetFunctions(dbc_, SQL_API_SQLDESCRIBEPARAM, &supported),
                   SQL_HANDLE_DBC, dbc_);
     EXPECT_EQ(SQL_TRUE, supported);
 }
 
-TEST_F(DescribeParamLiveTest, RequiresPreparedStatement) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, RequiresPreparedStatement, odbc_concurrency::kAllModes) {
     SQLSMALLINT data_type = 0;
     SQLRETURN rc =
         SQLDescribeParam(stmt_, 1, &data_type, nullptr, nullptr, nullptr);
@@ -127,7 +135,7 @@ TEST_F(DescribeParamLiveTest, RequiresPreparedStatement) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
 }
 
-TEST_F(DescribeParamLiveTest, RejectsInvalidOrdinals) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, RejectsInvalidOrdinals, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 42)"), SQL_HANDLE_STMT, stmt_);
 
     SQLSMALLINT data_type = 0;
@@ -144,7 +152,8 @@ TEST_F(DescribeParamLiveTest, RejectsInvalidOrdinals) {
 // Benefits-from-mock-tds: a mock TDS server could assert that
 // sp_describe_undeclared_parameters fired once and carried the prepared
 // statement text, which the returned metadata alone cannot show.
-TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, ReportsRepresentativeMetadata,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         Prepare("SELECT CAST(? AS INT), CAST(? AS NVARCHAR(40)), "
                 "CAST(? AS VARBINARY(16)), CAST(? AS DECIMAL(12,3)), "
@@ -170,7 +179,7 @@ TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
     }
 }
 
-TEST_F(DescribeParamLiveTest, DescribesClrUdtMetadata) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, DescribesClrUdtMetadata, odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(
         Prepare("SELECT CAST(? AS geography), CAST(? AS geometry), CAST(? AS hierarchyid)"),
         SQL_HANDLE_STMT, stmt_);
@@ -195,7 +204,8 @@ TEST_F(DescribeParamLiveTest, DescribesClrUdtMetadata) {
 // Benefits-from-mock-tds: a mock TDS server could assert the typed NULL that
 // SQL_C_DEFAULT produces reaches the wire as INTN rather than inferring it from
 // the ISNULL result.
-TEST_F(DescribeParamLiveTest, ExecutesMssqlPythonDefaultNullPath) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, ExecutesMssqlPythonDefaultNullPath,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 42)"), SQL_HANDLE_STMT, stmt_);
 
     ParamDescription description;
@@ -216,7 +226,8 @@ TEST_F(DescribeParamLiveTest, ExecutesMssqlPythonDefaultNullPath) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert only one
 // sp_describe_undeclared_parameters RPC fired for the two describes.
-TEST_F(DescribeParamLiveTest, DescribesAllNullsBeforeBinding) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, DescribesAllNullsBeforeBinding,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 7), CAST(? AS NVARCHAR(8))"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -246,7 +257,8 @@ TEST_F(DescribeParamLiveTest, DescribesAllNullsBeforeBinding) {
 //
 // Benefits-from-mock-tds: a mock TDS server could assert a second
 // sp_describe_undeclared_parameters RPC fired after the re-prepare.
-TEST_F(DescribeParamLiveTest, ReprepareInvalidatesMetadata) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, ReprepareInvalidatesMetadata,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, 42)"), SQL_HANDLE_STMT, stmt_);
     ParamDescription first;
     ASSERT_TRUE(Describe(1, first));
@@ -261,7 +273,8 @@ TEST_F(DescribeParamLiveTest, ReprepareInvalidatesMetadata) {
 
 // `*(max)` parameters have no bounded length; both drivers report a size of 0,
 // and a bind from that description must still round-trip.
-TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, DescribesMaxLengthParameters,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS NVARCHAR(MAX)), CAST(? AS VARBINARY(MAX))"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -291,7 +304,8 @@ TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
 
 // A described decimal must be re-declared with the same precision and scale, or
 // the first non-NULL value bound from that description would be truncated.
-TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
+ODBC_TEST_F_MODES(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale,
+                  odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, CAST(1.5 AS DECIMAL(12,3)))"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -322,7 +336,7 @@ TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
 // `a_server_error_during_describe_returns_the_connection_for_reuse` in
 // `describe_param.rs`, which drives `fail_with_tds` from a server error and
 // asserts the connection comes back unclaimed.
-TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds) {
+ODBC_TEST_F(DescribeParamLiveTest, ATempTableParameterCannotBeDescribedButStillBinds) {
     ExecDirect("CREATE TABLE #dp_tmp (id INT, data VARBINARY(32))");
     ASSERT_SQL_OK(Prepare("INSERT INTO #dp_tmp (id, data) VALUES (?, ?)"), SQL_HANDLE_STMT,
                   stmt_);

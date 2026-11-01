@@ -78,7 +78,7 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
 | `Single` | The body once, on the main thread | As `TEST_F` | - |
 | `CrossThread` | SetUp, body, and TearDown on three different threads | As `TEST_F`; catches thread affinity (handles move between threads in pools, async runtimes, and finalizers) | - |
 | `SharedEnv` | `THREADS` workers x `ITERS` runs; shared ENV, own DBC and STMT | Every run passes | Tests that change ENV, pooling, or process state; connect, disconnect, or driver-load tests; fixed-name permanent objects; reliance on `HasFatalFailure()` |
-| `SharedDbc` (opt-in via `ODBC_TEST_F_MODES` with `kAllModes`) | `THREADS` workers x `ITERS` runs; shared DBC, own STMT | Only `HY000` connection busy may fail, and is retried; the connection is idle afterward | As `SharedEnv`, plus connection-attribute or transaction changes, shared temp-object names, bodies unsafe to rerun |
+| `SharedDbc` (opt-in via `ODBC_TEST_F_MODES` with `kAllModes`) | `THREADS` workers x `ITERS` runs; shared DBC, own STMT | Only `HY000` connection busy may fail, and is retried; the connection is idle afterward | As `SharedEnv`, plus connection-attribute or transaction changes, shared temp-object names, connection-level diagnostics, bodies unsafe to rerun or that hold the connection for seconds |
 | `SharedStmt` | Owner runs the body `ITERS` times; `THREADS - 1` observers read its STMT and DBC diagnostics | Owner as `Single`; observers read in every iteration; every record well formed. Only the DBC reads overlap the owner's calls in the driver; STMT reads are serialized by the Driver Manager (see Driver Manager facts) | Bodies that free or replace `stmt_` or `dbc_` |
 
 - gtest keeps one result per test, not per thread. `SharedEnv` and `SharedDbc`
@@ -508,7 +508,7 @@ found so far, AB#49225, came from `SharedDbc`. Order of effort for finding
 races:
 
 1. `SharedDbc` opt-ins (scenario 3; the fetch and GetData suites opted in with
-   AB#49260).
+   AB#49260, the parameter and execution suites with AB#49258).
 2. Churn, pooling, and authentication (scenarios 7, 10, 11).
 3. Same-STMT and shared-APD races under ThreadSanitizer (scenarios 8, 9).
 4. Faults under load (scenario 12), and disconnect or free during use (see
@@ -645,16 +645,25 @@ Tracked under AB#49256:
    connection state, or (three) starve on the Debug driver. Six bound-row-array
    tests run `SharedDbc` on mssql-odbc only: msodbcsql's `SQLCloseCursor`
    leaves the cursor open on a busy shared connection (`SKIP_MSODBCSQL_IN_MODE`).
-4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
-   remaining cancel cases `cancel_test.cpp` does not cover, added to it
-   (idle cursor cleanup is covered by `connection_busy_test.cpp`, AB#49386):
-   - A cancel just before execute does not leak into that or the next
-     execution, through a Driver Manager (the driver's unit tests cover it
-     directly).
-   - A fetch blocked by a row lock held by a second connection, rather than a
-     `WAITFOR` inside the batch.
-   - A `SQLGetData` blocked mid-stream on a PLP column, the one operation in
-     the cancel list above with no e2e case.
+4. **AB#49258 (stacked on PR #756):** every test in the parameter and
+   execution suites (`execute`, `exec_direct`, `param_conversions`,
+   `param_char_conversions`, `param_binary_conversions`, `param_array`,
+   `output_params`, `dml_output`, `describe_param`, `call_routing`,
+   `escape_sequence`) runs in the default modes: 431 tests. `dml_output`'s
+   direct/prepared `TEST_P` became two fixtures over one set of bodies; the
+   ODBC-version `TEST_P` in `describe_param` stays single-threaded. The two
+   explicit-APD tests drop `SharedStmt` (Windows Driver Manager deadlock).
+   315 tests also run in `SharedDbc`; the rest use `#temp` objects or session
+   settings, change connection state, read `SQLNativeSql`'s connection-level
+   diagnostics (two, recorded), or hold the connection for a 2 s timeout (one,
+   recorded). Worker-token tests: prepared parameters across executes, two
+   20 KB data-at-execution streams, fifty parameter sets, and output
+   parameters through a per-worker temp procedure, all in every mode.
+   `cancel_test.cpp` gains the remaining cancel cases (idle cursor cleanup is
+   covered by `connection_busy_test.cpp`, AB#49386): a cancel just before
+   execute reaches neither it nor the next execute; a fetch blocked by
+   another connection's row lock; a `SQLGetData` blocked mid-PLP, through
+   `TcpPauseProxy::PauseResponses`.
 5. **AB#49262:** diagnostics, descriptor, metadata, and attribute suites;
    scenario 6.
 6. **AB#49261:** scenarios 7 and 10.
