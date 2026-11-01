@@ -18,6 +18,7 @@
 //   9-15. Bound-column fetch: rowset fill, several columns, NULL indicators,
 //         truncation, unbind, rebind, and mixed SQLGetData afterwards
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 #include "utf16_test_data.h"
 #include "cp1252_test_data.h"
@@ -79,19 +80,34 @@ protected:
         ExecDirect(
             "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY n");
     }
-
-    bool ServerSupportsNativeJson() {
-        SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT CAST(N'{}' AS JSON)");
-        const bool ok =
-            SQL_SUCCEEDED(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
-        SQLCloseCursor(stmt_);
-        return ok;
-    }
 };
 
 class FetchScrollUtf16Test : public FetchScrollLiveTest {};
 
-TEST_F(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding) {
+// Not /SharedStmt (nor /SharedDbc): with an explicit descriptor associated with
+// the statement, the Windows Driver Manager deadlocks between SQLSetStmtAttr on
+// it and a concurrent SQLGetDiagField on the same statement or connection
+// (odbc32!LockDescStmt waits for the statement lock while SQLGetDiagField waits
+// in EnterDbcCS). Measured with both drivers, neither on the blocked stacks; each
+// of the three tests below hung in every SharedStmt run at 8 x 20.
+constexpr unsigned kExplicitDescriptorModes =
+    odbc_concurrency::kSingle | odbc_concurrency::kCrossThread | odbc_concurrency::kSharedEnv;
+
+// Bound-row-array tests that call SKIP_MSODBCSQL_SHARED_DBC() run /SharedDbc on
+// mssql-odbc only. While another worker holds the shared connection,
+// msodbcsql's SQLCloseCursor returns SQL_SUCCESS_WITH_INFO 01000 "Cursor was not
+// closed" and leaves the cursor open, so the next execute fails 24000. That is
+// SQLFreeStmt(SQL_CLOSE) in sqlccmd.cpp, unchanged since 17.0.0.1, so it applies
+// to every version, including the 18.6.2.1 CI pins. Measured with native Windows
+// DLL 18.7.1.1 (FileVersion 2018.0187.0001.01) at 8 x 20: four of the first five
+// failed on msodbcsql in 6 to 8 of 8 runs,
+// TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll in 3 of 23 (SQLFetchScroll
+// returned SQL_ERROR; SQLSTATE not captured), and
+// RunUniqueStreamAbandonedMidwayLeavesNoRowsBehind fails even at 2 x 1.
+// mssql-odbc passed all of them in every run.
+#define SKIP_MSODBCSQL_SHARED_DBC() SKIP_MSODBCSQL_IN_MODE(odbc_concurrency::kSharedDbc)
+ODBC_TEST_F_MODES(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding, odbc_concurrency::kAllModes) {
+    SKIP_MSODBCSQL_SHARED_DBC();
     constexpr size_t row_count = 2;
     unsigned char output[row_count][32] = {};
     SQLLEN lengths[row_count] = {};
@@ -123,7 +139,7 @@ TEST_F(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding) {
     SQLFreeStmt(stmt_, SQL_UNBIND);
 }
 
-TEST_F(FetchScrollLiveTest, BoundClientCodePageLossHonorsWarningAttribute) {
+ODBC_TEST_F(FetchScrollLiveTest, BoundClientCodePageLossHonorsWarningAttribute) {
     bool had_loss = false;
     const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xF0\x9F\x98\x80", &had_loss);
     for (SQLULEN warn : {0UL, 1UL}) {
@@ -177,7 +193,8 @@ TEST_F(FetchScrollLiveTest, BoundClientCodePageLossHonorsWarningAttribute) {
     ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR, nullptr, 0), SQL_HANDLE_DBC, dbc_);
 }
 
-TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
+ODBC_TEST_F_MODES(FetchScrollUtf16Test, RawUnitsInBoundRowArrays, odbc_concurrency::kAllModes) {
+    SKIP_MSODBCSQL_SHARED_DBC();
     constexpr size_t row_count = 4;
     struct Column {
         SQLWCHAR before;
@@ -256,7 +273,8 @@ TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
 // was still unread when the rowset budget was reached and that the release
 // peek is what consumed it. `row_fetch_with_terminal_info_returns_success_with_info`
 // pins that split in Rust meanwhile.
-TEST_F(FetchScrollLiveTest, TerminalAggregateWarningIsReportedExactlyOnce) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, TerminalAggregateWarningIsReportedExactlyOnce, odbc_concurrency::kAllModes) {
+    SKIP_MSODBCSQL_SHARED_DBC();
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -342,7 +360,7 @@ TEST_F(FetchScrollLiveTest, TerminalAggregateWarningIsReportedExactlyOnce) {
     ASSERT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
 }
 
-TEST_F(FetchScrollUtf16Test, Cp1252UnalignedColumnArrayFitsExactCapacity) {
+ODBC_TEST_F(FetchScrollUtf16Test, Cp1252UnalignedColumnArrayFitsExactCapacity) {
     constexpr size_t row_count = 3;
     constexpr size_t capacity = 514;
     SQLULEN fetched = 0;
@@ -409,7 +427,7 @@ TEST_F(FetchScrollUtf16Test, Cp1252UnalignedColumnArrayFitsExactCapacity) {
     ASSERT_EQ(SQL_SUCCESS, SQLFreeStmt(stmt_, SQL_UNBIND));
 }
 
-TEST_F(FetchScrollUtf16Test, NullDataPointersStayUnboundWithOffsetAndLiveIndicators) {
+ODBC_TEST_F(FetchScrollUtf16Test, NullDataPointersStayUnboundWithOffsetAndLiveIndicators) {
     constexpr size_t row_count = 2;
     constexpr size_t capacity = 6;
     SQLLEN bind_offset = 1;
@@ -488,7 +506,8 @@ TEST_F(FetchScrollUtf16Test, NullDataPointersStayUnboundWithOffsetAndLiveIndicat
     }
 }
 
-TEST_F(FetchScrollUtf16Test, BoundedRawUnitsTruncateBoundRows) {
+ODBC_TEST_F_MODES(FetchScrollUtf16Test, BoundedRawUnitsTruncateBoundRows, odbc_concurrency::kAllModes) {
+    SKIP_MSODBCSQL_SHARED_DBC();
     constexpr size_t row_count = 3;
     struct Column {
         SQLWCHAR before;
@@ -534,7 +553,8 @@ TEST_F(FetchScrollUtf16Test, BoundedRawUnitsTruncateBoundRows) {
     }
 }
 
-TEST_F(FetchScrollUtf16Test, RawUnitsFitExactBoundCapacity) {
+ODBC_TEST_F_MODES(FetchScrollUtf16Test, RawUnitsFitExactBoundCapacity,
+                  odbc_concurrency::kAllModes) {
     for (const auto& value : Utf16TestData::Values()) {
         SCOPED_TRACE(value.name);
         for (const char* type : {"nvarchar(32)", "nchar(8)", "nvarchar(max)"}) {
@@ -565,7 +585,8 @@ TEST_F(FetchScrollUtf16Test, RawUnitsFitExactBoundCapacity) {
 
 // Live SQL Server reproduction; bound_wide_plp_preserves_units_across_wire_chunks
 // in api/fetch_scroll.rs additionally forces a pair across a PLP chunk boundary.
-TEST_F(FetchScrollUtf16Test, BoundTruncationPreservesOnlyCompletePairs) {
+ODBC_TEST_F_MODES(FetchScrollUtf16Test, BoundTruncationPreservesOnlyCompletePairs,
+                  odbc_concurrency::kAllModes) {
     struct Boundary {
         const char* hex;
         size_t capacity;
@@ -628,14 +649,20 @@ TEST(FetchScrollTest, NullHandle) {
 // Manager answers this one itself with HY010 without reaching the driver. The
 // driver's own 24000 for an executed-but-closed cursor is covered by its unit
 // tests, which call it directly.
-TEST_F(FetchScrollLiveTest, FreshStatementIsASequenceError) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, FreshStatementIsASequenceError,
+                  odbc_concurrency::kAllModes) {
+    // The DM's HY010 is cleaned up before unixODBC takes its statement lock.
+    std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
     EXPECT_EQ(SQL_ERROR, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
+    SQLULEN timeout = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, &timeout, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
 }
 
 // The cursor is forward-only, so a scrolling orientation is rejected rather
 // than quietly treated as SQL_FETCH_NEXT.
-TEST_F(FetchScrollLiveTest, OnlyFetchNextIsSupported) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, OnlyFetchNextIsSupported, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     for (SQLSMALLINT orientation :
          {SQL_FETCH_PRIOR, SQL_FETCH_FIRST, SQL_FETCH_LAST, SQL_FETCH_ABSOLUTE,
@@ -649,7 +676,7 @@ TEST_F(FetchScrollLiveTest, OnlyFetchNextIsSupported) {
 
 // With the default rowset of one and no bound columns, SQLFetchScroll is
 // SQLFetch: it positions the cursor and SQLGetData reads the row.
-TEST_F(FetchScrollLiveTest, AdvancesTheCursorLikeFetch) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, AdvancesTheCursorLikeFetch, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     for (int expected = 1; expected <= 3; ++expected) {
         ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
@@ -682,7 +709,8 @@ TEST_F(FetchScrollLiveTest, AdvancesTheCursorLikeFetch) {
 // the fetched count, which both drivers agree on. The status fill itself is
 // pinned at the driver boundary by the unit test
 // `exhausted_cursor_fast_path_marks_the_status_array_from_the_ard`.
-TEST_F(FetchScrollLiveTest, DescriptorArraySizeSizesTheRowset) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, DescriptorArraySizeSizesTheRowset,
+                  odbc_concurrency::kAllModes) {
     ExecThreeRows();
 
     SQLHDESC ard = SQL_NULL_HDESC;
@@ -724,7 +752,8 @@ TEST_F(FetchScrollLiveTest, DescriptorArraySizeSizesTheRowset) {
 
 // AB#49060: rowset controls set only through the ARD/IRD descriptor fields
 // drive the fetch.
-TEST_F(FetchScrollLiveTest, DescriptorSpellingsDriveTheBlockFetch) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, DescriptorSpellingsDriveTheBlockFetch,
+                  odbc_concurrency::kAllModes) {
     ExecThreeRows();
 
     SQLHDESC ard = SQL_NULL_HDESC;
@@ -769,7 +798,8 @@ TEST_F(FetchScrollLiveTest, DescriptorSpellingsDriveTheBlockFetch) {
 }
 
 // AB#49060: each row-side attribute and its descriptor field are one value.
-TEST_F(FetchScrollLiveTest, RowAttributesAndDescriptorFieldsAgree) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, RowAttributesAndDescriptorFieldsAgree,
+                  odbc_concurrency::kAllModes) {
     // Executed first for the IRD cases below: SQLGet/SetDescField on an IRD is
     // HY007 ("associated statement is not prepared") unless the statement is
     // prepared or executed. unixODBC enforces that; the Windows DM does not.
@@ -833,7 +863,8 @@ TEST_F(FetchScrollLiveTest, RowAttributesAndDescriptorFieldsAgree) {
 
 // AB#49060: SQL_ROWSET_SIZE lives on the ARD (msodbcsql `ADTag::dwRowSetSize`),
 // so it follows an ARD association.
-TEST_F(FetchScrollLiveTest, RowsetSizeFollowsTheAssociatedArd) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, RowsetSizeFollowsTheAssociatedArd,
+                  kExplicitDescriptorModes) {
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ROWSET_SIZE, reinterpret_cast<SQLPOINTER>(5), 0),
                   SQL_HANDLE_STMT, stmt_);
     SQLHDESC implicit_ard = SQL_NULL_HDESC;
@@ -877,7 +908,8 @@ SQLULEN StmtULen(SQLHSTMT stmt, SQLINTEGER attribute) {
 } // namespace
 
 // A row that fails conversion still counts as fetched (msodbcsql FetchRows).
-TEST_F(FetchScrollLiveTest, RowsFetchedCountsAnErrorRowInTheRowset) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, RowsFetchedCountsAnErrorRowInTheRowset,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(1 AS INT) AS c UNION ALL SELECT 300 UNION ALL SELECT 2 "
                "ORDER BY c");
     SQLHDESC ird = StmtDesc(stmt_, SQL_ATTR_IMP_ROW_DESC);
@@ -907,7 +939,8 @@ TEST_F(FetchScrollLiveTest, RowsFetchedCountsAnErrorRowInTheRowset) {
 // A truncated row: msodbcsql reports SQL_ROW_ERROR through SQLFetch and
 // SQL_ROW_SUCCESS_WITH_INFO through SQLFetchScroll; mssql-odbc reports the
 // latter through both (see `RowOutcome::status`). Each leg asserts its own.
-TEST_F(FetchScrollLiveTest, TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll, odbc_concurrency::kAllModes) {
+    SKIP_MSODBCSQL_SHARED_DBC();
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool reference = target && std::string(target) == "msodbcsql";
     for (bool scroll : {false, true}) {
@@ -944,7 +977,8 @@ TEST_F(FetchScrollLiveTest, TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll) 
 }
 
 // A fetch refused by validation leaves the rows-fetched buffer alone.
-TEST_F(FetchScrollLiveTest, ARefusedFetchLeavesRowsFetchedAlone) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ARefusedFetchLeavesRowsFetchedAlone,
+                  odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLULEN fetched = 77;
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
@@ -956,7 +990,8 @@ TEST_F(FetchScrollLiveTest, ARefusedFetchLeavesRowsFetchedAlone) {
 }
 
 // The bind offset is read per fetch, including after repointing it via the ARD.
-TEST_F(FetchScrollLiveTest, TheRowBindOffsetIsReadOnEveryFetch) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, TheRowBindOffsetIsReadOnEveryFetch,
+                  odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
     SQLINTEGER values[3] = {-1, -1, -1};
@@ -982,7 +1017,8 @@ TEST_F(FetchScrollLiveTest, TheRowBindOffsetIsReadOnEveryFetch) {
 }
 
 // The array size and rows-fetched pointer can change between fetches.
-TEST_F(FetchScrollLiveTest, RowsetControlsCanChangeBetweenFetches) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, RowsetControlsCanChangeBetweenFetches,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT n FROM (VALUES (1), (2), (3), (4), (5), (6)) AS t(n) ORDER BY n");
     SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
     SQLHDESC ird = StmtDesc(stmt_, SQL_ATTR_IMP_ROW_DESC);
@@ -1020,7 +1056,8 @@ TEST_F(FetchScrollLiveTest, RowsetControlsCanChangeBetweenFetches) {
 
 // One explicit descriptor as one statement's ARD and another's APD has one
 // header (from msodbcsql's DescFpp suite).
-TEST_F(FetchScrollLiveTest, OneDescriptorAsArdAndApdSharesEveryHeaderAlias) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, OneDescriptorAsArdAndApdSharesEveryHeaderAlias,
+                  kExplicitDescriptorModes) {
     SQLHSTMT other = AllocStmt();
     SQLHDESC shared = SQL_NULL_HDESC;
     ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &shared), SQL_HANDLE_DBC, dbc_);
@@ -1054,7 +1091,8 @@ TEST_F(FetchScrollLiveTest, OneDescriptorAsArdAndApdSharesEveryHeaderAlias) {
 }
 
 // Freeing an associated ARD reverts the row aliases to the implicit ARD's.
-TEST_F(FetchScrollLiveTest, FreeingTheAssociatedArdRevertsTheRowAliases) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, FreeingTheAssociatedArdRevertsTheRowAliases,
+                  kExplicitDescriptorModes) {
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
                                  reinterpret_cast<SQLPOINTER>(4), 0),
                   SQL_HANDLE_STMT, stmt_);
@@ -1083,7 +1121,8 @@ TEST_F(FetchScrollLiveTest, FreeingTheAssociatedArdRevertsTheRowAliases) {
 // Both spellings store a bind type wider than SQLINTEGER; SQLGetDescField
 // reports the low 32 bits.
 #if defined(_WIN64) || defined(__LP64__)
-TEST_F(FetchScrollLiveTest, AWideBindTypeIsStoredWholeThroughEitherSpelling) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, AWideBindTypeIsStoredWholeThroughEitherSpelling,
+                  odbc_concurrency::kAllModes) {
     SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
     const SQLULEN wide = (static_cast<SQLULEN>(1) << 32) | 0x18;
 
@@ -1104,7 +1143,7 @@ TEST_F(FetchScrollLiveTest, AWideBindTypeIsStoredWholeThroughEitherSpelling) {
 }
 #endif
 
-TEST_F(FetchScrollLiveTest, ReportsRowsFetched) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ReportsRowsFetched, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLULEN rowsFetched = 999;
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
@@ -1123,7 +1162,7 @@ TEST_F(FetchScrollLiveTest, ReportsRowsFetched) {
 
 // The rows the fetch did not fill have to be marked, or the application reads
 // stale statuses left by a previous, longer rowset.
-TEST_F(FetchScrollLiveTest, FillsTheRowStatusArray) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, FillsTheRowStatusArray, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     std::vector<SQLUSMALLINT> status(4, 0xFFFF);
     SQLULEN rowsFetched = 0;
@@ -1146,7 +1185,7 @@ TEST_F(FetchScrollLiveTest, FillsTheRowStatusArray) {
 
 // A rowset wider than what is left returns the partial block, and the call
 // after it reports end of set.
-TEST_F(FetchScrollLiveTest, PartialRowsetAtEndOfResultSet) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, PartialRowsetAtEndOfResultSet, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLULEN rowsFetched = 0;
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
@@ -1166,7 +1205,7 @@ TEST_F(FetchScrollLiveTest, PartialRowsetAtEndOfResultSet) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ReturnsNoDataAtEndOfResultSet) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ReturnsNoDataAtEndOfResultSet, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS n WHERE 1 = 0");
     EXPECT_EQ(SQL_NO_DATA, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
     SQLCloseCursor(stmt_);
@@ -1179,7 +1218,8 @@ TEST_F(FetchScrollLiveTest, ReturnsNoDataAtEndOfResultSet) {
 
 // One bound int column over a rowset wider than one row: each row must land at
 // its own offset in the array, with its own indicator.
-TEST_F(FetchScrollLiveTest, BindsAnIntegerColumnAcrossARowset) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, BindsAnIntegerColumnAcrossARowset,
+                  odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLINTEGER values[4] = {-1, -1, -1, -1};
     SQLLEN indicators[4] = {-99, -99, -99, -99};
@@ -1207,7 +1247,8 @@ TEST_F(FetchScrollLiveTest, BindsAnIntegerColumnAcrossARowset) {
 // SQL_C_DEFAULT is retained by SQLBindCol and resolved from each result
 // column's IRD type when the rowset is fetched. This covers both the fixed
 // stride of SQL_C_SLONG and the application-sized stride of SQL_C_CHAR.
-TEST_F(FetchScrollLiveTest, DefaultTargetResolvesAtFetchTime) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, DefaultTargetResolvesAtFetchTime,
+                  odbc_concurrency::kAllModes) {
     SQLINTEGER values[3] = {-1, -1, -1};
     SQLCHAR text[3][8] = {};
     SQLLEN valueIndicators[3] = {-99, -99, -99};
@@ -1255,7 +1296,8 @@ TEST_F(FetchScrollLiveTest, DefaultTargetResolvesAtFetchTime) {
 //
 // Skipped on the reference leg by construction: asserting a deviation is the
 // point, so comparing it would always report a divergence.
-TEST_F(FetchScrollLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     SQLWCHAR wide[2][8] = {};
     // Four slots for a rowset of two, with BufferLength deliberately set to two
@@ -1326,7 +1368,8 @@ TEST_F(FetchScrollLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
 //
 // Deliberately uses the two types both drivers resolve identically (int and
 // narrow varchar), so this runs on the msodbcsql leg too and compares.
-TEST_F(FetchScrollLiveTest, DefaultTargetResolvesPerResultSet) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, DefaultTargetResolvesPerResultSet,
+                  odbc_concurrency::kAllModes) {
     union {
         SQLINTEGER n;
         SQLCHAR text[16];
@@ -1353,7 +1396,8 @@ TEST_F(FetchScrollLiveTest, DefaultTargetResolvesPerResultSet) {
 
 // Two columns of different shapes bound at once, to prove the fill loop walks
 // the binding table rather than assuming a single column.
-TEST_F(FetchScrollLiveTest, BindsSeveralColumnsOfDifferentTypes) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, BindsSeveralColumnsOfDifferentTypes,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT 10 AS n, CAST('alpha' AS VARCHAR(20)) AS s"
         " UNION ALL SELECT 20, 'beta' ORDER BY n");
@@ -1387,7 +1431,8 @@ TEST_F(FetchScrollLiveTest, BindsSeveralColumnsOfDifferentTypes) {
 
 // NULL is reported through the indicator, and must not disturb the data slot of
 // a fixed-width target.
-TEST_F(FetchScrollLiveTest, BoundNullIsReportedThroughTheIndicator) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, BoundNullIsReportedThroughTheIndicator,
+                  odbc_concurrency::kAllModes) {
     // Ordered explicitly so the NULL's position is not left to the plan.
     ExecDirect(
         "SELECT n FROM (VALUES (1, 1), (2, NULL), (3, 3)) AS t(ord, n) ORDER BY ord");
@@ -1414,7 +1459,8 @@ TEST_F(FetchScrollLiveTest, BoundNullIsReportedThroughTheIndicator) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollUtf16Test, BoundNullPreservesSeparateOctetLength) {
+ODBC_TEST_F_MODES(FetchScrollUtf16Test, BoundNullPreservesSeparateOctetLength,
+                  odbc_concurrency::kAllModes) {
     for (const char* type : {"BINARY(3)", "CHAR(8)", "VARBINARY(8)",
                              "VARBINARY(MAX)", "VARCHAR(8)", "NVARCHAR(MAX)"}) {
         SCOPED_TRACE(type);
@@ -1449,7 +1495,8 @@ TEST_F(FetchScrollUtf16Test, BoundNullPreservesSeparateOctetLength) {
 
 // A bound column gets one shot at a fixed buffer, so an over-long value is
 // truncated with 01004 and the indicator reports the untruncated length.
-TEST_F(FetchScrollLiveTest, BoundCharacterDataTruncatesWithInfo) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, BoundCharacterDataTruncatesWithInfo,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST('abcdefghij' AS VARCHAR(20)) AS s");
     SQLCHAR text[5] = {};
     SQLLEN indicator = -99;
@@ -1471,7 +1518,7 @@ TEST_F(FetchScrollLiveTest, BoundCharacterDataTruncatesWithInfo) {
 
 // SQLFreeStmt(SQL_UNBIND) drops every binding; mssql-python calls it before
 // each fetch, so a fetch afterwards must deliver nothing.
-TEST_F(FetchScrollLiveTest, UnbindStopsDelivery) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, UnbindStopsDelivery, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLINTEGER value = -1;
     SQLLEN indicator = -99;
@@ -1496,7 +1543,8 @@ TEST_F(FetchScrollLiveTest, UnbindStopsDelivery) {
 
 // Rebinding a column replaces its entry rather than adding a second one, so the
 // value lands in the new buffer only.
-TEST_F(FetchScrollLiveTest, RebindingAColumnReplacesTheBinding) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, RebindingAColumnReplacesTheBinding,
+                  odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLINTEGER first = -1;
     SQLINTEGER second = -1;
@@ -1515,7 +1563,8 @@ TEST_F(FetchScrollLiveTest, RebindingAColumnReplacesTheBinding) {
 }
 
 // Unbinding one column leaves the others delivering.
-TEST_F(FetchScrollLiveTest, UnbindingOneColumnLeavesTheOthers) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, UnbindingOneColumnLeavesTheOthers,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 10 AS a, 20 AS b");
     SQLINTEGER a = -1;
     SQLINTEGER b = -1;
@@ -1536,7 +1585,8 @@ TEST_F(FetchScrollLiveTest, UnbindingOneColumnLeavesTheOthers) {
 
 // A bound fetch of a single row leaves the cursor positioned, so SQLGetData can
 // still read a column the fill loop did not take.
-TEST_F(FetchScrollLiveTest, GetDataStillWorksAfterASingleRowBoundFetch) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, GetDataStillWorksAfterASingleRowBoundFetch,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 10 AS a, 20 AS b");
     SQLINTEGER a = -1;
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &a, sizeof(a), nullptr),
@@ -1555,7 +1605,7 @@ TEST_F(FetchScrollLiveTest, GetDataStillWorksAfterASingleRowBoundFetch) {
 // ODBC defines SQLFetch as the SQL_FETCH_NEXT form of SQLFetchScroll, so the
 // classic SQLBindCol + SQLFetch loop must fill the bound buffers too. Keeping a
 // second row-reading path is how that silently stops being true.
-TEST_F(FetchScrollLiveTest, SQLFetchFillsBoundColumnsToo) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, SQLFetchFillsBoundColumnsToo, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLINTEGER value = -1;
     SQLLEN indicator = -99;
@@ -1573,7 +1623,7 @@ TEST_F(FetchScrollLiveTest, SQLFetchFillsBoundColumnsToo) {
 
 // SQL_ATTR_ROW_ARRAY_SIZE applies to SQLFetch as well, so it returns a rowset
 // rather than a single row.
-TEST_F(FetchScrollLiveTest, SQLFetchHonoursTheRowsetSize) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, SQLFetchHonoursTheRowsetSize, odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLINTEGER values[3] = {-1, -1, -1};
     SQLULEN rowsFetched = 0;
@@ -1598,7 +1648,8 @@ TEST_F(FetchScrollLiveTest, SQLFetchHonoursTheRowsetSize) {
 // left the row cursor inside the LOB, so the *next* column parsed payload bytes
 // as a length prefix -- which segfaulted the driver rather than failing
 // cleanly. The second bound column is the part that matters here.
-TEST_F(FetchScrollLiveTest, ABoundLobColumnDoesNotDesyncTheRow) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundLobColumnDoesNotDesyncTheRow,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT REPLICATE(CAST('x' AS NVARCHAR(MAX)), 10000) AS lob, 4242 AS n");
 
@@ -1624,7 +1675,8 @@ TEST_F(FetchScrollLiveTest, ABoundLobColumnDoesNotDesyncTheRow) {
 
 // The same hazard through the block path, and with the LOB last so the drain
 // has to happen even when no bound column follows it.
-TEST_F(FetchScrollLiveTest, ABoundLobIsDrainedAcrossARowset) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundLobIsDrainedAcrossARowset,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT n, REPLICATE(CAST('y' AS NVARCHAR(MAX)), 5000) AS lob "
         "FROM (VALUES (1),(2),(3)) AS t(n) ORDER BY n");
@@ -1657,7 +1709,8 @@ TEST_F(FetchScrollLiveTest, ABoundLobIsDrainedAcrossARowset) {
 // first, which is not implemented, so the cursor is deliberately left
 // unpositioned. The contract that matters is that SQLGetData then fails
 // cleanly: an unpositioned cursor must not be read as though a row were there.
-TEST_F(FetchScrollLiveTest, GetDataAfterABlockFetchFailsCleanly) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, GetDataAfterABlockFetchFailsCleanly,
+                  odbc_concurrency::kAllModes) {
     ExecThreeRows();
     SQLINTEGER values[3] = {-1, -1, -1};
     SQLULEN rowsFetched = 0;
@@ -1682,7 +1735,8 @@ TEST_F(FetchScrollLiveTest, GetDataAfterABlockFetchFailsCleanly) {
 // A null TargetValuePtr unbinds the column outright; the indicator is never
 // consulted. The column must therefore stay available to SQLGetData, which is
 // what distinguishes an unbind from a binding that delivers nothing.
-TEST_F(FetchScrollLiveTest, ANullTargetPointerUnbindsAndLeavesTheColumnReadable) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ANullTargetPointerUnbindsAndLeavesTheColumnReadable,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(42 AS INT) AS n, CAST('hi' AS VARCHAR(10)) AS s");
     SQLINTEGER v = -1;
     SQLLEN ind = -999;
@@ -1708,7 +1762,8 @@ TEST_F(FetchScrollLiveTest, ANullTargetPointerUnbindsAndLeavesTheColumnReadable)
 // msodbcsql keys the fetch return code on the rowset size: a single-row fetch
 // lets a row error stand as SQL_ERROR, while a block fetch demotes it to
 // SQL_SUCCESS_WITH_INFO and leaves the detail in the row status array.
-TEST_F(FetchScrollLiveTest, ARowErrorIsSQL_ERRORAtRowsetSizeOne) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ARowErrorIsSQL_ERRORAtRowsetSizeOne,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(NULL AS INT) AS z");
     SQLINTEGER v = -1;
     // NULL with no indicator to report it through is a row error.
@@ -1720,7 +1775,8 @@ TEST_F(FetchScrollLiveTest, ARowErrorIsSQL_ERRORAtRowsetSizeOne) {
 
 // The same row error inside a rowset is demoted, so the application reads the
 // per-row detail from the status array instead.
-TEST_F(FetchScrollLiveTest, TheSameRowErrorIsDemotedInABlockFetch) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, TheSameRowErrorIsDemotedInABlockFetch,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(NULL AS INT) AS z");
     SQLINTEGER v[2] = {-1, -1};
     SQLUSMALLINT status[2] = {0, 0};
@@ -1741,7 +1797,8 @@ TEST_F(FetchScrollLiveTest, TheSameRowErrorIsDemotedInABlockFetch) {
 // Neither 07009 ("invalid descriptor index", which is what bind time uses for
 // an out-of-range ordinal) nor 07006 is raised, so a stale binding must not
 // start failing fetches here.
-TEST_F(FetchScrollLiveTest, AStaleOrdinalPastTheResultSetIsIgnored) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, AStaleOrdinalPastTheResultSetIsIgnored,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT 1 AS only_column");
     SQLINTEGER v = -1;
     SQLLEN ind = -999;
@@ -1771,7 +1828,8 @@ TEST_F(FetchScrollLiveTest, AStaleOrdinalPastTheResultSetIsIgnored) {
 // count the wrong unit to report.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxThatFitsReportsItsLength) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundNvarcharMaxThatFitsReportsItsLength,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(N'abcdefghij' AS NVARCHAR(MAX)) AS c1");
 
     char buf[64] = {};
@@ -1787,7 +1845,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxThatFitsReportsItsLength) {
 
 // Transcoding UTF-16 to a narrow target means the wire byte count is not the
 // delivered byte count, so the full length cannot be reported.
-TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToCharReportsNoTotal) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToCharReportsNoTotal,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT REPLICATE(CAST(N'x' AS NVARCHAR(MAX)), 5000) AS c1");
 
     char buf[32] = {};
@@ -1804,7 +1863,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToCharReportsNoTotal) {
 
 // Same source into a wide target: the units match the wire, so the full length
 // is knowable and is reported.
-TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToWcharReportsFullLength) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToWcharReportsFullLength,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT REPLICATE(CAST(N'x' AS NVARCHAR(MAX)), 5000) AS c1");
 
     SQLWCHAR buf[16] = {};
@@ -1828,7 +1888,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToWcharReportsFullLength) 
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedReportsFullLength) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxTruncatedReportsFullLength,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT REPLICATE(CAST('y' AS VARCHAR(MAX)), 5000) AS c1");
 
     char buf[32] = {};
@@ -1842,7 +1903,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedReportsFullLength) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxWidensToWchar) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxWidensToWchar, odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST('abcdefghij' AS VARCHAR(MAX)) AS c1");
 
     SQLWCHAR buf[32] = {};
@@ -1858,7 +1919,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxWidensToWchar) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(NCHAR(233) COLLATE Latin1_General_100_CI_AS AS VARCHAR(MAX)) AS c1");
 
@@ -1875,7 +1937,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening) {
 }
 
 // Decode through the source collation, then encode for the client (AB#47564).
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)) AS c1");
 
@@ -1908,7 +1971,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
 // (VarcharMaxDbcsToCharSplitsCharacterAcrossChunks), which shows the corruption
 // verbatim: msodbcsql drops a GBK lead byte at a chunk boundary and the
 // following bytes decode shifted by one.
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunks) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunks,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) + NCHAR(0x754C) "
@@ -1936,7 +2000,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource,
+                  odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "This regression pins UTF-8 client length estimates";
     }
@@ -1990,7 +2055,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
 // (sqlcdata.h:1230): Linux package 18.6.2.1-1, SQL_DRIVER_VER 18.06.0002, reports
 // 5008 under C.UTF-8. Bound delivery uses the same estimate and raw-drains the
 // discarded tail instead of converting all 10,000 UTF-8 bytes.
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength,
+                  odbc_concurrency::kAllModes) {
     if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
         GTEST_SKIP() << "This regression pins UTF-8 client length estimates";
     }
@@ -2030,7 +2096,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
 // the slot. Split per-leg rather than skipped so the shared part -- that both
 // drivers truncate, report 01004, and deliver a prefix of the value -- stays
 // measured against msodbcsql.
-TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(0x4F60) "
         "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 500) AS c1");
@@ -2071,7 +2138,8 @@ TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBo
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToWcharReportsNoTotal) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToWcharReportsNoTotal,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT REPLICATE(CAST('y' AS VARCHAR(MAX)), 5000) AS c1");
 
     SQLWCHAR buf[16] = {};
@@ -2088,7 +2156,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToWcharReportsNoTotal) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundJsonWidensToWchar) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundJsonWidensToWchar, odbc_concurrency::kAllModes) {
     if (!ServerSupportsNativeJson()) {
         GTEST_SKIP() << "server has no native json type";
     }
@@ -2108,7 +2176,8 @@ TEST_F(FetchScrollLiveTest, ABoundJsonWidensToWchar) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening,
+                  odbc_concurrency::kAllModes) {
     // msodbcsql leaves the high surrogate in the ninth payload slot here. The
     // Rust driver deliberately applies the whole-character truncation rule used
     // by its existing nvarchar(max) bound delivery instead. Recorded as a
@@ -2138,7 +2207,8 @@ TEST_F(FetchScrollLiveTest, ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWi
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxConvertsToTypedCTargetLikeNonMax) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxConvertsToTypedCTargetLikeNonMax,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST('42' AS VARCHAR(50)), CAST('42' AS VARCHAR(MAX)), "
         "CAST(N'42' AS NVARCHAR(MAX))");
@@ -2169,7 +2239,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxConvertsToTypedCTargetLikeNonMax) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTypedConversionErrorStillDrainsTheRow) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarcharMaxTypedConversionErrorStillDrainsTheRow,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT CAST(v AS VARCHAR(MAX)), n FROM "
         "(VALUES (1, 'not-a-number'), (2, '8')) AS t(n, v) ORDER BY n");
@@ -2194,7 +2265,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTypedConversionErrorStillDrainsTheRo
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained,
+                  odbc_concurrency::kAllModes) {
     // The 1 MiB materialization cap is this driver's own resource bound and has
     // no msodbcsql counterpart, so parity cannot hold here by construction.
     // Recorded as a deliberate deviation in
@@ -2226,7 +2298,8 @@ TEST_F(FetchScrollLiveTest, AOversizedBoundVarcharMaxTypedConversionIsRefusedAnd
 }
 
 // Non-ASCII proves that the output is transcoded to the native client encoding.
-TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT CAST(REPLICATE(NCHAR(233), 4) AS NVARCHAR(MAX)) AS c1");
 
     unsigned char buf[64] = {};
@@ -2244,7 +2317,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
 
 // This driver keeps complete client characters, while msodbcsql truncates at
 // the output byte capacity even when that splits a multibyte character.
-TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary,
+                  odbc_concurrency::kAllModes) {
     ExecDirect("SELECT REPLICATE(CAST(NCHAR(233) AS NVARCHAR(MAX)), 5000) AS c1");
 
     unsigned char buf[32] = {};
@@ -2262,7 +2336,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary,
+                  odbc_concurrency::kAllModes) {
     if (!ServerSupportsNativeJson()) {
         GTEST_SKIP() << "server has no native json type";
     }
@@ -2289,7 +2364,8 @@ TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
 // capacity boundary. U+1F600 is two code units, so an odd-sized buffer would
 // otherwise end on a lone high surrogate. msodbcsql trims it too
 // (GetColDataSurrogateSafe).
-TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxDoesNotSplitASurrogatePair) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundNvarcharMaxDoesNotSplitASurrogatePair,
+                  odbc_concurrency::kAllModes) {
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(0xD83D) + NCHAR(0xDE00) AS NVARCHAR(MAX)), 500) AS c1");
 
@@ -2319,7 +2395,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxDoesNotSplitASurrogatePair) {
 
 // Bound VARBINARY(MAX) delivery across a rowset with a trailing scalar, so a
 // mis-sized drain would corrupt the following column and row.
-TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset,
+                  odbc_concurrency::kAllModes) {
     // Two rows and a trailing scalar: a bound LOB is drained into the caller's
     // buffer, and the value after it -- and the row after that -- still have to
     // decode, which is what a mis-sized drain would break.
@@ -2376,7 +2453,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
 // PLP metadata selects the streaming path regardless of the value's size. This
 // test keeps a large value to verify that refusing a binary PLP before typed
 // conversion still drains every chunk before the trailing column and next row.
-TEST_F(FetchScrollLiveTest, ABoundStreamedVarbinaryMaxToTypedCTargetIsStillUnsupported) {
+ODBC_TEST_F_MODES(FetchScrollLiveTest, ABoundStreamedVarbinaryMaxToTypedCTargetIsStillUnsupported,
+                  odbc_concurrency::kAllModes) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
         "SELECT n, CONVERT(varbinary(max), REPLICATE(CONVERT(varchar(max), 'a'), 1100000)) "
@@ -2405,4 +2483,123 @@ TEST_F(FetchScrollLiveTest, ABoundStreamedVarbinaryMaxToTypedCTargetIsStillUnsup
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
+}
+
+// Every row is derived from the run and numbered, so under the concurrent modes
+// a row delivered to another worker's statement, out of order, or lost fails
+// here. 5000 rows of about 110 bytes span many TDS packets, so the rowset fill
+// crosses packet boundaries many times while other workers stream as well.
+ODBC_TEST_F_MODES(FetchScrollLiveTest, RunUniqueLongRowStreamArrivesWholeAndInOrder,
+                  odbc_concurrency::kAllModes) {
+    constexpr SQLULEN kRowsetSize = 128;
+    constexpr int kRows = 5000;
+    const std::string token = WorkerToken("stream");
+    const std::string filler(80, 'x');
+    ExecDirect("WITH r AS (SELECT TOP (" + std::to_string(kRows) +
+               ") ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n "
+               "FROM sys.all_objects a CROSS JOIN sys.all_objects b) "
+               "SELECT CAST(n AS INT), CONCAT('" + token + ":', n, ':" + filler +
+               "') FROM r ORDER BY n");
+
+    SQLINTEGER numbers[kRowsetSize] = {};
+    SQLLEN number_ind[kRowsetSize] = {};
+    char text[kRowsetSize][160] = {};
+    SQLLEN text_ind[kRowsetSize] = {};
+    SQLUSMALLINT status[kRowsetSize] = {};
+    SQLULEN fetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(kRowsetSize), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, numbers, sizeof(numbers[0]), number_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_CHAR, text, sizeof(text[0]), text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    int next = 1;
+    SQLRETURN rc;
+    while ((rc = SQLFetch(stmt_)) != SQL_NO_DATA) {
+        ASSERT_EQ(SQL_SUCCESS, rc) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        ASSERT_GT(fetched, 0u);
+        ASSERT_LE(fetched, kRowsetSize);
+        for (SQLULEN row = 0; row < fetched; ++row, ++next) {
+            const std::string expected = token + ":" + std::to_string(next) + ":" + filler;
+            ASSERT_EQ(SQL_ROW_SUCCESS, status[row]) << "row " << next;
+            ASSERT_EQ(next, numbers[row]) << "row " << next;
+            ASSERT_EQ(static_cast<SQLLEN>(expected.size()), text_ind[row]) << "row " << next;
+            ASSERT_EQ(expected, std::string(text[row], expected.size())) << "row " << next;
+        }
+    }
+    EXPECT_EQ(kRows + 1, next) << "rows delivered";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// A stream abandoned after its first rowset must leave nothing behind: the rows
+// still on the wire belong to it, so neither this statement's next result nor,
+// in /SharedDbc, another worker's statement may receive them. Each round reads
+// one rowset, ends the stream (SQLCloseCursor, or an idle SQLCancel, which
+// closes the cursor; AB#49386), then reads a short run-unique result.
+ODBC_TEST_F_MODES(FetchScrollLiveTest, RunUniqueStreamAbandonedMidwayLeavesNoRowsBehind,
+                  odbc_concurrency::kAllModes) {
+    SKIP_MSODBCSQL_SHARED_DBC();
+    constexpr SQLULEN kRowsetSize = 64;
+    constexpr int kRows = 5000;
+    const std::string filler(80, 'x');
+    SQLINTEGER numbers[kRowsetSize] = {};
+    SQLLEN number_ind[kRowsetSize] = {};
+    char text[kRowsetSize][160] = {};
+    SQLLEN text_ind[kRowsetSize] = {};
+    SQLULEN fetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(kRowsetSize), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, numbers, sizeof(numbers[0]), number_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_CHAR, text, sizeof(text[0]), text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (const bool cancel : {false, true}) {
+        SCOPED_TRACE(cancel ? "SQLCancel" : "SQLCloseCursor");
+        const std::string token = WorkerToken(cancel ? "cancelled" : "closed");
+        ASSERT_NO_FATAL_FAILURE(ExecDirect(
+            "WITH r AS (SELECT TOP (" + std::to_string(kRows) +
+            ") ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n "
+            "FROM sys.all_objects a CROSS JOIN sys.all_objects b) "
+            "SELECT CAST(n AS INT), CONCAT('" + token + ":', n, ':" + filler +
+            "') FROM r ORDER BY n"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(kRowsetSize, fetched);
+        for (SQLULEN row = 0; row < fetched; ++row) {
+            const int n = static_cast<int>(row) + 1;
+            const std::string expected = token + ":" + std::to_string(n) + ":" + filler;
+            ASSERT_EQ(n, numbers[row]) << "row " << n;
+            ASSERT_EQ(static_cast<SQLLEN>(expected.size()), text_ind[row]) << "row " << n;
+            ASSERT_EQ(expected, std::string(text[row], expected.size())) << "row " << n;
+        }
+
+        if (cancel) {
+            ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
+        } else {
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        }
+
+        const std::string after = token + ":after";
+        ASSERT_NO_FATAL_FAILURE(ExecDirect("SELECT CAST(-1 AS INT), '" + after + "'"));
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(1u, fetched);
+        EXPECT_EQ(-1, numbers[0]);
+        ASSERT_EQ(static_cast<SQLLEN>(after.size()), text_ind[0]);
+        EXPECT_EQ(after, std::string(text[0], after.size()));
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+    SQLFreeStmt(stmt_, SQL_UNBIND);
 }
