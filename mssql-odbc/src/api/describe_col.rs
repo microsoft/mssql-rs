@@ -15,7 +15,8 @@ use crate::api::odbc_types::{
     SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
-    ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, ERR_NOT_CURSOR_SPECIFICATION,
+    WARN_STRING_TRUNCATION, post_diag,
 };
 use crate::api::util::{copy_utf16_with_nul, copy_with_nul, write_if_some};
 use crate::error::free_errors;
@@ -142,6 +143,10 @@ fn sql_describe_col_w_safe(
 
     if !stmt_state.has_state(STMT_STATE_EXEC_CONTEXT) {
         post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return SQL_ERROR;
+    }
+    if stmt_state.error_result {
+        post_diag(&mut stmt_state, ERR_NOT_CURSOR_SPECIFICATION);
         return SQL_ERROR;
     }
 

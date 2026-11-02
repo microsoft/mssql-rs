@@ -52,19 +52,23 @@ _SWITCHES = (
 )
 
 
-def evaluate(expression, parameters, succeeded=True):
-    """Evaluate only the boolean expression subset used by this pipeline."""
+def evaluate(expression, parameters, succeeded=True, variables=None):
+    """Evaluate only the condition subset used by these pipelines."""
     expression = re.sub(r"\band\(", "all_(", expression)
     expression = re.sub(r"\bor\(", "any_(", expression)
 
     def visit(node):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, ast.Name):
             return {"true": True, "false": False}[node.id.lower()]
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             assert node.value.id == "parameters"
             return parameters[node.attr]
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            assert node.value.id == "variables"
+            assert variables is not None
+            return variables[visit(node.slice)]
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             args = [visit(arg) for arg in node.args]
             return {
