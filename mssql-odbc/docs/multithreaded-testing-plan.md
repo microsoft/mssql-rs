@@ -533,6 +533,18 @@ races:
   only the `<name>_mt` entries. `run_e2e.sh --mt-profile` and
   `run_e2e.ps1 -MtProfile` apply a profile; a variable already set in the
   environment wins.
+- Linux and Windows stress jobs allow 240 minutes for weekly runs and 120
+  minutes for nightly runs. The 60-minute per-entry CTest limit and 5-minute
+  default phase watchdog are unchanged. Longer jobs can hold agent slots for
+  longer; this does not increase peak concurrency.
+- Windows runs four parallel jobs: fetch, parameters, metadata, and remaining
+  suites. Each job builds its own Debug driver and harness and runs its suite
+  group sequentially against both drivers on its own SQL Server agent. The
+  remaining-suites filter excludes the three named groups, so newly converted
+  suites are included automatically. Profiles, retries, and per-entry timeouts
+  are unchanged; test-run titles and dump, load, and trace artifact names include
+  the suite group. This trades additional agents and builds for less serial
+  test work per job without adding competing suite processes to one agent.
 - The nightly run exists to flush out obvious races while suites convert.
   Remove its schedule two to three weeks after it starts, once its findings
   are fixed; PR and weekly remain.
