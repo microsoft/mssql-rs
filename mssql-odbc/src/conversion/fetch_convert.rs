@@ -66,7 +66,7 @@ impl TextOutput {
         text: &str,
         offset: usize,
         length: usize,
-    ) -> Result<bool, crate::api::sqlstate::DiagMsg> {
+    ) -> Result<bool, ConvError> {
         if length == 0 {
             return Ok(false);
         }

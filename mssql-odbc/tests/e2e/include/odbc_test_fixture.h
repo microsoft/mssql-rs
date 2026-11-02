@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "odbc_diagnostics_mutex.h"
+
 #include <gtest/gtest.h>
 
 #ifdef _WIN32
@@ -232,6 +234,12 @@ protected:
     /// Execute a SQL statement, ignoring errors (useful for DROP IF EXISTS).
     void ExecDirectIgnoreError(const std::string& sql);
 
+    /// Whether the server has the native `json` type, probed on stmt_. Only
+    /// error 243 ("Type json is not a defined system type") means no; any
+    /// other failure, such as a busy shared connection, is reported with its
+    /// diagnostic, so a /SharedDbc attempt retries rather than skipping.
+    bool ServerSupportsNativeJson();
+
     // --- Logging ------------------------------------------------------------
     /// Print a timestamped, indented log message to stdout.
     void Log(const std::string& msg);
@@ -255,16 +263,40 @@ protected:
     }
 
     // Only idle cancellation uses this gate; running-command cancellation must
-    // remain concurrent with the executing call.
+    // remain concurrent with the executing call. The Driver Manager lets
+    // SQLCancel through its per-handle lock, so without the gate it can overlap
+    // an observer's STMT diagnostic read inside the driver. msodbcsql holds
+    // csStmt for that read, and SQLCancel decides idle vs cross-thread with
+    // TryEnter on csStmt (sqlcmisc.cpp:754), so the idle cancel leaves the
+    // cursor open and the next command finds the connection busy. Both drivers
+    // take the gate so the legs run the same interleavings.
     SQLRETURN CancelIdleStatement() {
-        std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
-        return SQLCancel(stmt_);
+        const auto requested = std::chrono::steady_clock::now();
+        std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
+        const auto locked = std::chrono::steady_clock::now();
+        const SQLRETURN rc = SQLCancel(stmt_);
+        idle_cancel_lock_wait_ = locked - requested;
+        idle_cancel_call_ = std::chrono::steady_clock::now() - locked;
+        return rc;
     }
-    std::shared_mutex diagnostics_mutex_;
+    // A slow idle cancel under SharedStmt can be time spent waiting for the
+    // observers' shared locks rather than in SQLCancel; add this to timing
+    // assertions so a failure says which.
+    std::string IdleCancelTiming() const {
+        using std::chrono::duration_cast;
+        using std::chrono::milliseconds;
+        return "idle cancel: lock_wait_ms=" +
+               std::to_string(duration_cast<milliseconds>(idle_cancel_lock_wait_).count()) +
+               " sqlcancel_ms=" +
+               std::to_string(duration_cast<milliseconds>(idle_cancel_call_).count());
+    }
+    OdbcDiagnosticsMutex diagnostics_mutex_;
 
 private:
     SQLHENV lent_env_ = SQL_NULL_HENV;
     SQLHDBC lent_dbc_ = SQL_NULL_HDBC;
     std::vector<SQLHSTMT> extra_stmts_;
     std::chrono::steady_clock::time_point test_start_;
+    std::chrono::steady_clock::duration idle_cancel_lock_wait_{};
+    std::chrono::steady_clock::duration idle_cancel_call_{};
 };

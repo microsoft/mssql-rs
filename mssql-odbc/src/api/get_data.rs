@@ -1487,7 +1487,7 @@ fn write_captured_column(
         let pair_bytes = match stmt_state.text_output.encoding.encode("00") {
             Ok(encoded) => encoded.bytes.len(),
             Err(diag) => {
-                post_diag(stmt_state, diag);
+                post_diag(stmt_state, diag.into());
                 return SQL_ERROR;
             }
         };
@@ -1520,7 +1520,7 @@ fn write_captured_column(
         let encoded = match stmt_state.text_output.encoding.encode(&as_text) {
             Ok(encoded) => encoded,
             Err(diag) => {
-                post_diag(stmt_state, diag);
+                post_diag(stmt_state, diag.into());
                 return SQL_ERROR;
             }
         };
@@ -1542,7 +1542,7 @@ fn write_captured_column(
                 Ok(true) => post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS),
                 Ok(false) => {}
                 Err(diag) => {
-                    post_diag(stmt_state, diag);
+                    post_diag(stmt_state, diag.into());
                     return SQL_ERROR;
                 }
             }
@@ -1926,9 +1926,9 @@ fn stream_active_plp_chunk_once<'a>(
             Ok(encoded) => encoded.bytes.len(),
             Err(diag) => {
                 if let Some(state) = retained_stmt_state.as_mut() {
-                    post_diag(&mut **state, diag);
+                    post_diag(&mut **state, diag.into());
                 } else if let Ok(mut state) = stmt.inner.lock() {
-                    post_diag(&mut state, diag);
+                    post_diag(&mut state, diag.into());
                 }
                 return SQL_ERROR;
             }
@@ -2768,9 +2768,9 @@ fn stream_active_plp_chunk_once<'a>(
                     Ok(encoded) => encoded,
                     Err(diag) => {
                         if let Some(state) = retained_stmt_state.as_mut() {
-                            post_diag(&mut **state, diag);
+                            post_diag(&mut **state, diag.into());
                         } else if let Ok(mut state) = stmt.inner.lock() {
-                            post_diag(&mut state, diag);
+                            post_diag(&mut state, diag.into());
                         }
                         return SQL_ERROR;
                     }
@@ -4035,37 +4035,8 @@ fn finish_typed_conv(
             post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION);
             SQL_SUCCESS_WITH_INFO
         }
-        Err(ConvError::OutOfRange) => {
-            post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE);
-            SQL_ERROR
-        }
-        Err(ConvError::InvalidDatetimeFormat) => {
-            post_diag(stmt_state, ERR_INVALID_DATETIME_FORMAT);
-            SQL_ERROR
-        }
-        Err(ConvError::DatetimeFieldOverflow) => {
-            post_diag(stmt_state, ERR_DATETIME_FIELD_OVERFLOW);
-            SQL_ERROR
-        }
-        Err(ConvError::Restricted) => {
-            post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE);
-            SQL_ERROR
-        }
-        Err(ConvError::InvalidCharacterValue) => {
-            post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
-            SQL_ERROR
-        }
-        Err(ConvError::Internal) => {
-            post_diag(stmt_state, ERR_INTERNAL_CONVERSION);
-            SQL_ERROR
-        }
-        Err(ConvError::NotHandledHere) => {
-            post_sql_error(
-                stmt_state,
-                SQLSTATE_HYC00,
-                0,
-                "Column type conversion not yet implemented",
-            );
+        Err(error) => {
+            post_diag(stmt_state, error.into());
             SQL_ERROR
         }
     }
@@ -4294,6 +4265,196 @@ mod tests {
             SQL_ERROR
         );
         assert_last_diag(&state.diag_records, ERR_INTERNAL_CONVERSION);
+    }
+
+    #[test]
+    fn unhandled_typed_conversion_preserves_unsupported_diagnostic() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            finish_typed_conv(&mut state, Err(ConvError::NotHandledHere)),
+            SQL_ERROR
+        );
+        assert_last_diag(
+            &state.diag_records,
+            DiagMsg {
+                state: SQLSTATE_HYC00,
+                text: "Column type conversion not yet implemented",
+            },
+        );
+    }
+
+    #[test]
+    fn client_codec_failure_preserves_captured_data_for_retry() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        client_code_page(&h, 932, false);
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::new(utf16le("\u{3042}"), EncodingType::Utf16)),
+        );
+        let mut output = [0xcc; 8];
+        let mut length = -99;
+        let mut read = || unsafe {
+            crate::api::exports::SQLGetData(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                output.as_mut_ptr().cast(),
+                8,
+                &mut length,
+            )
+        };
+        assert_eq!(with_failure(Call::Encode, 0, &mut read), SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_INTERNAL_CONVERSION,
+        );
+        assert_eq!(read(), SQL_SUCCESS);
+        assert_eq!(&output[..3], b"\x82\xa0\0");
+        assert_eq!(length, 2);
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_codec_failure_during_loss_reporting_is_not_a_truncation_success() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        client_code_page(&h, 1252, true);
+        stmt_with_captured(
+            &h,
+            ColumnValues::String(SqlString::new(
+                utf16le("\u{3042}\u{3044}"),
+                EncodingType::Utf16,
+            )),
+        );
+        let mut output = [0xcc; 4];
+        let mut length = -99;
+        let rc = with_failure(Call::Encode, 1, || unsafe {
+            crate::api::exports::SQLGetData(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                output.as_mut_ptr().cast(),
+                2,
+                &mut length,
+            )
+        });
+        assert_eq!(rc, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_INTERNAL_CONVERSION,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_codec_hex_failures_report_hy000_for_captured_and_streamed_values() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+
+        for streamed in [false, true] {
+            for retained in [false, true] {
+                for after in 0..=usize::from(streamed) {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    client_code_page(&h, 12000, false);
+                    if streamed {
+                        prefetched_text_stream(&h, PlpEncoding::Binary, None, vec![0xab], Some(1));
+                    } else {
+                        stmt_with_captured(&h, ColumnValues::Bytes(vec![0xab]));
+                    }
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    let mut output = [0xcc; 16];
+                    let mut length = -99;
+                    let rc = with_failure(Call::Encode, after, || {
+                        if !streamed || retained {
+                            unsafe {
+                                crate::api::exports::SQLGetData(
+                                    h.stmt,
+                                    1,
+                                    SQL_C_CHAR,
+                                    output.as_mut_ptr().cast(),
+                                    16,
+                                    &mut length,
+                                )
+                            }
+                        } else {
+                            stream_active_plp_chunk(
+                                stmt,
+                                h.stmt,
+                                1,
+                                SQL_C_CHAR,
+                                output.as_mut_ptr().cast(),
+                                16,
+                                &mut length,
+                                false,
+                                None,
+                                None,
+                            )
+                        }
+                    });
+                    assert_eq!(rc, SQL_ERROR);
+                    assert_eq!(output, [0xcc; 16]);
+                    assert_last_diag(
+                        &stmt.inner.lock().unwrap().diag_records,
+                        ERR_INTERNAL_CONVERSION,
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_codec_hex_failure_after_wire_read_reacquires_diagnostics() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
+
+        let (h, _server) = open_mock_plp_column(
+            ColumnDefinition::new("value", SqlDataType::VarBinaryMax),
+            ColumnValue::VarBinaryMax(vec![vec![0xab]]),
+        );
+        client_code_page(&h, 12000, false);
+        let mut output = [0xcc_u8; 16];
+        let mut length = -99;
+        let rc = with_failure(Call::Encode, 1, || unsafe {
+            crate::api::exports::SQLGetData(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                output.as_mut_ptr().cast(),
+                16,
+                &mut length,
+            )
+        });
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(output, [0xcc; 16]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_last_diag(
+            &stmt.inner.lock().unwrap().diag_records,
+            ERR_INTERNAL_CONVERSION,
+        );
+        let mut following = 0_i32;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetData(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    (&raw mut following).cast(),
+                    4,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(following, 42);
+        assert_eq!(length, 4);
     }
 
     #[test]

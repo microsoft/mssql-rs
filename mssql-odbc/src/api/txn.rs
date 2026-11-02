@@ -178,16 +178,16 @@ struct ConnectionRequestOptions {
 
 impl ConnectionRequestOptions {
     fn read(dbc: &DbcHandle) -> Result<Self, mssql_tds::error::Error> {
-        let Ok(state) = dbc.inner.lock() else {
+        let Ok(_state) = dbc.inner.lock() else {
             error!("dbc mutex poisoned reading the connection timeout");
             return Err(mssql_tds::error::Error::ImplementationError(
                 "connection state is poisoned".to_string(),
             ));
         };
         let mut cancel = CancelHandle::new();
-        cancel.set_cancel_timeout_secs(state.cancel_timeout_secs());
+        cancel.set_cancel_timeout_secs(dbc.cancel_timeout_secs());
         Ok(Self {
-            timeout_secs: state.connection_timeout,
+            timeout_secs: dbc.connection_timeout(),
             cancel,
         })
     }
@@ -1108,7 +1108,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         for (configured, settlement) in [(0, 120), (1, 1), (30, 30)] {
-            dbc.inner.lock().unwrap().connection_timeout = configured;
+            dbc.set_connection_timeout(configured);
             let request = ConnectionRequestOptions::read(dbc).unwrap();
             assert_eq!(request.timeout_secs, configured);
             assert_eq!(request.cancel.cancel_timeout_secs(), Some(settlement));

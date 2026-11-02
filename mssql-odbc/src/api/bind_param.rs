@@ -527,6 +527,7 @@ mod tests {
             &apd_state,
             &ipd_state,
             crate::handles::OdbcVersion::Odbc3_80,
+            false,
         )
     }
 

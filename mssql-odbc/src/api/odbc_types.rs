@@ -76,6 +76,10 @@ pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
 /// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).
 pub const SQL_COPT_SS_WARN_ON_CP_ERROR: SqlInteger = 1243;
 
+pub const SQL_COPT_SS_LONGASMAX: SqlInteger = 1403;
+pub const SQL_XL_OFF: usize = 0;
+pub const SQL_XL_ON: usize = 1;
+
 /// `SQL_COPT_SS_WARN_ON_CP_ERROR` values, as msodbcsql spells them.
 pub const SQL_WARN_NO: u64 = 0;
 /// See [`SQL_WARN_NO`].

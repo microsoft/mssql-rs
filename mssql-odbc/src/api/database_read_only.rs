@@ -131,7 +131,7 @@ pub(super) fn database_read_only(dbc: &DbcHandle) -> Result<bool, SqlReturn> {
         (
             state.session_generation,
             state.reset_generation,
-            state.connection_timeout,
+            dbc.connection_timeout(),
             route,
         )
     };
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn connection_timeout_bounds_idle_lookup_and_the_next_attempt_recovers() {
         let (h, server) = fixture(response("Y").with_delay(Duration::from_secs(8)));
-        dbc(&h).inner.lock().unwrap().connection_timeout = 1;
+        dbc(&h).set_connection_timeout(1);
         let started = Instant::now();
         assert_eq!(mode(h.dbc).0, SQL_ERROR);
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -692,7 +692,7 @@ mod tests {
     fn secondary_login_timeout_is_reported_and_original_session_remains_usable() {
         let (h, server) = fixture(response("Y"));
         open_pending_result(&h, &server);
-        dbc(&h).inner.lock().unwrap().connection_timeout = 1;
+        dbc(&h).set_connection_timeout(1);
         server.set_login_delay(Duration::from_secs(8));
         let started = Instant::now();
         assert_eq!(info(h.dbc).0, SQL_ERROR);
@@ -812,7 +812,7 @@ mod tests {
     fn secondary_read_timeout_leaves_the_original_session_untouched() {
         let (h, server) = fixture(response("Y").with_delay(Duration::from_secs(8)));
         open_pending_result(&h, &server);
-        dbc(&h).inner.lock().unwrap().connection_timeout = 1;
+        dbc(&h).set_connection_timeout(1);
         let started = Instant::now();
         assert_eq!(mode(h.dbc).0, SQL_ERROR);
         assert!(started.elapsed() < Duration::from_secs(5));

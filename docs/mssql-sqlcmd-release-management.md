@@ -134,7 +134,21 @@ Done by the release owner, the person who runs the release pipeline.
 - **From a local build:** build and pack the same layout with
   `.pipeline/scripts/build-mssql-sqlcmd-native.{ps1,sh}` and
   `.pipeline/scripts/pack-mssql-sqlcmd.ps1`, then point native sqlcmd at it with
-  `SQLCMD_RUST_PACKAGE_DIR=<staging directory>`. See the crate README.
+  `SQLCMD_RUST_PACKAGE_DIR=<staging directory>`.
+
+From the repository root, build the native artifacts for each required runtime:
+
+```text
+.pipeline/scripts/build-mssql-sqlcmd-native.ps1 -OutputDirectory <dir>        # Windows
+.pipeline/scripts/build-mssql-sqlcmd-native.sh <rust-target> <rid> <dir>       # Linux, macOS
+```
+
+Then stage the package and optionally create a `.nupkg`:
+
+```text
+.pipeline/scripts/pack-mssql-sqlcmd.ps1 -ArtifactsDirectory <dir> -StagingDirectory <staging> -RequiredRids <rids>
+nuget pack <staging>/mssql-sqlcmd.nuspec
+```
 
 ## Troubleshooting
 

@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 //
-// Entry point for e2e tests that skip *wholesale* when the driver path they
-// need is not configured — currently `dll_unload_stress_test` and
-// `trace_rotation_test`, both of which load the driver directly with
-// LoadLibrary and therefore require `MSSQL_ODBC_DLL`.
+// Entry point for e2e tests that can skip *wholesale*: `dll_unload_stress_test`
+// and `trace_rotation_test`, which load the driver directly with LoadLibrary and
+// therefore require `MSSQL_ODBC_DLL`, and every executable using ODBC_TEST_F,
+// whose `<name>_mt` entry skips entirely when MSSQL_ODBC_MT_SKIP_MODES names
+// every mode it selects.
 //
 // Why this exists: `GTEST_SKIP()` marks a case skipped but the binary still
 // exits 0. ctest records one result per *binary*, so without a distinct exit

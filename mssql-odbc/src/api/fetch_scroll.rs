@@ -324,8 +324,6 @@ pub(crate) enum RowIssue {
     CodePageLoss,
     /// Retain both diagnostics when a lossy prefix also fills the buffer.
     StringTruncatedWithCodePageLoss,
-    /// Preserve the platform codec's diagnostic without losing its message.
-    Conversion { state: [u8; 5], text: &'static str },
     /// 01S07 — fractional digits were dropped to fit the target.
     FractionalTruncated,
     /// 22003 — numeric value out of the target's range.
@@ -355,7 +353,6 @@ impl RowIssue {
                 post_diag(stmt_state, WARN_STRING_TRUNCATION);
                 post_diag(stmt_state, WARN_CODE_PAGE_CONVERSION_LOSS);
             }
-            RowIssue::Conversion { state, text } => post_diag(stmt_state, DiagMsg { state, text }),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
             RowIssue::OutOfRange => post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE),
             RowIssue::InvalidDatetimeFormat => post_diag(stmt_state, ERR_INVALID_DATETIME_FORMAT),
@@ -370,15 +367,6 @@ impl RowIssue {
                 0,
                 "Column type conversion not yet implemented",
             ),
-        }
-    }
-}
-
-impl From<DiagMsg> for RowIssue {
-    fn from(diag: DiagMsg) -> Self {
-        Self::Conversion {
-            state: diag.state,
-            text: diag.text,
         }
     }
 }
@@ -922,25 +910,17 @@ fn fetch_scroll_operation(
         };
         env_state.odbc_version
     };
-    let client_encoding = {
-        let Ok(dbc_state) = stmt.parent_dbc().inner.lock() else {
-            error!("SQLFetchScroll: dbc mutex poisoned reading client encoding");
-            return SQL_ERROR;
-        };
-        dbc_state.client_encoding
-    };
 
     // Under the STMT lock: validate, resolve the effective ARD and claim the
     // statement. The lock is released before any DESC lock (§7.1) and before
     // network I/O. The claim precedes every descriptor read so no rebind or
     // rowset setter (either spelling) can slip in between read and claim.
-    let (ard, column_count, trailing_utf16_plp, exhausted, text_output) = {
+    let (ard, column_count, trailing_utf16_plp, exhausted, text_output, bindings) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        stmt_state.text_output.encoding = client_encoding;
 
         if fetch_orientation != SQL_FETCH_NEXT {
             error!(
@@ -974,6 +954,7 @@ fn fetch_scroll_operation(
             trailing_utf16_plp,
             stmt_state.result_set_exhausted,
             stmt_state.text_output,
+            std::mem::take(&mut stmt_state.fetch_bindings),
         )
     };
 
@@ -986,7 +967,7 @@ fn fetch_scroll_operation(
 
     // One ARD acquisition for the extent, bind type, bind offset and records,
     // so they are mutually consistent. An exhausted cursor needs no records.
-    let ard_read = read_ard(ard, !exhausted);
+    let ard_read = read_ard(stmt, ard, !exhausted, bindings);
 
     // Checked before the exhausted fast path, as it was when the bind type
     // lived on the statement.
@@ -1088,6 +1069,8 @@ fn fetch_scroll_operation(
     // fill loop still releases it.
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+        bindings.clear();
+        stmt_state.fetch_bindings = bindings;
     }
     debug!(?rc, "SQLFetchScroll returning");
     rc
@@ -1681,24 +1664,30 @@ struct ArdSnapshot {
 
 /// Reads the ARD resolved under a since-dropped STMT lock. A freed descriptor
 /// and a poisoned one are kept apart: only the latter is an internal failure.
-fn read_ard(ard: SqlHandle, with_bindings: bool) -> ArdRead {
-    // Narrows (does not close) the race with a concurrent free.
-    if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
+fn read_ard(
+    stmt: &StmtHandle,
+    ard: SqlHandle,
+    with_bindings: bool,
+    mut bindings: Vec<ColumnBinding>,
+) -> ArdRead {
+    // The implicit ARD lives with the statement. Explicit descriptors can be freed.
+    if ard != stmt.ard && crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
         return ArdRead::Gone;
     }
     let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
     let Ok(desc_state) = desc.inner.lock() else {
         return ArdRead::Poisoned;
     };
+    if with_bindings {
+        ColumnBinding::read_from_ard_state(&desc_state, &mut bindings);
+    } else {
+        bindings.clear();
+    }
     ArdRead::Read(ArdSnapshot {
         array_size: desc_state.header.array_size,
         bind_type: desc_state.header.bind_type,
         bind_offset_ptr: desc_state.header.bind_offset_ptr.cast(),
-        bindings: if with_bindings {
-            ColumnBinding::all_from_ard_state(&desc_state)
-        } else {
-            Vec::new()
-        },
+        bindings,
     })
 }
 
@@ -1909,10 +1898,10 @@ fn client_text_outcome(truncated: bool, loss: bool) -> RowOutcome {
     }
 }
 
-fn client_hex_pair_width(text_output: TextOutput) -> Result<usize, DiagMsg> {
+fn client_hex_pair_width(text_output: TextOutput) -> Result<usize, ConvError> {
     let width = text_output.encoding.encode("00")?.bytes.len();
     if width == 0 {
-        Err(ERR_INTERNAL_CONVERSION)
+        Err(ConvError::Internal)
     } else {
         Ok(width)
     }
@@ -1934,7 +1923,7 @@ unsafe fn deliver_client_text(
 ) -> RowOutcome {
     let encoded = match text_output.encoding.encode(text) {
         Ok(encoded) => encoded,
-        Err(diag) => return RowOutcome::Error(diag.into()),
+        Err(diag) => return typed_conv_outcome(Err(diag)),
     };
     let payload_capacity = if slot.is_null() {
         0
@@ -1946,14 +1935,14 @@ unsafe fn deliver_client_text(
         .prefix_len(&encoded.bytes, payload_capacity)
     {
         Ok(take) => take,
-        Err(diag) => return RowOutcome::Error(diag.into()),
+        Err(diag) => return typed_conv_outcome(Err(diag)),
     };
     let truncated = take < encoded.bytes.len();
     let loss = if text_output.warn_on_loss && encoded.had_loss {
         if truncated {
             match text_output.range_has_loss(text, 0, take) {
                 Ok(loss) => loss,
-                Err(diag) => return RowOutcome::Error(diag.into()),
+                Err(diag) => return typed_conv_outcome(Err(diag)),
             }
         } else {
             true
@@ -2491,7 +2480,7 @@ unsafe fn deliver_bound_client_plp(
             Ok(width) => Some(width),
             Err(diag) => {
                 drain_plp_to_end(client, runtime, scratch)?;
-                return Ok(RowOutcome::Error(diag.into()));
+                return Ok(typed_conv_outcome(Err(diag)));
             }
         }
     } else {
@@ -2533,9 +2522,9 @@ unsafe fn deliver_bound_client_plp(
                     decoded.extend_from_slice(&crate::api::get_data::hex_pair(*byte));
                 }
             }
-            let converted = (|| -> Result<(), DiagMsg> {
+            let converted = (|| -> Result<(), ConvError> {
                 let text =
-                    std::str::from_utf8(&decoded).map_err(|_| ERR_INVALID_CHARACTER_VALUE)?;
+                    std::str::from_utf8(&decoded).map_err(|_| ConvError::InvalidCharacterValue)?;
                 let encoded = text_output.encoding.encode(text)?;
                 converted_bytes = converted_bytes.saturating_add(encoded.bytes.len());
                 converted_wire_read = chunk.total_read;
@@ -2563,7 +2552,7 @@ unsafe fn deliver_bound_client_plp(
                 Ok(())
             })();
             if let Err(diag) = converted {
-                conversion_error = Some(RowOutcome::Error(diag.into()));
+                conversion_error = Some(typed_conv_outcome(Err(diag)));
             }
             if narrow_source
                 && truncated
@@ -2579,13 +2568,13 @@ unsafe fn deliver_bound_client_plp(
                 }
                 if written != 0 {
                     let converted = std::str::from_utf8(&decoded[..written])
-                        .map_err(|_| ERR_INVALID_CHARACTER_VALUE)
+                        .map_err(|_| ConvError::InvalidCharacterValue)
                         .and_then(|text| text_output.encoding.encode(text));
                     match converted {
                         Ok(encoded) => {
                             converted_bytes = converted_bytes.saturating_add(encoded.bytes.len());
                         }
-                        Err(diag) => conversion_error = Some(RowOutcome::Error(diag.into())),
+                        Err(diag) => conversion_error = Some(typed_conv_outcome(Err(diag))),
                     }
                 }
             }
@@ -2910,7 +2899,7 @@ unsafe fn deliver_bound(
         if binding.target_type == SQL_C_CHAR && !text_output.encoding.is_ascii_compatible() {
             let width = match client_hex_pair_width(text_output) {
                 Ok(width) => width,
-                Err(diag) => return RowOutcome::Error(diag.into()),
+                Err(diag) => return typed_conv_outcome(Err(diag)),
             };
             if buf_elements == 0 {
                 0
@@ -3035,6 +3024,37 @@ mod tests {
         tds_client_from_mixed_lob_prefix_rows, tds_client_from_partial_int_rows,
         tds_client_from_tokens,
     };
+
+    #[test]
+    fn row_outcomes_fit_in_two_bytes() {
+        assert!(size_of::<RowIssue>() <= 1);
+        assert!(size_of::<RowOutcome>() <= 2);
+    }
+
+    #[test]
+    fn client_conversion_errors_preserve_state_and_message() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        for (error, expected) in [
+            (ConvError::Internal, ERR_INTERNAL_CONVERSION),
+            (
+                ConvError::InvalidCharacterValue,
+                ERR_INVALID_CHARACTER_VALUE,
+            ),
+        ] {
+            let outcome = typed_conv_outcome(Err(error));
+            assert_eq!(outcome.status(), SQL_ROW_ERROR);
+            assert_eq!(
+                RowOutcome::Info(RowIssue::StringTruncated).merge(outcome),
+                outcome
+            );
+            outcome.issue().unwrap().post(&mut state);
+            let diagnostic = state.diag_records.last().unwrap();
+            assert_eq!(diagnostic.sql_state, expected.state);
+            assert!(diagnostic.message.ends_with(expected.text));
+        }
+    }
 
     fn set_row_array_size(h: &TestHandles, value: SqlULen) {
         let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
@@ -3191,7 +3211,10 @@ mod tests {
             RowOutcome::Info(RowIssue::StringTruncatedWithCodePageLoss)
         );
         let diagnostic = ERR_INTERNAL_CONVERSION;
-        RowIssue::from(diagnostic).post(&mut state);
+        typed_conv_outcome(Err(ConvError::Internal))
+            .issue()
+            .unwrap()
+            .post(&mut state);
         assert_eq!(
             state.diag_records.last().unwrap().sql_state,
             diagnostic.state
@@ -3579,12 +3602,12 @@ mod tests {
     }
 
     #[test]
-    fn fetch_preserves_statement_warning_setting_when_refreshing_encoding() {
-        let h = TestHandles::with_env_dbc_stmt();
+    fn fetch_preserves_allocated_encoding_and_statement_warning_setting() {
+        let encoding = client_output(932, false).encoding;
+        let h = TestHandles::with_env_dbc_stmt_encoding(encoding);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let encoding = client_output(932, false).encoding;
-        dbc.inner.lock().unwrap().client_encoding = encoding;
+        assert_eq!(stmt.inner.lock().unwrap().text_output.encoding, encoding);
         for warn_on_loss in [true, false] {
             // Model a setter's fan-out occurring after an older DBC snapshot.
             dbc.inner.lock().unwrap().warn_on_cp_error = !warn_on_loss;
@@ -3604,7 +3627,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_snapshots_client_encoding_for_bound_row_arrays() {
+    fn fetch_uses_allocated_client_encoding_for_bound_row_arrays() {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
 
         let substituted = cp1252_loss_bytes("あ");
@@ -3635,19 +3658,15 @@ mod tests {
                     )],
                     rows,
                 );
-                let h = TestHandles::with_env_dbc_stmt();
+                let text_output = client_output(code_page, warn_on_loss);
+                let h = TestHandles::with_env_dbc_stmt_encoding(text_output.encoding);
                 let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
                 let _server =
                     crate::test_support::connect_mock_server(dbc, "SELECT client_rows", response);
-                let text_output = client_output(code_page, warn_on_loss);
                 let mut output = [[0xcc_u8; 8]; 2];
                 let mut lengths = [-99; 2];
                 let mut statuses = [SQL_ROW_NOROW; 2];
                 let mut fetched = 0;
-                {
-                    let mut state = dbc.inner.lock().unwrap();
-                    state.client_encoding = text_output.encoding;
-                }
                 assert_eq!(
                     unsafe {
                         crate::api::set_connect_attr::sql_set_connect_attr_w(
@@ -3707,6 +3726,265 @@ mod tests {
                     warn_on_loss
                 );
                 assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn client_codec_fetch_failures_preserve_diagnostics_and_following_columns() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let cases = [
+            (932, Call::Encode, 0, 8, false),
+            (932, Call::Prefix, 0, 8, false),
+            #[cfg(windows)]
+            (1252, Call::Encode, 1, 2, false),
+            #[cfg(unix)]
+            (12000, Call::Encode, 0, 8, true),
+        ];
+        for plp in [false, true] {
+            for (code_page, call, after, capacity, binary) in cases {
+                if binary && !plp {
+                    continue;
+                }
+                let text = "\u{3042}\u{3044}";
+                let encoding = client_output(code_page, true).encoding;
+                let h = TestHandles::with_env_dbc_stmt_encoding(encoding);
+                let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                stmt.inner.lock().unwrap().text_output.warn_on_loss = true;
+                let response = QueryResponse::new(
+                    vec![
+                        ColumnDefinition::new(
+                            "value",
+                            if binary {
+                                SqlDataType::VarBinaryMax
+                            } else if plp {
+                                SqlDataType::NVarCharMax
+                            } else {
+                                SqlDataType::NVarChar
+                            },
+                        ),
+                        ColumnDefinition::new("following", SqlDataType::Int),
+                    ],
+                    vec![Row::new(vec![
+                        if binary {
+                            ColumnValue::VarBinaryMax(vec![vec![0xab]])
+                        } else if plp {
+                            ColumnValue::NVarCharMax(vec![text.encode_utf16().collect()])
+                        } else {
+                            ColumnValue::NVarChar(text.into())
+                        },
+                        ColumnValue::Int(42),
+                    ])],
+                );
+                let _server =
+                    crate::test_support::connect_mock_server(dbc, "SELECT codec_failure", response);
+                let sql: Vec<u16> = "SELECT codec_failure".encode_utf16().collect();
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLExecDirectW(
+                            h.stmt,
+                            sql.as_ptr(),
+                            sql.len().try_into().unwrap(),
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let mut output = [0xcc; 8];
+                let mut length = -99;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLBindCol(
+                            h.stmt,
+                            1,
+                            SQL_C_CHAR,
+                            output.as_mut_ptr().cast(),
+                            capacity,
+                            &mut length,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                let rc = with_failure(call, after, || unsafe {
+                    crate::api::exports::SQLFetch(h.stmt)
+                });
+                assert_eq!(rc, SQL_ERROR);
+                {
+                    let state = stmt.inner.lock().unwrap();
+                    let diagnostic = state.diag_records.last().unwrap();
+                    assert_eq!(diagnostic.sql_state, ERR_INTERNAL_CONVERSION.state);
+                    assert!(diagnostic.message.ends_with(ERR_INTERNAL_CONVERSION.text));
+                }
+                let mut following = 0_i32;
+                assert_eq!(
+                    unsafe {
+                        crate::api::exports::SQLGetData(
+                            h.stmt,
+                            2,
+                            SQL_C_SLONG,
+                            (&raw mut following).cast(),
+                            4,
+                            &mut length,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(following, 42);
+                assert_eq!(length, 4);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_codec_hex_width_failure_does_not_write_bound_output() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+
+        let mut output = [0xcc; 16];
+        let mut length = -99;
+        let binding = binding(1, SQL_C_CHAR, output.as_mut_ptr().cast(), 16, &mut length);
+        let outcome = with_failure(Call::Encode, 0, || unsafe {
+            deliver_bound_value(
+                &binding,
+                &ColumnValues::Bytes(vec![0xab]),
+                client_output(12000, false),
+            )
+        });
+        assert_eq!(outcome, RowOutcome::Error(RowIssue::Internal));
+        assert_eq!(output, [0xcc; 16]);
+        assert_eq!(length, -99);
+    }
+
+    #[test]
+    fn truncated_narrow_plp_reencode_failure_preserves_prefix_and_drains() {
+        use crate::conversion::client_encoding::test_support::{Call, with_failure};
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for fail in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt_encoding(client_output(1252, false).encoding);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut column = ColumnDefinition::new("value", SqlDataType::VarCharMax);
+            column.collation = [0x09, 0x04, 0, 0x04, 0];
+            let response = QueryResponse::new(
+                vec![column, ColumnDefinition::new("following", SqlDataType::Int)],
+                vec![Row::new(vec![
+                    ColumnValue::VarCharMax(
+                        "\u{e9}\u{20ac}Z"
+                            .as_bytes()
+                            .iter()
+                            .map(|byte| vec![*byte])
+                            .collect(),
+                    ),
+                    ColumnValue::Int(42),
+                ])],
+            );
+            let _server =
+                crate::test_support::connect_mock_server(dbc, "SELECT narrow_failure", response);
+            let sql: Vec<u16> = "SELECT narrow_failure".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLExecDirectW(
+                        h.stmt,
+                        sql.as_ptr(),
+                        sql.len().try_into().unwrap(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let mut output = [0xcc_u8; 4];
+            let mut length = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLBindCol(
+                        h.stmt,
+                        1,
+                        SQL_C_CHAR,
+                        output.as_mut_ptr().cast(),
+                        2,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let fetch = || unsafe { crate::api::exports::SQLFetch(h.stmt) };
+            let rc = if fail {
+                with_failure(Call::Encode, 1, fetch)
+            } else {
+                fetch()
+            };
+            assert_eq!(
+                rc,
+                if fail {
+                    SQL_ERROR
+                } else {
+                    SQL_SUCCESS_WITH_INFO
+                }
+            );
+            assert_eq!(output[0], 0xe9);
+            assert_eq!(&output[2..], &[0xcc; 2]);
+            if !fail {
+                assert_eq!(output[1], 0);
+                assert_eq!(length, 3);
+            }
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            {
+                let state = stmt.inner.lock().unwrap();
+                let expected = if fail {
+                    ERR_INTERNAL_CONVERSION
+                } else {
+                    WARN_STRING_TRUNCATION
+                };
+                let diagnostic = state.diag_records.last().unwrap();
+                assert_eq!(diagnostic.sql_state, expected.state);
+                assert!(diagnostic.message.ends_with(expected.text));
+            }
+            let mut following = 0_i32;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetData(
+                        h.stmt,
+                        2,
+                        SQL_C_SLONG,
+                        (&raw mut following).cast(),
+                        4,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(following, 42);
+        }
+    }
+
+    #[test]
+    fn narrow_decoder_finalization_has_no_complete_text_left_to_reencode() {
+        use mssql_tds::datatypes::sql_string::ResolvedEncoding;
+
+        let cases: &[(&encoding_rs::Encoding, &[u8])] = &[
+            (encoding_rs::UTF_8, b"A\xc3\xa9\xe2\x82"),
+            (encoding_rs::SHIFT_JIS, b"A\x82\xa0\x82"),
+            (encoding_rs::BIG5, b"A\x88\x62\x88"),
+            (encoding_rs::EUC_KR, b"A\xb0\xa1\xb0"),
+            (encoding_rs::GBK, b"A\xc4\xe3\x81"),
+            (encoding_rs::GB18030, b"A\x81\x30\x81\x30\x81\x30\x81"),
+            (encoding_rs::WINDOWS_1252, b"A\xe9\x80"),
+            (encoding_rs::WINDOWS_1258, b"A\xea\xec"),
+        ];
+        for &(encoding, bytes) in cases {
+            for end in 0..=bytes.len() {
+                let resolved: ResolvedEncoding = encoding.into();
+                let mut decoder = resolved.new_decoder_without_bom_handling();
+                let mut decoded = Vec::new();
+                decode_narrow_into_pending(&mut decoder, &mut decoded, &bytes[..end], false);
+                assert!(std::str::from_utf8(&decoded).is_ok());
+                decoded.resize(decoder.max_utf8_buffer_length(0).unwrap(), 0);
+                let (result, read, written) =
+                    decoder.decode_to_utf8_without_replacement(&[], &mut decoded, true);
+                assert_ne!(result, encoding_rs::DecoderResult::OutputFull);
+                assert_eq!(read, 0);
+                assert_eq!(written, 0, "{} at source offset {end}", encoding.name());
             }
         }
     }
@@ -4730,6 +5008,97 @@ mod tests {
         assert!(state.buffered_get_data_row.is_none());
         drop(state);
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
+    }
+
+    #[test]
+    fn fetch_reuses_binding_storage_but_rereads_descriptor_changes() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT rebound rows".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.wire.put_client_for_test(client);
+            state.wire.set_owner_for_test(Some(h.stmt));
+        }
+        let mut first = 0_i32;
+        let mut second = 0_i32;
+        let mut length: SqlLen = 0;
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut first as *mut i32).cast(),
+                    4,
+                    &mut length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!((first, length), (10, 4));
+        let allocation = {
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.fetch_bindings.is_empty());
+            assert!(state.fetch_bindings.capacity() >= 1);
+            state.fetch_bindings.as_ptr()
+        };
+        assert_eq!(
+            unsafe {
+                crate::api::set_desc_field::sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_DATA_PTR as SqlSmallInt,
+                    (&mut second as *mut i32).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!((first, second), (10, 20));
+        assert_eq!(
+            stmt.inner.lock().unwrap().fetch_bindings.as_ptr(),
+            allocation
+        );
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!((first, second), (10, 20));
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.fetch_bindings.is_empty());
+        assert_eq!(state.fetch_bindings.as_ptr(), allocation);
     }
 
     #[test]

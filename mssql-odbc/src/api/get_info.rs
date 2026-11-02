@@ -1320,7 +1320,7 @@ fn database_user_name(dbc: &DbcHandle) -> String {
         // There is no statement here to take `SQL_ATTR_QUERY_TIMEOUT` from:
         // `SQLGetInfo` is a connection-level call, and msodbcsql reaches for
         // the connection timeout for exactly that reason.
-        (stale, state.connection_timeout)
+        (stale, dbc.connection_timeout())
     };
 
     // The claim returns the cache entry with the client, read under its own
@@ -2907,7 +2907,7 @@ mod tests {
 
         let (h, server) = user_name_fixture(user_name_row("dbo").with_delay(RESPONSE_DELAY));
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().connection_timeout = TIMEOUT_SECS;
+        dbc.set_connection_timeout(TIMEOUT_SECS);
 
         let started = Instant::now();
         let (rc, value, _) = get_wide_str(h.dbc, SQL_USER_NAME);
@@ -2989,7 +2989,7 @@ mod tests {
         let (h, _server) =
             user_name_fixture(user_name_row("dbo").with_delay(Duration::from_secs(4)));
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner.lock().unwrap().connection_timeout = 1;
+        dbc.set_connection_timeout(1);
 
         // Leave a record behind from an earlier call.
         let mut small = [0u16; 2];

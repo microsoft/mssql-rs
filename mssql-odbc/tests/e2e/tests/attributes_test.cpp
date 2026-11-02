@@ -164,12 +164,14 @@ SQLRETURN SetAccessMode(SQLHDBC dbc, SQLUINTEGER mode) {
                                  static_cast<uintptr_t>(mode)), 0);
 }
 
+// Reads into an SQLULEN: before connect the Windows Driver Manager answers
+// itself and writes 8 bytes once the application has set the attribute.
 SQLUINTEGER GetAccessMode(SQLHDBC dbc) {
-    SQLUINTEGER mode = 0xdeadbeef;
+    SQLULEN mode = 0xdeadbeef;
     EXPECT_SQL_OK(SQLGetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, &mode,
                                     sizeof(mode), nullptr),
                   SQL_HANDLE_DBC, dbc);
-    return mode;
+    return static_cast<SQLUINTEGER>(mode);
 }
 
 std::string GetDataSourceReadOnly(SQLHDBC dbc) {
@@ -435,7 +437,7 @@ ODBC_TEST_F(AttributesTest, AccessModeReadOnlyHintAllowsDml) {
 ODBC_TEST_F(AttributesTest, AccessModeInvalidValuePreservesMode) {
     ASSERT_SQL_OK(SetAccessMode(dbc_, SQL_MODE_READ_ONLY),
                   SQL_HANDLE_DBC, dbc_);
-    std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+    std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
     EXPECT_EQ(SQL_ERROR, SetAccessMode(dbc_, 2));
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY024");
     EXPECT_EQ(SQL_MODE_READ_ONLY, GetAccessMode(dbc_));

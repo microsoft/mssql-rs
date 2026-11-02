@@ -424,9 +424,12 @@ return `22001`.
 
 The TDS layer reports an `EncodedValueTooLong` error with the actual and maximum
 byte counts. The ODBC layer maps that typed error to `22001`; it does not match
-error text. `SQL_LONGVARCHAR` continues to use `varchar(max)` wire framing, but
-its ODBC `ColumnSize` is carried separately and enforced against the encoded
-value. A true `varchar(max)` declaration remains unbounded.
+error text. Materialized `SQL_LONGVARCHAR` values use legacy `text` RPC framing
+when `LongAsMax` is off and `varchar(max)` framing when it is on. DAE retains
+MAX/PLP payload framing independently of the SQL declaration. The LONG binding's
+`ColumnSize` is carried separately and enforced against the encoded value in
+either mode. An explicit `SQL_VARCHAR` binding with `ColumnSize=0` remains
+unbounded.
 
 This follows msodbcsql's convert-then-validate principle without copying its
 client-code-page assumption. This driver defines `SQL_C_CHAR` as UTF-8, so
@@ -445,17 +448,34 @@ Verified against msodbcsql source:
   `ColumnSize`: msodbcsql applies the bound whenever `!fIsVarMax` (`:2898`), and
   `fIsVarMax` needs `cbColDef == 0` *and* a varmax type or `longToMax` (`:2577`),
   which no `SQL_LONGVARCHAR` binding satisfies.
-- `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` are sent as `varchar(max)` /
-  `nvarchar(max)`, still bounded by `ColumnSize`. msodbcsql declares `text` /
-  `ntext` by default - it sends `max` only under `SQL_COPT_SS_LONGASMAX`
-  (`sqlcprot.h:1838`), which defaults off (`sqlcconn.cpp:84`, `:4686`) - so this
-  matches its `LongAsMax` mode rather than its default. `text` / `ntext` cannot
-  be declared until `mssql-tds` stops serializing them in bulk-copy ROW format:
-  an RPC parameter currently carries a textptr/timestamp header and a stray
-  table-name byte, and the server answers 4002 (AB#47591). Restoring the true
-  declaration, with `SQL_COPT_SS_LONGASMAX` as the opt-in fallback, is AB#47592.
-  The attribute itself is unimplemented, so the long types currently get its
-  *result* unconditionally with no way to ask for either behaviour.
+- `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` / `SQL_LONGVARBINARY` default to
+  `text` / `ntext` / `image` (AB#47592). `LongAsMax=Yes` or
+  `SQL_COPT_SS_LONGASMAX=SQL_XL_ON` selects the corresponding MAX types without
+  removing the `ColumnSize` bound. An explicit attribute overrides the keyword.
+  `Sql2Srv` selects MAX only for the exact value `SQL_XL_ON`; the setter keeps
+  other raw values and the getter reports their low `SQLUINTEGER`, rather than
+  rejecting them (`sqlcmisc.cpp`, `ExportImp::SQLSetConnectAttrW` / `GetParamValue`).
+  Changing this option does not invalidate an existing prepared handle.
+- Materialized legacy LOBs use a separate RPC serializer (AB#47591), not the
+  bulk ROW serializer: encoded `MaxLen`, optional collation, `ActualLen`, and
+  data, with `MaxLen=0` / `ActualLen=0xFFFFFFFF` for NULL. No table-name count,
+  text pointer, or timestamp is emitted. Encoding is resolved once and existing
+  wire bytes are borrowed. Preflight rejects a value over 2 GiB - 1 bytes before
+  any request bytes are written, re-encoding only a value large enough to reach
+  that limit. Bulk-copy ROW framing is unchanged.
+- DAE retains PLP/MAX payload framing even with a legacy declaration, matching
+  `PutParamData` (`sqlccmd.cpp:4651-4707`). `with_streamed_declaration` carries
+  the independent declaration. The connection policy is captured in the
+  execution's parameter snapshot, including any later buffered rebuild.
+  This does not add legacy non-PLP streaming types or whole-value buffering.
+- Windows measurements on SQL Server `17.00.4025`, retail msodbcsql
+  `SQL_DRIVER_VER=18.07.0001` (18.7.1.1), confirm default/No/Yes mapping,
+  attribute precedence, raw-value readback, and cached-declaration retention.
+  `long_params_test` checks server-side `tempdb.sys.columns` metadata for
+  values, typed NULLs, DAE, and parameter arrays. `SQL_VARIANT_PROPERTY`
+  rejects legacy and MAX LOBs and is not used as the type probe.
+  DSN-only connection support still depends on the existing DSN resolver gap;
+  this option is implemented on the current connection-string and attribute paths.
 - **Blank padding is left to the server.** msodbcsql pads client-side when
   `SQL_COPT_SS_ANSI_NPW` is on and the value is shorter than the declared length
   (`sqlcmisc.cpp:7472`, gated on `SQLBIGCHAR` / `SQLBIGBINARY` / `SQLNCHAR`).

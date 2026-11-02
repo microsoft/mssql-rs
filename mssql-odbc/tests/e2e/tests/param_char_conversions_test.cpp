@@ -1365,11 +1365,8 @@ TEST_F(CharConversionLiveTest, BestFitMappableCharacterDeviates) {
 // varchar(max) is PLP-framed rather than length-prefixed. A bug confined to one
 // arm would otherwise pass on plain varchar alone.
 //
-// Runs on both legs. SQL_LONGVARCHAR is deliberately absent: this driver sends
-// it as varchar(max) while msodbcsql declares `text` (AB#47592), and a `text`
-// parameter cannot be used in the ASCII()/DATALENGTH() probe below - measured,
-// msodbcsql answers SQL_ERROR then HY010 - so it is covered by its own
-// driver-specific case rather than made to look like a parity assertion.
+// SQL_LONGVARCHAR has its own case because ASCII(text) requires an explicit
+// cast; the parameter still reaches the server as text on both drivers.
 TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForEveryNarrowTarget) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
@@ -1409,22 +1406,15 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForEveryNarrowTar
     }
 }
 
-// SQL_LONGVARCHAR reaches the same encoder, but msodbcsql cannot run this
-// scenario at all rather than running it differently: it declares the parameter
-// `text` (AB#47592), and `text` is not a legal sp_executesql parameter type, so
-// the probe fails before any conversion happens. Measured with the skip
-// removed: SQL_ERROR from SQLExecute, then HY010 from the fetch. Skipped
-// because there is no msodbcsql behaviour to compare, not because we expect to
-// differ - revisit if AB#47592 changes our declaration.
+// text is a legal parameter declaration, but ASCII(text) is not. Cast only
+// after the parameter reaches the server so its narrow encoding stays tested.
 TEST_F(CharConversionLiveTest, UnmappableCharacterIsSubstitutedForLongVarchar) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 database collation";
     }
 
     ASSERT_SQL_OK(
-        Prepare("SELECT CAST(ASCII(?) AS VARCHAR(16)) + '/'"
+        Prepare("SELECT CAST(ASCII(CAST(? AS VARCHAR(MAX))) AS VARCHAR(16)) + '/'"
                 " + CAST(DATALENGTH(?) AS VARCHAR(16))"),
         SQL_HANDLE_STMT, stmt_);
     SQLWCHAR wide[] = {0x65E5};

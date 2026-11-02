@@ -54,7 +54,7 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelReleasesConnectionLikeFreeStmtClos
             {
                 // These errors live in the DM's list, whose next-call cleanup
                 // occurs before unixODBC takes its statement lock.
-                std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+                std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
                 SQLSMALLINT columns = -1;
                 EXPECT_EQ(SQL_ERROR, SQLNumResultCols(stmt_, &columns));
                 EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
@@ -116,7 +116,8 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsDelayedBatchTail) {
     ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
     const auto cancelling = std::chrono::steady_clock::now();
     ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
-    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3))
+        << IdleCancelTiming();
 
     SQLHSTMT other = AllocStmt();
     ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_tail"), SQL_HANDLE_STMT, other);
@@ -158,7 +159,8 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsPartiallyReadPlp) {
 
     const auto cancelling = std::chrono::steady_clock::now();
     ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
-    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3));
+    EXPECT_LT(std::chrono::steady_clock::now() - cancelling, std::chrono::seconds(3))
+        << IdleCancelTiming();
     SQLHSTMT other = AllocStmt();
     ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #idle_cancel_plp"), SQL_HANDLE_STMT, other);
     ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);

@@ -54,7 +54,8 @@ def test_wheel_version_rejects_wrong_distribution(tmp_path: Path) -> None:
 def test_linux_installs_use_mirrored_consumer_images() -> None:
     script = _LINUX_SCRIPT.read_text(encoding="utf-8")
 
-    assert "ghcr.io/microsoft/mssql-rs/import/python-build/" in script
+    assert 'registry="${3:-ghcr.io/microsoft/mssql-rs}"' in script
+    assert 'image="$registry/import/python-build/' in script
     assert "quay.io" not in script
 
 
