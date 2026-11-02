@@ -14,6 +14,7 @@
 // buffer-boundary contract without the driver manager's ANSI conversion.
 
 #include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -252,6 +253,87 @@ protected:
         Connect();
     }
 };
+
+ODBC_TEST_F(GetInfoLiveTest, ActiveStatementsReportsSingleConcurrentActivity) {
+    static_assert(SQL_ACTIVE_STATEMENTS == SQL_MAX_CONCURRENT_ACTIVITIES);
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT len = -1;
+    EXPECT_EQ(1, GetInfoU16(dbc_, SQL_MAX_CONCURRENT_ACTIVITIES, &rc, &len));
+    EXPECT_EQ(SQL_SUCCESS, rc);
+    EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUSMALLINT)), len);
+}
+
+// Deliberate metadata difference: parity registry entry 37 (AB#49637).
+ODBC_TEST_F(GetInfoLiveTest, NeedLongDataLengthReflectsDriverContract) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool reference = target && std::string(target) == "msodbcsql";
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT len = -1;
+    EXPECT_EQ(reference ? "Y" : "N",
+              GetInfoString(dbc_, SQL_NEED_LONG_DATA_LEN, &rc, &len));
+    EXPECT_EQ(SQL_SUCCESS, rc);
+    EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLTCHAR)), len);
+}
+
+// Benefits-from-mock-tds: round-tripping proves unknown-length input works;
+// a mock could also assert the PLP unknown-total header and chunk boundaries.
+ODBC_TEST_F(GetInfoLiveTest, UnknownLengthLongDataStreamsInChunks) {
+    struct LongType {
+        SQLSMALLINT sql_type;
+        SQLSMALLINT c_type;
+        const char* cast;
+        bool wide;
+    };
+    for (const auto& type : {
+             LongType{SQL_LONGVARCHAR, SQL_C_CHAR, "varchar(max)", false},
+             LongType{SQL_WLONGVARCHAR, SQL_C_WCHAR, "nvarchar(max)", true},
+             LongType{SQL_LONGVARBINARY, SQL_C_BINARY, "varbinary(max)", false},
+         }) {
+        SCOPED_TRACE(type.cast);
+        std::string value = WorkerToken("long-data") + ":";
+        value.resize(60000, 'x');
+        std::vector<SQLCHAR> payload;
+        payload.reserve(value.size() * (type.wide ? 2 : 1));
+        for (unsigned char ch : value) {
+            payload.push_back(ch);
+            if (type.wide) payload.push_back(0);
+        }
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(
+            std::string("SELECT CONVERT(varbinary(max), CAST(? AS ") + type.cast + "))");
+        ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        SQLLEN indicator = SQL_DATA_AT_EXEC;
+        SQLCHAR token = 0;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, type.c_type,
+                                      type.sql_type, static_cast<SQLULEN>(value.size()),
+                                      0, &token, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+        SQLPOINTER requested = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &requested));
+        ASSERT_EQ(&token, requested);
+        for (size_t offset = 0; offset < payload.size();) {
+            const size_t remaining = payload.size() - offset;
+            const size_t count = remaining < 8192 ? remaining : 8192;
+            ASSERT_SQL_OK(SQLPutData(stmt_, payload.data() + offset,
+                                     static_cast<SQLLEN>(count)),
+                          SQL_HANDLE_STMT, stmt_);
+            offset += count;
+        }
+        ASSERT_SQL_OK(SQLParamData(stmt_, &requested), SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+        std::vector<SQLCHAR> actual(payload.size());
+        SQLLEN length = -1;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, actual.data(),
+                                 static_cast<SQLLEN>(actual.size()), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(static_cast<SQLLEN>(payload.size()), length);
+        EXPECT_EQ(payload, actual);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    }
+}
 
 // ===================================================================
 // Identity strings
