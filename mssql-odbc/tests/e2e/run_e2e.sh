@@ -18,9 +18,9 @@
 #
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
-#   pr       (default) every ctest entry except the <name>_mt entries. Windows
-#            PR runs (run_e2e.ps1) cover /SharedDbc; run `ctest -L mt` or a
-#            stress profile to exercise the concurrent variants here.
+#   pr       (default) every ctest entry except the <name>_mt entries, unless
+#            --filter or MSSQL_ODBC_MT_SKIP_MODES is set. Windows PR runs
+#            (run_e2e.ps1) cover /SharedDbc.
 #   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
 #   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
 # nightly and weekly ignore --retries (an intermittent failure is what they
@@ -206,14 +206,17 @@ parse_args() {
 # header). Settings already in the environment win over the profile.
 # ----------------------------------------------------------------------------
 apply_mt_profile() {
-    local threads iters
+    local threads iters skip_override="${MSSQL_ODBC_MT_SKIP_MODES:-}"
     # AB#49575: restore SharedStmt after CI adopts the diagnostic-list fix.
     export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
     case "$MT_PROFILE" in
         pr)
             # PR time budget: Windows PR runs cover /SharedDbc, and the stress
-            # profiles cover every mode on every platform.
-            CTEST_ARGS+=(-LE mt)
+            # profiles cover every mode on every platform. A filter or a mode
+            # override asks for the concurrent variants, so keep them then.
+            if [ -z "$skip_override" ] && [ -z "${TEST_FILTER:-}" ]; then
+                CTEST_ARGS+=(-LE mt)
+            fi
             ;;
         nightly|weekly)
             if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi

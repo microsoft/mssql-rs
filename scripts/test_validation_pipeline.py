@@ -76,8 +76,41 @@ printf "ctest:%s\\n" "${{CTEST_ARGS[*]}}"
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"rust:{expected}:{threads}:{iterations}" in result.stdout.splitlines()
     assert f"reference:{expected}:2:1" in result.stdout.splitlines()
-    # Unix PR runs leave the <name>_mt entries to Windows PR runs and the stress profiles.
-    labels = "-LE mt" if profile == "pr" else "-L mt --timeout 3600"
+    # Unix PR runs leave the <name>_mt entries to Windows PR runs and the stress
+    # profiles, unless the caller overrides the modes.
+    if profile != "pr":
+        labels = "-L mt --timeout 3600"
+    else:
+        labels = "-LE mt" if expected == "SharedStmt" else ""
+    assert f"ctest:{labels}" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(("test_filter", "labels"), [("", "-LE mt"), ("execute_test_mt", "")])
+def test_unix_pr_profile_keeps_mt_entries_a_filter_selects(tmp_path, test_filter, labels):
+    runner = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.sh").read_text(
+        encoding="utf-8"
+    )
+    function = re.search(r"^apply_mt_profile\(\) \{\n.*?^\}", runner, re.M | re.S)
+    assert function, "apply_mt_profile not found"
+    script = f"""
+set -euo pipefail
+unset MSSQL_ODBC_MT_SKIP_MODES MSSQL_ODBC_MT_THREADS MSSQL_ODBC_MT_ITERS
+MT_PROFILE=pr
+RETRIES=0
+TEST_FILTER='{test_filter}'
+CTEST_ARGS=()
+MS_LEG_ENV=()
+{function.group()}
+apply_mt_profile
+printf "ctest:%s\\n" "${{CTEST_ARGS[*]}}"
+"""
+    script_path = tmp_path / "profile.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name], cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
     assert f"ctest:{labels}" in result.stdout.splitlines()
 
 
