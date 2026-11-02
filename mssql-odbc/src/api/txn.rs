@@ -878,6 +878,8 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         result = begin_dbc_transaction(dbc, &mut client);
     }
     release_dbc_client_and_publish(dbc, client, OP, |state| {
+        // The getter reflects the requested value, not proof of server state.
+        state.txn_isolation = level;
         if let Err(e) = result {
             // A failed SET leaves the server's level unknown, so the flag stays set
             // and the next attempt emits again. If the failure was an armed reset
@@ -897,8 +899,6 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
                 "{OP}: a reset was armed while this batch was in flight; the server's isolation level is unknown again"
             );
         }
-        // `value` was validated into `level` above.
-        state.txn_isolation = level;
         debug!(tsql, "{OP}: isolation level applied");
         SQL_SUCCESS
     })
@@ -1194,10 +1194,41 @@ mod tests {
         assert_connection_timeout(dbc, rc, started.elapsed());
         {
             let state = dbc.inner.lock().unwrap();
-            assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
+            assert_eq!(state.txn_isolation, SQL_TXN_SERIALIZABLE);
             assert!(state.server_isolation_unknown);
             assert!(!state.wire.client().unwrap().is_connection_dead());
         }
+
+        for attribute in [
+            odbc_types::SQL_ATTR_TXN_ISOLATION,
+            odbc_types::SQL_COPT_SS_TXN_ISOLATION,
+        ] {
+            let mut value = 0u32;
+            let mut length = 0;
+            assert_eq!(
+                unsafe {
+                    exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        attribute,
+                        (&mut value as *mut u32).cast(),
+                        0,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, SQL_TXN_SERIALIZABLE);
+            assert_eq!(length, size_of::<u32>() as i32);
+        }
+
+        let started = Instant::now();
+        let rc = set_connection_attr(
+            &h,
+            odbc_types::SQL_ATTR_TXN_ISOLATION,
+            SQL_TXN_SERIALIZABLE as usize,
+        );
+        assert_connection_timeout(dbc, rc, started.elapsed());
+        assert!(dbc.inner.lock().unwrap().server_isolation_unknown);
 
         server.register_query(SQL, QueryResponse::select_one());
         assert_eq!(
@@ -1208,10 +1239,9 @@ mod tests {
             ),
             SQL_SUCCESS
         );
-        assert_eq!(
-            dbc.inner.lock().unwrap().txn_isolation,
-            SQL_TXN_SERIALIZABLE
-        );
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.txn_isolation, SQL_TXN_SERIALIZABLE);
+        assert!(!state.server_isolation_unknown);
     }
 
     #[test]

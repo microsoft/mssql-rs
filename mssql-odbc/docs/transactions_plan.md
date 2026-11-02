@@ -122,6 +122,12 @@ retires the connection rather than returning a desynchronized stream to the pool
 Reset still marks a failed rollback's connection dead, and disconnect rollback
 remains best-effort. An isolation-change failure invalidates the isolation cache
 because the server may have applied the change before its response was lost.
+After a validated isolation change attempts network I/O, both isolation getters
+report the requested level even if the request fails. The unknown-server flag
+remains set, so requesting that same level again must still send the SET.
+This follows the reference setter's ordinary-error fallthrough to
+`dwOptions[fOption] = vParam` (`sqlcmisc.cpp`, `SQL_ATTR_TXN_ISOLATION` and the
+generic store); it is source-backed, not a measured retail timing claim.
 If switching to manual commit fails after BEGIN's ENVCHANGE, the driver rolls
 back the surviving transaction before returning the original error. If rollback
 fails, it marks the connection dead rather than leaving a usable autocommit
@@ -140,6 +146,9 @@ Rust mock-server tests measure delayed batches, begin/commit/rollback responses,
 session reuse, zero timeout, and statement-timeout independence. The scope follows
 the reference source; exact retail timing and diagnostics have not yet been
 measured against CI's pinned msodbcsql 18.6.2.1 build.
+The deliberate send-deadline and shared-budget differences, including statement
+and bulk-copy scope and the remaining RPC accounting difference, are recorded in
+[parity registry entry 37](parity-deviations.md).
 
 ## 2. Non-goals
 
