@@ -170,14 +170,13 @@ pub(crate) fn sql_driver_connect_w_safe(
     );
 
     // Transition to Connecting state under lock - prevents concurrent connect race.
-    // 08002 (already connected) is DM-enforced, so we debug_assert only.
-    debug_assert_ne!(
-        state.connection_state,
-        ConnectionState::Connected,
-        "SQLDriverConnectW: DM should reject connect on already-connected handle (08002)"
-    );
+    // Without a Driver Manager's 08002 check a second connect lands here; fail
+    // it without touching the live connection.
     if state.connection_state != ConnectionState::Disconnected {
-        error!("SQLDriverConnectW: connection attempt already in progress");
+        error!(
+            state = ?state.connection_state,
+            "SQLDriverConnectW: connection already open or in progress"
+        );
         post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
         return SQL_ERROR;
     }
@@ -1164,6 +1163,37 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    /// The losing call of two racing connects on one DBC, when no Driver
+    /// Manager turns it away first: it fails, and the winner's connection
+    /// survives (no panic under the DBC lock, which would poison it).
+    #[test]
+    fn connect_on_connected_dbc_fails_without_poisoning_it() {
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let conn_str: Vec<u16> = cs("Server=host;UID=u;<PW>=p")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(unsafe { diag_sqlstate(h.dbc, 1) }, "HY010");
+        let state = dbc.inner.lock().expect("DBC mutex must not be poisoned");
+        assert_eq!(state.connection_state, ConnectionState::Connected);
     }
 
     #[test]
