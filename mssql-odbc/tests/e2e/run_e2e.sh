@@ -18,8 +18,9 @@
 #
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
-#   pr       (default) every ctest entry; every mode except /SharedStmt, at the
-#            harness default of 2 threads x 1 iteration.
+#   pr       (default) every ctest entry; concurrent variants in /SharedDbc only,
+#            at the harness default of 2 threads x 1 iteration. The other modes
+#            cost more PR time than they catch at that size.
 #   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
 #   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
 # nightly and weekly ignore --retries (an intermittent failure is what they
@@ -27,7 +28,7 @@
 # installed, so a crash or a watchdog abort prints every thread's stack. With
 # --compare-with-msodbcsql the msodbcsql leg runs at 2 x 1: it checks that the
 # tests suit the modes, not msodbcsql's thread safety. /SharedStmt is left out
-# of all Unix profiles because unixODBC releases up to 2.3.14 corrupt their
+# of the Unix stress profiles because unixODBC releases up to 2.3.14 corrupt their
 # own diagnostic list when two threads use one statement (unixODBC #243, fixed
 # on master in ea454e49). Already-set MSSQL_ODBC_MT_THREADS, MSSQL_ODBC_MT_ITERS
 # and MSSQL_ODBC_MT_SKIP_MODES ("none" skips nothing) override a profile.
@@ -206,12 +207,14 @@ parse_args() {
 # ----------------------------------------------------------------------------
 apply_mt_profile() {
     local threads iters
-    # AB#49575: restore SharedStmt after CI adopts the diagnostic-list fix.
-    export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
     case "$MT_PROFILE" in
         pr)
+            # PR time budget: the stress profiles cover the other modes.
+            export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-CrossThread,SharedEnv,SharedStmt}"
             ;;
         nightly|weekly)
+            # AB#49575: restore SharedStmt after CI adopts the diagnostic-list fix.
+            export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
             if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
             export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
             export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"

@@ -523,7 +523,7 @@ races:
 
 | Profile | Where | Driver | Threads x iterations | Modes run | Retries |
 |---|---|---|---|---|---|
-| PR | validation pipeline, every PR | both | 2 x 1 | all; unixODBC skips `SharedStmt` | 3 |
+| PR | validation pipeline, every PR | both | 2 x 1 | `SharedDbc` only | 3 |
 | Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
 | Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
 | Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
@@ -537,7 +537,11 @@ races:
   Remove its schedule two to three weeks after it starts, once its findings
   are fixed; PR and weekly remain.
 - PRs do not hunt races: the 2 x 1 run catches tests unfit for concurrency
-  (fixed object names, process-wide settings) in the PR that adds them.
+  (fixed object names, process-wide settings) in the PR that adds them. PRs run
+  only `/SharedDbc`, which shares the most state: with every mode, the `_mt`
+  entries took 11 of the Windows job's 60 minutes and up to 48 of the macOS
+  job's 90 (build 188193). Tests that do not opt in to `SharedDbc` get no
+  concurrent run on a PR; the stress profiles run every mode.
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
 - Scenarios 7-15 join the stress run as their suites land (AB#49261,

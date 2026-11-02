@@ -530,10 +530,8 @@ stages:
     # nothing hung) was seen canceled by the 60m ceiling rather than by a
     # failure. Budgeted for headroom over the worst observed case, not to mask
     # a real hang — a genuinely wedged step still fails via its own tighter,
-    # dedicated timeout long before this outer one would matter. The concurrent
-    # (`_mt`) e2e suites raised healthy runs to 82-84m, and the parameter and
-    # execution suites add about 10m more, so 90m cancels passing runs.
-    timeoutInMinutes: 120
+    # dedicated timeout long before this outer one would matter.
+    timeoutInMinutes: 90
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest
