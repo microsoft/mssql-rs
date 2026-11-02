@@ -166,6 +166,7 @@ fn sql_set_desc_rec_safe(
             };
             let validation_diagnostic = std::cell::Cell::new(None);
             let internal_error = std::cell::Cell::new(false);
+            let focused_type = std::cell::Cell::new(None);
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 |binding| {
@@ -177,7 +178,7 @@ fn sql_set_desc_rec_safe(
                         internal_error.set(true);
                         return false;
                     }
-                    if focused_tvp_desc_rec_is_valid(
+                    if let Some(resolved_type) = focused_tvp_desc_rec_type(
                         binding,
                         desc.kind,
                         record_number,
@@ -190,6 +191,7 @@ fn sql_set_desc_rec_safe(
                         string_length_ptr,
                         indicator_ptr,
                     ) {
+                        focused_type.set(Some(resolved_type));
                         true
                     } else {
                         validation_diagnostic.set(Some(ERR_INVALID_PRECISION_OR_SCALE));
@@ -204,7 +206,7 @@ fn sql_set_desc_rec_safe(
                         )
                         .unwrap_or(SQL_C_DEFAULT)
                     } else {
-                        requested_c_type
+                        focused_type.get().unwrap_or(requested_c_type)
                     };
                     binding.buffer_length = length;
                     binding.app_precision = precision;
@@ -275,7 +277,7 @@ fn current_odbc_version(desc: &DescHandle) -> Result<OdbcVersion, ()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn focused_tvp_desc_rec_is_valid(
+fn focused_tvp_desc_rec_type(
     binding: &crate::params::BoundParam,
     kind: DescKind,
     record_number: SqlSmallInt,
@@ -287,13 +289,10 @@ fn focused_tvp_desc_rec_is_valid(
     data_ptr: SqlPointer,
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
-) -> bool {
-    let Some(record_index) = usize::try_from(record_number)
+) -> Option<SqlSmallInt> {
+    let record_index = usize::try_from(record_number)
         .ok()
-        .and_then(|number| number.checked_sub(1))
-    else {
-        return false;
-    };
+        .and_then(|number| number.checked_sub(1))?;
     let mut apd_record = DescRecord::default_for(kind);
     let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
     binding.write_to_records(&mut apd_record, &mut ipd_record);
@@ -307,7 +306,7 @@ fn focused_tvp_desc_rec_is_valid(
         header: DescHeader::default(),
         records,
     };
-    set_desc_rec(
+    if set_desc_rec(
         &mut state,
         kind,
         record_number,
@@ -319,7 +318,14 @@ fn focused_tvp_desc_rec_is_valid(
         data_ptr,
         string_length_ptr,
         indicator_ptr,
-    ) == SQL_SUCCESS
+    ) != SQL_SUCCESS
+    {
+        return None;
+    }
+    state
+        .records
+        .get(record_index)
+        .map(|record| record.concise_type)
 }
 
 fn post_focused_tvp_diag(desc: &DescHandle, diagnostic: DiagMsg) -> SqlReturn {
@@ -453,10 +459,12 @@ mod tests {
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::get_desc_rec::sql_get_desc_rec_w;
     use crate::api::odbc_types::{
-        SQL_C_NUMERIC, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR,
-        SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH,
-        SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_INTEGER, SQL_NO_NULLS,
+        SQL_C_NUMERIC, SQL_C_TYPE_TIMESTAMP, SQL_CODE_TIMESTAMP, SQL_DATETIME,
+        SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
+        SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR,
+        SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_INTEGER, SQL_NO_NULLS,
         SQL_NULL_HANDLE, SQL_NUMERIC, SQL_PARAM_INPUT, SQL_TYPE_TIMESTAMP, SqlPointer,
+        SqlTimestampStruct,
     };
     use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::api::sqlstate::{ERR_CANNOT_MODIFY_IRD, ERR_INVALID_PRECISION_OR_SCALE};
@@ -700,9 +708,111 @@ mod tests {
             get_small_int(h.ipd(), 1, SQL_DESC_CONCISE_TYPE as SqlSmallInt),
             SQL_TYPE_TIMESTAMP
         );
+    }
+
+    #[test]
+    fn focused_datetime_subtype_is_committed_to_the_child_binding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        let mut original = 7i32;
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(
+                1,
+                vec![Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: SQL_C_NUMERIC,
+                    sql_type: SQL_NUMERIC,
+                    column_size: 10,
+                    decimal_digits: 2,
+                    app_precision: 10,
+                    app_scale: 2,
+                    parameter_value_ptr: (&mut original as *mut i32).cast(),
+                    buffer_length: SqlLen::try_from(std::mem::size_of::<i32>()).unwrap(),
+                    strlen_or_ind_ptr: ptr::null_mut(),
+                    octet_length_ptr: ptr::null_mut(),
+                })],
+            );
+        }
+
+        let mut value = SqlTimestampStruct {
+            year: 2026,
+            month: 1,
+            day: 2,
+            hour: 3,
+            minute: 4,
+            second: 5,
+            fraction: 6,
+        };
         assert_eq!(
-            get_small_int(h.ipd(), 1, SQL_DESC_DATETIME_INTERVAL_CODE as SqlSmallInt),
+            unsafe {
+                sql_set_desc_rec(
+                    h.apd(),
+                    1,
+                    SQL_DATETIME,
+                    SqlSmallInt::try_from(SQL_CODE_TIMESTAMP).unwrap(),
+                    SqlLen::try_from(std::mem::size_of::<SqlTimestampStruct>()).unwrap(),
+                    0,
+                    9,
+                    (&raw mut value).cast(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            get_small_int(
+                h.apd(),
+                1,
+                SqlSmallInt::try_from(SQL_DESC_CONCISE_TYPE).unwrap()
+            ),
+            SQL_C_TYPE_TIMESTAMP
+        );
+        assert_eq!(
+            get_small_int(h.apd(), 1, SqlSmallInt::try_from(SQL_DESC_TYPE).unwrap()),
+            SQL_DATETIME
+        );
+        assert_eq!(
+            get_small_int(
+                h.apd(),
+                1,
+                SqlSmallInt::try_from(SQL_DESC_DATETIME_INTERVAL_CODE).unwrap()
+            ),
             SqlSmallInt::try_from(SQL_CODE_TIMESTAMP).unwrap()
+        );
+        let mut record_type = -1;
+        let mut record_sub_type = -1;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_rec_w(
+                    h.apd(),
+                    1,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    &mut record_type,
+                    &mut record_sub_type,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(record_type, SQL_DATETIME);
+        assert_eq!(
+            record_sub_type,
+            SqlSmallInt::try_from(SQL_CODE_TIMESTAMP).unwrap()
+        );
+        let state = stmt.inner.lock().unwrap();
+        let binding = state.tvp_column_bindings[&1][0].as_ref().unwrap();
+        assert_eq!(binding.c_type, SQL_C_TYPE_TIMESTAMP);
+        assert_eq!(
+            binding.parameter_value_ptr,
+            (&raw mut value).cast::<std::ffi::c_void>()
         );
     }
 

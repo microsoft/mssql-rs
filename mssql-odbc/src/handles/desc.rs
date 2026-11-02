@@ -866,7 +866,12 @@ impl DescHandle {
                 error!("validating focused TVP descriptor records: stmt mutex poisoned");
                 return Err(());
             };
-            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+            let owns_focus = if self.kind == DescKind::ImpParam {
+                std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self)
+            } else {
+                std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self)
+            };
+            if !owns_focus {
                 continue;
             }
             let focus = state
@@ -901,7 +906,12 @@ impl DescHandle {
                 error!("updating focused TVP descriptor records: stmt mutex poisoned");
                 return Err(());
             };
-            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+            let owns_focus = if self.kind == DescKind::ImpParam {
+                std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self)
+            } else {
+                std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self)
+            };
+            if !owns_focus {
                 continue;
             }
             let focus = state
@@ -948,7 +958,12 @@ impl DescHandle {
                 error!("reading focused TVP descriptor records: stmt mutex poisoned");
                 return Err(());
             };
-            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+            let owns_focus = if self.kind == DescKind::ImpParam {
+                std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self)
+            } else {
+                std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self)
+            };
+            if !owns_focus {
                 continue;
             }
             let focus = state
@@ -967,6 +982,71 @@ impl DescHandle {
             }
         }
         Ok(bindings)
+    }
+
+    pub(crate) fn focused_tvp_layout_headers(&self) -> Result<Vec<DescHeader>, ()> {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("reading focused TVP descriptor headers: dbc mutex poisoned");
+            return Err(());
+        };
+        let mut headers = Vec::new();
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(state) = stmt.inner.lock() else {
+                error!("reading focused TVP descriptor headers: stmt mutex poisoned");
+                return Err(());
+            };
+            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus != 0 {
+                headers.push(
+                    state
+                        .tvp_column_layouts
+                        .get(&focus)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        Ok(headers)
+    }
+
+    pub(crate) fn update_focused_tvp_layout_headers(
+        &self,
+        mut update: impl FnMut(&mut DescHeader),
+    ) -> Result<Option<bool>, ()> {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("updating focused TVP descriptor headers: dbc mutex poisoned");
+            return Err(());
+        };
+        let mut found = false;
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(mut state) = stmt.inner.lock() else {
+                error!("updating focused TVP descriptor headers: stmt mutex poisoned");
+                return Err(());
+            };
+            if !std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self) {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus == 0 {
+                continue;
+            }
+            update(state.tvp_column_layouts.entry(focus).or_default());
+            found = true;
+        }
+        Ok(found.then_some(true))
     }
 
     fn invalidate_prepared_owner(&self, first_changed: usize) -> Result<(), ()> {

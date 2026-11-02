@@ -223,7 +223,7 @@ fn sql_get_desc_rec_w_safe(
     }
 }
 
-fn focused_tvp_record(binding: crate::params::BoundParam, kind: DescKind) -> DescRecord {
+pub(super) fn focused_tvp_record(binding: crate::params::BoundParam, kind: DescKind) -> DescRecord {
     let mut record = DescRecord::default_for(kind);
     let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
     binding.write_to_records(&mut record, &mut ipd_record);

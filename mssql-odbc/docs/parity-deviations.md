@@ -1262,3 +1262,18 @@ msodbcsql build is measured.
     build and `SQL_DRIVER_VER` recorded must confirm the warning and effective
     MSF value. This does not change the separate mirroring implementation gap.
     Maintainer parity sign-off remains pending. Tracked in AB#49293.
+
+37. **A TVP can be rebound without `SQL_RESET_PARAMS`, clearing its prior
+    schema and retaining focused-column binding.** The review thread cites
+    msodbcsql's clear-on-bind path at `sqlcdesc.cpp:3110-3123`, but a measured
+    end-to-end attempt against ODBC Driver 18.07.0001 accepted the second
+    `SQLBindParameter` and then returned IM020 when the same statement was
+    focused again; continuing produced 22018 because the procedure received an
+    integer instead of the TVP. This driver treats the new TVP bind as a fresh
+    identity, clears the previous catalog/schema, and supports rebinding its
+    child columns under the caller's default schema. The author requested this
+    sequence in PR #715; `RebindingUnqualifiedTypeClearsPreviousSchema` pins
+    successful execution and is skipped on the msodbcsql comparison leg. No
+    existing call sequence is changed. The runtime evidence was collected with
+    the C++ test against the local SQL Server and ODBC Driver 18.07.0001.
+    Tracked in AB#49353.

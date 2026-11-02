@@ -37,10 +37,10 @@ use crate::api::odbc_types::{
     SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
-    ERR_CANNOT_MODIFY_IRD, ERR_INCONSISTENT_DESCRIPTOR_INFO, ERR_INVALID_ATTRIBUTE_VALUE,
-    ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX,
-    ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAMETER_TYPE, ERR_INVALID_PRECISION_OR_SCALE,
-    ERR_INVALID_SQL_DATA_TYPE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+    ERR_CANNOT_MODIFY_IRD, ERR_FUNCTION_SEQUENCE, ERR_INCONSISTENT_DESCRIPTOR_INFO,
+    ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_FIELD,
+    ERR_INVALID_DESCRIPTOR_INDEX, ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAMETER_TYPE,
+    ERR_INVALID_PRECISION_OR_SCALE, ERR_INVALID_SQL_DATA_TYPE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
     ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, WARN_ARRAY_SIZE_CHANGED, post_diag,
 };
 use crate::api::type_rules::{
@@ -128,6 +128,16 @@ fn sql_set_desc_field_w_safe(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
+    if let Some(result) = set_focused_tvp_header_field(
+        desc,
+        record_number,
+        field_identifier,
+        value_ptr,
+        buffer_length,
+    ) {
+        return result;
+    }
+
     let update = |state: &mut DescState| {
         set_desc_field(
             state,
@@ -138,17 +148,19 @@ fn sql_set_desc_field_w_safe(
             buffer_length,
         )
     };
-    if matches!(desc.kind, DescKind::AppParam | DescKind::Ad)
-        && record_number >= 1
-        && let Ok(field) = SqlUSmallInt::try_from(field_identifier)
+    if let Ok(field) = SqlUSmallInt::try_from(field_identifier)
+        && ((matches!(desc.kind, DescKind::AppParam | DescKind::Ad) && record_number >= 1)
+            || (desc.kind == DescKind::ImpParam && record_number >= 1 && field == SQL_DESC_SCALE))
         && matches!(
             field,
             SQL_DESC_DATA_PTR
                 | SQL_DESC_INDICATOR_PTR
                 | SQL_DESC_OCTET_LENGTH_PTR
                 | SQL_DESC_OCTET_LENGTH
+                | SQL_DESC_CONCISE_TYPE
                 | SQL_DESC_PRECISION
                 | SQL_DESC_SCALE
+                | SQL_DESC_TYPE
         )
         && classify_field(desc.kind, field)
             .is_some_and(|access| access.writable && access.scope == FieldScope::Record)
@@ -161,6 +173,8 @@ fn sql_set_desc_field_w_safe(
             }
         };
         if may_route {
+            let focused_type = std::cell::Cell::new(None);
+            let validation_diagnostic = std::cell::Cell::new(None);
             let focused_value = match field {
                 SQL_DESC_PRECISION | SQL_DESC_SCALE => {
                     let Ok(value) = SqlSmallInt::try_from(value_ptr as SqlLen) else {
@@ -174,6 +188,30 @@ fn sql_set_desc_field_w_safe(
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 |binding| match (field, focused_value) {
+                    (SQL_DESC_SCALE, Some(_)) if desc.kind == DescKind::ImpParam => {
+                        match focused_tvp_type_after_set(binding, desc.kind, field, value_ptr) {
+                            Some((c_type, precision, scale)) => {
+                                focused_type.set(Some((c_type, precision, scale)));
+                                true
+                            }
+                            None => {
+                                validation_diagnostic.set(Some(ERR_INVALID_PRECISION_OR_SCALE));
+                                false
+                            }
+                        }
+                    }
+                    (SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE, _) => {
+                        match focused_tvp_type_after_set(binding, desc.kind, field, value_ptr) {
+                            Some((c_type, precision, scale)) => {
+                                focused_type.set(Some((c_type, precision, scale)));
+                                true
+                            }
+                            None => {
+                                validation_diagnostic.set(Some(ERR_INVALID_C_DATA_TYPE));
+                                false
+                            }
+                        }
+                    }
                     (SQL_DESC_PRECISION, Some(precision)) => {
                         binding.c_type != SQL_C_NUMERIC
                             || ((1..=SQL_PREC_NUMERIC).contains(&precision)
@@ -204,8 +242,20 @@ fn sql_set_desc_field_w_safe(
                         }
                     }
                     SQL_DESC_SCALE => {
-                        if let Some(scale) = focused_value {
+                        if desc.kind == DescKind::ImpParam {
+                            if let Some((_, _, scale)) = focused_type.get() {
+                                binding.decimal_digits = scale;
+                            }
+                        } else if let Some(scale) = focused_value {
                             binding.app_scale = scale;
+                        }
+                    }
+                    SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE => {
+                        if let Some((c_type, precision, scale)) = focused_type.get() {
+                            binding.c_type = c_type;
+                            binding.app_precision = precision;
+                            binding.app_scale = scale;
+                            binding.parameter_value_ptr = std::ptr::null_mut();
                         }
                     }
                     _ => unreachable!(),
@@ -223,9 +273,14 @@ fn sql_set_desc_field_w_safe(
                 Ok(Some(false)) => {
                     error!(
                         field,
-                        "SQLSetDescFieldW: invalid focused SQL_C_NUMERIC precision/scale"
+                        "SQLSetDescFieldW: invalid focused descriptor field value"
                     );
-                    return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                    return post_focused_tvp_diag(
+                        desc,
+                        validation_diagnostic
+                            .get()
+                            .unwrap_or(ERR_INVALID_PRECISION_OR_SCALE),
+                    );
                 }
                 Ok(None) => {}
                 Err(()) => {
@@ -257,6 +312,134 @@ fn sql_set_desc_field_w_safe(
         }
         _ => desc.update_definition(record_number, "SQLSetDescFieldW", update),
     }
+}
+
+fn set_focused_tvp_header_field(
+    desc: &DescHandle,
+    record_number: SqlSmallInt,
+    field_identifier: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+) -> Option<SqlReturn> {
+    if !matches!(desc.kind, DescKind::AppParam | DescKind::Ad) || record_number != 0 {
+        return None;
+    }
+    let field = SqlUSmallInt::try_from(field_identifier).ok()?;
+    if !matches!(
+        field,
+        SQL_DESC_ARRAY_SIZE | SQL_DESC_BIND_OFFSET_PTR | SQL_DESC_BIND_TYPE
+    ) || !classify_field(desc.kind, field)
+        .is_some_and(|access| access.writable && access.scope == FieldScope::Header)
+    {
+        return None;
+    }
+    let may_route = match desc.readers_through(false, true) {
+        Ok((_, executing)) => !executing,
+        Err(()) => {
+            error!("SQLSetDescFieldW: failed checking focused descriptor headers");
+            return Some(SQL_ERROR);
+        }
+    };
+    if !may_route {
+        return Some(post_focused_tvp_diag(desc, ERR_FUNCTION_SEQUENCE));
+    }
+    let headers = match desc.focused_tvp_layout_headers() {
+        Ok(headers) => headers,
+        Err(()) => return Some(post_focused_tvp_internal_error(desc)),
+    };
+    let header = headers.first().copied()?;
+    let mut scratch = DescState {
+        diag_records: Vec::new(),
+        header,
+        records: Vec::new(),
+    };
+    let result = set_desc_field(
+        &mut scratch,
+        desc.kind,
+        record_number,
+        field_identifier,
+        value_ptr,
+        buffer_length,
+    );
+    if result == SQL_ERROR {
+        let Ok(mut state) = desc.inner.lock() else {
+            error!("SQLSetDescFieldW: desc mutex poisoned copying child-header diagnostics");
+            return Some(SQL_ERROR);
+        };
+        free_errors(&mut state);
+        state.diag_records = scratch.diag_records;
+        return Some(SQL_ERROR);
+    }
+    let updated = desc.update_focused_tvp_layout_headers(|target| match field {
+        SQL_DESC_ARRAY_SIZE => target.array_size = scratch.header.array_size,
+        SQL_DESC_BIND_OFFSET_PTR => target.bind_offset_ptr = scratch.header.bind_offset_ptr,
+        SQL_DESC_BIND_TYPE => target.bind_type = scratch.header.bind_type,
+        _ => unreachable!(),
+    });
+    match updated {
+        Ok(Some(true)) => {
+            let Ok(mut state) = desc.inner.lock() else {
+                error!("SQLSetDescFieldW: desc mutex poisoned clearing child-header diagnostics");
+                return Some(SQL_ERROR);
+            };
+            free_errors(&mut state);
+            state.diag_records = scratch.diag_records;
+            Some(result)
+        }
+        Ok(None | Some(false)) => Some(post_focused_tvp_internal_error(desc)),
+        Err(()) => Some(post_focused_tvp_internal_error(desc)),
+    }
+}
+
+fn post_focused_tvp_internal_error(desc: &DescHandle) -> SqlReturn {
+    let Ok(mut state) = desc.inner.lock() else {
+        error!("SQLSetDescFieldW: desc mutex poisoned posting focused-header error");
+        return SQL_ERROR;
+    };
+    free_errors(&mut state);
+    post_sql_error(
+        &mut state,
+        crate::api::sqlstate::SQLSTATE_HY000,
+        0,
+        "Internal error updating focused table-valued parameter descriptor header",
+    );
+    SQL_ERROR
+}
+
+fn focused_tvp_type_after_set(
+    binding: &crate::params::BoundParam,
+    kind: DescKind,
+    field: SqlUSmallInt,
+    value_ptr: SqlPointer,
+) -> Option<(SqlSmallInt, SqlSmallInt, SqlSmallInt)> {
+    let mut apd_record = DescRecord::default_for(DescKind::AppParam);
+    let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
+    binding.write_to_records(&mut apd_record, &mut ipd_record);
+    let record = if kind == DescKind::ImpParam {
+        ipd_record
+    } else {
+        apd_record.precision = binding.app_precision;
+        apd_record.scale = binding.app_scale;
+        apd_record
+    };
+    let mut state = DescState {
+        diag_records: Vec::new(),
+        header: Default::default(),
+        records: vec![record],
+    };
+    if set_desc_field(
+        &mut state,
+        kind,
+        1,
+        SqlSmallInt::try_from(field).ok()?,
+        value_ptr,
+        0,
+    ) != SQL_SUCCESS
+    {
+        return None;
+    }
+    let record = state.record(1)?;
+    Some((record.concise_type, record.precision, record.scale))
 }
 
 fn post_focused_tvp_diag(
@@ -536,11 +719,11 @@ pub(super) fn write_record_field(
 /// two fields cannot go stale relative to each other
 /// (`datetime_interval_code_for`).
 ///
-/// AD (ARD/APD) types are C types, validated exactly like `SQLBindParameter`
-/// validates `ValueType` (`canonical_c_type` + `is_valid_c_type`), so a
-/// descriptor-set type can never diverge from what direct binding accepts.
-/// C types have no verbose form, so `SQL_DESC_TYPE` and
-/// `SQL_DESC_CONCISE_TYPE` are handled identically for AD.
+/// AD (ARD/APD) concise types are C types, validated exactly like
+/// `SQLBindParameter` validates `ValueType` (`canonical_c_type` +
+/// `is_valid_c_type`). The verbose `SQL_DESC_TYPE = SQL_DATETIME` form still
+/// resolves from `SQL_DESC_DATETIME_INTERVAL_CODE`; `SQL_DESC_CONCISE_TYPE`
+/// accepts the corresponding concise C type.
 ///
 /// IPD types are SQL types. `SQL_DESC_TYPE = SQL_DATETIME` (the verbose
 /// family marker, `9`) is the standard way to bind a DATE/TIME/TIMESTAMP
@@ -569,15 +752,7 @@ pub(super) fn set_type(
         return SQL_ERROR;
     };
 
-    let resolved = if kind.is_application() {
-        let canonical = canonical_c_type(requested);
-        if !is_valid_c_type(canonical) {
-            error!(requested, "SQLSetDescFieldW: invalid application C type");
-            post_diag(state, ERR_INVALID_C_DATA_TYPE);
-            return SQL_ERROR;
-        }
-        canonical
-    } else if field == SQL_DESC_TYPE && requested == SQL_DATETIME {
+    let resolved = if field == SQL_DESC_TYPE && requested == SQL_DATETIME {
         let current_code = state
             .record(record_number)
             .map(|r| r.datetime_interval_code)
@@ -591,6 +766,14 @@ pub(super) fn set_type(
             return SQL_ERROR;
         };
         concise
+    } else if kind.is_application() {
+        let canonical = canonical_c_type(requested);
+        if !is_valid_c_type(canonical) {
+            error!(requested, "SQLSetDescFieldW: invalid application C type");
+            post_diag(state, ERR_INVALID_C_DATA_TYPE);
+            return SQL_ERROR;
+        }
+        canonical
     } else {
         match classify_parameter_sql_type(requested) {
             SqlTypeSupport::Supported => requested,
@@ -1005,6 +1188,22 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS, "GET failed reading back field {field}");
+        value
+    }
+
+    fn get_ulen(handle: SqlHandle, record: SqlSmallInt, field: SqlSmallInt) -> SqlULen {
+        let mut value: SqlULen = 0;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                handle,
+                record,
+                field,
+                &mut value as *mut SqlULen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS, "GET failed reading header field {field}");
         value
     }
 
@@ -2056,6 +2255,79 @@ mod tests {
                     || (binding.app_precision, binding.app_scale) == (10, 8)
             );
         }
+    }
+
+    #[test]
+    fn focused_tvp_type_change_updates_and_reads_the_child_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut original = 7i32;
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(
+                1,
+                vec![Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: SQL_C_NUMERIC,
+                    sql_type: SQL_NUMERIC,
+                    column_size: 10,
+                    decimal_digits: 2,
+                    app_precision: 10,
+                    app_scale: 2,
+                    parameter_value_ptr: (&mut original as *mut i32).cast(),
+                    buffer_length: size_of::<i32>() as SqlLen,
+                    strlen_or_ind_ptr: ptr::null_mut(),
+                    octet_length_ptr: ptr::null_mut(),
+                })],
+            );
+        }
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_LONG as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            get_small_int(h.apd(), 1, SQL_DESC_CONCISE_TYPE as SqlSmallInt),
+            SQL_C_LONG
+        );
+        assert_eq!(get_small_int(h.apd(), 1, SQL_DESC_TYPE), SQL_C_LONG);
+        assert_eq!(
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, 3isize as SqlPointer, 0,) },
+            SQL_SUCCESS
+        );
+        assert_eq!(get_small_int(h.ipd(), 1, SQL_DESC_SCALE), 3);
+        let state = stmt.inner.lock().unwrap();
+        let binding = state.tvp_column_bindings[&1][0].as_ref().unwrap();
+        assert_eq!(binding.c_type, SQL_C_LONG);
+        assert_eq!(binding.decimal_digits, 3);
+        assert!(binding.parameter_value_ptr.is_null());
+    }
+
+    #[test]
+    fn focused_tvp_array_size_uses_child_header_not_outer_apd() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(h.apd(), 0, SQL_DESC_ARRAY_SIZE, 2usize as SqlPointer, 0)
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(get_ulen(h.apd(), 0, SQL_DESC_ARRAY_SIZE), 2);
+
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(0);
+        assert_eq!(get_ulen(h.apd(), 0, SQL_DESC_ARRAY_SIZE), 1);
     }
 
     #[test]

@@ -3096,8 +3096,8 @@ mod tests {
             SQLBindParameter, SQLGetStmtAttrW, SQLSetDescFieldW, SQLSetStmtAttrW,
         };
         use crate::api::odbc_types::{
-            SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH_PTR,
-            SQL_INTEGER, SQL_PARAM_INPUT, SQL_SS_TABLE, SqlLen,
+            SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_ARRAY_SIZE, SQL_DESC_INDICATOR_PTR,
+            SQL_DESC_OCTET_LENGTH_PTR, SQL_INTEGER, SQL_PARAM_INPUT, SQL_SS_TABLE, SqlLen,
         };
         use mssql_tds::datatypes::sqltypes::SqlType;
 
@@ -3132,7 +3132,7 @@ mod tests {
                     SQL_PARAM_INPUT,
                     SQL_C_BINARY,
                     SQL_SS_TABLE,
-                    2,
+                    1,
                     0,
                     name.as_mut_ptr().cast(),
                     SqlLen::from(SQL_NTS),
@@ -3157,9 +3157,34 @@ mod tests {
             unsafe { SQLSetStmtAttrW(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1usize as SqlPointer, 0) },
             SQL_SUCCESS
         );
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    h.apd(),
+                    0,
+                    SQL_DESC_ARRAY_SIZE.try_into().unwrap(),
+                    2usize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut focused_capacity: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                SQLGetStmtAttrW(
+                    h.stmt,
+                    SQL_ATTR_PARAMSET_SIZE,
+                    (&raw mut focused_capacity).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(focused_capacity, 2);
         let mut offset = SqlLen::try_from(size_of::<Row>()).unwrap();
         for (attribute, value) in [
-            (SQL_ATTR_PARAMSET_SIZE, 2usize),
             (SQL_ATTR_PARAM_BIND_TYPE, size_of::<Row>()),
             (SQL_ATTR_PARAM_BIND_OFFSET_PTR, (&raw mut offset).addr()),
         ] {

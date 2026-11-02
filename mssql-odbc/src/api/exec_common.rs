@@ -1156,12 +1156,15 @@ pub(super) unsafe fn build_named_params_for_row(
             } else {
                 unsafe { layout.bind_offset_ptr.cast::<SqlLen>().read_unaligned() }
             };
-            let tvp_binding = snapshot
+            let mut tvp_binding = snapshot
                 .param
                 .for_row(row, bind_offset, param_bind_type)
                 .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                     ParamRowBuildError::Layout { parameter: i + 1 }
                 })?;
+            if let Some(child_layout) = tvp_layouts.get(&ordinal) {
+                tvp_binding.column_size = child_layout.array_size;
+            }
             if !tvp_binding.strlen_or_ind_ptr.is_null()
                 && unsafe { tvp_binding.strlen_or_ind_ptr.read_unaligned() }
                     == crate::api::odbc_types::SQL_NULL_DATA
@@ -1203,7 +1206,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 let rpc = unsafe {
                     crate::conversion::param_convert::build_tvp_param(
                         name,
-                        &snapshot.param,
+                        &tvp_binding,
                         snapshot.udt_names.as_deref(),
                         columns,
                         bind_offset,

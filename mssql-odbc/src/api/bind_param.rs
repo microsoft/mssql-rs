@@ -348,6 +348,13 @@ fn sql_bind_parameter_safe(
             stmt_state
                 .tvp_column_bindings
                 .remove(&usize::from(parameter_number));
+            let child_layout = crate::handles::desc::DescHeader {
+                array_size: column_size,
+                ..Default::default()
+            };
+            stmt_state
+                .tvp_column_layouts
+                .insert(usize::from(parameter_number), child_layout);
         }
 
         // SQLBindParameter/SetIPDRec in sqlcdesc.cpp retain indicator-only
@@ -565,8 +572,9 @@ unsafe fn read_tvp_type_name(
 }
 
 /// Records `name` as the table type name on `ipd`'s record, claiming it so a
-/// later `SQLDescribeParam` does not overwrite the application's choice (the
-/// same provenance the `SQL_CA_SS_*` descriptor-field writes use).
+/// later `SQLDescribeParam` does not overwrite the application's choice. A
+/// bind supplies only the type name, so it also clears any catalog/schema from
+/// an earlier binding; callers may set those fields again after this bind.
 fn store_tvp_type_name(
     ipd: SqlHandle,
     record_number: SqlUSmallInt,
@@ -581,6 +589,10 @@ fn store_tvp_type_name(
     let previous = record.parameter_definition();
     {
         let names = std::sync::Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
+        names.catalog.clear();
+        names.schema.clear();
+        record.udt_name_claimed.catalog = false;
+        record.udt_name_claimed.schema = false;
         names.type_name = name;
         record.udt_name_claimed.type_name = true;
     }

@@ -123,25 +123,43 @@ fn sql_get_desc_field_w_safe(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    if matches!(
-        desc.kind,
-        crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
-    ) && record_number >= 1
-        && let Ok(field) = SqlUSmallInt::try_from(field_identifier)
+    if let Some(result) = get_focused_tvp_header_field(
+        desc,
+        record_number,
+        field_identifier,
+        value_ptr,
+        buffer_length,
+        string_length_ptr,
+    ) {
+        return result;
+    }
+
+    if let Ok(field) = SqlUSmallInt::try_from(field_identifier)
+        && ((matches!(
+            desc.kind,
+            crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
+        ) && record_number >= 1)
+            || (desc.kind == crate::handles::desc::DescKind::ImpParam
+                && record_number >= 1
+                && field == SQL_DESC_SCALE))
         && matches!(
             field,
             SQL_DESC_DATA_PTR
                 | SQL_DESC_INDICATOR_PTR
                 | SQL_DESC_OCTET_LENGTH_PTR
                 | SQL_DESC_OCTET_LENGTH
+                | SQL_DESC_CONCISE_TYPE
+                | SQL_DESC_DATETIME_INTERVAL_CODE
                 | SQL_DESC_PRECISION
                 | SQL_DESC_SCALE
+                | SQL_DESC_TYPE
         )
         && classify_field(desc.kind, field).is_some_and(|access| access.scope == FieldScope::Record)
     {
         match desc.focused_tvp_bindings(record_number) {
             Ok(bindings) => {
                 if let Some(binding) = bindings.first() {
+                    let record = super::get_desc_rec::focused_tvp_record(*binding, desc.kind);
                     let Ok(mut state) = desc.inner.lock() else {
                         error!("SQLGetDescFieldW: desc mutex poisoned");
                         return SQL_ERROR;
@@ -156,7 +174,17 @@ fn sql_get_desc_field_w_safe(
                             FieldValue::Pointer(binding.octet_length_ptr.cast())
                         }
                         SQL_DESC_OCTET_LENGTH => FieldValue::Len(binding.buffer_length),
+                        SQL_DESC_CONCISE_TYPE | SQL_DESC_DATETIME_INTERVAL_CODE | SQL_DESC_TYPE => {
+                            let Some(value) = record_field_value(&record, field) else {
+                                post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+                                return SQL_ERROR;
+                            };
+                            value
+                        }
                         SQL_DESC_PRECISION => FieldValue::SmallInt(binding.app_precision),
+                        SQL_DESC_SCALE if desc.kind == crate::handles::desc::DescKind::ImpParam => {
+                            FieldValue::SmallInt(binding.decimal_digits)
+                        }
                         SQL_DESC_SCALE => FieldValue::SmallInt(binding.app_scale),
                         _ => unreachable!(),
                     };
@@ -253,6 +281,61 @@ fn sql_get_desc_field_w_safe(
     };
 
     value.write(value_ptr, buffer_length, string_length_ptr, &mut state)
+}
+
+fn get_focused_tvp_header_field(
+    desc: &DescHandle,
+    record_number: SqlSmallInt,
+    field_identifier: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
+) -> Option<SqlReturn> {
+    if !matches!(
+        desc.kind,
+        crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
+    ) || record_number != 0
+    {
+        return None;
+    }
+    let field = SqlUSmallInt::try_from(field_identifier).ok()?;
+    if !matches!(
+        field,
+        SQL_DESC_ARRAY_SIZE | SQL_DESC_BIND_OFFSET_PTR | SQL_DESC_BIND_TYPE
+    ) || !classify_field(desc.kind, field)
+        .is_some_and(|access| access.scope == FieldScope::Header)
+    {
+        return None;
+    }
+    let headers = match desc.focused_tvp_layout_headers() {
+        Ok(headers) => headers,
+        Err(()) => {
+            error!("SQLGetDescFieldW: failed reading focused TVP descriptor headers");
+            let Ok(mut state) = desc.inner.lock() else {
+                error!("SQLGetDescFieldW: desc mutex poisoned posting child-header error");
+                return Some(SQL_ERROR);
+            };
+            free_errors(&mut state);
+            post_sql_error(
+                &mut state,
+                crate::api::sqlstate::SQLSTATE_HY000,
+                0,
+                "Internal error reading focused table-valued parameter descriptor header",
+            );
+            return Some(SQL_ERROR);
+        }
+    };
+    let header = headers.first()?;
+    let Ok(mut state) = desc.inner.lock() else {
+        error!("SQLGetDescFieldW: desc mutex poisoned reading child header");
+        return Some(SQL_ERROR);
+    };
+    free_errors(&mut state);
+    let Some(value) = header_field_value(header, field) else {
+        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+        return Some(SQL_ERROR);
+    };
+    Some(value.write(value_ptr, buffer_length, string_length_ptr, &mut *state))
 }
 
 /// Maps a header field to its stored value. `SQL_DESC_COUNT` is handled by
