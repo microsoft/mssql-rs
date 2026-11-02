@@ -209,7 +209,7 @@ fn sql_set_desc_field_w_safe(
             let focused_length = (field == SQL_DESC_OCTET_LENGTH).then_some(value_ptr as SqlLen);
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
-                None,
+                Some(super::set_desc_rec::focused_tvp_initial_binding()),
                 |binding| {
                     if desc.kind == DescKind::ImpParam
                         && matches!(

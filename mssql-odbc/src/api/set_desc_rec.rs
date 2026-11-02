@@ -161,7 +161,7 @@ fn sql_set_desc_rec_safe(
         if may_route {
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
-                None,
+                Some(focused_tvp_initial_binding()),
                 |binding| {
                     focused_tvp_ipd_desc_rec(
                         binding,
@@ -247,21 +247,7 @@ fn sql_set_desc_rec_safe(
             let validation_diagnostic = std::cell::Cell::new(None);
             let internal_error = std::cell::Cell::new(false);
             let focused_type = std::cell::Cell::new(None);
-            let initial_binding = crate::params::BoundParam {
-                input_output_type: SQL_PARAM_INPUT,
-                c_type: SQL_C_DEFAULT,
-                sql_type: SQL_UNKNOWN_TYPE,
-                column_size: 0,
-                decimal_digits: 0,
-                app_datetime_interval_code: None,
-                sql_datetime_interval_code: None,
-                app_precision: 0,
-                app_scale: 0,
-                parameter_value_ptr: std::ptr::null_mut(),
-                buffer_length: 0,
-                strlen_or_ind_ptr: std::ptr::null_mut(),
-                octet_length_ptr: std::ptr::null_mut(),
-            };
+            let initial_binding = focused_tvp_initial_binding();
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 Some(initial_binding),
@@ -426,6 +412,24 @@ pub(super) fn current_odbc_version(desc: &DescHandle) -> Result<OdbcVersion, ()>
         return Err(());
     };
     Ok(state.odbc_version)
+}
+
+pub(super) fn focused_tvp_initial_binding() -> crate::params::BoundParam {
+    crate::params::BoundParam {
+        input_output_type: SQL_PARAM_INPUT,
+        c_type: SQL_C_DEFAULT,
+        sql_type: SQL_UNKNOWN_TYPE,
+        column_size: 0,
+        decimal_digits: 0,
+        app_datetime_interval_code: None,
+        sql_datetime_interval_code: None,
+        app_precision: 0,
+        app_scale: 0,
+        parameter_value_ptr: std::ptr::null_mut(),
+        buffer_length: 0,
+        strlen_or_ind_ptr: std::ptr::null_mut(),
+        octet_length_ptr: std::ptr::null_mut(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1409,6 +1413,34 @@ mod tests {
         assert_eq!(binding.sql_type, SQL_NUMERIC);
         assert_eq!(binding.column_size, 12);
         assert_eq!(binding.decimal_digits, 3);
+    }
+
+    #[test]
+    fn focused_ipd_set_desc_rec_initializes_an_unbound_child_only() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_rec(
+                    h.ipd(),
+                    1,
+                    crate::api::odbc_types::SQL_INTEGER,
+                    0,
+                    4,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(record_count(h.ipd()), 0, "the outer IPD stays untouched");
+        let binding = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
+        assert_eq!(binding.sql_type, crate::api::odbc_types::SQL_INTEGER);
     }
 
     #[test]

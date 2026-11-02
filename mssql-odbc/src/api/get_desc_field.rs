@@ -148,6 +148,7 @@ fn sql_get_desc_field_w_safe(
                 | SQL_DESC_INDICATOR_PTR
                 | SQL_DESC_OCTET_LENGTH_PTR
                 | SQL_DESC_OCTET_LENGTH
+                | SQL_DESC_LENGTH
                 | SQL_DESC_CONCISE_TYPE
                 | SQL_DESC_DATETIME_INTERVAL_CODE
                 | SQL_DESC_PRECISION
@@ -518,8 +519,8 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_DECIMAL, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE,
-        SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_UNNAMED,
+        SQL_C_NUMERIC, SQL_DECIMAL, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE, SQL_NULL_HANDLE,
+        SQL_PARAM_INPUT, SQL_UNNAMED,
     };
     use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::error::diag::DiagRecord;
@@ -680,21 +681,29 @@ mod tests {
     #[test]
     fn focused_record_uses_child_defaults_and_returns_no_data_past_count() {
         let h = TestHandles::with_env_dbc_stmt();
-        unsafe {
-            sql_set_desc_field_w(
-                h.apd(),
-                1,
-                SQL_DESC_CONCISE_TYPE,
-                SQL_C_NUMERIC as isize as SqlPointer,
-                0,
-            )
-        };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut state = stmt.inner.lock().unwrap();
-            state.vendor_attrs.store_param_focus(1);
-            state.tvp_column_bindings.insert(1, vec![None]);
-        }
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_CONCISE_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert!(
+            unsafe { handle_from_raw::<DescHandle>(h.apd()) }
+                .inner
+                .lock()
+                .unwrap()
+                .records
+                .is_empty(),
+            "focused write must not create an outer APD record"
+        );
 
         let mut concise: SqlSmallInt = -1;
         let ret = unsafe {
@@ -708,7 +717,21 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        assert_eq!(concise, SQL_C_DEFAULT);
+        assert_eq!(concise, SQL_C_NUMERIC);
+
+        let mut length: SqlULen = 0;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.apd(),
+                1,
+                crate::api::odbc_types::SQL_DESC_LENGTH as SqlSmallInt,
+                &mut length as *mut SqlULen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(length, 38);
 
         stmt.inner
             .lock()
