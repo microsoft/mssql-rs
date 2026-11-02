@@ -12,10 +12,9 @@
 # Legs: Windows x64 (four parallel suite groups, debug driver, Windows Driver
 # Manager, msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21
 # (musl), both running the release drops through unixODBC. /SharedStmt is left
-# out on unixODBC because
-# its releases up to 2.3.14 corrupt their own diagnostic list when two threads
-# use one statement (unixODBC #243, fixed on master in ea454e49); see
-# mssql-odbc/tests/e2e/run_e2e.sh.
+# out on unixODBC because its releases up to 2.3.14 corrupt their own diagnostic
+# list when two threads use one statement (unixODBC #243, fixed on master in
+# ea454e49); see mssql-odbc/tests/e2e/run_e2e.sh.
 #
 # Evidence: Windows hangs and crashes leave minidumps, with the matching driver,
 # test executables and PDBs, in the OdbcMtDumps_Windows_* artifacts; Linux legs run
@@ -248,9 +247,11 @@ stages:
             '"\Memory\Available MBytes"', '"\Process(sqlservr)\% Processor Time"',
             '-si', '1', '-f', 'CSV', '-o', "`"$loadDir/agent-load.csv`"", '-y')
         try {
+          # Empty matrix values leave $(var) macros unexpanded; the environment
+          # copy of an empty value is empty.
           ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
             -MtProfile '$(odbcMtProfile)' `
-            -FilterTests '$(filterTests)' -ExcludeTests '$(excludeTests)' `
+            -FilterTests "$env:FILTERTESTS" -ExcludeTests "$env:EXCLUDETESTS" `
             -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
         } finally {
           if (-not $sampler.HasExited) { Stop-Process -Id $sampler.Id }

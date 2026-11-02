@@ -99,7 +99,10 @@ def test_windows_stress_matrix_preserves_profiles_and_parity(windows_stress_job)
     command = step["pwsh"]
     assert "-CompareWithMsodbcsql" in command
     assert "-MtProfile '$(odbcMtProfile)'" in command
-    assert "-FilterTests '$(filterTests)' -ExcludeTests '$(excludeTests)'" in command
+    assert '-FilterTests "$env:FILTERTESTS" -ExcludeTests "$env:EXCLUDETESTS"' in command
+    # Azure leaves $(name) literal when a matrix value is empty.
+    for name in {key for group in matrix.values() for key, value in group.items() if not value}:
+        assert f"$({name})" not in command
 
 
 def test_windows_stress_groups_cover_current_concurrent_suites(windows_stress_job):
