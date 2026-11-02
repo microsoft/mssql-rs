@@ -1451,6 +1451,11 @@ impl NetworkTransport {
         Ok(())
     }
 
+    pub(crate) fn abort_transport(&mut self) {
+        self.stream = None;
+        self.known_dead = true;
+    }
+
     /// How many consecutive payload-free end-of-message packets a bulk read
     /// tolerates before giving up.
     ///
@@ -3467,6 +3472,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         Ok(())
     }
 
+    fn abort_transport(&mut self) {
+        Self::abort_transport(self);
+    }
+
     /// Send an attention packet and wait for acknowledgment with a timeout.
     ///
     /// This implements the attention sending flow with a configurable timeout:
@@ -3513,6 +3522,22 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn abort_transport_drops_the_stream_before_explicit_close() {
+        use crate::connection::transport::tds_transport::TdsTransport;
+        use crate::test_packet_support::create_network_transport_with_data;
+
+        let mut transport = create_network_transport_with_data(&[]);
+        assert!(transport.stream.is_some());
+
+        TdsTransport::abort_transport(&mut transport);
+
+        assert!(transport.stream.is_none());
+        assert!(transport.known_dead);
+        transport.close_transport().await.unwrap();
+        assert!(transport.stream.is_none());
+    }
+
     #[tokio::test]
     async fn sequential_connect_walks_every_address_without_a_parallel_limit() {
         use std::cell::RefCell;

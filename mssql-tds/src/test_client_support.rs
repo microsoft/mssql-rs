@@ -429,6 +429,9 @@ impl TdsTransport for TokenReplayTransport {
     async fn close_transport(&mut self) -> TdsResult<()> {
         Ok(())
     }
+    fn abort_transport(&mut self) {
+        self.known_dead = true;
+    }
     async fn send_attention_with_timeout(
         &mut self,
         _context: &ParserContext,
@@ -1025,6 +1028,9 @@ pub(crate) mod byte_stream {
         }
         async fn close_transport(&mut self) -> TdsResult<()> {
             Ok(())
+        }
+        fn abort_transport(&mut self) {
+            self.known_dead = true;
         }
         async fn send_attention_with_timeout(
             &mut self,

@@ -126,9 +126,11 @@ Encrypted keys.
 
 Write deadlines apply to SQL batches, RPCs (including streamed parameters), and
 bulk copy. If a timeout interrupts an in-flight packet, the connection is retired
-without further writes or automatic session recovery; there is no packet-completion
-grace period. Cancellation cannot extend the request's write deadline. At a clean
-packet boundary, normal withdrawal or cancellation recovery remains available.
+without TLS shutdown or automatic session recovery, including during later explicit
+closure. There is no packet-completion grace period, and cancellation cannot extend
+the request's write deadline. Transport failures remain eligible for negotiated
+recovery; at a clean packet boundary, normal withdrawal or cancellation recovery
+remains available.
 
 ## Runtime behavior
 

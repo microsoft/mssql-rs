@@ -3072,7 +3072,7 @@ impl TdsClient {
             match tokio::time::timeout_at(deadline, self.drain_stream()).await {
                 Ok(result) => result,
                 Err(_) => {
-                    self.retire_without_writing();
+                    self.mark_failed_request_dead();
                     Err(crate::error::Error::TimeoutError(
                         crate::error::TimeoutErrorType::String(
                             "Timed out draining an ignored request".to_string(),
@@ -3151,17 +3151,15 @@ impl TdsClient {
         }
     }
 
-    /// Retires the transport without shutting the stream down.
-    ///
-    /// For a write that was dropped mid-flight the stream may still hold a
-    /// half-flushed record, and `close_transport` shuts it down — which on the
-    /// native-tls engine emits a close_notify, one more write on exactly that
-    /// stream. `send_attention_and_wait` avoids it the same way, by marking the
-    /// connection dead and never writing again.
-    /// Recovery must also stay disabled: reconnect shuts down the old transport.
+    /// Discards an incomplete write without TLS shutdown, including on later close.
+    /// A completed send failure has already marked the transport dead and retains
+    /// its recovery policy; interrupting a still-live send disables recovery.
     fn retire_without_writing(&mut self) {
-        self.recovery_context.session_recovery_negotiated = false;
+        if !self.transport.connection_known_dead() {
+            self.recovery_context.session_recovery_negotiated = false;
+        }
         self.mark_failed_request_dead();
+        self.transport.abort_transport();
     }
 
     fn mark_failed_request_dead(&mut self) {
@@ -5270,8 +5268,8 @@ impl TdsClient {
     /// `close_transport` writes a TLS close_notify on a socket we just failed to
     /// read from, and its `?` returns before `self.stream = None`, so a
     /// swallowed error would leave the stream alive in exactly the degraded case
-    /// retirement exists for. Dropping the stream with no I/O is the fix; it
-    /// needs a new transport method and is left as follow-up.
+    /// retirement exists for. This drain path only marks the session dead;
+    /// interrupted writes additionally discard their transport without I/O.
     fn retire_after_failed_drain(&mut self, error: &crate::error::Error) {
         if self.take_settled_drain_interruption(error) {
             return;
@@ -9962,6 +9960,7 @@ mod tests {
         response_complete: bool,
         receive_error: Option<crate::error::Error>,
         receive_delay: Option<Duration>,
+        receive_should_hang: bool,
         sync_header_available: bool,
         /// Returned by the next `try_receive_row_header`, as if the buffered
         /// bytes it read were rejected.
@@ -10003,6 +10002,7 @@ mod tests {
                 response_complete: false,
                 receive_error: None,
                 receive_delay: None,
+                receive_should_hang: false,
                 sync_header_available: false,
                 sync_header_error: None,
                 sync_columns: VecDeque::new(),
@@ -10087,6 +10087,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(remaining_request_timeout);
+            if self.receive_should_hang {
+                std::future::pending::<()>().await;
+            }
             // Mirrors the production readers, which run every read under the
             // handle. Without this a cancelled read looks identical to a healthy
             // one and tests cannot tell the two apart.
@@ -10289,11 +10292,15 @@ mod tests {
         async fn close_transport(&mut self) -> TdsResult<()> {
             self.close_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if self.close_should_hang {
+            if self.close_should_hang && !self.closed {
                 std::future::pending::<()>().await;
             }
             self.closed = true;
             Ok(())
+        }
+        fn abort_transport(&mut self) {
+            self.closed = true;
+            self.known_dead = true;
         }
         async fn send_attention_with_timeout(
             &mut self,
@@ -20458,6 +20465,7 @@ mod tests {
     #[tokio::test]
     async fn streamed_write_chunk_send_failure_aborts_stream() {
         let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+        client.recovery_context.session_recovery_negotiated = true;
 
         client
             .begin_sp_executesql(
@@ -20504,6 +20512,23 @@ mod tests {
             .await
             .expect_err("no active streamed parameter after abort");
         assert!(matches!(end, UsageError(_)));
+
+        // A zero login budget proves recovery is reached without opening a socket.
+        client
+            .recovery_context
+            .client_context
+            .as_mut()
+            .unwrap()
+            .connect_timeout = 0;
+        let retry = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&retry, Error::SessionRecoveryFailed { .. }),
+            "a transport failure must remain recoverable: {retry:?}"
+        );
+        assert!(client.is_session_recovery_enabled());
     }
 
     /// A send failure while finalizing the last streamed parameter (flushing the
@@ -21495,6 +21520,37 @@ mod tests {
             assert!(client.execute("SELECT 1".to_string(), ()).await.is_err());
             assert!(sent.lock().unwrap().is_empty(), "{operation}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_close_after_interrupted_write_never_shuts_down_the_stream() {
+        let mut transport = TestTransport::new();
+        transport
+            .send_should_hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        transport.send_prefix_before_hang = true;
+        transport.close_should_hang = true;
+        let sent = Arc::clone(&transport.sent);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        let started = tokio::time::Instant::now();
+        let error = client
+            .execute(
+                "SELECT 1".to_string(),
+                ExecuteOptions::new().timeout_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::TimeoutError(_)));
+
+        tokio::time::timeout(Duration::from_secs(1), client.close_connection())
+            .await
+            .expect("closing an interrupted stream must not attempt a TLS shutdown")
+            .unwrap();
+
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -22602,6 +22658,58 @@ mod tests {
             client.is_connection_dead(),
             "an unacknowledged retraction leaves the stream desynchronized"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ignore_drain_timeout_preserves_session_recovery() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let mut transport = TestTransport::new();
+        transport.receive_should_hang = true;
+        let closes = Arc::clone(&transport.close_calls);
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        client.recovery_context.session_recovery_negotiated = true;
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        assert!(!message.send_incomplete());
+        cancel.cancel();
+        let started = tokio::time::Instant::now();
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.retract_partial_request(message),
+        )
+        .await
+        .expect("the IGNORE drain must be bounded");
+
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        {
+            let wire = sent.lock().unwrap();
+            let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+            assert_eq!(
+                last[1],
+                PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+            );
+        }
+        client
+            .recovery_context
+            .client_context
+            .as_mut()
+            .unwrap()
+            .connect_timeout = 0;
+        let retry = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&retry, Error::SessionRecoveryFailed { .. }),
+            "a clean-boundary drain timeout must remain recoverable: {retry:?}"
+        );
+        assert!(client.is_session_recovery_enabled());
     }
 
     /// The liveness check is the cached flag, never the socket-polling
