@@ -185,7 +185,7 @@ stages:
   dependsOn: []
   jobs:
   - job: Stress_Windows
-    displayName: ODBC stress Windows x64 ($(suiteGroup))
+    displayName: ODBC stress Windows x64
     timeoutInMinutes: ${{ variables.odbcMtJobTimeoutInMinutes }}
     strategy:
       matrix:

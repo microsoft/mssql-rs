@@ -94,6 +94,8 @@ def test_windows_stress_matrix_preserves_profiles_and_parity(windows_stress_job)
     assert set(matrix) == {"Fetch", "Parameters", "Metadata", "Other"}
     assert {group["suiteGroup"] for group in matrix.values()} == set(matrix)
     assert "maxParallel" not in windows_stress_job["strategy"]
+    # Matrix variables are not expanded in the job name; Azure appends the leg.
+    assert "$(" not in windows_stress_job["displayName"]
     assert windows_stress_job["timeoutInMinutes"] == "${{ variables.odbcMtJobTimeoutInMinutes }}"
     step = next(step for step in windows_stress_job["steps"] if "pwsh" in step)
     command = step["pwsh"]
