@@ -870,7 +870,7 @@ TEST_F(TvpTest, DaeRefillsMultipleTvpBatchesBeforeScalarDae) {
                 break;
             case 1:
                 ids = {3, 4};
-                label_indicators = {static_cast<SQLLEN>(sizeof(SQLWCHAR) * 3),
+                label_indicators = {static_cast<SQLLEN>(sizeof(SQLWCHAR) * 5),
                                     SQL_DATA_AT_EXEC};
                 set_label(0, "three");
                 break;
