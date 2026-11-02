@@ -371,13 +371,18 @@ fn focused_tvp_ipd_desc_rec(
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
 ) -> Option<(SqlSmallInt, SqlLen, SqlSmallInt, SqlSmallInt, SqlSmallInt)> {
+    let record_index = usize::try_from(record_number)
+        .ok()
+        .and_then(|number| number.checked_sub(1))?;
     let mut apd_record = DescRecord::default_for(DescKind::AppParam);
     let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
     binding.write_to_records(&mut apd_record, &mut ipd_record);
+    let mut records = vec![DescRecord::default_for(DescKind::ImpParam); record_index + 1];
+    records[record_index] = ipd_record;
     let mut state = DescState {
         diag_records: Vec::new(),
         header: DescHeader::default(),
-        records: vec![ipd_record],
+        records,
     };
     if set_desc_rec(
         &mut state,
@@ -1441,6 +1446,56 @@ mod tests {
         assert_eq!(record_count(h.ipd()), 0, "the outer IPD stays untouched");
         let binding = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
         assert_eq!(binding.sql_type, crate::api::odbc_types::SQL_INTEGER);
+    }
+
+    #[test]
+    fn focused_ipd_set_desc_rec_preserves_the_requested_child_metadata() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        let varchar = crate::params::BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_CHAR,
+            sql_type: crate::api::odbc_types::SQL_VARCHAR,
+            column_size: 50,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: ptr::null_mut(),
+            octet_length_ptr: ptr::null_mut(),
+        };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state
+                .tvp_column_bindings
+                .insert(1, vec![None, Some(varchar)]);
+        }
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_rec(
+                    h.ipd(),
+                    2,
+                    crate::api::odbc_types::SQL_VARCHAR,
+                    0,
+                    200,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(record_count(h.ipd()), 0, "the outer IPD stays untouched");
+        let binding = stmt.inner.lock().unwrap().tvp_column_bindings[&1][1].unwrap();
+        assert_eq!(binding.sql_type, crate::api::odbc_types::SQL_VARCHAR);
+        assert_eq!(binding.column_size, 50);
     }
 
     #[test]
