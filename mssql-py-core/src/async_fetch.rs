@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::error::{Error, SqlInfoMessage};
+use mssql_tds::query::metadata::ResultColumnMetadata;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -160,8 +161,10 @@ impl FetchState {
     }
 }
 
+/// Buffered result set with metadata describing the values exposed by the
+/// execution.
 pub(crate) struct BufferedRowSet {
-    pub(crate) metadata: Vec<mssql_tds::query::metadata::ColumnMetadata>,
+    pub(crate) metadata: Vec<ResultColumnMetadata>,
     pub(crate) rows: VecDeque<PyRowWriter>,
 }
 
@@ -193,8 +196,12 @@ impl BufferedResults {
         (rows, exhausted, has_next)
     }
 
-    fn advance(&self) -> Option<Vec<mssql_tds::query::metadata::ColumnMetadata>> {
-        let mut results = self.lock();
+    pub(crate) fn advance(&self) -> Option<Vec<ResultColumnMetadata>> {
+        let mut results = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         results.pop_front();
         results.front().map(|result| result.metadata.clone())
     }
@@ -969,7 +976,7 @@ pub(crate) fn nextset<'py>(
             let mut client = client.lock().await;
             let result = client.advance().await.map(|result| {
                 let metadata =
-                    matches!(result, StatementResult::Rows).then(|| client.get_metadata().clone());
+                    matches!(result, StatementResult::Rows).then(|| client.get_result_metadata());
                 (result, metadata)
             });
             let has_open_batch = client.has_open_batch();
