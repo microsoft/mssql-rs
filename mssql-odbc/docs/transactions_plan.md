@@ -62,7 +62,9 @@ a round trip. Raw T-SQL can leave the cache stale: repeating the cached level
 does not restore the server's isolation. This differs from msodbcsql's isolation
 branch (`sqlcmisc.cpp:1761-1828`), which executes the `SET` even for the cached
 level; retail 18.07.0001 reports `HY000` when unread results are pending.
-Changing this pre-existing shortcut is outside this cursor-preservation fix.
+Changing this pre-existing shortcut is tracked as an implementation gap in
+[#798](https://github.com/microsoft/mssql-rs/issues/798), outside this
+cursor-preservation fix.
 
 Changing isolation preserves application cursors, their result metadata, and
 statement diagnostics. Only the connection's diagnostics are cleared for the

@@ -749,6 +749,7 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
         // Retain the cached-value shortcut: unlike msodbcsql's isolation
         // branch (`sqlcmisc.cpp:1761-1828`), this skips the busy/transaction
         // checks and round trip. It does not restore changes made by raw SQL.
+        // Changing this pre-existing shortcut is tracked in #798.
         //
         // This cache tracks only isolation set through this attribute. Raw T-SQL
         // can therefore make SQLGetConnectAttr report a stale value.
