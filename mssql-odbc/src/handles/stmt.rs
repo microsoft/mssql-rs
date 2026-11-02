@@ -951,6 +951,7 @@ impl DaeParam {
             sql_type: crate::api::odbc_types::SQL_VARBINARY,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value_ptr,
@@ -1115,6 +1116,14 @@ pub(crate) struct DaeState {
     pub(crate) fractional_truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TvpBatchStageError {
+    CapacityExceeded,
+    InvalidState,
+    MemoryAllocation,
+    Overflow,
+}
+
 impl DaeState {
     pub(crate) fn new(
         client: WireLease,
@@ -1266,14 +1275,152 @@ impl DaeState {
         self.params.get(self.cursor?)
     }
 
-    pub(crate) fn tvp_row_capacity(&self, tvp_index: usize) -> Option<usize> {
-        let param = self.current_param()?;
-        match param.target {
-            DaeTarget::TvpRowControl {
-                tvp_index: target, ..
-            } if target == tvp_index => Some(param.binding.column_size),
-            _ => None,
+    pub(crate) fn stage_tvp_batch(
+        &mut self,
+        tvp_index: usize,
+        row_index: usize,
+        batch_count: usize,
+    ) -> Result<(), TvpBatchStageError> {
+        let current = self
+            .current_param()
+            .filter(|param| {
+                matches!(
+                    param.target,
+                    DaeTarget::TvpRowControl {
+                        tvp_index: target,
+                        row_index: target_row,
+                    } if target == tvp_index && target_row == row_index
+                )
+            })
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        let capacity = current.binding.column_size;
+        if batch_count > capacity {
+            return Err(TvpBatchStageError::CapacityExceeded);
         }
+        let batch_end = row_index
+            .checked_add(batch_count)
+            .ok_or(TvpBatchStageError::Overflow)?;
+        if batch_count == 0 {
+            return Ok(());
+        }
+
+        let segment_end = self
+            .params
+            .iter()
+            .rposition(|param| {
+                matches!(
+                    param.target,
+                    DaeTarget::TvpRowControl { tvp_index: target, .. }
+                        | DaeTarget::TvpCell { tvp_index: target, .. }
+                        if target == tvp_index
+                )
+            })
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        let staged_end = self.params[..=segment_end]
+            .iter()
+            .filter_map(|param| match param.target {
+                DaeTarget::TvpRowControl {
+                    tvp_index: target,
+                    row_index,
+                } if target == tvp_index => Some(row_index),
+                _ => None,
+            })
+            .max()
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        if batch_end <= staged_end {
+            return Ok(());
+        }
+
+        let mut cell_templates = Vec::new();
+        let template_count = self.params[..=segment_end]
+            .iter()
+            .filter(|param| {
+                matches!(
+                    param.target,
+                    DaeTarget::TvpCell {
+                        tvp_index: target,
+                        row_index: 0,
+                        ..
+                    } if target == tvp_index
+                )
+            })
+            .count();
+        cell_templates
+            .try_reserve_exact(template_count)
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        for column_index in 0..template_count {
+            let template = self.params[..=segment_end]
+                .iter()
+                .find(|param| {
+                    matches!(
+                        param.target,
+                        DaeTarget::TvpCell {
+                            tvp_index: target,
+                            row_index: 0,
+                            column_index: column,
+                        } if target == tvp_index && column == column_index
+                    )
+                })
+                .cloned()
+                .ok_or(TvpBatchStageError::InvalidState)?;
+            cell_templates.push(template);
+        }
+
+        let additional_rows = batch_end - staged_end;
+        let token_count = additional_rows
+            .checked_mul(
+                cell_templates
+                    .len()
+                    .checked_add(1)
+                    .ok_or(TvpBatchStageError::Overflow)?,
+            )
+            .ok_or(TvpBatchStageError::Overflow)?;
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(token_count)
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+
+        let current_control = current.clone();
+        for row in staged_end..batch_end {
+            if row != staged_end {
+                let mut row_control = current_control.clone();
+                row_control.target = DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index: row,
+                };
+                staged.push(row_control);
+            }
+            for template in &cell_templates {
+                let Some(layout) = template.tvp_cell_binding else {
+                    return Err(TvpBatchStageError::InvalidState);
+                };
+                let mut cell = template.clone();
+                cell.target = DaeTarget::TvpCell {
+                    tvp_index,
+                    row_index: row,
+                    column_index: match template.target {
+                        DaeTarget::TvpCell { column_index, .. } => column_index,
+                        _ => return Err(TvpBatchStageError::InvalidState),
+                    },
+                };
+                cell.binding = layout.binding;
+                cell.value_ptr = layout.binding.parameter_value_ptr;
+                cell.expected_len = None;
+                staged.push(cell);
+            }
+        }
+        let mut terminal = current_control;
+        terminal.target = DaeTarget::TvpRowControl {
+            tvp_index,
+            row_index: batch_end,
+        };
+        staged.push(terminal);
+
+        self.params
+            .try_reserve(staged.len())
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        self.params.splice(segment_end + 1..segment_end + 1, staged);
+        Ok(())
     }
 
     pub(crate) fn position_current_tvp_cell(&mut self) -> Result<(), ()> {

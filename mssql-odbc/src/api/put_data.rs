@@ -25,8 +25,8 @@ use crate::api::odbc_types::{
     SQL_NULL_DATA, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn,
 };
 use crate::conversion::param_convert::reserve_dae_buffer;
-use crate::error::free_errors;
-use crate::handles::stmt::DaeTarget;
+use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::{DaeTarget, TvpBatchStageError};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Supplies a data chunk for the current data-at-execution parameter.
@@ -165,19 +165,31 @@ unsafe fn sql_put_data_operation(
             error!("SQLPutData: stmt mutex poisoned checking TVP row control");
             return SQL_ERROR;
         };
-        let Some(dae) = stmt_state.dae.as_ref() else {
-            error!("SQLPutData: DAE sequence ended before TVP row control");
-            return SQL_ERROR;
+        let (target, call_in_flight, put_data_called) = {
+            let Some(dae) = stmt_state.dae.as_ref() else {
+                error!("SQLPutData: DAE sequence ended before TVP row control");
+                return SQL_ERROR;
+            };
+            (
+                dae.current_param().map(|param| param.target),
+                dae.call_in_flight(),
+                dae.progress.put_data_called,
+            )
         };
-        match dae.current_param().map(|param| param.target) {
+        match target {
             Some(DaeTarget::TvpRowControl {
                 tvp_index,
                 row_index,
             }) => {
-                if dae.call_in_flight() {
+                if call_in_flight {
                     error!("SQLPutData: DAE sequence is in use by another call");
                     post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                     return SQL_ERROR;
+                }
+                if put_data_called {
+                    drop(stmt_state);
+                    error!("SQLPutData: multiple writes to a TVP row-control token");
+                    return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_FUNCTION_SEQUENCE);
                 }
                 let batch_count = if row_index == 0 && strlen_or_ind == SQL_DEFAULT_PARAM {
                     Some(0)
@@ -195,24 +207,32 @@ unsafe fn sql_put_data_operation(
                     post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
                     return SQL_ERROR;
                 };
-                let Some(capacity) = dae.tvp_row_capacity(tvp_index) else {
-                    error!("SQLPutData: TVP row-control token has no capacity");
-                    return SQL_ERROR;
-                };
-                if batch_count > capacity.saturating_sub(row_index) {
-                    error!("SQLPutData: TVP row batch exceeds the bound capacity");
-                    post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
-                    return SQL_ERROR;
-                }
-                if dae.progress.put_data_called {
-                    drop(stmt_state);
-                    error!("SQLPutData: multiple writes to a TVP row-control token");
-                    return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_FUNCTION_SEQUENCE);
-                }
                 let Some(dae) = stmt_state.dae.as_mut() else {
-                    error!("SQLPutData: DAE sequence vanished capturing TVP row control");
+                    error!("SQLPutData: DAE sequence vanished extending TVP row batch");
                     return SQL_ERROR;
                 };
+                if let Err(stage_error) = dae.stage_tvp_batch(tvp_index, row_index, batch_count) {
+                    match stage_error {
+                        TvpBatchStageError::CapacityExceeded | TvpBatchStageError::Overflow => {
+                            error!("SQLPutData: TVP row batch exceeds the bound capacity");
+                            post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                        }
+                        TvpBatchStageError::MemoryAllocation => {
+                            error!("SQLPutData: failed to extend TVP row batch tokens");
+                            post_diag(&mut stmt_state, ERR_MEMORY_ALLOCATION);
+                        }
+                        TvpBatchStageError::InvalidState => {
+                            error!("SQLPutData: failed to extend TVP row batch tokens");
+                            post_sql_error(
+                                &mut stmt_state,
+                                SQLSTATE_HY000,
+                                0,
+                                "Internal error extending table-valued parameter data-at-execution batch",
+                            );
+                        }
+                    }
+                    return SQL_ERROR;
+                }
                 dae.progress.put_data_called = true;
                 dae.progress.tvp_row_batch_count = Some(batch_count);
                 true
@@ -909,6 +929,33 @@ mod tests {
         assert!(progress.put_data_called);
         assert_eq!(progress.tvp_row_batch_count, Some(1));
         assert!(progress.buffer.is_empty());
+    }
+
+    #[test]
+    fn tvp_row_control_batch_cannot_exceed_reusable_capacity() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        control.binding.column_size = 1;
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(vec![control], Some(0)));
+        }
+
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, 1usize as SqlPointer, 2) },
+            SQL_ERROR
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_INVALID_STRING_OR_BUFFER_LENGTH.state
+        );
     }
 
     #[test]

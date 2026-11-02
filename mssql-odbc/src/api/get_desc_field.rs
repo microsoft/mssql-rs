@@ -285,27 +285,69 @@ fn sql_get_desc_field_w_safe(
 
 fn get_focused_tvp_header_field(
     desc: &DescHandle,
-    record_number: SqlSmallInt,
+    _record_number: SqlSmallInt,
     field_identifier: SqlSmallInt,
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> Option<SqlReturn> {
-    if !matches!(
-        desc.kind,
-        crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
-    ) || record_number != 0
-    {
+    let field = SqlUSmallInt::try_from(field_identifier).ok()?;
+    let is_count = field == SQL_DESC_COUNT;
+    if if is_count {
+        !matches!(
+            desc.kind,
+            crate::handles::desc::DescKind::AppParam
+                | crate::handles::desc::DescKind::Ad
+                | crate::handles::desc::DescKind::ImpParam
+        )
+    } else {
+        !matches!(
+            desc.kind,
+            crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
+        )
+    } {
         return None;
     }
-    let field = SqlUSmallInt::try_from(field_identifier).ok()?;
     if !matches!(
         field,
-        SQL_DESC_ARRAY_SIZE | SQL_DESC_BIND_OFFSET_PTR | SQL_DESC_BIND_TYPE
+        SQL_DESC_COUNT | SQL_DESC_ARRAY_SIZE | SQL_DESC_BIND_OFFSET_PTR | SQL_DESC_BIND_TYPE
     ) || !classify_field(desc.kind, field)
         .is_some_and(|access| access.scope == FieldScope::Header)
     {
         return None;
+    }
+    if is_count {
+        let count = match desc.focused_tvp_record_count() {
+            Ok(Some(count)) => count,
+            Ok(None) => return None,
+            Err(()) => {
+                error!("SQLGetDescFieldW: failed reading focused TVP descriptor count");
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLGetDescFieldW: desc mutex poisoned posting child-count error");
+                    return Some(SQL_ERROR);
+                };
+                free_errors(&mut state);
+                post_sql_error(
+                    &mut state,
+                    crate::api::sqlstate::SQLSTATE_HY000,
+                    0,
+                    "Internal error reading focused table-valued parameter descriptor count",
+                );
+                return Some(SQL_ERROR);
+            }
+        };
+        let Ok(mut state) = desc.inner.lock() else {
+            error!("SQLGetDescFieldW: desc mutex poisoned reading child count");
+            return Some(SQL_ERROR);
+        };
+        free_errors(&mut state);
+        let count = SqlSmallInt::try_from(count).unwrap_or(SqlSmallInt::MAX);
+        return Some(FieldValue::SmallInt(count).write(
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+            &mut state,
+        ));
     }
     let headers = match desc.focused_tvp_layout_headers() {
         Ok(headers) => headers,

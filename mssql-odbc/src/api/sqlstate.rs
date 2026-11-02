@@ -759,6 +759,10 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
         TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
+        TdsError::TvpCellSerialization { source, .. } => match source.as_ref() {
+            TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
+            _ => default,
+        },
         TdsError::OperationCancelledError(_) => SQLSTATE_HY008,
         _ => default,
     };
@@ -1023,6 +1027,25 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_22001);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    #[test]
+    fn tvp_cell_encoded_value_overflow_keeps_coordinates_and_maps_to_22001() {
+        let mut s = FakeState::default();
+        let err = TdsError::TvpCellSerialization {
+            parameter: "name @tvp".to_string(),
+            row: 2,
+            column: 1,
+            source: Box::new(TdsError::EncodedValueTooLong {
+                actual: 5,
+                maximum: 3,
+            }),
+        };
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_22001);
+        assert!(s.records[0].message.contains("name @tvp"));
+        assert!(s.records[0].message.contains("row 2, column 1"));
     }
 
     /// A client-side deadline elapsing (`SQL_ATTR_QUERY_TIMEOUT` /

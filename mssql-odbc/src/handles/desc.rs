@@ -834,15 +834,23 @@ impl DescHandle {
     pub(crate) fn update_focused_tvp_bindings(
         &self,
         record_number: SqlSmallInt,
+        initial_binding: Option<crate::params::BoundParam>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         update: impl FnMut(&mut crate::params::BoundParam),
     ) -> Result<Option<bool>, ()> {
-        self.update_focused_tvp_bindings_after_validation(record_number, is_valid, update, || {})
+        self.update_focused_tvp_bindings_after_validation(
+            record_number,
+            initial_binding,
+            is_valid,
+            update,
+            || {},
+        )
     }
 
     fn update_focused_tvp_bindings_after_validation(
         &self,
         record_number: SqlSmallInt,
+        initial_binding: Option<crate::params::BoundParam>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         mut update: impl FnMut(&mut crate::params::BoundParam),
         after_validation: impl FnOnce(),
@@ -881,12 +889,13 @@ impl DescHandle {
             if focus == 0 {
                 continue;
             }
-            if let Some(binding) = state
+            let binding = state
                 .tvp_column_bindings
                 .get(&focus)
                 .and_then(|columns| columns.get(column_index))
                 .and_then(Option::as_ref)
-            {
+                .or(initial_binding.as_ref());
+            if let Some(binding) = binding {
                 found = true;
                 if !is_valid(binding) {
                     return Ok(Some(false));
@@ -921,15 +930,39 @@ impl DescHandle {
             if focus == 0 {
                 continue;
             }
-            if let Some(Some(binding)) = state
+            let existing = state
                 .tvp_column_bindings
-                .get_mut(&focus)
-                .and_then(|columns| columns.get_mut(column_index))
-            {
+                .get(&focus)
+                .and_then(|columns| columns.get(column_index))
+                .and_then(Option::as_ref)
+                .is_some();
+            if existing {
+                let Some(Some(binding)) = state
+                    .tvp_column_bindings
+                    .get_mut(&focus)
+                    .and_then(|columns| columns.get_mut(column_index))
+                else {
+                    continue;
+                };
                 if !is_valid(binding) {
                     return Ok(Some(false));
                 }
                 update(binding);
+                updated = true;
+            } else if let Some(mut binding) = initial_binding {
+                if !is_valid(&binding) {
+                    return Ok(Some(false));
+                }
+                update(&mut binding);
+                let columns = state.tvp_column_bindings.entry(focus).or_default();
+                if columns.len() <= column_index {
+                    let additional = column_index + 1 - columns.len();
+                    columns.try_reserve(additional).map_err(|_| {
+                        error!("updating focused TVP descriptor records: allocation failed");
+                    })?;
+                    columns.resize(column_index + 1, None);
+                }
+                columns[column_index] = Some(binding);
                 updated = true;
             }
         }
@@ -1015,6 +1048,113 @@ impl DescHandle {
             }
         }
         Ok(headers)
+    }
+
+    pub(crate) fn focused_tvp_record_count(&self) -> Result<Option<usize>, ()> {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("reading focused TVP descriptor count: dbc mutex poisoned");
+            return Err(());
+        };
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(state) = stmt.inner.lock() else {
+                error!("reading focused TVP descriptor count: stmt mutex poisoned");
+                return Err(());
+            };
+            let owns_focus = if self.kind == DescKind::ImpParam {
+                std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self)
+            } else {
+                std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self)
+            };
+            if !owns_focus {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus != 0 {
+                return Ok(Some(
+                    state.tvp_column_bindings.get(&focus).map_or(0, Vec::len),
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn update_focused_tvp_record_count(
+        &self,
+        record_count: usize,
+    ) -> Result<Option<bool>, ()> {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
+        let Ok(dbc_state) = dbc.inner.lock() else {
+            error!("updating focused TVP descriptor count: dbc mutex poisoned");
+            return Err(());
+        };
+        let mut found = false;
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(mut state) = stmt.inner.lock() else {
+                error!("reserving focused TVP descriptor records: stmt mutex poisoned");
+                return Err(());
+            };
+            let owns_focus = if self.kind == DescKind::ImpParam {
+                std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self)
+            } else {
+                std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self)
+            };
+            if !owns_focus {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus == 0 {
+                continue;
+            }
+            found = true;
+            let columns = state.tvp_column_bindings.entry(focus).or_default();
+            if columns.len() < record_count {
+                columns
+                    .try_reserve_exact(record_count - columns.len())
+                    .map_err(|_| {
+                        error!("updating focused TVP descriptor records: allocation failed");
+                    })?;
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+
+        for &raw in &dbc_state.statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let Ok(mut state) = stmt.inner.lock() else {
+                error!("updating focused TVP descriptor records: stmt mutex poisoned");
+                return Err(());
+            };
+            let owns_focus = if self.kind == DescKind::ImpParam {
+                std::ptr::eq(stmt.ipd.cast::<DescHandle>(), self)
+            } else {
+                std::ptr::eq(state.effective_apd(stmt).cast::<DescHandle>(), self)
+            };
+            if !owns_focus {
+                continue;
+            }
+            let focus = state
+                .vendor_attrs
+                .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+                .unwrap_or(0);
+            if focus != 0 {
+                state
+                    .tvp_column_bindings
+                    .entry(focus)
+                    .or_default()
+                    .resize(record_count, None);
+            }
+        }
+        Ok(Some(true))
     }
 
     pub(crate) fn update_focused_tvp_layout_headers(
@@ -1292,6 +1432,7 @@ mod tests {
                     sql_type: SQL_NUMERIC,
                     column_size: 10,
                     decimal_digits: scale,
+                    app_datetime_interval_code: None,
                     app_precision: precision,
                     app_scale: scale,
                     parameter_value_ptr: std::ptr::null_mut(),
@@ -1306,6 +1447,7 @@ mod tests {
 
         let result = desc.update_focused_tvp_bindings_after_validation(
             1,
+            None,
             |binding| binding.app_scale <= 5,
             |binding| binding.app_precision = 5,
             || {

@@ -1132,6 +1132,7 @@ mod tests {
             sql_type: crate::api::odbc_types::SQL_SS_TABLE,
             column_size: 2,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -1253,6 +1254,58 @@ mod tests {
         assert_eq!(dae.tvp_cells[1].value, Some(SqlType::Int(Some(22))));
         assert_eq!(dae.tvp_cells[0].row_index, 0);
         assert_eq!(dae.tvp_cells[1].row_index, 1);
+    }
+
+    #[test]
+    fn tvp_dae_batches_can_exceed_the_reusable_array_capacity() {
+        use crate::api::exports::{SQLParamData, SQLPutData};
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut values = [11, 999];
+        let mut indicators = [std::mem::size_of::<i32>() as SqlLen; 2];
+        let mut lengths = indicators;
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut lengths,
+        ));
+
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+
+        values[0] = 22;
+        values[1] = 33;
+        assert_eq!(values, [22, 33]);
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(dae.tvp_row_counts.get(&0), Some(&4));
+        assert_eq!(
+            dae.tvp_cells
+                .iter()
+                .map(|cell| (cell.row_index, cell.value.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Some(SqlType::Int(Some(11)))),
+                (1, Some(SqlType::Int(Some(999)))),
+                (2, Some(SqlType::Int(Some(22)))),
+                (3, Some(SqlType::Int(Some(33)))),
+            ]
+        );
     }
 
     #[test]

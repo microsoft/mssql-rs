@@ -51,6 +51,15 @@ pub(crate) fn map_tds_error(
         | TdsError::EncodedValueTooLong { .. }
         | TdsError::UnsupportedEncoding { .. }
         | TdsError::ColumnEncryptionError(_) => DataError::new_err(message),
+        TdsError::TvpCellSerialization { source, .. } => match *source {
+            TdsError::UsageError(_) => ProgrammingError::new_err(message),
+            TdsError::TypeConversionError(_)
+            | TdsError::EncodedValueTooLong { .. }
+            | TdsError::UnsupportedEncoding { .. }
+            | TdsError::ColumnEncryptionError(_) => DataError::new_err(message),
+            TdsError::UnimplementedFeature { .. } => NotSupportedError::new_err(message),
+            _ => OperationalError::new_err(message),
+        },
         TdsError::UnimplementedFeature { .. } => NotSupportedError::new_err(message),
         TdsError::ProtocolError(_)
         | TdsError::ImplementationError(_)

@@ -2604,6 +2604,7 @@ mod tests {
             sql_type: 0,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: ptr,
@@ -4572,6 +4573,37 @@ mod tests {
             unsafe { tvp_row_count(&binding, 0) },
             Err(ParamBuildError::InvalidTvpRowCount)
         );
+    }
+
+    #[test]
+    fn tvp_build_reads_row_count_after_outer_bind_offset_once() {
+        let names = UdtNames {
+            type_name: "Rows".into(),
+            ..Default::default()
+        };
+        let mut row_counts: [SqlLen; 3] = [0, 1, 0];
+        let mut parent = param(SQL_C_BINARY, std::ptr::null_mut(), row_counts.as_mut_ptr())
+            .with_bind_offset(std::mem::size_of::<SqlLen>() as isize);
+        parent.column_size = 1;
+        assert_eq!(unsafe { tvp_row_count(&parent, 0) }, Ok(Some(1)));
+        assert_eq!(
+            unsafe { tvp_row_count(&parent, std::mem::size_of::<SqlLen>() as isize) },
+            Ok(Some(0))
+        );
+        assert!(matches!(
+            unsafe {
+                build_tvp_param(
+                    None,
+                    &parent,
+                    Some(&names),
+                    &[None],
+                    0,
+                    0,
+                    SQL_BIND_BY_COLUMN,
+                )
+            },
+            Err(ParamBuildError::TvpColumnUnbound(0))
+        ));
     }
 
     #[test]

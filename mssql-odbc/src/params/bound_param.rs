@@ -42,6 +42,9 @@ pub(crate) struct BoundParam {
     pub(crate) column_size: SqlULen,
     /// Decimal digits (scale) as passed by the application.
     pub(crate) decimal_digits: SqlSmallInt,
+    /// Application descriptor subtype, which can be set before its datetime
+    /// family type. `None` uses the subtype implied by `c_type`.
+    pub(crate) app_datetime_interval_code: Option<SqlSmallInt>,
     pub(crate) app_precision: SqlSmallInt,
     pub(crate) app_scale: SqlSmallInt,
     /// Pointer to the application's value buffer (read at execute time).
@@ -192,7 +195,9 @@ impl BoundParam {
         ipd_record: &mut DescRecord,
     ) {
         apd_record.concise_type = self.c_type;
-        apd_record.datetime_interval_code = datetime_interval_code_for(self.c_type);
+        apd_record.datetime_interval_code = self
+            .app_datetime_interval_code
+            .unwrap_or_else(|| datetime_interval_code_for(self.c_type));
         apd_record.reset_app_type_defaults(self.c_type);
         apd_record.data_ptr = self.parameter_value_ptr;
         apd_record.data_bound = true;
@@ -280,6 +285,7 @@ impl BoundParam {
             sql_type,
             column_size,
             decimal_digits,
+            app_datetime_interval_code: Some(apd_record.datetime_interval_code),
             app_precision: apd_record.precision,
             app_scale: apd_record.scale,
             parameter_value_ptr: apd_record.data_ptr,
@@ -347,6 +353,7 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 8,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value,
@@ -507,6 +514,7 @@ mod tests {
             sql_type: crate::api::odbc_types::SQL_DECIMAL,
             column_size,
             decimal_digits,
+            app_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -604,6 +612,7 @@ mod tests {
             sql_type: crate::api::odbc_types::SQL_TYPE_TIMESTAMP,
             column_size: 27,
             decimal_digits: 7,
+            app_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr().cast(),

@@ -244,6 +244,20 @@ pub enum Error {
         maximum: usize,
     },
 
+    /// A TVP cell failed while being serialized.
+    #[error("TVP parameter {parameter}, row {row}, column {column} serialization failed: {source}")]
+    TvpCellSerialization {
+        /// Parameter name or ordinal in the RPC request.
+        parameter: String,
+        /// Zero-based row containing the cell.
+        row: usize,
+        /// Zero-based column containing the cell.
+        column: usize,
+        /// The underlying cell serialization error.
+        #[source]
+        source: Box<Error>,
+    },
+
     /// Connection was closed by server or transport.
     #[error("Connection closed: {0}")]
     ConnectionClosed(String),
@@ -338,6 +352,43 @@ pub enum Error {
         "The connection reset was not acknowledged by the server, so the session was not returned to its login defaults"
     )]
     ConnectionResetNotAcknowledged,
+}
+
+impl Error {
+    pub(crate) fn with_tvp_cell_context(self, row: usize, column: usize) -> Self {
+        if !matches!(
+            &self,
+            Self::UsageError(_)
+                | Self::TypeConversionError(_)
+                | Self::EncodedValueTooLong { .. }
+                | Self::UnsupportedEncoding { .. }
+        ) {
+            return self;
+        }
+        Self::TvpCellSerialization {
+            parameter: "unknown".to_string(),
+            row,
+            column,
+            source: Box::new(self),
+        }
+    }
+
+    pub(crate) fn with_tvp_parameter_context(self, parameter: String) -> Self {
+        match self {
+            Self::TvpCellSerialization {
+                row,
+                column,
+                source,
+                ..
+            } => Self::TvpCellSerialization {
+                parameter,
+                row,
+                column,
+                source,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Helper for `SqlServerError` display formatting.

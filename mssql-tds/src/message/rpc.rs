@@ -128,10 +128,13 @@ impl<'a> SqlRpc<'a> {
         // Example: Write a placeholder implementation
         if let Some(positional_parameters) = &self.positional_parameters {
             let encoder = GenericEncoder::new();
-            for parameter in positional_parameters {
-                parameter
+            for (index, parameter) in positional_parameters.iter().enumerate() {
+                if let Err(error) = parameter
                     .serialize(packet_writer, self.db_collation, true, &encoder)
-                    .await?;
+                    .await
+                {
+                    return Err(error.with_tvp_parameter_context(format!("position {}", index + 1)));
+                }
             }
         } else {
             debug!("Positional parameters are None, skipping serialization.");
@@ -145,9 +148,13 @@ impl<'a> SqlRpc<'a> {
         if let Some(parameters) = &self.named_parameters {
             let encoder = GenericEncoder::new();
             for parameter in parameters {
-                parameter
+                if let Err(error) = parameter
                     .serialize(packet_writer, self.db_collation, false, &encoder)
-                    .await?;
+                    .await
+                {
+                    let name = parameter.name.as_deref().unwrap_or("unnamed");
+                    return Err(error.with_tvp_parameter_context(format!("name {name}")));
+                }
             }
         }
         Ok(())
@@ -333,6 +340,49 @@ mod tests {
         });
         drop(writer);
         mock.data
+    }
+
+    #[test]
+    fn named_tvp_serialization_error_includes_parameter_and_cell_coordinates() {
+        let collation = SqlCollation::default();
+        let table = SqlType::Table(
+            crate::datatypes::sql_tvp::TvpTypeName::new(
+                Some("dbo".to_string()),
+                "ExampleType".to_string(),
+            ),
+            Some(crate::datatypes::sql_tvp::TvpTableData::new(
+                vec![crate::datatypes::sql_tvp::TvpColumnDef::new(
+                    SqlType::Varchar(None, 2),
+                )],
+                vec![vec![SqlType::Varchar(
+                    Some(SqlString::from_utf8_string("too long".to_string())),
+                    2,
+                )]],
+            )),
+        );
+        let parameter = RpcParameter::new(Some("@tvp".to_string()), StatusFlags::NONE, table);
+        let context = ExecutionContext::new();
+        let rpc = SqlRpc::new(
+            RpcType::Named("proc".to_string()),
+            None,
+            Some(vec![parameter]),
+            &collation,
+            &context,
+        );
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+
+        let error = block_on(rpc.serialize_prefix(&mut writer)).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::TvpCellSerialization {
+                parameter,
+                row: 0,
+                column: 0,
+                ..
+            } if parameter == "name @tvp"
+        ));
+        assert!(error.to_string().contains("row 0, column 0"));
     }
 
     #[test]

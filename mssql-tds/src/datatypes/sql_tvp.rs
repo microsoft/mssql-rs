@@ -563,7 +563,7 @@ pub(crate) async fn write_tvp_rows(
     rows: &[Vec<SqlType>],
     db_collation: &SqlCollation,
 ) -> TdsResult<()> {
-    for row in rows {
+    for (row_index, row) in rows.iter().enumerate() {
         if row.len() != columns.len() {
             return Err(Error::UsageError(format!(
                 "TVP row has {} values but the table type has {} columns",
@@ -574,7 +574,7 @@ pub(crate) async fn write_tvp_rows(
 
         packet_writer.write_byte_async(TVP_ROW_TOKEN).await?;
 
-        for (column, cell) in columns.iter().zip(row.iter()) {
+        for (column_index, (column, cell)) in columns.iter().zip(row.iter()).enumerate() {
             let (mut value, cell_ctx) = cell.to_column_value_and_context(db_collation);
             let ctx = if matches!(column.column_type, SqlType::Variant(_)) {
                 cell_ctx
@@ -590,14 +590,18 @@ pub(crate) async fn write_tvp_rows(
             // Callers must have run `TvpTableData::validate` first: this can
             // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
             // buffered, which would leave a half-written TVP on the wire.
-            apply_column_metadata(column, &mut value)?;
-            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
-                packet_writer,
-                &value,
-                &ctx,
-                None,
-            )
-            .await?;
+            let result = async {
+                apply_column_metadata(column, &mut value)?;
+                TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                    packet_writer,
+                    &value,
+                    &ctx,
+                    None,
+                )
+                .await
+            }
+            .await;
+            result.map_err(|source| source.with_tvp_cell_context(row_index, column_index))?;
         }
     }
 
@@ -674,6 +678,49 @@ mod tests {
             &mock.data[PacketWriter::PACKET_HEADER_SIZE..],
             &[TVP_ROW_TOKEN, 3, 0, 0xE2, 0x82, 0xAC, TVP_END_TOKEN]
         );
+    }
+
+    #[tokio::test]
+    async fn tvp_cell_serialization_error_includes_zero_based_coordinates() {
+        let columns = [
+            TvpColumnDef::new(SqlType::Int(None)),
+            TvpColumnDef::new(SqlType::Varchar(None, 2)),
+        ];
+        let rows = [
+            vec![
+                SqlType::Int(Some(1)),
+                SqlType::Varchar(
+                    Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                        "ok".to_string(),
+                    )),
+                    2,
+                ),
+            ],
+            vec![
+                SqlType::Int(Some(2)),
+                SqlType::Varchar(
+                    Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                        "too long".to_string(),
+                    )),
+                    2,
+                ),
+            ],
+        ];
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+
+        let error = write_tvp_rows(&mut writer, &columns, &rows, &default_collation())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                source,
+                ..
+            } if matches!(*source, Error::EncodedValueTooLong { .. })
+        ));
     }
 
     #[test]
@@ -765,10 +812,18 @@ mod tests {
 
         assert!(matches!(
             row_bytes_with_collation(&columns, &rows, &collation).await,
-            Err(Error::EncodedValueTooLong {
-                actual: 2,
-                maximum: 1
-            })
+            Err(Error::TvpCellSerialization {
+                row: 0,
+                column: 0,
+                source,
+                ..
+            }) if matches!(
+                *source,
+                Error::EncodedValueTooLong {
+                    actual: 2,
+                    maximum: 1
+                }
+            )
         ));
     }
 
@@ -896,10 +951,19 @@ mod tests {
 
         assert!(matches!(
             error,
-            Error::EncodedValueTooLong {
-                actual: 5,
-                maximum: 4
+            Error::TvpCellSerialization {
+                row: 0,
+                column: 0,
+                source,
+                ..
             }
+                if matches!(
+                    *source,
+                    Error::EncodedValueTooLong {
+                        actual: 5,
+                        maximum: 4
+                    }
+                )
         ));
     }
 

@@ -24,8 +24,8 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_DESC_TYPE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt,
+    SQL_C_DEFAULT, SQL_DESC_TYPE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS,
+    SQL_UNKNOWN_TYPE, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
 };
 use crate::api::set_desc_field::{
     set_data_ptr, set_precision, set_scale, set_type, write_record_field,
@@ -167,8 +167,23 @@ fn sql_set_desc_rec_safe(
             let validation_diagnostic = std::cell::Cell::new(None);
             let internal_error = std::cell::Cell::new(false);
             let focused_type = std::cell::Cell::new(None);
+            let initial_binding = crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_DEFAULT,
+                sql_type: SQL_UNKNOWN_TYPE,
+                column_size: 0,
+                decimal_digits: 0,
+                app_datetime_interval_code: None,
+                app_precision: 0,
+                app_scale: 0,
+                parameter_value_ptr: std::ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: std::ptr::null_mut(),
+                octet_length_ptr: std::ptr::null_mut(),
+            };
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
+                Some(initial_binding),
                 |binding| {
                     if !is_valid_c_type(requested_c_type) {
                         validation_diagnostic.set(Some(ERR_INVALID_C_DATA_TYPE));
@@ -199,6 +214,8 @@ fn sql_set_desc_rec_safe(
                     }
                 },
                 |binding| {
+                    let (resolved_type, datetime_interval_code) =
+                        focused_type.get().unwrap_or((requested_c_type, 0));
                     binding.c_type = if requested_c_type == SQL_C_DEFAULT {
                         resolve_default_c_type(
                             binding.sql_type,
@@ -206,8 +223,9 @@ fn sql_set_desc_rec_safe(
                         )
                         .unwrap_or(SQL_C_DEFAULT)
                     } else {
-                        focused_type.get().unwrap_or(requested_c_type)
+                        resolved_type
                     };
+                    binding.app_datetime_interval_code = Some(datetime_interval_code);
                     binding.buffer_length = length;
                     binding.app_precision = precision;
                     binding.app_scale = scale;
@@ -267,10 +285,10 @@ fn sql_set_desc_rec_safe(
     })
 }
 
-fn current_odbc_version(desc: &DescHandle) -> Result<OdbcVersion, ()> {
+pub(super) fn current_odbc_version(desc: &DescHandle) -> Result<OdbcVersion, ()> {
     let dbc = unsafe { handle_from_raw::<DbcHandle>(desc.parent_dbc) };
     let Ok(state) = dbc.parent_env().inner.lock() else {
-        error!("SQLSetDescRec: env mutex poisoned reading ODBC version");
+        error!("descriptor update: env mutex poisoned reading ODBC version");
         return Err(());
     };
     Ok(state.odbc_version)
@@ -289,7 +307,7 @@ fn focused_tvp_desc_rec_type(
     data_ptr: SqlPointer,
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
-) -> Option<SqlSmallInt> {
+) -> Option<(SqlSmallInt, SqlSmallInt)> {
     let record_index = usize::try_from(record_number)
         .ok()
         .and_then(|number| number.checked_sub(1))?;
@@ -325,7 +343,7 @@ fn focused_tvp_desc_rec_type(
     state
         .records
         .get(record_index)
-        .map(|record| record.concise_type)
+        .map(|record| (record.concise_type, record.datetime_interval_code))
 }
 
 fn post_focused_tvp_diag(desc: &DescHandle, diagnostic: DiagMsg) -> SqlReturn {
@@ -726,6 +744,7 @@ mod tests {
                     sql_type: SQL_NUMERIC,
                     column_size: 10,
                     decimal_digits: 2,
+                    app_datetime_interval_code: None,
                     app_precision: 10,
                     app_scale: 2,
                     parameter_value_ptr: (&mut original as *mut i32).cast(),
@@ -813,6 +832,43 @@ mod tests {
         assert_eq!(
             binding.parameter_value_ptr,
             (&raw mut value).cast::<std::ffi::c_void>()
+        );
+    }
+
+    #[test]
+    fn focused_set_desc_rec_initializes_an_unbound_child_only() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        let mut value = 42i32;
+        let value_ptr = (&mut value as *mut i32).cast();
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_rec(
+                    h.apd(),
+                    1,
+                    crate::api::odbc_types::SQL_C_LONG,
+                    0,
+                    SqlLen::try_from(std::mem::size_of::<i32>()).unwrap(),
+                    0,
+                    0,
+                    value_ptr,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(record_count(h.apd()), 0);
+
+        let state = stmt.inner.lock().unwrap();
+        let binding = state.tvp_column_bindings[&1][0].as_ref().unwrap();
+        assert_eq!(binding.c_type, crate::api::odbc_types::SQL_C_LONG);
+        assert_eq!(binding.parameter_value_ptr, value_ptr);
+        assert_eq!(
+            binding.buffer_length,
+            SqlLen::try_from(std::mem::size_of::<i32>()).unwrap()
         );
     }
 
@@ -956,6 +1012,7 @@ mod tests {
                     sql_type: SQL_NUMERIC,
                     column_size: 10,
                     decimal_digits: 2,
+                    app_datetime_interval_code: None,
                     app_precision: 10,
                     app_scale: 2,
                     parameter_value_ptr: (&mut old_value as *mut u8).cast(),

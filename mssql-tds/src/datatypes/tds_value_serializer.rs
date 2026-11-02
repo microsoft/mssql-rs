@@ -156,7 +156,7 @@ impl TdsValueSerializer {
         'b: 'a,
     {
         if ctx.tds_type == SQL_VARIANT {
-            return Self::serialize_as_variant(writer, value, ctx, false).await;
+            return Self::serialize_as_variant(writer, value, ctx, None, false).await;
         }
 
         Self::serialize_value_inner(writer, value, ctx, None, false).await
@@ -175,7 +175,8 @@ impl TdsValueSerializer {
         // Check if target column is sql_variant (TDS type SQL_VARIANT)
         // If so, wrap the value with variant wire format
         if ctx.tds_type == SQL_VARIANT {
-            return Self::serialize_as_variant(writer, value, ctx, true).await;
+            return Self::serialize_as_variant(writer, value, ctx, narrow_string_byte_limit, true)
+                .await;
         }
 
         Self::serialize_value_inner(writer, value, ctx, narrow_string_byte_limit, true).await
@@ -2045,6 +2046,7 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
         fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
@@ -2092,8 +2094,12 @@ impl TdsValueSerializer {
             {
                 let (bytes, had_loss) = Self::resolve_narrow_wire_bytes(s, ctx.collation);
                 narrow_had_loss = had_loss;
+                let narrow_string_byte_limit =
+                    Self::effective_narrow_string_byte_limit(s, narrow_string_byte_limit);
+                let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit)
+                    .unwrap_or(ctx.max_size);
                 if fit_narrow_overflow {
-                    let fitted_len = Self::fit_narrow_bytes(&bytes, ctx.max_size)?.len();
+                    let fitted_len = Self::fit_narrow_bytes(&bytes, maximum)?.len();
                     Some(match bytes {
                         Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..fitted_len]),
                         Cow::Owned(mut bytes) => {
@@ -2102,10 +2108,10 @@ impl TdsValueSerializer {
                         }
                     })
                 } else {
-                    if bytes.len() > ctx.max_size {
+                    if bytes.len() > maximum {
                         return Err(Error::EncodedValueTooLong {
                             actual: bytes.len(),
-                            maximum: ctx.max_size,
+                            maximum,
                         });
                     }
                     Some(bytes)
@@ -4173,6 +4179,43 @@ mod serializer_tests {
         assert_eq!(bytes[4], 0xA7);
         assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 1);
         assert_eq!(&bytes[13..], b"a");
+    }
+
+    #[test]
+    fn variant_varchar_applies_value_level_narrow_byte_limit() {
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 10;
+        ctx.collation = Some(crate::token::tokens::SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        });
+        for (text, value_limit, parameter_limit) in
+            [(b"a ".as_slice(), 1, None), (b"a  ".as_slice(), 2, Some(1))]
+        {
+            let mut mock = MockNetworkWriter::new(128);
+            let mut writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+            let mut value = crate::datatypes::sql_string::SqlString::new(
+                text.to_vec(),
+                crate::datatypes::sql_string::EncodingType::Utf8,
+            );
+            value.set_narrow_string_byte_limit(value_limit);
+            block_on(
+                TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                    &mut writer,
+                    &ColumnValues::String(value),
+                    &ctx,
+                    parameter_limit,
+                ),
+            )
+            .unwrap();
+
+            let bytes = payload(&writer);
+            assert_eq!(&bytes[0..4], &10u32.to_le_bytes());
+            assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 1);
+            assert_eq!(&bytes[13..], b"a");
+        }
     }
 
     /// The collation defaulted when none is known must be the same one used
