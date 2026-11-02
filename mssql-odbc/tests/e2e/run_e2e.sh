@@ -18,11 +18,12 @@
 #
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
-#   pr       (default) every ctest entry except the <name>_mt entries, unless
-#            --filter or MSSQL_ODBC_MT_SKIP_MODES is set. Windows PR runs
-#            (run_e2e.ps1) cover /SharedDbc.
+#   pr       (default) every ctest entry; every mode except /SharedStmt, at the
+#            harness default of 2 threads x 1 iteration. Linux and macOS build
+#            no <name>_mt entries unless ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
 #   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
 #   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
+#            Both build with ODBC_E2E_CONCURRENT=ON.
 # nightly and weekly ignore --retries (an intermittent failure is what they
 # look for) and run each entry under gdb through run_mt_test.sh when gdb is
 # installed, so a crash or a watchdog abort prints every thread's stack. With
@@ -206,19 +207,14 @@ parse_args() {
 # header). Settings already in the environment win over the profile.
 # ----------------------------------------------------------------------------
 apply_mt_profile() {
-    local threads iters skip_override="${MSSQL_ODBC_MT_SKIP_MODES:-}"
+    local threads iters
     # AB#49575: restore SharedStmt after CI adopts the diagnostic-list fix.
     export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
     case "$MT_PROFILE" in
         pr)
-            # PR time budget: Windows PR runs cover /SharedDbc, and the stress
-            # profiles cover every mode on every platform. A filter or a mode
-            # override asks for the concurrent variants, so keep them then.
-            if [ -z "$skip_override" ] && [ -z "${TEST_FILTER:-}" ]; then
-                CTEST_ARGS+=(-LE mt)
-            fi
             ;;
         nightly|weekly)
+            export ODBC_E2E_CONCURRENT=ON
             if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
             export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
             export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"

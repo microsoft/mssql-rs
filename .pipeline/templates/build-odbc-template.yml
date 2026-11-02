@@ -37,6 +37,7 @@ steps:
         -v "$HOME/.cargo/registry:/root/.cargo/registry" \
         -v "$HOME/.cargo/git:/root/.cargo/git" \
         -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        -e ODBC_E2E_CONCURRENT \
         ${{ iif(eq(parameters.keepDebugInfo, true), '-e CARGO_PROFILE_RELEASE_STRIP=none -e CARGO_PROFILE_RELEASE_DEBUG=line-tables-only', '') }} \
         -w /workspace \
         ${{ parameters.buildImage }} \

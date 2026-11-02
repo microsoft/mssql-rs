@@ -523,7 +523,7 @@ races:
 
 | Profile | Where | Driver | Threads x iterations | Modes run | Retries |
 |---|---|---|---|---|---|
-| PR | validation pipeline, every PR | both | 2 x 1 | Windows: `SharedDbc` only; Unix: none | 3 |
+| PR | validation pipeline, every PR | both | 2 x 1 | Windows: `SharedDbc` only; Linux, macOS: none (not built) | 3 |
 | Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
 | Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
 | Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
@@ -543,9 +543,16 @@ races:
   profiles, so run their `_mt` entries locally in every mode before review.
   With every mode, the `_mt` entries took 11 of the Windows job's 60 minutes
   and up to 48 minutes of macOS e2e time (build 188193). With `/SharedDbc`
-  alone they took more than 15 minutes on macOS before the cancellation, where Docker under Colima
-  makes busy retries slow, and Test MacOS exceeded its 90-minute limit
-  (build 188249).
+  alone they took more than 15 minutes on macOS before the cancellation, where
+  Docker under Colima makes busy retries slow, and Test MacOS exceeded its
+  90-minute limit (build 188249).
+- Linux and macOS builds compile the concurrent variants only when
+  `ODBC_E2E_CONCURRENT=ON` is in the environment at CMake configure time; the
+  stress profiles set it, Windows builds them by default. Without it,
+  `ODBC_TEST_F` registers only the single-threaded test and no `<name>_mt`
+  entry exists. Compiling `execute`, `param_conversions` and `param_array` took
+  21 s instead of 89 s on Windows with it off; on macOS the C++ e2e build had
+  grown from 4.8 to 11.1 minutes with these suites converted.
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
 - Scenarios 7-15 join the stress run as their suites land (AB#49261,

@@ -112,6 +112,23 @@ if(MSVC)
     target_compile_options(odbc_test_lib PUBLIC /bigobj)
 endif()
 
+# The ODBC_TEST_F concurrent variants (<name>_mt) are compiled only where they
+# run: Windows by default. ODBC_E2E_CONCURRENT=ON|OFF in the environment at
+# configure time overrides that (the Unix stress builds set ON).
+if(DEFINED ENV{ODBC_E2E_CONCURRENT})
+    set(ODBC_E2E_CONCURRENT "$ENV{ODBC_E2E_CONCURRENT}")
+elseif(WIN32)
+    set(ODBC_E2E_CONCURRENT ON)
+else()
+    set(ODBC_E2E_CONCURRENT OFF)
+endif()
+if(ODBC_E2E_CONCURRENT)
+    message(STATUS "ODBC e2e tests: concurrent variants enabled")
+else()
+    target_compile_definitions(odbc_test_lib PUBLIC ODBC_E2E_SINGLE_THREADED)
+    message(STATUS "ODBC e2e tests: concurrent variants disabled (ODBC_E2E_CONCURRENT=ON enables them)")
+endif()
+
 # ---------------------------------------------------------------------------
 # include/odbc_sql_server_types.h copies values and layouts from msodbcsql.h
 # rather than depending on it. Where msodbcsql.h is installed, compile a check
@@ -145,8 +162,9 @@ endif()
 # Test registration
 #
 # An executable whose sources invoke ODBC_TEST_F or ODBC_TEST_F_MODES at the
-# start of a line (odbc_concurrent_test.h) is registered twice, so a concurrency
-# failure cannot hide the single-threaded verdict in the parity report:
+# start of a line (odbc_concurrent_test.h) is registered twice when
+# ODBC_E2E_CONCURRENT is on, so a concurrency failure cannot hide the
+# single-threaded verdict in the parity report:
 #   <name>     single-threaded tests only
 #   <name>_mt  the concurrent variants only, labelled "mt" (ctest -L mt)
 # Both filter on the mode suffixes rather than "*/*", because parameterized
@@ -177,7 +195,7 @@ endfunction()
 
 function(odbc_register_ctest TEST_NAME)
     odbc_uses_concurrent_tests(concurrent ${ARGN})
-    if(concurrent)
+    if(concurrent AND ODBC_E2E_CONCURRENT)
         add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME} "--gtest_filter=-${ODBC_MT_MODE_FILTER}")
         if(UNIX)
             add_test(NAME ${TEST_NAME}_mt

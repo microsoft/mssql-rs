@@ -85,6 +85,9 @@ variables:
   msodbcsqlVersion: '18.6.2.1'
   # Resolved when the run starts: the schedule that fired it, or the manual choice.
   odbcMtProfile: $[ iif(eq('${{ parameters.profile }}', 'auto'), iif(eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'), 'weekly', 'nightly'), '${{ parameters.profile }}') ]
+  # Linux builds compile the <name>_mt entries only when asked (CMakeLists.txt);
+  # the build templates forward this into their containers.
+  ODBC_E2E_CONCURRENT: 'ON'
 
 stages:
 - stage: Build_Linux_Drops
