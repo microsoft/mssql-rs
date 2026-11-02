@@ -564,7 +564,10 @@ races:
   `ODBC_TEST_F` registers only the single-threaded test and no `<name>_mt`
   entry exists. Compiling `execute`, `param_conversions` and `param_array` took
   21 s instead of 89 s on Windows with it off; on macOS the C++ e2e build had
-  grown from 4.8 to 11.1 minutes with these suites converted.
+  grown from 4.8 to 11.1 minutes with these suites converted. The stress
+  pipeline has no macOS leg, so no CI run exercises the concurrent variants on
+  macOS; run them locally with `--mt-profile=nightly` when a change is
+  macOS-specific.
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
 - Scenarios 7-15 join the stress run as their suites land (AB#49261,
