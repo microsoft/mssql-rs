@@ -139,20 +139,26 @@ def client_context():
 
 
 @pytest.fixture
-def mock_client_context():
-    """Client context backed by an ephemeral mock TDS server."""
+def mock_tds_server():
+    """Ephemeral TLS mock server, including received-token inspection."""
     if mssql_mock_tds is None:
         pytest.skip("mssql_mock_tds is not installed")
 
     server = mssql_mock_tds.PyMockTdsServer(port=0, tls=True)
     with server:
-        yield {
-            "server": server.sql_address,
-            "database": "master",
-            "access_token": "async-cursor-test-token",
-            "encryption": "Optional",
-            "trust_server_certificate": True,
-        }
+        yield server
+
+
+@pytest.fixture
+def mock_client_context(mock_tds_server):
+    """Client context backed by an ephemeral mock TDS server."""
+    return {
+        "server": mock_tds_server.sql_address,
+        "database": "master",
+        "access_token": "async-cursor-test-token",
+        "encryption": "Optional",
+        "trust_server_certificate": True,
+    }
 
 
 @pytest.fixture

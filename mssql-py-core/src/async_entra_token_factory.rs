@@ -7,8 +7,7 @@
 //! a non-empty JWT string in `token`. Acquisition runs on the captured asyncio
 //! loop; dropping the Rust operation schedules cancellation there, and a done
 //! callback observes the outcome even after the caller has stopped waiting.
-//! Providers remain caller-owned. Native connect and built-in SDK credentials
-//! are deliberately not wired through this adapter yet.
+//! Providers remain caller-owned. Built-in SDK credential selection is separate.
 
 use std::sync::Arc;
 
@@ -16,6 +15,7 @@ use async_trait::async_trait;
 use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticationMethod};
 use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
+use mssql_tds::security::SecurityError;
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -108,7 +108,9 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
                 Error::OperationCancelledError("Async Entra token acquisition cancelled".into())
             } else {
                 // Provider messages can contain credentials or tokens.
-                Error::ConnectionError("Async Entra token acquisition failed".into())
+                Error::Security(SecurityError::AuthenticationDenied(
+                    "Async Entra token acquisition failed".into(),
+                ))
             }
         })
     }

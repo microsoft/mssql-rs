@@ -18,16 +18,61 @@ use pyo3::types::{PyDict, PyType};
 use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
+use mssql_tds::connection::client_context::TdsAuthenticationMethod;
 use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+use mssql_tds::error::Error as TdsError;
 
 use crate::async_cursor::PyAsyncCursor;
+use crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory;
+use crate::async_errors::InterfaceError;
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
 use crate::connection::PyCoreConnection;
 use crate::python_logger_adapter::python_logger_dispatch;
 
 /// One-shot `FutureWarning` per process; silenceable via `warnings.filterwarnings`.
 static PREVIEW_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn validate_custom_token_context(dict: &Bound<'_, PyDict>) -> PyResult<()> {
+    let optional_string = |key| -> PyResult<Option<String>> {
+        dict.get_item(key)?
+            .filter(|value| !value.is_none())
+            .map(|value| value.extract())
+            .transpose()
+    };
+    let trusted_connection = optional_string("trusted_connection")?;
+    let trusted_connection = match trusted_connection.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("yes") => Some(true),
+        Some(value) if value.eq_ignore_ascii_case("no") => Some(false),
+        None => None,
+        Some(_) => {
+            return Err(InterfaceError::new_err(
+                "Trusted_Connection must be 'Yes' or 'No'",
+            ));
+        }
+    };
+    let mut conflicts = Vec::new();
+    if trusted_connection == Some(true) {
+        conflicts.push("trusted_connection");
+    }
+    for key in ["authentication", "user_name", "password"] {
+        if optional_string(key)?.is_some_and(|value| !value.is_empty()) {
+            conflicts.push(key);
+        }
+    }
+    for key in ["access_token", "entra_id_token_factory"] {
+        if dict.get_item(key)?.is_some_and(|value| !value.is_none()) {
+            conflicts.push(key);
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(InterfaceError::new_err(format!(
+            "token_provider cannot be combined with: {}",
+            conflicts.join(", ")
+        )));
+    }
+    Ok(())
+}
 
 fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
     if PREVIEW_WARNED.load(Ordering::Acquire) {
@@ -165,13 +210,18 @@ impl PyAsyncConnection {
     ///
     /// `client_context_dict` supplies the SQL Server connection options.
     /// `autocommit` defaults to `False`.
+    /// `token_provider` optionally supplies a caller-owned async credential whose
+    /// `get_token(scope)` awaitable returns an object with a non-empty `token`
+    /// string. It cannot be combined with other authentication sources. The
+    /// driver never closes the provider.
     #[classmethod]
-    #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false))]
+    #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false, *, token_provider=None))]
     fn connect<'py>(
         cls: &Bound<'py, PyType>,
         client_context_dict: &Bound<'_, PyDict>,
         python_logger: Option<&Bound<'_, PyAny>>,
         autocommit: bool,
+        token_provider: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = cls.py();
 
@@ -182,7 +232,20 @@ impl PyAsyncConnection {
         emit_preview_warning(py)?;
 
         tracing::debug!("PyAsyncConnection::connect: extracting client context");
-        let context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
+        let uses_async_provider = token_provider.is_some();
+        if uses_async_provider {
+            validate_custom_token_context(client_context_dict)?;
+        }
+        let mut context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
+        if let Some(provider) = token_provider {
+            let factory = AsyncPythonEntraIdTokenFactory::new(py, provider)?;
+            context.tds_authentication_method =
+                TdsAuthenticationMethod::ActiveDirectoryTokenCredential;
+            context.auth_method_map.insert(
+                TdsAuthenticationMethod::ActiveDirectoryTokenCredential,
+                Box::new(factory),
+            );
+        }
         let datasource = context.data_source.clone();
 
         tracing::info!(
@@ -213,7 +276,31 @@ impl PyAsyncConnection {
                         .create_client(context, &datasource, None)
                         .await
                         .map_err(|e| {
-                            map_tds_error("connect", "Failed to connect to SQL Server", e)
+                            if !uses_async_provider {
+                                return map_tds_error(
+                                    "connect",
+                                    "Failed to connect to SQL Server",
+                                    e,
+                                );
+                            }
+                            if matches!(e, TdsError::OperationCancelledError(_)) {
+                                tracing::debug!(
+                                    "PyAsyncConnection::connect: token acquisition cancelled"
+                                );
+                                return Python::attach(|py| {
+                                    py.import("asyncio")?
+                                        .getattr("CancelledError")?
+                                        .call0()
+                                        .map(PyErr::from_value)
+                                })
+                                .unwrap_or_else(|error| error);
+                            }
+                            tracing::error!("PyAsyncConnection::connect: failed: {e}");
+                            crate::async_errors::map_tds_error(
+                                "Failed to connect to SQL Server",
+                                e,
+                                Vec::new(),
+                            )
                         })?;
 
                     tracing::info!("PyAsyncConnection::connect: connection established");
