@@ -75,9 +75,12 @@ authentication loads GSSAPI at runtime.
 
 Drain a response with `close_query()` before reuse, or call
 `cancel_query(timeout_secs)` to abandon it and wait for cancellation
-acknowledgement. Zero uses the transport default; failed cancellation settlement
-retires the connection. Discarding rows during cancellation does not decode
-values or resolve Always Encrypted keys.
+acknowledgement. `abandon_query(timeout_secs)` abandons it the way an ODBC
+statement close does: unread messages and statement errors are discarded, and
+ATTENTION is skipped when the response has already fully arrived. Zero uses the
+transport default; failed cancellation settlement retires the connection.
+Discarding rows during cancellation does not decode values or resolve Always
+Encrypted keys.
 
 ## Runtime behavior
 

@@ -172,9 +172,46 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelAbandonsPartiallyReadPlp) {
     ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #idle_cancel_plp"), SQL_HANDLE_STMT, stmt_);
 }
 
-// Benefits-from-mock-tds: close_cursor.rs pins unpublished completion after
-// wire exhaustion; this checks the application's parameter-array outputs.
-ODBC_TEST_F(ConnectionBusyLiveTest, ClosingFetchedParameterArrayPublishesCompletion) {
+// Benefits-from-mock-tds: CursorPhase::IdleClose pins the ATTENTION a close
+// sends; this proves SQL_CLOSE and SQLCloseCursor stop delayed server work
+// rather than draining it, as msodbcsql's Cancel does (AB#49495).
+ODBC_TEST_F(ConnectionBusyLiveTest, CloseAbandonsDelayedBatchTail) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #close_tail(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    for (bool close_cursor : {false, true}) {
+        SCOPED_TRACE(close_cursor ? "SQLCloseCursor" : "SQLFreeStmt(SQL_CLOSE)");
+        const auto started = std::chrono::steady_clock::now();
+        ASSERT_SQL_OK(Run(stmt_,
+            "SELECT REPLICATE('x',4000) FROM (VALUES(1),(2),(3)) AS v(n); "
+            "WAITFOR DELAY '00:00:05'; INSERT #close_tail VALUES(1)"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+        const auto closing = std::chrono::steady_clock::now();
+        ASSERT_SQL_OK(close_cursor ? SQLCloseCursor(stmt_) : SQLFreeStmt(stmt_, SQL_CLOSE),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_LT(std::chrono::steady_clock::now() - closing, std::chrono::seconds(3));
+    }
+
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #close_tail"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #close_tail"), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: close_cursor.rs pins the RPC DONE that publishes a
+// set's status; this checks the application's outputs after fetch then close.
+ODBC_TEST_F(ConnectionBusyLiveTest, FetchingParameterSetsPublishesTheirCompletion) {
     SQLINTEGER values[] = {1000 + Worker() * 100 + Iteration(), 2000 + Worker() * 100 + Iteration()};
     SQLLEN indicators[] = {0, 0};
     SQLUSMALLINT statuses[] = {SQL_PARAM_UNUSED, SQL_PARAM_UNUSED};
@@ -198,6 +235,8 @@ ODBC_TEST_F(ConnectionBusyLiveTest, ClosingFetchedParameterArrayPublishesComplet
                           SQL_HANDLE_STMT, stmt_);
             EXPECT_EQ(values[set], value);
             ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            EXPECT_EQ(static_cast<SQLULEN>(set + 1), processed);
+            EXPECT_EQ(SQL_PARAM_SUCCESS, statuses[set]);
             if (set == 0) {
                 ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
             }
@@ -210,6 +249,139 @@ ODBC_TEST_F(ConnectionBusyLiveTest, ClosingFetchedParameterArrayPublishesComplet
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}
+
+// AB#49495. Benefits-from-mock-tds: close_cursor.rs pins publication at each
+// set boundary; this compares the outputs close and cancel leave live. Both
+// drivers read the set's DONE after a bound fetch of its only row, or once
+// SQLGetData reaches its last column; an unbound fetch leaves it unread.
+ODBC_TEST_F(ConnectionBusyLiveTest, ClosingParameterArrayKeepsReachedSetStatuses) {
+    const SQLINTEGER base = 1000 + Worker() * 100 + Iteration();
+    SQLINTEGER values[] = {base, base + 1, base + 2};
+    SQLLEN indicators[] = {0, 0, 0};
+    SQLUSMALLINT statuses[3] = {};
+    SQLULEN processed = 0;
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? AS n"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                reinterpret_cast<SQLPOINTER>(3), 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, statuses, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                  0, 0, values, sizeof(values[0]), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+    enum class Access { Bound, Unbound, GetData };
+    for (Access access : {Access::Bound, Access::Unbound, Access::GetData}) {
+        if (access == Access::Bound) {
+            ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+        } else {
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+        }
+        for (bool cancel : {false, true}) {
+            for (int advanced = 0; advanced < 3; ++advanced) {
+                SCOPED_TRACE(::testing::Message() << "access=" << static_cast<int>(access)
+                                                  << ", cancel=" << cancel
+                                                  << ", advanced=" << advanced);
+                for (auto& status : statuses) {
+                    status = SQL_PARAM_UNUSED;
+                }
+                processed = 0;
+                value = 0;
+                ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+                for (int set = 0; set < advanced; ++set) {
+                    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+                }
+                ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+                if (access == Access::GetData) {
+                    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                                  SQL_HANDLE_STMT, stmt_);
+                }
+                if (access != Access::Unbound) {
+                    EXPECT_EQ(values[advanced], value);
+                }
+                ASSERT_SQL_OK(cancel ? CancelIdleStatement() : SQLFreeStmt(stmt_, SQL_CLOSE),
+                              SQL_HANDLE_STMT, stmt_);
+                const int reached = access == Access::Unbound ? advanced : advanced + 1;
+                EXPECT_EQ(static_cast<SQLULEN>(reached == 0 ? 1 : reached), processed);
+                for (int set = 0; set < 3; ++set) {
+                    EXPECT_EQ(set < reached ? SQL_PARAM_SUCCESS : SQL_PARAM_UNUSED, statuses[set])
+                        << "set " << set;
+                }
+            }
+        }
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}
+
+// Benefits-from-mock-tds: assert the ATTENTION close sends; this checks that
+// no unreached parameter set runs and that its status stays unreported.
+ODBC_TEST_F(ConnectionBusyLiveTest, ClosingParameterArrayAbandonsUnreachedSets) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CONNECTION_TIMEOUT,
+                                   reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(Run(stmt_, "CREATE TABLE #close_array(n int)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER values[] = {1, 2, 3};
+    SQLLEN indicators[] = {0, 0, 0};
+    SQLUSMALLINT statuses[3] = {};
+    SQLULEN processed = 0;
+    ASSERT_SQL_OK(Prepare(stmt_,
+        "DECLARE @v int = ?; "
+        "SELECT REPLICATE('x',4000) FROM (VALUES(1),(2),(3)) AS v(n); "
+        "WAITFOR DELAY '00:00:05'; INSERT #close_array VALUES(@v)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                reinterpret_cast<SQLPOINTER>(3), 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, statuses, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, &processed, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                  0, 0, values, sizeof(values[0]), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+    for (bool cancel : {false, true}) {
+        SCOPED_TRACE(cancel ? "SQLCancel" : "SQLFreeStmt(SQL_CLOSE)");
+        for (auto& status : statuses) {
+            status = SQL_PARAM_UNUSED;
+        }
+        processed = 0;
+        const auto started = std::chrono::steady_clock::now();
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(3));
+        const auto closing = std::chrono::steady_clock::now();
+        ASSERT_SQL_OK(cancel ? CancelIdleStatement() : SQLFreeStmt(stmt_, SQL_CLOSE),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_LT(std::chrono::steady_clock::now() - closing, std::chrono::seconds(3));
+        EXPECT_EQ(1u, processed);
+        for (int set = 0; set < 3; ++set) {
+            EXPECT_EQ(SQL_PARAM_UNUSED, statuses[set]) << "set " << set;
+        }
+    }
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_STATUS_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMS_PROCESSED_PTR, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                reinterpret_cast<SQLPOINTER>(1), 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+    SQLHSTMT other = AllocStmt();
+    ASSERT_SQL_OK(Run(other, "SELECT COUNT(*) FROM #close_array"), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+    SQLINTEGER count = -1;
+    ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &count, sizeof(count), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(0, count);
+    ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(Run(stmt_, "DROP TABLE #close_array"), SQL_HANDLE_STMT, stmt_);
 }
 
 // A first execution of a prepared statement uses sp_prepexec. Its output
