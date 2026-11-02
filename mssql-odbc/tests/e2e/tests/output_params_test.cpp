@@ -354,7 +354,7 @@ ODBC_TEST_F_MODES(OutputParamsTest, RunUniqueOutputParametersReturnToTheirOwnBuf
     ASSERT_SQL_OK(Direct("CREATE PROCEDURE " + proc +
                          " @i int, @t nvarchar(64), @o int OUTPUT, @s nvarchar(80) OUTPUT,"
                          " @io int OUTPUT AS SET NOCOUNT ON; SET @o = @i * 2 + 1;"
-                         " SET @s = @t + N'!'; SET @io = @io + 7; RETURN @i % 100"),
+                         " SET @s = @t + N'!'; SET @io = @io + 7; RETURN @i"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
 
@@ -402,7 +402,7 @@ ODBC_TEST_F_MODES(OutputParamsTest, RunUniqueOutputParametersReturnToTheirOwnBuf
         ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_NO_DATA)
             << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(SQL_NO_DATA, Exhaust(rc));
-        EXPECT_EQ(input % 100, status);
+        EXPECT_EQ(input, status);
         EXPECT_EQ(input * 2 + 1, output);
         EXPECT_EQ(input + 10, in_out);
         EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), status_length);
