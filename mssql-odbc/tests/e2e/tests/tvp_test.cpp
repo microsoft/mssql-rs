@@ -900,10 +900,14 @@ TEST_F(TvpTest, DaeRefillsMultipleTvpBatchesBeforeScalarDae) {
     while (rc == SQL_NEED_DATA) {
         ASSERT_LT(++iterations, 20) << "SQLParamData did not terminate";
         if (token == type_w.data()) {
-            set_batch(batch);
-            ASSERT_SQL_OK(SQLPutData(stmt_, reinterpret_cast<SQLPOINTER>(1), 2),
-                           SQL_HANDLE_STMT, stmt_);
-            ++batch;
+            if (batch < 3) {
+                set_batch(batch);
+                ASSERT_SQL_OK(SQLPutData(stmt_, reinterpret_cast<SQLPOINTER>(1), 2),
+                              SQL_HANDLE_STMT, stmt_);
+                ++batch;
+            } else {
+                ASSERT_SQL_OK(SQLPutData(stmt_, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+            }
         } else if (token == labels.data() || token == labels.data() + 51) {
             const size_t row = token == labels.data() ? 0 : 1;
             const std::string value =
