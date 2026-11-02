@@ -385,7 +385,8 @@ infrastructure works (`runtests.c`).
   but not yet released). Until the pipelines test against a unixODBC build with
   the fix ([AB#49575](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49575)),
   all Unix runner profiles skip `/SharedStmt` for both drivers. Linux and
-  macOS build the `<name>_mt` entries only with `ODBC_E2E_CONCURRENT=ON` (the
+  macOS build the `<name>_mt` entries only with `ODBC_E2E_CONCURRENT=ON`, set
+  in the environment at configure time or as `-DODBC_E2E_CONCURRENT=ON` (the
   stress profiles set it), so Unix PR runs have none; Windows PR runs only
   `/SharedDbc`. Single-threaded tests and `/CrossThread`, `/SharedEnv`, and
   `/SharedDbc` remain enabled in the stress profiles. This temporarily removes

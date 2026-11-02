@@ -544,7 +544,8 @@ on; these guarantees were verified against msodbcsql's behavior.
   concurrency coverage comes without a second copy of the test. PR validation
   runs only `/SharedDbc`, and only on Windows; the other modes run in the
   stress pipeline (Windows and Linux, no macOS leg). Linux and macOS compile
-  the variants only with `ODBC_E2E_CONCURRENT=ON` set when CMake configures.
+  the variants only with `ODBC_E2E_CONCURRENT=ON` (environment, or
+  `-DODBC_E2E_CONCURRENT=ON`) when CMake configures.
   - Before review, run the `<name>_mt` entry of a test you add or convert in
     every mode (`MSSQL_ODBC_MT_SKIP_MODES=none`, plus `ODBC_E2E_CONCURRENT=ON`
     on Unix, or `--mt-profile=nightly` / `-MtProfile nightly`):

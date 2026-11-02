@@ -113,14 +113,17 @@ if(MSVC)
 endif()
 
 # The ODBC_TEST_F concurrent variants (<name>_mt) are compiled only where they
-# run: Windows by default. ODBC_E2E_CONCURRENT=ON|OFF in the environment at
-# configure time overrides that (the Unix stress builds set ON).
+# run: Windows by default. -DODBC_E2E_CONCURRENT=ON|OFF, or the same variable in
+# the environment at configure time, overrides that (the Unix stress builds set
+# the environment, which wins).
 if(DEFINED ENV{ODBC_E2E_CONCURRENT})
     set(ODBC_E2E_CONCURRENT "$ENV{ODBC_E2E_CONCURRENT}")
-elseif(WIN32)
-    set(ODBC_E2E_CONCURRENT ON)
-else()
-    set(ODBC_E2E_CONCURRENT OFF)
+elseif(NOT DEFINED ODBC_E2E_CONCURRENT)
+    if(WIN32)
+        set(ODBC_E2E_CONCURRENT ON)
+    else()
+        set(ODBC_E2E_CONCURRENT OFF)
+    endif()
 endif()
 if(ODBC_E2E_CONCURRENT)
     message(STATUS "ODBC e2e tests: concurrent variants enabled")

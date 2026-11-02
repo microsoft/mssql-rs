@@ -558,8 +558,9 @@ races:
   alone they took more than 15 minutes on macOS before the cancellation, where
   Docker under Colima makes busy retries slow, and Test MacOS exceeded its
   90-minute limit (build 188249).
-- Linux and macOS builds compile the concurrent variants only when
-  `ODBC_E2E_CONCURRENT=ON` is in the environment at CMake configure time; the
+- Linux and macOS builds compile the concurrent variants only with
+  `ODBC_E2E_CONCURRENT=ON`, from the environment at CMake configure time (which
+  wins) or `-DODBC_E2E_CONCURRENT=ON` (cached); the
   stress profiles set it, Windows builds them by default. Without it,
   `ODBC_TEST_F` registers only the single-threaded test and no `<name>_mt`
   entry exists. Compiling `execute`, `param_conversions` and `param_array` took
