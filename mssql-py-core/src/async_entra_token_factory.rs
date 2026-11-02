@@ -1,13 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Loop-bound adapter for caller-owned asynchronous Entra credentials.
+//! Loop-bound adapter for asynchronous Entra credentials.
 //!
 //! The provider's `get_token(scope)` returns an awaitable whose result exposes
 //! a non-empty JWT string in `token`. Acquisition runs on the captured asyncio
 //! loop; dropping the Rust operation schedules cancellation there, and a done
 //! callback observes the outcome even after the caller has stopped waiting.
-//! Providers remain caller-owned. Built-in SDK credential selection is separate.
+//! Custom providers remain caller-owned. Built-in credentials are acquired and
+//! closed on the same loop for each token attempt, before the token reaches TDS.
 
 use std::sync::Arc;
 
@@ -22,9 +23,19 @@ use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::TaskLocals;
 use tokio::sync::oneshot;
 
+use crate::async_entra_credentials::BuiltInEntraCredential;
+
+const CREDENTIAL_CLOSE_TIMEOUT_SECS: f64 = 5.0;
+
+#[derive(Clone)]
+enum TokenProvider {
+    Custom(Arc<Py<PyAny>>),
+    BuiltIn(Arc<BuiltInEntraCredential>),
+}
+
 #[derive(Clone)]
 pub(crate) struct AsyncPythonEntraIdTokenFactory {
-    provider: Arc<Py<PyAny>>,
+    provider: TokenProvider,
     locals: TaskLocals,
 }
 
@@ -43,12 +54,20 @@ impl AsyncPythonEntraIdTokenFactory {
             ));
         }
         Ok(Self {
-            provider: Arc::new(provider),
+            provider: TokenProvider::Custom(Arc::new(provider)),
             locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
         })
     }
 
-    async fn acquire_token(&self, spn: &str) -> PyResult<Vec<u8>> {
+    pub(crate) fn built_in(py: Python<'_>, config: BuiltInEntraCredential) -> PyResult<Self> {
+        BuiltInEntraCredential::check_dependencies(py)?;
+        Ok(Self {
+            provider: TokenProvider::BuiltIn(Arc::new(config)),
+            locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
+        })
+    }
+
+    async fn acquire_token(&self, spn: &str, sts_url: &str) -> PyResult<Vec<u8>> {
         let scope = token_scope(spn)?;
         let (sender, receiver) = oneshot::channel();
         let mut cancellation = Python::attach(|py| {
@@ -56,13 +75,15 @@ impl AsyncPythonEntraIdTokenFactory {
                 py,
                 TokenCompletion {
                     sender: Some(sender),
+                    owned_provider: None,
                 },
             )?;
             let request = Py::new(
                 py,
                 TokenRequest {
-                    provider: self.provider.clone_ref(py),
+                    provider: self.provider.clone(),
                     scope,
+                    sts_url: sts_url.to_owned(),
                     completion,
                     task: None,
                     cancelled: false,
@@ -95,10 +116,10 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
     async fn create_token(
         &self,
         spn: String,
-        _sts_url: String,
+        sts_url: String,
         _auth_method: TdsAuthenticationMethod,
     ) -> TdsResult<Vec<u8>> {
-        self.acquire_token(&spn).await.map_err(|error| {
+        self.acquire_token(&spn, &sts_url).await.map_err(|error| {
             let cancelled = Python::attach(|py| {
                 py.import("asyncio")
                     .and_then(|module| module.getattr("CancelledError"))
@@ -136,8 +157,9 @@ fn token_scope(spn: &str) -> PyResult<String> {
 
 #[pyclass]
 struct TokenRequest {
-    provider: Py<PyAny>,
+    provider: TokenProvider,
     scope: String,
+    sts_url: String,
     completion: Py<TokenCompletion>,
     task: Option<Py<PyAny>>,
     cancelled: bool,
@@ -150,8 +172,15 @@ impl TokenRequest {
             return;
         }
         let result = (|| {
-            let awaitable = self
-                .provider
+            let provider = match &self.provider {
+                TokenProvider::Custom(provider) => provider.clone_ref(py),
+                TokenProvider::BuiltIn(config) => {
+                    let provider = config.create(py, &self.scope, &self.sts_url)?;
+                    self.completion.borrow_mut(py).owned_provider = Some(provider.clone_ref(py));
+                    provider
+                }
+            };
+            let awaitable = provider
                 .bind(py)
                 .call_method1("get_token", (&self.scope,))?;
             let asyncio = py.import("asyncio")?;
@@ -164,7 +193,7 @@ impl TokenRequest {
         })();
         if let Err(error) = result {
             self.cancel(py);
-            self.completion.borrow_mut(py).complete(Err(error));
+            self.completion.borrow_mut(py).complete(py, Err(error));
         }
     }
 
@@ -181,10 +210,50 @@ impl TokenRequest {
 #[pyclass]
 struct TokenCompletion {
     sender: Option<oneshot::Sender<PyResult<Vec<u8>>>>,
+    owned_provider: Option<Py<PyAny>>,
 }
 
 impl TokenCompletion {
-    fn complete(&mut self, result: PyResult<Vec<u8>>) {
+    fn complete(&mut self, py: Python<'_>, result: PyResult<Vec<u8>>) {
+        if let Some(provider) = self.owned_provider.take() {
+            let cleanup = (|| {
+                let completion = Py::new(
+                    py,
+                    CredentialCloseCompletion {
+                        sender: None,
+                        result: None,
+                        provider: None,
+                        task: None,
+                    },
+                )?;
+                let close = provider.call_method0(py, "close")?;
+                let asyncio = py.import("asyncio")?;
+                let bounded =
+                    asyncio.call_method1("wait_for", (close, CREDENTIAL_CLOSE_TIMEOUT_SECS))?;
+                let task = asyncio.call_method1("ensure_future", (bounded,))?;
+                task.call_method1("add_done_callback", (completion.bind(py),))?;
+                completion.borrow_mut(py).task = Some(task.unbind());
+                Ok::<_, PyErr>(completion)
+            })();
+            match cleanup {
+                Ok(completion) => {
+                    let mut completion = completion.borrow_mut(py);
+                    completion.sender = self.sender.take();
+                    completion.result = Some(result);
+                    completion.provider = Some(provider);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to schedule driver-owned Entra credential cleanup");
+                    self.send(result.and(Err(error)));
+                    return;
+                }
+            }
+        }
+        self.send(result);
+    }
+
+    fn send(&mut self, result: PyResult<Vec<u8>>) {
         if let Some(sender) = self.sender.take() {
             // A dropped receiver means the native operation was cancelled.
             let _ = sender.send(result);
@@ -222,7 +291,32 @@ impl TokenCompletion {
             }
             Ok(token.encode_utf16().flat_map(u16::to_le_bytes).collect())
         });
-        self.complete(result);
+        self.complete(task.py(), result);
+    }
+}
+
+#[pyclass]
+struct CredentialCloseCompletion {
+    sender: Option<oneshot::Sender<PyResult<Vec<u8>>>>,
+    result: Option<PyResult<Vec<u8>>>,
+    provider: Option<Py<PyAny>>,
+    task: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl CredentialCloseCompletion {
+    fn __call__(&mut self, task: &Bound<'_, PyAny>) {
+        self.task.take();
+        let closed = task.call_method0("result").map(|_| ());
+        if closed.is_err() {
+            tracing::warn!("Failed to close driver-owned async Entra credential");
+        }
+        self.provider.take();
+        if let Some(sender) = self.sender.take()
+            && let Some(result) = self.result.take()
+        {
+            let _ = sender.send(result.and_then(|bytes| closed.map(|_| bytes)));
+        }
     }
 }
 
@@ -261,7 +355,7 @@ pub(crate) fn _invoke_async_entra_id_token_factory<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let factory = AsyncPythonEntraIdTokenFactory::new(py, provider)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let bytes = factory.acquire_token(&spn).await?;
+        let bytes = factory.acquire_token(&spn, "").await?;
         Python::attach(|py| Ok(PyBytes::new(py, &bytes).unbind()))
     })
 }

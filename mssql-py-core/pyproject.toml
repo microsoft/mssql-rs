@@ -41,4 +41,5 @@ features = ["pyo3/extension-module"]
 auditwheel = "skip"
 
 [project.optional-dependencies]
+azure-async = ["azure-identity>=1.25.3", "aiohttp>=3.12"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21.0", "python-dotenv>=1.0.0", "maturin>=1.0,<2.0"]

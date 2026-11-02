@@ -10,6 +10,7 @@ mod arrow_bulkcopy;
 mod async_connection;
 mod async_cursor;
 mod async_description;
+mod async_entra_credentials;
 mod async_entra_token_factory;
 mod async_errors;
 mod async_execute;

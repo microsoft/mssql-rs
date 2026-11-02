@@ -24,6 +24,7 @@ use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvid
 use mssql_tds::error::Error as TdsError;
 
 use crate::async_cursor::PyAsyncCursor;
+use crate::async_entra_credentials::BuiltInEntraCredential;
 use crate::async_entra_token_factory::AsyncPythonEntraIdTokenFactory;
 use crate::async_errors::InterfaceError;
 use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
@@ -214,6 +215,10 @@ impl PyAsyncConnection {
     /// `get_token(scope)` awaitable returns an object with a non-empty `token`
     /// string. It cannot be combined with other authentication sources. The
     /// driver never closes the provider.
+    /// Built-in ActiveDirectoryDefault, ActiveDirectoryMSI, and client-secret
+    /// ActiveDirectoryServicePrincipal use azure.identity.aio. They require the
+    /// azure-async extra and support Azure Public Cloud only. Driver-created
+    /// credentials are closed after each acquisition attempt.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false, *, token_provider=None))]
     fn connect<'py>(
@@ -232,8 +237,8 @@ impl PyAsyncConnection {
         emit_preview_warning(py)?;
 
         tracing::debug!("PyAsyncConnection::connect: extracting client context");
-        let uses_async_provider = token_provider.is_some();
-        if uses_async_provider {
+        let mut uses_async_auth = token_provider.is_some();
+        if uses_async_auth {
             validate_custom_token_context(client_context_dict)?;
         }
         let mut context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
@@ -245,6 +250,12 @@ impl PyAsyncConnection {
                 TdsAuthenticationMethod::ActiveDirectoryTokenCredential,
                 Box::new(factory),
             );
+        } else if let Some(config) = BuiltInEntraCredential::from_context(&mut context)? {
+            let factory = AsyncPythonEntraIdTokenFactory::built_in(py, config)?;
+            context
+                .auth_method_map
+                .insert(context.tds_authentication_method.clone(), Box::new(factory));
+            uses_async_auth = true;
         }
         let datasource = context.data_source.clone();
 
@@ -276,7 +287,7 @@ impl PyAsyncConnection {
                         .create_client(context, &datasource, None)
                         .await
                         .map_err(|e| {
-                            if !uses_async_provider {
+                            if !uses_async_auth {
                                 return map_tds_error(
                                     "connect",
                                     "Failed to connect to SQL Server",
