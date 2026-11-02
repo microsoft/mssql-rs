@@ -4,6 +4,7 @@
 """Built-in aio credential selection and ownership over mock FedAuth login."""
 
 import asyncio
+import builtins
 import contextvars
 import gc
 import sys
@@ -237,6 +238,84 @@ def test_owned_close_timeout_does_not_send_token(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("wait_after_cancel", [False, True])
+def test_close_timeout_is_terminal_even_if_close_suppresses_cancellation(
+    builtin_context, builtin_sdk, mock_tds_server, wait_after_cancel
+):
+    async def run():
+        released = asyncio.Event()
+        finished = asyncio.Event()
+        unhandled = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _, context: unhandled.append(context))
+
+        async def close(instance):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                if wait_after_cancel:
+                    await released.wait()
+            finally:
+                finished.set()
+
+        builtin_sdk.close_hook = close
+        connection = None
+        try:
+            with pytest.raises(mssql_py_core.OperationalError):
+                connection = await asyncio.wait_for(
+                    connect(
+                        dict(
+                            builtin_context,
+                            authentication="ActiveDirectoryDefault",
+                            connect_timeout=15,
+                        )
+                    ),
+                    8,
+                )
+        finally:
+            released.set()
+            await asyncio.wait_for(finished.wait(), 2)
+            if connection is not None:
+                await connection.close()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gc.collect()
+        assert not mock_tds_server.has_received_token(builtin_sdk.instances[0].token)
+        assert not unhandled
+
+    asyncio.run(run())
+
+
+def test_cleanup_failure_trace_uses_connection_logger_without_sdk_diagnostics(
+    builtin_context, builtin_sdk
+):
+    async def run():
+        messages = []
+
+        class Logger:
+            def py_core_log(self, _level, message, _module, _line):
+                messages.append(message)
+
+        async def close(instance):
+            raise RuntimeError("private-sdk-close-diagnostic")
+
+        builtin_sdk.close_hook = close
+        with pytest.raises(mssql_py_core.OperationalError) as caught:
+            await connect(
+                dict(builtin_context, authentication="ActiveDirectoryDefault"),
+                python_logger=Logger(),
+            )
+        assert any(
+            "Failed to close driver-owned async Entra credential" in message
+            for message in messages
+        )
+        assert "private-sdk-close-diagnostic" not in "\n".join(messages)
+        assert "private-sdk-close-diagnostic" not in str(caught.value)
+        assert builtin_sdk.instances[0].token not in "\n".join(messages)
+
+    asyncio.run(run())
+
+
 def test_token_is_not_sent_until_owned_credential_is_closed(
     builtin_context, builtin_sdk, mock_tds_server
 ):
@@ -363,6 +442,226 @@ def test_login_timeout_still_closes_owned_credential(builtin_context, builtin_sd
     asyncio.run(run())
 
 
+def test_login_deadline_does_not_restart_when_owned_cleanup_begins(
+    builtin_context, builtin_sdk, mock_tds_server
+):
+    async def run():
+        closing = asyncio.Event()
+        release = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def close(instance):
+            closing.set()
+            await release.wait()
+            closed.set()
+
+        builtin_sdk.close_hook = close
+        context = dict(
+            builtin_context,
+            authentication="ActiveDirectoryDefault",
+            connect_timeout=1,
+        )
+        try:
+            with pytest.raises(mssql_py_core.OperationalError, match="(?i)timeout"):
+                await asyncio.wait_for(connect(context), 2)
+            assert closing.is_set()
+            assert not closed.is_set()
+            assert not mock_tds_server.has_received_token(builtin_sdk.instances[0].token)
+        finally:
+            release.set()
+        await asyncio.wait_for(closed.wait(), 2)
+        assert builtin_sdk.instances[0].close_calls == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("expire_on_retry", [False, True])
+def test_transport_retry_preserves_credential_ownership_and_native_login_budget(
+    builtin_context, builtin_sdk, mock_tds_server, owned, expire_on_retry
+):
+    async def run():
+        handlers = set()
+        connections = []
+        transport_attempts = []
+        acquisitions = []
+        second_cancelled = asyncio.Event()
+        owned_closed = asyncio.Event()
+
+        async def forward(reader, writer):
+            try:
+                while data := await reader.read(65536):
+                    writer.write(data)
+                    await writer.drain()
+            except ConnectionError:
+                pass  # The first connection is deliberately aborted below.
+
+        async def relay(reader, writer):
+            handler = asyncio.current_task()
+            handlers.add(handler)
+            pipes = []
+            upstream = None
+            try:
+                transport_attempts.append(writer)
+                if len(transport_attempts) == 1:
+                    if expire_on_retry:
+                        await asyncio.sleep(1)
+                    writer.transport.abort()
+                    return
+                upstream_reader, upstream = await asyncio.open_connection(
+                    "127.0.0.1", mock_tds_server.port
+                )
+                connections.append((writer, upstream))
+                pipes = [
+                    asyncio.create_task(forward(reader, upstream)),
+                    asyncio.create_task(forward(upstream_reader, writer)),
+                ]
+                await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for pipe in pipes:
+                    pipe.cancel()
+                await asyncio.gather(*pipes, return_exceptions=True)
+                writer.close()
+                if upstream is not None:
+                    upstream.close()
+                handlers.remove(handler)
+
+        async def get_token(instance):
+            acquisitions.append(instance)
+            if expire_on_retry:
+                try:
+                    await asyncio.Future()
+                finally:
+                    second_cancelled.set()
+            return SimpleNamespace(token="retried-connection-token")
+
+        async def close(instance):
+            owned_closed.set()
+
+        builtin_sdk.get_hook = get_token
+        builtin_sdk.close_hook = close
+        server = await asyncio.start_server(relay, "127.0.0.1", 0)
+        connection = None
+        try:
+            context = dict(
+                builtin_context,
+                server=f"127.0.0.1,{server.sockets[0].getsockname()[1]}",
+                connect_timeout=2 if expire_on_retry else 5,
+                connect_retry_count=3,
+                connect_retry_interval=0,
+            )
+            options = {}
+            if owned:
+                context["authentication"] = "ActiveDirectoryDefault"
+            else:
+                from azure.identity.aio import DefaultAzureCredential
+
+                options["token_provider"] = DefaultAzureCredential()
+            started = asyncio.get_running_loop().time()
+            if expire_on_retry:
+                with pytest.raises(mssql_py_core.OperationalError, match="(?i)timeout"):
+                    await asyncio.wait_for(connect(context, **options), 2.8)
+                elapsed = asyncio.get_running_loop().time() - started
+                assert 1.8 <= elapsed < 2.8
+                await asyncio.wait_for(second_cancelled.wait(), 2)
+                if owned:
+                    for _ in range(10):
+                        if all(item.close_finished for item in builtin_sdk.instances):
+                            break
+                        await asyncio.sleep(0)
+            else:
+                connection = await asyncio.wait_for(connect(context, **options), 5)
+                assert mock_tds_server.get_last_access_token() == "retried-connection-token"
+                await connection.close()
+                await connection.close()
+            assert len(transport_attempts) == 2
+            assert len(acquisitions) == 1
+            assert len(builtin_sdk.instances) == 1
+            assert all(
+                item.close_calls == (1 if owned else 0)
+                for item in builtin_sdk.instances
+            )
+            assert owned_closed.is_set() == owned
+        finally:
+            if connection is not None:
+                await connection.close()
+            server.close()
+            await server.wait_closed()
+            for pair in connections:
+                for writer in pair:
+                    writer.close()
+            await asyncio.gather(*handlers)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scheduling", ["acquisition", "cleanup"])
+def test_scheduling_failure_discards_unstarted_coroutine(
+    builtin_context, builtin_sdk, monkeypatch, scheduling
+):
+    async def run():
+        schedule = asyncio.ensure_future
+        calls = 0
+
+        def fail_once(awaitable, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == (1 if scheduling == "acquisition" else 2):
+                raise RuntimeError("private-scheduler-diagnostic")
+            return schedule(awaitable, **kwargs)
+
+        monkeypatch.setattr(asyncio, "ensure_future", fail_once)
+        with pytest.raises(mssql_py_core.OperationalError) as caught:
+            await connect(dict(builtin_context, authentication="ActiveDirectoryDefault"))
+        assert "private-scheduler" not in str(caught.value)
+        if scheduling == "acquisition":
+            assert builtin_sdk.instances[0].close_calls == 1
+        gc.collect()
+
+    asyncio.run(run())
+
+
+def test_cleanup_failure_preserves_provider_cancellation(
+    builtin_context, builtin_sdk
+):
+    async def run():
+        async def get_token(instance):
+            raise asyncio.CancelledError
+
+        async def close(instance):
+            raise RuntimeError("private-cleanup-diagnostic")
+
+        builtin_sdk.get_hook = get_token
+        builtin_sdk.close_hook = close
+        with pytest.raises(asyncio.CancelledError):
+            await connect(dict(builtin_context, authentication="ActiveDirectoryDefault"))
+        assert builtin_sdk.instances[0].close_calls == 1
+
+    asyncio.run(run())
+
+
+def test_owned_credentials_are_not_reused_or_closed_again_on_connection_close(
+    builtin_context, builtin_sdk
+):
+    async def run():
+        connection = await connect(
+            dict(builtin_context, authentication="ActiveDirectoryDefault")
+        )
+        instance = builtin_sdk.instances[-1]
+        assert instance.close_calls == 1
+        await connection.close()
+        await connection.close()
+        assert instance.close_calls == 1
+        assert not [
+            task for task in asyncio.all_tasks() if task is not asyncio.current_task()
+        ]
+
+    asyncio.run(run())
+    asyncio.run(run())
+    assert len(builtin_sdk.instances) == 2
+    assert builtin_sdk.instances[0].loop is not builtin_sdk.instances[1].loop
+
+
 @pytest.mark.parametrize("module", ["azure.identity.aio", "aiohttp"])
 def test_missing_optional_dependency_is_explicit(monkeypatch, module):
     monkeypatch.setitem(sys.modules, module, None)
@@ -373,6 +672,25 @@ def test_missing_optional_dependency_is_explicit(monkeypatch, module):
                 "authentication": "ActiveDirectoryDefault",
             }
         )
+
+
+def test_dependency_initialization_error_is_a_safe_native_exception(monkeypatch):
+    import_module = builtins.__import__
+
+    def fail_import(name, *args, **kwargs):
+        if name == "azure.identity.aio":
+            raise RuntimeError("private-dependency-diagnostic")
+        return import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_import)
+    with pytest.raises(mssql_py_core.OperationalError, match="dependencies") as caught:
+        connect(
+            {
+                "server": "127.0.0.1,1",
+                "authentication": "ActiveDirectoryDefault",
+            }
+        )
+    assert "private-dependency" not in str(caught.value)
 
 
 def test_non_entra_and_custom_provider_do_not_require_sdk(

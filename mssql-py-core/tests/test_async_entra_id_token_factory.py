@@ -7,6 +7,7 @@ import asyncio
 import contextvars
 import gc
 import threading
+import weakref
 from types import SimpleNamespace
 
 import mssql_py_core
@@ -105,7 +106,7 @@ def test_nonawaitable_provider_result_is_rejected():
 @pytest.mark.parametrize("provider", [None, object(), SimpleNamespace(get_token=42)])
 def test_invalid_provider_is_rejected(provider):
     async def run():
-        with pytest.raises(TypeError, match="callable get_token"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="callable get_token"):
             await invoke(provider, SPN)
 
     asyncio.run(run())
@@ -223,12 +224,17 @@ def test_caller_cancellation_settles_and_observes_provider(fail_during_cleanup):
     asyncio.run(run())
 
 
-def test_cancellation_before_dispatch_does_not_invoke_provider(monkeypatch):
+@pytest.mark.parametrize("cancel_callback_first", [False, True])
+def test_cancellation_before_dispatch_does_not_invoke_provider(
+    monkeypatch, cancel_callback_first
+):
     async def run():
         loop = asyncio.get_running_loop()
         queued = asyncio.Event()
         cancelled = asyncio.Event()
         deferred = []
+        deferred_cancellation = []
+        calls = []
         schedule = loop.call_soon_threadsafe
 
         def intercept(callback, *args, **kwargs):
@@ -239,6 +245,10 @@ def test_cancellation_before_dispatch_does_not_invoke_provider(monkeypatch):
                     deferred.append((callback, args, kwargs))
                     return schedule(queued.set)
                 if name == "cancel":
+                    if not cancel_callback_first:
+                        deferred_cancellation.append((callback, args))
+                        return schedule(cancelled.set)
+
                     def cancel():
                         callback(*args)
                         cancelled.set()
@@ -250,6 +260,7 @@ def test_cancellation_before_dispatch_does_not_invoke_provider(monkeypatch):
 
         class Credential:
             def get_token(self, scope):
+                calls.append(scope)
                 pytest.fail("Cancelled request invoked the provider")
 
         future = invoke(Credential(), SPN)
@@ -261,11 +272,68 @@ def test_cancellation_before_dispatch_does_not_invoke_provider(monkeypatch):
         for callback, args, kwargs in deferred:
             schedule(callback, *args, **kwargs)
         await asyncio.sleep(0)
+        for callback, args in deferred_cancellation:
+            schedule(callback, *args)
+        await asyncio.sleep(0)
+        assert not calls
         assert not [
             task
             for task in asyncio.all_tasks()
             if task is not asyncio.current_task()
         ]
+
+    asyncio.run(run())
+
+
+def test_cancelled_acquisition_is_retained_until_a_late_result_is_observed():
+    async def run():
+        started = asyncio.Event()
+        cancelling = asyncio.Event()
+        finished = asyncio.Event()
+        pending = []
+        tasks = []
+        unhandled = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _, context: unhandled.append(context)
+        )
+
+        class Credential:
+            async def get_token(self, scope):
+                tasks.append(weakref.ref(asyncio.current_task()))
+                started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    future = asyncio.get_running_loop().create_future()
+                    pending.append(weakref.ref(future))
+                    cancelling.set()
+                    await future
+                    raise RuntimeError("late-provider-diagnostic")
+                finally:
+                    finished.set()
+
+            async def close(self):
+                pytest.fail("Caller-owned credential was closed")
+
+        future = invoke(Credential(), SPN)
+        await asyncio.wait_for(started.wait(), 2)
+        future.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await future
+        await asyncio.wait_for(cancelling.wait(), 2)
+        gc.collect()
+        try:
+            assert tasks[0]() is not None
+            assert pending[0]() is not None
+        finally:
+            if pending[0]() is not None:
+                pending[0]().set_result(None)
+        await asyncio.wait_for(finished.wait(), 2)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gc.collect()
+        assert tasks[0]() is None
+        assert not unhandled
 
     asyncio.run(run())
 

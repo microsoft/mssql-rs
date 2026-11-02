@@ -101,8 +101,62 @@ def test_conflicting_sources_rejected_before_connection(conflict):
 @pytest.mark.parametrize("provider", [object(), SimpleNamespace(get_token=42)])
 def test_invalid_provider_rejected_before_connection(provider):
     async def run():
-        with pytest.raises(TypeError, match="callable get_token"):
+        with pytest.raises(mssql_py_core.InterfaceError, match="callable get_token"):
             connect({"server": "127.0.0.1,1"}, token_provider=provider)
+
+    asyncio.run(run())
+
+
+def test_provider_validation_error_is_native_and_does_not_expose_getter_error():
+    class Credential:
+        @property
+        def get_token(self):
+            raise RuntimeError("private-provider-getter-diagnostic")
+
+    async def run():
+        with pytest.raises(mssql_py_core.InterfaceError) as caught:
+            connect({"server": "127.0.0.1,1"}, token_provider=Credential())
+        assert "private-provider-getter" not in str(caught.value)
+        assert caught.value.__cause__ is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "key", ["authentication", "user_name", "password", "trusted_connection"]
+)
+def test_custom_provider_auth_options_have_native_type_errors(key):
+    with pytest.raises(mssql_py_core.InterfaceError, match=key):
+        connect({"server": "127.0.0.1,1", key: object()}, token_provider=object())
+
+
+def test_unavailable_dispatch_loop_is_a_safe_native_auth_error(
+    mock_client_context, monkeypatch
+):
+    async def run():
+        loop = asyncio.get_running_loop()
+        schedule = loop.call_soon_threadsafe
+
+        def fail_dispatch(callback, *args, **kwargs):
+            owner = getattr(callback, "__self__", None)
+            if type(owner).__name__ == "TokenRequest":
+                raise RuntimeError("private-dispatch-diagnostic")
+            return schedule(callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", fail_dispatch)
+
+        class Credential:
+            async def get_token(self, scope):
+                pytest.fail("Unavailable loop dispatched credential work")
+
+        with pytest.raises(mssql_py_core.OperationalError) as caught:
+            await asyncio.wait_for(
+                connect(
+                    provider_context(mock_client_context), token_provider=Credential()
+                ),
+                3,
+            )
+        assert "private-dispatch" not in str(caught.value)
 
     asyncio.run(run())
 

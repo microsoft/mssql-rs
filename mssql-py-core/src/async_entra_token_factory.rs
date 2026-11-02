@@ -17,13 +17,16 @@ use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticati
 use mssql_tds::core::TdsResult;
 use mssql_tds::error::Error;
 use mssql_tds::security::SecurityError;
-use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyAttributeError, PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::TaskLocals;
 use tokio::sync::oneshot;
 
 use crate::async_entra_credentials::BuiltInEntraCredential;
+use crate::async_errors::InterfaceError;
 
 const CREDENTIAL_CLOSE_TIMEOUT_SECS: f64 = 5.0;
 
@@ -37,25 +40,23 @@ enum TokenProvider {
 pub(crate) struct AsyncPythonEntraIdTokenFactory {
     provider: TokenProvider,
     locals: TaskLocals,
+    dispatch: tracing::Dispatch,
 }
 
 impl AsyncPythonEntraIdTokenFactory {
     pub(crate) fn new(py: Python<'_>, provider: Py<PyAny>) -> PyResult<Self> {
-        let get_token = provider.bind(py).getattr("get_token").map_err(|error| {
-            if error.is_instance_of::<PyAttributeError>(py) {
-                PyTypeError::new_err("token_provider must have a callable get_token(scope) method")
-            } else {
-                error
-            }
+        let get_token = provider.bind(py).getattr("get_token").map_err(|_| {
+            InterfaceError::new_err("token_provider must have a callable get_token(scope) method")
         })?;
         if !get_token.is_callable() {
-            return Err(PyTypeError::new_err(
+            return Err(InterfaceError::new_err(
                 "token_provider must have a callable get_token(scope) method",
             ));
         }
         Ok(Self {
             provider: TokenProvider::Custom(Arc::new(provider)),
             locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
         })
     }
 
@@ -64,6 +65,7 @@ impl AsyncPythonEntraIdTokenFactory {
         Ok(Self {
             provider: TokenProvider::BuiltIn(Arc::new(config)),
             locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
         })
     }
 
@@ -76,6 +78,8 @@ impl AsyncPythonEntraIdTokenFactory {
                 TokenCompletion {
                     sender: Some(sender),
                     owned_provider: None,
+                    task: None,
+                    dispatch: self.dispatch.clone(),
                 },
             )?;
             let request = Py::new(
@@ -85,7 +89,6 @@ impl AsyncPythonEntraIdTokenFactory {
                     scope,
                     sts_url: sts_url.to_owned(),
                     completion,
-                    task: None,
                     cancelled: false,
                 },
             )?;
@@ -99,6 +102,7 @@ impl AsyncPythonEntraIdTokenFactory {
             Ok::<_, PyErr>(AcquisitionCancellation {
                 request,
                 locals: self.locals.clone(),
+                dispatch: self.dispatch.clone(),
                 completed: false,
             })
         })?;
@@ -119,6 +123,9 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
         sts_url: String,
         _auth_method: TdsAuthenticationMethod,
     ) -> TdsResult<Vec<u8>> {
+        // TODO: In mssql-tds TdsClient::reconnect, stop retrying terminal auth
+        // failures and propagate OperationCancelledError without wrapping it in
+        // SessionRecoveryFailed, so recovery preserves initial-login semantics.
         self.acquire_token(&spn, &sts_url).await.map_err(|error| {
             let cancelled = Python::attach(|py| {
                 py.import("asyncio")
@@ -155,22 +162,57 @@ fn token_scope(spn: &str) -> PyResult<String> {
     })
 }
 
+fn schedule_awaitable<'py>(awaitable: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = awaitable.py();
+    let result = (|| {
+        let asyncio = py.import("asyncio")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("loop", asyncio.call_method0("get_running_loop")?)?;
+        asyncio.call_method("ensure_future", (awaitable,), Some(&kwargs))
+    })();
+    if result.is_err() {
+        let discard = (|| {
+            let coroutine = py.import("types")?.getattr("CoroutineType")?;
+            if awaitable.is_instance(&coroutine)? {
+                awaitable.call_method0("close")?;
+            }
+            Ok::<_, PyErr>(())
+        })();
+        if discard.is_err() {
+            tracing::warn!("Failed to discard an unscheduled async Entra coroutine");
+        }
+    }
+    result
+}
+
 #[pyclass]
 struct TokenRequest {
     provider: TokenProvider,
     scope: String,
     sts_url: String,
     completion: Py<TokenCompletion>,
-    task: Option<Py<PyAny>>,
     cancelled: bool,
 }
 
 #[pymethods]
 impl TokenRequest {
     fn start(&mut self, py: Python<'_>) {
-        if self.cancelled {
+        let dispatch = self.completion.borrow(py).dispatch.clone();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        if self.cancelled
+            || self
+                .completion
+                .borrow(py)
+                .sender
+                .as_ref()
+                .is_none_or(|sender| sender.is_closed())
+        {
             return;
         }
+        tracing::debug!(
+            "Starting async Entra token acquisition (driver-owned={})",
+            matches!(self.provider, TokenProvider::BuiltIn(_))
+        );
         let result = (|| {
             let provider = match &self.provider {
                 TokenProvider::Custom(provider) => provider.clone_ref(py),
@@ -183,11 +225,8 @@ impl TokenRequest {
             let awaitable = provider
                 .bind(py)
                 .call_method1("get_token", (&self.scope,))?;
-            let asyncio = py.import("asyncio")?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("loop", asyncio.call_method0("get_running_loop")?)?;
-            let task = asyncio.call_method("ensure_future", (awaitable,), Some(&kwargs))?;
-            self.task = Some(task.clone().unbind());
+            let task = schedule_awaitable(&awaitable)?;
+            self.completion.borrow_mut(py).task = Some(task.clone().unbind());
             task.call_method1("add_done_callback", (self.completion.bind(py),))?;
             Ok::<_, PyErr>(())
         })();
@@ -198,8 +237,14 @@ impl TokenRequest {
     }
 
     fn cancel(&mut self, py: Python<'_>) {
+        let dispatch = self.completion.borrow(py).dispatch.clone();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        if self.cancelled {
+            return;
+        }
         self.cancelled = true;
-        if let Some(task) = self.task.take()
+        tracing::debug!("Cancelling async Entra token acquisition");
+        if let Some(task) = self.completion.borrow(py).task.as_ref()
             && task.call_method0(py, "cancel").is_err()
         {
             tracing::warn!("Failed to cancel async Entra token acquisition task");
@@ -211,11 +256,15 @@ impl TokenRequest {
 struct TokenCompletion {
     sender: Option<oneshot::Sender<PyResult<Vec<u8>>>>,
     owned_provider: Option<Py<PyAny>>,
+    // asyncio keeps only weak references to tasks, including cancelled ones.
+    task: Option<Py<PyAny>>,
+    dispatch: tracing::Dispatch,
 }
 
 impl TokenCompletion {
     fn complete(&mut self, py: Python<'_>, result: PyResult<Vec<u8>>) {
         if let Some(provider) = self.owned_provider.take() {
+            tracing::debug!("Closing driver-owned async Entra credential");
             let cleanup = (|| {
                 let completion = Py::new(
                     py,
@@ -224,15 +273,25 @@ impl TokenCompletion {
                         result: None,
                         provider: None,
                         task: None,
+                        timer: None,
+                        dispatch: self.dispatch.clone(),
                     },
                 )?;
                 let close = provider.call_method0(py, "close")?;
-                let asyncio = py.import("asyncio")?;
-                let bounded =
-                    asyncio.call_method1("wait_for", (close, CREDENTIAL_CLOSE_TIMEOUT_SECS))?;
-                let task = asyncio.call_method1("ensure_future", (bounded,))?;
+                let task = schedule_awaitable(close.bind(py))?;
                 task.call_method1("add_done_callback", (completion.bind(py),))?;
                 completion.borrow_mut(py).task = Some(task.unbind());
+                let timer = py
+                    .import("asyncio")?
+                    .call_method0("get_running_loop")?
+                    .call_method1(
+                        "call_later",
+                        (
+                            CREDENTIAL_CLOSE_TIMEOUT_SECS,
+                            completion.bind(py).getattr("timeout")?,
+                        ),
+                    )?;
+                completion.borrow_mut(py).timer = Some(timer.unbind());
                 Ok::<_, PyErr>(completion)
             })();
             match cleanup {
@@ -264,6 +323,9 @@ impl TokenCompletion {
 #[pymethods]
 impl TokenCompletion {
     fn __call__(&mut self, task: &Bound<'_, PyAny>) {
+        let dispatch = self.dispatch.clone();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        self.task.take();
         // Always retrieve the outcome, even after the Rust receiver is dropped.
         let result = task.call_method0("result").and_then(|value| {
             let py = value.py();
@@ -291,6 +353,11 @@ impl TokenCompletion {
             }
             Ok(token.encode_utf16().flat_map(u16::to_le_bytes).collect())
         });
+        if result.is_err() {
+            tracing::debug!("Async Entra token acquisition failed or was cancelled");
+        } else {
+            tracing::debug!("Async Entra token acquisition completed");
+        }
         self.complete(task.py(), result);
     }
 }
@@ -301,17 +368,12 @@ struct CredentialCloseCompletion {
     result: Option<PyResult<Vec<u8>>>,
     provider: Option<Py<PyAny>>,
     task: Option<Py<PyAny>>,
+    timer: Option<Py<PyAny>>,
+    dispatch: tracing::Dispatch,
 }
 
-#[pymethods]
 impl CredentialCloseCompletion {
-    fn __call__(&mut self, task: &Bound<'_, PyAny>) {
-        self.task.take();
-        let closed = task.call_method0("result").map(|_| ());
-        if closed.is_err() {
-            tracing::warn!("Failed to close driver-owned async Entra credential");
-        }
-        self.provider.take();
+    fn finish(&mut self, closed: PyResult<()>) {
         if let Some(sender) = self.sender.take()
             && let Some(result) = self.result.take()
         {
@@ -320,9 +382,51 @@ impl CredentialCloseCompletion {
     }
 }
 
+#[pymethods]
+impl CredentialCloseCompletion {
+    fn timeout(&mut self, py: Python<'_>) {
+        let dispatch = self.dispatch.clone();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        self.timer.take();
+        tracing::warn!(
+            "Timed out closing driver-owned async Entra credential; requesting cancellation"
+        );
+        if let Some(task) = self.task.as_ref()
+            && task.call_method0(py, "cancel").is_err()
+        {
+            tracing::warn!("Failed to cancel driver-owned Entra credential cleanup task");
+        }
+        // wait_for can exceed its timeout when close suppresses cancellation.
+        // Keep observing the task, but never publish its token after the deadline.
+        self.finish(Err(PyTimeoutError::new_err(
+            "Timed out closing driver-owned async Entra credential",
+        )));
+    }
+
+    fn __call__(&mut self, task: &Bound<'_, PyAny>) {
+        let dispatch = self.dispatch.clone();
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        if let Some(timer) = self.timer.take()
+            && timer.call_method0(task.py(), "cancel").is_err()
+        {
+            tracing::warn!("Failed to cancel async Entra credential cleanup timer");
+        }
+        self.task.take();
+        let closed = task.call_method0("result").map(|_| ());
+        if closed.is_err() {
+            tracing::warn!("Failed to close driver-owned async Entra credential");
+        } else {
+            tracing::debug!("Driver-owned async Entra credential closed");
+        }
+        self.provider.take();
+        self.finish(closed);
+    }
+}
+
 struct AcquisitionCancellation {
     request: Py<TokenRequest>,
     locals: TaskLocals,
+    dispatch: tracing::Dispatch,
     completed: bool,
 }
 
@@ -331,6 +435,7 @@ impl Drop for AcquisitionCancellation {
         if self.completed {
             return;
         }
+        let _guard = tracing::dispatcher::set_default(&self.dispatch);
         Python::attach(|py| {
             let result = self.request.bind(py).getattr("cancel").and_then(|cancel| {
                 self.locals

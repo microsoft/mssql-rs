@@ -58,13 +58,16 @@ impl BuiltInEntraCredential {
     pub(crate) fn check_dependencies(py: Python<'_>) -> PyResult<()> {
         for module in ["azure.identity.aio", "aiohttp"] {
             if let Err(error) = py.import(module) {
+                tracing::error!("Failed to load built-in async Entra authentication dependencies");
                 if error.is_instance_of::<PyImportError>(py) {
                     return Err(OperationalError::new_err(
                         "Built-in async Entra authentication requires azure-identity and aiohttp; \
                          install mssql-python-rs[azure-async]",
                     ));
                 }
-                return Err(error);
+                return Err(OperationalError::new_err(
+                    "Failed to load built-in async Entra authentication dependencies",
+                ));
             }
         }
         Ok(())

@@ -38,7 +38,11 @@ fn validate_custom_token_context(dict: &Bound<'_, PyDict>) -> PyResult<()> {
     let optional_string = |key| -> PyResult<Option<String>> {
         dict.get_item(key)?
             .filter(|value| !value.is_none())
-            .map(|value| value.extract())
+            .map(|value| {
+                value
+                    .extract()
+                    .map_err(|_| InterfaceError::new_err(format!("{key} must be a string or None")))
+            })
             .transpose()
     };
     let trusted_connection = optional_string("trusted_connection")?;
@@ -219,6 +223,10 @@ impl PyAsyncConnection {
     /// ActiveDirectoryServicePrincipal use azure.identity.aio. They require the
     /// azure-async extra and support Azure Public Cloud only. Driver-created
     /// credentials are closed after each acquisition attempt.
+    /// Acquisition shares the native login deadline. Owned cleanup has a
+    /// separate five-second settlement limit; a cleanup timeout fails login
+    /// even if the close coroutine suppresses cancellation. Keep the originating
+    /// loop running until credential tasks have settled.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false, *, token_provider=None))]
     fn connect<'py>(
