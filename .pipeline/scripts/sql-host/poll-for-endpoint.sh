@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # poll-for-endpoint.sh — block until the matching SQL host has published its
 # "sql-ready" sentinel artifact, then download it and export the SQL endpoint
-# (host + port) as pipeline variables for downstream test steps.
+# (host + port) and sa password as pipeline variables for downstream test steps.
 #
 # This is the symmetric counterpart of wait-for-teardown.sh on the SQL host
 # side. Both jobs run concurrently (no ADO `dependsOn` between them, which
@@ -14,8 +14,17 @@
 # per stage attempt so a rerun forms a fresh handshake instead of colliding
 # with or reading a prior attempt's artifacts. Set ARTIFACT_NAME accordingly.
 #
+# Password key exchange (see wait-for-teardown.sh): fork PR builds receive no
+# secret variables, so the password cannot arrive as one. Before waiting for
+# the endpoint, this script generates an ephemeral RSA-3072 key pair and
+# publishes the public key as sql-key-<SENTINEL_ARTIFACT_NAME>. The SQL host
+# answers with sql-cred-<SENTINEL_ARTIFACT_NAME>, the password encrypted to
+# that key with RSA-OAEP (SHA-256). The private key never leaves this step.
+#
 # Required env:
 #   ARTIFACT_NAME         Name of the sql-ready sentinel artifact.
+#   SENTINEL_ARTIFACT_NAME  Exact teardown sentinel artifact name this job
+#                         publishes; it names the key and credential artifacts.
 #   SQL_CREDENTIAL_GENERATION  Nonsecret initialization generation ID.
 #   BUILD_BUILDID
 #   SYSTEM_COLLECTIONURI
@@ -33,10 +42,14 @@
 #   RERUN_HINT_AFTER_SECONDS default 600. On attempt > 1, how long to wait with
 #                            no endpoint before warning that the SQL host job
 #                            was probably not restarted.
+#   CREDENTIAL_WAIT_SECONDS  default 600. How long to wait, after the endpoint
+#                            appears, for the SQL host to answer the key.
 #
 # Sets pipeline variables on success:
-#   DB_HOST   IP advertised by the SQL host
-#   DB_PORT   port advertised by the SQL host
+#   DB_HOST                 IP advertised by the SQL host
+#   DB_PORT                 port advertised by the SQL host
+#   SQL_PASSWORD            sa password (secret)
+#   SQL_PASSWORD_GENERATED  1, so generate-sql-password-template.yml no-ops
 
 set -euo pipefail
 
@@ -52,6 +65,20 @@ if [[ ! "${SQL_CREDENTIAL_GENERATION:-}" =~ ^[0-9a-f]{32}$ ]]; then
     exit 1
 fi
 
+STAGE_ATTEMPT="${SYSTEM_STAGEATTEMPT:-1}"
+
+# The name is embedded in ##vso logging commands, and the suffix keeps the key
+# and credential artifacts unique per initialization and stage attempt.
+if [[ ! "${SENTINEL_ARTIFACT_NAME:-}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+    || [[ "${SENTINEL_ARTIFACT_NAME}" != *"-${SQL_CREDENTIAL_GENERATION}-${STAGE_ATTEMPT}" ]]; then
+    echo "ERROR: SENTINEL_ARTIFACT_NAME must be this job's teardown artifact name." >&2
+    exit 1
+fi
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "ERROR: openssl is required for the SQL credential key exchange." >&2
+    exit 1
+fi
+
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 # Generous default — the x64 SQL host job has its own queue + boot latency
 # (DockerInstaller, image pull, SQL Server startup). 60 min comfortably
@@ -59,8 +86,8 @@ POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 # 120-min MAX_LIFETIME_MINUTES so we always fail-fast instead of racing
 # the host's own teardown.
 MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-3600}"
+CREDENTIAL_WAIT_SECONDS="${CREDENTIAL_WAIT_SECONDS:-600}"
 
-STAGE_ATTEMPT="${SYSTEM_STAGEATTEMPT:-1}"
 # On a rerun (attempt > 1), warn this long into a fruitless wait that a partial
 # "Rerun failed jobs" won't have restarted the sibling SQL host job.
 RERUN_HINT_AFTER_SECONDS="${RERUN_HINT_AFTER_SECONDS:-600}"
@@ -82,12 +109,67 @@ collection="${SYSTEM_COLLECTIONURI%/}/"
 project_enc="$(printf '%s' "${SYSTEM_TEAMPROJECT}" | sed 's/ /%20/g')"
 url="${collection}${project_enc}/_apis/build/builds/${BUILD_BUILDID}/artifacts?api-version=7.1"
 
+list_artifacts() {
+    curl -sS -f \
+        -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+        -H "Accept: application/json" \
+        "${url}"
+}
+
+# Prints the downloadUrl of artifact $1 from the artifact-list JSON on stdin.
+artifact_download_url() {
+    ARTIFACT="$1" python3 -c '
+import json, os, sys
+target = os.environ["ARTIFACT"]
+for a in json.load(sys.stdin).get("value", []):
+    if a.get("name") == target:
+        print(a.get("resource", {}).get("downloadUrl", ""))
+        break
+'
+}
+
+# Retries the download; transient 5xx / connection resets shouldn't fail the
+# rendezvous after we already saw the artifact was published.
+download_artifact() {
+    local name="$1" download_url="$2" zip_path="$3" attempt
+    for attempt in 1 2 3 4 5; do
+        if curl -sS -f -L \
+                -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+                -o "${zip_path}" \
+                "${download_url}"; then
+            return 0
+        fi
+        echo "WARN: ${name} download attempt ${attempt} failed; retrying." >&2
+        sleep $(( attempt * 5 ))
+    done
+    echo "ERROR: failed to download ${name} after 5 attempts." >&2
+    return 1
+}
+
 echo "=== sql-host/poll-for-endpoint.sh ==="
 echo "  ARTIFACT_NAME = ${ARTIFACT_NAME}"
 echo "  Build         = ${BUILD_BUILDID}"
 echo "  Poll URL      = ${url}"
 echo "  Poll every    = ${POLL_INTERVAL_SECONDS}s"
 echo "  Max wait      = ${MAX_WAIT_SECONDS}s"
+
+key_artifact="sql-key-${SENTINEL_ARTIFACT_NAME}"
+cred_artifact="sql-cred-${SENTINEL_ARTIFACT_NAME}"
+private_dir="$(mktemp -d "${AGENT_TEMPDIRECTORY}/sql-key-private.XXXXXX")"
+trap 'rm -rf "${private_dir}"' EXIT
+if ! (umask 077 && openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+        -out "${private_dir}/key.pem" 2>"${private_dir}/genpkey.err"); then
+    cat "${private_dir}/genpkey.err" >&2
+    echo "ERROR: failed to generate the SQL credential key pair." >&2
+    exit 1
+fi
+public_dir="${AGENT_TEMPDIRECTORY}/${key_artifact}"
+rm -rf "${public_dir}"
+mkdir -p "${public_dir}"
+openssl pkey -in "${private_dir}/key.pem" -pubout -out "${public_dir}/key.pem"
+# Publish before the endpoint wait so the host can answer as soon as it is up.
+# The agent uploads asynchronously, so public_dir must outlive this script.
+echo "##vso[artifact.upload containerfolder=${key_artifact};artifactname=${key_artifact}]${public_dir}"
 
 deadline=$(( $(date +%s) + MAX_WAIT_SECONDS ))
 start="$(date +%s)"
@@ -106,20 +188,8 @@ while :; do
         exit 1
     fi
 
-    if body="$(curl -sS -f \
-            -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
-            -H "Accept: application/json" \
-            "${url}" 2>/tmp/sql-host-poll-curl.err)"; then
-        download_url="$(printf '%s' "${body}" | ARTIFACT_NAME="${ARTIFACT_NAME}" \
-            python3 -c '
-import json, os, sys
-target = os.environ["ARTIFACT_NAME"]
-data = json.load(sys.stdin)
-for a in data.get("value", []):
-    if a.get("name") == target:
-        print(a.get("resource", {}).get("downloadUrl", ""))
-        break
-' 2>/dev/null || true)"
+    if body="$(list_artifacts 2>/tmp/sql-host-poll-curl.err)"; then
+        download_url="$(printf '%s' "${body}" | artifact_download_url "${ARTIFACT_NAME}" 2>/dev/null || true)"
         if [ -n "${download_url}" ]; then
             echo "Endpoint sentinel ${ARTIFACT_NAME} found."
             break
@@ -145,24 +215,7 @@ DOWNLOAD_DIR="${AGENT_TEMPDIRECTORY}/${ARTIFACT_NAME}"
 mkdir -p "${DOWNLOAD_DIR}"
 zip_path="${DOWNLOAD_DIR}/artifact.zip"
 
-# Retry the download; transient 5xx / connection resets shouldn't fail the
-# rendezvous after we already saw the artifact was published.
-download_ok=0
-for attempt in 1 2 3 4 5; do
-    if curl -sS -f -L \
-            -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
-            -o "${zip_path}" \
-            "${download_url}"; then
-        download_ok=1
-        break
-    fi
-    echo "WARN: artifact download attempt ${attempt} failed; retrying." >&2
-    sleep $(( attempt * 5 ))
-done
-if [ "${download_ok}" -ne 1 ]; then
-    echo "ERROR: failed to download ${ARTIFACT_NAME} after 5 attempts." >&2
-    exit 1
-fi
+download_artifact "${ARTIFACT_NAME}" "${download_url}" "${zip_path}" || exit 1
 
 # DownloadUrl returns the artifact as a zip; the artifact root directory
 # inside the zip equals the artifact name. Use python's zipfile module so
@@ -204,6 +257,51 @@ if [ -n "${deadline}" ]; then
     fi
     echo "SQL host has ${remaining}s of life remaining (well over ${MIN_HOST_LIFE_REMAINING_SECONDS}s threshold)."
 fi
+
+cred_deadline=$(( $(date +%s) + CREDENTIAL_WAIT_SECONDS ))
+cred_url=""
+while :; do
+    now="$(date +%s)"
+    if [ "${now}" -ge "${cred_deadline}" ]; then
+        echo "##vso[task.logissue type=error]SQL credential ${cred_artifact} did not appear within ${CREDENTIAL_WAIT_SECONDS}s. Check the SQL host job's credential-serving step for a rejected ${key_artifact}."
+        exit 1
+    fi
+    if body="$(list_artifacts 2>/tmp/sql-host-poll-curl.err)"; then
+        cred_url="$(printf '%s' "${body}" | artifact_download_url "${cred_artifact}" 2>/dev/null || true)"
+        if [ -n "${cred_url}" ]; then
+            echo "SQL credential ${cred_artifact} found."
+            break
+        fi
+    else
+        echo "WARN: artifact list HTTP error: $(cat /tmp/sql-host-poll-curl.err)" >&2
+    fi
+    echo "$(date -u +%H:%M:%S) waiting for ${cred_artifact}; $(( cred_deadline - now ))s left."
+    sleep "${POLL_INTERVAL_SECONDS}"
+done
+
+cred_dir="${AGENT_TEMPDIRECTORY}/${cred_artifact}"
+rm -rf "${cred_dir}"
+mkdir -p "${cred_dir}"
+download_artifact "${cred_artifact}" "${cred_url}" "${cred_dir}/artifact.zip" || exit 1
+python3 -m zipfile -e "${cred_dir}/artifact.zip" "${cred_dir}"
+cred_file="$(find "${cred_dir}" -type f -name credential.bin | head -n 1)"
+if [ -z "${cred_file}" ]; then
+    echo "ERROR: credential.bin not found inside ${cred_artifact} artifact." >&2
+    exit 1
+fi
+if ! password="$(openssl pkeyutl -decrypt -inkey "${private_dir}/key.pem" \
+        -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 \
+        -in "${cred_file}" 2>/dev/null)"; then
+    echo "ERROR: ${cred_artifact} could not be decrypted with this job's key." >&2
+    exit 1
+fi
+if [[ ! "${password}" =~ ^Aa1![A-Za-z0-9]{22}$ ]]; then
+    echo "ERROR: ${cred_artifact} did not decrypt to a valid SQL password." >&2
+    exit 1
+fi
+echo "##vso[task.setvariable variable=SQL_PASSWORD;issecret=true]${password}"
+echo "##vso[task.setvariable variable=SQL_PASSWORD_GENERATED]1"
+echo "Received SQL password from the SQL host (length=${#password})."
 
 echo "Resolved SQL endpoint: host=${host} port=${port}"
 echo "##vso[task.setvariable variable=DB_HOST]${host}"

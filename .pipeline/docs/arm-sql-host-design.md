@@ -37,28 +37,33 @@ ARM tests finish. No new Azure-service dependency is introduced.
 For each ARM test stage:
 
 ```
-InitializeValidation (secret output), then Build                    completes
+InitializeValidation (nonsecret generation ID), then Build          completes
    |
    |                                                       x64 1ES agent
    +---> Sql_Host_<id>  --------------------------------------------+
-   |        1. import initialization secret                         |
+   |        1. generate job-local SA password                       |
    |        2. boot mcr.microsoft.com/mssql/server                  |
    |        3. probe readiness via sqlcmd                           |
    |        4. publish sql-ready-<id> artifact (contains endpoint)  |
-   |        5. poll ADO REST API for teardown sentinels             |
+   |        5. poll ADO REST API: encrypt the password to each      |
+   |           sql-key-<S> and publish sql-cred-<S>; wait for       |
+   |           teardown sentinels                                   |
    |        6. always() docker stop + rm                            |
    |                                                                |
    |                                                       ARM 1ES agent(s)
    +---> Test_*  ---------------------------------------------------+
             (no `dependsOn` on Sql_Host_<id> — runs concurrently)
-            1. import initialization secret (same output)
-            2. download Build_Linux_ARM artifact
+            1. download Build_Linux_ARM artifact
+            2. generate an ephemeral RSA key; publish sql-key-<S>
             3. poll ADO REST API for sql-ready-<id> artifact
-            4. download endpoint, set DB_HOST/DB_PORT
+            4. download endpoint; poll for sql-cred-<S> and decrypt
+               it; set SQL_PASSWORD, DB_HOST, DB_PORT
             5. run docker-cargo-run.sh against $DB_HOST:$DB_PORT
             6. publish junit
             7. always() PublishPipelineArtifact@1
-                       artifact = <sentinel name>      ----> releases SQL host
+                       artifact = <S>                  ----> releases SQL host
+
+<S> = <sentinelName>-<generation>-<stageAttempt>, the consumer's teardown sentinel
 ```
 
 ### Why no `dependsOn` between SQL host and test job?
@@ -81,7 +86,9 @@ ADO dependency between the jobs:
 | Direction | Artifact name              | Producer side                       | Consumer side                                |
 |-----------|----------------------------|-------------------------------------|----------------------------------------------|
 | host→test | `sql-ready-<instanceId>-<generation>-<stageAttempt>`   | `PublishPipelineArtifact@1` after `start.sh` | `poll-for-endpoint.sh` at start of test job  |
-| test→host | `<sentinelName>-<generation>-<stageAttempt>` (per matrix entry) | `PublishPipelineArtifact@1` always() at end of test job | `wait-for-teardown.sh` poll loop in SQL host |
+| test→host | `sql-key-<S>` (consumer public key)  | `poll-for-endpoint.sh` before polling for the endpoint | `wait-for-teardown.sh` poll loop in SQL host |
+| host→test | `sql-cred-<S>` (encrypted password)  | `wait-for-teardown.sh` once `sql-key-<S>` appears | `poll-for-endpoint.sh` after the endpoint |
+| test→host | `<S>` = `<sentinelName>-<generation>-<stageAttempt>` (per matrix entry) | `PublishPipelineArtifact@1` always() at end of test job | `wait-for-teardown.sh` poll loop in SQL host |
 
 Both jobs are queued at the start of the stage and run concurrently. The
 test job's first SQL-touching step blocks on the `sql-ready` sentinel; the
@@ -91,44 +98,67 @@ Every rendezvous artifact name is suffixed with `$(SQL_CREDENTIAL_GENERATION)-$(
 the *Rerun safety* property below), so a stage rerun forms a fresh, isolated
 handshake instead of colliding with the previous attempt's artifacts.
 
-### Shared SA password
+### SA password key exchange
 
-`generate-sql-password-template.yml` produces a job-scoped random password
-and is fine for the amd64 stages where SQL Server and the test runner share
-a job. For the cross-pool ARM design, the SQL host job and the test jobs
-must agree on a run-scoped password. Artifacts are readable by anyone with build
-read access, so they must never carry credentials.
+`generate-sql-password-template.yml` produces a job-scoped random password and
+is fine for the amd64 stages where SQL Server and the test runner share a job.
+In the cross-pool ARM design, the SQL host job and its consumers must agree on
+that password without a shared secret. Azure Pipelines withholds secret
+variables, including secret output variables, from fork PR builds, so secrets
+cannot cross a job boundary. Build IDs and collection IDs are visible to fork
+authors, so a password derived from them is not secret. Pipeline artifacts are
+readable by anyone with build read access, so they never carry plaintext
+credentials.
 
-`InitializeValidation` runs on the utility pool for normal PR and CI validation.
-Its `Initialize` job first checks PR duplicates; CI emits an explicit false
-decision without a lookup. Confirmed duplicates skip secret generation and
-validation. Lookup failures retain the full-validation fallback. Fuzz-only and
-long-haul-only runs bypass initialization.
+Instead, each consumer receives the host's job-local password through a
+per-consumer public-key exchange over pipeline artifacts:
 
-A separate `GenerateSqlCredential` step uses Python's cryptographic `secrets`
-module to generate 192 random bits with a SQL-policy-compliant prefix. It emits
-`SQL_PASSWORD` with `isSecret=true;isOutput=true`, and an independent random,
-nonsecret `SQL_CREDENTIAL_GENERATION`. Neither build IDs nor collection IDs
-provide secrecy. RNG failure fails initialization, with no fallback.
+1. The SQL host generates its SA password with
+   `generate-sql-password-template.yml`. It never leaves the host job in
+   plaintext.
+2. Each consumer creates an ephemeral RSA-3072 key before polling for the
+   endpoint and publishes the SPKI public key as `sql-key-<S>/key.pem`, where
+   `<S>` is the consumer's own teardown sentinel name. The Bash poller writes
+   the private key under a `umask 077` temporary directory that it removes on
+   exit. The PowerShell poller keeps it in memory.
+3. `wait-for-teardown.sh` downloads each expected `sql-key-<S>`, requires an
+   RSA key of at least 3072 bits, encrypts the password with RSA-OAEP
+   (SHA-256, MGF1 SHA-256), and publishes the ciphertext as
+   `sql-cred-<S>/credential.bin`. Each key is served at most once. The host
+   warns about and skips an unusable key, then keeps waiting for teardown
+   sentinels so that cleanup still runs.
+4. After it accepts the endpoint, the consumer polls for `sql-cred-<S>` for up
+   to `CREDENTIAL_WAIT_SECONDS` (default 600), decrypts it, and requires
+   `^Aa1![A-Za-z0-9]{22}$`. Only then does it set the job-local secret
+   `SQL_PASSWORD`, the `SQL_PASSWORD_GENERATED` marker, `DB_HOST`, and
+   `DB_PORT`.
+
+The private key never leaves the consumer step, and only ciphertext reaches an
+artifact. Decryption or validation failures fail the consumer without
+exposing the endpoint. A key artifact published early by someone else makes
+the consumer's own upload of that name fail, so the exchange fails closed. The
+trust boundary matches the existing endpoint artifact: anyone who can write
+artifacts to this build can already redirect consumers.
+
+`InitializeValidation` runs on the utility pool for normal PR and CI
+validation. Its `Initialize` job first checks PR duplicates; CI emits an
+explicit false decision without a lookup. Confirmed duplicates skip validation.
+Lookup failures retain the full-validation fallback. Fuzz-only and
+long-haul-only runs bypass initialization. A separate `GenerateSqlCredential`
+step emits only the random, nonsecret `SQL_CREDENTIAL_GENERATION` output, which
+works in fork builds. RNG failure fails initialization, with no fallback.
 
 `Build`, `Test_arm64`, and `Test_alpine_arm64` depend directly on successful
-initialization. Only SQL hosts, ARM test matrix jobs (including ODBC), and
-PR-only Linux/Windows ARM build consumers map the outputs through
+initialization. SQL hosts, ARM test matrix jobs (including ODBC), and PR-only
+Linux and Windows ARM build consumers map only the generation through
 `stageDependencies.InitializeValidation.Initialize.outputs[...]`. No test job
-depends on completion of its SQL host. The Bash and PowerShell import helpers
-validate both outputs before setting the job-local secret and
-`SQL_PASSWORD_GENERATED` marker. Missing or unresolved outputs fail; consumers
-never generate an independent replacement. Secrets enter scripts through
-explicit environment mappings, not substitution into script source.
+depends on completion of its SQL host.
 
-Consuming-stage retries reuse the original initialization output. Artifact
-names include the independent generation ID, and both endpoint readers verify
-the same ID in the payload before exposing `DB_HOST`/`DB_PORT`. Old endpoints
-and teardown sentinels cannot be reused after reinitialization. Reinitialize
-with a fresh pipeline run, not while consumers are active: an old running host
-keeps its original credential until its normal teardown or lifetime cap.
-If Azure cannot supply the original output on retry, the import fails closed;
-queue a fresh run instead of generating a job-local credential.
+Consuming-stage retries reuse the original generation, and the new stage
+attempt boots a new host with a new password. Every artifact name includes the
+generation and stage attempt, and both endpoint readers verify the generation
+in the payload before continuing, so old endpoints, keys, credentials, and
+teardown sentinels cannot be reused.
 
 ### Shared TLS cert chain
 
@@ -198,7 +228,8 @@ so the test side polls for the right sentinel.
    refuses to proceed if the embedded deadline leaves less than
    `MIN_HOST_LIFE_REMAINING_SECONDS` (default 5 min) of host life — that
    case usually means the SQL host hit its lifetime cap while the test
-   job was queued — and otherwise sets pipeline variables `DB_HOST` and
+   job was queued — and otherwise waits for and decrypts `sql-cred-<S>` (see
+   *SA password key exchange*) before setting `SQL_PASSWORD`, `DB_HOST`, and
    `DB_PORT`.
 
 If the readiness probe fails, `start.sh` exits non-zero, the publish step
@@ -241,15 +272,20 @@ so a misbehaving watcher cannot pin a 1ES VM.
 ```
 ARM job(s)                        Sql_Host (x64)                 ADO Pipelines
     | (start at the same time)         |                                |
-    | import initialization secret     | import initialization secret   |
-    | (download Build artifact)        | start.sh: docker run           |
+    | (download Build artifact)        | generate job-local password    |
+    | generate RSA key; publish sql-key-<S> ---------------------------->|
     | poll-for-endpoint.sh: GET /artifacts                              |
-    |  (artifact missing — backoff)    | start.sh: probe sqlcmd         |
+    |  (artifact missing — backoff)    | start.sh: docker run           |
+    |                                  | start.sh: probe sqlcmd         |
     |                                  | start.sh: write endpoint.txt   |
     |                                  | PublishPipelineArtifact ------>|
     |                                  |   sql-ready-shared             |
+    |                                  | wait-for-teardown.sh: poll     |
+    |                                  |   sees sql-key-<S> <-----------|
+    |                                  |   publish sql-cred-<S> ------->|
     | poll-for-endpoint.sh: GET /artifacts (sees sql-ready-shared) <----|
-    | download zip, set DB_HOST/DB_PORT                                 |
+    | download endpoint; poll and decrypt sql-cred-<S> <----------------|
+    | set SQL_PASSWORD, DB_HOST, DB_PORT                                |
     | run tests against $DB_HOST:$DB_PORT                               |
     | always(): publish "Ubuntu22" artifact ---------------------------->|
     | always(): publish "Alpine3_18" artifact -------------------------->|
@@ -317,16 +353,15 @@ coverage is the Rust integration suite.
 | Path                                                          | Role                                                           |
 |---------------------------------------------------------------|----------------------------------------------------------------|
 | `.pipeline/templates/sql-host-template.yml`                   | Job template for the on-demand SQL host.                       |
-| `.pipeline/scripts/sql-host/generate-shared-password.py`      | Generate the secret output and independent generation ID.     |
-| `.pipeline/scripts/sql-host/import-sql-password.sh`, `Import-SqlPassword.ps1` | Validate and import the initialization outputs. |
+| `.pipeline/scripts/sql-host/generate-credential-generation.py` | Generate the nonsecret generation ID in `InitializeValidation`. |
 | `.pipeline/scripts/sql-host/start.sh`                         | Boot SQL container, probe readiness, stage endpoint payload.   |
-| `.pipeline/scripts/sql-host/poll-for-endpoint.sh`             | Test-side: poll for sql-ready artifact, set DB_HOST/DB_PORT.   |
-| `.pipeline/scripts/sql-host/wait-for-teardown.sh`             | SQL-host-side: poll ADO REST for teardown sentinels.         |
+| `.pipeline/scripts/sql-host/poll-for-endpoint.sh`, `Wait-ForSqlEndpoint.ps1` | Test-side: publish the public key, poll for the sql-ready artifact, decrypt the credential, set SQL_PASSWORD/DB_HOST/DB_PORT. |
+| `.pipeline/scripts/sql-host/wait-for-teardown.sh`             | SQL-host-side: serve encrypted credentials, poll ADO REST for teardown sentinels. |
 | `.pipeline/scripts/sql-host/teardown.sh`                      | Idempotent docker cleanup for `always()` step.                 |
 | `.pipeline/templates/test-matrix-template-arm64.yml`          | Refactored; targets list + sqlInstanceMode; consumes endpoint. |
 | `.pipeline/templates/test-matrix-template-alpine_arm64.yml`   | Same refactor for the musl/alpine flow.                        |
 | `.pipeline/templates/validation-stages.yml`                   | Converts ARM stage matrices into `targets` lists; threads `sqlInstanceMode` / `sqlImageTag`; adds PR-only `Sql_Host_build_arm` to the Build stage. |
-| `.pipeline/templates/build-template-container.yml`           | ARM64 branch: import password, poll the cross-pool endpoint, run the integration suite against it, publish the `build_arm` teardown sentinel. x64 retains job-local generation. |
+| `.pipeline/templates/build-template-container.yml`           | ARM64 branch: poll the cross-pool endpoint and credential, run the integration suite against it, publish the `build_arm` teardown sentinel. x64 retains job-local generation. |
 | `.pipeline/validation-pipeline.yml`, `.pipeline/validation-pipeline-ci.yml` | Add `sqlInstanceMode` and `sqlImageTag` parameters and pass them to `validation-stages.yml`. |
 
 The amd64 templates and `sql-setup-template.yml` are intentionally left
@@ -368,12 +403,15 @@ unchanged.
 
 ## Open assumptions
 
-- Secret output propagation, log masking, and retention across consuming-stage
-  retries require live Azure Pipelines validation. Local executable tests and
-  YAML graph assertions do not prove those service behaviors. Validate normal
-  PR and CI paths, both SQL-host cardinality modes, Linux/Windows consumers,
-  a consuming-stage retry, and missing-output/reinitialization failures before
-  marking the PR ready. Do not manually queue a full PR matrix as a CI run.
+- The key exchange requires live Azure Pipelines validation, including a fork
+  PR build. Local executable tests and YAML graph assertions use a fake artifact
+  store, so they do not prove that `##vso[artifact.upload]` works in fork
+  builds, that artifact `downloadUrl` zips are readable with
+  `System.AccessToken` and rooted at the artifact name, or that the agent
+  finishes asynchronous uploads while the host step keeps polling. Validate
+  normal and fork PR paths, CI, both SQL-host cardinality modes, Linux and
+  Windows consumers, and a consuming-stage retry before marking the PR ready.
+  Do not manually queue a full PR matrix as a CI run.
 - Cross-pool reachability within both pool sets: `RUST-X64-WUS3` (x64) to
   `RUST-ARM64-WUS3` (ARM), and `RUST-PUBLIC-X64-WUS3` (x64) to
   `RUST-PUBLIC-ARM64-WUS3` (ARM), on the SQL host's private IPv4 and the
@@ -389,8 +427,10 @@ unchanged.
   The image also ships `net-tools` and `iproute`, but `net-tools`' `hostname`
   has no `-I` flag and exits 3 on it, so `start.sh` relies on the `ip(8)`
   fallback to advertise the agent's private IPv4.
-- Both ARM and x64 1ES pool agents have `python3` available (used by
-  `poll-for-endpoint.sh` for JSON parsing). Standard in the Azure Linux images.
+- Both ARM and x64 1ES pool agents have `python3` (JSON parsing and zip
+  extraction) and `openssl` (key generation, encryption, and decryption)
+  available. Both are standard in the Azure Linux images; the scripts fail
+  with a clear error when `openssl` is missing.
 - **Rerun granularity.** Attempt namespacing makes **Rerun stage** fully clean
   (all jobs re-run under a new `System.StageAttempt`, forming a fresh
   handshake). **Rerun failed jobs** is *not* fully supported yet: on a test
@@ -407,14 +447,16 @@ unchanged.
 
 ## Operational notes
 
-- To diagnose a stuck SQL host, look at the `Wait for test-completion
-  sentinels` step's logs — it prints the missing sentinel count every poll.
+- To diagnose a stuck SQL host, look at the `Serve SQL credentials and wait
+  for test-completion sentinels` step's logs — it prints the missing sentinel
+  count every poll and warns about any rejected `sql-key-*` artifact.
   Cross-reference against the test job's `Publish teardown sentinel` step
   to see whether a particular matrix entry never published.
-- To diagnose a stuck test job, look at the `Wait for SQL host endpoint
-  sentinel` step — it prints remaining wait time every poll. If it never
-  finds the sentinel, check whether the SQL host job published it (look at
-  the SQL host's own timeline).
+- To diagnose a stuck test job, look at the `Wait for SQL host endpoint and
+  credential` step — it prints remaining wait time every poll. If it never
+  finds the endpoint, check whether the SQL host job published it (look at
+  the SQL host's own timeline). If it never finds `sql-cred-<S>`, check the
+  SQL host's serving step for a warning about `sql-key-<S>`.
 - To force shutdown of a stuck SQL host without cancelling the build,
   manually publish a pipeline artifact with the missing sentinel name from
   any other job in the same build.
