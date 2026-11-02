@@ -10,7 +10,8 @@
 //! arbitrary single-field lookup. Reading `DescRecord`'s fields directly
 //! (rather than routing through `get_desc_field.rs`'s single-field
 //! `record_field_value`) answers with the same stored values. Under TVP
-//! parameter focus, the child binding is materialized as an APD record first.
+//! parameter focus, the child binding is materialized as the matching APD or
+//! IPD record.
 
 use tracing::{debug, error};
 
@@ -149,31 +150,33 @@ fn sql_get_desc_rec_w_safe(
         "SQLGetDescRecW: DM should reject negative buffer_length (HY090)"
     );
 
-    let focused_record =
-        if record_number >= 1 && matches!(desc.kind, DescKind::AppParam | DescKind::Ad) {
-            match desc.focused_tvp_bindings(record_number) {
-                Ok(bindings) => bindings
-                    .first()
-                    .copied()
-                    .map(|binding| focused_tvp_record(binding, desc.kind)),
-                Err(()) => {
-                    let Ok(mut state) = desc.inner.lock() else {
-                        error!("SQLGetDescRecW: desc mutex poisoned posting focused lookup error");
-                        return SQL_ERROR;
-                    };
-                    free_errors(&mut state);
-                    post_sql_error(
-                        &mut state,
-                        SQLSTATE_HY000,
-                        0,
-                        "Internal error reading focused table-valued parameter descriptor",
-                    );
+    let (focused_record, focused_record_past_count) = if record_number >= 1
+        && matches!(
+            desc.kind,
+            DescKind::AppParam | DescKind::Ad | DescKind::ImpParam
+        ) {
+        match focused_tvp_record_for_desc(desc, record_number) {
+            Ok(Some(FocusedTvpRecord::Record(record))) => (Some(record), false),
+            Ok(Some(FocusedTvpRecord::PastCount)) => (None, true),
+            Ok(None) => (None, false),
+            Err(()) => {
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLGetDescRecW: desc mutex poisoned posting focused lookup error");
                     return SQL_ERROR;
-                }
+                };
+                free_errors(&mut state);
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error reading focused table-valued parameter descriptor",
+                );
+                return SQL_ERROR;
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        (None, false)
+    };
 
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLGetDescRecW: desc mutex poisoned");
@@ -195,6 +198,10 @@ fn sql_get_desc_rec_w_safe(
     // within SQL_DESC_COUNT but never populated answers its stored defaults
     // (`DescRecord::default_for`) — already the same values a fresh record
     // holds, so no separate "no data for this column" branch is needed.
+    if focused_record_past_count {
+        return SQL_NO_DATA;
+    }
+
     let Some(record) = focused_record
         .as_ref()
         .or_else(|| state.record(record_number))
@@ -223,13 +230,44 @@ fn sql_get_desc_rec_w_safe(
     }
 }
 
-pub(super) fn focused_tvp_record(binding: crate::params::BoundParam, kind: DescKind) -> DescRecord {
-    let mut record = DescRecord::default_for(kind);
+pub(super) enum FocusedTvpRecord {
+    PastCount,
+    Record(DescRecord),
+}
+
+pub(super) fn focused_tvp_record_for_desc(
+    desc: &DescHandle,
+    record_number: SqlSmallInt,
+) -> Result<Option<FocusedTvpRecord>, ()> {
+    let Some(count) = desc.focused_tvp_record_count()? else {
+        return Ok(None);
+    };
+    if usize::try_from(record_number).map_err(|_| ())? > count {
+        return Ok(Some(FocusedTvpRecord::PastCount));
+    }
+    let record = desc
+        .focused_tvp_bindings(record_number)?
+        .first()
+        .copied()
+        .map(|binding| focused_tvp_record_from_binding(binding, desc.kind))
+        .unwrap_or_else(|| DescRecord::default_for(desc.kind));
+    Ok(Some(FocusedTvpRecord::Record(record)))
+}
+
+pub(super) fn focused_tvp_record_from_binding(
+    binding: crate::params::BoundParam,
+    kind: DescKind,
+) -> DescRecord {
+    let mut app_record = DescRecord::default_for(kind);
     let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
-    binding.write_to_records(&mut record, &mut ipd_record);
-    record.precision = binding.app_precision;
-    record.scale = binding.app_scale;
-    record
+    binding.write_to_records(&mut app_record, &mut ipd_record);
+    if kind == DescKind::ImpParam {
+        ipd_record
+    } else {
+        app_record.precision = binding.app_precision;
+        app_record.scale = binding.app_scale;
+        app_record
+    }
 }
 
 #[cfg(test)]
@@ -238,8 +276,10 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_SLONG, SQL_DATETIME, SQL_INTEGER, SQL_NULL_HANDLE, SQL_NULLABLE, SQL_TYPE_TIMESTAMP,
+        SQL_C_DEFAULT, SQL_C_SLONG, SQL_DATETIME, SQL_DECIMAL, SQL_INTEGER, SQL_NULL_HANDLE,
+        SQL_NULLABLE, SQL_PARAM_INPUT, SQL_TYPE_TIMESTAMP,
     };
+    use crate::handles::StmtHandle;
     use crate::handles::desc::{DescKind, DescRecord};
     use crate::test_support::TestHandles;
 
@@ -329,6 +369,66 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         // A fresh IRD has SQL_DESC_COUNT == 0.
         let result = get_rec(h.ird(), 1, 0);
+        assert_eq!(result.rc, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn focused_ipd_reads_the_sql_side_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        stmt.inner.lock().unwrap().tvp_column_bindings.insert(
+            1,
+            vec![Some(crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_SLONG,
+                sql_type: SQL_DECIMAL,
+                column_size: 10,
+                decimal_digits: 2,
+                app_datetime_interval_code: None,
+                app_precision: 10,
+                app_scale: 0,
+                parameter_value_ptr: ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: ptr::null_mut(),
+                octet_length_ptr: ptr::null_mut(),
+            })],
+        );
+
+        let result = get_rec(h.ipd(), 1, 0);
+        assert_eq!(result.rc, SQL_SUCCESS);
+        assert_eq!(result.sql_type, SQL_DECIMAL);
+        assert_eq!(result.precision, 10);
+        assert_eq!(result.scale, 2);
+    }
+
+    #[test]
+    fn focused_get_rec_uses_child_defaults_and_count() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        {
+            let mut state = apd.inner.lock().unwrap();
+            state.set_record_count(1, DescKind::AppParam);
+            state.record_mut(1).unwrap().concise_type = SQL_C_SLONG;
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(1, vec![None]);
+        }
+
+        let result = get_rec(h.apd(), 1, 0);
+        assert_eq!(result.rc, SQL_SUCCESS);
+        assert_eq!(result.sql_type, SQL_C_DEFAULT);
+
+        stmt.inner
+            .lock()
+            .unwrap()
+            .tvp_column_bindings
+            .insert(1, Vec::new());
+        let result = get_rec(h.apd(), 1, 0);
         assert_eq!(result.rc, SQL_NO_DATA);
     }
 

@@ -154,6 +154,11 @@ fn sql_bind_parameter_safe(
         env_state.odbc_version
     };
 
+    let Ok(param_focus_guard) = stmt.param_focus_gate.lock() else {
+        error!("SQLBindParameter: parameter-focus mutex poisoned");
+        return SQL_ERROR;
+    };
+
     // Validated under the STMT lock, exactly as before, but the write lands
     // on the effective APD's and the IPD's own DescState records (AB#47437:
     // the descriptors are the storage `SQLBindParameter` and
@@ -437,6 +442,7 @@ fn sql_bind_parameter_safe(
         }
         return SQL_ERROR;
     };
+    drop(param_focus_guard);
 
     // Classic SetIPDRec uses ParamInfoSnapshot::FHasChanged to mark RE_PREPARE
     // and DropPrepHandle(FALSE); DESC_CONSISTENT only controls validation.

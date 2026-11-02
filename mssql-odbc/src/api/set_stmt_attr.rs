@@ -578,8 +578,19 @@ unsafe fn sql_set_stmt_attr_w_safe(
         SQL_SOPT_SS_PARAM_FOCUS => {
             let focus = value_ptr as SqlULen;
             if focus != 0 {
-                // Read the IPD after releasing the STMT lock (locking rule).
                 drop(state);
+                let Ok(_param_focus_guard) = stmt.param_focus_gate.lock() else {
+                    error!(
+                        "SQLSetStmtAttrW: parameter-focus mutex poisoned validating PARAM_FOCUS"
+                    );
+                    return SQL_ERROR;
+                };
+                let dbc = stmt.parent_dbc();
+                let Ok(_dbc_state) = dbc.inner.lock() else {
+                    error!("SQLSetStmtAttrW: dbc mutex poisoned validating PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                // Read the IPD after releasing the STMT lock (locking rule).
                 let valid = match is_valid_tvp_ordinal(stmt, focus) {
                     Ok(valid) => valid,
                     Err(()) => {
@@ -607,14 +618,6 @@ unsafe fn sql_set_stmt_attr_w_safe(
                     post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
                     return SQL_ERROR;
                 }
-                // Focused APD descriptor updates hold the parent DBC lock
-                // across validation and mutation; serialize focus changes with
-                // those updates.
-                let dbc = stmt.parent_dbc();
-                let Ok(_dbc_state) = dbc.inner.lock() else {
-                    error!("SQLSetStmtAttrW: dbc mutex poisoned setting PARAM_FOCUS");
-                    return SQL_ERROR;
-                };
                 let Ok(mut state) = stmt.inner.lock() else {
                     error!("SQLSetStmtAttrW: stmt mutex poisoned setting PARAM_FOCUS");
                     return SQL_ERROR;
@@ -624,6 +627,10 @@ unsafe fn sql_set_stmt_attr_w_safe(
                 SQL_SUCCESS
             } else {
                 drop(state);
+                let Ok(_param_focus_guard) = stmt.param_focus_gate.lock() else {
+                    error!("SQLSetStmtAttrW: parameter-focus mutex poisoned clearing PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
                 let dbc = stmt.parent_dbc();
                 let Ok(_dbc_state) = dbc.inner.lock() else {
                     error!("SQLSetStmtAttrW: dbc mutex poisoned clearing PARAM_FOCUS");

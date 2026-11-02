@@ -156,41 +156,28 @@ fn sql_get_desc_field_w_safe(
         )
         && classify_field(desc.kind, field).is_some_and(|access| access.scope == FieldScope::Record)
     {
-        match desc.focused_tvp_bindings(record_number) {
-            Ok(bindings) => {
-                if let Some(binding) = bindings.first() {
-                    let record = super::get_desc_rec::focused_tvp_record(*binding, desc.kind);
-                    let Ok(mut state) = desc.inner.lock() else {
-                        error!("SQLGetDescFieldW: desc mutex poisoned");
-                        return SQL_ERROR;
-                    };
-                    free_errors(&mut state);
-                    let value = match field {
-                        SQL_DESC_DATA_PTR => FieldValue::Pointer(binding.parameter_value_ptr),
-                        SQL_DESC_INDICATOR_PTR => {
-                            FieldValue::Pointer(binding.strlen_or_ind_ptr.cast())
-                        }
-                        SQL_DESC_OCTET_LENGTH_PTR => {
-                            FieldValue::Pointer(binding.octet_length_ptr.cast())
-                        }
-                        SQL_DESC_OCTET_LENGTH => FieldValue::Len(binding.buffer_length),
-                        SQL_DESC_CONCISE_TYPE | SQL_DESC_DATETIME_INTERVAL_CODE | SQL_DESC_TYPE => {
-                            let Some(value) = record_field_value(&record, field) else {
-                                post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
-                                return SQL_ERROR;
-                            };
-                            value
-                        }
-                        SQL_DESC_PRECISION => FieldValue::SmallInt(binding.app_precision),
-                        SQL_DESC_SCALE if desc.kind == crate::handles::desc::DescKind::ImpParam => {
-                            FieldValue::SmallInt(binding.decimal_digits)
-                        }
-                        SQL_DESC_SCALE => FieldValue::SmallInt(binding.app_scale),
-                        _ => unreachable!(),
-                    };
-                    return value.write(value_ptr, buffer_length, string_length_ptr, &mut *state);
-                }
+        match super::get_desc_rec::focused_tvp_record_for_desc(desc, record_number) {
+            Ok(Some(super::get_desc_rec::FocusedTvpRecord::PastCount)) => {
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLGetDescFieldW: desc mutex poisoned");
+                    return SQL_ERROR;
+                };
+                free_errors(&mut state);
+                return SQL_NO_DATA;
             }
+            Ok(Some(super::get_desc_rec::FocusedTvpRecord::Record(record))) => {
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLGetDescFieldW: desc mutex poisoned");
+                    return SQL_ERROR;
+                };
+                free_errors(&mut state);
+                let Some(value) = record_field_value(&record, field) else {
+                    post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+                    return SQL_ERROR;
+                };
+                return value.write(value_ptr, buffer_length, string_length_ptr, &mut *state);
+            }
+            Ok(None) => {}
             Err(()) => {
                 error!("SQLGetDescFieldW: failed reading focused TVP descriptor records");
                 if let Ok(mut state) = desc.inner.lock() {
@@ -531,12 +518,12 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_NUMERIC, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_PARAM_INPUT,
-        SQL_UNNAMED,
+        SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE, SQL_NULL_HANDLE,
+        SQL_PARAM_INPUT, SQL_UNNAMED,
     };
     use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::error::diag::DiagRecord;
-    use crate::handles::{DescHandle, handle_from_raw};
+    use crate::handles::{DescHandle, StmtHandle, handle_from_raw};
     use crate::test_support::TestHandles;
     use crate::test_support::assert_last_diag;
 
@@ -680,6 +667,57 @@ mod tests {
                 1,
                 SQL_DESC_TYPE,
                 ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn focused_record_uses_child_defaults_and_returns_no_data_past_count() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_CONCISE_TYPE,
+                SQL_C_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(1, vec![None]);
+        }
+
+        let mut concise: SqlSmallInt = -1;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_CONCISE_TYPE,
+                &mut concise as *mut SqlSmallInt as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(concise, SQL_C_DEFAULT);
+
+        stmt.inner
+            .lock()
+            .unwrap()
+            .tvp_column_bindings
+            .insert(1, Vec::new());
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_CONCISE_TYPE,
+                &mut concise as *mut SqlSmallInt as SqlPointer,
                 0,
                 ptr::null_mut(),
             )

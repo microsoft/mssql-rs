@@ -553,6 +553,7 @@ pub fn fuzz_bound_param(data: &[u8]) {
         decimal_digits,
         app_precision: 0,
         app_scale: 0,
+        app_datetime_interval_code: None,
         parameter_value_ptr: value_ptr,
         buffer_length: fuzz_len,
         strlen_or_ind_ptr: ind_ptr,

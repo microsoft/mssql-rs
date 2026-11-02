@@ -28,7 +28,8 @@ use crate::api::odbc_types::{
     SQL_UNKNOWN_TYPE, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
 };
 use crate::api::set_desc_field::{
-    set_data_ptr, set_precision, set_scale, set_type, write_record_field,
+    datetime_interval_code_for, set_data_ptr, set_precision, set_scale, set_type,
+    write_record_field,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_CANNOT_MODIFY_IRD, ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_INDEX,
@@ -214,18 +215,24 @@ fn sql_set_desc_rec_safe(
                     }
                 },
                 |binding| {
-                    let (resolved_type, datetime_interval_code) =
+                    let (requested_type, datetime_interval_code) =
                         focused_type.get().unwrap_or((requested_c_type, 0));
-                    binding.c_type = if requested_c_type == SQL_C_DEFAULT {
+                    let resolved_type = if requested_c_type == SQL_C_DEFAULT {
                         resolve_default_c_type(
                             binding.sql_type,
                             odbc_version.unwrap_or(OdbcVersion::Unset),
                         )
                         .unwrap_or(SQL_C_DEFAULT)
                     } else {
-                        resolved_type
+                        requested_type
                     };
-                    binding.app_datetime_interval_code = Some(datetime_interval_code);
+                    binding.c_type = resolved_type;
+                    binding.app_datetime_interval_code =
+                        Some(if requested_c_type == SQL_C_DEFAULT {
+                            datetime_interval_code_for(resolved_type)
+                        } else {
+                            datetime_interval_code
+                        });
                     binding.buffer_length = length;
                     binding.app_precision = precision;
                     binding.app_scale = scale;
@@ -832,6 +839,93 @@ mod tests {
         assert_eq!(
             binding.parameter_value_ptr,
             (&raw mut value).cast::<std::ffi::c_void>()
+        );
+    }
+
+    #[test]
+    fn focused_default_timestamp_derives_its_datetime_subtype() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(
+                1,
+                vec![Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: SQL_C_DEFAULT,
+                    sql_type: SQL_TYPE_TIMESTAMP,
+                    column_size: 23,
+                    decimal_digits: 7,
+                    app_datetime_interval_code: None,
+                    app_precision: 0,
+                    app_scale: 0,
+                    parameter_value_ptr: ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: ptr::null_mut(),
+                    octet_length_ptr: ptr::null_mut(),
+                })],
+            );
+        }
+
+        let mut value = SqlTimestampStruct {
+            year: 2026,
+            month: 1,
+            day: 2,
+            hour: 3,
+            minute: 4,
+            second: 5,
+            fraction: 6,
+        };
+        assert_eq!(
+            unsafe {
+                sql_set_desc_rec(
+                    h.apd(),
+                    1,
+                    SQL_C_DEFAULT,
+                    0,
+                    SqlLen::try_from(std::mem::size_of::<SqlTimestampStruct>()).unwrap(),
+                    0,
+                    7,
+                    (&raw mut value).cast(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let mut record_type = -1;
+        let mut record_sub_type = -1;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_rec_w(
+                    h.apd(),
+                    1,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    &mut record_type,
+                    &mut record_sub_type,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(record_type, SQL_DATETIME);
+        assert_eq!(
+            record_sub_type,
+            SqlSmallInt::try_from(SQL_CODE_TIMESTAMP).unwrap()
+        );
+        let state = stmt.inner.lock().unwrap();
+        let binding = state.tvp_column_bindings[&1][0].as_ref().unwrap();
+        assert_eq!(binding.c_type, SQL_C_TYPE_TIMESTAMP);
+        assert_eq!(
+            binding.app_datetime_interval_code,
+            Some(SqlSmallInt::try_from(SQL_CODE_TIMESTAMP).unwrap())
         );
     }
 
