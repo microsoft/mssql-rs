@@ -1832,6 +1832,7 @@ impl TdsClient {
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
+        let send_started = self.request_timeout_start();
         self.transport.reset_reader();
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
@@ -1839,6 +1840,9 @@ impl TdsClient {
         let serialize_result = batch.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
         self.finish_send(serialize_result, message).await?;
+        if let Some(start) = send_started {
+            self.update_remaining_timeout(start);
+        }
         Ok(())
     }
 
@@ -20501,8 +20505,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_request_charges_send_time_against_response_budget() {
-        for operation in ["begin", "commit", "rollback"] {
+    async fn request_charges_send_time_against_response_budget() {
+        for operation in ["batch", "begin", "commit", "rollback"] {
             let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
             transport.send_delay = Some(Duration::from_millis(700));
             transport.receive_delay = Some(Duration::from_millis(700));
@@ -20510,6 +20514,13 @@ mod tests {
             let mut client = create_test_client_with_transport(transport);
             let options = ExecuteOptions::new().timeout_secs(1);
             let result = match operation {
+                "batch" => client
+                    .execute(
+                        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE".to_string(),
+                        options,
+                    )
+                    .await
+                    .map(|_| ()),
                 "begin" => {
                     client
                         .begin_transaction_with_options(
