@@ -1,10 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
-class DmlOutputTest : public ODBCTest, public testing::WithParamInterface<bool> {
+class DmlOutputTest : public ODBCTest {
 protected:
+    explicit DmlOutputTest(bool prepared) : prepared_(prepared) {}
+
     void SetUp() override {
         ODBCTest::SetUp();
         ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection());
@@ -25,7 +28,7 @@ protected:
 
     SQLRETURN Call(const std::string& sql = "{call #dml_outputs(?)}") {
         auto text = ODBCTestUtils::ToSqlTStr(sql);
-        if (GetParam()) {
+        if (prepared_) {
             SQLRETURN rc = SQLPrepare(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
             if (!SQL_SUCCEEDED(rc)) return rc;
             return SQLExecute(stmt_);
@@ -51,9 +54,32 @@ protected:
         EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state,
                                              nullptr, nullptr, 0, nullptr));
     }
+
+    // Test bodies, each registered below for both execution routes.
+    void CountsDeferOutputAndReturnStatusUntilFinalMoreResults();
+    void ZeroAffectedRowsStillDefersOutput();
+    void NoCountKeepsImmediateDelivery();
+    void ConversionErrorIsReportedOnceAfterTheCount();
+    void TruncationWarningIsReportedOnceAfterTheCount();
+    void ResetBindingsDiscardsPendingOutput();
+    void RebindingRedirectsPendingOutput();
+
+private:
+    const bool prepared_;
 };
 
-TEST_P(DmlOutputTest, CountsDeferOutputAndReturnStatusUntilFinalMoreResults) {
+// The two routes are separate fixtures, so each body runs both ways in every mode.
+class DmlOutputDirectTest : public DmlOutputTest {
+protected:
+    DmlOutputDirectTest() : DmlOutputTest(false) {}
+};
+
+class DmlOutputPreparedTest : public DmlOutputTest {
+protected:
+    DmlOutputPreparedTest() : DmlOutputTest(true) {}
+};
+
+void DmlOutputTest::CountsDeferOutputAndReturnStatusUntilFinalMoreResults() {
     Procedure("@v int OUTPUT AS SET NOCOUNT OFF; "
               "UPDATE #dml_output SET v=1; "
               "UPDATE #dml_output SET v=2 WHERE id=1; SET @v=73; RETURN 19");
@@ -85,7 +111,7 @@ TEST_P(DmlOutputTest, CountsDeferOutputAndReturnStatusUntilFinalMoreResults) {
     EXPECT_EQ(-2, status);
 }
 
-TEST_P(DmlOutputTest, ZeroAffectedRowsStillDefersOutput) {
+void DmlOutputTest::ZeroAffectedRowsStillDefersOutput() {
     Procedure("@v int OUTPUT AS SET NOCOUNT OFF; "
               "UPDATE #dml_output SET v=1 WHERE id=99; SET @v=73");
     SQLINTEGER output = -1;
@@ -99,7 +125,7 @@ TEST_P(DmlOutputTest, ZeroAffectedRowsStillDefersOutput) {
     EXPECT_EQ(73, output);
 }
 
-TEST_P(DmlOutputTest, NoCountKeepsImmediateDelivery) {
+void DmlOutputTest::NoCountKeepsImmediateDelivery() {
     Procedure("@v int OUTPUT AS SET NOCOUNT ON; "
               "UPDATE #dml_output SET v=1; SET @v=73; RETURN 19");
     SQLINTEGER status = -1, output = -1;
@@ -113,7 +139,7 @@ TEST_P(DmlOutputTest, NoCountKeepsImmediateDelivery) {
     EXPECT_EQ(sizeof(SQLINTEGER), status_length);
 }
 
-TEST_P(DmlOutputTest, ConversionErrorIsReportedOnceAfterTheCount) {
+void DmlOutputTest::ConversionErrorIsReportedOnceAfterTheCount() {
     Procedure("@v varchar(8) OUTPUT AS SET NOCOUNT OFF; "
               "UPDATE #dml_output SET v=1; SET @v='invalid'");
     SQLINTEGER output = -1;
@@ -132,7 +158,7 @@ TEST_P(DmlOutputTest, ConversionErrorIsReportedOnceAfterTheCount) {
     NoDiagnostics();
 }
 
-TEST_P(DmlOutputTest, TruncationWarningIsReportedOnceAfterTheCount) {
+void DmlOutputTest::TruncationWarningIsReportedOnceAfterTheCount() {
     Procedure("@v varchar(8) OUTPUT AS SET NOCOUNT OFF; "
               "UPDATE #dml_output SET v=1; "
               "SET NOCOUNT ON; SELECT 1; SET @v='abcdefgh'");
@@ -179,7 +205,7 @@ TEST_P(DmlOutputTest, TruncationWarningIsReportedOnceAfterTheCount) {
     EXPECT_EQ('x', output[0]);
 }
 
-TEST_P(DmlOutputTest, ResetBindingsDiscardsPendingOutput) {
+void DmlOutputTest::ResetBindingsDiscardsPendingOutput() {
     Procedure("@v int OUTPUT AS SET NOCOUNT OFF; "
               "UPDATE #dml_output SET v=1; SET @v=73");
     SQLINTEGER output = -1;
@@ -194,7 +220,7 @@ TEST_P(DmlOutputTest, ResetBindingsDiscardsPendingOutput) {
     EXPECT_EQ(-1, length);
 }
 
-TEST_P(DmlOutputTest, RebindingRedirectsPendingOutput) {
+void DmlOutputTest::RebindingRedirectsPendingOutput() {
     Procedure("@v int OUTPUT AS SET NOCOUNT OFF; "
               "UPDATE #dml_output SET v=1; SET @v=73");
     SQLINTEGER old_output = -1, new_output = -2;
@@ -211,7 +237,58 @@ TEST_P(DmlOutputTest, RebindingRedirectsPendingOutput) {
     EXPECT_EQ(sizeof(SQLINTEGER), new_length);
 }
 
-INSTANTIATE_TEST_SUITE_P(ExecutionRoutes, DmlOutputTest, testing::Bool(),
-                        [](const testing::TestParamInfo<bool>& info) {
-                            return info.param ? "Prepared" : "Direct";
-                        });
+ODBC_TEST_F(DmlOutputDirectTest, CountsDeferOutputAndReturnStatusUntilFinalMoreResults) {
+    CountsDeferOutputAndReturnStatusUntilFinalMoreResults();
+}
+
+ODBC_TEST_F(DmlOutputPreparedTest, CountsDeferOutputAndReturnStatusUntilFinalMoreResults) {
+    CountsDeferOutputAndReturnStatusUntilFinalMoreResults();
+}
+
+ODBC_TEST_F(DmlOutputDirectTest, ZeroAffectedRowsStillDefersOutput) {
+    ZeroAffectedRowsStillDefersOutput();
+}
+
+ODBC_TEST_F(DmlOutputPreparedTest, ZeroAffectedRowsStillDefersOutput) {
+    ZeroAffectedRowsStillDefersOutput();
+}
+
+ODBC_TEST_F(DmlOutputDirectTest, NoCountKeepsImmediateDelivery) {
+    NoCountKeepsImmediateDelivery();
+}
+
+ODBC_TEST_F(DmlOutputPreparedTest, NoCountKeepsImmediateDelivery) {
+    NoCountKeepsImmediateDelivery();
+}
+
+ODBC_TEST_F(DmlOutputDirectTest, ConversionErrorIsReportedOnceAfterTheCount) {
+    ConversionErrorIsReportedOnceAfterTheCount();
+}
+
+ODBC_TEST_F(DmlOutputPreparedTest, ConversionErrorIsReportedOnceAfterTheCount) {
+    ConversionErrorIsReportedOnceAfterTheCount();
+}
+
+ODBC_TEST_F(DmlOutputDirectTest, TruncationWarningIsReportedOnceAfterTheCount) {
+    TruncationWarningIsReportedOnceAfterTheCount();
+}
+
+ODBC_TEST_F(DmlOutputPreparedTest, TruncationWarningIsReportedOnceAfterTheCount) {
+    TruncationWarningIsReportedOnceAfterTheCount();
+}
+
+ODBC_TEST_F(DmlOutputDirectTest, ResetBindingsDiscardsPendingOutput) {
+    ResetBindingsDiscardsPendingOutput();
+}
+
+ODBC_TEST_F(DmlOutputPreparedTest, ResetBindingsDiscardsPendingOutput) {
+    ResetBindingsDiscardsPendingOutput();
+}
+
+ODBC_TEST_F(DmlOutputDirectTest, RebindingRedirectsPendingOutput) {
+    RebindingRedirectsPendingOutput();
+}
+
+ODBC_TEST_F(DmlOutputPreparedTest, RebindingRedirectsPendingOutput) {
+    RebindingRedirectsPendingOutput();
+}
