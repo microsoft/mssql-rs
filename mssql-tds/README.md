@@ -91,11 +91,10 @@ transport default; failed cancellation settlement retires the connection.
 Discarding rows during cancellation does not decode values or resolve Always
 Encrypted keys.
 
-`close_query_with_options` can impose an additional drain timeout and cancellation
-handle without extending the active request's remaining timeout.
-
-Bulk-copy write timeouts retire the connection if a packet was interrupted;
-clean packet boundaries use normal cancellation recovery.
+Write deadlines apply to SQL batches, RPCs (including streamed parameters), and
+bulk copy. If a timeout interrupts an in-flight packet, the connection is retired
+without further writes; there is no packet-completion grace period. At a clean
+packet boundary, normal withdrawal or cancellation recovery remains available.
 
 ## Runtime behavior
 

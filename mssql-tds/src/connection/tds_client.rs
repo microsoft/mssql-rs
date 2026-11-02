@@ -8946,35 +8946,6 @@ impl TdsClient {
         }
     }
 
-    /// Drains the current response with an additional timeout or cancellation
-    /// handle. A positive timeout can shorten, but never extend, the remaining
-    /// request budget; zero leaves that budget unchanged.
-    pub async fn close_query_with_options<'a>(
-        &mut self,
-        options: impl Into<ExecuteOptions<'a>>,
-    ) -> TdsResult<()> {
-        let ExecuteOptions {
-            timeout,
-            cancel,
-            on_error,
-            ..
-        } = options.into();
-        Self::note_on_error_ignored(on_error);
-        if self.has_open_batch() {
-            if let Some(seconds) = timeout.filter(|seconds| *seconds != 0) {
-                let timeout = Duration::from_secs(u64::from(seconds));
-                self.remaining_request_timeout = Some(
-                    self.remaining_request_timeout
-                        .map_or(timeout, |remaining| remaining.min(timeout)),
-                );
-            }
-            if let Some(cancel) = cancel {
-                self.cancel_handle = Some(cancel.child_handle());
-            }
-        }
-        self.close_query().await
-    }
-
     /// Abandons an outstanding response the way an ODBC statement close does.
     ///
     /// Unlike [`close_query`](Self::close_query), the unread tail is discarded,
@@ -20750,7 +20721,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn request_write_timeout_retires_a_stalled_send_without_external_cancellation() {
         for configured_cancel in [false, true] {
-            for operation in ["batch", "begin", "commit", "rollback"] {
+            for operation in ["batch", "rpc", "begin", "commit", "rollback"] {
                 let mut cancel = CancelHandle::new();
                 cancel.set_cancel_timeout_secs(1);
                 let mut transport = TestTransport::new();
@@ -20771,6 +20742,10 @@ mod tests {
                     match operation {
                         "batch" => client
                             .execute("SELECT 1".to_string(), options)
+                            .await
+                            .map(|_| ()),
+                        "rpc" => client
+                            .execute_sp_executesql("SELECT 1".to_string(), Vec::new(), options)
                             .await
                             .map(|_| ()),
                         "begin" => {
@@ -20805,6 +20780,41 @@ mod tests {
                 assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
                 assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
             }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn statement_write_timeout_retires_a_slow_send_without_a_grace_period() {
+        for operation in ["batch", "rpc"] {
+            let mut transport = TestTransport::new();
+            transport.send_delay = Some(Duration::from_secs(2));
+            let sent = Arc::clone(&transport.sent);
+            let closes = Arc::clone(&transport.close_calls);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            let options = ExecuteOptions::new().timeout_secs(1);
+            let started = tokio::time::Instant::now();
+            let result = match operation {
+                "batch" => client
+                    .execute("SELECT 1".to_string(), options)
+                    .await
+                    .map(|_| ()),
+                "rpc" => client
+                    .execute_sp_executesql("SELECT 1".to_string(), Vec::new(), options)
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(result, Err(crate::error::Error::TimeoutError(_))),
+                "{operation}"
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(1), "{operation}");
+            assert!(client.is_connection_dead(), "{operation}");
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(client.execute("SELECT 1".to_string(), ()).await.is_err());
+            assert!(sent.lock().unwrap().is_empty(), "{operation}");
         }
     }
 
@@ -21034,37 +21044,6 @@ mod tests {
             ));
             assert!(sent.lock().unwrap().is_empty());
             assert_eq!(client.connection_recovery_count(), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn close_query_options_only_shorten_the_active_request_budget() {
-        for (original, seconds, expected) in [
-            (None, 1, Some(1)),
-            (Some(5), 1, Some(1)),
-            (Some(1), 5, Some(1)),
-            (Some(1), 0, Some(1)),
-            (None, 0, None),
-        ] {
-            let transport = TestTransport::with_tokens(vec![done_no_more()]);
-            let timeouts = Arc::clone(&transport.receive_timeouts);
-            let mut client = create_test_client_with_transport(transport);
-            client.execution_context.set_has_open_batch(true);
-            client.current_result_set_has_been_read_till_end = true;
-            client.remaining_request_timeout = original.map(Duration::from_secs);
-            client
-                .close_query_with_options(ExecuteOptions::new().timeout_secs(seconds))
-                .await
-                .unwrap();
-            let observed = timeouts.lock().unwrap()[0];
-            match expected {
-                Some(seconds) => assert!(observed.is_some_and(|timeout| {
-                    timeout > Duration::ZERO && timeout <= Duration::from_secs(seconds)
-                })),
-                None => assert_eq!(observed, None),
-            }
-            assert!(!client.has_open_batch());
-            assert!(client.remaining_request_timeout.is_none());
         }
     }
 
