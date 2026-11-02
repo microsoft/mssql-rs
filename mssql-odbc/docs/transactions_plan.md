@@ -148,7 +148,7 @@ the reference source; exact retail timing and diagnostics have not yet been
 measured against CI's pinned msodbcsql 18.6.2.1 build.
 The deliberate send-deadline and shared-budget differences, including statement
 and bulk-copy scope and the remaining RPC accounting difference, are recorded in
-[parity registry entry 37](parity-deviations.md).
+[parity registry entry 38](parity-deviations.md).
 
 ## 2. Non-goals
 
