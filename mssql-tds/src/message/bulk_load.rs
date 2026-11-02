@@ -314,6 +314,33 @@ impl<'a> StreamingBulkLoadWriter<'a> {
             ))
         })?;
 
+        if let ColumnValues::Vector(vector) = value {
+            let col_meta = &self.column_metadata[column_index];
+            if ctx.tds_type != TdsDataType::Vector as u8 {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector value cannot be written to non-vector column '{}'",
+                    col_meta.column_name
+                )));
+            }
+            let base_type =
+                crate::datatypes::sqldatatypes::VectorBaseType::try_from(col_meta.scale)?;
+            let actual_base_type = vector.base_type();
+            if actual_base_type != base_type {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector base type mismatch: declared {:?}, but vector has {:?}",
+                    base_type, actual_base_type
+                )));
+            }
+            let dimensions = col_meta.vector_dimensions()?;
+            let actual_dimensions = vector.element_count();
+            if actual_dimensions != dimensions {
+                return Err(Error::TypeConversionError(format!(
+                    "Vector dimension mismatch: declared {}, but vector has {}",
+                    dimensions, actual_dimensions
+                )));
+            }
+        }
+
         TdsValueSerializer::serialize_value(self.packet_writer, value, ctx).await?;
 
         Ok(())
@@ -1147,6 +1174,190 @@ pub(crate) fn build_insert_bulk_command(
 #[cfg(test)]
 #[path = "bulk_load_tests.rs"]
 mod bulk_load_tests;
+
+#[cfg(test)]
+mod vector_tests {
+    use super::*;
+    use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+    use crate::datatypes::sql_vector::SqlVector;
+    use crate::datatypes::sqldatatypes::{VECTOR_HEADER_SIZE, VectorBaseType};
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::messages::PacketType;
+
+    async fn write_vector_column(
+        base_type: VectorBaseType,
+        dimensions: u16,
+        value: ColumnValues,
+    ) -> (TdsResult<()>, Vec<u8>) {
+        let length =
+            (VECTOR_HEADER_SIZE + usize::from(dimensions) * base_type.element_size_bytes()) as i32;
+        let column = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, TdsDataType::Vector as u8)
+            .with_length(length, TypeLength::Variable(length))
+            .with_scale(base_type as u8);
+        write_column(column, value).await
+    }
+
+    async fn write_column(
+        column: BulkCopyColumnMetadata,
+        value: ColumnValues,
+    ) -> (TdsResult<()>, Vec<u8>) {
+        let mut mock = MockNetworkWriter::new(512);
+        let mut packet_writer = PacketWriter::new(PacketType::BulkLoad, &mut mock, None, None);
+        let mut writer = StreamingBulkLoadWriter::new(
+            &mut packet_writer,
+            "T".to_string(),
+            vec![column],
+            SqlCollation::default(),
+        );
+        writer.begin().await.unwrap();
+        let before = writer.packet_writer.get_payload().into_inner().to_vec();
+        let result = writer.write_column_value(0, &value).await;
+        let after = writer.packet_writer.get_payload().into_inner().to_vec();
+        assert_eq!(&after[..before.len()], before.as_slice());
+        (result, after[before.len()..].to_vec())
+    }
+
+    #[tokio::test]
+    async fn vector_float16_matching_metadata() {
+        let value = SqlVector::try_from_f16(vec![1.0, 2.0]).unwrap();
+        let (result, bytes) =
+            write_vector_column(VectorBaseType::Float16, 2, ColumnValues::Vector(value)).await;
+        result.unwrap();
+        assert_eq!(bytes, [12, 0, 0xA9, 1, 2, 0, 1, 0, 0, 0, 0, 0x3C, 0, 0x40]);
+    }
+
+    #[tokio::test]
+    async fn vector_rejected_for_non_vector_column() {
+        for value in [
+            SqlVector::try_from_f16(vec![1.0, 2.0]).unwrap(),
+            SqlVector::try_from_f32(vec![1.0, 2.0]).unwrap(),
+        ] {
+            let column = BulkCopyColumnMetadata::new("v", SqlDbType::VarChar, 0xA7)
+                .with_length(8000, TypeLength::Variable(8000));
+            let (result, bytes) = write_column(column, ColumnValues::Vector(value)).await;
+            assert!(matches!(
+                result,
+                Err(Error::TypeConversionError(message))
+                    if message == "Vector value cannot be written to non-vector column 'v'"
+            ));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_float32_rejected_for_float16_column() {
+        let value = SqlVector::try_from_f32(vec![1.0, 2.0]).unwrap();
+        let (result, bytes) =
+            write_vector_column(VectorBaseType::Float16, 2, ColumnValues::Vector(value)).await;
+        assert!(matches!(
+            result,
+            Err(Error::TypeConversionError(message))
+                if message == "Vector base type mismatch: declared Float16, but vector has Float32"
+        ));
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vector_float16_rejected_for_float32_column() {
+        let value = SqlVector::try_from_f16(vec![1.0, 2.0]).unwrap();
+        let (result, bytes) =
+            write_vector_column(VectorBaseType::Float32, 2, ColumnValues::Vector(value)).await;
+        assert!(matches!(
+            result,
+            Err(Error::TypeConversionError(message))
+                if message == "Vector base type mismatch: declared Float32, but vector has Float16"
+        ));
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vector_same_byte_size_base_type_mismatch() {
+        for (base_type, dimensions, value) in [
+            (
+                VectorBaseType::Float16,
+                2,
+                SqlVector::try_from_f32(vec![1.0]).unwrap(),
+            ),
+            (
+                VectorBaseType::Float32,
+                1,
+                SqlVector::try_from_f16(vec![1.0, 2.0]).unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                value.total_size(),
+                VECTOR_HEADER_SIZE + usize::from(dimensions) * base_type.element_size_bytes()
+            );
+            let (result, bytes) =
+                write_vector_column(base_type, dimensions, ColumnValues::Vector(value)).await;
+            assert!(matches!(
+                result,
+                Err(Error::TypeConversionError(message))
+                    if message.starts_with("Vector base type mismatch:")
+            ));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_dimension_mismatch() {
+        for value in [
+            SqlVector::try_from_f16(vec![1.0]).unwrap(),
+            SqlVector::try_from_f16(vec![1.0, 2.0, 3.0]).unwrap(),
+            SqlVector::try_from_f32(vec![1.0]).unwrap(),
+            SqlVector::try_from_f32(vec![1.0, 2.0, 3.0]).unwrap(),
+        ] {
+            let expected = format!(
+                "Vector dimension mismatch: declared 2, but vector has {}",
+                value.dimension_count()
+            );
+            let (result, bytes) =
+                write_vector_column(value.base_type(), 2, ColumnValues::Vector(value)).await;
+            assert!(matches!(
+                result,
+                Err(Error::TypeConversionError(message)) if message == expected
+            ));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_wrapped_dimension_count_rejected() {
+        use crate::datatypes::sql_vector::VectorData;
+
+        // 65,538 elements wrap to 2 as a u16 and a 12-byte total size.
+        for (base_type, data) in [
+            (
+                VectorBaseType::Float16,
+                VectorData::Float16(vec![0.0; 65_538]),
+            ),
+            (
+                VectorBaseType::Float32,
+                VectorData::Float32(vec![0.0; 65_538]),
+            ),
+        ] {
+            let value = SqlVector { base_type, data };
+            assert_eq!(value.dimension_count(), 2);
+            let (result, bytes) =
+                write_vector_column(base_type, 2, ColumnValues::Vector(value)).await;
+            assert!(matches!(
+                result,
+                Err(Error::TypeConversionError(message))
+                    if message == "Vector dimension mismatch: declared 2, but vector has 65538"
+            ));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_null_uses_destination_metadata() {
+        for base_type in [VectorBaseType::Float16, VectorBaseType::Float32] {
+            let (result, bytes) = write_vector_column(base_type, 2, ColumnValues::Null).await;
+            result.unwrap();
+            assert_eq!(bytes, [0xFF, 0xFF]);
+        }
+    }
+}
 
 /// Always Encrypted COLMETADATA serialization tests.
 ///

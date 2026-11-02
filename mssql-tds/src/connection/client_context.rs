@@ -380,6 +380,7 @@ pub struct ClientContext {
     pub login_server_name: Option<String>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
+    /// Default: [`VectorVersion::V2`].
     pub vector_version: VectorVersion,
     /// Always Encrypted (column encryption) setting for the connection.
     /// Default: [`ColumnEncryptionSetting::Disabled`].
@@ -594,8 +595,7 @@ impl ClientContext {
                 port: 1433,
                 instance_name: None,
             },
-            // TODO: make V2 as default when full V2 support is added
-            vector_version: VectorVersion::V1,
+            vector_version: VectorVersion::V2,
             column_encryption_setting: ColumnEncryptionSetting::Disabled,
             column_encryption_key_store_providers: std::sync::Arc::new(
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
@@ -661,8 +661,7 @@ impl ClientContext {
                 port: 1433,
                 instance_name: None,
             },
-            // TODO: make V2 as default when full V2 support is added
-            vector_version: VectorVersion::V1,
+            vector_version: VectorVersion::V2,
             column_encryption_setting: ColumnEncryptionSetting::Disabled,
             column_encryption_key_store_providers: std::sync::Arc::new(
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),

@@ -53,6 +53,39 @@ The server certificate must be trusted and match the hostname.
 cancellation, and other per-command settings. Use `advance()` for subsequent
 results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
+## Vectors
+
+Connections request `VectorVersion::V2` by default, supporting float32 and float16
+vectors when the server negotiates the corresponding feature version. Set
+`ClientContext::vector_version` to `VectorVersion::V1` before connecting to opt out
+of float16 support while retaining float32 support. A float16 RPC parameter,
+including a typed NULL, requires negotiated V2; requesting V2 alone does not
+guarantee server support.
+
+`SqlVector::try_from_f32` creates float32 vectors (up to 1998 dimensions).
+`SqlVector::try_from_f16` accepts `Vec<f32>` and tags it for float16 wire storage
+(up to 3996 dimensions). Both types are held in memory as `f32` and exposed through
+`as_f32()`; constructing a float16 vector does not immediately round its values.
+Serialization narrows each element to IEEE 754 binary16 using `half::f16`, and
+deserialization widens the received binary16 values to `f32`. Conversion is lossy:
+round-to-nearest, ties-to-even can lose precision, magnitudes at or below `2^-25`
+become signed zero, and magnitudes of `65520.0` or more (including `f32::MAX`)
+become infinity without an error. Values between `65504.0` and `65520.0`, such as
+`65505.0f32`, round to the finite `65504.0`. This matches the msodbcsql
+`Float32ToFloat16Bits` behavior; callers that need to reject out-of-range input must
+validate it before building the vector. These conversion semantics do not imply that
+SQL Server accepts non-finite vector elements.
+
+Float16 live integration tests are ignored by default. Explicit opt-in requires nextest
+`--run-ignored ignored-only` with the `test(vector16)` filter, `VECTOR16_TEST=1`, an explicit `DB_DATABASE`,
+and `DB_HOST`/`DB_PORT` for a server with float16 support preprovisioned by an
+administrator. The general integration helper always connects to `master`,
+but float16 tests use a separate helper that requires `DB_DATABASE` with no fallback.
+When selected without `VECTOR16_TEST=1` they return early with a diagnostic; with opt-in they fail on bad
+configuration. Tests never change database configuration or global flags.
+See the [transport test guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/tests/TRANSPORT_TESTS_README.md#float16-vector-integration-tests)
+for environment details and the `test(vector16)` nextest filter.
+
 ## Connection policy and migration
 
 See the [connection behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
