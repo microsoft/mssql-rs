@@ -23,6 +23,11 @@ parameters:
   - name: publishArtifacts
     type: boolean
     default: true
+  # Keep symbols and line tables in the release driver (LTO and optimization
+  # unchanged) so gdb can name driver frames; used by the stress pipeline.
+  - name: keepDebugInfo
+    type: boolean
+    default: false
 
 steps:
   - script: |
@@ -30,6 +35,7 @@ steps:
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         -v "$PWD:/workspace" \
         -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        ${{ iif(eq(parameters.keepDebugInfo, true), '-e CARGO_PROFILE_RELEASE_STRIP=none -e CARGO_PROFILE_RELEASE_DEBUG=line-tables-only', '') }} \
         -w /workspace \
         ${{ parameters.buildImage }} \
         /workspace/scripts/dockerentry/alpine-odbc-build.sh

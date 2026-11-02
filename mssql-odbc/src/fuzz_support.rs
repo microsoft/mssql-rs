@@ -492,6 +492,8 @@ pub fn fuzz_bound_param(data: &[u8]) {
     let c_type = PARAM_C_TYPES[(cur.u8() as usize) % PARAM_C_TYPES.len()];
     let sql_type = PARAM_SQL_TYPES[(cur.u8() as usize) % PARAM_SQL_TYPES.len()];
     let ind_mode = cur.u8();
+    // Reuse an unused indicator bit without shifting existing corpus payloads.
+    let long_as_max = ind_mode & 0x80 != 0;
     let column_size = cur.u8() as SqlULen;
     let decimal_digits = SqlSmallInt::from(cur.u8() % 39);
     // Only for a UDT draw: these bytes come out of the value buffer, and every
@@ -560,7 +562,8 @@ pub fn fuzz_bound_param(data: &[u8]) {
     // the value buffer, so passing `None` would make every `SQL_SS_UDT` draw
     // return `MissingUdtTypeName` and leave the UDT arm - the `SqlType::Udt`
     // construction and the binary payload pass-through behind it - unfuzzed.
-    let Ok((rpc, _)) = (unsafe { bound_param_to_rpc("@P1".to_string(), &param, udt.as_ref()) })
+    let Ok((rpc, _)) =
+        (unsafe { bound_param_to_rpc("@P1".to_string(), &param, udt.as_ref(), long_as_max) })
     else {
         return;
     };

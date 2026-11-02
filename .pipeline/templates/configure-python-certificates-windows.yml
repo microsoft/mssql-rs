@@ -1,0 +1,18 @@
+steps:
+- pwsh: |
+    $ErrorActionPreference = 'Stop'
+    $certificates = @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root |
+      Sort-Object Thumbprint -Unique)
+    if ($certificates.Count -eq 0) {
+      throw 'No Windows trusted root certificates found for pip.'
+    }
+
+    $bundle = Join-Path $env:AGENT_TEMPDIRECTORY 'python-ca-bundle.pem'
+    $pem = foreach ($certificate in $certificates) {
+      '-----BEGIN CERTIFICATE-----'
+      [Convert]::ToBase64String($certificate.RawData, [Base64FormattingOptions]::InsertLineBreaks)
+      '-----END CERTIFICATE-----'
+    }
+    Set-Content -LiteralPath $bundle -Value $pem -Encoding ascii
+    Write-Host "##vso[task.setvariable variable=PIP_CERT]$bundle"
+  displayName: 'Configure pip to use Windows trusted root certificates'

@@ -416,7 +416,7 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
 /// prepared handle on statement drop).
 ///
 /// If the statement still has an open cursor, its result set is drained first
-/// (via `close_cursor::drain_and_release`) so the trailing `@handle` token is
+/// (via `close_cursor::abandon_and_release`) so the trailing `@handle` token is
 /// captured and the connection goes idle. The unprepare itself is best-effort
 /// and non-fatal: it acts only when the connection is live and idle, reusing
 /// [`try_claim_idle_client`] / [`return_client_idle`]. If the connection is
@@ -435,7 +435,7 @@ fn best_effort_unprepare_on_free_inner(
     dbc: &DbcHandle,
     process_is_shutting_down: bool,
 ) {
-    // If a cursor is still open, drain it first: `drain_and_release` reads the
+    // If a cursor is still open, drain it first: `abandon_and_release` reads the
     // trailing `@handle` token (capturing it into `prepared`), returns the
     // client, and releases the wire — leaving the connection idle so the
     // unprepare below can claim it. Without this, a `prepare -> SQLExecute
@@ -447,7 +447,7 @@ fn best_effort_unprepare_on_free_inner(
         .map(|s| s.has_state(STMT_STATE_CURSOR_OPEN))
         .unwrap_or(false);
     if cursor_open {
-        super::close_cursor::drain_and_release(stmt, handle);
+        super::close_cursor::abandon_and_release(stmt, handle);
     }
 
     // A statement freed mid data-at-execution still owns the connection's
@@ -1388,7 +1388,7 @@ mod tests {
     ///
     /// This pins the hand-off the skip arm still owes the DBC: client returned,
     /// connection not left claimed. It does **not** pin the skip itself, unlike
-    /// the `drain_and_release` and `rollback_before_disconnect` pairs — a
+    /// the `abandon_and_release` and `rollback_before_disconnect` pairs — a
     /// scripted client makes a skipped `unprepare` and an attempted one
     /// indistinguishable, because the round-trip neither errors observably nor
     /// marks the connection dead. The skip is covered end to end instead, by

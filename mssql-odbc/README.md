@@ -51,11 +51,16 @@ flowchart TD
 ```
 
 User-visible performance behavior is recorded as data-path contracts in the
-[ODBC driver engineering guidelines](../.github/instructions/mssql-odbc.instructions.md#11-performance-and-ffi-data-movement).
+[ODBC driver engineering guidelines](https://github.com/microsoft/mssql-rs/blob/main/.github/instructions/mssql-odbc.instructions.md#11-performance-and-ffi-data-movement).
 The measurements and trade-offs behind each contract live beside the code that
 implements it, and deliberate departures from msodbcsql are recorded in the
 [parity registry](docs/parity-deviations.md). Subsystem design notes live in
 [`docs/`](docs/).
+
+Fetch reuses binding storage between calls while honoring descriptor changes on
+the next fetch. The connection retains one heap-allocated protocol client to
+avoid large client copies during result retrieval; cancellation and connection
+ownership behavior are unchanged.
 
 ### Connection defaults
 
@@ -99,6 +104,23 @@ because `SQLParamData` tokens must remain in bind order. Once no buffered
 parameters remain, subsequent PLP values stream normally. Validation that
 depends on the completed value can occur during `SQLPutData` or when
 `SQLParamData` closes the parameter rather than at bind time.
+
+### Legacy LOB parameters
+
+`SQL_LONGVARCHAR`, `SQL_WLONGVARCHAR`, and `SQL_LONGVARBINARY` parameters use
+`text`, `ntext`, and `image` by default, including typed NULLs. Set
+`LongAsMax=Yes` in the connection string, or set `SQL_COPT_SS_LONGASMAX` to
+`SQL_XL_ON`, to use `varchar(max)`, `nvarchar(max)`, and `varbinary(max)`.
+Explicit connection attributes take precedence over the keyword.
+
+**Migration note:** earlier alpha builds always substituted MAX types. Use
+`LongAsMax=Yes` to retain that behavior. `ColumnSize` bounds still apply to
+LONG bindings in either mode; use the ordinary variable-length SQL types with
+`ColumnSize=0` for explicitly unbounded MAX parameters.
+
+An already-executed prepared statement retains its server-side declaration
+when the option changes; prepare it again to select a new declaration. DAE
+parameters remain chunked in both modes.
 
 ## Platform artifacts
 

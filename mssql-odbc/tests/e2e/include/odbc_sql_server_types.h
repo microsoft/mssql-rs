@@ -45,6 +45,13 @@ typedef struct tagSS_TIMESTAMPOFFSET_STRUCT {
 #ifndef SQL_SS_XML
 #define SQL_SS_XML (-152)
 #endif
+#ifndef SQL_COPT_SS_LONGASMAX
+#define SQL_COPT_SS_LONGASMAX 1403
+#endif
+#ifndef SQL_XL_OFF
+#define SQL_XL_OFF 0L
+#define SQL_XL_ON 1L
+#endif
 #ifndef SQL_SS_TIME2
 #define SQL_SS_TIME2 (-154)
 #endif

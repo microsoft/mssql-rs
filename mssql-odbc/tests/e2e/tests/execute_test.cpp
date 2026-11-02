@@ -1419,14 +1419,11 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// The same-family long pairing still streams. Its placeholder is varchar(max),
-// which is also what the materialized path now declares for SQL_LONGVARCHAR
-// until text/ntext can be sent (AB#47592), so the two agree.
+// The legacy declaration does not change the PLP/MAX framing used for DAE.
 //
 // ColumnSize must be a real length: 0 is the `max` sentinel for SQL_VARCHAR but
 // invalid for the long types on both drivers (HY104), as
-// ZeroColumnSizeIsRejectedForFixedLengthCharTypes pins. The streamed path does
-// not enforce it either way (AB#47590).
+// ZeroColumnSizeIsRejectedForFixedLengthCharTypes pins.
 TEST_F(PrepareExecuteLiveTest, LongVarcharDataAtExecutionStreams) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
