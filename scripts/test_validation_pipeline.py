@@ -15,6 +15,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from test_release_pipeline import evaluate
+
 _ROOT = Path(__file__).parents[1]
 _TEMPLATES = _ROOT / ".pipeline" / "templates"
 _NON_PR = "and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))"
@@ -32,13 +34,59 @@ def load_template(name):
 
 
 @pytest.fixture
-def windows_stress_job():
-    pipeline = yaml.safe_load(
+def stress_pipeline():
+    return yaml.safe_load(
         (_ROOT / ".pipeline" / "odbc-stress-pipeline.yml").read_text(encoding="utf-8")
     )
-    stage = next(stage for stage in pipeline["stages"] if stage["stage"] == "Stress_Windows")
+
+
+@pytest.fixture
+def windows_stress_job(stress_pipeline):
+    stage = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
+    )
     assert stage["dependsOn"] == []
     return stage["jobs"][0]
+
+
+@pytest.mark.parametrize(
+    ("profile", "schedule", "expected"),
+    [
+        ("auto", None, 120),
+        ("auto", "", 120),
+        ("auto", "Nightly ODBC stress", 120),
+        ("auto", "Weekly ODBC stress", 240),
+        ("weekly", None, 240),
+        ("weekly", "Nightly ODBC stress", 240),
+        ("nightly", "Weekly ODBC stress", 120),
+    ],
+)
+def test_stress_job_timeout_follows_profile(stress_pipeline, profile, schedule, expected):
+    variables = stress_pipeline["variables"]
+    conditional = next(key for key in variables if key.startswith("${{ if "))
+    condition = conditional.removeprefix("${{ if ").removesuffix(" }}")
+    weekly = evaluate(
+        condition, {"profile": profile},
+        variables={"Build.CronSchedule.DisplayName": schedule},
+    )
+    selected = variables[conditional if weekly else "${{ else }}"]
+    assert selected["odbcMtJobTimeoutInMinutes"] == expected
+    timeout = "${{ variables.odbcMtJobTimeoutInMinutes }}"
+    windows = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
+    )
+    assert windows["jobs"][0]["timeoutInMinutes"] == timeout
+    linux = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Linux"
+    )
+    assert len(linux["jobs"]) == 2
+    for job in linux["jobs"]:
+        assert job["parameters"]["timeoutInMinutes"] == timeout
+        assert len(job["parameters"]["matrix"]) == 1
+    build = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Build_Linux_Drops"
+    )
+    assert build["jobs"][0]["timeoutInMinutes"] == 90
 
 
 def test_windows_stress_matrix_preserves_profiles_and_parity(windows_stress_job):
@@ -46,7 +94,7 @@ def test_windows_stress_matrix_preserves_profiles_and_parity(windows_stress_job)
     assert set(matrix) == {"Fetch", "Parameters", "Metadata", "Other"}
     assert {group["suiteGroup"] for group in matrix.values()} == set(matrix)
     assert "maxParallel" not in windows_stress_job["strategy"]
-    assert windows_stress_job["timeoutInMinutes"] == 120
+    assert windows_stress_job["timeoutInMinutes"] == "${{ variables.odbcMtJobTimeoutInMinutes }}"
     step = next(step for step in windows_stress_job["steps"] if "pwsh" in step)
     command = step["pwsh"]
     assert "-CompareWithMsodbcsql" in command
