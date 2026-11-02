@@ -148,6 +148,30 @@ pub enum TimeoutErrorType {
     String(String),
 }
 
+/// Identifies a TVP parameter in a serialization diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TvpParameterRef {
+    /// One-based parameter ordinal in the ODBC statement.
+    OdbcOrdinal(usize),
+    /// One-based position in the TDS RPC request.
+    RpcPosition(usize),
+    /// Name of a named TDS RPC parameter.
+    Name(String),
+    /// No parameter identity was available at the serialization layer.
+    Unknown,
+}
+
+impl std::fmt::Display for TvpParameterRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OdbcOrdinal(ordinal) => write!(f, "ODBC ordinal {ordinal}"),
+            Self::RpcPosition(position) => write!(f, "RPC position {position}"),
+            Self::Name(name) => write!(f, "name {name}"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
 /// All errors produced by the TDS client.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -247,11 +271,11 @@ pub enum Error {
     /// A TVP cell failed while being serialized.
     #[error("TVP parameter {parameter}, row {row}, column {column} serialization failed: {source}")]
     TvpCellSerialization {
-        /// Parameter name or ordinal in the RPC request.
-        parameter: String,
-        /// Zero-based row containing the cell.
+        /// Parameter identity.
+        parameter: TvpParameterRef,
+        /// One-based row containing the cell.
         row: usize,
-        /// Zero-based column containing the cell.
+        /// One-based column containing the cell.
         column: usize,
         /// The underlying cell serialization error.
         #[source]
@@ -366,14 +390,14 @@ impl Error {
             return self;
         }
         Self::TvpCellSerialization {
-            parameter: "unknown".to_string(),
-            row,
-            column,
+            parameter: TvpParameterRef::Unknown,
+            row: row + 1,
+            column: column + 1,
             source: Box::new(self),
         }
     }
 
-    pub(crate) fn with_tvp_parameter_context(self, parameter: String) -> Self {
+    pub(crate) fn with_tvp_parameter_context(self, parameter: TvpParameterRef) -> Self {
         match self {
             Self::TvpCellSerialization {
                 row,

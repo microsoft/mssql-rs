@@ -904,7 +904,7 @@ pub(super) fn post_param_row_build_error(
     let diagnostic = error.diag();
     if let Some((row, column)) = error.tvp_cell_location() {
         let message = format!(
-            "TVP parameter {}, row {}, column {}: {}",
+            "TVP parameter ODBC ordinal {}, row {}, column {}: {}",
             error.parameter() + parameter_offset,
             row + 1,
             column + 1,
@@ -1257,11 +1257,10 @@ pub(super) unsafe fn build_named_params_for_row(
                 } else {
                     StatusFlags::NONE
                 };
-                params.push(RpcParameter::data_at_exec(
-                    name,
-                    status,
-                    StreamedSqlType::VarBinaryMax,
-                ));
+                params.push(
+                    RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax)
+                        .with_odbc_ordinal(ordinal),
+                );
             } else {
                 let rpc = unsafe {
                     // The parent binding already includes the outer bind offset.
@@ -1279,7 +1278,7 @@ pub(super) unsafe fn build_named_params_for_row(
                     parameter: i + 1,
                     source,
                 })?;
-                params.push(rpc);
+                params.push(rpc.with_odbc_ordinal(ordinal));
             }
             continue;
         }
@@ -1626,6 +1625,10 @@ pub(super) fn rebuild_deferred_params(
         }
         let row_count = tvp_row_counts.get(&tvp_index).copied().unwrap_or(0);
         let name = parameter_name(tvp_index);
+        let parameter_ordinal = params
+            .get(tvp_index)
+            .and_then(RpcParameter::odbc_ordinal)
+            .unwrap_or(tvp_index + 1);
         let Some(slot) = params.get_mut(tvp_index) else {
             error!("{op}: TVP parameter {} has no RPC slot", tvp_index + 1);
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
@@ -1639,15 +1642,15 @@ pub(super) fn rebuild_deferred_params(
             row_count,
             tvp_cells,
         ) {
-            Ok(param) => *slot = param,
+            Ok(param) => *slot = param.with_odbc_ordinal(parameter_ordinal),
             Err(error) => {
                 let row_error = ParamRowBuildError::Conversion {
-                    parameter: tvp_index + 1,
+                    parameter: parameter_ordinal,
                     source: error,
                 };
                 error!(
                     "{op}: TVP parameter {} conversion failed: {}",
-                    tvp_index + 1,
+                    parameter_ordinal,
                     row_error.diag().text
                 );
                 post_param_row_build_error(stmt_state, &row_error, 0);
@@ -3217,6 +3220,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
@@ -3506,6 +3510,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3554,6 +3559,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3568,6 +3574,7 @@ mod tests {
             column_size: 5,
             decimal_digits: 1,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 38,
             app_scale: 2,
             parameter_value_ptr: (&mut numeric as *mut SqlNumericStruct).cast(),
@@ -3758,6 +3765,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3782,6 +3790,7 @@ mod tests {
             column_size: 2,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3853,6 +3862,7 @@ mod tests {
             column_size: 2,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3917,6 +3927,7 @@ mod tests {
             column_size: 2,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: 0x1000usize as *mut c_void,
@@ -3931,6 +3942,7 @@ mod tests {
             column_size: 20,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: 0x2000usize as *mut c_void,
@@ -3999,6 +4011,95 @@ mod tests {
     }
 
     #[test]
+    fn tvp_parameter_array_applies_bind_offset_once_to_parent_and_child() {
+        use crate::api::odbc_types::{SQL_C_BINARY, SQL_C_SLONG, SQL_SS_TABLE};
+        use crate::handles::desc::{DescHeader, UdtNames};
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let bind_offset = std::mem::size_of::<SqlLen>() as isize;
+        let mut row_counts: [SqlLen; 3] = [0, 1, 0];
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_BINARY,
+            sql_type: SQL_SS_TABLE,
+            column_size: 1,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: row_counts.as_mut_ptr(),
+            octet_length_ptr: row_counts.as_mut_ptr(),
+        };
+        let mut snapshot = snap(tvp).unwrap();
+        snapshot.udt_names = Some(std::sync::Arc::new(UdtNames {
+            type_name: "Rows".to_string(),
+            ..Default::default()
+        }));
+        let bound = [Some(snapshot)];
+
+        let mut values = [0i32, 0, 42];
+        let mut indicators: [SqlLen; 3] = [0, 0, 0];
+        let column = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_SLONG,
+            sql_type: SQL_INTEGER,
+            column_size: 4,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: std::mem::size_of::<i32>() as SqlLen,
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+        };
+        let mut child_bind_offset = bind_offset as SqlLen;
+        let layout = DescHeader {
+            array_size: 1,
+            bind_offset_ptr: (&mut child_bind_offset as *mut SqlLen).cast(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { layout.bind_offset_ptr.cast::<SqlLen>().read_unaligned() },
+            bind_offset as SqlLen
+        );
+        assert_eq!(
+            column
+                .with_bind_offset(child_bind_offset as isize)
+                .parameter_value_ptr,
+            unsafe { values.as_mut_ptr().add(2) }.cast()
+        );
+        let columns = BTreeMap::from([(1, vec![Some(column)])]);
+        let layouts = BTreeMap::from([(1, layout)]);
+
+        let built = unsafe {
+            build_named_params_for_row(
+                &bound,
+                &columns,
+                &layouts,
+                1,
+                1,
+                bind_offset,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }
+        .unwrap_or_else(|_| panic!("TVP bind-offset conversion failed"));
+
+        match mssql_tds::test_client_support::rpc_parameter_value(&built.params[0]).unwrap() {
+            SqlType::Table(_, Some(data)) => {
+                assert_eq!(data.rows, vec![vec![SqlType::Int(Some(42))]]);
+            }
+            other => panic!("expected a materialized TVP, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_named_params_rejects_null_tvp_indicator_before_dae_staging() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -4011,6 +4112,7 @@ mod tests {
             column_size: 2,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -4063,6 +4165,7 @@ mod tests {
                 column_size: 10,
                 decimal_digits: 0,
                 app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
                 app_precision: 0,
                 app_scale: 0,
                 parameter_value_ptr: std::ptr::null_mut(),
@@ -4135,6 +4238,7 @@ mod tests {
                     column_size: 8,
                     decimal_digits: 0,
                     app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
                     app_precision: 0,
                     app_scale: 0,
                     parameter_value_ptr: std::ptr::null_mut(),
@@ -4196,6 +4300,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
@@ -4228,6 +4333,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
@@ -4276,6 +4382,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
@@ -4324,6 +4431,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value.as_mut_ptr().cast(),
@@ -4367,6 +4475,7 @@ mod tests {
             column_size: 10,
             decimal_digits: 2,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 38,
             app_scale: 0,
             parameter_value_ptr: values.as_mut_ptr().cast(),
@@ -4401,6 +4510,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,

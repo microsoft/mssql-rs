@@ -969,26 +969,25 @@ impl DescHandle {
         Ok(updated.then_some(true))
     }
 
-    pub(crate) fn focused_tvp_bindings(
+    pub(crate) fn focused_tvp_record_snapshot(
         &self,
         record_number: SqlSmallInt,
-    ) -> Result<Vec<crate::params::BoundParam>, ()> {
+    ) -> Result<Option<(usize, Option<crate::params::BoundParam>)>, ()> {
         let Some(column_index) = usize::try_from(record_number)
             .ok()
             .and_then(|number| number.checked_sub(1))
         else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
         let Ok(dbc_state) = dbc.inner.lock() else {
-            error!("reading focused TVP descriptor records: dbc mutex poisoned");
+            error!("reading focused TVP descriptor record: dbc mutex poisoned");
             return Err(());
         };
-        let mut bindings = Vec::new();
         for &raw in &dbc_state.statements {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
             let Ok(state) = stmt.inner.lock() else {
-                error!("reading focused TVP descriptor records: stmt mutex poisoned");
+                error!("reading focused TVP descriptor record: stmt mutex poisoned");
                 return Err(());
             };
             let owns_focus = if self.kind == DescKind::ImpParam {
@@ -1006,15 +1005,15 @@ impl DescHandle {
             if focus == 0 {
                 continue;
             }
-            if let Some(Some(binding)) = state
-                .tvp_column_bindings
-                .get(&focus)
+            let columns = state.tvp_column_bindings.get(&focus);
+            let count = columns.map_or(0, Vec::len);
+            let binding = columns
                 .and_then(|columns| columns.get(column_index))
-            {
-                bindings.push(*binding);
-            }
+                .copied()
+                .flatten();
+            return Ok(Some((count, binding)));
         }
-        Ok(bindings)
+        Ok(None)
     }
 
     pub(crate) fn focused_tvp_layout_headers(&self) -> Result<Vec<DescHeader>, ()> {
@@ -1433,6 +1432,7 @@ mod tests {
                     column_size: 10,
                     decimal_digits: scale,
                     app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
                     app_precision: precision,
                     app_scale: scale,
                     parameter_value_ptr: std::ptr::null_mut(),

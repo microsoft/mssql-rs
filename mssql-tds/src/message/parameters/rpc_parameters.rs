@@ -16,7 +16,7 @@ use crate::datatypes::tds_value_serializer::TdsValueSerializer;
 use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
-    error::Error,
+    error::{Error, TvpParameterRef},
     io::packet_writer::{PacketWriter, TdsPacketWriter},
     token::tokens::SqlCollation,
 };
@@ -219,6 +219,11 @@ pub struct RpcParameter {
     /// `SqlParameter.ForceColumnEncryption`; a client-side directive that is
     /// never sent on the wire.
     force_column_encryption: bool,
+
+    /// Original one-based ODBC ordinal, when this RPC parameter was built by
+    /// the ODBC driver.
+    /// Zero means unavailable; ODBC descriptor ordinals fit in `SQLSMALLINT`.
+    odbc_ordinal: u16,
 }
 
 impl RpcParameter {
@@ -234,6 +239,7 @@ impl RpcParameter {
             narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
+            odbc_ordinal: 0,
         }
     }
 
@@ -253,7 +259,31 @@ impl RpcParameter {
             narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
+            odbc_ordinal: 0,
         }
+    }
+
+    /// Associates the original ODBC ordinal with this RPC parameter for
+    /// diagnostics. This is used when a TVP cell fails during wire
+    /// serialization, where the RPC position may differ from the ODBC ordinal.
+    #[doc(hidden)]
+    pub fn with_odbc_ordinal(mut self, ordinal: usize) -> Self {
+        self.odbc_ordinal = u16::try_from(ordinal).unwrap_or_default();
+        self
+    }
+
+    /// Returns the original ODBC ordinal for an RPC parameter built by the
+    /// ODBC driver.
+    #[doc(hidden)]
+    pub fn odbc_ordinal(&self) -> Option<usize> {
+        (self.odbc_ordinal != 0).then_some(usize::from(self.odbc_ordinal))
+    }
+
+    pub(crate) fn tvp_parameter_ref(&self, fallback: TvpParameterRef) -> TvpParameterRef {
+        self.odbc_ordinal()
+            .map(TvpParameterRef::OdbcOrdinal)
+            .or_else(|| self.name.clone().map(TvpParameterRef::Name))
+            .unwrap_or(fallback)
     }
 
     /// Declares this parameter as `declaration` in the `@params` string while

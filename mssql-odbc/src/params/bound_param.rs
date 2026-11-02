@@ -38,6 +38,8 @@ pub(crate) struct BoundParam {
     pub(crate) c_type: SqlSmallInt,
     /// SQL data type of the column/expression (ODBC `ParameterType`, `SQL_*`).
     pub(crate) sql_type: SqlSmallInt,
+    /// Explicit IPD subtype, if set independently of the concise SQL type.
+    pub(crate) sql_datetime_interval_code: Option<SqlSmallInt>,
     /// Column size (precision) as passed by the application.
     pub(crate) column_size: SqlULen,
     /// Decimal digits (scale) as passed by the application.
@@ -207,7 +209,9 @@ impl BoundParam {
 
         ipd_record.parameter_type = self.input_output_type;
         ipd_record.concise_type = self.sql_type;
-        ipd_record.datetime_interval_code = datetime_interval_code_for(self.sql_type);
+        ipd_record.datetime_interval_code = self
+            .sql_datetime_interval_code
+            .unwrap_or_else(|| datetime_interval_code_for(self.sql_type));
         ipd_record.scale = self.decimal_digits;
         if parameter_size_is_precision(self.sql_type) {
             ipd_record.precision =
@@ -261,19 +265,21 @@ impl BoundParam {
         if !apd_record.data_bound {
             return None;
         }
-        let (input_output_type, sql_type, column_size, decimal_digits) = match ipd_record {
-            Some(ipd) => (
-                ipd.parameter_type,
-                ipd.concise_type,
-                if parameter_size_is_precision(ipd.concise_type) {
-                    SqlULen::try_from(ipd.precision.max(0)).unwrap_or(0)
-                } else {
-                    ipd.length
-                },
-                ipd.scale,
-            ),
-            None => (SQL_PARAM_INPUT, 0, 0, 0),
-        };
+        let (input_output_type, sql_type, sql_datetime_interval_code, column_size, decimal_digits) =
+            match ipd_record {
+                Some(ipd) => (
+                    ipd.parameter_type,
+                    ipd.concise_type,
+                    Some(ipd.datetime_interval_code),
+                    if parameter_size_is_precision(ipd.concise_type) {
+                        SqlULen::try_from(ipd.precision.max(0)).unwrap_or(0)
+                    } else {
+                        ipd.length
+                    },
+                    ipd.scale,
+                ),
+                None => (SQL_PARAM_INPUT, 0, None, 0, 0),
+            };
         let c_type = if apd_record.concise_type == SQL_C_DEFAULT {
             resolve_default_c_type(sql_type, odbc_version).unwrap_or(apd_record.concise_type)
         } else {
@@ -283,6 +289,7 @@ impl BoundParam {
             input_output_type,
             c_type,
             sql_type,
+            sql_datetime_interval_code,
             column_size,
             decimal_digits,
             app_datetime_interval_code: Some(apd_record.datetime_interval_code),
@@ -354,6 +361,7 @@ mod tests {
             column_size: 8,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value,
@@ -515,6 +523,7 @@ mod tests {
             column_size,
             decimal_digits,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -613,6 +622,7 @@ mod tests {
             column_size: 27,
             decimal_digits: 7,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr().cast(),

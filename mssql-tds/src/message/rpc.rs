@@ -8,7 +8,7 @@ use crate::{
     connection::execution_context::ExecutionContext,
     core::TdsResult,
     datatypes::encoder::GenericEncoder,
-    error::Error,
+    error::{Error, TvpParameterRef},
     io::packet_writer::{PacketWriter, TdsPacketWriter},
     message::messages::PacketType,
     token::tokens::SqlCollation,
@@ -133,7 +133,9 @@ impl<'a> SqlRpc<'a> {
                     .serialize(packet_writer, self.db_collation, true, &encoder)
                     .await
                 {
-                    return Err(error.with_tvp_parameter_context(format!("position {}", index + 1)));
+                    return Err(error.with_tvp_parameter_context(
+                        parameter.tvp_parameter_ref(TvpParameterRef::RpcPosition(index + 1)),
+                    ));
                 }
             }
         } else {
@@ -152,8 +154,13 @@ impl<'a> SqlRpc<'a> {
                     .serialize(packet_writer, self.db_collation, false, &encoder)
                     .await
                 {
-                    let name = parameter.name.as_deref().unwrap_or("unnamed");
-                    return Err(error.with_tvp_parameter_context(format!("name {name}")));
+                    return Err(
+                        error.with_tvp_parameter_context(parameter.tvp_parameter_ref(
+                            TvpParameterRef::Name(
+                                parameter.name.as_deref().unwrap_or("unnamed").to_string(),
+                            ),
+                        )),
+                    );
                 }
             }
         }
@@ -343,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn named_tvp_serialization_error_includes_parameter_and_cell_coordinates() {
+    fn tvp_serialization_error_uses_the_original_odbc_ordinal() {
         let collation = SqlCollation::default();
         let table = SqlType::Table(
             crate::datatypes::sql_tvp::TvpTypeName::new(
@@ -360,12 +367,12 @@ mod tests {
                 )]],
             )),
         );
-        let parameter = RpcParameter::new(Some("@tvp".to_string()), StatusFlags::NONE, table);
+        let parameter = RpcParameter::new(None, StatusFlags::NONE, table).with_odbc_ordinal(2);
         let context = ExecutionContext::new();
         let rpc = SqlRpc::new(
             RpcType::Named("proc".to_string()),
-            None,
             Some(vec![parameter]),
+            None,
             &collation,
             &context,
         );
@@ -377,12 +384,16 @@ mod tests {
             &error,
             Error::TvpCellSerialization {
                 parameter,
-                row: 0,
-                column: 0,
+                row: 1,
+                column: 1,
                 ..
-            } if parameter == "name @tvp"
+            } if parameter == &TvpParameterRef::OdbcOrdinal(2)
         ));
-        assert!(error.to_string().contains("row 0, column 0"));
+        assert!(
+            error
+                .to_string()
+                .contains("TVP parameter ODBC ordinal 2, row 1, column 1")
+        );
     }
 
     #[test]

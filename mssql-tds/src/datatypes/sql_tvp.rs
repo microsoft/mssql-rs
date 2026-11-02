@@ -715,8 +715,8 @@ mod tests {
         assert!(matches!(
             error,
             Error::TvpCellSerialization {
-                row: 1,
-                column: 1,
+                row: 2,
+                column: 2,
                 source,
                 ..
             } if matches!(*source, Error::EncodedValueTooLong { .. })
@@ -813,8 +813,8 @@ mod tests {
         assert!(matches!(
             row_bytes_with_collation(&columns, &rows, &collation).await,
             Err(Error::TvpCellSerialization {
-                row: 0,
-                column: 0,
+                row: 1,
+                column: 1,
                 source,
                 ..
             }) if matches!(
@@ -952,8 +952,8 @@ mod tests {
         assert!(matches!(
             error,
             Error::TvpCellSerialization {
-                row: 0,
-                column: 0,
+                row: 1,
+                column: 1,
                 source,
                 ..
             }

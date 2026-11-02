@@ -135,13 +135,13 @@ fn sql_get_desc_field_w_safe(
     }
 
     if let Ok(field) = SqlUSmallInt::try_from(field_identifier)
-        && ((matches!(
+        && record_number >= 1
+        && matches!(
             desc.kind,
-            crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
-        ) && record_number >= 1)
-            || (desc.kind == crate::handles::desc::DescKind::ImpParam
-                && record_number >= 1
-                && field == SQL_DESC_SCALE))
+            crate::handles::desc::DescKind::AppParam
+                | crate::handles::desc::DescKind::Ad
+                | crate::handles::desc::DescKind::ImpParam
+        )
         && matches!(
             field,
             SQL_DESC_DATA_PTR
@@ -518,8 +518,8 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE, SQL_NULL_HANDLE,
-        SQL_PARAM_INPUT, SQL_UNNAMED,
+        SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_DECIMAL, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE,
+        SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_UNNAMED,
     };
     use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::error::diag::DiagRecord;
@@ -543,6 +543,9 @@ mod tests {
         crate::api::odbc_types::SQL_DESC_PARAMETER_TYPE as SqlSmallInt;
     const SQL_DESC_UNNAMED: SqlSmallInt = crate::api::odbc_types::SQL_DESC_UNNAMED as SqlSmallInt;
     const SQL_DESC_NAME: SqlSmallInt = crate::api::odbc_types::SQL_DESC_NAME as SqlSmallInt;
+    const SQL_DESC_PRECISION: SqlSmallInt =
+        crate::api::odbc_types::SQL_DESC_PRECISION as SqlSmallInt;
+    const SQL_DESC_SCALE: SqlSmallInt = crate::api::odbc_types::SQL_DESC_SCALE as SqlSmallInt;
 
     fn desc_diags(handle: SqlHandle) -> Vec<DiagRecord> {
         let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
@@ -723,6 +726,57 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn focused_ipd_fields_read_sql_metadata_from_the_child_binding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        stmt.inner.lock().unwrap().tvp_column_bindings.insert(
+            1,
+            vec![Some(crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: crate::api::odbc_types::SQL_C_SLONG,
+                sql_type: SQL_DECIMAL,
+                column_size: 10,
+                decimal_digits: 2,
+                app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
+                app_precision: 0,
+                app_scale: 0,
+                parameter_value_ptr: ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: ptr::null_mut(),
+                octet_length_ptr: ptr::null_mut(),
+            })],
+        );
+
+        let mut concise: SqlSmallInt = -1;
+        let mut precision: SqlSmallInt = -1;
+        let mut scale: SqlSmallInt = -1;
+        for (field, value) in [
+            (SQL_DESC_CONCISE_TYPE, &mut concise),
+            (SQL_DESC_PRECISION, &mut precision),
+            (SQL_DESC_SCALE, &mut scale),
+        ] {
+            assert_eq!(
+                unsafe {
+                    sql_get_desc_field_w(
+                        h.ipd(),
+                        1,
+                        field,
+                        value as *mut SqlSmallInt as SqlPointer,
+                        0,
+                        ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        assert_eq!(concise, SQL_DECIMAL);
+        assert_eq!(precision, 10);
+        assert_eq!(scale, 2);
     }
 
     #[test]

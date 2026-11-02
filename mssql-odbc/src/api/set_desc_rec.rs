@@ -25,7 +25,7 @@ use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_DESC_TYPE, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS,
-    SQL_UNKNOWN_TYPE, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
+    SQL_UNKNOWN_TYPE, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen,
 };
 use crate::api::set_desc_field::{
     datetime_interval_code_for, set_data_ptr, set_precision, set_scale, set_type,
@@ -148,6 +148,85 @@ fn sql_set_desc_rec_safe(
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
 ) -> SqlReturn {
+    if desc.kind == DescKind::ImpParam && record_number >= 1 {
+        let may_route = match desc.readers_through(false, true) {
+            Ok((_, executing)) => !executing,
+            Err(()) => {
+                return post_focused_tvp_internal_error(
+                    desc,
+                    "Internal error checking focused descriptor statement state",
+                );
+            }
+        };
+        if may_route {
+            let updated = desc.update_focused_tvp_bindings(
+                record_number,
+                None,
+                |binding| {
+                    focused_tvp_ipd_desc_rec(
+                        binding,
+                        record_number,
+                        field_type,
+                        sub_type,
+                        length,
+                        precision,
+                        scale,
+                        data_ptr,
+                        string_length_ptr,
+                        indicator_ptr,
+                    )
+                    .is_some()
+                },
+                |binding| {
+                    if let Some((sql_type, length, precision, scale, interval_code)) =
+                        focused_tvp_ipd_desc_rec(
+                            binding,
+                            record_number,
+                            field_type,
+                            sub_type,
+                            length,
+                            precision,
+                            scale,
+                            data_ptr,
+                            string_length_ptr,
+                            indicator_ptr,
+                        )
+                    {
+                        binding.sql_type = sql_type;
+                        binding.column_size =
+                            if crate::api::type_rules::parameter_size_is_precision(sql_type) {
+                                SqlULen::try_from(precision.max(0)).unwrap_or_default()
+                            } else {
+                                SqlULen::try_from(length.max(0)).unwrap_or_default()
+                            };
+                        binding.decimal_digits = scale;
+                        binding.sql_datetime_interval_code = Some(interval_code);
+                    }
+                },
+            );
+            match updated {
+                Ok(Some(true)) => {
+                    let Ok(mut state) = desc.inner.lock() else {
+                        error!("SQLSetDescRec: desc mutex poisoned clearing diagnostics");
+                        return SQL_ERROR;
+                    };
+                    free_errors(&mut state);
+                    return SQL_SUCCESS;
+                }
+                Ok(Some(false)) => {
+                    return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    return post_focused_tvp_internal_error(
+                        desc,
+                        "Internal error updating focused table-valued parameter descriptor",
+                    );
+                }
+            }
+        }
+    }
+
     if matches!(desc.kind, DescKind::AppParam | DescKind::Ad) && record_number >= 1 {
         let may_route = match desc.readers_through(false, true) {
             Ok((_, executing)) => !executing,
@@ -175,6 +254,7 @@ fn sql_set_desc_rec_safe(
                 column_size: 0,
                 decimal_digits: 0,
                 app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
                 app_precision: 0,
                 app_scale: 0,
                 parameter_value_ptr: std::ptr::null_mut(),
@@ -290,6 +370,53 @@ fn sql_set_desc_rec_safe(
             indicator_ptr,
         )
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn focused_tvp_ipd_desc_rec(
+    binding: &crate::params::BoundParam,
+    record_number: SqlSmallInt,
+    field_type: SqlSmallInt,
+    sub_type: SqlSmallInt,
+    length: SqlLen,
+    precision: SqlSmallInt,
+    scale: SqlSmallInt,
+    data_ptr: SqlPointer,
+    string_length_ptr: *mut SqlLen,
+    indicator_ptr: *mut SqlLen,
+) -> Option<(SqlSmallInt, SqlLen, SqlSmallInt, SqlSmallInt, SqlSmallInt)> {
+    let mut apd_record = DescRecord::default_for(DescKind::AppParam);
+    let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
+    binding.write_to_records(&mut apd_record, &mut ipd_record);
+    let mut state = DescState {
+        diag_records: Vec::new(),
+        header: DescHeader::default(),
+        records: vec![ipd_record],
+    };
+    if set_desc_rec(
+        &mut state,
+        DescKind::ImpParam,
+        record_number,
+        field_type,
+        sub_type,
+        length,
+        precision,
+        scale,
+        data_ptr,
+        string_length_ptr,
+        indicator_ptr,
+    ) != SQL_SUCCESS
+    {
+        return None;
+    }
+    let record = state.record(record_number)?;
+    Some((
+        record.concise_type,
+        SqlLen::try_from(record.length).ok()?,
+        record.precision,
+        record.scale,
+        record.datetime_interval_code,
+    ))
 }
 
 pub(super) fn current_odbc_version(desc: &DescHandle) -> Result<OdbcVersion, ()> {
@@ -484,8 +611,8 @@ mod tests {
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::get_desc_rec::sql_get_desc_rec_w;
     use crate::api::odbc_types::{
-        SQL_C_NUMERIC, SQL_C_TYPE_TIMESTAMP, SQL_CODE_TIMESTAMP, SQL_DATETIME,
-        SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
+        SQL_C_NUMERIC, SQL_C_TYPE_TIMESTAMP, SQL_CODE_DATE, SQL_CODE_TIMESTAMP, SQL_DATETIME,
+        SQL_DECIMAL, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
         SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR,
         SQL_DESC_PRECISION, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_INTEGER, SQL_NO_NULLS,
         SQL_NULL_HANDLE, SQL_NUMERIC, SQL_PARAM_INPUT, SQL_TYPE_TIMESTAMP, SqlPointer,
@@ -752,6 +879,7 @@ mod tests {
                     column_size: 10,
                     decimal_digits: 2,
                     app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
                     app_precision: 10,
                     app_scale: 2,
                     parameter_value_ptr: (&mut original as *mut i32).cast(),
@@ -858,6 +986,7 @@ mod tests {
                     column_size: 23,
                     decimal_digits: 7,
                     app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
                     app_precision: 0,
                     app_scale: 0,
                     parameter_value_ptr: ptr::null_mut(),
@@ -1107,6 +1236,7 @@ mod tests {
                     column_size: 10,
                     decimal_digits: 2,
                     app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
                     app_precision: 10,
                     app_scale: 2,
                     parameter_value_ptr: (&mut old_value as *mut u8).cast(),
@@ -1227,5 +1357,106 @@ mod tests {
         assert_eq!(precision, 12);
         assert_eq!(scale, 3);
         assert_eq!(nullable, SQL_NO_NULLS);
+    }
+
+    #[test]
+    fn focused_ipd_set_desc_rec_updates_the_child_sql_binding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(
+                1,
+                vec![Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: SQL_C_NUMERIC,
+                    sql_type: SQL_DECIMAL,
+                    column_size: 10,
+                    decimal_digits: 2,
+                    app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
+                    app_precision: 10,
+                    app_scale: 2,
+                    parameter_value_ptr: ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: ptr::null_mut(),
+                    octet_length_ptr: ptr::null_mut(),
+                })],
+            );
+        }
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_rec(
+                    h.ipd(),
+                    1,
+                    SQL_NUMERIC,
+                    0,
+                    12,
+                    12,
+                    3,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(record_count(h.ipd()), 0, "the outer IPD stays untouched");
+        let state = stmt.inner.lock().unwrap();
+        let binding = state.tvp_column_bindings[&1][0].as_ref().unwrap();
+        assert_eq!(binding.sql_type, SQL_NUMERIC);
+        assert_eq!(binding.column_size, 12);
+        assert_eq!(binding.decimal_digits, 3);
+    }
+
+    #[test]
+    fn focused_ipd_set_desc_rec_preserves_the_child_datetime_subtype() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        stmt.inner.lock().unwrap().tvp_column_bindings.insert(
+            1,
+            vec![Some(crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_TYPE_TIMESTAMP,
+                sql_type: SQL_TYPE_TIMESTAMP,
+                column_size: 27,
+                decimal_digits: 7,
+                app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
+                app_precision: 0,
+                app_scale: 0,
+                parameter_value_ptr: ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: ptr::null_mut(),
+                octet_length_ptr: ptr::null_mut(),
+            })],
+        );
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_rec(
+                    h.ipd(),
+                    1,
+                    SQL_DATETIME,
+                    SqlSmallInt::try_from(SQL_CODE_DATE).unwrap(),
+                    0,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let binding = stmt.inner.lock().unwrap().tvp_column_bindings[&1][0].unwrap();
+        assert_eq!(binding.sql_type, crate::api::odbc_types::SQL_TYPE_DATE);
+        assert_eq!(
+            binding.sql_datetime_interval_code,
+            Some(SqlSmallInt::try_from(SQL_CODE_DATE).unwrap())
+        );
     }
 }

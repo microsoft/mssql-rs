@@ -239,16 +239,13 @@ pub(super) fn focused_tvp_record_for_desc(
     desc: &DescHandle,
     record_number: SqlSmallInt,
 ) -> Result<Option<FocusedTvpRecord>, ()> {
-    let Some(count) = desc.focused_tvp_record_count()? else {
+    let Some((count, binding)) = desc.focused_tvp_record_snapshot(record_number)? else {
         return Ok(None);
     };
     if usize::try_from(record_number).map_err(|_| ())? > count {
         return Ok(Some(FocusedTvpRecord::PastCount));
     }
-    let record = desc
-        .focused_tvp_bindings(record_number)?
-        .first()
-        .copied()
+    let record = binding
         .map(|binding| focused_tvp_record_from_binding(binding, desc.kind))
         .unwrap_or_else(|| DescRecord::default_for(desc.kind));
     Ok(Some(FocusedTvpRecord::Record(record)))
@@ -386,6 +383,7 @@ mod tests {
                 column_size: 10,
                 decimal_digits: 2,
                 app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
                 app_precision: 10,
                 app_scale: 0,
                 parameter_value_ptr: ptr::null_mut(),
@@ -400,6 +398,65 @@ mod tests {
         assert_eq!(result.sql_type, SQL_DECIMAL);
         assert_eq!(result.precision, 10);
         assert_eq!(result.scale, 2);
+    }
+
+    #[test]
+    fn focused_record_snapshot_keeps_child_count_and_binding_from_one_focus() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let binding = crate::params::BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_SLONG,
+            sql_type: SQL_INTEGER,
+            column_size: 4,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: ptr::null_mut(),
+            octet_length_ptr: ptr::null_mut(),
+        };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.tvp_column_bindings.insert(1, vec![Some(binding)]);
+            state.tvp_column_bindings.insert(2, Vec::new());
+            state.vendor_attrs.store_param_focus(1);
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let toggle_barrier = Arc::clone(&barrier);
+        let stmt_handle = h.stmt as usize;
+        let toggler = thread::spawn(move || {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle as SqlHandle) };
+            toggle_barrier.wait();
+            for index in 0..10_000 {
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .vendor_attrs
+                    .store_param_focus(if index % 2 == 0 { 2 } else { 1 });
+            }
+        });
+
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        barrier.wait();
+        for _ in 0..10_000 {
+            let (count, binding) = desc
+                .focused_tvp_record_snapshot(1)
+                .unwrap()
+                .expect("the statement owns the focused IPD");
+            assert!(
+                (count == 1 && binding.is_some()) || (count == 0 && binding.is_none()),
+                "count {count} and binding {binding:?} must come from the same focus"
+            );
+        }
+        toggler.join().unwrap();
     }
 
     #[test]

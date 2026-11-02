@@ -2605,6 +2605,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: ptr,

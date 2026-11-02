@@ -1133,6 +1133,7 @@ mod tests {
             column_size: 2,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -1284,7 +1285,15 @@ mod tests {
 
         values[0] = 22;
         values[1] = 33;
-        assert_eq!(values, [22, 33]);
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+
+        values[0] = 44;
+        values[1] = 55;
+        assert_eq!(values, [44, 55]);
         assert_eq!(
             unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
             SQL_SUCCESS
@@ -1293,7 +1302,7 @@ mod tests {
 
         let state = stmt.inner.lock().unwrap();
         let dae = state.dae.as_ref().unwrap();
-        assert_eq!(dae.tvp_row_counts.get(&0), Some(&4));
+        assert_eq!(dae.tvp_row_counts.get(&0), Some(&6));
         assert_eq!(
             dae.tvp_cells
                 .iter()
@@ -1304,6 +1313,8 @@ mod tests {
                 (1, Some(SqlType::Int(Some(999)))),
                 (2, Some(SqlType::Int(Some(22)))),
                 (3, Some(SqlType::Int(Some(33)))),
+                (4, Some(SqlType::Int(Some(44)))),
+                (5, Some(SqlType::Int(Some(55)))),
             ]
         );
     }

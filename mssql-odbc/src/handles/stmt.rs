@@ -954,6 +954,7 @@ impl DaeParam {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value_ptr,
@@ -1345,6 +1346,9 @@ impl DaeState {
                     .ok_or(TvpBatchStageError::Overflow)?,
             )
             .ok_or(TvpBatchStageError::Overflow)?;
+        let buffered_cell_count = additional_rows
+            .checked_mul(staging.cell_templates.len())
+            .ok_or(TvpBatchStageError::Overflow)?;
         let mut staged = Vec::new();
         staged
             .try_reserve_exact(token_count)
@@ -1385,6 +1389,9 @@ impl DaeState {
         let staged_len = staged.len();
         self.params
             .try_reserve(staged_len)
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        self.tvp_cells
+            .try_reserve(buffered_cell_count)
             .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
         self.params.splice(segment_end + 1..segment_end + 1, staged);
         for (&cached_tvp, state) in &mut self.tvp_staging {

@@ -1033,7 +1033,7 @@ mod tests {
     fn tvp_cell_encoded_value_overflow_keeps_coordinates_and_maps_to_22001() {
         let mut s = FakeState::default();
         let err = TdsError::TvpCellSerialization {
-            parameter: "name @tvp".to_string(),
+            parameter: mssql_tds::error::TvpParameterRef::Name("@tvp".to_string()),
             row: 2,
             column: 1,
             source: Box::new(TdsError::EncodedValueTooLong {

@@ -375,6 +375,7 @@ fn sql_bind_parameter_safe(
         column_size,
         decimal_digits,
         app_datetime_interval_code: None,
+        sql_datetime_interval_code: None,
         app_precision: 0,
         app_scale: 0,
         parameter_value_ptr,
@@ -773,8 +774,9 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_BINARY, SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NTS, SQL_NULL_DATA,
-        SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
+        SQL_C_BINARY, SQL_C_CHAR, SQL_C_SLONG, SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME,
+        SQL_GUID, SQL_INTEGER, SQL_NTS, SQL_NULL_DATA, SQL_NULL_HANDLE, SQL_PARAM_OUTPUT,
+        SQL_SS_TABLE, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -1275,6 +1277,81 @@ mod tests {
         let names = record.udt_names.as_ref().expect("type name recorded");
         assert_eq!(names.type_name, "OrderList");
         assert!(record.udt_name_claimed.type_name, "name is claimed");
+    }
+
+    #[test]
+    fn rebinding_tvp_clears_previous_catalog_and_schema() {
+        use crate::api::odbc_types::{SQL_PARAM_INPUT, SqlInteger};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut type_name: Vec<u16> = "OrderList".encode_utf16().collect();
+        let mut indicator: SqlLen = 0;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_BINARY,
+                    SQL_SS_TABLE,
+                    0,
+                    0,
+                    type_name.as_mut_ptr().cast(),
+                    (type_name.len() * size_of::<u16>()) as SqlLen,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        for (field, value) in [
+            (SQL_CA_SS_CATALOG_NAME, "old_catalog"),
+            (SQL_CA_SS_SCHEMA_NAME, "old_schema"),
+        ] {
+            let mut value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+            assert_eq!(
+                unsafe {
+                    crate::api::set_desc_field::sql_set_desc_field_w(
+                        h.ipd(),
+                        1,
+                        field as SqlSmallInt,
+                        value.as_mut_ptr().cast(),
+                        SqlInteger::from(SQL_NTS),
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+
+        let mut rebound_name: Vec<u16> = "OtherRows".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_BINARY,
+                    SQL_SS_TABLE,
+                    0,
+                    0,
+                    rebound_name.as_mut_ptr().cast(),
+                    (rebound_name.len() * size_of::<u16>()) as SqlLen,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        let state = ipd.inner.lock().unwrap();
+        let names = state.record(1).unwrap().udt_names.as_ref().unwrap();
+        assert_eq!(names.catalog, "");
+        assert_eq!(names.schema, "");
+        assert_eq!(names.type_name, "OtherRows");
+        let record = state.record(1).unwrap();
+        assert!(!record.udt_name_claimed.catalog);
+        assert!(!record.udt_name_claimed.schema);
+        assert!(record.udt_name_claimed.type_name);
     }
 
     #[test]
@@ -2292,6 +2369,7 @@ mod tests {
             column_size: 0,
             decimal_digits: 0,
             app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: &mut buf as *mut i32 as SqlPointer,
