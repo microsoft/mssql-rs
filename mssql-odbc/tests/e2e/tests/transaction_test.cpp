@@ -658,6 +658,42 @@ ODBC_TEST_F(TransactionLiveTest, IsolationRejectsBusyWireWithoutDiscardingRowsOr
     }
 }
 
+// Benefits-from-mock-tds: verify that busy rejection leaves the next result on the wire.
+ODBC_TEST_F(TransactionLiveTest, IsolationRejectsPendingResultsAfterFirstResultIsExhausted) {
+    const SQLINTEGER first = 1000 * Worker() + 10 * Iteration() + 1;
+    for (SQLINTEGER attribute : {SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION}) {
+        SCOPED_TRACE(attribute);
+        ASSERT_SQL_OK(Run(stmt_, "SELECT " + std::to_string(first) + "; SELECT " +
+                                    std::to_string(first + 1)),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+        EXPECT_SQL_ERROR(SQLSetConnectAttr(
+            dbc_, attribute,
+            reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SERIALIZABLE)),
+            SQL_IS_UINTEGER));
+        EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY000");
+        ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER value = 0;
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(first + 1, value);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2, ServerIsolation());
+
+        ASSERT_SQL_OK(SQLSetConnectAttr(
+                          dbc_, attribute,
+                          reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SERIALIZABLE)),
+                          SQL_IS_UINTEGER),
+                      SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(4, ServerIsolation());
+        ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+    }
+}
+
 // A server-side lock timeout is a statement error, not a client query timeout.
 // Execution must consume the ERROR/DONE response and return it instead of
 // waiting indefinitely for another token (AB#47771).

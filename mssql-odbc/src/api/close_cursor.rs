@@ -1185,7 +1185,7 @@ mod tests {
         assert!(ss.pending_fetch_error.is_none());
     }
 
-    /// The connection-scoped sweep (`SQLEndTran`/autocommit/isolation change)
+    /// The connection-scoped sweep (`SQLEndTran`/autocommit/connection reset)
     /// must NOT fail its own return over a pending fetch error on one
     /// statement: `SQL_ERROR` from this function specifically means "the
     /// stream failed to drain, unsafe to send a TM request next" — a stale
