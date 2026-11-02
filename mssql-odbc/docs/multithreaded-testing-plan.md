@@ -634,7 +634,7 @@ Tracked under AB#49256:
    and weekly profiles, crash and hang evidence, `msodbcsql.h` type check.
    PR #778 extends the unixODBC `/SharedStmt` skip to the PR profile until
    AB#49575.
-3. **AB#49260 (PR #756):** every `TEST_F` in the fetch and GetData suites
+3. **AB#49260 (merged):** every `TEST_F` in the fetch and GetData suites
    (`get_data`, `binary_fetch`, `bin_to_char`, `datetime_types`,
    `time_to_timestamp`, `numeric_types`, `text_money_types`, `fetch_scroll`,
    `fetch_error_semantics`, `col_attribute`, `describe_col`,
@@ -649,7 +649,7 @@ Tracked under AB#49256:
    connection state, or (three) starve on the Debug driver. Six bound-row-array
    tests run `SharedDbc` on mssql-odbc only: msodbcsql's `SQLCloseCursor`
    leaves the cursor open on a busy shared connection (`SKIP_MSODBCSQL_IN_MODE`).
-4. **AB#49258 (stacked on PR #756):** every test in the parameter and
+4. **AB#49258:** every test in the parameter and
    execution suites (`execute`, `exec_direct`, `param_conversions`,
    `param_char_conversions`, `param_binary_conversions`, `param_array`,
    `output_params`, `dml_output`, `describe_param`, `call_routing`,
@@ -663,6 +663,11 @@ Tracked under AB#49256:
    recorded). Worker-token tests: prepared parameters across executes, two
    20 KB data-at-execution streams, fifty parameter sets, and output
    parameters through a per-worker temp procedure, all in every mode.
+   Busy retries release private statements, and permanent escape-test
+   procedures are dropped after closing the cursor, with bounded busy
+   retries. Cleanup failures are non-retryable, even when the driver reports
+   a busy connection. The new parameter-set status
+   checks start from `SQL_PARAM_UNUSED`, not the expected success value.
    `cancel_test.cpp` gains the remaining cancel cases (idle cursor cleanup is
    covered by `connection_busy_test.cpp`, AB#49386): a cancel just before
    execute reaches neither it nor the next execute; a fetch blocked by

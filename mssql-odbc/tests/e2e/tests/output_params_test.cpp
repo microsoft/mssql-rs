@@ -395,7 +395,8 @@ ODBC_TEST_F_MODES(OutputParamsTest, RunUniqueOutputParametersReturnToTheirOwnBuf
         std::fill(std::begin(result), std::end(result), SQLWCHAR{0});
         status = output = -1;
         in_out = input + 3;
-        result_length = -1;
+        status_length = output_length = result_length = -1;
+        in_out_length = 0;
 
         const SQLRETURN rc = SQLExecute(stmt_);
         ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_NO_DATA)
@@ -404,6 +405,9 @@ ODBC_TEST_F_MODES(OutputParamsTest, RunUniqueOutputParametersReturnToTheirOwnBuf
         EXPECT_EQ(input % 100, status);
         EXPECT_EQ(input * 2 + 1, output);
         EXPECT_EQ(input + 10, in_out);
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), status_length);
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), output_length);
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), in_out_length);
         const std::string expected = token + "!";
         ASSERT_EQ(static_cast<SQLLEN>(expected.size() * sizeof(SQLWCHAR)), result_length);
         EXPECT_TRUE(std::equal(expected.begin(), expected.end(), result)) << "nvarchar output";

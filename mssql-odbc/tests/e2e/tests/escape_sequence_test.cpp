@@ -10,7 +10,11 @@
 #include "odbc_test_fixture.h"
 
 #include <atomic>
+#include <chrono>
+#include <functional>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -66,7 +70,40 @@ protected:
 
     void TearDown() override {
         if (!proc_name_.empty()) {
-            ExecDirectIgnoreError("DROP PROCEDURE " + proc_name_);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            std::minstd_rand rng(static_cast<unsigned>(std::hash<std::string>{}(proc_name_)));
+            auto retry_busy = [&](auto operation) {
+                SQLRETURN rc = operation();
+                for (int attempt = 0; !SQL_SUCCEEDED(rc) &&
+                                      odbc_concurrency::detail::StatementReportsBusy(stmt_) &&
+                                      std::chrono::steady_clock::now() < deadline;
+                     ++attempt) {
+                    std::this_thread::sleep_for(
+                        odbc_concurrency::detail::ConflictBackoff(attempt, rng));
+                    rc = operation();
+                }
+                return rc;
+            };
+            // Cleanup failures must not become a discarded busy-only attempt.
+            auto check_cleanup = [&](SQLRETURN rc, const char* operation) {
+                if (SQL_SUCCEEDED(rc)) return true;
+                Log(std::string(operation) + " cleanup: " +
+                    ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_));
+                ADD_FAILURE() << operation << " failed during procedure cleanup (rc=" << rc << ")";
+                return false;
+            };
+            const SQLRETURN closed = retry_busy([&] { return SQLFreeStmt(stmt_, SQL_CLOSE); });
+            if (check_cleanup(closed, "SQL_CLOSE")) {
+                // A busy CREATE can stop the body before the procedure exists.
+                const SqlTString drop = ODBCTestUtils::ToSqlTStr(
+                    "IF OBJECT_ID('" + proc_name_ + "', 'P') IS NOT NULL DROP PROCEDURE " +
+                    proc_name_);
+                check_cleanup(retry_busy([&] {
+                                  return SQLExecDirect(
+                                      stmt_, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS);
+                              }),
+                              "DROP PROCEDURE");
+            }
         }
         ODBCTest::TearDown();
     }

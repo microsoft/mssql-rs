@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -52,6 +54,19 @@ protected:
     SQLRETURN ExecDirect(const std::string& sql) {
         SqlTString s = ODBCTestUtils::ToSqlTStr(sql);
         return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
+    }
+
+    static void CleanupStatement(SQLHSTMT stmt) {
+        // Do not classify a failed cleanup as a retryable body conflict.
+        auto check = [&](SQLRETURN rc, const char* operation) {
+            if (!SQL_SUCCEEDED(rc)) {
+                std::cerr << operation << " cleanup: "
+                          << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt) << '\n';
+                ADD_FAILURE() << operation << " failed during statement cleanup (rc=" << rc << ")";
+            }
+        };
+        check(SQLCancel(stmt), "SQLCancel");
+        check(SQLFreeHandle(SQL_HANDLE_STMT, stmt), "SQLFreeHandle");
     }
 
     // Bind a narrow (SQL_C_CHAR / varchar) input parameter held in |store|.
@@ -2096,6 +2111,7 @@ ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKee
                   odbc_concurrency::kAllModes) {
     SQLHSTMT s = SQL_NULL_HSTMT;
     ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &s));
+    std::unique_ptr<void, decltype(&CleanupStatement)> cleanup(s, CleanupStatement);
 
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 7 AS v");
     ASSERT_EQ(SQL_SUCCESS,
@@ -2108,7 +2124,9 @@ ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKee
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
 
     // Free with the cursor still open — the driver must drain + unprepare.
-    ASSERT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, s));
+    const SQLRETURN freed = SQLFreeHandle(SQL_HANDLE_STMT, s);
+    if (SQL_SUCCEEDED(freed)) cleanup.release();
+    ASSERT_EQ(SQL_SUCCESS, freed);
 
     // The connection is still healthy: a fresh statement executes normally.
     ASSERT_SQL_OK(Prepare("SELECT 8 AS v"), SQL_HANDLE_STMT, stmt_);
@@ -2139,16 +2157,18 @@ ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKee
 // connection is retried rather than failed.
 ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FreeStatementMidDataAtExecutionIsRejectedUntilCancelled,
                   odbc_concurrency::kAllModes) {
+    std::vector<SQLCHAR> buffer(16, 0);
+    SQLLEN ind = SQL_DATA_AT_EXEC;
     SQLHSTMT s = SQL_NULL_HSTMT;
     ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &s));
 
+    // Destroy the statement before its bound storage, including on a busy retry.
+    std::unique_ptr<void, decltype(&CleanupStatement)> cleanup(s, CleanupStatement);
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
     ASSERT_EQ(SQL_SUCCESS,
               SQLPrepare(s, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS))
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
 
-    std::vector<SQLCHAR> buffer(16, 0);
-    SQLLEN ind = SQL_DATA_AT_EXEC;
     ASSERT_EQ(SQL_SUCCESS,
               SQLBindParameter(s, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
                                0, 0, buffer.data(),
@@ -2166,13 +2186,17 @@ ODBC_TEST_F_MODES(PrepareExecuteLiveTest, FreeStatementMidDataAtExecutionIsRejec
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, s);
 
     // Free without ever completing the sequence: rejected, handle still valid.
-    EXPECT_EQ(SQL_ERROR, SQLFreeHandle(SQL_HANDLE_STMT, s));
+    const SQLRETURN refused = SQLFreeHandle(SQL_HANDLE_STMT, s);
+    if (SQL_SUCCEEDED(refused)) cleanup.release();
+    ASSERT_EQ(SQL_ERROR, refused);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, s, "HY010");
 
     // SQLCancel unwinds the parked sequence and returns the client, so the
     // statement is now an ordinary idle handle that frees cleanly.
     ASSERT_SQL_OK(SQLCancel(s), SQL_HANDLE_STMT, s);
-    ASSERT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, s));
+    const SQLRETURN freed = SQLFreeHandle(SQL_HANDLE_STMT, s);
+    if (SQL_SUCCEEDED(freed)) cleanup.release();
+    ASSERT_EQ(SQL_SUCCESS, freed);
 
     // The connection is still healthy: a fresh statement executes normally.
     ASSERT_SQL_OK(Prepare("SELECT 9 AS v"), SQL_HANDLE_STMT, stmt_);
@@ -2637,6 +2661,10 @@ ODBC_TEST_F_MODES(PrepareExecuteLiveTest, RunUniqueDataAtExecutionStreamsArriveW
             EXPECT_TRUE(SQL_SUCCEEDED(got))
                 << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
             if (!SQL_SUCCEEDED(got) || calls > 100) {
+                break;
+            }
+            if (got == SQL_SUCCESS && (length < 0 || length > static_cast<SQLLEN>(chunk))) {
+                ADD_FAILURE() << "final chunk has an invalid byte count: " << length;
                 break;
             }
             value.append(buffer,

@@ -3013,6 +3013,7 @@ ODBC_TEST_F_MODES(ParamArrayTest, RunUniqueParameterSetsAnswerInOrder,
         const std::string value = token + "-" + std::to_string(i);
         std::memcpy(text[i], value.c_str(), value.size() + 1);
         text_ind[i] = SQL_NTS;
+        status[i] = SQL_PARAM_UNUSED;
     }
     Prepare("SELECT CAST(? AS INT), CAST(? AS VARCHAR(48))");
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,

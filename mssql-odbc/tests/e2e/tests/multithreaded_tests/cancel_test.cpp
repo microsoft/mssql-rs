@@ -264,7 +264,7 @@ TEST_F(CancelLiveTest, FinalParamDataCancellationRestoresPreparedStatement) {
 // through a Driver Manager; the driver's unit tests pin the same directly. Even
 // rounds cancel the idle statement and then execute, which must return its own
 // row. Odd rounds race the cancel against the execute, which it may interrupt
-// (HY008; it did in every measured round). Each round ends with an execute and
+// (HY008). Each round ends with an execute and
 // no cancel, which must succeed.
 //
 // Benefits-from-mock-tds: delay the response so the racing cancel lands at a
@@ -333,20 +333,41 @@ TEST_F(CancelLiveTest, CancelInterruptsAFetchBlockedByAnotherConnectionsRowLock)
         "FROM sys.all_objects) INSERT " + table + " SELECT id, REPLICATE('x', 150) FROM n"));
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
 
-    SQLHDBC holder = SQL_NULL_HDBC;
-    SQLHSTMT holding = SQL_NULL_HSTMT;
-    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &holder), SQL_HANDLE_ENV, env_);
+    struct LockHolder {
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        bool connected = false;
+        bool transaction = false;
+        ~LockHolder() {
+            if (transaction) {
+                EXPECT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc);
+            }
+            if (stmt != SQL_NULL_HSTMT) {
+                EXPECT_SQL_OK(SQLFreeHandle(SQL_HANDLE_STMT, stmt), SQL_HANDLE_STMT, stmt);
+            }
+            if (connected) {
+                EXPECT_SQL_OK(SQLDisconnect(dbc), SQL_HANDLE_DBC, dbc);
+            }
+            if (dbc != SQL_NULL_HDBC) {
+                EXPECT_SQL_OK(SQLFreeHandle(SQL_HANDLE_DBC, dbc), SQL_HANDLE_DBC, dbc);
+            }
+        }
+    } holder;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &holder.dbc), SQL_HANDLE_ENV, env_);
     auto connection = ODBCTestUtils::BuildConnectionString();
-    ASSERT_SQL_OK(SQLDriverConnect(holder, nullptr, const_cast<SQLTCHAR*>(connection.c_str()),
+    ASSERT_SQL_OK(SQLDriverConnect(holder.dbc, nullptr, const_cast<SQLTCHAR*>(connection.c_str()),
                                   SQL_NTS, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT),
-                  SQL_HANDLE_DBC, holder);
-    ASSERT_SQL_OK(SQLSetConnectAttr(holder, SQL_ATTR_AUTOCOMMIT,
+                  SQL_HANDLE_DBC, holder.dbc);
+    holder.connected = true;
+    ASSERT_SQL_OK(SQLSetConnectAttr(holder.dbc, SQL_ATTR_AUTOCOMMIT,
                                    reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0),
-                  SQL_HANDLE_DBC, holder);
-    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, holder, &holding), SQL_HANDLE_DBC, holder);
+                  SQL_HANDLE_DBC, holder.dbc);
+    holder.transaction = true;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, holder.dbc, &holder.stmt),
+                  SQL_HANDLE_DBC, holder.dbc);
     auto lock = ODBCTestUtils::ToSqlTStr("UPDATE " + table + " SET v = 'held' WHERE id = 301");
-    ASSERT_SQL_OK(SQLExecDirect(holding, const_cast<SQLTCHAR*>(lock.c_str()), SQL_NTS),
-                  SQL_HANDLE_STMT, holding);
+    ASSERT_SQL_OK(SQLExecDirect(holder.stmt, const_cast<SQLTCHAR*>(lock.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, holder.stmt);
 
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT,
                                 reinterpret_cast<SQLPOINTER>(15), 0),
@@ -372,11 +393,10 @@ TEST_F(CancelLiveTest, CancelInterruptsAFetchBlockedByAnotherConnectionsRowLock)
     const SQLRETURN cancelRc = SQLCancel(stmt_);
     const auto settled = fetching.wait_for(5s);
     // Release the lock before any fatal assertion, so cleanup cannot block.
-    EXPECT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, holder, SQL_ROLLBACK), SQL_HANDLE_DBC, holder);
+    const SQLRETURN rolled_back = SQLEndTran(SQL_HANDLE_DBC, holder.dbc, SQL_ROLLBACK);
+    EXPECT_SQL_OK(rolled_back, SQL_HANDLE_DBC, holder.dbc);
+    if (SQL_SUCCEEDED(rolled_back)) holder.transaction = false;
     const SQLRETURN fetchRc = fetching.get();
-    SQLFreeHandle(SQL_HANDLE_STMT, holding);
-    SQLDisconnect(holder);
-    SQLFreeHandle(SQL_HANDLE_DBC, holder);
 
     EXPECT_GT(beforeCancel, 0) << "the execute, not a fetch, was blocked";
     EXPECT_LT(beforeCancel, 301);
