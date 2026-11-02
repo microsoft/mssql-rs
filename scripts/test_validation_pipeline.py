@@ -38,14 +38,16 @@ def load_template(name):
 @pytest.mark.parametrize(
     ("override", "expected"),
     [
-        ("unset MSSQL_ODBC_MT_SKIP_MODES", "SharedStmt"),
-        ("export MSSQL_ODBC_MT_SKIP_MODES=''", "SharedStmt"),
+        ("unset MSSQL_ODBC_MT_SKIP_MODES", None),
+        ("export MSSQL_ODBC_MT_SKIP_MODES=''", None),
         ("export MSSQL_ODBC_MT_SKIP_MODES=none", "none"),
         ("export MSSQL_ODBC_MT_SKIP_MODES=SharedEnv,SharedDbc", "SharedEnv,SharedDbc"),
     ],
 )
 def test_unix_odbc_profiles_skip_shared_stmt(tmp_path, profile, threads, iterations,
                                            override, expected):
+    if expected is None:
+        expected = "CrossThread,SharedEnv,SharedStmt" if profile == "pr" else "SharedStmt"
     runner = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.sh").read_text(
         encoding="utf-8"
     )
