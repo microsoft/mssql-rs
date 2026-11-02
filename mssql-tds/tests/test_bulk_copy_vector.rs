@@ -12,7 +12,7 @@ mod bulk_copy_vector_tests {
     };
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::ResultSet;
+    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sql_vector::SqlVector;
@@ -21,6 +21,23 @@ mod bulk_copy_vector_tests {
     #[ctor::ctor]
     fn init() {
         init_tracing();
+    }
+
+    /// A client-side rejection must leave the connection usable.
+    async fn assert_connection_usable(client: &mut TdsClient) {
+        client
+            .execute("SELECT 1 AS test_value".to_string(), ())
+            .await
+            .expect("Connection should remain usable after a rejected bulk copy");
+        if client.on_rows() {
+            let row = client
+                .next_row()
+                .await
+                .expect("Failed to read row")
+                .expect("Expected a row");
+            assert_eq!(row[0], ColumnValues::Int(1));
+            while client.next_row().await.expect("Failed to drain").is_some() {}
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -504,21 +521,14 @@ mod bulk_copy_vector_tests {
                 .await
         };
 
+        let error =
+            result.expect_err("Expected bulk copy to fail with dimension mismatch (2 vs 3)");
         assert!(
-            result.is_err(),
-            "Expected bulk copy to fail with dimension mismatch (2 vs 3)"
+            matches!(&error, mssql_tds::error::Error::TypeConversionError(message)
+                if message.starts_with("Vector dimension mismatch:")),
+            "Expected dimension mismatch (2 vs 3), got {error:?}"
         );
-
-        // A failed bulk load may leave the connection unusable; isolate the next attempt.
-        let mut client = begin_connection(&build_tcp_datasource()).await;
-        client
-            .execute(
-                "CREATE TABLE #BulkCopyVectorMismatchTest (id INT NOT NULL, vector_col VECTOR(3))"
-                    .to_string(),
-                (),
-            )
-            .await
-            .unwrap();
+        assert_connection_usable(&mut client).await;
 
         // Try to insert vector with wrong dimensions (4 instead of 3)
         let rows_too_long = vec![VectorRow {
@@ -534,10 +544,14 @@ mod bulk_copy_vector_tests {
                 .await
         };
 
+        let error =
+            result.expect_err("Expected bulk copy to fail with dimension mismatch (4 vs 3)");
         assert!(
-            result.is_err(),
-            "Expected bulk copy to fail with dimension mismatch (4 vs 3)"
+            matches!(&error, mssql_tds::error::Error::TypeConversionError(message)
+                if message.starts_with("Vector dimension mismatch:")),
+            "Expected dimension mismatch (4 vs 3), got {error:?}"
         );
+        assert_connection_usable(&mut client).await;
     }
 
     #[derive(Debug, Clone)]
@@ -982,20 +996,19 @@ mod bulk_copy_vector_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "Requires a preview-enabled database and native Vector v2 support"]
     async fn test_bulk_copy_vector16_dimension_mismatch() {
-        for (id, values) in [(1, vec![1.0, 2.0]), (2, vec![1.0, 2.0, 3.0, 4.0])] {
-            // Each failed attempt gets a fresh connection and its own temporary table.
-            let Some(mut client) = begin_vector16_connection(None).await else {
-                return;
-            };
-            client
-                .execute(
-                    "CREATE TABLE #BulkCopyVector16MismatchTest (id INT NOT NULL, vector_col VECTOR(3, float16))"
-                        .to_string(),
-                    (),
-                )
-                .await
-                .unwrap();
+        let Some(mut client) = begin_vector16_connection(None).await else {
+            return;
+        };
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyVector16MismatchTest (id INT NOT NULL, vector_col VECTOR(3, float16))"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
 
+        for (id, values) in [(1, vec![1.0, 2.0]), (2, vec![1.0, 2.0, 3.0, 4.0])] {
             let dims = values.len();
             let rows = vec![Vector16Row {
                 id,
@@ -1013,10 +1026,11 @@ mod bulk_copy_vector_tests {
             let error = result.expect_err("Expected a vector dimension mismatch");
             assert!(
                 matches!(&error, mssql_tds::error::Error::TypeConversionError(message)
-                    if message.contains("Vector dimension mismatch:")),
+                    if message.starts_with("Vector dimension mismatch:")),
                 "Expected dimension mismatch ({} vs 3), got {error:?}",
                 dims
             );
+            assert_connection_usable(&mut client).await;
         }
     }
 }

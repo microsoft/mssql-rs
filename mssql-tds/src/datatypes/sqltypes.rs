@@ -1938,6 +1938,7 @@ mod coverage_tests {
         sqldatatypes::{FixedLengthTypes, TdsDataType},
         sqltypes::{SqlType, get_time_length_from_scale},
     };
+    use crate::error::Error;
     use crate::token::tokens::SqlCollation;
 
     fn default_collation() -> SqlCollation {
@@ -2428,6 +2429,34 @@ mod coverage_tests {
             SqlType::Vector(None, 3, VectorBaseType::Float32).to_column_value_and_context(col);
         assert_eq!(cv, ColumnValues::Null);
         assert_eq!(ctx.max_size, 8 + 3 * 4); // header + 3 floats
+    }
+
+    #[test]
+    fn validate_vector_wrapped_dimension_count_rejected() {
+        use crate::datatypes::sql_vector::{SqlVector, VectorData};
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        let col = &default_collation();
+
+        // 65,538 elements wrap to 2 as a u16.
+        for (base_type, data) in [
+            (
+                VectorBaseType::Float16,
+                VectorData::Float16(vec![0.0; 65_538]),
+            ),
+            (
+                VectorBaseType::Float32,
+                VectorData::Float32(vec![0.0; 65_538]),
+            ),
+        ] {
+            let vector = SqlVector { base_type, data };
+            assert_eq!(vector.dimension_count(), 2);
+            let result = SqlType::Vector(Some(vector), 2, base_type).validate_for_send(col, None);
+            assert!(matches!(
+                result,
+                Err(Error::TypeConversionError(message))
+                    if message == "Vector dimension mismatch: declared 2, but vector has 65538"
+            ));
+        }
     }
 
     #[test]
