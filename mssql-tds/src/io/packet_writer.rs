@@ -521,10 +521,14 @@ impl<'a> PacketWriter<'a> {
                 result = &mut send_data_fut => result?,
                 () = handle.cancel_token.cancelled() => {
                     cancelled = true;
-                    // Finish the same packet/TLS record before any withdrawal.
+                    // Finish the same packet/TLS record within both deadlines.
                     // On expiry send_incomplete stays set: no further write is safe.
+                    let cancellation_deadline =
+                        handle.settlement_deadline(std::time::Duration::ZERO);
+                    let completion_deadline = deadline
+                        .map_or(cancellation_deadline, |request| request.min(cancellation_deadline));
                     tokio::time::timeout_at(
-                        handle.settlement_deadline(std::time::Duration::ZERO),
+                        completion_deadline,
                         &mut send_data_fut,
                     ).await.map_err(|_| OperationCancelledError(
                         "Cancellation timed out completing the current packet".to_string(),

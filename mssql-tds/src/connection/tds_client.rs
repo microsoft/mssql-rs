@@ -3145,7 +3145,7 @@ impl TdsClient {
     /// incomplete one, so the socket is all that is left to discard. Clearing
     /// the open-batch flag lets the next `check_and_reconnect` recover.
     async fn abort_partial_request(&mut self) {
-        self.retire_without_writing();
+        self.mark_failed_request_dead();
         if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after a partial request abort");
         }
@@ -3158,7 +3158,13 @@ impl TdsClient {
     /// native-tls engine emits a close_notify, one more write on exactly that
     /// stream. `send_attention_and_wait` avoids it the same way, by marking the
     /// connection dead and never writing again.
+    /// Recovery must also stay disabled: reconnect shuts down the old transport.
     fn retire_without_writing(&mut self) {
+        self.recovery_context.session_recovery_negotiated = false;
+        self.mark_failed_request_dead();
+    }
+
+    fn mark_failed_request_dead(&mut self) {
         self.execution_context.set_has_open_batch(false);
         self.abort_pending_prepare_capture();
         self.transport.mark_known_dead();
@@ -9911,6 +9917,7 @@ mod tests {
     struct TestTransport {
         closed: bool,
         close_calls: Arc<std::sync::atomic::AtomicUsize>,
+        close_should_hang: bool,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
         /// Mirrors the production writer's dispatch record so client tests can
@@ -9972,6 +9979,7 @@ mod tests {
             Self {
                 closed: false,
                 close_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                close_should_hang: false,
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
@@ -10281,6 +10289,9 @@ mod tests {
         async fn close_transport(&mut self) -> TdsResult<()> {
             self.close_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.close_should_hang {
+                std::future::pending::<()>().await;
+            }
             self.closed = true;
             Ok(())
         }
@@ -15515,6 +15526,7 @@ mod tests {
 
         for phase in ["metadata", "rows", "finalize"] {
             let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.close_should_hang = true;
             transport
                 .send_should_hang
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -15524,6 +15536,7 @@ mod tests {
             let attentions = Arc::clone(&transport.attentions);
             let closes = Arc::clone(&transport.close_calls);
             let mut client = create_test_client_with_transport(transport);
+            client.recovery_context.session_recovery_negotiated = true;
             let columns = (0..if phase == "metadata" { 512 } else { 1 })
                 .map(|index| {
                     BulkCopyColumnMetadata::new(
@@ -15584,7 +15597,20 @@ mod tests {
                 );
                 wire.len()
             };
-            assert!(client.execute("SELECT 1".to_string(), ()).await.is_err());
+            let retry = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().timeout_secs(1),
+                ),
+            )
+            .await;
+            assert!(
+                matches!(&retry, Ok(Err(crate::error::Error::ConnectionClosed(_)))),
+                "{phase}: an interrupted bulk write must not enter recovery: {retry:?}"
+            );
+            assert!(!client.is_session_recovery_enabled(), "{phase}");
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(sent.lock().unwrap().len(), length_before_retry, "{phase}");
         }
     }
@@ -16023,6 +16049,22 @@ mod tests {
             err.to_string().contains("Session not recoverable"),
             "Expected SessionNotRecoverable, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn abort_partial_request_preserves_recovery_after_safe_shutdown() {
+        let transport = TestTransport::new();
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        client.recovery_context.session_recovery_negotiated = true;
+        client.execution_context.set_has_open_batch(true);
+
+        client.abort_partial_request().await;
+
+        assert!(client.is_session_recovery_enabled());
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -21303,6 +21345,7 @@ mod tests {
                 let mut cancel = CancelHandle::new();
                 cancel.set_cancel_timeout_secs(1);
                 let mut transport = TestTransport::new();
+                transport.close_should_hang = true;
                 transport
                     .send_should_hang
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -21311,6 +21354,7 @@ mod tests {
                 let closes = Arc::clone(&transport.close_calls);
                 let attentions = Arc::clone(&transport.attentions);
                 let mut client = create_test_client_with_transport(transport);
+                client.recovery_context.session_recovery_negotiated = true;
                 let start = tokio::time::Instant::now();
                 let result = tokio::time::timeout(Duration::from_secs(5), async {
                     let mut options = ExecuteOptions::new().timeout_secs(1);
@@ -21354,10 +21398,67 @@ mod tests {
                 assert_eq!(start.elapsed(), Duration::from_secs(1), "{operation}");
                 assert!(!cancel.cancel_token.is_cancelled());
                 assert!(client.is_connection_dead(), "{operation}");
+                let retry = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.execute(
+                        "SELECT 1".to_string(),
+                        ExecuteOptions::new().timeout_secs(1),
+                    ),
+                )
+                .await;
+                assert!(
+                    matches!(&retry, Ok(Err(crate::error::Error::ConnectionClosed(_)))),
+                    "{operation}: an interrupted write must not enter recovery: {retry:?}"
+                );
+                assert!(!client.is_session_recovery_enabled(), "{operation}");
                 assert_eq!(sent.lock().unwrap().len(), 8, "{operation}");
                 assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
                 assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
             }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_also_bounds_cancellation_while_sending() {
+        for (request_timeout, cancellation_timeout, expected_millis) in [
+            (Some(1), 120, 1000),
+            (Some(5), 1, 1250),
+            (Some(0), 1, 1250),
+            (None, 1, 1250),
+        ] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(cancellation_timeout);
+            let mut transport = TestTransport::new();
+            transport.send_delay = Some(Duration::from_millis(250));
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            let sent = Arc::clone(&transport.sent);
+            let closes = Arc::clone(&transport.close_calls);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions {
+                        timeout: request_timeout,
+                        cancel: Some(&cancel),
+                        ..ExecuteOptions::default()
+                    },
+                ),
+            )
+            .await
+            .expect("overlapping cancellation must not extend the request write deadline");
+
+            assert!(matches!(
+                result,
+                Err(crate::error::Error::OperationCancelledError(_))
+            ));
+            assert_eq!(started.elapsed(), Duration::from_millis(expected_millis));
+            assert!(client.is_connection_dead());
+            assert_eq!(sent.lock().unwrap().len(), 8);
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 
