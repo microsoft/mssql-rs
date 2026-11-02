@@ -542,10 +542,12 @@ on; these guarantees were verified against msodbcsql's behavior.
   `odbc_concurrent_test.h`) instead of `TEST_F`. The body is unchanged; the macro
   also runs it across threads (`/CrossThread`, `/SharedEnv`, `/SharedStmt`), so
   concurrency coverage comes without a second copy of the test. PR validation
-  runs only `/SharedDbc`; the other modes run in the stress profiles.
+  runs only `/SharedDbc`, and only on Windows; the other modes and platforms
+  run in the stress profiles.
   - Before review, run the `<name>_mt` entry of a test you add or convert in
     every mode (`MSSQL_ODBC_MT_SKIP_MODES=none`, or `-MtProfile nightly`):
-    PR validation does not cover a test that keeps out of `/SharedDbc`.
+    PR validation does not cover a test that keeps out of `/SharedDbc`, nor
+    any concurrent variant on unixODBC.
   - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests
     that change ENV, pooling, or process state, test connect, disconnect, or
     driver loading, create fixed-name permanent objects, free or replace

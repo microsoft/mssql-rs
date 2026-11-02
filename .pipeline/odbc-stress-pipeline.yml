@@ -1,10 +1,10 @@
 # Scheduled multithreaded stress runs of the mssql-odbc C++ e2e suite (AB#49263).
 #
 # PR validation runs the ODBC_TEST_F concurrent variants once at 2 threads x 1
-# iteration, in /SharedDbc only, which catches tests unfit for concurrency but
-# rarely a race. This pipeline reruns only those variants (the <name>_mt ctest
-# entries) in every mode at stress size, without retries, so an intermittent
-# failure is reported rather than retried away:
+# iteration, in /SharedDbc only and only on Windows, which catches tests unfit
+# for concurrency but rarely a race. This pipeline reruns only those variants
+# (the <name>_mt ctest entries) in every mode at stress size, without retries,
+# so an intermittent failure is reported rather than retried away:
 #
 #   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
 #   weekly  16 x 50, the same modes

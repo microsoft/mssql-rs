@@ -38,16 +38,14 @@ def load_template(name):
 @pytest.mark.parametrize(
     ("override", "expected"),
     [
-        ("unset MSSQL_ODBC_MT_SKIP_MODES", None),
-        ("export MSSQL_ODBC_MT_SKIP_MODES=''", None),
+        ("unset MSSQL_ODBC_MT_SKIP_MODES", "SharedStmt"),
+        ("export MSSQL_ODBC_MT_SKIP_MODES=''", "SharedStmt"),
         ("export MSSQL_ODBC_MT_SKIP_MODES=none", "none"),
         ("export MSSQL_ODBC_MT_SKIP_MODES=SharedEnv,SharedDbc", "SharedEnv,SharedDbc"),
     ],
 )
 def test_unix_odbc_profiles_skip_shared_stmt(tmp_path, profile, threads, iterations,
                                            override, expected):
-    if expected is None:
-        expected = "CrossThread,SharedEnv,SharedStmt" if profile == "pr" else "SharedStmt"
     runner = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.sh").read_text(
         encoding="utf-8"
     )
@@ -68,6 +66,7 @@ bash -c 'printf "rust:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
 env ${{MS_LEG_ENV[@]+"${{MS_LEG_ENV[@]}}"}} \
 bash -c 'printf "reference:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
 "${{MSSQL_ODBC_MT_THREADS:-2}}" "${{MSSQL_ODBC_MT_ITERS:-1}}"'
+printf "ctest:%s\\n" "${{CTEST_ARGS[*]}}"
 """
     script_path = tmp_path / "profile.sh"
     script_path.write_text(script, encoding="utf-8", newline="\n")
@@ -77,6 +76,9 @@ bash -c 'printf "reference:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"rust:{expected}:{threads}:{iterations}" in result.stdout.splitlines()
     assert f"reference:{expected}:2:1" in result.stdout.splitlines()
+    # Unix PR runs leave the <name>_mt entries to Windows PR runs and the stress profiles.
+    labels = "-LE mt" if profile == "pr" else "-L mt --timeout 3600"
+    assert f"ctest:{labels}" in result.stdout.splitlines()
 
 
 @pytest.mark.parametrize(

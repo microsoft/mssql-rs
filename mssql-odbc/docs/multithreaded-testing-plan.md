@@ -523,7 +523,7 @@ races:
 
 | Profile | Where | Driver | Threads x iterations | Modes run | Retries |
 |---|---|---|---|---|---|
-| PR | validation pipeline, every PR | both | 2 x 1 | `SharedDbc` only | 3 |
+| PR | validation pipeline, every PR | both | 2 x 1 | Windows: `SharedDbc` only; Unix: none | 3 |
 | Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
 | Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
 | Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
@@ -536,13 +536,16 @@ races:
 - The nightly run exists to flush out obvious races while suites convert.
   Remove its schedule two to three weeks after it starts, once its findings
   are fixed; PR and weekly remain.
-- PRs do not hunt races, and run only `/SharedDbc`: the 2 x 1 run catches
-  `SharedDbc` opt-ins unfit for concurrency (fixed object names, process-wide
-  settings) in the PR that adds them. Other `ODBC_TEST_F` tests are first
-  checked by the stress profiles, so run their `_mt` entries locally in every
-  mode before review. With every mode, the `_mt` entries took 11 of the Windows
-  job's 60 minutes and up to 48 minutes of macOS e2e time (build 188193, which
-  then exceeded a temporary 120-minute Test MacOS limit; the limit stays 90).
+- PRs do not hunt races, and run only `/SharedDbc`, only on Windows: the 2 x 1
+  run catches `SharedDbc` opt-ins unfit for concurrency (fixed object names,
+  process-wide settings) in the PR that adds them. Other `ODBC_TEST_F` tests,
+  and every concurrent variant on unixODBC, are first checked by the stress
+  profiles, so run their `_mt` entries locally in every mode before review.
+  With every mode, the `_mt` entries took 11 of the Windows job's 60 minutes
+  and up to 48 minutes of macOS e2e time (build 188193). With `/SharedDbc`
+  alone they took more than 15 minutes on macOS before the cancellation, where Docker under Colima
+  makes busy retries slow, and Test MacOS exceeded its 90-minute limit
+  (build 188249).
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
 - Scenarios 7-15 join the stress run as their suites land (AB#49261,
