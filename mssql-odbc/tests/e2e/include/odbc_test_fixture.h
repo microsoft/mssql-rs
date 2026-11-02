@@ -234,6 +234,12 @@ protected:
     /// Execute a SQL statement, ignoring errors (useful for DROP IF EXISTS).
     void ExecDirectIgnoreError(const std::string& sql);
 
+    /// Whether the server has the native `json` type, probed on stmt_. Only
+    /// error 243 ("Type json is not a defined system type") means no; any
+    /// other failure, such as a busy shared connection, is reported with its
+    /// diagnostic, so a /SharedDbc attempt retries rather than skipping.
+    bool ServerSupportsNativeJson();
+
     // --- Logging ------------------------------------------------------------
     /// Print a timestamped, indented log message to stdout.
     void Log(const std::string& msg);
