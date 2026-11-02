@@ -155,7 +155,8 @@ fn sql_set_desc_field_w_safe(
                 && record_number >= 1
                 && matches!(
                     field,
-                    SQL_DESC_CONCISE_TYPE
+                    SQL_DESC_LENGTH
+                        | SQL_DESC_CONCISE_TYPE
                         | SQL_DESC_DATETIME_INTERVAL_CODE
                         | SQL_DESC_PRECISION
                         | SQL_DESC_SCALE
@@ -167,12 +168,14 @@ fn sql_set_desc_field_w_safe(
                 | SQL_DESC_INDICATOR_PTR
                 | SQL_DESC_OCTET_LENGTH_PTR
                 | SQL_DESC_OCTET_LENGTH
+                | SQL_DESC_LENGTH
                 | SQL_DESC_CONCISE_TYPE
                 | SQL_DESC_DATETIME_INTERVAL_CODE
                 | SQL_DESC_PRECISION
                 | SQL_DESC_SCALE
                 | SQL_DESC_TYPE
         )
+        && (field != SQL_DESC_LENGTH || desc.kind == DescKind::ImpParam)
         && classify_field(desc.kind, field)
             .is_some_and(|access| access.writable && access.scope == FieldScope::Record)
     {
@@ -233,7 +236,12 @@ fn sql_set_desc_field_w_safe(
                                 return true;
                             }
                             None => {
-                                validation_diagnostic.set(Some(ERR_INVALID_PRECISION_OR_SCALE));
+                                validation_diagnostic.set(Some(match field {
+                                    SQL_DESC_TYPE | SQL_DESC_CONCISE_TYPE => {
+                                        ERR_INVALID_SQL_DATA_TYPE
+                                    }
+                                    _ => ERR_INVALID_PRECISION_OR_SCALE,
+                                }));
                                 return false;
                             }
                         }
@@ -293,6 +301,9 @@ fn sql_set_desc_field_w_safe(
                 |binding| {
                     if desc.kind == DescKind::ImpParam {
                         match field {
+                            SQL_DESC_LENGTH => {
+                                binding.column_size = value_ptr as SqlULen;
+                            }
                             SQL_DESC_CONCISE_TYPE | SQL_DESC_TYPE => {
                                 if let Some((sql_type, precision, scale, code)) = focused_type.get()
                                 {
@@ -1331,6 +1342,7 @@ mod tests {
     const SQL_DESC_PRECISION: SqlSmallInt =
         crate::api::odbc_types::SQL_DESC_PRECISION as SqlSmallInt;
     const SQL_DESC_SCALE: SqlSmallInt = crate::api::odbc_types::SQL_DESC_SCALE as SqlSmallInt;
+    const SQL_DESC_LENGTH: SqlSmallInt = crate::api::odbc_types::SQL_DESC_LENGTH as SqlSmallInt;
     const SQL_DESC_DATA_PTR: SqlSmallInt = crate::api::odbc_types::SQL_DESC_DATA_PTR as SqlSmallInt;
     const SQL_DESC_ARRAY_SIZE: SqlSmallInt =
         crate::api::odbc_types::SQL_DESC_ARRAY_SIZE as SqlSmallInt;
@@ -2555,6 +2567,90 @@ mod tests {
                 .unwrap()
                 .records
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn focused_ipd_length_write_updates_the_child_sql_binding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        stmt.inner.lock().unwrap().tvp_column_bindings.insert(
+            1,
+            vec![Some(crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_LONG,
+                sql_type: SQL_INTEGER,
+                column_size: 10,
+                decimal_digits: 0,
+                app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
+                app_precision: 0,
+                app_scale: 0,
+                parameter_value_ptr: ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: ptr::null_mut(),
+                octet_length_ptr: ptr::null_mut(),
+            })],
+        );
+
+        assert_eq!(
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_LENGTH, 20isize as SqlPointer, 0,) },
+            SQL_SUCCESS
+        );
+        assert_eq!(get_ulen(h.ipd(), 1, SQL_DESC_LENGTH), 20);
+        assert_eq!(
+            stmt.inner.lock().unwrap().tvp_column_bindings[&1][0]
+                .as_ref()
+                .unwrap()
+                .column_size,
+            20
+        );
+        assert!(
+            unsafe { handle_from_raw::<DescHandle>(h.ipd()) }
+                .inner
+                .lock()
+                .unwrap()
+                .records
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn focused_ipd_invalid_type_write_reports_hy004() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        stmt.inner.lock().unwrap().tvp_column_bindings.insert(
+            1,
+            vec![Some(crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_LONG,
+                sql_type: SQL_INTEGER,
+                column_size: 10,
+                decimal_digits: 0,
+                app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
+                app_precision: 0,
+                app_scale: 0,
+                parameter_value_ptr: ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: ptr::null_mut(),
+                octet_length_ptr: ptr::null_mut(),
+            })],
+        );
+
+        assert_eq!(
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_TYPE, 9999isize as SqlPointer, 0,) },
+            SQL_ERROR
+        );
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_SQL_DATA_TYPE);
+        assert_eq!(
+            stmt.inner.lock().unwrap().tvp_column_bindings[&1][0]
+                .as_ref()
+                .unwrap()
+                .sql_type,
+            SQL_INTEGER
         );
     }
 
