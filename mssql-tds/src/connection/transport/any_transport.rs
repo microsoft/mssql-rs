@@ -436,6 +436,14 @@ impl AnyTransport {
         }
     }
 
+    pub(crate) fn response_fully_received(&self) -> bool {
+        match self {
+            Self::Network(transport) => TdsTransport::response_fully_received(transport),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.response_fully_received(),
+        }
+    }
+
     /// Flags the connection as known-dead without touching the socket, so a
     /// later pool checkout discards it. See
     /// [`TdsTransport::mark_known_dead`].

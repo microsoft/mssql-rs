@@ -102,6 +102,12 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
         false
     }
 
+    /// Whether the current response's final packet has been framed, so the
+    /// server will send nothing further for it.
+    fn response_fully_received(&self) -> bool {
+        false
+    }
+
     /// Marks the connection as known-dead so [`connection_known_dead`] reports
     /// `true` without touching the socket.
     ///

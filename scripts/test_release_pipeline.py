@@ -47,17 +47,23 @@ _SWITCHES = (
 )
 
 
-def evaluate(expression, parameters, succeeded=True):
-    """Evaluate only the boolean expression subset used by this pipeline."""
+def evaluate(expression, parameters, succeeded=True, variables=None):
+    """Evaluate only the condition subset used by these pipelines."""
     expression = re.sub(r"\band\(", "all_(", expression)
     expression = re.sub(r"\bor\(", "any_(", expression)
 
     def visit(node):
+        if isinstance(node, ast.Constant):
+            return node.value
         if isinstance(node, ast.Name):
             return {"true": True, "false": False}[node.id.lower()]
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             assert node.value.id == "parameters"
             return parameters[node.attr]
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            assert node.value.id == "variables"
+            assert variables is not None
+            return variables[visit(node.slice)]
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             args = [visit(arg) for arg in node.args]
             return {
@@ -1643,11 +1649,11 @@ def test_twine_upload_fails_closed_when_index_is_unreadable(tmp_path: Path) -> N
     [
         (
             "Linux_x64",
-            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_x86_64_rust:latest",
+            "tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest",
         ),
         (
             "Linux_ARM64",
-            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_aarch64_rust:latest",
+            "tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest",
         ),
     ],
 )

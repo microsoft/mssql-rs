@@ -91,7 +91,9 @@ for the full precedence and applicability rules.
 
 `SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-scoped network requests,
 including pooled reset, isolation and autocommit changes, transaction completion,
-and cursor draining for those operations. Zero leaves request I/O unlimited.
+and cancellation settlement when those operations close pending cursors.
+Cursor cleanup abandons unfinished server work rather than draining it.
+Zero leaves request I/O unlimited and uses the default cancellation budget.
 Cancellation settlement and a pool's replacement login can add time; this is not
 an end-to-end pool-checkout deadline. A connection that cannot finish cancellation
 is retired rather than returned with an unsynchronized response stream.

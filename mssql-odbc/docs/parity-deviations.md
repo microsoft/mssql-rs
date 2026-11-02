@@ -1262,3 +1262,39 @@ msodbcsql build is measured.
     build and `SQL_DRIVER_VER` recorded must confirm the warning and effective
     MSF value. This does not change the separate mirroring implementation gap.
     Maintainer parity sign-off remains pending. Tracked in AB#49293.
+
+37. **Long-data input does not require a declared total length.**
+    This driver reports `SQL_NEED_LONG_DATA_LEN="N"` and accepts
+    `SQL_DATA_AT_EXEC` for supported long input through both streamed PLP
+    and deferred buffering. A positive `SQL_LEN_DATA_AT_EXEC(n)` still
+    commits the caller to supplying exactly `n` bytes; that is not a
+    requirement to declare a total.
+
+    **Reference:** `SQLGetInfoTable` in
+    `Sql/Ntdbms/sqlncli/odbc/sqlcinfo.cpp:388` advertises `"Y"`;
+    `ExportImp::SQLGetInfoW` returns it as a one-character string.
+    Source inspected at msodbcsql master `dc673881adda90a8c78e51ecfa1e7ec67d38ebc1`.
+    In `sqlccmd.cpp`, the `SQLParamData` path maps `SQL_DATA_AT_EXEC` to
+    `NO_PARAM_LENGTH` (:5429-5433). Its close-time length check only applies
+    when `cbDAEDataTotal > 0` (:6010-6011). The long-data requirement in
+    the `SQLSetPos` data path is guarded by `!ISYUKON` (:4156-4160), so
+    that older-server branch does not justify rejecting unknown totals on
+    modern parameter execution.
+
+    **Measurement:** Windows x64 retail 18.7.1.1
+    (`SQL_DRIVER_VER=18.07.0001`) reports `"Y"` on a directly allocated,
+    unconnected DBC; main `b746d40c` reports `"N"`. Both drivers successfully
+    execute unknown-length `SQL_LONGVARCHAR`, `SQL_WLONGVARCHAR`, and
+    `SQL_LONGVARBINARY` input, supplied in 8192-byte chunks, with server
+    byte lengths 60000, 120000, and 60000. This measures parameter input
+    against a modern SQL Server, not legacy servers or positioned updates.
+    `NeedLongDataLengthReflectsDriverContract` measures each driver's
+    advertised value on the e2e comparison legs;
+    `UnknownLengthLongDataStreamsInChunks` pins the shared input capability.
+
+    Reporting `"N"` preserves the implemented unknown-total contract instead
+    of making applications precompute a length unnecessarily. The decision
+    spans SQLGetInfo and DAE execution, so it belongs in this registry.
+    The author approved retaining `"N"` on 2026-11-02; maintainer parity
+    sign-off remains pending. Owned by AB#49637, with the
+    [SQLGetInfo plan](sql-get-info-plan.md#active-statements-and-long-data-lengths).

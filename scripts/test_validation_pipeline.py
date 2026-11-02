@@ -4,6 +4,7 @@
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
 import importlib.util
+import json
 import re
 import shutil
 import subprocess
@@ -13,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+
+from test_release_pipeline import evaluate
 
 _ROOT = Path(__file__).parents[1]
 _TEMPLATES = _ROOT / ".pipeline" / "templates"
@@ -28,6 +31,157 @@ _SPEC.loader.exec_module(verify_python)
 
 def load_template(name):
     return yaml.safe_load((_TEMPLATES / name).read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def stress_pipeline():
+    return yaml.safe_load(
+        (_ROOT / ".pipeline" / "odbc-stress-pipeline.yml").read_text(encoding="utf-8")
+    )
+
+
+@pytest.fixture
+def windows_stress_job(stress_pipeline):
+    stage = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
+    )
+    assert stage["dependsOn"] == []
+    return stage["jobs"][0]
+
+
+@pytest.mark.parametrize(
+    ("profile", "schedule", "expected"),
+    [
+        ("auto", None, 120),
+        ("auto", "", 120),
+        ("auto", "Nightly ODBC stress", 120),
+        ("auto", "Weekly ODBC stress", 240),
+        ("weekly", None, 240),
+        ("weekly", "Nightly ODBC stress", 240),
+        ("nightly", "Weekly ODBC stress", 120),
+    ],
+)
+def test_stress_job_timeout_follows_profile(stress_pipeline, profile, schedule, expected):
+    variables = stress_pipeline["variables"]
+    conditional = next(key for key in variables if key.startswith("${{ if "))
+    condition = conditional.removeprefix("${{ if ").removesuffix(" }}")
+    weekly = evaluate(
+        condition, {"profile": profile},
+        variables={"Build.CronSchedule.DisplayName": schedule},
+    )
+    selected = variables[conditional if weekly else "${{ else }}"]
+    assert selected["odbcMtJobTimeoutInMinutes"] == expected
+    timeout = "${{ variables.odbcMtJobTimeoutInMinutes }}"
+    windows = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
+    )
+    assert windows["jobs"][0]["timeoutInMinutes"] == timeout
+    linux = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Linux"
+    )
+    assert len(linux["jobs"]) == 2
+    for job in linux["jobs"]:
+        assert job["parameters"]["timeoutInMinutes"] == timeout
+        assert len(job["parameters"]["matrix"]) == 1
+    build = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Build_Linux_Drops"
+    )
+    assert build["jobs"][0]["timeoutInMinutes"] == 90
+
+
+def test_windows_stress_matrix_preserves_profiles_and_parity(windows_stress_job):
+    matrix = windows_stress_job["strategy"]["matrix"]
+    assert set(matrix) == {"Fetch", "Parameters", "Metadata", "Other"}
+    assert {group["suiteGroup"] for group in matrix.values()} == set(matrix)
+    assert "maxParallel" not in windows_stress_job["strategy"]
+    # Matrix variables are not expanded in the job name; Azure appends the leg.
+    assert "$(" not in windows_stress_job["displayName"]
+    assert windows_stress_job["timeoutInMinutes"] == "${{ variables.odbcMtJobTimeoutInMinutes }}"
+    step = next(step for step in windows_stress_job["steps"] if "pwsh" in step)
+    command = step["pwsh"]
+    assert "-CompareWithMsodbcsql" in command
+    assert "-MtProfile '$(odbcMtProfile)'" in command
+    assert '-FilterTests "$env:FILTERTESTS" -ExcludeTests "$env:EXCLUDETESTS"' in command
+    # Azure leaves $(name) literal when a matrix value is empty.
+    for name in {key for group in matrix.values() for key, value in group.items() if not value}:
+        assert f"$({name})" not in command
+
+
+def test_windows_stress_groups_cover_current_concurrent_suites(windows_stress_job):
+    e2e = _ROOT / "mssql-odbc" / "tests" / "e2e"
+    concurrent = {
+        f"{source.stem}_mt"
+        for source in (e2e / "tests").rglob("*.cpp")
+        if re.search(r"^ODBC_TEST_F(_MODES)?\(", source.read_text(encoding="utf-8"), re.M)
+    }
+    assert concurrent
+    for name, group in windows_stress_job["strategy"]["matrix"].items():
+        selected = {
+            suite for suite in concurrent
+            if (not group["filterTests"] or re.search(group["filterTests"], suite))
+            and (not group["excludeTests"] or not re.search(group["excludeTests"], suite))
+        }
+        assert selected, f"{name} selects no concurrent suites"
+
+
+@pytest.mark.skipif(shutil.which("ctest") is None, reason="CTest is required")
+def test_windows_stress_ctest_groups_are_exhaustive_and_disjoint(tmp_path, windows_stress_job):
+    cmake = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    # Model every suite as converted, including ones not converted yet.
+    suites = set(re.findall(r"^add_odbc_(?:direct_load_)?test\((\w+)", cmake, re.M))
+    suites.add("future_suite_test")
+    entries = {f"{suite}_mt" for suite in suites}
+    testfile = tmp_path / "CTestTestfile.cmake"
+    testfile.write_text(
+        "\n".join(
+            f'add_test("{suite}" "unused")\n'
+            f'add_test("{suite}_mt" "unused")\n'
+            f'set_tests_properties("{suite}_mt" PROPERTIES LABELS "mt")'
+            for suite in sorted(suites)
+        ),
+        encoding="utf-8",
+    )
+    seen = set()
+    for name, group in windows_stress_job["strategy"]["matrix"].items():
+        args = [shutil.which("ctest"), "--show-only=json-v1", "-L", "mt"]
+        if group["filterTests"]:
+            args += ["-R", group["filterTests"]]
+        if group["excludeTests"]:
+            args += ["-E", group["excludeTests"]]
+        result = subprocess.run(args, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        selected = {test["name"] for test in json.loads(result.stdout)["tests"]}
+        assert selected, f"{name} selects no suites"
+        assert not seen & selected, f"{name} duplicates {seen & selected}"
+        seen.update(selected)
+    assert seen == entries
+
+
+def test_windows_stress_results_and_artifacts_are_group_scoped(windows_stress_job):
+    def artifacts(steps):
+        for step in steps:
+            if step.get("task") == "PublishPipelineArtifact@1":
+                yield step["inputs"]["artifact"]
+            for key, value in step.items():
+                if key.startswith("${{ if "):
+                    yield from artifacts(value)
+
+    names = list(artifacts(windows_stress_job["steps"]))
+    assert len(names) == 3
+    assert len(set(names)) == len(names)
+    for name in names:
+        assert "$(suiteGroup)" in name
+        assert "$(System.JobAttempt)" in name
+    results = [
+        step for step in windows_stress_job["steps"]
+        if step.get("task") == "PublishTestResults@2"
+    ]
+    assert len(results) == 2
+    for step in results:
+        assert "$(suiteGroup)" in step["inputs"]["testRunTitle"]
+        assert step["condition"] == "succeededOrFailed()"
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
