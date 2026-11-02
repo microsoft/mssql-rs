@@ -536,12 +536,13 @@ races:
 - The nightly run exists to flush out obvious races while suites convert.
   Remove its schedule two to three weeks after it starts, once its findings
   are fixed; PR and weekly remain.
-- PRs do not hunt races: the 2 x 1 run catches tests unfit for concurrency
-  (fixed object names, process-wide settings) in the PR that adds them. PRs run
-  only `/SharedDbc`, which shares the most state: with every mode, the `_mt`
-  entries took 11 of the Windows job's 60 minutes and up to 48 of the macOS
-  job's 90 (build 188193). Tests that do not opt in to `SharedDbc` get no
-  concurrent run on a PR; the stress profiles run every mode.
+- PRs do not hunt races, and run only `/SharedDbc`: the 2 x 1 run catches
+  `SharedDbc` opt-ins unfit for concurrency (fixed object names, process-wide
+  settings) in the PR that adds them. Other `ODBC_TEST_F` tests are first
+  checked by the stress profiles, so run their `_mt` entries locally in every
+  mode before review. With every mode, the `_mt` entries took 11 of the Windows
+  job's 60 minutes and up to 48 minutes of macOS e2e time (build 188193, which
+  then exceeded a temporary 120-minute Test MacOS limit; the limit stays 90).
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
 - Scenarios 7-15 join the stress run as their suites land (AB#49261,
