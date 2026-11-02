@@ -242,6 +242,9 @@ fn apply_vendor_overrides(params: &mut ConnectionParams, overrides: &VendorConnO
     if let Some(multi_subnet_failover) = overrides.multi_subnet_failover {
         params.multi_subnet_failover = Some(multi_subnet_failover != 0);
     }
+    if let Some(long_as_max) = overrides.long_as_max {
+        params.long_as_max = Some(long_as_max);
+    }
 }
 
 /// Resolves the `Encrypt=` keyword vocabulary onto an mssql-tds setting.
@@ -283,6 +286,7 @@ fn effective_vendor_settings(
         trust_server_certificate: Some(u32::from(trust)),
         integrated_security: Some(u32::from(params.trusted_connection.unwrap_or(false))),
         multi_subnet_failover: Some(u32::from(multi_subnet_failover)),
+        long_as_max: Some(params.long_as_max.unwrap_or(0)),
     }
 }
 
@@ -867,6 +871,7 @@ mod tests {
                 trust_server_certificate: Some(0),
                 integrated_security: Some(1),
                 multi_subnet_failover: Some(0),
+                long_as_max: None,
             },
         );
         assert_eq!(overridden.encrypt.as_deref(), Some("strict"));
@@ -1029,6 +1034,7 @@ mod tests {
                 trust_server_certificate: Some(0),
                 integrated_security: Some(1),
                 multi_subnet_failover: Some(1),
+                long_as_max: Some(0),
             }
         );
 
@@ -1057,6 +1063,28 @@ mod tests {
         let mut context = ClientContext::default();
         apply_connection_params(&mut context, &params);
         assert_eq!(context.multi_subnet_failover, None);
+    }
+
+    #[test]
+    fn long_as_max_attribute_overrides_keyword_and_preserves_raw_value() {
+        for keyword in ["", ";LongAsMax=No", ";LongAsMax=Yes"] {
+            for raw in [0, 1, 2, usize::MAX] {
+                let (mut params, _) =
+                    parse_connection_string(&format!("Server=h{keyword}")).unwrap();
+                apply_vendor_overrides(
+                    &mut params,
+                    &VendorConnOverrides {
+                        long_as_max: Some(raw),
+                        ..VendorConnOverrides::default()
+                    },
+                );
+                assert_eq!(params.long_as_max, Some(raw));
+                assert_eq!(
+                    effective_vendor_settings(&params, false, false).long_as_max,
+                    Some(raw)
+                );
+            }
+        }
     }
 
     /// The trust flag reports the effective certificate policy, not the

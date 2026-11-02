@@ -1643,11 +1643,11 @@ def test_twine_upload_fails_closed_when_index_is_unreadable(tmp_path: Path) -> N
     [
         (
             "Linux_x64",
-            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_x86_64_rust:latest",
+            "tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest",
         ),
         (
             "Linux_ARM64",
-            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_aarch64_rust:latest",
+            "tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest",
         ),
     ],
 )

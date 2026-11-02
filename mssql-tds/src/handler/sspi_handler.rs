@@ -67,8 +67,7 @@ pub(crate) struct SspiAuthHandler {
     security_context: Box<dyn SecurityContext>,
     /// Current authentication state
     state: SspiAuthState,
-    /// Target SPN (for debugging/logging)
-    #[allow(dead_code)] // read via target_spn() in tests
+    /// Target SPN, recorded on the login's connect stage.
     target_spn: String,
 }
 
@@ -87,7 +86,7 @@ impl SspiAuthHandler {
     /// if the security context could not be created.
     pub(crate) fn new(config: &IntegratedAuthConfig, server: &str, port: u16) -> TdsResult<Self> {
         let security_context = create_security_context(config, server, port)?;
-        let target_spn = security_context.spn().to_string();
+        let target_spn = security_context.imported_name().to_string();
 
         Ok(Self {
             security_context,
@@ -202,7 +201,6 @@ impl SspiAuthHandler {
     }
 
     /// Returns the target SPN being used for authentication.
-    #[cfg(test)]
     pub(crate) fn target_spn(&self) -> &str {
         &self.target_spn
     }

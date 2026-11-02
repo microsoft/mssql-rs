@@ -15,6 +15,7 @@ pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
 pub(crate) const SQLSTATE_01S05: [u8; 5] = *b"01S05";
 pub(crate) const SQLSTATE_01S07: [u8; 5] = *b"01S07";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
+pub(crate) const SQLSTATE_07005: [u8; 5] = *b"07005";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_07S01: [u8; 5] = *b"07S01";
@@ -85,6 +86,25 @@ pub(crate) struct DiagMsg {
     pub(crate) text: &'static str,
 }
 
+impl From<crate::conversion::error::ConvError> for DiagMsg {
+    fn from(error: crate::conversion::error::ConvError) -> Self {
+        use crate::conversion::error::ConvError;
+
+        match error {
+            ConvError::OutOfRange => ERR_NUMERIC_OUT_OF_RANGE,
+            ConvError::DatetimeFieldOverflow => ERR_DATETIME_FIELD_OVERFLOW,
+            ConvError::InvalidDatetimeFormat => ERR_INVALID_DATETIME_FORMAT,
+            ConvError::Restricted => ERR_RESTRICTED_DATA_TYPE,
+            ConvError::InvalidCharacterValue => ERR_INVALID_CHARACTER_VALUE,
+            ConvError::Internal => ERR_INTERNAL_CONVERSION,
+            ConvError::NotHandledHere => Self {
+                state: SQLSTATE_HYC00,
+                text: "Column type conversion not yet implemented",
+            },
+        }
+    }
+}
+
 pub(crate) const ERR_INVALID_CURSOR_STATE: DiagMsg = DiagMsg {
     state: SQLSTATE_24000,
     text: "Invalid cursor state",
@@ -121,6 +141,12 @@ pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
+};
+/// msodbcsql's text for describing a statement positioned on no result set
+/// (measured on 18.6.2.1).
+pub(crate) const ERR_NOT_CURSOR_SPECIFICATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_07005,
+    text: "Prepared statement is not a cursor-specification",
 };
 /// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
 /// allocated a connection. Reached either by a caller that skipped the

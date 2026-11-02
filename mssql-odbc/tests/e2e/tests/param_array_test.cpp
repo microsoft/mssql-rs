@@ -79,6 +79,7 @@
 //  38.  RowReturningArrayTimeoutDuringNavigation - cancel and reuse
 
 #include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 #include "odbc_sql_server_types.h"
 
 // From msodbcsql.h, which this suite does not include: `SQL_COPT_SS_BASE_EX + 3`,
@@ -2381,8 +2382,9 @@ TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
 }
 
 // -------------------------------------------------------------------
-// 30. SQLMoreResults skips unread rows, and closing before the final
-// result releases the connection without executing any parameter set twice.
+// 30. SQLMoreResults skips unread rows, and closing before the final result
+// abandons the rest of the batch without executing any parameter set twice.
+// Every set here completes before the close, so all three rows exist.
 // -------------------------------------------------------------------
 TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
     ExecDirect("CREATE TABLE #pa_out3 (id int)");
@@ -2556,6 +2558,153 @@ TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
     EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
     EXPECT_EQ(SQL_PARAM_SUCCESS, status[2]);
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
+}
+
+// AB#49495: a parameter set's failure is reported by the call where msodbcsql
+// reads it, measured on msodbcsql 18.6.2.1. Navigation onto a set that fails
+// before its first row returns SQL_SUCCESS_WITH_INFO; the fetch that meets a
+// set failing after its row returns SQL_NO_DATA; navigation that discards a
+// failed set's unread rest posts the error but returns SQL_SUCCESS.
+ODBC_TEST_F(ParamArrayTest, SetErrorsAreReportedByTheCallThatReachesThem) {
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLUSMALLINT status[3] = {};
+    SQLULEN processed = 0;
+    const auto reset = [&] {
+        for (auto& item : status) {
+            item = SQL_PARAM_UNUSED;
+        }
+        processed = 0;
+    };
+
+    // Set 2 divides by zero before producing a row.
+    Prepare("SELECT 1 / (CAST(? AS int) - 2) AS q");
+    BindIntArray(values, indicators, 3, status, &processed);
+    reset();
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(-1);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLMoreResults(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+    EXPECT_EQ(SQL_PARAM_UNUSED, status[2]);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(1);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(3u, processed);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[2]);
+
+    // Set 2 returns one row, then divides by zero.
+    Prepare("SELECT 1 / (CASE WHEN CAST(? AS int) = 2 AND v = 0 THEN 0 ELSE 1 END) AS q "
+            "FROM (VALUES (1), (0)) AS t(v) ORDER BY v DESC");
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    reset();
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1, value);
+    EXPECT_EQ(1u, processed);
+    EXPECT_EQ(SQL_PARAM_UNUSED, status[1]) << "the error follows the row";
+    // unixODBC does not surface driver diagnostics after SQL_NO_DATA, so only
+    // the outputs are checked; the Rust unit tests pin the posted error.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    reset();
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    // The driver posts the discarded rest's error, but a Driver Manager need
+    // not surface diagnostics after SQL_SUCCESS, so only the outputs are checked.
+    EXPECT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+}
+
+// msodbcsql 18.6.2.1 presents a set that fails before its first row, with no
+// status array bound, as an error result: no columns and no cursor to fetch
+// or close, while SQLMoreResults still reaches the later sets.
+ODBC_TEST_F(ParamArrayTest, FailedSetWithoutStatusArrayIsAnErrorResult) {
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLULEN processed = 0;
+    const auto expect_error_result = [&](const char* fetch_state) {
+        // The Driver Manager may raise some of these errors itself; its list
+        // is cleaned up outside unixODBC's statement lock, so keep SharedStmt
+        // observers out until a non-mutating call has cleared it.
+        std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
+        SQLSMALLINT columns = -1;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(0, columns);
+        EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, fetch_state);
+        EXPECT_EQ(SQL_ERROR, SQLCloseCursor(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+        SQLULEN timeout = 0;
+        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, &timeout, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+    };
+
+    // SQLMoreResults positions on the failed second set.
+    Prepare("SELECT 1 / (CAST(? AS int) - 2) AS q");
+    BindIntArray(values, indicators, 3, nullptr, &processed);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(-1);
+    EXPECT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    expect_error_result("24000");
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(1);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(3u, processed);
+
+    // SQLExecute positions on the failed first set. The Driver Manager treats
+    // a failed SQLExecute as leaving no cursor and answers SQLFetch with HY010
+    // without calling the driver.
+    Prepare("SELECT 1 / (CAST(? AS int) - 1) AS q");
+    BindIntArray(values, indicators, 3, nullptr, &processed);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    expect_error_result("HY010");
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(1);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, ScalarInt("SELECT 1"));
+}
+
+// msodbcsql 18.6.2.1 posts an error inside the rows SQLMoreResults discards
+// without failing the call, but an error from a later statement of the set,
+// after its row set ends, fails SQLMoreResults like any navigation error.
+ODBC_TEST_F(ParamArrayTest, ErrorAfterTheRowSetFailsMoreResults) {
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    SQLUSMALLINT status[2] = {};
+    SQLULEN processed = 0;
+    Prepare("DECLARE @v int = ?; SELECT @v; IF @v = 1 RAISERROR ('tail error', 16, 1)");
+    BindIntArray(values, indicators, 2, status, &processed);
+
+    for (const bool fetch_first : {false, true}) {
+        SCOPED_TRACE(fetch_first ? "rows fetched" : "rows discarded");
+        status[0] = status[1] = SQL_PARAM_UNUSED;
+        ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+        if (fetch_first) {
+            FetchIntResult(1);
+        }
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLMoreResults(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+        EXPECT_EQ(SQL_PARAM_ERROR, status[0]);
+        FetchIntResult(2);
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        EXPECT_EQ(2u, processed);
+        EXPECT_EQ(SQL_PARAM_SUCCESS, status[1]);
+    }
 }
 
 TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {

@@ -505,12 +505,7 @@ impl JsonDocument {
                 })
                 .collect(),
         };
-        let mut out = Vec::new();
-        let mut serializer = serde_json::Serializer::with_formatter(&mut out, Layout::default());
-        document.serialize(&mut serializer)?;
-        out.push(b'\n');
-        // serde_json writes only UTF-8.
-        String::from_utf8(out).map_err(serde::ser::Error::custom)
+        to_json_string(&document, ONE_LINE_DEPTH)
     }
 }
 
@@ -518,18 +513,41 @@ impl JsonDocument {
 /// entry, its `rows` or `columns`, then the row or column itself.
 const ONE_LINE_DEPTH: usize = 5;
 
-/// serde_json's indented layout, except that a row or a column description
-/// (anything nested `ONE_LINE_DEPTH` deep or deeper) is written on one line:
+/// Writes `value` with [`Layout`] and ends it with a newline.
+pub(crate) fn to_json_string<T: Serialize + ?Sized>(
+    value: &T,
+    one_line_depth: usize,
+) -> Result<String, serde_json::Error> {
+    let mut out = Vec::new();
+    let mut serializer =
+        serde_json::Serializer::with_formatter(&mut out, Layout::new(one_line_depth));
+    value.serialize(&mut serializer)?;
+    out.push(b'\n');
+    // serde_json writes only UTF-8.
+    String::from_utf8(out).map_err(serde::ser::Error::custom)
+}
+
+/// serde_json's indented layout, except that anything nested `one_line_depth`
+/// deep or deeper (a row or a column description in the JSON document) is
+/// written on one line:
 /// `["master", "1", null]`, `{ "ordinal": 0, "name": "id" }`.
-#[derive(Default)]
 struct Layout {
     pretty: PrettyFormatter<'static>,
     depth: usize,
+    one_line_depth: usize,
 }
 
 impl Layout {
+    fn new(one_line_depth: usize) -> Self {
+        Self {
+            pretty: PrettyFormatter::new(),
+            depth: 0,
+            one_line_depth,
+        }
+    }
+
     fn one_line(&self) -> bool {
-        self.depth >= ONE_LINE_DEPTH
+        self.depth >= self.one_line_depth
     }
 }
 
@@ -803,7 +821,7 @@ fn millis_between(from: Instant, to: Instant) -> u64 {
 
 /// Formats milliseconds since the Unix epoch as an RFC 3339 UTC timestamp with
 /// milliseconds, e.g. `2026-10-03T02:40:11.483Z`.
-fn utc_timestamp(unix_ms: u64) -> String {
+pub(crate) fn utc_timestamp(unix_ms: u64) -> String {
     let millis = unix_ms % 1000;
     let seconds = unix_ms / 1000;
     let (hour, minute, second) = (seconds / 3600 % 24, seconds / 60 % 60, seconds % 60);

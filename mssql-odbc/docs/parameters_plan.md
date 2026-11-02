@@ -424,9 +424,12 @@ return `22001`.
 
 The TDS layer reports an `EncodedValueTooLong` error with the actual and maximum
 byte counts. The ODBC layer maps that typed error to `22001`; it does not match
-error text. `SQL_LONGVARCHAR` continues to use `varchar(max)` wire framing, but
-its ODBC `ColumnSize` is carried separately and enforced against the encoded
-value. A true `varchar(max)` declaration remains unbounded.
+error text. Materialized `SQL_LONGVARCHAR` values use legacy `text` RPC framing
+when `LongAsMax` is off and `varchar(max)` framing when it is on. DAE retains
+MAX/PLP payload framing independently of the SQL declaration. The LONG binding's
+`ColumnSize` is carried separately and enforced against the encoded value in
+either mode. An explicit `SQL_VARCHAR` binding with `ColumnSize=0` remains
+unbounded.
 
 This follows msodbcsql's convert-then-validate principle without copying its
 client-code-page assumption. This driver defines `SQL_C_CHAR` as UTF-8, so
@@ -445,17 +448,34 @@ Verified against msodbcsql source:
   `ColumnSize`: msodbcsql applies the bound whenever `!fIsVarMax` (`:2898`), and
   `fIsVarMax` needs `cbColDef == 0` *and* a varmax type or `longToMax` (`:2577`),
   which no `SQL_LONGVARCHAR` binding satisfies.
-- `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` are sent as `varchar(max)` /
-  `nvarchar(max)`, still bounded by `ColumnSize`. msodbcsql declares `text` /
-  `ntext` by default - it sends `max` only under `SQL_COPT_SS_LONGASMAX`
-  (`sqlcprot.h:1838`), which defaults off (`sqlcconn.cpp:84`, `:4686`) - so this
-  matches its `LongAsMax` mode rather than its default. `text` / `ntext` cannot
-  be declared until `mssql-tds` stops serializing them in bulk-copy ROW format:
-  an RPC parameter currently carries a textptr/timestamp header and a stray
-  table-name byte, and the server answers 4002 (AB#47591). Restoring the true
-  declaration, with `SQL_COPT_SS_LONGASMAX` as the opt-in fallback, is AB#47592.
-  The attribute itself is unimplemented, so the long types currently get its
-  *result* unconditionally with no way to ask for either behaviour.
+- `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` / `SQL_LONGVARBINARY` default to
+  `text` / `ntext` / `image` (AB#47592). `LongAsMax=Yes` or
+  `SQL_COPT_SS_LONGASMAX=SQL_XL_ON` selects the corresponding MAX types without
+  removing the `ColumnSize` bound. An explicit attribute overrides the keyword.
+  `Sql2Srv` selects MAX only for the exact value `SQL_XL_ON`; the setter keeps
+  other raw values and the getter reports their low `SQLUINTEGER`, rather than
+  rejecting them (`sqlcmisc.cpp`, `ExportImp::SQLSetConnectAttrW` / `GetParamValue`).
+  Changing this option does not invalidate an existing prepared handle.
+- Materialized legacy LOBs use a separate RPC serializer (AB#47591), not the
+  bulk ROW serializer: encoded `MaxLen`, optional collation, `ActualLen`, and
+  data, with `MaxLen=0` / `ActualLen=0xFFFFFFFF` for NULL. No table-name count,
+  text pointer, or timestamp is emitted. Encoding is resolved once and existing
+  wire bytes are borrowed. Preflight rejects a value over 2 GiB - 1 bytes before
+  any request bytes are written, re-encoding only a value large enough to reach
+  that limit. Bulk-copy ROW framing is unchanged.
+- DAE retains PLP/MAX payload framing even with a legacy declaration, matching
+  `PutParamData` (`sqlccmd.cpp:4651-4707`). `with_streamed_declaration` carries
+  the independent declaration. The connection policy is captured in the
+  execution's parameter snapshot, including any later buffered rebuild.
+  This does not add legacy non-PLP streaming types or whole-value buffering.
+- Windows measurements on SQL Server `17.00.4025`, retail msodbcsql
+  `SQL_DRIVER_VER=18.07.0001` (18.7.1.1), confirm default/No/Yes mapping,
+  attribute precedence, raw-value readback, and cached-declaration retention.
+  `long_params_test` checks server-side `tempdb.sys.columns` metadata for
+  values, typed NULLs, DAE, and parameter arrays. `SQL_VARIANT_PROPERTY`
+  rejects legacy and MAX LOBs and is not used as the type probe.
+  DSN-only connection support still depends on the existing DSN resolver gap;
+  this option is implemented on the current connection-string and attribute paths.
 - **Blank padding is left to the server.** msodbcsql pads client-side when
   `SQL_COPT_SS_ANSI_NPW` is on and the value is shorter than the declared length
   (`sqlcmisc.cpp:7472`, gated on `SQLBIGCHAR` / `SQLBIGBINARY` / `SQLNCHAR`).
@@ -843,16 +863,44 @@ accept/store contract itself belongs to AB#46377 and is documented in
   through the remaining results in parameter-set order. Empty result sets and
   multiple results from one procedure remain distinct. Rows are streamed, not
   buffered for the whole array. Advancing discards any unread rows of the
-  current result; closing drains the rest of the batch without executing any
-  set again.
+  current result. Closing abandons the rest of the batch as msodbcsql does
+  (AB#49495): ATTENTION stops sets the server has not run, no set executes
+  again, and the abandoned sets' results, messages, and errors are not
+  reported.
 - **Deferred completion.** A row-returning array is not finished when execute
-  returns. Statuses are written as RPC completions are consumed by navigation
-  or close; inspect the final processed count and status array after
-  `SQLMoreResults` reaches `SQL_NO_DATA`. A successful set is never marked
-  `SQL_PARAM_ERROR` merely for returning rows. A real per-set error retains its
-  status and diagnostic while later results remain fetchable, including when
-  `SQLMoreResults` reports `SQL_ERROR` without a status array. Pending results
-  keep the connection claimed until they are navigated or closed.
+  returns. A set's status and the processed count are written at the call
+  where msodbcsql's `OnDone` reads that set's RPC DONE: `SQLExecute` or
+  `SQLMoreResults` positioning on an empty set, a bound fetch of a set's last
+  row or the fetch that finds no more rows, `SQLGetData` reaching the last
+  column of the last row, or navigation past the set. Rust's read-ahead can
+  read a DONE before msodbcsql would, either past an unbound row buffered for
+  `SQLGetData`, which msodbcsql leaves on the wire, or past an ERROR token,
+  where msodbcsql's peek stops; that completion is held until one of those
+  calls (all measured call by call on msodbcsql 18.6.2.1). Like `OnDone`, the
+  processed count reports completed sets, not the set now producing results.
+  Close and cancel publish nothing for sets the cursor did not reach,
+  including a held completion; those statuses keep `SQL_PARAM_UNUSED`. Inspect
+  the final processed count and status array after `SQLMoreResults` reaches
+  `SQL_NO_DATA`.
+- **Per-set error return codes** (measured on msodbcsql 18.6.2.1). The call
+  that reports a set's failure posts its diagnostics and writes
+  `SQL_PARAM_ERROR`. Navigation (`SQLExecute`, `SQLMoreResults`) that positions
+  on a set failing before its first row returns `SQL_SUCCESS_WITH_INFO` with a
+  status array and `SQL_ERROR` without one. A fetch that finds a set failing
+  after its rows returns `SQL_NO_DATA` with a status array and `SQL_ERROR`
+  without one. `SQLMoreResults` that discards the unread rest of a failed set
+  posts an error read inside those rows without failing the call; an error
+  from a later statement of the set, after its row set ends, fails the call
+  like any navigation error. A successful set is never marked
+  `SQL_PARAM_ERROR` merely for returning rows, and later results remain
+  fetchable after a per-set error. Pending results keep the connection claimed
+  until they are navigated or closed. With no status array bound, a navigation
+  that reports a server-side set failure and lands on an empty set presents an
+  error result, not a cursor, whichever set failed (a set with rows stays a
+  cursor; a client-side conversion failure does not count):
+  `SQLNumResultCols` reports zero columns, `SQLDescribeCol` returns `07005`,
+  `SQLFetch` and `SQLCloseCursor` return `24000` (the batch stays open), and
+  `SQLGetData` returns `HY010` until `SQLMoreResults` advances past it.
 - **Failure handling.** A set that fails to build client-side does not abort the
   batch - the request serializes as it streams, so earlier sets are already on
   the wire. The return code is decided once, from one rule, whether the set

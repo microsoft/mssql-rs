@@ -167,6 +167,7 @@ fn finish_cancelled_dae_call(
 /// the drain of SQLFreeStmt(SQL_CLOSE) or SQLEndTran. msodbcsql sends ATTN in
 /// that window too (`sqlcmisc.cpp`, `pBatchCtx->Cancel` while `csStmt` is
 /// held), so the pending response is abandoned here, before SQLCancel returns.
+#[inline]
 pub(super) fn finish_operation(
     mut operation: StatementOperation<'_>,
     stmt: &StmtHandle,
@@ -180,6 +181,7 @@ pub(super) fn finish_operation(
     }
 }
 
+#[cold]
 fn settle_late_cancellation(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
@@ -219,7 +221,7 @@ fn settle_late_cancellation(
         }
     }
     let drained = !matches!(
-        super::close_cursor::drain_and_release(stmt, statement_handle),
+        super::close_cursor::abandon_and_release(stmt, statement_handle),
         super::close_cursor::DrainOutcome::Failed
     );
     if drained
@@ -538,10 +540,17 @@ pub(super) fn try_claim_idle_client(
 /// so it has to be recorded first; its return value reports whether it posted
 /// a server message. Callers with nothing pending pass `|_| false`.
 ///
-/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is
-/// `false` when the statement lock was poisoned and the closure therefore
-/// never ran, so a caller that relies on it having posted can fall back rather
-/// than assume. A stale lease returns `SQL_ERROR` without publishing state.
+/// Returns `(has_server_info, preceding_ran, cancelled, array_failed)`.
+/// `preceding_ran` is `false` when the statement lock was poisoned and the
+/// closure therefore never ran, so a caller that relies on it having posted can
+/// fall back rather than assume. `array_failed` reports a completed parameter
+/// set whose failure the status array cannot carry; its diagnostics are posted
+/// and `has_server_info` is set. A stale lease returns `SQL_ERROR` without
+/// publishing state.
+///
+/// `delivery` says how this call read the row it delivered, which decides
+/// whether msodbcsql has already read the set's DONE (measured on 18.6.2.1).
+/// Completions it has not are held on the statement for the call that would.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -552,8 +561,9 @@ pub(super) fn release_busy_if_row_exhausted(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     mut client: WireLease,
+    delivery: RowDelivery,
     post_preceding: impl FnOnce(&mut StmtState) -> bool,
-) -> Result<(bool, bool, bool), SqlReturn> {
+) -> Result<(bool, bool, bool, bool), SqlReturn> {
     debug_assert_eq!(client.owner(), WireOwner::Statement(statement_handle));
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
@@ -582,6 +592,11 @@ pub(super) fn release_busy_if_row_exhausted(
         Some(dbc.runtime.block_on(client.complete_current_result()))
     } else {
         None
+    };
+    let array_update = if completion_result.is_some() {
+        super::execute::take_parameter_array_update(stmt, &mut client)
+    } else {
+        Ok(None)
     };
     let batch_done = match &completion_result {
         Some(Ok(done)) => *done,
@@ -621,7 +636,16 @@ pub(super) fn release_busy_if_row_exhausted(
 
     let mut has_server_info = false;
     let mut preceding_ran = false;
+    let mut array_update = array_update;
+    let defer_array_completion = match (delivery, &array_update) {
+        (RowDelivery::Buffered, _) => true,
+        (RowDelivery::Read, Ok(Some(update))) => update.has_failed_set(),
+        _ => false,
+    };
     if let Ok(mut stmt_state) = stmt.inner.lock() {
+        if defer_array_completion && let Ok(update) = &mut array_update {
+            stmt_state.deferred_array_update = update.take().map(Box::new);
+        }
         if let Some(output_params) = pending_output_params {
             stmt_state.pending_output_params = Some(output_params);
         }
@@ -644,7 +668,30 @@ pub(super) fn release_busy_if_row_exhausted(
             stmt_state.batch_exhausted = true;
         }
     }
-    Ok((has_server_info, preceding_ran, cancelled))
+    // msodbcsql's OnDone writes a set's status when its RPC DONE is read, so a
+    // later close or cancel cannot discard it. Published after the STMT lock is
+    // released: the IPD is read first and must not nest beneath it. An
+    // internal failure fails the call rather than downgrading to a warning.
+    let array_rc = super::execute::try_apply_parameter_array_update(stmt, array_update?)?;
+    has_server_info |= array_rc != SQL_SUCCESS;
+    Ok((
+        has_server_info,
+        preceding_ran,
+        cancelled,
+        array_rc == SQL_ERROR,
+    ))
+}
+
+/// How a call that releases an exhausted cursor read the row it delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowDelivery {
+    /// No row: the call itself reached the end of the result set.
+    None,
+    /// Every column was read. msodbcsql also peeks past the row, but stops at
+    /// an ERROR token, so a failed set is left for the next call.
+    Read,
+    /// The row was buffered for `SQLGetData`; msodbcsql leaves it on the wire.
+    Buffered,
 }
 
 /// The TDS read has settled or retired its transport and returned the client.
@@ -903,12 +950,19 @@ pub(super) fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
 /// reading `StmtState::bound_params` exactly as it did before AB#47437.
 ///
-/// `Err(SQL_ERROR)` on a poisoned STMT/env/APD/IPD mutex: the caller posts a
+/// `Err(SQL_ERROR)` on a poisoned STMT/DBC/env/APD/IPD mutex: the caller posts a
 /// diagnostic against the statement and fails the execute outright, rather
 /// than silently snapshotting "every parameter unbound" — which used to let
 /// a zero-marker statement execute successfully despite the internal
 /// failure, and reported a misleading `07002` for one with markers.
 pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, SqlReturn> {
+    let long_as_max = {
+        let Ok(state) = stmt.parent_dbc().inner.lock() else {
+            error!("snapshotting parameters: dbc mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        state.long_as_max() == crate::api::odbc_types::SQL_XL_ON
+    };
     // Read before the STMT lock below, matching bind_param.rs's own
     // parent-before-child lock ordering for the same lookup.
     let odbc_version = {
@@ -948,7 +1002,12 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
         return Err(SQL_ERROR);
     };
     Ok(BoundParamSet {
-        params: BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, odbc_version),
+        params: BoundParam::all_from_descriptor_states(
+            &apd_state,
+            &ipd_state,
+            odbc_version,
+            long_as_max,
+        ),
         header: ParamArrayHeader::from_headers(&apd_state.header, &ipd_state.header),
     })
 }
@@ -1184,6 +1243,7 @@ pub(super) unsafe fn build_named_params_for_row(
                     columns,
                     column_offset,
                     layout.bind_type,
+                    snapshot.long_as_max,
                 )
                 .map_err(|source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
@@ -1276,8 +1336,19 @@ pub(super) unsafe fn build_named_params_for_row(
                     // declaration implies. Staying `max` keeps the value intact
                     // until the bound is measurable on this path too
                     // (AB#47590).
-                    let declaration = if length_limit.is_some() {
-                        dae_streamed_declaration(bound_param.sql_type, bound_param.column_size)
+                    // Legacy declarations carry no length, so that guard does not apply.
+                    let declaration = if length_limit.is_some()
+                        || matches!(
+                            bound_param.sql_type,
+                            crate::api::odbc_types::SQL_LONGVARCHAR
+                                | crate::api::odbc_types::SQL_WLONGVARCHAR
+                                | crate::api::odbc_types::SQL_LONGVARBINARY
+                        ) {
+                        dae_streamed_declaration(
+                            bound_param.sql_type,
+                            bound_param.column_size,
+                            snapshot.long_as_max,
+                        )
                     } else {
                         Ok(None)
                     };
@@ -1304,6 +1375,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 length_limit,
                 bound_param,
                 snapshot.udt_names.clone(),
+                snapshot.long_as_max,
             ));
         } else {
             if bound_param.sql_type == SQL_SS_XML
@@ -1315,11 +1387,12 @@ pub(super) unsafe fn build_named_params_for_row(
                 });
             }
             unsafe { crate::conversion::param_convert::stamp_numeric_apd(&bound_param) };
-            let (param, outcome) = unsafe { bound_param_to_rpc(name, &bound_param, udt_names) }
-                .map_err(|source| ParamRowBuildError::Conversion {
-                    parameter: i + 1,
-                    source,
-                })?;
+            let (param, outcome) =
+                unsafe { bound_param_to_rpc(name, &bound_param, udt_names, snapshot.long_as_max) }
+                    .map_err(|source| ParamRowBuildError::Conversion {
+                        parameter: i + 1,
+                        source,
+                    })?;
             if outcome == ConvOk::Truncated && dae_params.is_empty() {
                 fractional_truncated = true;
             }
@@ -1360,6 +1433,7 @@ pub(super) fn build_tvp_dae_params(
     columns: &[Option<BoundParam>],
     bind_offset: isize,
     bind_type: SqlULen,
+    long_as_max: bool,
 ) -> Result<Vec<DaeParam>, ParamBuildError> {
     let row_capacity = tvp.column_size;
     let per_row = columns
@@ -1377,19 +1451,26 @@ pub(super) fn build_tvp_dae_params(
 
     for row_index in 0..row_capacity {
         staged.push(
-            DaeParam::new(tvp_index, None, true, None, *tvp, udt_names.clone()).with_target(
-                DaeTarget::TvpRowControl {
-                    tvp_index,
-                    row_index,
-                },
-            ),
+            DaeParam::new(
+                tvp_index,
+                None,
+                true,
+                None,
+                *tvp,
+                udt_names.clone(),
+                long_as_max,
+            )
+            .with_target(DaeTarget::TvpRowControl {
+                tvp_index,
+                row_index,
+            }),
         );
         for (column_index, column) in columns.iter().enumerate() {
             let binding = column
                 .as_ref()
                 .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
             staged.push(
-                DaeParam::new(tvp_index, None, true, None, *binding, None)
+                DaeParam::new(tvp_index, None, true, None, *binding, None, long_as_max)
                     .with_target(DaeTarget::TvpCell {
                         tvp_index,
                         row_index,
@@ -1400,7 +1481,7 @@ pub(super) fn build_tvp_dae_params(
         }
     }
     staged.push(
-        DaeParam::new(tvp_index, None, true, None, *tvp, udt_names).with_target(
+        DaeParam::new(tvp_index, None, true, None, *tvp, udt_names, long_as_max).with_target(
             DaeTarget::TvpRowControl {
                 tvp_index,
                 row_index: row_capacity,
@@ -1486,6 +1567,7 @@ pub(super) fn rebuild_deferred_params(
             dae.udt_names.as_deref(),
             bytes,
             *is_null,
+            dae.long_as_max,
         ) {
             Ok((param, outcome)) => {
                 *slot = param;
@@ -2616,7 +2698,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0
         );
@@ -2650,7 +2732,7 @@ mod tests {
         let preceding_ran = std::cell::Cell::new(false);
 
         assert_eq!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| {
                 preceding_ran.set(true);
                 true
             }),
@@ -2687,7 +2769,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0
         );
@@ -2707,7 +2789,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -2746,7 +2829,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert_eq!(
             dbc.inner.lock().unwrap().wire.statement_owner(),
@@ -2789,7 +2873,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0,
             "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
@@ -2832,7 +2916,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert!(
             dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
@@ -2886,7 +2971,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert_eq!(
             dbc.inner.lock().unwrap().wire.statement_owner(),
@@ -2936,7 +3022,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0,
             "the caller must be told a server message was posted"
@@ -2987,7 +3073,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0
         );
@@ -3040,8 +3126,8 @@ mod tests {
         );
 
         let ran = std::cell::Cell::new(false);
-        let (_, preceding_ran, _) =
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+        let (_, preceding_ran, _, _) =
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| {
                 ran.set(true);
                 true
             })
@@ -3087,7 +3173,7 @@ mod tests {
         }];
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |s| {
                 post_tds_info_messages(s, &earlier)
             })
             .unwrap()
@@ -3232,6 +3318,22 @@ mod tests {
             ss.active_apd = Some(explicit_apd);
         }
         assert!(snapshot_bound_params(stmt).is_err());
+    }
+
+    /// A poisoned DBC must fail the snapshot rather than silently default the
+    /// LongAsMax policy to legacy declarations.
+    #[test]
+    fn snapshot_bound_params_fails_cleanly_on_a_poisoned_dbc() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dbc.inner.lock().unwrap();
+            panic!("poison the dbc lock");
+        }));
+        let snapshot = snapshot_bound_params(stmt);
+        dbc.inner.clear_poison();
+        assert!(matches!(snapshot, Err(SQL_ERROR)));
     }
 
     #[test]
@@ -3708,6 +3810,7 @@ mod tests {
             &[Some(bound), Some(dae)],
             0,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            false,
         )
         .unwrap();
         assert_eq!(staged.len(), 7);
@@ -3767,6 +3870,7 @@ mod tests {
             &[Some(column)],
             0,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            false,
         )
         .unwrap();
         let mut dae = DaeState::for_test(staged, None);
@@ -3968,6 +4072,97 @@ mod tests {
                 narrowed, expect_narrowed,
                 "{c_type} -> {sql_type}: declaration narrowing must follow the bound"
             );
+        }
+    }
+
+    #[test]
+    fn long_dae_declaration_and_buffered_rebuild_keep_the_execution_policy() {
+        use crate::api::odbc_types::{
+            SQL_C_BINARY, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_WLONGVARCHAR,
+        };
+        use mssql_tds::test_client_support::rpc_parameter_declaration;
+
+        for (c_type, sql_type, legacy, max, wire) in [
+            (
+                SQL_C_CHAR,
+                SQL_LONGVARCHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
+            (
+                SQL_C_CHAR,
+                SQL_WLONGVARCHAR,
+                "ntext",
+                "nvarchar(MAX)",
+                "NVarcharMax",
+            ),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARBINARY,
+                "image",
+                "varbinary(MAX)",
+                "VarBinaryMax",
+            ),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARCHAR,
+                "text",
+                "varchar(MAX)",
+                "VarcharMax",
+            ),
+        ] {
+            for long_as_max in [false, true] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let mut indicator = SQL_DATA_AT_EXEC;
+                let mut snapshot = snap(BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type,
+                    sql_type,
+                    column_size: 8,
+                    decimal_digits: 0,
+                    app_precision: 0,
+                    app_scale: 0,
+                    parameter_value_ptr: std::ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: &raw mut indicator,
+                    octet_length_ptr: &raw mut indicator,
+                });
+                snapshot.as_mut().unwrap().long_as_max = long_as_max;
+                let mut state = stmt.inner.lock().unwrap();
+                state.bound_params.push(snapshot);
+                let built = unsafe { build_named_params(&mut state, 1, 0, "test") }.unwrap();
+                let expected = if long_as_max { max } else { legacy };
+                assert_eq!(
+                    rpc_parameter_declaration(&built.params[0]).unwrap(),
+                    expected
+                );
+                assert_eq!(built.dae_params[0].long_as_max, long_as_max);
+                if c_type == SQL_C_BINARY && sql_type == SQL_LONGVARCHAR {
+                    assert!(built.dae_params[0].length_limit.is_none());
+                    // Cross-family materialization is not implemented; this
+                    // case pins the streamed declaration without a length guard.
+                    continue;
+                }
+                state.bound_params[0].as_mut().unwrap().long_as_max = !long_as_max;
+                let (rebuilt, _) = rebuild_deferred_params(
+                    &mut state,
+                    built.params,
+                    &[(0, b"abc".to_vec(), false)],
+                    &built.dae_params,
+                    &mut [],
+                    &std::collections::BTreeMap::new(),
+                    "test",
+                )
+                .unwrap();
+                assert_eq!(rpc_parameter_declaration(&rebuilt[0]).unwrap(), expected);
+                let framing = format!("{:?}", rebuilt[0]);
+                assert!(
+                    framing.contains(&format!("Materialized({wire}(")),
+                    "a rebuilt DAE value must keep PLP framing: {framing}"
+                );
+            }
         }
     }
 
@@ -4274,7 +4469,7 @@ mod tests {
     /// This pins what the skip arm still owes: the sequence is unwound, the
     /// client is handed back, and the connection is released — without which
     /// the DBC records the freed statement as busy forever. It does **not** pin
-    /// the skip itself, unlike the `drain_and_release` and
+    /// the skip itself, unlike the `abandon_and_release` and
     /// `rollback_before_disconnect` pairs: `cancel_streamed_write` returns `()`
     /// and has no observable effect on a scripted client, so a skipped cancel
     /// and an attempted one are indistinguishable here. The skip is covered end

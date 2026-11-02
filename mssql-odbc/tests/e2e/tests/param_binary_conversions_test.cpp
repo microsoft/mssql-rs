@@ -215,9 +215,7 @@ TEST_F(BinaryConversionLiveTest, ZeroColumnSizeOnVarbinaryIsTheMaxSpelling) {
 
 // image carries its value like the other two. Asserted by length rather than by
 // CONVERT: msodbcsql declares a real image, and the server refuses an explicit
-// image -> varchar conversion (error 529). This driver substitutes
-// varbinary(max) for image (AB#47592), so only the length assertion is common
-// to both.
+// image -> varchar conversion (error 529).
 TEST_F(BinaryConversionLiveTest, ImageParamCarriesItsValue) {
     EXPECT_EQ("4", DataLengthOfBoundParam({0xDE, 0xAD, 0xBE, 0xEF}, SQL_LONGVARBINARY, 16));
 }
@@ -230,7 +228,7 @@ TEST_F(BinaryConversionLiveTest, ImageParamIsStillBoundedByColumnSize) {
     EXPECT_EQ("2", DataLengthOfBoundParam({1, 2, 0, 0, 0}, SQL_LONGVARBINARY, 2));
 
     // Anything else is 22001, covered for all three types by
-    // OverflowCarryingDataIs22001; repeated here against the max declaration.
+    // OverflowCarryingDataIs22001; repeated here against the image declaration.
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindBytes({1, 2, 3}, SQL_LONGVARBINARY, 2), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));

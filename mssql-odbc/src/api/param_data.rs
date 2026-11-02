@@ -1156,6 +1156,7 @@ mod tests {
             &[Some(column)],
             0,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            false,
         )
         .unwrap();
         for param in &mut params {

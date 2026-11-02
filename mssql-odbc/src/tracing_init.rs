@@ -1401,7 +1401,7 @@ mod tests {
                 QueryResponse::select_one().with_delay(Duration::from_secs(8)),
             );
             dbc.trace.establish(id);
-            dbc.inner.lock().unwrap().connection_timeout = 1;
+            dbc.set_connection_timeout(1);
             let raw = h.stmt as usize;
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             std::thread::scope(|scope| {
