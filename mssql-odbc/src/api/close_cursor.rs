@@ -76,7 +76,9 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         return SQL_ERROR;
     };
     free_errors(&mut stmt_state);
-    if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
+    // msodbcsql has no cursor on a failed set's error result, but keeps the
+    // batch for SQLMoreResults, so closing it changes nothing.
+    if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) || stmt_state.error_result {
         error!("SQLCloseCursor: no cursor is open — SQLSTATE 24000");
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
         return SQL_ERROR;
@@ -93,7 +95,7 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    let outcome = drain_and_release(stmt, statement_handle);
+    let outcome = abandon_and_release(stmt, statement_handle);
     if let Some(e) = pending_fetch_error {
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
@@ -138,16 +140,15 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
         error!("SQLFreeStmt(SQL_CLOSE): stmt mutex poisoned");
         return SQL_ERROR;
     };
-    free_stmt_close_locked(statement_handle, stmt, stmt_state, false)
+    free_stmt_close_locked(statement_handle, stmt, stmt_state)
 }
 
-/// The caller retains an operation or cancellation guard through the drain.
+/// The caller retains an operation or cancellation guard through the abandon.
 /// SQLCancel must not begin another operation while holding its cancellation fence.
 pub(super) fn free_stmt_close_locked(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
     mut stmt_state: MutexGuard<'_, StmtState>,
-    cancel_pending: bool,
 ) -> SqlReturn {
     free_errors(&mut stmt_state);
     // No-op if cursor is already closed.
@@ -156,20 +157,14 @@ pub(super) fn free_stmt_close_locked(
     }
 
     // An exhausted response has already released the client to other DBC calls.
-    // Parameter arrays still need their completion status published on close.
-    let needs_drain = !stmt_state.batch_exhausted || stmt_state.parameter_array.is_some();
+    let needs_drain = !stmt_state.batch_exhausted;
     // See the identical comment in sql_close_cursor_safe.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
     let outcome = if needs_drain {
-        drain_and_release_inner(
-            stmt,
-            statement_handle,
-            process_is_shutting_down(),
-            cancel_pending,
-        )
+        abandon_and_release_inner(stmt, statement_handle, process_is_shutting_down())
     } else {
         DrainOutcome::Clean
     };
@@ -237,7 +232,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
         pending_fetch_error
     };
 
-    let outcome = drain_and_release(stmt, handle);
+    let outcome = abandon_and_release(stmt, handle);
     if let Some(e) = pending_fetch_error
         && let Ok(mut stmt_state) = stmt.inner.lock()
     {
@@ -254,52 +249,62 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
 }
 
 /// Resets cursor state on the statement (cursor is no longer open, metadata cleared).
+///
+/// Parameter-set completions not yet published are discarded with the cursor:
+/// msodbcsql's `OnDone` skips status writes once the batch is cancelled.
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
     stmt_state.reset_row_stream();
     stmt_state.clear_result_metadata();
     stmt_state.pending_row_counts.clear();
     stmt_state.clear_exhaustion_state();
+    stmt_state.parameter_array = None;
 }
 
-/// Outcome of draining the TDS stream and releasing the connection on cursor close.
+/// Outcome of abandoning the TDS response and releasing the connection on cursor close.
 pub(super) enum DrainOutcome {
-    /// Drain completed cleanly; no server INFO messages were posted.
+    /// The response was abandoned; no server INFO messages were posted.
     Clean,
-    /// Drain completed and one or more server INFO messages were posted.
+    /// The response was abandoned and messages read before the close were posted.
     InfoPosted,
-    /// Draining the TDS stream failed (I/O error or a lost/poisoned client).
-    /// A diagnostic is posted where possible; the connection may be broken.
+    /// Abandoning the response failed (I/O error, unacknowledged ATTENTION, or
+    /// a lost/poisoned client). A diagnostic is posted where possible; the
+    /// connection may be broken.
     Failed,
 }
 
-/// Takes the TDS client from the DBC, drains any pending tokens, and releases the wire.
-/// The wire stays reserved for this statement until the drain finishes so concurrent
+/// Takes the TDS client from the DBC, abandons any pending response, and releases the wire.
+/// The wire stays reserved for this statement until the abandon finishes so concurrent
 /// threads see the connection as busy (HY000) throughout — not just until `client` is taken.
 /// No locks are held during the network I/O.
 ///
+/// Like msodbcsql's `SQLFreeStmt(SQL_CLOSE)` → `Cancel` → `ProcessTDSStream(TDS_TIMEOUT)`,
+/// unread results are not executed to completion: ATTENTION stops the server's remaining
+/// work, bounded by the connection's cancellation timeout, and the discarded tail's rows,
+/// messages, errors, and parameter-set completions are not reported. A response whose
+/// final packet already arrived is discarded locally without ATTENTION.
+///
 /// Returns a [`DrainOutcome`] so callers can distinguish a clean close from one
-/// that surfaced server INFO messages, and — importantly — from a drain failure,
+/// that surfaced server INFO messages, and — importantly — from a failure,
 /// which must not be reported to the app as success.
-pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> DrainOutcome {
-    drain_and_release_inner(stmt, statement_handle, process_is_shutting_down(), false)
+pub(super) fn abandon_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> DrainOutcome {
+    abandon_and_release_inner(stmt, statement_handle, process_is_shutting_down())
 }
 
-/// The body of [`drain_and_release`], with the loader's shutdown flag passed in
+/// The body of [`abandon_and_release`], with the loader's shutdown flag passed in
 /// rather than read. The skip arm below is unreachable in a live process, so
 /// threading the flag is the only way a test can exercise it — without that,
 /// deleting the arm leaves the suite green and restores the AB#47510 hang.
-fn drain_and_release_inner(
+fn abandon_and_release_inner(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     process_is_shutting_down: bool,
-    cancel_pending: bool,
 ) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
     let (mut client, cancel_timeout) = {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
-            error!("drain_and_release: dbc mutex poisoned");
+            error!("abandon_and_release: dbc mutex poisoned");
             return DrainOutcome::Failed;
         };
         // A fetch may have already released the wire early once this
@@ -321,7 +326,7 @@ fn drain_and_release_inner(
             Err(claim_error) => {
                 error!(
                     ?claim_error,
-                    "drain_and_release: connection is not available"
+                    "abandon_and_release: connection is not available"
                 );
                 post_claim_error(dbc_state, stmt, claim_error);
                 return DrainOutcome::Failed;
@@ -338,53 +343,42 @@ fn drain_and_release_inner(
     // is still returned below so the DBC is left consistent for whatever
     // teardown runs after this.
     if process_is_shutting_down {
-        debug!("drain_and_release: process is exiting — skipping the drain round-trip");
+        debug!("abandon_and_release: process is exiting — skipping the drain round-trip");
         dbc.return_lease(client, LeaseReturn::Release);
         return DrainOutcome::Clean;
     }
 
-    let close_result = if cancel_pending && client.has_open_batch() {
-        dbc.runtime.block_on(client.cancel_query(cancel_timeout))
-    } else {
-        dbc.runtime.block_on(client.close_query())
-    };
+    let close_result = dbc.runtime.block_on(client.abandon_query(cancel_timeout));
     if let Err(e) = close_result {
-        error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");
+        error!(%e, "abandon_and_release: failed to abandon TDS response — connection may be broken");
         if !dbc.return_lease(client, LeaseReturn::Release) {
             return DrainOutcome::Failed;
         }
         // Surface the failure as a diagnostic so the app is not told the close
-        // succeeded when the stream did not drain cleanly.
+        // succeeded when the response was not settled.
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
         }
         return DrainOutcome::Failed;
     }
 
-    let array_update = super::execute::take_parameter_array_update(stmt, &mut client);
     let info_messages = client.take_info_messages();
 
-    // Drain complete: return client and release busy claim before publishing
+    // Abandon complete: return client and release busy claim before publishing
     // anything derived from a session that may have been disconnected.
     if !dbc.return_lease(client, LeaseReturn::Release) {
         return DrainOutcome::Failed;
     }
 
-    let array_rc = match array_update {
-        Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
-        Err(rc) => rc,
-    };
     let has_server_info = match stmt.inner.lock() {
         Ok(mut stmt_state) => post_tds_info_messages(&mut stmt_state, &info_messages),
         Err(_) => {
-            error!("drain_and_release: stmt mutex poisoned while posting info messages");
+            error!("abandon_and_release: stmt mutex poisoned while posting info messages");
             return DrainOutcome::Failed;
         }
     };
 
-    if array_rc == SQL_ERROR {
-        DrainOutcome::Failed
-    } else if has_server_info || array_rc == SQL_SUCCESS_WITH_INFO {
+    if has_server_info {
         DrainOutcome::InfoPosted
     } else {
         DrainOutcome::Clean
@@ -398,22 +392,595 @@ mod tests {
     use crate::test_support::TestHandles;
     use crate::test_support::assert_last_diag;
 
+    /// A prepared two-set `SELECT ?` array executed against a scripted client,
+    /// with its status and processed outputs kept alive for the statement.
+    struct ScriptedArray {
+        h: TestHandles,
+        statuses: Box<[u16; 2]>,
+        processed: Box<usize>,
+        _values: Box<[i32; 2]>,
+        _chars: Box<[[u8; 8]; 2]>,
+        _indicators: Box<[isize; 2]>,
+        execute_rc: SqlReturn,
+    }
+
+    impl ScriptedArray {
+        fn execute(client: mssql_tds::connection::tds_client::TdsClient, status: bool) -> Self {
+            Self::execute_bound(client, status, None)
+        }
+
+        /// Binds `chars` as `SQL_C_CHAR` text for the integer parameter when
+        /// given, so a set can fail client-side conversion.
+        fn execute_bound(
+            client: mssql_tds::connection::tds_client::TdsClient,
+            status: bool,
+            chars: Option<[[u8; 8]; 2]>,
+        ) -> Self {
+            use crate::api::odbc_types::*;
+            use mssql_tds::connection::tds_client::PreparedStatement;
+
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            h.mark_dbc_connected();
+            let mut client = client;
+            let id = client.register_prepared_handle_for_test(42);
+            stmt.parent_dbc()
+                .inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(client);
+            let mut array = Self {
+                h,
+                statuses: Box::new([SQL_PARAM_UNUSED; 2]),
+                processed: Box::new(0),
+                _values: Box::new([1, 2]),
+                _chars: Box::new(chars.unwrap_or_default()),
+                _indicators: Box::new([if chars.is_some() { SQL_NTS as isize } else { 0 }; 2]),
+                execute_rc: SQL_ERROR,
+            };
+            let sql: Vec<u16> = "SELECT ?".encode_utf16().collect();
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLPrepareW(
+                    array.h.stmt,
+                    sql.as_ptr(),
+                    i16::try_from(sql.len()).unwrap(),
+                )
+            });
+            let (c_type, buffer, length): (SqlSmallInt, SqlPointer, isize) = if chars.is_some() {
+                (SQL_C_CHAR, array._chars.as_mut_ptr().cast(), 8)
+            } else {
+                (SQL_C_LONG, array._values.as_mut_ptr().cast(), 4)
+            };
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLBindParameter(
+                    array.h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    c_type,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    buffer,
+                    length,
+                    array._indicators.as_mut_ptr(),
+                )
+            });
+            let status_ptr: SqlPointer = if status {
+                array.statuses.as_mut_ptr().cast()
+            } else {
+                std::ptr::null_mut()
+            };
+            for (attribute, value) in [
+                (SQL_ATTR_PARAMSET_SIZE, 2usize as SqlPointer),
+                (SQL_ATTR_PARAM_STATUS_PTR, status_ptr),
+                (
+                    SQL_ATTR_PARAMS_PROCESSED_PTR,
+                    (&mut *array.processed as *mut usize).cast(),
+                ),
+            ] {
+                assert_eq!(SQL_SUCCESS, unsafe {
+                    crate::api::SQLSetStmtAttrW(array.h.stmt, attribute, value, 0)
+                });
+            }
+            stmt.inner.lock().unwrap().prepared.as_mut().unwrap().stmt =
+                PreparedStatement::materialized_for_test("SELECT @P1", id);
+            array.execute_rc = unsafe { crate::api::SQLExecute(array.h.stmt) };
+            array
+        }
+
+        fn outputs(&self) -> (usize, [u16; 2]) {
+            (*self.processed, *self.statuses)
+        }
+
+        fn last_diag_native(&self) -> Option<i32> {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(self.h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            state.diag_records.last().map(|record| record.native_error)
+        }
+    }
+
+    /// msodbcsql reports a parameter set that fails before its first row from
+    /// the navigation that positions on it, and posts, without failing the
+    /// call, an error in the unread rows `SQLMoreResults` discards; an error
+    /// after those rows end fails it (all measured on 18.6.2.1). A status
+    /// array downgrades a reported failure to a warning.
     #[test]
-    fn exhausted_parameter_array_publishes_completion_on_close_or_cancel() {
+    fn parameter_set_errors_fail_the_call_that_positions_on_them() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_proc_in_batch_more, done_proc_no_more,
+            int_columns, return_status, sql_error, tds_client_from_int_rows_with_trailing_tokens,
+            tds_client_from_tokens,
+        };
+        let failed_then_empty = || {
+            tds_client_from_tokens(vec![
+                col_metadata(int_columns(1)),
+                sql_error(8134, 16, "Divide by zero error encountered."),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_in_batch_more(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ])
+        };
+
+        for status in [true, false] {
+            let array = ScriptedArray::execute(failed_then_empty(), status);
+            assert_eq!(
+                array.execute_rc,
+                if status {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_ERROR
+                },
+                "status array: {status}"
+            );
+            assert_eq!(array.last_diag_native(), Some(8134));
+            let failed = if status {
+                SQL_PARAM_ERROR
+            } else {
+                SQL_PARAM_UNUSED
+            };
+            assert_eq!(array.outputs(), (1, [failed, SQL_PARAM_UNUSED]));
+            if !status {
+                continue;
+            }
+            assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLMoreResults(array.h.stmt)
+            });
+            assert_eq!(array.outputs(), (2, [SQL_PARAM_ERROR, SQL_PARAM_SUCCESS]));
+            assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        }
+
+        // The first set fails after its row; navigating past it posts the
+        // error, and settling the empty second set completes the batch.
+        for status in [true, false] {
+            let array = ScriptedArray::execute(
+                tds_client_from_int_rows_with_trailing_tokens(
+                    vec![vec![1]],
+                    vec![
+                        sql_error(8134, 16, "Divide by zero error encountered."),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_in_batch_more(),
+                        col_metadata(int_columns(1)),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_no_more(),
+                    ],
+                ),
+                status,
+            );
+            assert_eq!(array.execute_rc, SQL_SUCCESS);
+            assert_eq!(
+                SQL_SUCCESS,
+                unsafe { crate::api::SQLMoreResults(array.h.stmt) },
+                "status array: {status}"
+            );
+            assert_eq!(array.last_diag_native(), Some(8134));
+            let failed = if status {
+                SQL_PARAM_ERROR
+            } else {
+                SQL_PARAM_UNUSED
+            };
+            let succeeded = if status {
+                SQL_PARAM_SUCCESS
+            } else {
+                SQL_PARAM_UNUSED
+            };
+            assert_eq!(array.outputs(), (2, [failed, succeeded]));
+            assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        }
+
+        // The first set's row set ends cleanly and a later statement in the set
+        // fails: the error is not in the discarded rest, so it fails the call.
+        for status in [true, false] {
+            let array = ScriptedArray::execute(
+                tds_client_from_int_rows_with_trailing_tokens(
+                    vec![vec![1]],
+                    vec![
+                        done_in_proc_more(),
+                        sql_error(50000, 16, "tail error"),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_in_batch_more(),
+                        col_metadata(int_columns(1)),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_no_more(),
+                    ],
+                ),
+                status,
+            );
+            assert_eq!(array.execute_rc, SQL_SUCCESS);
+            assert_eq!(
+                if status {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_ERROR
+                },
+                unsafe { crate::api::SQLMoreResults(array.h.stmt) },
+                "status array: {status}"
+            );
+            assert_eq!(array.last_diag_native(), Some(50000));
+            if status {
+                assert_eq!(array.outputs(), (2, [SQL_PARAM_ERROR, SQL_PARAM_SUCCESS]));
+            }
+        }
+    }
+
+    /// msodbcsql's error-result state, measured on 18.6.2.1 for a parameter
+    /// set that fails before its first row with no status array bound.
+    #[test]
+    fn a_failed_empty_set_without_status_array_is_an_error_result() {
+        use crate::api::odbc_types::*;
+        use crate::api::sqlstate::{
+            ERR_FUNCTION_SEQUENCE, ERR_INVALID_CURSOR_STATE, ERR_NOT_CURSOR_SPECIFICATION,
+        };
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_proc_in_batch_more, done_proc_no_more,
+            int_columns, return_status, sql_error, tds_client_from_int_rows_with_trailing_tokens,
+            tds_client_from_tokens,
+        };
+
+        fn assert_error_result(array: &ScriptedArray) {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(array.h.stmt) };
+            let last_diag =
+                |expected| assert_last_diag(&stmt.inner.lock().unwrap().diag_records, expected);
+            let mut columns: SqlSmallInt = -1;
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLNumResultCols(array.h.stmt, &mut columns)
+            });
+            assert_eq!(columns, 0);
+            let mut row_count: SqlLen = 0;
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLRowCount(array.h.stmt, &mut row_count)
+            });
+            assert_eq!(row_count, -1);
+            assert_eq!(SQL_ERROR, unsafe {
+                crate::api::SQLDescribeColW(
+                    array.h.stmt,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            });
+            last_diag(ERR_NOT_CURSOR_SPECIFICATION);
+            assert_eq!(SQL_ERROR, unsafe { crate::api::SQLFetch(array.h.stmt) });
+            last_diag(ERR_INVALID_CURSOR_STATE);
+            let mut value = 0i32;
+            let mut indicator: SqlLen = 0;
+            assert_eq!(SQL_ERROR, unsafe {
+                crate::api::SQLGetData(
+                    array.h.stmt,
+                    1,
+                    SQL_C_LONG,
+                    (&mut value as *mut i32).cast(),
+                    4,
+                    &mut indicator,
+                )
+            });
+            last_diag(ERR_FUNCTION_SEQUENCE);
+            assert_eq!(SQL_ERROR, unsafe {
+                crate::api::SQLCloseCursor(array.h.stmt)
+            });
+            last_diag(ERR_INVALID_CURSOR_STATE);
+        }
+
+        // Execute positions on the failed first set; SQLCloseCursor keeps the
+        // batch, so SQLMoreResults still reaches the second set.
+        let array = ScriptedArray::execute(
+            tds_client_from_tokens(vec![
+                col_metadata(int_columns(1)),
+                sql_error(8134, 16, "Divide by zero error encountered."),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_in_batch_more(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ]),
+            false,
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        assert_error_result(&array);
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLMoreResults(array.h.stmt)
+        });
+        assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        assert_eq!(*array.processed, 2);
+
+        // SQLMoreResults positions on the failed last set.
+        let array = ScriptedArray::execute(
+            tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![1]],
+                vec![
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_in_batch_more(),
+                    col_metadata(int_columns(1)),
+                    sql_error(8134, 16, "Divide by zero error encountered."),
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_no_more(),
+                ],
+            ),
+            false,
+        );
+        assert_eq!(array.execute_rc, SQL_SUCCESS);
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        assert_eq!(SQL_ERROR, unsafe {
+            crate::api::SQLMoreResults(array.h.stmt)
+        });
+        assert_eq!(array.last_diag_native(), Some(8134));
+        assert_error_result(&array);
+        assert_eq!(SQL_NO_DATA, unsafe {
+            crate::api::SQLMoreResults(array.h.stmt)
+        });
+        assert_eq!(*array.processed, 2);
+
+        // msodbcsql also presents a successful empty set as an error result
+        // when the navigation that reaches it reports another set's failure.
+        let array = ScriptedArray::execute(
+            tds_client_from_tokens(vec![
+                sql_error(50000, 16, "rejected"),
+                return_status(0),
+                done_proc_in_batch_more(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ]),
+            false,
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        assert_eq!(array.last_diag_native(), Some(50000));
+        assert_error_result(&array);
+        assert_eq!(*array.processed, 2);
+    }
+
+    /// A client-side conversion failure never reached the server, so the
+    /// successful empty set `SQLExecute` positions on keeps its columns, as
+    /// msodbcsql's does (measured on 18.6.2.1).
+    #[test]
+    fn a_conversion_failure_leaves_an_empty_set_a_cursor() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_proc_no_more, int_columns, return_status,
+            tds_client_from_tokens,
+        };
+
+        let array = ScriptedArray::execute_bound(
+            tds_client_from_tokens(vec![
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ]),
+            false,
+            Some([*b"1\0\0\0\0\0\0\0", *b"x\0\0\0\0\0\0\0"]),
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(array.h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"22018"
+        );
+        let mut columns: SqlSmallInt = -1;
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLNumResultCols(array.h.stmt, &mut columns)
+        });
+        assert_eq!(columns, 1);
+        assert!(!stmt.inner.lock().unwrap().error_result);
+    }
+
+    /// A completed set's status survives a failed first-row read of the next.
+    #[test]
+    fn a_first_row_read_failure_publishes_completed_sets() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_proc_in_batch_more, int_columns, return_status,
+            tds_client_from_tokens,
+        };
+
+        let array = ScriptedArray::execute(
+            tds_client_from_tokens(vec![
+                return_status(0),
+                done_proc_in_batch_more(),
+                col_metadata(int_columns(1)),
+            ]),
+            true,
+        );
+        assert_eq!(array.execute_rc, SQL_ERROR);
+        assert_eq!(array.outputs(), (1, [SQL_PARAM_SUCCESS, SQL_PARAM_UNUSED]));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(array.h.stmt) };
+        assert_ne!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            *b"01000"
+        );
+    }
+
+    /// msodbcsql's bound read-ahead stops at an ERROR token after the row, so
+    /// a set that fails mid-rowset is reported by the next fetch: `SQL_NO_DATA`
+    /// with the diagnostic when a status array is bound, `SQL_ERROR` otherwise
+    /// (measured on 18.6.2.1).
+    #[test]
+    fn a_set_failing_after_its_row_is_reported_by_the_next_fetch() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_proc_in_batch_more, done_proc_no_more,
+            int_columns, return_status, sql_error, tds_client_from_int_rows_with_trailing_tokens,
+        };
+
+        for status in [true, false] {
+            let array = ScriptedArray::execute(
+                tds_client_from_int_rows_with_trailing_tokens(
+                    vec![vec![1]],
+                    vec![
+                        sql_error(8134, 16, "Divide by zero error encountered."),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_in_batch_more(),
+                        col_metadata(int_columns(1)),
+                        done_in_proc_more(),
+                        return_status(0),
+                        done_proc_no_more(),
+                    ],
+                ),
+                status,
+            );
+            let mut value = 0i32;
+            let mut indicator = 0isize;
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLBindCol(
+                    array.h.stmt,
+                    1,
+                    SQL_C_LONG,
+                    (&mut value as *mut i32).cast(),
+                    4,
+                    &mut indicator,
+                )
+            });
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(array.h.stmt) });
+            assert_eq!(value, 1);
+            assert_eq!(array.outputs(), (1, [SQL_PARAM_UNUSED; 2]));
+            assert_eq!(
+                if status { SQL_NO_DATA } else { SQL_ERROR },
+                unsafe { crate::api::SQLFetch(array.h.stmt) },
+                "status array: {status}"
+            );
+            assert_eq!(array.last_diag_native(), Some(8134));
+            let failed = if status {
+                SQL_PARAM_ERROR
+            } else {
+                SQL_PARAM_UNUSED
+            };
+            assert_eq!(array.outputs(), (1, [failed, SQL_PARAM_UNUSED]));
+        }
+    }
+
+    /// An internal failure while publishing a held completion fails the fetch
+    /// rather than being reported as a parameter set's warning.
+    #[test]
+    fn a_poisoned_ipd_fails_the_fetch_that_publishes_a_held_completion() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_proc_in_batch_more, done_proc_no_more,
+            int_columns, return_status, tds_client_from_int_rows_with_trailing_tokens,
+        };
+
+        let array = ScriptedArray::execute(
+            tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![1]],
+                vec![
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_in_batch_more(),
+                    col_metadata(int_columns(1)),
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_no_more(),
+                ],
+            ),
+            true,
+        );
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(array.h.stmt) };
+        assert!(stmt.inner.lock().unwrap().deferred_array_update.is_some());
+        let ipd = unsafe { handle_from_raw::<crate::handles::DescHandle>(array.h.ipd()) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ipd.inner.lock().unwrap();
+            panic!("poison the ipd lock");
+        }));
+        assert_eq!(SQL_ERROR, unsafe { crate::api::SQLFetch(array.h.stmt) });
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HY000"
+        );
+    }
+
+    /// AB#49495: a set's status and the processed count are published at the
+    /// call where msodbcsql's `OnDone` reads that set's RPC DONE. An unbound
+    /// row buffered for `SQLGetData` defers it to the next fetch, `SQLGetData`
+    /// of the last column, or `SQLMoreResults`, because msodbcsql leaves that
+    /// row on the wire; closing or cancelling first discards it (measured on
+    /// 18.6.2.1).
+    #[test]
+    fn parameter_array_completion_is_published_at_each_set_boundary() {
         use crate::api::odbc_types::*;
         use mssql_tds::connection::tds_client::PreparedStatement;
         use mssql_tds::test_client_support::{
-            done_in_proc_more, done_proc_no_more, tds_client_from_int_rows_with_trailing_tokens,
+            col_metadata, done_in_proc_more, done_proc_in_batch_more, done_proc_no_more,
+            int_columns, return_status, tds_client_from_int_rows_with_trailing_tokens,
         };
 
-        for cancel in [false, true] {
+        #[derive(Clone, Copy, Debug)]
+        enum AfterRow {
+            Fetch,
+            GetData,
+            Close,
+            Cancel,
+            MoreResults,
+        }
+        for after in [
+            AfterRow::Fetch,
+            AfterRow::GetData,
+            AfterRow::Close,
+            AfterRow::Cancel,
+            AfterRow::MoreResults,
+        ] {
             let h = TestHandles::with_env_dbc_stmt();
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let dbc = stmt.parent_dbc();
             h.mark_dbc_connected();
             let mut client = tds_client_from_int_rows_with_trailing_tokens(
-                vec![vec![2]],
-                vec![done_in_proc_more(), done_proc_no_more()],
+                vec![vec![1]],
+                vec![
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_in_batch_more(),
+                    col_metadata(int_columns(1)),
+                    done_in_proc_more(),
+                    return_status(0),
+                    done_proc_no_more(),
+                ],
             );
             let id = client.register_prepared_handle_for_test(42);
             dbc.inner.lock().unwrap().wire.put_client_for_test(client);
@@ -421,7 +988,6 @@ mod tests {
             let mut values = [1i32, 2];
             let mut indicators = [0isize; 2];
             let mut statuses = [SQL_PARAM_UNUSED; 2];
-            let mut operations = [SQL_PARAM_IGNORE, SQL_PARAM_PROCEED];
             let mut processed = 0usize;
             assert_eq!(SQL_SUCCESS, unsafe {
                 crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
@@ -443,7 +1009,6 @@ mod tests {
             for (attribute, value) in [
                 (SQL_ATTR_PARAMSET_SIZE, 2usize as SqlPointer),
                 (SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr().cast()),
-                (SQL_ATTR_PARAM_OPERATION_PTR, operations.as_mut_ptr().cast()),
                 (
                     SQL_ATTR_PARAMS_PROCESSED_PTR,
                     (&mut processed as *mut usize).cast(),
@@ -461,48 +1026,70 @@ mod tests {
                 "{:?}",
                 stmt.inner.lock().unwrap().diag_records
             );
+            assert_eq!((processed, statuses), (1, [SQL_PARAM_UNUSED; 2]));
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
-            assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
-            // Model wire exhaustion before the ODBC parameter-array completion
-            // has been published. SQLMoreResults would publish it immediately.
-            let mut client = dbc
-                .inner
-                .lock()
-                .unwrap()
-                .wire
-                .clear_client_for_test()
-                .unwrap();
-            dbc.runtime.block_on(client.advance()).unwrap();
-            assert!(!client.has_open_batch());
-            {
-                let mut state = dbc.inner.lock().unwrap();
-                state.wire.put_client_for_test(client);
-                state.wire.set_owner_for_test(None);
-            }
-            stmt.inner.lock().unwrap().batch_exhausted = true;
-            {
-                let state = stmt.inner.lock().unwrap();
-                assert!(state.batch_exhausted);
-                assert!(state.parameter_array.is_some());
-            }
-            processed = 0;
             assert_eq!(
-                if cancel {
-                    SQL_SUCCESS_WITH_INFO
-                } else {
-                    SQL_SUCCESS
-                },
-                unsafe {
-                    if cancel {
-                        crate::api::SQLCancel(h.stmt)
-                    } else {
-                        crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
-                    }
-                }
+                (processed, statuses),
+                (1, [SQL_PARAM_UNUSED; 2]),
+                "{after:?}"
             );
-            assert_eq!(processed, 2);
-            assert_eq!(statuses, [SQL_PARAM_UNUSED, SQL_PARAM_SUCCESS]);
-            assert!(stmt.inner.lock().unwrap().parameter_array.is_none());
+            assert!(
+                stmt.inner.lock().unwrap().deferred_array_update.is_some(),
+                "the buffered row must defer the set's completion"
+            );
+
+            let reached = (1, [SQL_PARAM_SUCCESS, SQL_PARAM_UNUSED]);
+            let expected = match after {
+                AfterRow::Fetch => {
+                    assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+                    reached
+                }
+                AfterRow::GetData => {
+                    let mut value = 0i32;
+                    let mut indicator = 0isize;
+                    assert_eq!(SQL_SUCCESS, unsafe {
+                        crate::api::SQLGetData(
+                            h.stmt,
+                            1,
+                            SQL_C_LONG,
+                            (&mut value as *mut i32).cast(),
+                            4,
+                            &mut indicator,
+                        )
+                    });
+                    assert_eq!(value, 1);
+                    reached
+                }
+                AfterRow::Close => {
+                    assert_eq!(SQL_SUCCESS, unsafe {
+                        crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+                    });
+                    (1, [SQL_PARAM_UNUSED; 2])
+                }
+                AfterRow::Cancel => {
+                    assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+                        crate::api::SQLCancel(h.stmt)
+                    });
+                    (1, [SQL_PARAM_UNUSED; 2])
+                }
+                AfterRow::MoreResults => {
+                    assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLMoreResults(h.stmt) });
+                    // Navigation reads the empty second set through its DONE.
+                    assert_eq!((processed, statuses), (2, [SQL_PARAM_SUCCESS; 2]));
+                    assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+                    (2, [SQL_PARAM_SUCCESS; 2])
+                }
+            };
+            assert_eq!((processed, statuses), expected, "{after:?}");
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+            });
+            assert_eq!((processed, statuses), expected, "{after:?}");
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.parameter_array.is_none());
+            assert!(state.deferred_array_update.is_none());
+            drop(state);
+            assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         }
     }
 
@@ -622,7 +1209,7 @@ mod tests {
         }
         h.mark_dbc_connected();
         // A fresh, never-executed client: has_open_batch() is false, so
-        // drain_and_release's own close_query() is a real no-op — isolating
+        // abandon_and_release's own close_query() is a real no-op — isolating
         // the assertion to "does a pending fetch error alone force
         // SQL_ERROR", independent of drain success/failure.
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
@@ -651,7 +1238,7 @@ mod tests {
     /// still-open result set. Closing A's cursor in that window must not touch
     /// B's client at all: taking it here would drain/corrupt B's pending rows.
     #[test]
-    fn drain_and_release_does_not_touch_a_different_statements_client() {
+    fn abandon_and_release_does_not_touch_a_different_statements_client() {
         use crate::handles::dbc::DbcHandle;
         use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
 
@@ -681,7 +1268,7 @@ mod tests {
                 .set_state(STMT_STATE_CURSOR_OPEN);
         }
 
-        let outcome = drain_and_release(unsafe { handle_from_raw::<StmtHandle>(h.stmt) }, h.stmt);
+        let outcome = abandon_and_release(unsafe { handle_from_raw::<StmtHandle>(h.stmt) }, h.stmt);
 
         assert!(matches!(outcome, DrainOutcome::Clean));
         let ds = dbc.inner.lock().unwrap();
@@ -699,7 +1286,7 @@ mod tests {
     /// An early-released statement has nothing to drain while a
     /// connection-scoped operation holds the wire.
     #[test]
-    fn drain_and_release_leaves_a_connection_operations_lease_alone() {
+    fn abandon_and_release_leaves_a_connection_operations_lease_alone() {
         use crate::handles::dbc::DbcHandle;
         use crate::test_support::connection_lease_for_test;
         use mssql_tds::test_client_support::tds_client_from_tokens;
@@ -711,7 +1298,7 @@ mod tests {
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(matches!(
-            drain_and_release(stmt, h.stmt),
+            abandon_and_release(stmt, h.stmt),
             DrainOutcome::Clean
         ));
         assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
@@ -731,7 +1318,7 @@ mod tests {
     /// The client is left holding an open batch, which is what proves no drain
     /// was attempted — a real `close_query()` would have consumed it.
     #[test]
-    fn drain_and_release_skips_the_round_trip_while_the_process_is_exiting() {
+    fn abandon_and_release_skips_the_round_trip_while_the_process_is_exiting() {
         use crate::handles::dbc::DbcHandle;
         use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
 
@@ -751,11 +1338,10 @@ mod tests {
             ds.wire.set_owner_for_test(Some(h.stmt));
         }
 
-        let outcome = drain_and_release_inner(
+        let outcome = abandon_and_release_inner(
             unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
             h.stmt,
             true,
-            false,
         );
 
         assert!(
@@ -774,11 +1360,11 @@ mod tests {
         );
     }
 
-    /// The same call with the flag false takes the ordinary path and does drain
-    /// the batch. Without this pair, a guard that fired unconditionally would
-    /// also pass the test above.
+    /// The same call with the flag false takes the ordinary path and does
+    /// settle the batch. Without this pair, a guard that fired unconditionally
+    /// would also pass the test above.
     #[test]
-    fn drain_and_release_still_drains_while_the_process_is_alive() {
+    fn abandon_and_release_still_settles_while_the_process_is_alive() {
         use crate::handles::dbc::DbcHandle;
         use mssql_tds::test_client_support::{
             col_metadata_empty, done_no_more, tds_client_from_tokens,
@@ -798,17 +1384,16 @@ mod tests {
             ds.wire.set_owner_for_test(Some(h.stmt));
         }
 
-        let _ = drain_and_release_inner(
+        let _ = abandon_and_release_inner(
             unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
             h.stmt,
-            false,
             false,
         );
 
         let ds = dbc.inner.lock().unwrap();
         assert!(
             ds.wire.client().is_some_and(|c| !c.has_open_batch()),
-            "the live-process path must actually drain the batch"
+            "the live-process path must actually settle the batch"
         );
     }
 
@@ -843,7 +1428,7 @@ mod tests {
         let closer = std::thread::spawn(move || {
             let handle = stmt_a_addr as SqlHandle;
             let stmt_a = unsafe { handle_from_raw::<StmtHandle>(handle) };
-            matches!(drain_and_release(stmt_a, handle), DrainOutcome::Clean)
+            matches!(abandon_and_release(stmt_a, handle), DrainOutcome::Clean)
         });
 
         let deadline = Instant::now() + Duration::from_secs(10);

@@ -212,6 +212,10 @@ fn sql_get_data_operation(
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
         return SQL_ERROR;
     }
+    if stmt_state.error_result {
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return SQL_ERROR;
+    }
 
     let col_index = usize::from(column_number);
     let metadata_len = stmt_state.column_metadata.len();
@@ -1015,13 +1019,38 @@ fn finish_get_data(
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
-    if ready {
+    // A buffered fetch deferred the set's completion; msodbcsql reads its DONE
+    // once SQLGetData reaches the last column, unless an ERROR token follows
+    // the row, which it leaves for the next fetch (measured on 18.6.2.1).
+    let deferred_array_update = if ready {
         stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
-    }
+        if stmt_state
+            .deferred_array_update
+            .as_ref()
+            .is_some_and(|update| !update.has_failed_set())
+        {
+            stmt_state.deferred_array_update.take()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     drop(stmt_state);
     if !ready {
         return rc;
     }
+    let rc = match deferred_array_update {
+        None => rc,
+        Some(update) => {
+            match super::execute::publish_deferred_parameter_array(stmt, Some(update)) {
+                Err(_) => return SQL_ERROR,
+                Ok(SQL_SUCCESS) => rc,
+                Ok(_) if rc == SQL_SUCCESS => SQL_SUCCESS_WITH_INFO,
+                Ok(_) => rc,
+            }
+        }
+    };
 
     let dbc = stmt.parent_dbc();
     let Ok(mut dbc_state) = dbc.inner.lock() else {
@@ -1040,9 +1069,14 @@ fn finish_get_data(
     // A row's column was genuinely captured to reach this point (`ready`
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
-    let Ok((has_server_info, _, cancelled)) =
-        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |_| false)
-    else {
+    let Ok((has_server_info, _, cancelled, _)) = release_busy_if_row_exhausted(
+        dbc,
+        stmt,
+        statement_handle,
+        client,
+        super::exec_common::RowDelivery::Read,
+        |_| false,
+    ) else {
         return SQL_ERROR;
     };
     if cancelled {

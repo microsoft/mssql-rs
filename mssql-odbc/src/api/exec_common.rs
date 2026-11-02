@@ -221,7 +221,7 @@ fn settle_late_cancellation(
         }
     }
     let drained = !matches!(
-        super::close_cursor::drain_and_release(stmt, statement_handle),
+        super::close_cursor::abandon_and_release(stmt, statement_handle),
         super::close_cursor::DrainOutcome::Failed
     );
     if drained
@@ -540,10 +540,17 @@ pub(super) fn try_claim_idle_client(
 /// so it has to be recorded first; its return value reports whether it posted
 /// a server message. Callers with nothing pending pass `|_| false`.
 ///
-/// Returns `(has_server_info, preceding_ran, cancelled)`. `preceding_ran` is
-/// `false` when the statement lock was poisoned and the closure therefore
-/// never ran, so a caller that relies on it having posted can fall back rather
-/// than assume. A stale lease returns `SQL_ERROR` without publishing state.
+/// Returns `(has_server_info, preceding_ran, cancelled, array_failed)`.
+/// `preceding_ran` is `false` when the statement lock was poisoned and the
+/// closure therefore never ran, so a caller that relies on it having posted can
+/// fall back rather than assume. `array_failed` reports a completed parameter
+/// set whose failure the status array cannot carry; its diagnostics are posted
+/// and `has_server_info` is set. A stale lease returns `SQL_ERROR` without
+/// publishing state.
+///
+/// `delivery` says how this call read the row it delivered, which decides
+/// whether msodbcsql has already read the set's DONE (measured on 18.6.2.1).
+/// Completions it has not are held on the statement for the call that would.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -554,8 +561,9 @@ pub(super) fn release_busy_if_row_exhausted(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     mut client: WireLease,
+    delivery: RowDelivery,
     post_preceding: impl FnOnce(&mut StmtState) -> bool,
-) -> Result<(bool, bool, bool), SqlReturn> {
+) -> Result<(bool, bool, bool, bool), SqlReturn> {
     debug_assert_eq!(client.owner(), WireOwner::Statement(statement_handle));
     let peek_result = match client.try_peek_past_current_row() {
         Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
@@ -584,6 +592,11 @@ pub(super) fn release_busy_if_row_exhausted(
         Some(dbc.runtime.block_on(client.complete_current_result()))
     } else {
         None
+    };
+    let array_update = if completion_result.is_some() {
+        super::execute::take_parameter_array_update(stmt, &mut client)
+    } else {
+        Ok(None)
     };
     let batch_done = match &completion_result {
         Some(Ok(done)) => *done,
@@ -623,7 +636,16 @@ pub(super) fn release_busy_if_row_exhausted(
 
     let mut has_server_info = false;
     let mut preceding_ran = false;
+    let mut array_update = array_update;
+    let defer_array_completion = match (delivery, &array_update) {
+        (RowDelivery::Buffered, _) => true,
+        (RowDelivery::Read, Ok(Some(update))) => update.has_failed_set(),
+        _ => false,
+    };
     if let Ok(mut stmt_state) = stmt.inner.lock() {
+        if defer_array_completion && let Ok(update) = &mut array_update {
+            stmt_state.deferred_array_update = update.take().map(Box::new);
+        }
         if let Some(output_params) = pending_output_params {
             stmt_state.pending_output_params = Some(output_params);
         }
@@ -646,7 +668,30 @@ pub(super) fn release_busy_if_row_exhausted(
             stmt_state.batch_exhausted = true;
         }
     }
-    Ok((has_server_info, preceding_ran, cancelled))
+    // msodbcsql's OnDone writes a set's status when its RPC DONE is read, so a
+    // later close or cancel cannot discard it. Published after the STMT lock is
+    // released: the IPD is read first and must not nest beneath it. An
+    // internal failure fails the call rather than downgrading to a warning.
+    let array_rc = super::execute::try_apply_parameter_array_update(stmt, array_update?)?;
+    has_server_info |= array_rc != SQL_SUCCESS;
+    Ok((
+        has_server_info,
+        preceding_ran,
+        cancelled,
+        array_rc == SQL_ERROR,
+    ))
+}
+
+/// How a call that releases an exhausted cursor read the row it delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowDelivery {
+    /// No row: the call itself reached the end of the result set.
+    None,
+    /// Every column was read. msodbcsql also peeks past the row, but stops at
+    /// an ERROR token, so a failed set is left for the next call.
+    Read,
+    /// The row was buffered for `SQLGetData`; msodbcsql leaves it on the wire.
+    Buffered,
 }
 
 /// The TDS read has settled or retired its transport and returned the client.
@@ -2374,7 +2419,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0
         );
@@ -2408,7 +2453,7 @@ mod tests {
         let preceding_ran = std::cell::Cell::new(false);
 
         assert_eq!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| {
                 preceding_ran.set(true);
                 true
             }),
@@ -2445,7 +2490,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            !release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0
         );
@@ -2465,7 +2510,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert!(dbc.inner.lock().unwrap().wire.statement_owner().is_none());
         let ss = stmt.inner.lock().unwrap();
@@ -2504,7 +2550,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert_eq!(
             dbc.inner.lock().unwrap().wire.statement_owner(),
@@ -2547,7 +2594,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0,
             "the fetch caller must be told to return SQL_SUCCESS_WITH_INFO"
@@ -2590,7 +2637,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert!(
             dbc.inner.lock().unwrap().wire.statement_owner().is_none(),
@@ -2644,7 +2692,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
-        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false).unwrap();
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
+            .unwrap();
 
         assert_eq!(
             dbc.inner.lock().unwrap().wire.statement_owner(),
@@ -2694,7 +2743,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0,
             "the caller must be told a server message was posted"
@@ -2745,7 +2794,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| false)
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| false)
                 .unwrap()
                 .0
         );
@@ -2798,8 +2847,8 @@ mod tests {
         );
 
         let ran = std::cell::Cell::new(false);
-        let (_, preceding_ran, _) =
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |_| {
+        let (_, preceding_ran, _, _) =
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |_| {
                 ran.set(true);
                 true
             })
@@ -2845,7 +2894,7 @@ mod tests {
         }];
 
         assert!(
-            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, |s| {
+            release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, RowDelivery::None, |s| {
                 post_tds_info_messages(s, &earlier)
             })
             .unwrap()
@@ -3868,7 +3917,7 @@ mod tests {
     /// This pins what the skip arm still owes: the sequence is unwound, the
     /// client is handed back, and the connection is released — without which
     /// the DBC records the freed statement as busy forever. It does **not** pin
-    /// the skip itself, unlike the `drain_and_release` and
+    /// the skip itself, unlike the `abandon_and_release` and
     /// `rollback_before_disconnect` pairs: `cancel_streamed_write` returns `()`
     /// and has no observable effect on a scripted client, so a skipped cancel
     /// and an attempted one are indistinguishable here. The skip is covered end
