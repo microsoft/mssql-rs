@@ -71,10 +71,17 @@ statement diagnostics. Only the connection's diagnostics are cleared for the
 new call. Apart from the cached-value shortcut above, an exhausted batch does
 not prevent the change; unread results occupying the wire cause
 `SQL_ERROR` / `HY000` without discarding rows. Exhausting only the first result
-of a multi-result batch still leaves the wire busy. This
+of a multi-result batch still leaves the wire busy. This cursor/diagnostic behavior
 matches msodbcsql's isolation branch, which executes and closes only its private
 driver statement (`sqlcmisc.cpp:1808-1822`), not the connection-wide cursor sweep
 used for transaction completion.
+
+The getter differs after busy rejection: msodbcsql reports the rejected requested
+level through both aliases, while this driver retains the last successfully
+applied level. The server remains unchanged in both. Copying that cache update
+while retaining the same-value shortcut would make a close-and-retry succeed
+without applying the level. See [parity entry 38](parity-deviations.md) and
+[#798](https://github.com/microsoft/mssql-rs/issues/798) for the shortcut interaction.
 
 ### G4 — Transaction-safe disconnect
 
@@ -275,8 +282,9 @@ free child statements; drop client; state = Disconnected
 Rust unit tests (`TestHandles`) cover argument validation, state transitions and
 diagnostics without a server. C++ e2e tests
 (`tests/e2e/tests/transaction_test.cpp`) run against a live SQL Server under
-`run_e2e.ps1 -CompareWithMsodbcsql`, so every assertion must hold for **both**
-drivers unless guarded by `SKIP_IF_COMPARING_MSODBCSQL()`.
+`run_e2e.ps1 -CompareWithMsodbcsql`. Shared assertions hold for **both**
+drivers; dedicated parity-registry cases assert each leg's measured outcome,
+and mssql-odbc-only cases use `SKIP_IF_COMPARING_MSODBCSQL()`.
 
 | # | Scenario | Layer |
 |---|---|---|
@@ -320,6 +328,7 @@ drivers unless guarded by `SKIP_IF_COMPARING_MSODBCSQL()`.
 | 36 | Isolation changes preserve exhausted cursors, metadata, and statement diagnostics (both aliases) | unit + e2e |
 | 37 | Isolation changes with unread rows return `HY000`; rows and diagnostics survive close/retry (both aliases) | unit + e2e |
 | 38 | Isolation changes after exhausting only the first result return `HY000`; the second result remains fetchable and close/retry succeeds (both aliases) | unit + e2e |
+| 39 | Isolation getters after busy rejection retain the applied level here and report the requested level on msodbcsql; the server stays unchanged and retry applies the level (both aliases, parity entry 38) | e2e |
 
 ### 7.1 What the Driver Manager decides for us
 

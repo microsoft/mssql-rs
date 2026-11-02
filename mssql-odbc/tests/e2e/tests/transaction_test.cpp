@@ -2,16 +2,17 @@
 // transaction_test.cpp  –  E2E tests for SQLEndTran, SQL_ATTR_AUTOCOMMIT and
 // SQL_ATTR_TXN_ISOLATION.
 //
-// Every assertion here must hold for msodbcsql 18 as well, because the same
+// Shared behavior is asserted on msodbcsql 18 as well, because the same
 // binary runs against both drivers under `run_e2e.ps1 -CompareWithMsodbcsql`.
-// Behaviour that is deliberately mssql-odbc-only is guarded with
-// SKIP_IF_COMPARING_MSODBCSQL().
+// Dedicated parity-registry cases assert each driver's measured behavior;
+// mssql-odbc-only cases use SKIP_IF_COMPARING_MSODBCSQL().
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
 #include "odbc_concurrent_test.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <string>
 
@@ -96,10 +97,10 @@ protected:
                                  SQL_IS_UINTEGER);
     }
 
-    static SQLUINTEGER GetIsolation(SQLHDBC dbc) {
+    static SQLUINTEGER GetIsolation(SQLHDBC dbc, SQLINTEGER attribute = SQL_ATTR_TXN_ISOLATION) {
         SQLUINTEGER value = 0xDEAD;
         SQLRETURN rc =
-            SQLGetConnectAttr(dbc, SQL_ATTR_TXN_ISOLATION, &value, SQL_IS_UINTEGER, nullptr);
+            SQLGetConnectAttr(dbc, attribute, &value, SQL_IS_UINTEGER, nullptr);
         EXPECT_SQL_OK(rc, SQL_HANDLE_DBC, dbc);
         return value;
     }
@@ -655,6 +656,55 @@ ODBC_TEST_F(TransactionLiveTest, IsolationRejectsBusyWireWithoutDiscardingRowsOr
                       SQL_HANDLE_DBC, dbc_);
         EXPECT_EQ(4, ServerIsolation());
         ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+    }
+}
+
+// Parity registry entry 38: a rejected SET changes msodbcsql's getter, not the server.
+ODBC_TEST_F(TransactionLiveTest, IsolationGetterAfterBusyRejection) {
+    SQLTCHAR driver_version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfo(dbc_, SQL_DRIVER_VER, driver_version, sizeof(driver_version),
+                             nullptr), SQL_HANDLE_DBC, dbc_);
+    RecordProperty("driver_version", ODBCTestUtils::ToNarrow(SqlTString(driver_version)));
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const SQLUINTEGER expected =
+        target && std::string(target) == "msodbcsql" ? SQL_TXN_SERIALIZABLE
+                                                    : SQL_TXN_READ_COMMITTED;
+    const SQLINTEGER first = 1000 * Worker() + 10 * Iteration() + 1;
+
+    for (SQLINTEGER attribute : {SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION}) {
+        SCOPED_TRACE(attribute);
+        for (const bool pending_result : {false, true}) {
+            SCOPED_TRACE(pending_result);
+            ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+            const std::string sql =
+                "SELECT " + std::to_string(first) +
+                (pending_result ? "; SELECT " : " UNION ALL SELECT ") +
+                std::to_string(first + 1);
+            ASSERT_SQL_OK(Run(stmt_, sql), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            if (pending_result) {
+                ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            }
+
+            EXPECT_SQL_ERROR(SQLSetConnectAttr(
+                dbc_, attribute,
+                reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SERIALIZABLE)),
+                SQL_IS_UINTEGER));
+            EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY000");
+            for (SQLINTEGER getter : {SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_TXN_ISOLATION}) {
+                EXPECT_EQ(expected, GetIsolation(dbc_, getter)) << "getter " << getter;
+            }
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(2, ServerIsolation());
+
+            ASSERT_SQL_OK(SQLSetConnectAttr(
+                              dbc_, attribute,
+                              reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(SQL_TXN_SERIALIZABLE)),
+                              SQL_IS_UINTEGER),
+                          SQL_HANDLE_DBC, dbc_);
+            EXPECT_EQ(4, ServerIsolation());
+            ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+        }
     }
 }
 

@@ -787,6 +787,8 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
 
     // msodbcsql closes only its private driver statement after the SET
     // (`sqlcmisc.cpp:1822`), never the application's statements.
+    // Busy rejection retains the last applied isolation, unlike msodbcsql's
+    // unconditional cache update (parity entry 38); #798 tracks the shortcut.
     let mut client = match claim_dbc_client(dbc, OP) {
         Ok(c) => c,
         Err(ret) => return ret,
