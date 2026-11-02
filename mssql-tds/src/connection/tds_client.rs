@@ -9151,6 +9151,7 @@ impl TdsClient {
         self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
         let result = async {
+            let send_started = self.request_timeout_start();
             let transaction =
                 TransactionManagementRequest::new(transaction_params, &self.execution_context);
             let mut packet_writer =
@@ -9159,6 +9160,9 @@ impl TdsClient {
             let message = packet_writer.suspend();
             drop(transaction);
             self.finish_send(sent, message).await?;
+            if let Some(start) = send_started {
+                self.update_remaining_timeout(start);
+            }
             self.consume_transaction_response().await
         }
         .await;
@@ -9773,6 +9777,7 @@ mod tests {
         cancel_during_send: Option<tokio_util::sync::CancellationToken>,
         sends_before_cancel: usize,
         send_delay: Option<Duration>,
+        receive_delay: Option<Duration>,
         /// Simulates a send completing in one poll after a stalled runtime,
         /// so only the post-send budget check can observe the timeout.
         send_completion_delay: Option<Duration>,
@@ -9816,6 +9821,7 @@ mod tests {
                 cancel_during_send: None,
                 sends_before_cancel: 0,
                 send_delay: None,
+                receive_delay: None,
                 send_completion_delay: None,
                 partial_bulk_send: false,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -9905,6 +9911,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(remaining_request_timeout);
+            if let Some(delay) = self.receive_delay.take() {
+                let receive = tokio::time::sleep(delay);
+                if let Some(timeout) = remaining_request_timeout {
+                    tokio::time::timeout(timeout, receive).await.map_err(|_| {
+                        crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                            "test response timed out".to_string(),
+                        ))
+                    })?;
+                } else {
+                    receive.await;
+                }
+            }
             // Mirrors the production readers, which run every read under the
             // handle. Without this a cancelled read looks identical to a healthy
             // one and tests cannot tell the two apart.
@@ -20471,12 +20489,57 @@ mod tests {
                 } else {
                     result.unwrap();
                     assert!(!sent.lock().unwrap().is_empty());
-                    assert_eq!(
-                        *timeouts.lock().unwrap(),
-                        vec![Some(Duration::from_secs(3))]
-                    );
+                    let timeouts = timeouts.lock().unwrap();
+                    assert_eq!(timeouts.len(), 1);
+                    let remaining = timeouts[0].unwrap();
+                    assert!(remaining > Duration::ZERO);
+                    assert!(remaining < Duration::from_secs(3));
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_request_charges_send_time_against_response_budget() {
+        for operation in ["begin", "commit", "rollback"] {
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.send_delay = Some(Duration::from_millis(700));
+            transport.receive_delay = Some(Duration::from_millis(700));
+            let timeouts = Arc::clone(&transport.receive_timeouts);
+            let mut client = create_test_client_with_transport(transport);
+            let options = ExecuteOptions::new().timeout_secs(1);
+            let result = match operation {
+                "begin" => {
+                    client
+                        .begin_transaction_with_options(
+                            TransactionIsolationLevel::NoChange,
+                            None,
+                            options,
+                        )
+                        .await
+                }
+                "commit" => {
+                    client
+                        .commit_transaction_with_options(None, None, options)
+                        .await
+                }
+                _ => {
+                    client
+                        .rollback_transaction_with_options(None, None, options)
+                        .await
+                }
+            };
+            assert!(
+                matches!(result, Err(crate::error::Error::TimeoutError(_))),
+                "{operation}: {result:?}"
+            );
+            let response_budget = timeouts.lock().unwrap()[0].unwrap();
+            assert!(
+                response_budget <= Duration::from_millis(300),
+                "{response_budget:?}"
+            );
+            assert!(client.remaining_request_timeout.is_none());
+            assert!(client.cancel_handle.is_none());
         }
     }
 

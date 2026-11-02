@@ -105,6 +105,8 @@ connection-owned batches and transaction-manager requests: catalog and isolation
 changes, autocommit transitions, `SQLEndTran`, post-login settings, and rollback
 performed during reset or disconnect. The value is read when each request starts,
 so it can be changed before or after login. Zero leaves the request unbounded.
+Transaction serialization and sending consume the same request budget as response
+processing; a completed send does not restart the response timeout.
 
 Application statements retain `SQL_ATTR_QUERY_TIMEOUT`, including an implicit
 transaction begin immediately before statement execution. Do not take the minimum

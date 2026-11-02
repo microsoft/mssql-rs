@@ -1115,6 +1115,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn connection_request_options_reject_a_poisoned_dbc_before_network_io() {
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_tokens(Vec::new());
+        std::thread::scope(|scope| {
+            assert!(
+                scope
+                    .spawn(|| {
+                        let _guard = dbc.inner.lock().unwrap();
+                        panic!("poison the dbc lock");
+                    })
+                    .join()
+                    .is_err()
+            );
+        });
+        for result in [
+            exec_batch(dbc, &mut client, "SELECT 1"),
+            begin_dbc_transaction(dbc, &mut client),
+            end_dbc_transaction(dbc, &mut client, true),
+            end_dbc_transaction(dbc, &mut client, false),
+        ] {
+            assert!(matches!(
+                result,
+                Err(mssql_tds::error::Error::ImplementationError(ref message))
+                    if message == "connection state is poisoned"
+            ));
+        }
+        assert_eq!(
+            set_connection_attr(&h, odbc_types::SQL_ATTR_AUTOCOMMIT, 0),
+            SQL_ERROR
+        );
+        dbc.inner.clear_poison();
+    }
+
     fn set_connection_attr(
         h: &TestHandles,
         attribute: odbc_types::SqlInteger,

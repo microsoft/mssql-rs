@@ -196,6 +196,9 @@ the batch; use `advance()` to move through the rest of a multi-statement batch.
 `rollback_transaction_with_options` accept the same timeout and cancellation
 options. These options expire when the transaction request returns, including
 on error; later savepoint or DTC requests do not inherit them.
+Transaction requests charge serialization and packet-send time against the
+remaining response budget. Packet sends reject an expired deadline before
+polling the transport; a pending send does not receive a fresh timeout per packet.
 
 If a timeout interrupts a packet send, the client retires that transport without
 further writes, including graceful TLS shutdown during recovery or close.
