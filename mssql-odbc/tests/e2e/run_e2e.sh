@@ -18,12 +18,15 @@
 #
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
-#   pr       (default) every ctest entry; every mode except /SharedStmt, at the
-#            harness default of 2 threads x 1 iteration. Linux and macOS build
-#            no <name>_mt entries unless ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
-#   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
-#   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
-#            Both build with ODBC_E2E_CONCURRENT=ON.
+#   pr       (default) every ctest entry except those labelled mt_weekly; every
+#            mode except /SharedStmt, at the harness default of 2 threads x 1
+#            iteration. Linux and macOS build no <name>_mt entries unless
+#            ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
+#   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt,
+#            and not the entries labelled mt_weekly.
+#   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly;
+#            the only profile that runs mt_weekly entries. Nightly and weekly
+#            build with ODBC_E2E_CONCURRENT=ON.
 # nightly and weekly ignore --retries (an intermittent failure is what they
 # look for) and run each entry under gdb through run_mt_test.sh when gdb is
 # installed, so a crash or a watchdog abort prints every thread's stack. With
@@ -239,6 +242,9 @@ apply_mt_profile() {
             exit 2
             ;;
     esac
+    if [ "$MT_PROFILE" != weekly ]; then
+        CTEST_ARGS+=(-LE mt_weekly)
+    fi
     echo "MT profile: $MT_PROFILE (threads=${MSSQL_ODBC_MT_THREADS:-2} iterations=${MSSQL_ODBC_MT_ITERS:-1} skip_modes='${MSSQL_ODBC_MT_SKIP_MODES:-}')"
 }
 

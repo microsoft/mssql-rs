@@ -582,7 +582,10 @@ on; these guarantees were verified against msodbcsql's behavior.
     `stmt_` must stream that statement's diagnostic, so a busy connection is
     retried rather than failed. PR and stress runs execute the mode.
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
-    connect races) go under `tests/e2e/tests/multithreaded_tests/`.
+    faults under load) go under `tests/e2e/tests/multithreaded_tests/`. Size
+    them with the harness's `LoadConfig()` and register them with
+    `add_odbc_mt_only_test`, which labels them `mt_weekly`: only the weekly
+    stress profile runs them.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
     than loosen the assertion or the mode.
   - For idle `SQLCancel`, use `CancelIdleStatement()` so `SharedStmt` diagnostic

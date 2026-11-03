@@ -556,6 +556,10 @@ single-threaded tests and `<name>_mt` (label `mt`) the concurrent variants, so
 a concurrency failure never hides a parity verdict. Nothing to add in
 `CMakeLists.txt`; reconfigure after converting a file. Both entries pass
 `--gtest_filter`, which overrides a `GTEST_FILTER` environment variable.
+Scenarios with no single-threaded form, such as `handle_lifecycle_test`, live
+in `tests/multithreaded_tests/` and register with `add_odbc_mt_only_test`,
+which creates only the `<name>_mt` entry, labelled `mt_weekly`: only the weekly
+profile runs it.
 
 ```bash
 ctest --test-dir build -L mt                            # every concurrent variant, 2 x 1

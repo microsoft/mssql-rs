@@ -27,11 +27,14 @@
 # -MtProfile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable), as in
 # run_e2e.sh --mt-profile:
-#   pr       (default) every ctest entry; concurrent variants in /SharedDbc only,
-#            at the harness default of 2 threads x 1 iteration. The other modes
-#            cost more PR time than they catch at that size.
-#   nightly  only the <name>_mt entries, 8 x 20, every mode.
-#   weekly   only the <name>_mt entries, 16 x 50, every mode.
+#   pr       (default) every ctest entry except those labelled mt_weekly;
+#            concurrent variants in /SharedDbc only, at the harness default of
+#            2 threads x 1 iteration. The other modes cost more PR time than
+#            they catch at that size.
+#   nightly  only the <name>_mt entries, 8 x 20, every mode, except entries
+#            labelled mt_weekly.
+#   weekly   only the <name>_mt entries, 16 x 50, every mode; the only profile
+#            that runs mt_weekly entries.
 # nightly and weekly ignore -Retries (an intermittent failure is what they look
 # for) and leave evidence in -MtDumpDir (default build\mt-dumps): a minidump from
 # the watchdog for a hang, and from the test process itself for a crash or
@@ -453,6 +456,9 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
             # Set-MtProfile created it, but a dump directory inside build\ is gone
             # if Remove-IncompatibleCMakeBuildTree deleted the tree since.
             New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
+        }
+        if ($MtProfile -ne 'weekly') {
+            $ctestArgs += @('-LE', 'mt_weekly')
         }
         if ($FilterTests) {
             $ctestArgs += @('-R', $FilterTests)
