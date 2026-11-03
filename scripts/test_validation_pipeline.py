@@ -368,6 +368,7 @@ $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
         (["-OutDir", "unused"], "-BuildOnly and -OutDir"),
         (["-BuildOnly", "-SkipBuild"], "-BuildOnly cannot be combined"),
         (["-SkipBuild", "-Coverage"], "-SkipBuild cannot be combined"),
+        (["-SkipBuild", "-Release"], "-SkipBuild cannot be combined with -Release"),
         (["-BuildJobs", "0"], "BuildJobs"),
     ],
 )

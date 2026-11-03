@@ -110,6 +110,9 @@ if ($BuildOnly -ne [bool]$OutDir) {
 if ($SkipBuild -and $Coverage) {
     throw "-SkipBuild cannot be combined with -Coverage; coverage requires an instrumented build."
 }
+if ($SkipBuild -and $Release) {
+    throw "-SkipBuild cannot be combined with -Release; the prebuilt drop determines the driver build."
+}
 
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $OdbcCrateDir = Resolve-Path (Join-Path $ScriptDir "..\..")

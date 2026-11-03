@@ -642,7 +642,8 @@ consumer checkout paths may differ from the producer's. No CMake cache, object
 files, or compiler installation is needed for `-SkipBuild`; CTest,
 the runtime dependencies, and administrator privileges for
 driver registration are still required. `-BuildOnly` does not register drivers
-or require SQL Server. `-SkipBuild` cannot be combined with `-Coverage`.
+or require SQL Server. `-SkipBuild` cannot be combined with `-Coverage` or
+`-Release`; the prebuilt drop determines the driver build.
 
 The producer publishes an attempt-scoped artifact name and passes that name
 to consumers through a job output, so retrying the build does not collide with
