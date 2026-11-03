@@ -414,6 +414,7 @@ fn tcp_stage(address: &SocketAddr) -> tracing::Span {
         os_error = tracing::field::Empty,
         io_kind = tracing::field::Empty,
         timed_out = tracing::field::Empty,
+        includes_tls = tracing::field::Empty,
         error = tracing::field::Empty,
         ok = tracing::field::Empty
     )
@@ -636,6 +637,7 @@ async fn connect_in_order(
         keep_alive_interval_in_ms,
         connect_timeout_ms,
         diagnosis,
+        false,
         |address| {
             let socket = new_tcp_socket(address, keep_alive_in_ms, keep_alive_interval_in_ms)?;
             Ok(async move {
@@ -665,6 +667,7 @@ async fn connect_in_order_with<S, C, F>(
     keep_alive_interval_in_ms: u32,
     connect_timeout_ms: u64,
     diagnosis: Option<&Diagnosis>,
+    includes_tls: bool,
     connect: C,
 ) -> TdsResult<S>
 where
@@ -677,6 +680,7 @@ where
     let mut remaining = socket_addresses.into_iter();
     for socket_address in remaining.by_ref() {
         let tcp_stage = tcp_stage(&socket_address);
+        tcp_stage.record(connect_stage::INCLUDES_TLS, includes_tls);
         let attempt = connect(socket_address)
             .inspect_err(|e| connect_stage::record_io_error(&tcp_stage, e))?;
 
@@ -754,10 +758,11 @@ async fn create_base_stream_parallel(
         host, port
     );
 
-    let (result, resolution) = race_to_connect(host, port, connect_timeout_ms, move |address| {
-        connect_with_keepalive(address, keep_alive_in_ms, keep_alive_interval_in_ms)
-    })
-    .await?;
+    let (result, resolution) =
+        race_to_connect(host, port, connect_timeout_ms, false, move |address| {
+            connect_with_keepalive(address, keep_alive_in_ms, keep_alive_interval_in_ms)
+        })
+        .await?;
 
     info!(
         "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
@@ -777,6 +782,7 @@ async fn race_to_connect<S, C, F, E>(
     host: &str,
     port: u16,
     connect_timeout_ms: u64,
+    includes_tls: bool,
     connect: C,
 ) -> TdsResult<(ParallelConnectResult<S>, Resolution)>
 where
@@ -790,6 +796,8 @@ where
         connect_stage::TCP,
         address = tracing::field::Empty,
         port = port,
+        includes_tls = includes_tls,
+        timed_out = tracing::field::Empty,
         source = tracing::field::Empty,
         os_error = tracing::field::Empty,
         io_kind = tracing::field::Empty,
@@ -834,6 +842,9 @@ where
         }
         None => {
             if let Err(e) = &raced {
+                if matches!(e, crate::error::Error::TimeoutError(_)) {
+                    tcp_stage.record(connect_stage::TIMED_OUT, true);
+                }
                 connect_stage::record_error(&tcp_stage, e);
             }
         }
@@ -1017,10 +1028,11 @@ async fn create_network_framework_transport(
             host, port
         );
         let connector = connector()?;
-        let (result, resolution) = race_to_connect(host, port, connect_timeout_ms, |address| {
-            connector.connect(address)
-        })
-        .await?;
+        let (result, resolution) =
+            race_to_connect(host, port, connect_timeout_ms, true, |address| {
+                connector.connect(address)
+            })
+            .await?;
         info!(
             "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
             result.connected_address, result.total_addresses, result.failed_attempts
@@ -1042,6 +1054,7 @@ async fn create_network_framework_transport(
             keep_alive_interval_in_ms,
             connect_timeout_ms,
             diagnosis,
+            true,
             |address| connector.start(address),
         )
         .await?;
@@ -3738,6 +3751,7 @@ pub(crate) mod tests {
             1_000,
             1_000,
             None,
+            false,
             |address| Ok(connect(address)),
         )
         .await
@@ -7784,6 +7798,7 @@ mod extra_connect_tests {
                         1_000,
                         5_000,
                         Some(&diagnosis),
+                        true,
                         |_| {
                             Ok(async {
                                 Err::<(), _>(AttemptError::Rejected(
@@ -7837,6 +7852,7 @@ mod extra_connect_tests {
                         1_000,
                         5_000,
                         Some(&diagnosis),
+                        true,
                         |_| {
                             Err::<std::future::Ready<Result<(), AttemptError>>, _>(
                                 std::io::Error::other("no connection object"),
@@ -8078,8 +8094,43 @@ mod dns_stage_tests {
     /// reached: the `tcp` stage records it as the one connected to, and a
     /// `tls` stage the rejection.
     #[test]
+    fn combined_connect_deadlines_record_tls_inclusion_in_both_modes() {
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        for parallel in [false, true] {
+            let (result, log) = recording(async {
+                if parallel {
+                    race_to_connect("127.0.0.1", 1, 10, true, |_| {
+                        std::future::pending::<Result<(), AttemptError>>()
+                    })
+                    .await
+                    .map(|_| ())
+                } else {
+                    connect_in_order_with(
+                        vec![address],
+                        "127.0.0.1",
+                        1,
+                        30_000,
+                        1_000,
+                        10,
+                        None,
+                        true,
+                        |_| Ok(std::future::pending::<Result<(), AttemptError>>()),
+                    )
+                    .await
+                }
+            });
+            assert!(result.is_err());
+            let tcp = log.named(connect_stage::TCP);
+            assert_eq!(tcp.len(), 1);
+            assert_eq!(tcp[0].field(connect_stage::INCLUDES_TLS), Some("true"));
+            assert_eq!(tcp[0].field(connect_stage::TIMED_OUT), Some("true"));
+            assert_eq!(tcp[0].field(connect_stage::OK), Some("false"));
+        }
+    }
+
+    #[test]
     fn a_rejection_in_the_race_is_recorded_on_the_tls_stage() {
-        let (result, log) = recording(race_to_connect("127.0.0.1", 1, 5_000, |_| async {
+        let (result, log) = recording(race_to_connect("127.0.0.1", 1, 5_000, true, |_| async {
             Err::<(), _>(AttemptError::Rejected(
                 crate::error::Error::CertificateMismatch,
             ))
@@ -8164,6 +8215,79 @@ mod network_framework_stage_tests {
 
     fn names(log: &StageLog) -> Vec<&'static str> {
         log.stages().iter().map(|stage| stage.name).collect()
+    }
+
+    #[tokio::test]
+    async fn stalled_strict_handshakes_leave_tcp_acceptance_unconfirmed() {
+        for multi_subnet_failover in [false, true] {
+            for partial_record in [false, true] {
+                let (listener, address) = listen().await;
+                let server = tokio::spawn(async move {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    let mut hello = [0; 4096];
+                    assert!(peer.read(&mut hello).await.unwrap() > 0);
+                    if partial_record {
+                        peer.write_all(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x02])
+                            .await
+                            .unwrap();
+                    }
+                    let ended = timeout(Duration::from_secs(5), peer.read_to_end(&mut Vec::new()))
+                        .await
+                        .expect("timed-out attempt must release the connection");
+                    assert!(
+                        ended.is_ok()
+                            || ended.as_ref().is_err_and(|e| {
+                                matches!(
+                                    e.kind(),
+                                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                                )
+                            }),
+                        "{ended:?}"
+                    );
+                });
+                let log = StageLog::default();
+                let _recording = tracing::subscriber::set_default(log.clone());
+                let context = TransportContext::Tcp {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                    instance_name: None,
+                };
+                let diagnosis = Diagnosis::new(Some(DiagnosticStop::Transport));
+                let started = std::time::Instant::now();
+                let result = timeout(
+                    Duration::from_secs(5),
+                    create_transport(
+                        IPAddressPreference::IPv4First,
+                        TdsVersion::V8_0,
+                        &context,
+                        EncryptionOptions::new(),
+                        30_000,
+                        1_000,
+                        multi_subnet_failover,
+                        250,
+                        Some(&diagnosis),
+                    ),
+                )
+                .await
+                .expect("the connect deadline must bound the stalled handshake");
+                match result {
+                    Err(Error::TimeoutError(_)) => {}
+                    Err(Error::Io(error)) => assert_eq!(error.kind(), ErrorKind::TimedOut),
+                    Err(error) => panic!("expected the connect deadline, got {error:?}"),
+                    Ok(_) => panic!("a stalled handshake must not succeed"),
+                }
+                assert!(started.elapsed() >= Duration::from_millis(250));
+                let tcp = log.named(connect_stage::TCP);
+                assert_eq!(tcp.len(), 1);
+                assert_eq!(tcp[0].field(connect_stage::INCLUDES_TLS), Some("true"));
+                assert_eq!(tcp[0].field(connect_stage::OK), Some("false"));
+                assert!(log.named(connect_stage::TLS).is_empty());
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
     }
 
     #[tokio::test]

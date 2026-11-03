@@ -157,6 +157,9 @@ every non-Strict mode) stay on a socket with Secure Transport.
   created: in turn, it fails that address's `tcp` stage and ends the attempt;
   under MSF, the race moves on. A diagnostic connection's extra connects to the
   remaining addresses are TCP-only, as on the socket path.
+  Combined attempts record `includes_tls=true`; a timeout cannot distinguish
+  TCP non-acceptance from a stalled TLS handshake. Transport-stop diagnostics
+  remain TLS-inclusive, and sqlcmd reports that TCP reachability as unconfirmed.
 - **Trust.** Security.framework evaluates the chain under Apple's TLS server
   policy, so keychain roots, administrator-installed CAs, and trust settings
   decide which servers are trusted. The expected name is `host_name_in_cert`,

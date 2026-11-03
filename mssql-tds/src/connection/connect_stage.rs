@@ -47,6 +47,8 @@ pub const DNS: &str = "dns";
 /// in a span of its own. On macOS, a Strict (TDS 8.0) connect negotiates TLS
 /// too, so its span covers the handshake, and an address that rejects the
 /// handshake was reached: its span succeeds and the connect ends.
+/// [`INCLUDES_TLS`] distinguishes this combined attempt from a TCP-only connect;
+/// its timeout does not establish whether TCP was accepted.
 pub const TCP: &str = "tcp";
 
 /// The SQL Server Browser lookup of a named instance. Fields: [`SERVER`],
@@ -118,6 +120,8 @@ pub const OS_ERROR: &str = "os_error";
 pub const IO_KIND: &str = "io_kind";
 /// `true` when a TCP connect ran out of its own time limit.
 pub const TIMED_OUT: &str = "timed_out";
+/// `true` when the TCP stage includes TLS negotiation in its time budget.
+pub const INCLUDES_TLS: &str = "includes_tls";
 /// The text of the error a stage failed with.
 pub const ERROR: &str = "error";
 /// On a MultiSubnetFailover [`TCP`] stage whose addresses came from the DNS
