@@ -244,81 +244,45 @@ Measured on both drivers unless noted.
 
 Purpose-built workloads using the same settings, start gate, and watchdog.
 They register with `add_odbc_mt_only_test`, so only the weekly stress profile
-runs them. Each must check exact per-run results and recovery, not only the
-absence of a crash.
+runs them. Each checks exact per-run results (a worker token) and recovery,
+not only the absence of a crash. Each ENV runs all its connections on one
+Tokio worker thread, so one slow, failed, or cancelled connection could stall
+or corrupt the others; the highest-value scenarios check that it cannot. All
+run against a real SQL Server; a mock TDS server is only for exact protocol
+sequences.
 
-**Implemented**
+Ordered by value; the backlog is done top-down.
 
-7. **Handle churn** (`handle_lifecycle_test.cpp`, AB#49261): threads allocate
-   ENV/DBC/STMT trees, connect, query a per-run token, disconnect, and free,
-   with a private ENV per tree and with one shared ENV. 20 rounds of the
-   profile's size, each under its own watchdog (16,000 trees per test weekly).
-   Process thread and handle (fd) counts after the last round must match those
-   after round 0, within a small slack (msodbcsql drifts by a few), so a leaked
-   runtime, socket, or thread fails.
+| # | Scenario | Checks | Value | Needs | Status |
+|---|---|---|---|---|---|
+| 7 | **Handle churn** (`handle_lifecycle_test.cpp`) | Threads allocate, connect, query, disconnect, and free ENV/DBC/STMT trees, on private ENVs and on one shared ENV: 20 rounds, 16,000 trees per test weekly. Thread and handle (fd) counts after the last round match those after round 0. | Catches runtime, socket, and thread leaks that successful API calls hide; a leaked ENV runtime fails it | - | Implemented (AB#49261) |
+| 8 | **Killed connection under load** (`fault_recovery_test.cpp`) | THREADS - 1 workers query nonstop on the shared ENV while an admin connection `KILL`s a victim on that ENV, alternately idle and mid-`WAITFOR`. Healthy workers never fail or stall over 10 s; an idle victim recovers (new `connect_time`) and returns its token; an executing one fails within 10 s and frees cleanly. | One dead connection must not stall or break the others sharing its runtime; covers Idle Connection Resiliency under load | `VIEW SERVER STATE`, `ALTER ANY CONNECTION` | Implemented (AB#49261) |
+| 9 | **Timeout and cancel churn** (`fault_recovery_test.cpp`) | Each worker keeps a connection and in turn times out a `WAITFOR` (`HYT00`), has another thread cancel one once the server shows it running (`HY008`), and cancels a data-at-execution stream; then selects its token on the same STMT. 3 rounds; counts return. | Recovery paths most likely to leave a connection busy or leak results, diagnostics, or tasks | `VIEW SERVER STATE` | Implemented (AB#49261) |
+| 10 | **Failed-connect churn** (`handle_lifecycle_test.cpp`) | Four in five logins fail - unknown login, unknown database, refused port, a listener that never answers (1 s login timeout) - interleaved with real logins on private and shared ENVs. Each reports its SQLSTATE in bounded time; counts return. | Partly built connections are a common leak and hang source; real logins must be unaffected | - | Implemented (AB#49261) |
+| 11 | **Pooled reuse under load** | Driver Manager pooling with the reset `connection_pool_test.cpp` checks single-threaded. A borrower never sees the previous one's SET options, temp tables, transaction, or database; reuse is proven (same SPID), or the test passes trivially. | Session state leaking between borrowers is a correctness and security bug | DM pooling on both platforms | Backlog |
+| 12 | **Thread scale and mixed workloads** | 8-10 at 128 and 512 threads on one ENV; short queries alongside LOB streams and parameter arrays, each worker making progress. | Starvation and deadlock on the ENV's single runtime worker | Configuration of 8-10 plus a mixed workload | Backlog |
+| 13 | **Process-global authentication caches** | Concurrent connects through Entra and MSQA authentication. | Their credential and context caches are process-wide | Credentials in the stress pipeline | Blocked |
+| 14 | **Long haul** (AB#49795) | Random operations from 7-12 (LOB stream, parameter array, catalog call, prepare and execute, cancel, reconnect, kill) for hours, against a server with injected latency. Tokens checked; thread, handle, socket, and memory counts plateau. | Slow leaks and rare interleavings that bounded runs miss | Separate weekly job | Backlog |
+| 15 | **One STMT, or one explicit APD, shared across threads** | Races on one STMT (execute, fetch, `SQLGetData`, `SQLMoreResults`, close, bindings, attributes, its descriptors) and read-only metadata calls; or STMTs on one DBC sharing an APD with read-only buffers. Only success, `SQL_NO_DATA`, `HY010`, `24000`, busy, or `HY008`; self-checking values; a reset STMT returns exact values afterwards. | Memory safety at the FFI boundary. Ranked low: apps rarely do this, handle mutexes serialize it, and failures are often ambiguous | Direct driver loading (Driver Managers serialize same-handle calls); ThreadSanitizer (AB#49259) | Backlog |
+| 16 | **Disconnect or free during use** | `SQLDisconnect` or `SQLFreeHandle` racing an in-flight call on a child or the same handle. | Applications reach it through timeout cleanup and finalizers; a known crash class | Reference-counted or generation-checked handle lifetimes | Blocked |
+| 17 | **Tracing toggled under load** | Tracing switched on and off while other threads run queries. | Process-wide state changed mid-call | - | Backlog |
 
-**Backlog, most valuable first**
-
-Each ENV owns a Tokio runtime with one worker thread, shared by all its
-connections, so the first items check that one slow, failed, or cancelled
-connection cannot stall or corrupt the others. All run against a real SQL
-Server; a mock TDS server is only for exact protocol sequences.
-
-8. **Fault isolation and recovery under load:** workers on one ENV query
-   continuously while one connection is killed (`KILL` from an admin
-   connection, as in `session_recovery_test.cpp`) or reset by a proxy, while
-   idle, executing, and fetching. Healthy workers keep returning their own
-   tokens within a bound; the faulted connection fails with a connection error
-   or recovers as Idle Connection Resiliency allows, and is usable or cleanly
-   freed afterwards. Needs `ALTER ANY CONNECTION`, or `TcpPauseProxy` extended
-   to many clients and an abrupt close.
-9. **Timeout and cancel churn:** workers repeatedly hit `SQL_ATTR_QUERY_TIMEOUT`
-   on `WAITFOR` and cancel each other's execute, fetch, `SQLGetData`, and
-   parameter streams, then run a token query on the same DBC. No connection
-   stays busy, no result or diagnostic leaks into the next call, and churn's
-   thread and handle counts return. `cancel_test.cpp` has the single-pair
-   cases.
-10. **Failed-connect churn:** churn (7) mixed with logins that fail: an
-    unknown login (not a real one, to avoid lockout), an unknown database, a
-    closed port, and a login timeout against a listener that never answers.
-    Failure paths must release what they allocated (counts return) and leave
-    concurrent successful connects unaffected.
-11. **Pooled connection reuse under load:** Driver Manager pooling with the
-    reset that `connection_pool_test.cpp` checks single-threaded. A borrower
-    must not see the previous one's SET options, temp tables, open
-    transaction, or database, and the test must prove reuse happened (same
-    SPID); without reuse it passes trivially.
-12. **Thread scale:** 8-10 at 128 and 512 threads on one ENV, far more than its
-    runtime's single worker. Checks starvation and deadlock; a configuration
-    of the tests above, not separate test logic.
-13. **Process-global authentication caches:** concurrent connects through
-    Entra and MSQA authentication, whose credential and context caches are
-    process-wide. Blocked until the stress pipeline has those credentials.
-14. **Long haul** (AB#49795): each thread picks random operations from 7-11
-    (LOB stream, parameter array, catalog call, prepare and execute, cancel,
-    reconnect) against a server with injected latency, for hours. Results are
-    token-checked; thread, handle, socket, and memory counts must plateau.
-15. **One STMT, or one explicit APD, shared across threads:** threads race
-    `SQLExecDirect`, `SQLExecute`, `SQLFetch`, `SQLGetData`,
-    `SQLMoreResults`, `SQLCloseCursor`, bindings, `SQLSetStmtAttr`, and
-    descriptor changes on one STMT; or STMTs on one DBC share an APD with
-    read-only buffers. Check invariants: one column shape, self-checking
-    values, only success, `SQL_NO_DATA`, `HY010`, `24000`, busy, or `HY008`,
-    and a reset STMT returns exact values afterwards. Same-handle calls reach
-    the driver concurrently only when it is loaded directly, which is also the
-    ThreadSanitizer target (AB#49259). Ranked low: apps rarely do this, the
-    driver's handle mutexes serialize it, and a failure is often ambiguous.
-16. **Process-wide changes under load:** tracing toggled while other threads
-    run queries. Driver unload with live handles is application misuse;
-    `dll_unload_stress_test.cpp` covers unload after use.
-
-Not tested end to end: two connects racing on one DBC. The driver's unit test
-`connect_on_connected_dbc_fails_without_poisoning_it` covers its guard
-(`HY010`, the live connection kept). The Windows Driver Manager rejects the
-second call with `08002` before the driver sees it. unixODBC 2.3.9 releases its
-lock mid-connect when it switches a new DBC from level 3 to the driver's
-`Threading` (`dbc_change_thread_support`), so both calls connect and the
-process then hangs or crashes on both drivers (measured in CI).
+- 8 and 9 wait until the server shows a request running before they `KILL` or
+  cancel it, so neither depends on sleeps; a cancel on an idle statement would
+  close nothing and clear diagnostics instead.
+- msodbcsql recovers a killed idle connection only once its socket has seen the
+  reset (a request sent earlier fails with `08S01`), so 8 waits 1 s after the
+  `KILL`, as `session_recovery_test.cpp` does.
+- In 10, mssql-odbc reports a refused port as `HYT00` after the login timeout,
+  where msodbcsql reports `08001`; and msodbcsql lists `28000` before an
+  unknown database's `42000`. The test accepts either state, in any record.
+- Not tested end to end: two connects racing on one DBC. The driver's unit test
+  `connect_on_connected_dbc_fails_without_poisoning_it` covers its guard
+  (`HY010`, the live connection kept). The Windows Driver Manager rejects the
+  second call with `08002` before the driver sees it. unixODBC 2.3.9 releases
+  its lock mid-connect when it switches a new DBC from level 3 to the driver's
+  `Threading` (`dbc_change_thread_support`), so both calls connect and the
+  process then hangs or crashes on both drivers (measured in CI).
 
 ### Priorities
 
@@ -331,8 +295,7 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
 
 1. `SharedDbc` opt-ins (scenario 3; fetch and GetData with AB#49260,
    parameters and execution with AB#49258).
-2. Multithreaded-only scenarios 8-16, in that order.
-3. Disconnect or free during use (see Deferred).
+2. The multithreaded-only backlog, top-down from scenario 11.
 
 ## Stress Profiles
 
@@ -366,7 +329,8 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   converted test, mostly `SharedEnv` connects. The fetch and GetData suites
   (AB#49260, 1,547 variants) take about 50 s (mssql-odbc) and 72 s (msodbcsql)
   at 2 x 1, 13 minutes at 8 x 20, and 33 minutes at 16 x 50 before their
-  `SharedDbc` opt-ins. `handle_lifecycle_test_mt` takes about 21 s (mssql-odbc) and 16 s (msodbcsql) weekly.
+  `SharedDbc` opt-ins. `handle_lifecycle_test_mt` and `fault_recovery_test_mt`
+  take about 85 s and 81 s on mssql-odbc at 16 x 50.
 
 ## Validation and evidence
 
@@ -417,17 +381,14 @@ Tracked under AB#49256:
    mid-PLP.
 5. **AB#49262:** diagnostics, descriptor, metadata, and attribute suites;
    scenario 6.
-6. **AB#49261 (PR #796):** scenario 7, and the driver's same-DBC connect
+6. **AB#49261 (PR #796):** scenarios 7-10, and the driver's same-DBC connect
    guard (unit test).
 7. **AB#49795:** scenario 14.
 8. **AB#49259:** scenario 15 under ThreadSanitizer.
-9. Not yet tracked: scenarios 8-13 and 16.
+9. Not yet tracked: scenarios 11-13, 16, and 17.
 
 ## Deferred
 
-- **Disconnect or free during use:** `SQLDisconnect` frees child STMTs and can
-  race an in-flight child call. Add to 15 once handle lifetimes are
-  reference-counted or generation-checked; applications reach it through
-  timeout cleanup and finalizers, so until then it is a known crash class with
-  no test.
+- **Disconnect or free during use:** scenario 16, once handle lifetimes are
+  reference-counted or generation-checked.
 - **Async execution and MARS:** once the driver supports them.
