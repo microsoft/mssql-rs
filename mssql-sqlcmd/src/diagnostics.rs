@@ -1110,6 +1110,15 @@ fn resolver_timed_out(lookup: &Step) -> bool {
         && lookup.detail(connect_stage::ADDRESSES).is_none()
 }
 
+/// A Browser lookup that never got the server's addresses: its resolving
+/// failed or timed out, or the attempt's time limit dropped it while it was
+/// still resolving (the lookup records the addresses as soon as it has them,
+/// before it asks SQL Server Browser).
+fn lookup_unresolved(lookup: &Step, timed_out: bool) -> bool {
+    lookup_name_failure(lookup)
+        || (lookup.abandoned() && timed_out && lookup.detail(connect_stage::ADDRESSES).is_none())
+}
+
 /// The addresses a stage lists, without repeats.
 fn listed_addresses(step: &Step) -> Vec<String> {
     let mut addresses: Vec<String> = Vec::new();
@@ -1623,8 +1632,9 @@ impl Diagnosis {
         superseded: bool,
     ) -> bool {
         let id = CheckId::NameResolution;
-        let from_lookup = lookup
-            .filter(|l| l.detail(connect_stage::ADDRESSES).is_some() || lookup_name_failure(l));
+        let from_lookup = lookup.filter(|l| {
+            l.detail(connect_stage::ADDRESSES).is_some() || lookup_unresolved(l, timed_out)
+        });
         let Some(step) = tcp.and_then(|t| t.dns).or(from_lookup) else {
             if lookup.is_some_and(Step::abandoned) && !timed_out {
                 // A cancel cut short the lookup that resolves the name.
@@ -1646,9 +1656,11 @@ impl Diagnosis {
             .push(Field::identifier("host", host.clone(), Category::Host));
         // Resolving for the Browser lookup has the lookup's time limit, as
         // instance resolution does, whatever `-l` is; the client's own
-        // resolving has `-l`.
+        // resolving has `-l`, and so does a lookup `-l` dropped while it was
+        // still resolving.
         let in_lookup = step.stage == Stage::InstanceLookup;
-        let deadline_ms = if in_lookup {
+        let dropped_resolving = step.abandoned() && step.detail(connect_stage::ADDRESSES).is_none();
+        let deadline_ms = if in_lookup && !dropped_resolving {
             BROWSER_TIMEOUT_MS
         } else {
             self.request.timeout_ms()
@@ -1694,13 +1706,13 @@ impl Diagnosis {
             Stage::Dns => error_text.is_none() && step.os_error().is_none(),
             _ => step.detail(connect_stage::RESULT) == Some("noAddresses"),
         };
-        let (code, from_text, message) = if step.abandoned() && !in_lookup {
+        let (code, from_text, message) = if step.abandoned() {
             (
                 "timedOut",
                 false,
                 format!("no answer within {} s", self.request.timeout().as_secs()),
             )
-        } else if step.abandoned() || resolver_timeout {
+        } else if resolver_timeout {
             (
                 "timedOut",
                 false,
@@ -1886,7 +1898,7 @@ impl Diagnosis {
             self.checks.push(Check::skipped(id, Skip::Canceled));
             return Some(Skip::Canceled);
         }
-        if lookup_name_failure(step) {
+        if lookup_unresolved(step, timed_out) {
             // Name resolution reports it.
             self.checks
                 .push(Check::skipped(id, Skip::BlockedBy(CheckId::NameResolution)));
@@ -4867,6 +4879,79 @@ pub(crate) mod tests {
             );
             assert_eq!(report.exit_code(), 2, "{depth:?}");
         }
+    }
+
+    /// The attempt's time limit dropped the Browser lookup while it was still
+    /// resolving (abandoned, no addresses): name resolution timed out within
+    /// `-l`, and instance resolution is blocked by it, asking for no port.
+    /// Dropped after resolving, the lookup is the Browser's to answer.
+    #[test]
+    fn a_lookup_dropped_while_resolving_is_a_name_resolution_timeout() {
+        let dropped = |addresses: Option<&'static str>| {
+            let mut fields = vec![(cs::SERVER, "db01"), (cs::INSTANCE, "SQL2022")];
+            if let Some(addresses) = addresses {
+                fields.push((cs::ADDRESSES, addresses));
+            }
+            Stages::new().add(Stage::InstanceLookup, None, 0, 1000, &fields)
+        };
+        for depth in [Depth::EndpointResolution, Depth::NetworkReachability] {
+            let mut short = request("db01\\SQL2022", depth);
+            short.login_timeout_seconds = 1;
+            let report = observed(short, dropped(None), timed_out());
+            let name = checked(&report, CheckId::NameResolution);
+            assert_eq!(name.coverage, Coverage::Inconclusive, "{name:#?}");
+            assert_eq!(name.field("result"), Some("timedOut"));
+            assert_eq!(name.field("host"), Some("db01"));
+            assert_eq!(name.deadline_ms, Some(1000));
+            assert_eq!(
+                checked(&report, CheckId::InstanceResolution).skip,
+                Some(Skip::BlockedBy(CheckId::NameResolution)),
+                "{depth:?}"
+            );
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .all(|c| c.field(REQUIRES).is_none() && c.skip != Some(Skip::PortRequired)),
+                "{:#?}",
+                report.checks
+            );
+            assert!(
+                report.findings.iter().all(|f| f.text != PORT_REQUEST),
+                "{:#?}",
+                report.findings
+            );
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.text.contains("no answer within 1 s")),
+                "{:#?}",
+                report.findings
+            );
+            assert_eq!(report.exit_code(), 2, "{depth:?}");
+        }
+
+        // Resolved, then dropped while waiting for SQL Server Browser.
+        let mut short = request("db01\\SQL2022", Depth::EndpointResolution);
+        short.login_timeout_seconds = 1;
+        let report = observed(short, dropped(Some("10.0.0.1")), timed_out());
+        assert_eq!(
+            checked(&report, CheckId::NameResolution).field("result"),
+            Some("resolved")
+        );
+        let lookup = checked(&report, CheckId::InstanceResolution);
+        assert_eq!(lookup.field("result"), Some("timedOut"), "{lookup:#?}");
+
+        // A cancel while resolving is a cancel, not a timeout.
+        let report = canceled_with(
+            request("db01\\SQL2022", Depth::NetworkReachability),
+            dropped(None),
+        );
+        assert_eq!(
+            checked(&report, CheckId::NameResolution).skip,
+            Some(Skip::Canceled)
+        );
     }
 
     const PORT_REQUEST: &str = "Give the instance's port explicitly, as -S db01,<port>: sqlcmd \
