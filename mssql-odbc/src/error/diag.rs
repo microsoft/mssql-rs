@@ -52,7 +52,7 @@ pub(crate) struct DiagRecord {
     pub(crate) sql_state: SqlState,
     pub(crate) native_error: i32,
     /// Borrowed for driver-raised `DiagMsg` text, so posting a fixed
-    /// diagnostic (e.g. the `01004` of every `SQLGetData` length probe) does
+    /// diagnostic (e.g. the `01004` of a `SQLGetData` length probe) does
     /// not allocate.
     pub(crate) message: Cow<'static, str>,
 }

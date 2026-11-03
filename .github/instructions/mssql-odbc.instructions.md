@@ -165,7 +165,7 @@ on the `master` branch.
     appears, or could appear, in more than one place. Declare new constants
     inside the `diag_msgs!` block: it builds the prefixed text at compile time
     so `post_diag` stores a borrowed `&'static str` without allocating, which
-    matters on hot paths such as the `01004` of every `SQLGetData` length probe.
+    matters on hot paths such as the `01004` of a `SQLGetData` length probe.
   - `post_sql_error(state, sqlstate, native, message)` — the lower-level
     primitive behind `post_diag`. Use it directly only for genuinely one-off
     or **dynamic** messages (text computed at runtime) that don't warrant a
