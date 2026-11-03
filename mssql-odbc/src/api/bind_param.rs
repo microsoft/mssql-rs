@@ -1475,4 +1475,25 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(bind_param_records(stmt, explicit_apd, 1, bound).is_err());
     }
+
+    /// `SQL_RESET_PARAMS` keeps the liveness check for an explicit APD: a
+    /// dangling association fails cleanly instead of truncating freed memory.
+    #[test]
+    fn reset_params_fails_cleanly_on_a_freed_explicit_apd() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_apd = h.alloc_explicit_desc();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // Same dangling-association setup as set_stmt_attr's
+        // `array_size_fails_cleanly_on_a_freed_descriptor`: free through the
+        // fixture, then plant the stale pointer the resolve/lock window leaves.
+        assert_eq!(h.free_explicit_desc(explicit_apd), SQL_SUCCESS);
+        stmt.inner.lock().unwrap().active_apd = Some(explicit_apd);
+
+        assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.last().unwrap().sql_state, SQLSTATE_HY000);
+        drop(state);
+
+        stmt.inner.lock().unwrap().active_apd = None;
+    }
 }
