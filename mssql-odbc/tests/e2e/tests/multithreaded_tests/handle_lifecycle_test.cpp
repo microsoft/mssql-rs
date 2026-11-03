@@ -15,8 +15,7 @@
 
 #include "lifecycle_support.h"
 
-#include <map>
-#include <set>
+#include <functional>
 
 namespace {
 
@@ -88,31 +87,68 @@ bool RunTree(SQLHENV shared_env, long long token, std::string& error) {
 // own watchdog so the hang timeout still bounds a normal-sized phase. Counts
 // sampled after the first round must be back after the last.
 constexpr int kChurnRounds = 20;
-constexpr int kFailedConnectRounds = 3;
-
-long long Token(int round, const Config& config, int worker, int iteration) {
-    return 1 + (static_cast<long long>(round) * config.threads + worker) * config.iterations +
-           iteration;
-}
 
 class HandleLifecycleTest : public LifecycleTest {
    protected:
     void Churn(bool shared_env);
 };
 
+// Allocates a STMT on |dbc|, sets an attribute, and frees it, until
+// keep_going() is false. Through a Driver Manager a DBC or ENV allocation only
+// reaches the driver at connect (the Driver Manager does not know the driver
+// before then), but a STMT on a connected DBC is the driver's own, so this
+// reaches the driver's handle registry in microseconds rather than a login's
+// milliseconds.
+bool SpinStatements(SQLHDBC dbc, const std::function<bool()>& keep_going,
+                    std::atomic<long long>& spins, std::string& error) {
+    while (keep_going()) {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        if (!SQL_SUCCEEDED(rc)) {
+            error = Describe("SQLAllocHandle(STMT)", rc, SQL_HANDLE_DBC, dbc);
+            return false;
+        }
+        rc = SQLSetStmtAttr(stmt, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(5), 0);
+        if (!SQL_SUCCEEDED(rc)) {
+            error = Describe("SQLSetStmtAttr(QUERY_TIMEOUT)", rc, SQL_HANDLE_STMT, stmt);
+        }
+        const SQLRETURN freed = SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        if (!SQL_SUCCEEDED(freed) && error.empty()) {
+            error = Describe("SQLFreeHandle(STMT)", freed, SQL_HANDLE_STMT, stmt);
+        }
+        if (!error.empty()) {
+            return false;
+        }
+        ++spins;
+    }
+    return true;
+}
+
 // Each worker builds and tears down a whole tree per iteration, either under
-// its own ENV or under the fixture's shared ENV.
+// its own ENV or under the fixture's shared ENV. On the shared ENV, a quarter
+// as many spinner threads hold a connection of their own and churn STMTs on it
+// throughout, so cheap handle registration overlaps the workers' DBC
+// allocation, connects, and frees instead of only their logins overlapping.
 void HandleLifecycleTest::Churn(bool shared_env) {
     const SQLHENV env = shared_env ? env_ : SQL_NULL_HENV;
+    const int spinners = shared_env ? (std::max)(1, config_.threads / 4) : 0;
     Failures failures;
+    std::atomic<long long> spins{0};
     long long completed = 0;
     ProcessCounts baseline;
     for (int round = 0; round < kChurnRounds && failures.Empty(); ++round) {
-        completed += RunWorkers(TestLabel() + " round " + std::to_string(round), config_, failures,
-                                [&, round](int worker, int iteration, std::string& error) {
-                                    return RunTree(env, Token(round, config_, worker, iteration),
-                                                   error);
-                                });
+        completed += RunWorkers(
+            TestLabel() + " round " + std::to_string(round), config_, failures,
+            [&, round](int worker, int iteration, std::string& error) {
+                return RunTree(env, 1 + RunIndex(round, config_, worker, iteration), error);
+            },
+            spinners,
+            [&](int, const std::function<bool()>& keep_going, std::string& error) {
+                Connection connection(env_);
+                return connection.Open(error) &&
+                       SpinStatements(connection.dbc(), keep_going, spins, error) &&
+                       connection.Close(error);
+            });
         if (round == 0) {
             baseline = SampleProcess();
         }
@@ -121,6 +157,10 @@ void HandleLifecycleTest::Churn(bool shared_env) {
     EXPECT_TRUE(failures.Empty()) << failures.Summary();
     EXPECT_EQ(static_cast<long long>(kChurnRounds) * config_.threads * config_.iterations,
               completed);
+    if (spinners > 0) {
+        RecordProperty("statement_spins", std::to_string(spins.load()));
+        EXPECT_GT(spins.load(), 0) << "the spinners never overlapped the churn";
+    }
     if (failures.Empty()) {
         ExpectNoGrowth(baseline, after);
     }
@@ -134,7 +174,8 @@ TEST_F(HandleLifecycleTest, ChurnPrivateEnvTrees) {
 }
 
 // The same under one ENV: DBC allocation and freeing race on the ENV's shared
-// child list and runtime while other DBCs connect and query.
+// child list and runtime while other DBCs connect and query, and the spinners'
+// STMT churn races both on the driver's handle registry.
 TEST_F(HandleLifecycleTest, ChurnDbcTreesOnSharedEnv) {
     RunWatched([&] { Churn(true); });
 }
@@ -149,10 +190,20 @@ const char* KindName(int kind) {
     return names[kind];
 }
 
-// A SQLSTATE that must appear among each failing login's records. Drivers
+// A SQLSTATE that must appear among each failing login's records; drivers
 // order records differently (msodbcsql puts 28000 before an unknown
-// database's 42000), and mssql-odbc reports a refused port as HYT00 after the
-// login timeout where msodbcsql reports 08001.
+// database's 42000).
+//
+// A refused port: on Windows a refused TCP connect is retried for about 2 s
+// (see each_extra_connect_has_its_own_connect_timeout in mssql-tds
+// network_transport.rs), longer than this test's 1 s login timeout, so both
+// drivers end at the login timeout. mssql-odbc reports only HYT00; msodbcsql
+// reports 08001 ("TCP Provider: The wait operation timed out") first, then
+// HYT00, then another 08001 - measured on msodbcsql 18 here, and the same for
+// the silent server. Elsewhere a refused connect fails at once (08001). An
+// application reading only the first record sees different SQLSTATEs; that is
+// undecided, not a deliberate deviation, so it is recorded here and in the plan
+// rather than in parity-deviations.md.
 std::vector<std::string> ExpectedStates(int kind) {
     switch (kind) {
         case kUnknownLogin:
@@ -182,41 +233,46 @@ constexpr SQLULEN kLoginTimeoutSeconds = 1;
 // A failed login must return within the login timeout plus this.
 constexpr long long kFailureSlackMs = 10000;
 
-class FailedConnects {
+class ConnectCases {
    public:
-    void Record(int kind, const std::string& state, long long elapsed_ms) {
+    void Ran(int kind, bool shared_env) {
         std::lock_guard<std::mutex> lock(mutex_);
-        states_[kind].insert(state);
-        slowest_ms_[kind] = (std::max)(slowest_ms_[kind], elapsed_ms);
-        ++count_[kind];
+        ++ran_[kind][shared_env ? 1 : 0];
     }
 
-    void Report() const {
+    void Failed(int kind, const std::string& diagnostic, long long elapsed_ms) {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (int kind = kUnknownLogin; kind < kKinds; ++kind) {
-            std::string states;
-            for (const auto& state : states_.count(kind) ? states_.at(kind) : std::set<std::string>{}) {
-                states += state + " ";
-            }
+        if (first_diagnostic_[kind].empty()) {
+            first_diagnostic_[kind] = diagnostic;
+        }
+        slowest_ms_[kind] = (std::max)(slowest_ms_[kind], elapsed_ms);
+    }
+
+    // Records what each kind did, and fails if a kind/ENV case never ran.
+    void Check() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int kind = 0; kind < kKinds; ++kind) {
             ::testing::Test::RecordProperty(
-                std::string(KindName(kind)),
-                std::to_string(count_.count(kind) ? count_.at(kind) : 0) + " attempts; states " +
-                    states + "; slowest " +
-                    std::to_string(slowest_ms_.count(kind) ? slowest_ms_.at(kind) : 0) + " ms");
+                KindName(kind), std::to_string(ran_[kind][0]) + " private-ENV, " +
+                                    std::to_string(ran_[kind][1]) + " shared-ENV; slowest " +
+                                    std::to_string(slowest_ms_[kind]) + " ms; first: " +
+                                    first_diagnostic_[kind]);
+            EXPECT_GT(ran_[kind][0], 0) << KindName(kind) << " never ran on a private ENV";
+            EXPECT_GT(ran_[kind][1], 0) << KindName(kind) << " never ran on the shared ENV";
         }
     }
 
    private:
     mutable std::mutex mutex_;
-    std::map<int, std::set<std::string>> states_;
-    std::map<int, long long> slowest_ms_;
-    std::map<int, long long> count_;
+    long long ran_[kKinds][2] = {};
+    long long slowest_ms_[kKinds] = {};
+    std::string first_diagnostic_[kKinds];
 };
 
 // Connects with |connstr|, which must fail with |kind|'s SQLSTATE within the
 // login timeout plus slack, then frees the DBC (and the tree's own ENV) with
 // each step checked.
-bool FailConnect(SQLHENV shared_env, int kind, const std::string& connstr, FailedConnects& seen,
+bool FailConnect(SQLHENV shared_env, int kind, const std::string& connstr, ConnectCases& cases,
                  std::string& error) {
     Env own;
     if (shared_env == SQL_NULL_HENV && !own.Alloc(error)) {
@@ -237,12 +293,11 @@ bool FailConnect(SQLHENV shared_env, int kind, const std::string& connstr, Faile
         const Clock::time_point start = Clock::now();
         rc = DriverConnect(dbc, connstr);
         const long long elapsed_ms = MillisecondsSince(start);
-        const std::string state = ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, dbc);
         if (SQL_SUCCEEDED(rc)) {
             error = std::string(KindName(kind)) + " login connected";
             SQLDisconnect(dbc);
         } else {
-            seen.Record(kind, state, elapsed_ms);
+            cases.Failed(kind, DiagText(SQL_HANDLE_DBC, dbc), elapsed_ms);
             if (rc != SQL_ERROR || !HasExpectedState(kind, dbc)) {
                 error = std::string(KindName(kind)) + " login expected SQL_ERROR with [" +
                         ExpectedStates(kind)[0] + "]; " +
@@ -270,8 +325,10 @@ bool FailConnect(SQLHENV shared_env, int kind, const std::string& connstr, Faile
 // Plan scenario 10: churn where four in five logins fail - an unknown login, an
 // unknown database, a refused port, and a server that never answers (login
 // timeout) - on private and shared ENVs alike, interleaved with real logins.
-// Failed logins must report their SQLSTATE in bounded time and release what
-// they allocated; the real logins between them must still succeed.
+// Each run's index picks its kind and ENV, so every kind runs on both kinds of
+// ENV at any profile size (at 2 x 1, in five rounds). Failed logins must
+// report their SQLSTATE in bounded time and release what they allocated; the
+// real logins between them must still succeed.
 TEST_F(HandleLifecycleTest, ChurnWithFailedConnects) {
     RunWatched([&] {
         ClosedPort refused;
@@ -290,20 +347,24 @@ TEST_F(HandleLifecycleTest, ChurnWithFailedConnects) {
             ConnStrWith(base, {{"Server", "tcp:127.0.0.1," + std::to_string(silent.Port())}}),
         };
 
+        const int rounds = RoundsCovering(3, 2 * kKinds, config_);
         Failures failures;
-        FailedConnects seen;
+        ConnectCases cases;
         long long completed = 0;
         ProcessCounts baseline;
-        for (int round = 0; round < kFailedConnectRounds && failures.Empty(); ++round) {
+        for (int round = 0; round < rounds && failures.Empty(); ++round) {
             completed += RunWorkers(
                 TestLabel() + " round " + std::to_string(round), config_, failures,
                 [&, round](int worker, int iteration, std::string& error) {
-                    const int kind = (worker + iteration) % kKinds;
-                    const SQLHENV env = iteration % 2 == 0 ? SQL_NULL_HENV : env_;
+                    const long long run = RunIndex(round, config_, worker, iteration);
+                    const int kind = static_cast<int>(run % kKinds);
+                    const bool shared = (run / kKinds) % 2 == 1;
+                    cases.Ran(kind, shared);
+                    const SQLHENV env = shared ? env_ : SQL_NULL_HENV;
                     if (kind == kConnects) {
-                        return RunTree(env, Token(round, config_, worker, iteration), error);
+                        return RunTree(env, 1 + run, error);
                     }
-                    return FailConnect(env, kind, connstrs[kind], seen, error);
+                    return FailConnect(env, kind, connstrs[kind], cases, error);
                 });
             silent.CloseAccepted();
             if (round == 0) {
@@ -311,12 +372,11 @@ TEST_F(HandleLifecycleTest, ChurnWithFailedConnects) {
             }
         }
         const ProcessCounts after = SampleProcess();
-        seen.Report();
         EXPECT_TRUE(failures.Empty()) << failures.Summary();
-        EXPECT_EQ(static_cast<long long>(kFailedConnectRounds) * config_.threads *
-                      config_.iterations,
+        EXPECT_EQ(static_cast<long long>(rounds) * config_.threads * config_.iterations,
                   completed);
         if (failures.Empty()) {
+            cases.Check();
             ExpectNoGrowth(baseline, after);
         }
     });

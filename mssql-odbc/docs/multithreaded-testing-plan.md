@@ -255,9 +255,9 @@ Ordered by value; the backlog is done top-down.
 
 | # | Scenario | Checks | Value | Needs | Status |
 |---|---|---|---|---|---|
-| 7 | **Handle churn** (`handle_lifecycle_test.cpp`) | Threads allocate, connect, query, disconnect, and free ENV/DBC/STMT trees, on private ENVs and on one shared ENV: 20 rounds, 16,000 trees per test weekly. Thread and handle (fd) counts after the last round match those after round 0. | Catches runtime, socket, and thread leaks that successful API calls hide; a leaked ENV runtime fails it | - | Implemented (AB#49261) |
-| 8 | **Killed connection under load** (`fault_recovery_test.cpp`) | THREADS - 1 workers query nonstop on the shared ENV while an admin connection `KILL`s a victim on that ENV, alternately idle and mid-`WAITFOR`. Healthy workers never fail or stall over 10 s; an idle victim recovers (new `connect_time`) and returns its token; an executing one fails within 10 s and frees cleanly. | One dead connection must not stall or break the others sharing its runtime; covers Idle Connection Resiliency under load | `VIEW SERVER STATE`, `ALTER ANY CONNECTION` | Implemented (AB#49261) |
-| 9 | **Timeout and cancel churn** (`fault_recovery_test.cpp`) | Each worker keeps a connection and in turn times out a `WAITFOR` (`HYT00`), has another thread cancel one once the server shows it running (`HY008`), and cancels a data-at-execution stream; then selects its token on the same STMT. 3 rounds; counts return. | Recovery paths most likely to leave a connection busy or leak results, diagnostics, or tasks | `VIEW SERVER STATE` | Implemented (AB#49261) |
+| 7 | **Handle churn** (`handle_lifecycle_test.cpp`) | Threads allocate, connect, query, disconnect, and free ENV/DBC/STMT trees, on private ENVs and on one shared ENV: 20 rounds, 16,000 trees per test weekly. On the shared ENV, THREADS / 4 spinner threads allocate, set an attribute on, and free STMTs on their own connections throughout (DBC and ENV allocations reach the driver only at connect through a Driver Manager), so handle registration overlaps the churn. Thread and handle (fd) counts after the last round match those after round 0. | Catches runtime, socket, and thread leaks that successful API calls hide; a leaked ENV runtime fails it | - | Implemented (AB#49261) |
+| 8 | **Killed or stalled connection under load** (`fault_recovery_test.cpp`) | THREADS - 1 workers query nonstop on the shared ENV while a victim on that ENV is faulted. Killed: an admin connection `KILL`s it, alternately idle and mid-`WAITFOR`; an idle victim recovers (new `connect_time`) and returns its token, an executing one fails within 10 s and frees cleanly. Stalled: the victim reads 8 MB through `TcpPauseProxy`, which holds the response mid-value for 15 s without closing; the read stays blocked, then delivers every byte. Healthy workers never fail or wait over 8 s between queries. | One dead connection must not stall or break the others sharing its runtime; covers Idle Connection Resiliency under load | `VIEW SERVER STATE`, `ALTER ANY CONNECTION`; `ODBC_TEST_SERVER` for the stall proxy | Implemented (AB#49261) |
+| 9 | **Timeout and cancel churn** (`fault_recovery_test.cpp`) | Each worker keeps a connection and in turn times out a `WAITFOR` (`HYT00`), has another thread cancel one once the server shows it running (`HY008`), cancels a data-at-execution stream, or has another thread cancel a 20,000-row read at a random point (before send, mid-execute, mid-fetch, between fetches, or after the last row; any valid outcome); then selects its token on the same STMT. Every fault runs at any profile size; counts return. | Recovery paths most likely to leave a connection busy or leak results, diagnostics, or tasks | `VIEW SERVER STATE` | Implemented (AB#49261) |
 | 10 | **Failed-connect churn** (`handle_lifecycle_test.cpp`) | Four in five logins fail - unknown login, unknown database, refused port, a listener that never answers (1 s login timeout) - interleaved with real logins on private and shared ENVs. Each reports its SQLSTATE in bounded time; counts return. | Partly built connections are a common leak and hang source; real logins must be unaffected | - | Implemented (AB#49261) |
 | 11 | **Pooled reuse under load** | Driver Manager pooling with the reset `connection_pool_test.cpp` checks single-threaded. A borrower never sees the previous one's SET options, temp tables, transaction, or database; reuse is proven (same SPID), or the test passes trivially. | Session state leaking between borrowers is a correctness and security bug | DM pooling on both platforms | Backlog |
 | 12 | **Thread scale and mixed workloads** | 8-10 at 128 and 512 threads on one ENV; short queries alongside LOB streams and parameter arrays, each worker making progress. | Starvation and deadlock on the ENV's single runtime worker | Configuration of 8-10 plus a mixed workload | Backlog |
@@ -267,15 +267,29 @@ Ordered by value; the backlog is done top-down.
 | 16 | **Disconnect or free during use** | `SQLDisconnect` or `SQLFreeHandle` racing an in-flight call on a child or the same handle. | Applications reach it through timeout cleanup and finalizers; a known crash class | Reference-counted or generation-checked handle lifetimes | Blocked |
 | 17 | **Tracing toggled under load** | Tracing switched on and off while other threads run queries. | Process-wide state changed mid-call | - | Backlog |
 
-- 8 and 9 wait until the server shows a request running before they `KILL` or
-  cancel it, so neither depends on sleeps; a cancel on an idle statement would
-  close nothing and clear diagnostics instead.
+- The `KILL` and the deterministic cancel wait until the server shows the
+  request running, so they do not depend on sleeps. The random cancel covers
+  the other timings: its delay spans 0-120% of that connection's measured
+  uncancelled read. At 16 x 50 it ended as completed 242, mid-execute 8,
+  mid-fetch 135, and closed cursor 215 on mssql-odbc.
+- The stall limit (8 s against a 15 s hold) sits above agent noise: on a
+  16-core dev box with a local server, healthy queries occasionally took 2-5 s
+  on both drivers with no fault at all (a victim that only slept), and the
+  server showed them running, not waiting. Blocking the ENV runtime's worker
+  on a stalled read (a mutation) made healthy queries wait 40 s with a 3 s
+  hold, and hung the run past its watchdog with a 15 s hold.
+- Scenarios pick each run's case from its index across all rounds, and add
+  rounds when needed, so every case runs even at the msodbcsql leg's 2 x 1.
 - msodbcsql recovers a killed idle connection only once its socket has seen the
   reset (a request sent earlier fails with `08S01`), so 8 waits 1 s after the
   `KILL`, as `session_recovery_test.cpp` does.
-- In 10, mssql-odbc reports a refused port as `HYT00` after the login timeout,
-  where msodbcsql reports `08001`; and msodbcsql lists `28000` before an
-  unknown database's `42000`. The test accepts either state, in any record.
+- In 10, Windows retries a refused TCP connect for about 2 s, longer than the
+  1 s login timeout, so both drivers end at the timeout: mssql-odbc reports
+  only `HYT00`, msodbcsql reports `08001`, `HYT00`, `08001`. Elsewhere a
+  refused connect fails at once. msodbcsql also lists `28000` before an
+  unknown database's `42000`. The test accepts the expected state in any
+  record. The first-record difference is undecided, so it is not in
+  [parity-deviations.md](parity-deviations.md).
 - Not tested end to end: two connects racing on one DBC. The driver's unit test
   `connect_on_connected_dbc_fails_without_poisoning_it` covers its guard
   (`HY010`, the live connection kept). The Windows Driver Manager rejects the
@@ -330,7 +344,7 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   (AB#49260, 1,547 variants) take about 50 s (mssql-odbc) and 72 s (msodbcsql)
   at 2 x 1, 13 minutes at 8 x 20, and 33 minutes at 16 x 50 before their
   `SharedDbc` opt-ins. `handle_lifecycle_test_mt` and `fault_recovery_test_mt`
-  take about 85 s and 81 s on mssql-odbc at 16 x 50.
+  take about 90 s and 160 s on mssql-odbc at 16 x 50.
 
 ## Validation and evidence
 
