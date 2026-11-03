@@ -59,8 +59,9 @@ impl CancelHandle {
     /// Configure before deriving children; subsequent updates are shared with
     /// those children. Zero restores the TDS default. Cleanup already in
     /// progress keeps its original deadline.
-    /// Configured writes finish their current packet within this budget before
-    /// withdrawing the request; an unfinished packet retires the transport.
+    /// Configured writes finish their current packet within both this budget
+    /// and any request deadline before withdrawing the request; an unfinished
+    /// packet retires the transport.
     pub fn set_cancel_timeout_secs(&mut self, seconds: u32) {
         match &self.settlement {
             Some(settings) => settings.timeout_secs.store(seconds, Ordering::Relaxed),

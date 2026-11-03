@@ -53,6 +53,15 @@ The server certificate must be trusted and match the hostname.
 cancellation, and other per-command settings. Use `advance()` for subsequent
 results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
+SQL-batch timeout accounting includes both sending the batch and reading its
+response.
+
+Use `begin_transaction_with_options`, `commit_transaction_with_options`, and
+`rollback_transaction_with_options` to bound transaction requests with the same
+options. The timeout covers both sending the request and consuming its response.
+Their original counterparts remain unbounded. Commit and rollback never reconnect
+onto a different session.
+
 ## Vectors
 
 Connections request `VectorVersion::V2` by default, supporting float32 and float16
@@ -114,6 +123,14 @@ ATTENTION is skipped when the response has already fully arrived. Zero uses the
 transport default; failed cancellation settlement retires the connection.
 Discarding rows during cancellation does not decode values or resolve Always
 Encrypted keys.
+
+Write deadlines apply to SQL batches, RPCs (including streamed parameters), and
+bulk copy. If a timeout interrupts an in-flight packet, the connection is retired
+without TLS shutdown or automatic session recovery, including during later explicit
+closure. There is no packet-completion grace period, and cancellation cannot extend
+the request's write deadline. Transport failures remain eligible for negotiated
+recovery; at a clean packet boundary, normal withdrawal or cancellation recovery
+remains available.
 
 ## Runtime behavior
 
