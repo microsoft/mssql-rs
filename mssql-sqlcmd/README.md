@@ -44,6 +44,19 @@ text output for very large results.
 See the [JSON output contract](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/json-output.md)
 for the schema, status fields, and an example.
 
+## Diagnose
+
+`sqlcmd diagnose` checks, from the bottom up, that a connection can be made
+and, when it cannot, where and why, depth by depth (`--depth`), as a text or
+JSON (`--format json`) report with an exit code per outcome. Its output may
+contain server names, host names and IP addresses as they are; review it before
+sharing it. The checks that connect use `mssql-tds`, which is 64-bit only, so
+`win-x86` builds leave diagnose out: there `mssql_sqlcmd_diagnostics_run`
+returns `MSSQL_SQLCMD_UNSUPPORTED`.
+
+See the [diagnose reference](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/diagnose.md)
+for the depths, the report, the exit codes and what is shown or labelled.
+
 ## Build from source
 
 From the repository root:

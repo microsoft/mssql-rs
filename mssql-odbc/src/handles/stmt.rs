@@ -516,8 +516,8 @@ pub(crate) struct StmtState {
     /// cursor close (`SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`, whose own
     /// drain can no longer discover it on the wire because the peek already
     /// consumed the terminating ERROR token) — to drain and fail on. The
-    /// connection-scoped close sweep (`SQLEndTran`/autocommit/isolation
-    /// change, `close_cursor_for_connection_op`) is the one exception: it
+    /// connection-scoped close sweep (`SQLEndTran`/autocommit/connection
+    /// reset, `close_cursor_for_connection_op`) is the one exception: it
     /// still posts this to the statement's diagnostics but does not fail its
     /// own return, since that return code specifically means "the stream
     /// failed to drain," which a stale diagnostic on an already-closed batch
@@ -569,6 +569,16 @@ pub(crate) struct StmtState {
     /// `sp_execute` reuse path.
     pub(crate) pending_unprepare: Option<StatementId>,
     pub(crate) parameter_array: Option<crate::api::execute::BatchClientResults>,
+    /// Parameter-set completions a read-ahead found before msodbcsql would
+    /// (past a buffered unbound row or an ERROR token). Published at the call
+    /// where msodbcsql reads them; discarded with the cursor.
+    pub(crate) deferred_array_update: Option<Box<crate::api::execute::ParameterArrayUpdate>>,
+    /// Positioned on an empty parameter set by a navigation that reported a
+    /// server-side set failure with no status array to carry it. msodbcsql
+    /// treats that position as no result set while later sets stay reachable
+    /// through `SQLMoreResults`: fetch and `SQLCloseCursor` report 24000,
+    /// `SQLGetData` HY010, and `SQLDescribeCol` 07005 (measured on 18.6.2.1).
+    pub(crate) error_result: bool,
     /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
@@ -1419,6 +1429,8 @@ impl StmtState {
         self.batch_exhausted = false;
         self.pending_fetch_error = None;
         self.pending_output_params = None;
+        self.deferred_array_update = None;
+        self.error_result = false;
     }
 
     /// The statement's currently *effective* ARD: the explicit descriptor
@@ -1943,6 +1955,9 @@ impl StmtHandle {
                 bound_params: Vec::new(),
                 pending_unprepare: None,
                 parameter_array: None,
+                deferred_array_update: None,
+
+                error_result: false,
                 row_positioned: false,
                 last_captured: None,
                 captured_plp_wire: None,

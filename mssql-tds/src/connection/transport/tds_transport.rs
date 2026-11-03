@@ -37,6 +37,9 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// This should cleanly shut down any underlying network connections.
     async fn close_transport(&mut self) -> TdsResult<()>;
 
+    /// Drop the connection without a protocol or TLS shutdown.
+    fn abort_transport(&mut self);
+
     /// Send an attention packet and drain the response to its acknowledgment
     /// with a timeout.
     ///
@@ -99,6 +102,12 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     ///
     /// [`is_connection_dead`]: TdsTransport::is_connection_dead
     fn connection_known_dead(&self) -> bool {
+        false
+    }
+
+    /// Whether the current response's final packet has been framed, so the
+    /// server will send nothing further for it.
+    fn response_fully_received(&self) -> bool {
         false
     }
 

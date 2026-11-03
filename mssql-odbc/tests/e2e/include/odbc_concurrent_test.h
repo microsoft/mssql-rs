@@ -7,6 +7,8 @@
 //       Fixture.Name/CrossThread, /SharedEnv, and /SharedStmt.
 //   ODBC_TEST_F_MODES(Fixture, Name, odbc_concurrency::kAllModes) { ... }
 //       Chooses the modes explicitly; kAllModes adds /SharedDbc.
+//   SKIP_MSODBCSQL_IN_MODE(mode)
+//       In a body: skips only the msodbcsql comparison leg in that mode.
 //
 // The body is written as for TEST_F: it uses stmt_, dbc_, and the fixture's
 // helpers. Every non-Single run uses fresh fixture instances (SetUp, body,
@@ -35,9 +37,9 @@
 //                without a statement, so an ENV-only fixture must leave this
 //                mode out with ODBC_TEST_F_MODES rather than register it.
 //                The Driver Manager serializes calls per handle (Windows, and
-//                unixODBC at the Threading=1 run_e2e.sh sets), so only the DBC
-//                reads overlap the owner's calls in the driver; STMT reads run
-//                between them.
+//                unixODBC at the Threading=1 run_e2e.sh sets) except
+//                SQLCancel, so STMT reads run between the owner's calls; the
+//                fixture's diagnostics gate keeps them out of idle SQLCancel.
 //
 // Worker() and Iteration() identify the run (0, 0 when single-threaded).
 // WorkerToken() derives a value unique to the run, so a result delivered to
@@ -77,7 +79,9 @@
 //
 // ctest runs the concurrent variants of each converted executable as a separate
 // entry, <name>_mt, so they do not hide its single-threaded results; see
-// tests/e2e/CMakeLists.txt and the runners' stress profiles.
+// tests/e2e/CMakeLists.txt and the runners' stress profiles. Builds with
+// ODBC_E2E_CONCURRENT off (the Linux and macOS default) define
+// ODBC_E2E_SINGLE_THREADED and compile only the single-threaded test.
 
 #pragma once
 
@@ -109,6 +113,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -165,7 +170,26 @@ class WorkerScope {
 
 namespace detail {
 
-constexpr int kMaxConflictRetries = 10000;
+// A busy SharedDbc attempt waits a random time in [0, min(cap, base * 2^attempt)]
+// before rerunning. A fixed short wait livelocks long bodies: every restarted
+// attempt claims the connection again and knocks out whichever worker was
+// partway through. Measured at 8 x 20 on Linux, a 60-statement body finished 1
+// to 6 of 160 iterations before every worker exhausted a 1 ms retry loop.
+constexpr std::chrono::milliseconds kConflictBackoffBase{1};
+constexpr std::chrono::milliseconds kConflictBackoffCap{256};
+
+// Conflict retries stop at this share of MSSQL_ODBC_MT_TIMEOUT_SECONDS, so a
+// starved run fails with its last busy error before the watchdog kills it.
+constexpr int kConflictBudgetPercent = 80;
+
+template <typename Rng>
+std::chrono::microseconds ConflictBackoff(int attempt, Rng& rng) {
+    const int shift = attempt < 0 ? 0 : (attempt > 16 ? 16 : attempt);
+    const std::chrono::microseconds ceiling = std::min<std::chrono::microseconds>(
+        kConflictBackoffCap, kConflictBackoffBase * (1 << shift));
+    std::uniform_int_distribution<long long> pick(0, ceiling.count());
+    return std::chrono::microseconds(pick(rng));
+}
 
 // Returns false when |name| is unset; an empty value counts as set.
 inline bool ReadEnv(const char* name, std::string& value) {
@@ -484,9 +508,16 @@ enum class Outcome { kClean, kSkipped, kConflict, kFailed };
 
 // An iteration is a conflict only when every failure is explained by a busy
 // connection. Failure text carries the diagnostic when the body used
-// ASSERT_SQL_OK; a bare ASSERT_EQ on the return code does not, so the last
-// failure may instead be explained by the statement's own diagnostic.
-inline Outcome Classify(const ::testing::TestPartResultArray& parts, bool statement_busy) {
+// ASSERT_SQL_OK; a bare assertion on the return code does not, so the failure
+// that stopped the attempt on a busy statement is explained too, and so is a
+// last fatal failure (one in SetUp, which runs unarmed) while the statement
+// reports busy.
+struct AttemptFacts {
+    bool statement_busy = false;
+    int busy_stop_index = -1;
+};
+
+inline Outcome Classify(const ::testing::TestPartResultArray& parts, const AttemptFacts& facts) {
     int last_failure = -1;
     bool skipped = false;
     for (int i = 0; i < parts.size(); ++i) {
@@ -506,7 +537,8 @@ inline Outcome Classify(const ::testing::TestPartResultArray& parts, bool statem
             continue;
         }
         const bool explained_by_statement =
-            i == last_failure && part.fatally_failed() && statement_busy;
+            i == facts.busy_stop_index ||
+            (i == last_failure && part.fatally_failed() && facts.statement_busy);
         if (!explained_by_statement) {
             return Outcome::kFailed;
         }
@@ -559,6 +591,10 @@ struct WorkerResult {
     std::string skip_message;
 };
 
+// Thrown by AttemptReporter to end a SharedDbc attempt; RunCapturedIteration
+// catches it around the body and RunPhase lets it through.
+struct AttemptStopped {};
+
 // gtest turns an exception into a test failure only on the thread running the
 // test, and only around the calls it makes itself. The runners call fixture
 // phases themselves, often on other threads, where an escaping exception would
@@ -578,6 +614,8 @@ bool RunPhase(const char* location, F&& phase) {
     try {
         phase();
         return true;
+    } catch (const AttemptStopped&) {
+        throw;
     } catch (const std::exception& e) {
         message = std::string("C++ exception with description \"") + e.what() +
                   "\" thrown in " + location + ".";
@@ -603,6 +641,51 @@ bool RunPhase(const char* location, F&& phase) {
 template <typename T>
 using RetainedFixtures = std::vector<std::unique_ptr<T>>;
 
+// Records one attempt's failures for this thread only. In SharedDbc it also
+// ends the body at the first fatal failure, and at the first failure caused by
+// a busy connection (by its text, or by the statement's own diagnostic when the
+// assertion carries none). gtest's ASSERT returns only from the function it is
+// in, so a busy error inside a fixture helper such as ODBCTest::ExecDirect
+// would otherwise let the body go on to fail on the statement that never ran
+// (HY010), and that cascade is not a busy error Classify can retry. The
+// retried attempt reruns the body from the start, so nothing the stopped
+// attempt skipped goes unchecked.
+class AttemptReporter : public ::testing::ScopedFakeTestPartResultReporter {
+   public:
+    explicit AttemptReporter(::testing::TestPartResultArray* parts)
+        : ScopedFakeTestPartResultReporter(INTERCEPT_ONLY_CURRENT_THREAD, parts), parts_(parts) {}
+
+    void Arm(std::function<bool()> statement_busy) {
+        armed_ = true;
+        statement_busy_ = std::move(statement_busy);
+    }
+    void Disarm() { armed_ = false; }
+    // Index in the captured parts of the failure that stopped the attempt on a
+    // busy connection, or -1.
+    int BusyStopIndex() const { return busy_stop_index_; }
+
+    void ReportTestPartResult(const ::testing::TestPartResult& result) override {
+        ScopedFakeTestPartResultReporter::ReportTestPartResult(result);
+        if (!armed_ || !result.failed()) {
+            return;
+        }
+        const bool busy = MentionsConnectionBusy(result.message()) || statement_busy_();
+        if (busy || result.fatally_failed()) {
+            armed_ = false;
+            if (busy) {
+                busy_stop_index_ = parts_->size() - 1;
+            }
+            throw AttemptStopped{};
+        }
+    }
+
+   private:
+    ::testing::TestPartResultArray* parts_;
+    bool armed_ = false;
+    std::function<bool()> statement_busy_;
+    int busy_stop_index_ = -1;
+};
+
 // Runs one iteration with its failures captured for this thread only. Workers
 // must not report into, or read, the current test's shared TestResult while
 // other workers write to it: gtest appends to it under a lock but reads it
@@ -610,9 +693,8 @@ using RetainedFixtures = std::vector<std::unique_ptr<T>>;
 template <typename T>
 void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
                           const std::string& tag, ::testing::TestPartResultArray& parts,
-                          bool& statement_busy, RetainedFixtures<T>& retained) {
-    ::testing::ScopedFakeTestPartResultReporter reporter(
-        ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD, &parts);
+                          AttemptFacts& facts, RetainedFixtures<T>& retained) {
+    AttemptReporter reporter(&parts);
     SCOPED_TRACE(tag);
     std::unique_ptr<T> test;
     // Retains the fixture on every path out, including a throwing constructor.
@@ -635,10 +717,18 @@ void RunCapturedIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int i
         set_up = set_up && !part.fatally_failed() && !part.skipped();
     }
     if (set_up) {
-        RunPhase("the test body", [&] { test->ConcurrentBody(); });
+        if (mode == kSharedDbc) {
+            reporter.Arm([&test] { return test->ConcurrentStatementBusy(); });
+        }
+        try {
+            RunPhase("the test body", [&] { test->ConcurrentBody(); });
+        } catch (const AttemptStopped&) {
+        }
+        reporter.Disarm();
+        facts.busy_stop_index = reporter.BusyStopIndex();
     }
     RunPhase("TearDown()", [&] {
-        statement_busy = StatementReportsBusy(test->ConcurrentStmt());
+        facts.statement_busy = test->ConcurrentStatementBusy();
         test->ConcurrentTearDown();
     });
 }
@@ -649,9 +739,9 @@ bool RunSharedEnvIteration(SQLHENV env, Mode mode, int worker, int iteration,
                            const std::string& tag, WorkerResult& result,
                            RetainedFixtures<T>& retained) {
     ::testing::TestPartResultArray parts;
-    bool statement_busy = false;
-    RunCapturedIteration<T>(env, SQL_NULL_HDBC, mode, worker, iteration, tag, parts,
-                            statement_busy, retained);
+    AttemptFacts facts;
+    RunCapturedIteration<T>(env, SQL_NULL_HDBC, mode, worker, iteration, tag, parts, facts,
+                            retained);
     bool failed = false;
     bool skipped = false;
     for (int i = 0; i < parts.size(); ++i) {
@@ -669,18 +759,21 @@ bool RunSharedEnvIteration(SQLHENV env, Mode mode, int worker, int iteration,
     return true;
 }
 
-// SharedDbc: an iteration whose only failures are a busy connection is retried
-// instead of failing the test.
+// SharedDbc: an iteration whose only failures are a busy connection is retried,
+// with ConflictBackoff between attempts, until |deadline|.
 template <typename T>
 bool RunSharedDbcIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int iteration,
                            const std::string& tag, WorkerResult& result,
-                           RetainedFixtures<T>& retained) {
+                           RetainedFixtures<T>& retained,
+                           std::chrono::steady_clock::time_point deadline,
+                           void (*wait)(std::chrono::microseconds) = nullptr) {
+    std::minstd_rand rng(static_cast<unsigned>(worker) * 1000003u +
+                         static_cast<unsigned>(iteration) + 1u);
     for (int attempt = 0;; ++attempt) {
         ::testing::TestPartResultArray parts;
-        bool statement_busy = false;
-        RunCapturedIteration<T>(env, dbc, mode, worker, iteration, tag, parts, statement_busy,
-                                retained);
-        switch (Classify(parts, statement_busy)) {
+        AttemptFacts facts;
+        RunCapturedIteration<T>(env, dbc, mode, worker, iteration, tag, parts, facts, retained);
+        switch (Classify(parts, facts)) {
             case Outcome::kClean:
                 return true;
             case Outcome::kSkipped:
@@ -691,13 +784,27 @@ bool RunSharedDbcIteration(SQLHENV env, SQLHDBC dbc, Mode mode, int worker, int 
                 return false;
             case Outcome::kConflict:
                 ++result.conflicts;
-                if (attempt >= kMaxConflictRetries) {
-                    ADD_FAILURE() << tag << ": connection still busy after "
-                                  << kMaxConflictRetries
-                                  << " retries; last: " << FirstMessage(parts);
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now < deadline) {
+                        const std::chrono::microseconds pause = (std::min)(
+                            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now),
+                            ConflictBackoff(attempt, rng));
+                        if (wait != nullptr) {
+                            wait(pause);
+                        } else {
+                            std::this_thread::sleep_for(pause);
+                        }
+                    }
+                }
+                // Checked after the wait: a wait clamped to the deadline must not
+                // start another attempt past it.
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    ADD_FAILURE() << tag << ": connection still busy after " << (attempt + 1)
+                                  << " attempts, at the retry deadline; last: "
+                                  << FirstMessage(parts);
                     return false;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 break;
         }
     }
@@ -731,6 +838,9 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
     std::atomic<bool> stop{false};
     StartGate gate(config.threads);
     const auto started = std::chrono::steady_clock::now();
+    const auto conflict_deadline =
+        started + std::chrono::milliseconds(std::chrono::seconds(config.timeout_seconds)) *
+                      kConflictBudgetPercent / 100;
     {
         Watchdog watchdog(label, std::chrono::seconds(config.timeout_seconds), progress);
         std::vector<std::thread> workers;
@@ -750,7 +860,8 @@ void RunConcurrent(T& coordinator, Mode mode, const char* name) {
                                                       results[index], retained[index]);
                     } else {
                         ok = RunSharedDbcIteration<T>(env, dbc, mode, worker, iteration, tag,
-                                                      results[index], retained[index]);
+                                                      results[index], retained[index],
+                                                      conflict_deadline);
                     }
                     if (!ok) {
                         stop.store(true);
@@ -931,8 +1042,11 @@ inline bool CheckDiagnostics(SQLSMALLINT type, SQLHANDLE handle, std::string& er
 // thread reports it, so no thread writes the test's result while the owner
 // reads it. MSSQL_ODBC_MT_THREADS=1 runs the owner alone, which is how a
 // SharedStmt failure is told apart from a plain bug in the body.
-// CancelIdleStatement excludes observers only during SQLCancel, whose DM
-// diagnostic-list cleanup is not protected by unixODBC's Threading=1.
+// CancelIdleStatement stops admitting diagnostic readers before waiting for
+// existing readers to leave, then excludes them during SQLCancel. See its
+// comment: unixODBC does not protect the DM's diagnostic cleanup, and
+// msodbcsql treats a cancel that overlaps a STMT diagnostic read as a
+// cross-thread cancel and leaves the idle cursor open.
 template <typename T>
 void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     const Config config = LoadConfig();
@@ -948,7 +1062,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
     std::shared_mutex handles_mutex;
     SQLHSTMT observed_stmt = SQL_NULL_HSTMT;
     SQLHDBC observed_dbc = SQL_NULL_HDBC;
-    std::shared_mutex* observed_diagnostics_mutex = nullptr;
+    OdbcDiagnosticsMutex* observed_diagnostics_mutex = nullptr;
     std::atomic<bool> retracting{false};
     std::atomic<bool> stop{false};
     std::atomic<bool> observer_failed{false};
@@ -995,7 +1109,7 @@ void RunSharedStmt(T& coordinator, Mode mode, const char* name) {
                         {
                             std::shared_lock<std::shared_mutex> lock(handles_mutex);
                             if (observed_stmt != SQL_NULL_HSTMT) {
-                                std::shared_lock<std::shared_mutex> diagnostics_lock(
+                                std::shared_lock<OdbcDiagnosticsMutex> diagnostics_lock(
                                     *observed_diagnostics_mutex);
                                 if (!CheckDiagnostics(SQL_HANDLE_STMT, observed_stmt, error) ||
                                     !CheckDiagnostics(SQL_HANDLE_DBC, observed_dbc, error)) {
@@ -1179,6 +1293,12 @@ inline ::testing::Environment* const kUnattendedCrashReporting =
 
 template <typename T>
 void RunTest(T& test, Mode mode, const char* name) {
+#ifdef ODBC_E2E_SINGLE_THREADED
+    // Register() keeps only kSingle, and no mode runner is instantiated.
+    (void)mode;
+    (void)name;
+    test.ConcurrentBody();
+#else
     if (mode != kSingle) {
         unsigned skipped = 0;
         std::string error;
@@ -1206,12 +1326,16 @@ void RunTest(T& test, Mode mode, const char* name) {
             return;
     }
     ADD_FAILURE() << name << ": unhandled mode " << static_cast<unsigned>(mode);
+#endif
 }
 
 // The factory returns Fixture*, so gtest files these tests under the same
 // fixture id as TEST_F and both macros can share a suite.
 template <typename Fixture, typename T>
 bool Register(const char* suite, const char* name, const char* file, int line, unsigned modes) {
+#ifdef ODBC_E2E_SINGLE_THREADED
+    modes &= kSingle;
+#endif
     for (Mode mode : kModes) {
         if ((modes & mode) == 0) {
             continue;
@@ -1258,7 +1382,11 @@ bool Register(const char* suite, const char* name, const char* file, int line, u
         SQLHENV ConcurrentEnv() const { return env_; }                                         \
         SQLHDBC ConcurrentDbc() const { return dbc_; }                                         \
         SQLHSTMT ConcurrentStmt() const { return stmt_; }                                      \
-        std::shared_mutex& ConcurrentDiagnosticsMutex() { return diagnostics_mutex_; }        \
+        bool ConcurrentStatementBusy() const {                                                 \
+            return ::odbc_concurrency::detail::StatementReportsBusy(stmt_);                    \
+        }                                                                                      \
+        OdbcDiagnosticsMutex& ConcurrentDiagnosticsMutex() { return diagnostics_mutex_; }      \
+        ::odbc_concurrency::Mode CurrentMode() const { return mode_; }                         \
                                                                                                \
        private:                                                                                \
         ::odbc_concurrency::Mode mode_;                                                        \
@@ -1270,3 +1398,16 @@ bool Register(const char* suite, const char* name, const char* file, int line, u
 
 #define ODBC_TEST_F(Fixture, Name) \
     ODBC_TEST_F_MODES(Fixture, Name, ::odbc_concurrency::kDefaultModes)
+
+// In an ODBC_TEST_F body: skips the msodbcsql comparison leg in |mode| only,
+// for a body that is valid there but that the reference driver fails under that
+// contention. mssql-odbc still runs the mode. Record the measured symptom at
+// the call site.
+#define SKIP_MSODBCSQL_IN_MODE(mode)                                                      \
+    do {                                                                                  \
+        const char* _target = std::getenv("ODBC_TEST_TARGET");                            \
+        if (CurrentMode() == (mode) && _target && std::string(_target) == "msodbcsql") { \
+            GTEST_SKIP() << "msodbcsql fails this body in /"                              \
+                         << ::odbc_concurrency::ModeName(mode);                           \
+        }                                                                                 \
+    } while (0)

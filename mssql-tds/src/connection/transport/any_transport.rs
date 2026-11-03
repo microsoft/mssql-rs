@@ -384,6 +384,14 @@ impl AnyTransport {
         }
     }
 
+    pub(crate) fn abort_transport(&mut self) {
+        match self {
+            Self::Network(transport) => TdsTransport::abort_transport(transport),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.abort_transport(),
+        }
+    }
+
     /// Dispatches ATTENTION with the parser state needed to drain queued rows.
     ///
     /// Row tokens are not self-describing, so the network transport needs the
@@ -433,6 +441,14 @@ impl AnyTransport {
             Self::Network(transport) => TdsTransport::connection_known_dead(transport),
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.connection_known_dead(),
+        }
+    }
+
+    pub(crate) fn response_fully_received(&self) -> bool {
+        match self {
+            Self::Network(transport) => TdsTransport::response_fully_received(transport),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.response_fully_received(),
         }
     }
 
