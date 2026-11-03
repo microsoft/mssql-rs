@@ -245,6 +245,29 @@ function(add_odbc_direct_load_test TEST_NAME)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# Helper function: a multithreaded-only test (tests/multithreaded_tests/) that
+# reads the MSSQL_ODBC_MT_* settings itself rather than through ODBC_TEST_F.
+# It has no single-threaded form, so it registers only <name>_mt, labelled "mt"
+# and "mt_weekly": only the weekly profile runs it (PR and nightly exclude
+# mt_weekly). It is built only with ODBC_E2E_CONCURRENT.
+# Usage:  add_odbc_mt_only_test(name sources...)
+# ---------------------------------------------------------------------------
+function(add_odbc_mt_only_test TEST_NAME)
+    if(NOT ODBC_E2E_CONCURRENT)
+        return()
+    endif()
+    add_executable(${TEST_NAME} ${ARGN} lib/odbc_skip_aware_main.cpp)
+    target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib)
+    if(UNIX)
+        add_test(NAME ${TEST_NAME}_mt
+                 COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/run_mt_test.sh" $<TARGET_FILE:${TEST_NAME}>)
+    else()
+        add_test(NAME ${TEST_NAME}_mt COMMAND ${TEST_NAME})
+    endif()
+    set_tests_properties(${TEST_NAME}_mt PROPERTIES SKIP_RETURN_CODE 77 LABELS "mt;mt_weekly")
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 enable_testing()
@@ -295,6 +318,7 @@ endif()
 set_tests_properties(cancel_test PROPERTIES TIMEOUT 30)
 add_odbc_test(shared_connection_busy_test tests/multithreaded_tests/shared_connection_busy_test.cpp)
 add_odbc_test(concurrent_harness_test tests/multithreaded_tests/concurrent_harness_test.cpp)
+add_odbc_mt_only_test(handle_lifecycle_test tests/multithreaded_tests/handle_lifecycle_test.cpp)
 add_odbc_test(more_results_test  tests/more_results_test.cpp)
 add_odbc_test(output_params_test tests/output_params_test.cpp)
 add_odbc_test(dml_output_test    tests/dml_output_test.cpp)
