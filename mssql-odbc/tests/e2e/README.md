@@ -632,7 +632,9 @@ pwsh -File .\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\od
 ```
 
 `-BuildOnly` requires PowerShell 7 or later (`pwsh`) and rejects Windows
-PowerShell 5.1 before starting a build.
+PowerShell 5.1 before starting a build. Relative `-OutDir` paths resolve against
+the current PowerShell location. `-BuildOnly -Release` is rejected: the drop
+requires a debug driver with symbols.
 
 `-BuildJobs N` bounds parallel C++ build processes. The stress producer selects
 the smaller of four and the logical CPU count; other runner invocations retain

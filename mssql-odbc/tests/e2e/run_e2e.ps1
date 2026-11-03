@@ -104,6 +104,9 @@ $ErrorActionPreference = "Stop"
 if ($BuildOnly -and $PSVersionTable.PSVersion.Major -lt 7) {
     throw "-BuildOnly requires PowerShell 7 or later; run this script with pwsh."
 }
+if ($BuildOnly -and $Release) {
+    throw "-BuildOnly cannot be combined with -Release; prebuilt drops require a debug driver with symbols."
+}
 if ($BuildOnly -and ($SkipBuild -or $Coverage -or $CompareWithMsodbcsql)) {
     throw "-BuildOnly cannot be combined with -SkipBuild, -Coverage, or -CompareWithMsodbcsql."
 }
@@ -777,7 +780,7 @@ function Remove-IncompatibleCMakeBuildTree([string]$BuildDir) {
 
 function Export-PrebuiltTests([string]$DriverPath, [string]$Destination) {
     $buildDir = Join-Path $ScriptDir "build"
-    $destinationPath = [IO.Path]::GetFullPath($Destination)
+    $destinationPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
     if (Test-Path $destinationPath) {
         throw "Prebuilt output directory already exists: $destinationPath"
     }

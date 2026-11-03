@@ -218,7 +218,8 @@ $runner = Join-Path $env:PRODUCER 'run_e2e.ps1'
 [IO.File]::WriteAllText($runner, $source)
 $buildArgs = @{}
 if ($env:BUILD_JOBS) { $buildArgs.BuildJobs = [int]$env:BUILD_JOBS }
-& $runner -BuildOnly -OutDir $env:DROP @buildArgs
+Set-Location (Split-Path -Parent $env:DROP)
+& $runner -BuildOnly -OutDir (Split-Path -Leaf $env:DROP) @buildArgs
 """
     log = tmp_path / "cmake.log"
     env = {**os.environ, "RUNNER": str(_WINDOWS_E2E), "PRODUCER": str(producer),
@@ -367,6 +368,8 @@ $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
         (["-BuildOnly"], "-BuildOnly and -OutDir"),
         (["-OutDir", "unused"], "-BuildOnly and -OutDir"),
         (["-BuildOnly", "-SkipBuild"], "-BuildOnly cannot be combined"),
+        (["-BuildOnly", "-Release", "-OutDir", "unused"],
+         "-BuildOnly cannot be combined with -Release"),
         (["-SkipBuild", "-Coverage"], "-SkipBuild cannot be combined"),
         (["-SkipBuild", "-Release"], "-SkipBuild cannot be combined with -Release"),
         (["-BuildJobs", "0"], "BuildJobs"),
