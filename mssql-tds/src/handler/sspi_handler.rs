@@ -198,6 +198,19 @@ impl SspiAuthHandler {
         Ok(Some(result.data))
     }
 
+    /// [`Self::process_challenge`] on a blocking thread, so a security context
+    /// that blocks cannot stall the login's timeout and cancellation.
+    pub(crate) async fn process_challenge_off_runtime(
+        mut self,
+        challenge: Vec<u8>,
+    ) -> TdsResult<(Self, Option<Vec<u8>>)> {
+        crate::connection::blocking::off_runtime_thread(move || {
+            let response = self.process_challenge(&challenge)?;
+            Ok((self, response))
+        })
+        .await
+    }
+
     /// Returns true if authentication is complete.
     #[cfg(test)]
     pub(crate) fn is_complete(&self) -> bool {
@@ -303,5 +316,54 @@ mod tests {
         let mut handler = SspiAuthHandler::new(&config, "host", 1433, Some(&MockProvider)).unwrap();
 
         assert_eq!(handler.get_initial_token().unwrap(), b"custom");
+    }
+
+    /// Records the thread each challenge round runs on.
+    struct ThreadRecordingContext(
+        MockSecurityContext,
+        std::sync::mpsc::Sender<std::thread::ThreadId>,
+    );
+
+    impl SecurityContext for ThreadRecordingContext {
+        fn package_name(&self) -> &str {
+            self.0.package_name()
+        }
+        fn generate_token(
+            &mut self,
+            server_token: Option<&[u8]>,
+        ) -> Result<crate::security::SspiAuthToken, SecurityError> {
+            if server_token.is_some() {
+                self.1.send(std::thread::current().id()).unwrap();
+            }
+            self.0.generate_token(server_token)
+        }
+        fn is_complete(&self) -> bool {
+            self.0.is_complete()
+        }
+        fn spn(&self) -> &str {
+            self.0.spn()
+        }
+    }
+
+    /// A provider's challenge round can block, so it must not run on the
+    /// thread polling the login's timeout and cancellation.
+    #[tokio::test]
+    async fn test_challenge_runs_off_the_runtime_thread() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mock = MockSecurityContext::multi_round(b"t1".to_vec(), b"t3".to_vec());
+        let mut handler = SspiAuthHandler::with_context(
+            Box::new(ThreadRecordingContext(mock, tx)),
+            "MSSQLSvc/server:1433".to_string(),
+        );
+        handler.get_initial_token().unwrap();
+
+        let (handler, response) = handler
+            .process_challenge_off_runtime(b"t2".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(response.as_deref(), Some(&b"t3"[..]));
+        assert!(handler.is_complete());
+        assert_ne!(rx.recv().unwrap(), std::thread::current().id());
     }
 }

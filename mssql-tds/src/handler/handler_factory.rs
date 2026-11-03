@@ -648,7 +648,7 @@ impl LoginHandler<'_> {
                 )
             })?;
 
-            let handler = sspi_handler.as_mut().ok_or_else(|| {
+            let handler = sspi_handler.take().ok_or_else(|| {
                 Error::ProtocolError(
                     "Received SSPI challenge but no SSPI handler available".to_string(),
                 )
@@ -660,7 +660,10 @@ impl LoginHandler<'_> {
             );
 
             // Process the challenge and generate response
-            let response_opt = handler.process_challenge(&sspi_challenge.data)?;
+            let (handler, response_opt) = handler
+                .process_challenge_off_runtime(sspi_challenge.data.clone())
+                .await?;
+            sspi_handler = Some(handler);
             match response_opt {
                 Some(response_token) => {
                     debug!("Sending SSPI response ({} bytes)", response_token.len());
