@@ -200,19 +200,14 @@ impl<'a> SqlRpc<'a> {
         self.write_named_parameters(packet_writer).await
     }
 
-    /// Writes a non-first batch command synchronously when its exact encoded
-    /// length ends strictly before the current packet boundary, returning
-    /// `false` (having written nothing) otherwise.
+    /// Writes a non-first batch command without awaiting when its exact
+    /// encoded length ends strictly before the packet boundary; otherwise
+    /// returns `false` having written nothing.
     ///
-    /// Under that bound [`Self::serialize_batch_command`] would not flush, and
-    /// sends are the only place it can suspend, observe cancellation or the
-    /// deadline, or change EOM state; the buffer bytes are all it would change.
-    /// So writing the same bytes here leaves the writer, and every later
-    /// packet, identical. The point is to skip building and moving that
-    /// method's KB-sized future, once per row. The bound is strict: a command
-    /// filling the packet exactly is flushed at different points by different
-    /// async primitives, which decides whether `finalize` sends a header-only
-    /// EOM, so it stays on the async path.
+    /// Below the boundary the async path cannot flush, so it changes only
+    /// buffer bytes. The bound is strict because an exact fill is flushed at
+    /// different points by different async primitives, which decides whether
+    /// `finalize` sends a header-only EOM.
     pub(crate) fn try_write_batch_command_within_packet(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -757,8 +752,12 @@ mod tests {
     /// Writes `rows` as one batch either through `serialize_batch_command`
     /// alone or through the production try-then-fallback sequence in
     /// `execute_sp_execute_batch`.
-    fn run_batch(packet_size: u32, rows: &[Vec<RpcParameter>], fast_path: bool) -> BatchRun {
-        let collation = SqlCollation::default();
+    fn run_batch(
+        packet_size: u32,
+        collation: &SqlCollation,
+        rows: &[Vec<RpcParameter>],
+        fast_path: bool,
+    ) -> BatchRun {
         let mut context = ExecutionContext::new();
         context.set_transaction_descriptor(1);
         let mut mock = MockNetworkWriter::new(packet_size);
@@ -771,7 +770,7 @@ mod tests {
                     RpcType::ProcId(RpcProcs::Execute),
                     Some(row.clone()),
                     None,
-                    &collation,
+                    collation,
                     &context,
                     first,
                 );
@@ -796,7 +795,7 @@ mod tests {
     /// Encoded command length measured on the async path alone, in a packet
     /// large enough that nothing flushes.
     fn command_len(row: &[RpcParameter], first: bool) -> usize {
-        let collation = SqlCollation::default();
+        let collation = db_collation();
         let mut context = ExecutionContext::new();
         context.set_transaction_descriptor(1);
         let mut mock = MockNetworkWriter::new(32767);
@@ -814,6 +813,26 @@ mod tests {
         drop(writer);
         assert!(mock.data.is_empty());
         length
+    }
+
+    /// Non-zero so a swapped or misplaced collation field changes the wire.
+    fn db_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0x00D0_0409,
+            lcid_language_id: 0x0409,
+            col_flags: 0x0D,
+            sort_id: 52,
+        }
+    }
+
+    /// Differs from [`db_collation`]; NVARCHAR TYPE_INFO must never carry it.
+    fn value_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0x0010_0411,
+            lcid_language_id: 0x0411,
+            col_flags: 0x01,
+            sort_id: 0,
+        }
     }
 
     fn param(value: SqlType) -> RpcParameter {
@@ -898,7 +917,7 @@ mod tests {
                     param(SqlType::NVarchar(
                         Some(SqlString::new(
                             vec![0x41, 0, 0x42, 0],
-                            EncodingType::LcidBased(SqlCollation::default()),
+                            EncodingType::LcidBased(value_collation()),
                         )),
                         2,
                     )),
@@ -957,7 +976,7 @@ mod tests {
     fn batch_fast_path_matches_async_wire_across_packet_boundaries() {
         for packet_size in [512u32, 4096, 16192] {
             let max_payload = usize::try_from(packet_size).unwrap() - 8;
-            let row_count = 3 * max_payload / 40;
+            let row_count = 2 * max_payload / 40;
             let (mut rows, mut eligible): (Vec<_>, Vec<_>) =
                 (1..=row_count).map(matrix_row).unzip();
             // Full-width NVARCHAR(4000) commands: only a 16192-byte packet can
@@ -975,8 +994,8 @@ mod tests {
             for shift in 0..=100 {
                 let mut batch = vec![shift_row(shift)];
                 batch.extend(rows.iter().cloned());
-                let slow = run_batch(packet_size, &batch, false);
-                let fast = run_batch(packet_size, &batch, true);
+                let slow = run_batch(packet_size, &db_collation(), &batch, false);
+                let fast = run_batch(packet_size, &db_collation(), &batch, true);
                 assert_eq!(slow.result, "Ok(())");
                 assert_eq!(fast.result, slow.result);
                 assert_eq!(fast.wire, slow.wire, "packet {packet_size}, shift {shift}");
@@ -1035,8 +1054,8 @@ mod tests {
                 let (chars, shift) = (target / 2, target % 2);
                 let batch = vec![shift_row(shift), final_row(chars)];
                 assert_eq!(command_len(&batch[1], false), empty + 2 * chars);
-                let slow = run_batch(packet_size, &batch, false);
-                let fast = run_batch(packet_size, &batch, true);
+                let slow = run_batch(packet_size, &db_collation(), &batch, false);
+                let fast = run_batch(packet_size, &db_collation(), &batch, true);
                 assert_eq!(fast.commands[1].0, base + shift);
                 assert_eq!(slow.result, "Ok(())");
                 assert_eq!(fast.result, slow.result);
@@ -1061,7 +1080,7 @@ mod tests {
         let odd = SqlType::NVarchar(
             Some(SqlString::new(
                 vec![0x41, 0, 0x42],
-                EncodingType::LcidBased(SqlCollation::default()),
+                EncodingType::LcidBased(value_collation()),
             )),
             10,
         );
@@ -1073,8 +1092,8 @@ mod tests {
                     batch.extend((1..at).map(|index| matrix_row(index).0));
                     batch.push(vec![param(SqlType::Int(Some(42))), param(invalid.clone())]);
                     batch.push(matrix_row(at + 1).0);
-                    let slow = run_batch(packet_size, &batch, false);
-                    let fast = run_batch(packet_size, &batch, true);
+                    let slow = run_batch(packet_size, &db_collation(), &batch, false);
+                    let fast = run_batch(packet_size, &db_collation(), &batch, true);
                     assert!(
                         slow.result.starts_with("Err(UsageError("),
                         "{}",
@@ -1129,7 +1148,7 @@ mod tests {
     fn prepared_insert_batch_fast_path_matches_async_wire() {
         for packet_size in [512u32, 4096, 8000, 16192] {
             let rows: Vec<_> = (0..2000).map(insert_parameters).collect();
-            let fast = run_batch(packet_size, &rows, true);
+            let fast = run_batch(packet_size, &SqlCollation::default(), &rows, true);
             assert_eq!(fast.result, "Ok(())");
             assert_eq!(fast.wire, serialize_insert_batch(packet_size));
             let hits = fast.commands.iter().filter(|&&(_, fast)| fast).count();
@@ -1142,6 +1161,24 @@ mod tests {
             assert!(
                 hits + 2 * packets + 1 >= 2000,
                 "{packet_size}: {hits} fast commands"
+            );
+
+            // NVARCHAR(15) TYPE_INFO built by hand: the database collation,
+            // info little-endian then sort_id.
+            let collated = run_batch(packet_size, &db_collation(), &rows, true);
+            let slow = run_batch(packet_size, &db_collation(), &rows, false);
+            assert_eq!(collated.wire, slow.wire);
+            let mut payload = Vec::new();
+            for packet in collated.wire.chunks(usize::try_from(packet_size).unwrap()) {
+                payload.extend_from_slice(&packet[8..]);
+            }
+            let type_info = [0xe7, 30, 0, 0x09, 0x04, 0xd0, 0x00, 52];
+            assert_eq!(
+                payload
+                    .windows(type_info.len())
+                    .filter(|window| *window == type_info)
+                    .count(),
+                2000
             );
         }
     }
