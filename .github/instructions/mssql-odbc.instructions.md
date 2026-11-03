@@ -162,9 +162,13 @@ on the `master` branch.
     mirroring msodbcsql's `IDS_*` resource entries. In new code, prefer
     adding/using an `ERR_*` `DiagMsg` constant over inlining `post_sql_error`
     with a literal — especially when the same `(SQLSTATE, message)` pair
-    appears, or could appear, in more than one place.
+    appears, or could appear, in more than one place. Declare new constants
+    inside the `diag_msgs!` block: it builds the prefixed text at compile time
+    so `post_diag` stores a borrowed `&'static str` without allocating, which
+    matters on hot paths such as the `01004` of a `SQLGetData` length probe.
   - `post_sql_error(state, sqlstate, native, message)` — the lower-level
-    primitive behind `post_diag`. Use it directly only for genuinely one-off
+    primitive for driver text built at runtime (`post_diag` bypasses it and
+    posts the precomputed `DiagMsg` text). Use it directly only for genuinely one-off
     or **dynamic** messages (text computed at runtime) that don't warrant a
     constant. Posts exactly one record.
   - `post_tds_error(state, &tds_err, default_sqlstate)` — for any
