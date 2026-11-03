@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use tracing::error;
 
@@ -13,11 +13,13 @@ use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 use mssql_tds::core::CancelHandle;
 use mssql_tds::error::Error as TdsError;
 
+use super::dbc::DbcState;
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::wire::WireLease;
-use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
+use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_from_raw, handle_to_raw};
 use crate::api::odbc_types::{
-    self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
+    self, SQL_DESC_ALLOC_AUTO, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
+    SqlUSmallInt,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::conversion::client_encoding::ClientEncoding;
@@ -534,6 +536,9 @@ pub(crate) struct StmtState {
     /// `SQLExecute`. `Some` marks the statement as prepared; the handle is filled
     /// after the first execute.
     pub(crate) prepared: Option<PreparedPlan>,
+    /// Earliest changed IPD ordinal since the last execution snapshot began.
+    /// Survives a plan being staged, restored, or materialized by that execution.
+    parameter_definition_changed: Option<usize>,
     /// Marker count of the accepted direct SQL, independent of a prepared plan.
     /// Retained across cursor close and parameter reset; replaced by new SQL.
     pub(crate) direct_marker_count: Option<usize>,
@@ -1396,6 +1401,64 @@ pub(crate) struct PreparedPlan {
     pub(crate) original_sql: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StatementDescriptor {
+    Ard,
+    Apd,
+    Ird,
+    Ipd,
+}
+
+impl StatementDescriptor {
+    pub(crate) fn resolve(self, state: &StmtState, stmt: &StmtHandle) -> SqlHandle {
+        match self {
+            Self::Ard => state.effective_ard(stmt),
+            Self::Apd => state.effective_apd(stmt),
+            Self::Ird => stmt.ird,
+            Self::Ipd => stmt.ipd,
+        }
+    }
+
+    fn implicit(self, stmt: &StmtHandle) -> SqlHandle {
+        match self {
+            Self::Ard => stmt.ard,
+            Self::Apd => stmt.apd,
+            Self::Ird => stmt.ird,
+            Self::Ipd => stmt.ipd,
+        }
+    }
+}
+
+/// Keeps an explicit descriptor registered until the last descriptor access.
+/// Implicit descriptors borrow the statement's lifetime without a parent lock.
+pub(crate) struct DescriptorAccess<'a> {
+    desc: &'a DescHandle,
+    parent: Option<MutexGuard<'a, DbcState>>,
+}
+
+impl std::ops::Deref for DescriptorAccess<'_> {
+    type Target = DescHandle;
+
+    fn deref(&self) -> &DescHandle {
+        self.desc
+    }
+}
+
+impl DescriptorAccess<'_> {
+    pub(crate) fn readers_through(
+        &self,
+        want_fetch: bool,
+        want_exec: bool,
+    ) -> Result<(bool, bool), ()> {
+        match &self.parent {
+            Some(parent) => self
+                .desc
+                .readers_through_locked(parent, want_fetch, want_exec),
+            None => self.desc.readers_through(want_fetch, want_exec),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParameterDescription {
     pub(crate) data_type: SqlSmallInt,
@@ -1405,6 +1468,17 @@ pub(crate) struct ParameterDescription {
 }
 
 impl StmtState {
+    pub(crate) fn apply_parameter_definition_changes(&mut self) {
+        if let Some(first_changed) = self.parameter_definition_changed.take()
+            && self
+                .prepared
+                .as_ref()
+                .is_some_and(|plan| first_changed <= plan.marker_count)
+        {
+            self.orphan_prepared_handle();
+        }
+    }
+
     pub(crate) fn has_state(&self, mask: u32) -> bool {
         (self.state_flags & mask) != 0
     }
@@ -1735,6 +1809,40 @@ impl Drop for StatementCancel<'_> {
 }
 
 impl StmtHandle {
+    /// Re-resolves an explicit association under DBC -> STMT, then retains
+    /// only DBC while the caller accesses DESC. Never retain across I/O.
+    pub(crate) fn access_descriptor(
+        &self,
+        role: StatementDescriptor,
+        resolved: SqlHandle,
+    ) -> Result<DescriptorAccess<'_>, ()> {
+        let implicit = role.implicit(self);
+        let (raw, parent) = if self.owns_implicit_desc(resolved) {
+            (resolved, None)
+        } else {
+            let Ok(parent) = self.parent_dbc().inner.lock() else {
+                error!("accessing statement descriptor: dbc mutex poisoned");
+                return Err(());
+            };
+            let raw = {
+                let Ok(state) = self.inner.lock() else {
+                    error!("accessing statement descriptor: stmt mutex poisoned");
+                    return Err(());
+                };
+                role.resolve(&state, self)
+            };
+            if raw != implicit && !parent.descriptors.contains(&raw) {
+                error!("accessing statement descriptor: association is not registered");
+                return Err(());
+            }
+            (raw, Some(parent))
+        };
+        // SAFETY: implicit descriptors live with self; explicit descriptors
+        // cannot be unregistered or freed while the parent guard is held.
+        let desc = unsafe { handle_from_raw::<DescHandle>(raw) };
+        Ok(DescriptorAccess { desc, parent })
+    }
+
     #[cfg(test)]
     pub(crate) fn cancellation_state_for_test(&self) -> (bool, bool) {
         let state = self.cancel.lock().unwrap();
@@ -1894,6 +2002,11 @@ impl StmtHandle {
             error!("invalidating parameter definition: stmt mutex poisoned");
             return Err(());
         };
+        state.parameter_definition_changed = Some(
+            state
+                .parameter_definition_changed
+                .map_or(first_changed, |previous| previous.min(first_changed)),
+        );
         if state
             .prepared
             .as_ref()
@@ -1949,6 +2062,7 @@ impl StmtHandle {
                 pending_fetch_error: None,
                 pending_output_params: None,
                 prepared: None,
+                parameter_definition_changed: None,
                 direct_marker_count: None,
                 parameter_metadata: Vec::new(),
                 parameter_udt_names: Vec::new(),
@@ -2009,8 +2123,8 @@ impl StmtHandle {
     /// Those are allocated in `new`, never reassigned, rejected by `free_desc`
     /// with `HY017`, and freed only in `Drop`, so they are live for as long as
     /// `&self` is. A caller holding `&self` may dereference such a `raw`
-    /// without the process-global `live_type` lookup; every other descriptor,
-    /// explicit ones in particular, still needs it.
+    /// without the process-global `live_type` lookup. Explicit descriptors
+    /// need the parent guard from `access_descriptor` instead.
     pub(crate) fn owns_implicit_desc(&self, raw: *mut c_void) -> bool {
         raw == self.ard || raw == self.apd || raw == self.ird || raw == self.ipd
     }
@@ -2056,6 +2170,66 @@ mod tests {
         assert!(!stmt.owns_implicit_desc(explicit));
         assert!(!stmt.owns_implicit_desc(std::ptr::null_mut()));
         assert!(!stmt.owns_implicit_desc(h.stmt));
+    }
+
+    #[test]
+    fn implicit_descriptor_access_does_not_lock_parent() {
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let _parent = stmt.parent_dbc().inner.lock().unwrap();
+        for role in [
+            StatementDescriptor::Ard,
+            StatementDescriptor::Apd,
+            StatementDescriptor::Ird,
+            StatementDescriptor::Ipd,
+        ] {
+            let access = stmt.access_descriptor(role, role.implicit(stmt)).unwrap();
+            assert!(access.parent.is_none());
+            assert!(!access.is_explicit());
+        }
+    }
+
+    #[test]
+    fn explicit_descriptor_access_holds_parent_and_reresolves_after_free() {
+        use crate::api::odbc_types::{SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC};
+        use std::sync::mpsc;
+
+        for (role, attribute) in [
+            (StatementDescriptor::Ard, SQL_ATTR_APP_ROW_DESC),
+            (StatementDescriptor::Apd, SQL_ATTR_APP_PARAM_DESC),
+        ] {
+            let mut h = crate::test_support::TestHandles::with_env_dbc_stmt();
+            let explicit = h.alloc_explicit_desc();
+            assert_eq!(
+                unsafe { crate::api::SQLSetStmtAttrW(h.stmt, attribute, explicit, 0) },
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let address = explicit.addr();
+            std::thread::scope(|scope| {
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                scope.spawn(move || {
+                    let access = stmt.access_descriptor(role, address as SqlHandle).unwrap();
+                    assert!(access.is_explicit());
+                    // Header setters must reuse this parent guard, not lock it twice.
+                    assert_eq!(access.readers_through(true, true), Ok((false, false)));
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                entered_rx.recv().unwrap();
+                assert!(matches!(
+                    stmt.parent_dbc().inner.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                release_tx.send(()).unwrap();
+                assert_eq!(h.free_explicit_desc(explicit), SQL_SUCCESS);
+            });
+            let access = stmt.access_descriptor(role, explicit).unwrap();
+            assert!(std::ptr::eq(&*access, unsafe {
+                handle_from_raw::<DescHandle>(role.implicit(stmt))
+            }));
+        }
     }
 
     #[test]

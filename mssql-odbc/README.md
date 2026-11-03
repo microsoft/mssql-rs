@@ -62,6 +62,17 @@ the next fetch. The connection retains one heap-allocated protocol client to
 avoid large client copies during result retrieval; cancellation and connection
 ownership behavior are unchanged.
 
+### Descriptors
+
+Binding and descriptor APIs share the same records. Freeing an explicit
+descriptor restores associated statements' implicit descriptors. Application
+buffers must remain valid until outstanding operations finish.
+
+IPD SQL-definition changes take effect on the next prepared execution, including
+edits overlapping a synchronous execution. Equivalent definitions and
+application-buffer-only changes retain cached plans. During Need Data, complete
+or cancel the data-at-execution sequence before changing bindings.
+
 ### Connection defaults
 
 Eligible TCP connections use MultiSubnetFailover (MSF) by default. Set
