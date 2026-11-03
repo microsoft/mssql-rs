@@ -732,7 +732,7 @@ mod tests {
         GetDataReadAhead,
         MoreResults,
         Close,
-        ConnectionClose,
+        EndTran,
         Idle,
         IdlePlp,
         IdleClose,
@@ -942,8 +942,8 @@ mod tests {
         }
         let raw = h.stmt as usize;
         let raw_dbc = h.dbc as usize;
-        let connection_close = matches!(phase, CursorPhase::ConnectionClose);
-        if stall || connection_close {
+        let connection_end_tran = matches!(phase, CursorPhase::EndTran);
+        if stall || connection_end_tran {
             // Change after execution to verify the current connection attribute,
             // not the execute-time snapshot, controls cancellation settlement.
             assert_eq!(SQL_SUCCESS, unsafe {
@@ -985,12 +985,11 @@ mod tests {
                     CursorPhase::Fetch | CursorPhase::ReadAhead => crate::api::SQLFetch(raw),
                     CursorPhase::MoreResults => crate::api::SQLMoreResults(raw),
                     CursorPhase::Close => crate::api::SQLFreeStmt(raw, SQL_CLOSE),
-                    CursorPhase::ConnectionClose => {
-                        let rc = crate::api::SQLSetConnectAttrW(
+                    CursorPhase::EndTran => {
+                        let rc = crate::api::SQLEndTran(
+                            SQL_HANDLE_DBC,
                             raw_dbc as SqlHandle,
-                            SQL_ATTR_TXN_ISOLATION,
-                            SQL_TXN_SERIALIZABLE as usize as SqlPointer,
-                            0,
+                            SQL_COMMIT,
                         );
                         idle_tx.send(rc).unwrap();
                         rc
@@ -1029,7 +1028,7 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
-            let cancel = (!idle && !connection_close).then(|| {
+            let cancel = (!idle && !connection_end_tran).then(|| {
                 scope.spawn(move || {
                     let rc = unsafe { crate::api::SQLCancel(raw as SqlHandle) };
                     cancel_tx.send(rc).unwrap();
@@ -1045,7 +1044,7 @@ mod tests {
                 ack_tx.send(()).unwrap();
             }
             assert_eq!(
-                if connection_close {
+                if connection_end_tran {
                     if acknowledge { SQL_SUCCESS } else { SQL_ERROR }
                 } else if idle {
                     if acknowledge { idle_success } else { SQL_ERROR }
@@ -1064,11 +1063,11 @@ mod tests {
                 assert!(!state.has_state(STMT_STATE_CURSOR_OPEN), "{phase:?}");
                 assert!(state.active_plp.is_none());
                 assert!(state.pending_fetch_error.is_none());
-                if idle || connection_close {
+                if idle || connection_end_tran {
                     if !acknowledge {
                         assert!(!state.diag_records.is_empty());
                         assert!(state.diag_records.iter().all(|d| d.sql_state != *b"01S05"));
-                    } else if matches!(phase, CursorPhase::IdleClose) || connection_close {
+                    } else if matches!(phase, CursorPhase::IdleClose) || connection_end_tran {
                         assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
                     } else {
                         assert_eq!(state.diag_records.last().unwrap().sql_state, *b"01S05");
@@ -1084,13 +1083,11 @@ mod tests {
             {
                 let state = dbc.inner.lock().unwrap();
                 assert!(state.wire.owner().is_none());
-                if connection_close {
+                if connection_end_tran {
                     if acknowledge {
                         assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
-                        assert_eq!(state.txn_isolation, SQL_TXN_SERIALIZABLE);
                     } else {
                         assert_eq!(state.diag_records[0].sql_state, *b"HY000");
-                        assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
                     }
                 }
                 assert_eq!(
@@ -1104,7 +1101,9 @@ mod tests {
             assert_eq!(
                 if idle && acknowledge {
                     idle_success
-                } else if matches!(phase, CursorPhase::Close) || (connection_close && acknowledge) {
+                } else if matches!(phase, CursorPhase::Close)
+                    || (connection_end_tran && acknowledge)
+                {
                     SQL_SUCCESS
                 } else {
                     SQL_ERROR
@@ -1173,9 +1172,9 @@ mod tests {
     }
 
     #[test]
-    fn connection_timeout_bounds_cursor_cleanup_before_an_attribute_change() {
-        cancel_cursor_phase(CursorPhase::ConnectionClose, true, false);
-        cancel_cursor_phase(CursorPhase::ConnectionClose, false, true);
+    fn connection_timeout_bounds_cursor_cleanup_before_end_tran() {
+        cancel_cursor_phase(CursorPhase::EndTran, true, false);
+        cancel_cursor_phase(CursorPhase::EndTran, false, true);
     }
 
     /// Replays a SQLCancel that signals after a call's last read but before
