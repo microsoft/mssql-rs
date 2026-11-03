@@ -96,9 +96,9 @@ stages:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
     - bash: |
         set -euo pipefail
-        python3 .pipeline/scripts/sql-host/generate-shared-password.py
+        python3 .pipeline/scripts/sql-host/generate-credential-generation.py
       name: GenerateSqlCredential
-      displayName: Generate shared SQL credential
+      displayName: Generate SQL credential generation ID
       condition: and(succeeded(), ne(variables['SetDuplicateState.skipDuplicate'], 'true'))
 - stage: Build
   displayName: Build Stage
@@ -248,7 +248,6 @@ stages:
         - imageOverride -equals RUST-WINSRV-ARM
     variables:
       ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
-        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
         SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
       CARGO_TARGET_DIR: C:\cargo_target_dir
@@ -441,7 +440,6 @@ stages:
         - imageOverride -equals ${{ parameters.linuxArmImage }}
     variables:
       ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
-        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
         SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
