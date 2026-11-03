@@ -635,8 +635,13 @@ For ODBC hot paths:
     do not add avoidable per-row allocation or metadata cloning.
     Across fetch calls, retain only the empty binding vector's allocation and
     rebuild its contents under the ARD lock. Descriptor writes, reassociation,
-    and unbinding must remain visible on the next fetch. Only the statement's
-    own implicit ARD can bypass the global descriptor-liveness lookup.
+    and unbinding must remain visible on the next fetch. Only a statement's
+    own implicit ARD, APD, IRD, and IPD can bypass the global
+    descriptor-liveness lookup, and only by exact pointer equality
+    (`StmtHandle::owns_implicit_desc`): they are allocated in
+    `StmtHandle::new`, never reassigned, rejected by `free_desc` with `HY017`,
+    and freed only when the statement drops. Explicit descriptors keep the
+    lookup.
     Keep `RowIssue` and `RowOutcome` within two bytes: converters return the
     compact `ConvError`, mapped to a canonical diagnostic only on failure.
     Carrying a full diagnostic enlarges every successful column conversion
