@@ -155,6 +155,9 @@ fn sql_get_desc_field_w_safe(
                 | SQL_DESC_PRECISION
                 | SQL_DESC_SCALE
                 | SQL_DESC_TYPE
+                | SQL_DESC_NAME
+                | SQL_DESC_UNNAMED
+                | SQL_DESC_PARAMETER_TYPE
         )
         && classify_field(desc.kind, field).is_some_and(|access| access.scope == FieldScope::Record)
     {
@@ -757,24 +760,35 @@ mod tests {
     fn focused_ipd_fields_read_sql_metadata_from_the_child_binding() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            state.set_record_count(1, ipd.kind);
+            let outer = state.record_mut(1).unwrap();
+            outer.name = "outer parameter".to_string();
+            outer.parameter_type = crate::api::odbc_types::SQL_PARAM_OUTPUT;
+        }
         stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
         stmt.inner.lock().unwrap().tvp_column_bindings.insert(
             1,
-            vec![Some(crate::params::BoundParam {
-                input_output_type: SQL_PARAM_INPUT,
-                c_type: crate::api::odbc_types::SQL_C_SLONG,
-                sql_type: SQL_DECIMAL,
-                column_size: 10,
-                decimal_digits: 2,
-                app_datetime_interval_code: None,
-                sql_datetime_interval_code: None,
-                app_precision: 0,
-                app_scale: 0,
-                parameter_value_ptr: ptr::null_mut(),
-                buffer_length: 0,
-                strlen_or_ind_ptr: ptr::null_mut(),
-                octet_length_ptr: ptr::null_mut(),
-            })],
+            vec![
+                Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: crate::api::odbc_types::SQL_C_SLONG,
+                    sql_type: SQL_DECIMAL,
+                    column_size: 10,
+                    decimal_digits: 2,
+                    app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
+                    app_precision: 0,
+                    app_scale: 0,
+                    parameter_value_ptr: ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: ptr::null_mut(),
+                    octet_length_ptr: ptr::null_mut(),
+                }),
+                None,
+            ],
         );
 
         let mut concise: SqlSmallInt = -1;
@@ -803,6 +817,56 @@ mod tests {
         assert_eq!(concise, SQL_DECIMAL);
         assert_eq!(precision, 10);
         assert_eq!(scale, 2);
+
+        let mut name = [0u16; 32];
+        let mut name_length = -1;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_field_w(
+                    h.ipd(),
+                    1,
+                    SQL_DESC_NAME,
+                    name.as_mut_ptr().cast(),
+                    (name.len() * size_of::<u16>()) as SqlInteger,
+                    &mut name_length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(name_length, 0);
+        assert_eq!(name[0], 0, "the focused child name is empty");
+        let get_small_int = |record_number, field_identifier| {
+            let mut value: SqlSmallInt = 0;
+            assert_eq!(
+                unsafe {
+                    sql_get_desc_field_w(
+                        h.ipd(),
+                        record_number,
+                        field_identifier,
+                        (&mut value as *mut SqlSmallInt).cast(),
+                        0,
+                        ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            value
+        };
+        assert_eq!(
+            get_small_int(1, SQL_DESC_UNNAMED),
+            SQL_UNNAMED as SqlSmallInt,
+            "an overlapping outer IPD name must not leak into the focused child"
+        );
+        assert_eq!(
+            get_small_int(1, SQL_DESC_PARAMETER_TYPE),
+            SQL_PARAM_INPUT,
+            "an overlapping outer parameter type must not leak into the child"
+        );
+        assert_eq!(
+            get_small_int(2, SQL_DESC_PARAMETER_TYPE),
+            SQL_PARAM_INPUT,
+            "a focused child past the outer IPD count still has a default record"
+        );
     }
 
     #[test]
