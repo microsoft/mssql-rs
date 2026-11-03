@@ -416,6 +416,71 @@ def test_cancel_connect_does_not_abandon_owned_cleanup(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("owned", [False, True])
+def test_cancelled_connect_cannot_send_token_before_tokio_processes_cancellation(
+    builtin_context, builtin_sdk, mock_tds_server, owned
+):
+    async def run():
+        loop = asyncio.get_running_loop()
+        closing = asyncio.Event()
+        release = asyncio.Event()
+        native_settled = asyncio.Event()
+        messages = []
+
+        class Logger:
+            def py_core_log(self, _level, message, _module, _line):
+                messages.append(message)
+                if (
+                    "PyAsyncConnection::connect: token acquisition cancelled" in message
+                    or "PyAsyncConnection::connect: connection established" in message
+                    or "PyAsyncConnection::connect: failed:" in message
+                ):
+                    loop.call_soon_threadsafe(native_settled.set)
+
+        async def close(instance):
+            closing.set()
+            await release.wait()
+
+        async def get_token(instance):
+            if not owned:
+                closing.set()
+                await release.wait()
+            return SimpleNamespace(token=instance.token)
+
+        builtin_sdk.close_hook = close
+        builtin_sdk.get_hook = get_token
+        context = dict(builtin_context)
+        options = {"python_logger": Logger()}
+        if owned:
+            context["authentication"] = "ActiveDirectoryDefault"
+        else:
+            from azure.identity.aio import DefaultAzureCredential
+
+            options["token_provider"] = DefaultAzureCredential()
+        future = connect(context, **options)
+        await asyncio.wait_for(closing.wait(), 2)
+        # Withhold the runtime bridge's cancellation callback to model a busy
+        # Tokio executor; the caller-loop authentication callback must suffice.
+        callbacks = [
+            callback
+            for callback, _ in future._callbacks
+            if type(callback).__name__ != "ConnectCancellation"
+        ]
+        assert callbacks
+        for callback in callbacks:
+            future.remove_done_callback(callback)
+        future.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await future
+        release.set()
+        await asyncio.wait_for(native_settled.wait(), 2)
+        assert any("token acquisition cancelled" in message for message in messages)
+        assert builtin_sdk.instances[0].close_calls == (1 if owned else 0)
+        assert not mock_tds_server.has_received_token(builtin_sdk.instances[0].token)
+
+    asyncio.run(run())
+
+
 def test_login_timeout_still_closes_owned_credential(builtin_context, builtin_sdk):
     async def run():
         closed = asyncio.Event()

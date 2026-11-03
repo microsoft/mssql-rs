@@ -11,6 +11,7 @@
 //! closed on the same loop for each token attempt, before the token reaches TDS.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticationMethod};
@@ -41,6 +42,7 @@ pub(crate) struct AsyncPythonEntraIdTokenFactory {
     provider: TokenProvider,
     locals: TaskLocals,
     dispatch: tracing::Dispatch,
+    connect_cancelled: Arc<AtomicBool>,
 }
 
 impl AsyncPythonEntraIdTokenFactory {
@@ -57,6 +59,7 @@ impl AsyncPythonEntraIdTokenFactory {
             provider: TokenProvider::Custom(Arc::new(provider)),
             locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
+            connect_cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -66,7 +69,18 @@ impl AsyncPythonEntraIdTokenFactory {
             provider: TokenProvider::BuiltIn(Arc::new(config)),
             locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
+            connect_cancelled: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub(crate) fn connection_cancellation_callback(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Py::new(
+            py,
+            ConnectCancellation {
+                cancelled: self.connect_cancelled.clone(),
+            },
+        )
+        .map(Py::into_any)
     }
 
     async fn acquire_token(&self, spn: &str, sts_url: &str) -> PyResult<Vec<u8>> {
@@ -126,7 +140,14 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
         // TODO: In mssql-tds TdsClient::reconnect, stop retrying terminal auth
         // failures and propagate OperationCancelledError without wrapping it in
         // SessionRecoveryFailed, so recovery preserves initial-login semantics.
-        self.acquire_token(&spn, &sts_url).await.map_err(|error| {
+        let result = self.acquire_token(&spn, &sts_url).await;
+        // The caller loop can observe cancellation before Tokio drops this future.
+        if self.connect_cancelled.load(Ordering::Acquire) {
+            return Err(Error::OperationCancelledError(
+                "Async Entra token acquisition cancelled".into(),
+            ));
+        }
+        result.map_err(|error| {
             let cancelled = Python::attach(|py| {
                 py.import("asyncio")
                     .and_then(|module| module.getattr("CancelledError"))
@@ -141,6 +162,21 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
                 ))
             }
         })
+    }
+}
+
+#[pyclass]
+struct ConnectCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl ConnectCancellation {
+    fn __call__(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future.call_method0("cancelled")?.is_truthy()? {
+            self.cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 }
 

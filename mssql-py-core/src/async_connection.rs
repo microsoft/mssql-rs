@@ -250,8 +250,10 @@ impl PyAsyncConnection {
             validate_custom_token_context(client_context_dict)?;
         }
         let mut context = PyCoreConnection::dict_to_client_context(client_context_dict)?;
+        let mut auth_cancellation_callback = None;
         if let Some(provider) = token_provider {
             let factory = AsyncPythonEntraIdTokenFactory::new(py, provider)?;
+            auth_cancellation_callback = Some(factory.connection_cancellation_callback(py)?);
             context.tds_authentication_method =
                 TdsAuthenticationMethod::ActiveDirectoryTokenCredential;
             context.auth_method_map.insert(
@@ -260,6 +262,7 @@ impl PyAsyncConnection {
             );
         } else if let Some(config) = BuiltInEntraCredential::from_context(&mut context)? {
             let factory = AsyncPythonEntraIdTokenFactory::built_in(py, config)?;
+            auth_cancellation_callback = Some(factory.connection_cancellation_callback(py)?);
             context
                 .auth_method_map
                 .insert(context.tds_authentication_method.clone(), Box::new(factory));
@@ -286,7 +289,7 @@ impl PyAsyncConnection {
         );
 
         let future_dispatch = dispatch.clone();
-        pyo3_async_runtimes::tokio::future_into_py(
+        let future = pyo3_async_runtimes::tokio::future_into_py(
             py,
             with_optional_dispatch(
                 async move {
@@ -338,7 +341,11 @@ impl PyAsyncConnection {
                 },
                 future_dispatch,
             ),
-        )
+        )?;
+        if let Some(callback) = auth_cancellation_callback {
+            future.call_method1("add_done_callback", (callback,))?;
+        }
+        Ok(future)
     }
 
     /// Default query timeout (seconds) inherited by cursors created from this
