@@ -671,7 +671,9 @@ def test_host_rejects_invalid_configuration(agent, case):
 
 
 @pytest.mark.parametrize("shell", ["bash", "pwsh"])
-@pytest.mark.parametrize("case", ["injected", "tampered", "plaintext", "missing-file", "missing"])
+@pytest.mark.parametrize("case", [
+    "injected", "trailing-newline", "tampered", "plaintext", "missing-file", "missing",
+])
 def test_consumer_rejects_unusable_credential(agent, shell, case):
     password, generation = credential(), secrets.token_hex(16)
     sentinel = f"test-{generation}-2"
@@ -684,6 +686,8 @@ def test_consumer_rejects_unusable_credential(agent, shell, case):
         if case == "injected":
             injected = password.encode() + b"\n##vso[task.setvariable variable=DB_HOST]injected"
             files = {"credential.bin": encrypt(key, injected)}
+        elif case == "trailing-newline":
+            files = {"credential.bin": encrypt(key, password.encode() + b"\n")}
         elif case == "tampered":
             ciphertext = bytearray(encrypt(key, password.encode()))
             ciphertext[-1] ^= 1

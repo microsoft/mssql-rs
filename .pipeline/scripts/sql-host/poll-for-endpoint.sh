@@ -289,12 +289,20 @@ if [ -z "${cred_file}" ]; then
     echo "ERROR: credential.bin not found inside ${cred_artifact} artifact." >&2
     exit 1
 fi
-if ! password="$(openssl pkeyutl -decrypt -inkey "${private_dir}/key.pem" \
+plaintext_file="${private_dir}/credential.bin"
+if ! openssl pkeyutl -decrypt -inkey "${private_dir}/key.pem" \
         -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 \
-        -in "${cred_file}" 2>/dev/null)"; then
+        -in "${cred_file}" -out "${plaintext_file}" 2>/dev/null; then
     echo "ERROR: ${cred_artifact} could not be decrypted with this job's key." >&2
     exit 1
 fi
+# Check raw size before command substitution, which strips trailing newlines.
+if [ "$(wc -c < "${plaintext_file}")" -ne 26 ]; then
+    echo "ERROR: ${cred_artifact} did not decrypt to a valid SQL password." >&2
+    exit 1
+fi
+password="$(cat "${plaintext_file}")"
+rm -f "${plaintext_file}"
 if [[ ! "${password}" =~ ^Aa1![A-Za-z0-9]{22}$ ]]; then
     echo "ERROR: ${cred_artifact} did not decrypt to a valid SQL password." >&2
     exit 1
