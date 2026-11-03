@@ -616,7 +616,38 @@ Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
 etc.) through the Driver Manager, which loads our shared library — the same
 code path a real application uses.
 
-## CI: prebuilt artifact flow (build once, test on many distros)
+## CI: prebuilt artifact flow
+
+### Windows stress jobs
+
+The Windows stress pipeline builds the debug driver and C++ suite once, then
+shares that drop across the Fetch, Parameters, Metadata, and Other jobs. Each
+execution job keeps its existing stress profile and msodbcsql comparison leg.
+Compilation and execution have separate job budgets.
+
+```powershell
+.\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\odbc-e2e
+# Download/copy the drop's build\ directory into the consumer's tests\e2e\.
+.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile nightly -CompareWithMsodbcsql
+```
+
+`-BuildJobs N` bounds parallel C++ build processes; the default is the smaller
+of four and the logical CPU count. Test concurrency is unchanged. Measure build
+duration and memory use before increasing the limit.
+
+The drop includes the driver, test binaries, and PDBs. Its generated CTest
+registration resolves executable paths relative to the downloaded drop, so
+consumer checkout paths may differ from the producer's. No CMake cache, object
+files, or compiler installation is needed for `-SkipBuild`; CTest,
+the runtime dependencies, and administrator privileges for
+driver registration are still required. `-BuildOnly` does not register drivers
+or require SQL Server. `-SkipBuild` cannot be combined with `-Coverage`.
+
+The producer publishes an attempt-scoped artifact name and passes that name
+to consumers through a job output, so retrying the build does not collide with
+an earlier attempt's drop.
+
+### Linux distro jobs
 
 CI (the main-branch pipeline) does not rebuild the driver in every distro. It
 splits the flow into a build half and a run half so a single set of binaries can

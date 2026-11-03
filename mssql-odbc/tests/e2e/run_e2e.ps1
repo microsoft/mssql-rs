@@ -17,6 +17,12 @@
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
 #                      [-FilterTests REGEX] [-MtProfile pr|nightly|weekly]
 #                      [-MtDumpDir PATH]
+#                      [-BuildJobs N] [-BuildOnly -OutDir PATH | -SkipBuild]
+#
+# -BuildJobs bounds parallel C++ build processes (default: at most 4 CPUs).
+# -BuildOnly -OutDir PATH stages a relocatable build/ drop without running tests
+# or registering drivers. Download its contents into this directory and run
+# -SkipBuild to reuse the driver and tests without Cargo or a C++ compiler.
 #
 # -MtProfile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable), as in
@@ -85,10 +91,25 @@ param(
     [string]$ExcludeTests = '',
     [ValidateSet('pr', 'nightly', 'weekly')]
     [string]$MtProfile = 'pr',
-    [string]$MtDumpDir = ''
+    [string]$MtDumpDir = '',
+    [ValidateRange(1, 64)]
+    [int]$BuildJobs = [Math]::Min(4, [Environment]::ProcessorCount),
+    [switch]$BuildOnly,
+    [string]$OutDir = '',
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($BuildOnly -and ($SkipBuild -or $Coverage -or $CompareWithMsodbcsql)) {
+    throw "-BuildOnly cannot be combined with -SkipBuild, -Coverage, or -CompareWithMsodbcsql."
+}
+if ($BuildOnly -ne [bool]$OutDir) {
+    throw "-BuildOnly and -OutDir must be supplied together."
+}
+if ($SkipBuild -and $Coverage) {
+    throw "-SkipBuild cannot be combined with -Coverage; coverage requires an instrumented build."
+}
 
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $OdbcCrateDir = Resolve-Path (Join-Path $ScriptDir "..\..")
@@ -748,8 +769,49 @@ function Remove-IncompatibleCMakeBuildTree([string]$BuildDir) {
     }
 }
 
+function Export-PrebuiltTests([string]$DriverPath, [string]$Destination) {
+    $buildDir = Join-Path $ScriptDir "build"
+    $destinationPath = [IO.Path]::GetFullPath($Destination)
+    if (Test-Path $destinationPath) {
+        throw "Prebuilt output directory already exists: $destinationPath"
+    }
+    if (-not (Test-Path (Join-Path $buildDir "CTestTestfile.cmake") -PathType Leaf)) {
+        throw "CTest registration not found in $buildDir"
+    }
+
+    $drop = Join-Path $destinationPath "build"
+    New-Item -ItemType Directory -Path $drop -Force | Out-Null
+    $binaries = Join-Path $drop "Debug"
+    New-Item -ItemType Directory -Path $binaries | Out-Null
+    Get-ChildItem (Join-Path $buildDir "Debug") -File |
+        Where-Object Extension -In @('.exe', '.dll', '.pdb') |
+        Copy-Item -Destination $binaries
+    Copy-Item $DriverPath (Join-Path $drop "Debug\mssqlodbc.dll")
+    $driverPdb = [IO.Path]::ChangeExtension($DriverPath, '.pdb')
+    if (-not (Test-Path $driverPdb -PathType Leaf)) {
+        throw "Driver symbols not found: $driverPdb"
+    }
+    Copy-Item $driverPdb (Join-Path $drop "Debug\mssqlodbc.pdb")
+
+    # Keep CMake's generated filters and properties, but resolve binary paths at
+    # CTest load time. Do not ship the machine-specific cache or build system.
+    $buildPrefix = $buildDir.Replace('\', '/') + '/'
+    foreach ($testfile in Get-ChildItem $buildDir -Filter CTestTestfile.cmake -Recurse -File) {
+        $relative = [IO.Path]::GetRelativePath($buildDir, $testfile.FullName)
+        $target = Join-Path $drop $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        $content = [IO.File]::ReadAllText($testfile.FullName)
+        $content = $content.Replace($buildPrefix, '${ODBC_E2E_BUILD_DIR}/', [StringComparison]::OrdinalIgnoreCase)
+        $root = [IO.Path]::GetRelativePath((Split-Path -Parent $target), $drop).Replace('\', '/')
+        $content = 'set(ODBC_E2E_BUILD_DIR "${CMAKE_CURRENT_LIST_DIR}/' +
+            $root + '")' + "`n" + $content
+        [IO.File]::WriteAllText($target, $content)
+    }
+    Write-Host "Staged prebuilt driver, tests, and symbols in $destinationPath"
+}
+
 try {
-    Set-MtProfile
+    if (-not $BuildOnly) { Set-MtProfile }
     if ($Retries -gt 0) {
         Write-Host "Retries enabled: each failing test reruns up to $Retries time(s)."
     }
@@ -758,21 +820,31 @@ try {
         Enable-CoverageInstrumentation
     }
 
-    Initialize-DevSqlEnv
+    if (-not $BuildOnly) { Initialize-DevSqlEnv }
 
-    Write-Host "=== Building mssql-odbc ($BuildType) ==="
-    Push-Location $OdbcCrateDir
-    try {
-        if ($Release) {
-            Invoke-Checked "cargo build --release" { cargo build --release }
-        } else {
-            Invoke-Checked "cargo build" { cargo build }
+    if ($SkipBuild) {
+        $DriverPath = Join-Path $ScriptDir "build\Debug\mssqlodbc.dll"
+        foreach ($file in @($DriverPath, (Join-Path $ScriptDir "build\CTestTestfile.cmake"))) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+                throw "Prebuilt artifact file not found: $file"
+            }
         }
-    } finally {
-        Pop-Location
+        $DriverPath = (Resolve-Path $DriverPath).Path
+        Write-Host "=== Reusing prebuilt driver and e2e tests (-SkipBuild) ==="
+    } else {
+        Write-Host "=== Building mssql-odbc ($BuildType) ==="
+        Push-Location $OdbcCrateDir
+        try {
+            if ($Release) {
+                Invoke-Checked "cargo build --release" { cargo build --release }
+            } else {
+                Invoke-Checked "cargo build" { cargo build }
+            }
+        } finally {
+            Pop-Location
+        }
+        $DriverPath = & (Join-Path $OdbcCrateDir "scripts\finalize-artifact.ps1") -BuildProfile $BuildType
     }
-
-    $DriverPath = & (Join-Path $OdbcCrateDir "scripts\finalize-artifact.ps1") -BuildProfile $BuildType
     Write-Host "Rust driver: $DriverPath"
 
     if ($Coverage) {
@@ -785,7 +857,7 @@ try {
 
     # Snapshot our own registration (if a Rust driver is already installed under
     # the same name) so it can be restored on exit.
-    Save-OriginalRegistration
+    if (-not $BuildOnly) { Save-OriginalRegistration }
 
     # Resolve the reference driver for comparison mode from its own registration.
     $RefDriverPath = $null
@@ -814,26 +886,33 @@ try {
         Write-Host "Reference driver (msodbcsql): $RefDriverPath"
     }
 
-    Write-Host ""
-    Write-Host "=== Configuring e2e tests (CMake) ==="
     Initialize-CMake
-    Remove-IncompatibleCMakeBuildTree (Join-Path $ScriptDir "build")
-    Push-Location $ScriptDir
-    try {
+    if (-not $SkipBuild) {
+        Write-Host ""
+        Write-Host "=== Configuring e2e tests (CMake) ==="
+        Remove-IncompatibleCMakeBuildTree (Join-Path $ScriptDir "build")
+        Push-Location $ScriptDir
         try {
-            Invoke-Checked "CMake configure" {
-                cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DODBC_E2E_FORCE_UNICODE=ON
-            }
+            try {
+                Invoke-Checked "CMake configure" {
+                    cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DODBC_E2E_FORCE_UNICODE=ON
+                }
 
-            Write-Host ""
-            Write-Host "=== Building e2e tests ==="
-            Invoke-Checked "CMake build" { cmake --build build --config Debug }
-        } catch {
-            Write-FailureDiagnostics "CMake configure/build failed"
-            throw
+                Write-Host ""
+                Write-Host "=== Building e2e tests ($BuildJobs parallel jobs) ==="
+                Invoke-Checked "CMake build" { cmake --build build --config Debug --parallel $BuildJobs }
+            } catch {
+                Write-FailureDiagnostics "CMake configure/build failed"
+                throw
+            }
+        } finally {
+            Pop-Location
         }
-    } finally {
-        Pop-Location
+    }
+
+    if ($BuildOnly) {
+        Export-PrebuiltTests $DriverPath $OutDir
+        return
     }
 
     $BuildDir  = Join-Path $ScriptDir "build"
@@ -892,8 +971,10 @@ try {
     Write-Host "=== Both runs passed with full parity ==="
 }
 finally {
-    # Best effort: a failure here must not skip restoring the registry.
-    try { Save-MtSymbols $DriverPath } catch { Write-Warning "Could not save MT symbols: $_" }
-    Restore-MtProfile
-    Restore-Registration
+    if (-not $BuildOnly) {
+        # Best effort: a failure here must not skip restoring the registry.
+        try { Save-MtSymbols $DriverPath } catch { Write-Warning "Could not save MT symbols: $_" }
+        Restore-MtProfile
+        Restore-Registration
+    }
 }
