@@ -101,6 +101,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($BuildOnly -and $PSVersionTable.PSVersion.Major -lt 7) {
+    throw "-BuildOnly requires PowerShell 7 or later; run this script with pwsh."
+}
 if ($BuildOnly -and ($SkipBuild -or $Coverage -or $CompareWithMsodbcsql)) {
     throw "-BuildOnly cannot be combined with -SkipBuild, -Coverage, or -CompareWithMsodbcsql."
 }

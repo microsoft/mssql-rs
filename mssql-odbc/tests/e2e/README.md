@@ -626,10 +626,13 @@ execution job keeps its existing stress profile and msodbcsql comparison leg.
 Compilation and execution have separate job budgets.
 
 ```powershell
-.\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\odbc-e2e
+pwsh -File .\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\odbc-e2e
 # Download/copy the drop's build\ directory into the consumer's tests\e2e\.
 .\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile nightly -CompareWithMsodbcsql
 ```
+
+`-BuildOnly` requires PowerShell 7 or later (`pwsh`) and rejects Windows
+PowerShell 5.1 before starting a build.
 
 `-BuildJobs N` bounds parallel C++ build processes. The stress producer selects
 the smaller of four and the logical CPU count; other runner invocations retain

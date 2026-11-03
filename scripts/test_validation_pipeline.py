@@ -381,6 +381,27 @@ def test_windows_e2e_rejects_incompatible_build_options(args, error):
     assert error in result.stderr
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32" or shutil.which("powershell.exe") is None,
+    reason="needs Windows PowerShell",
+)
+def test_windows_build_only_rejects_legacy_powershell_before_building(tmp_path):
+    script = str(_WINDOWS_E2E).replace("'", "''")
+    drop = str(tmp_path / "drop").replace("'", "''")
+    command = (
+        "function cargo { throw 'Unexpected build' }; "
+        f"& '{script}' -BuildOnly -OutDir '{drop}'"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "-BuildOnly requires PowerShell 7 or later" in result.stderr
+    assert "Unexpected build" not in result.stderr
+    assert not (tmp_path / "drop").exists()
+
+
 def test_windows_stress_groups_cover_current_concurrent_suites(windows_stress_job):
     e2e = _ROOT / "mssql-odbc" / "tests" / "e2e"
     concurrent = {
