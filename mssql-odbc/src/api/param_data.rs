@@ -1126,6 +1126,16 @@ mod tests {
         indicators: &mut [SqlLen; 2],
         lengths: &mut [SqlLen; 2],
     ) -> DaeState {
+        tvp_array_dae_with_total_capacity(h, values, indicators, lengths, 2)
+    }
+
+    fn tvp_array_dae_with_total_capacity(
+        h: &TestHandles,
+        values: &mut [i32; 2],
+        indicators: &mut [SqlLen; 2],
+        lengths: &mut [SqlLen; 2],
+        total_capacity: crate::api::odbc_types::SqlULen,
+    ) -> DaeState {
         let tvp = crate::params::BoundParam {
             input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
             c_type: crate::api::odbc_types::SQL_C_BINARY,
@@ -1177,6 +1187,7 @@ mod tests {
             None,
             params,
         )
+        .with_tvp_total_capacities(std::collections::BTreeMap::from([(0, total_capacity)]))
         .deferred(Vec::new(), Some("SELECT ?".into()), 0)
     }
 
@@ -1295,6 +1306,47 @@ mod tests {
         let dae = state.dae.as_ref().unwrap();
         assert_eq!(dae.tvp_row_counts.get(&0), Some(&2));
         assert_eq!(dae.tvp_cells.len(), 2);
+    }
+
+    #[test]
+    fn tvp_dae_batches_use_focused_and_total_capacities_independently() {
+        use crate::api::exports::{SQLParamData, SQLPutData};
+        use crate::api::odbc_types::SQL_SUCCESS;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut values = [11, 999];
+        let mut indicators = [std::mem::size_of::<i32>() as SqlLen; 2];
+        let mut lengths = indicators;
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae_with_total_capacity(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut lengths,
+            6,
+        ));
+
+        let mut token = std::ptr::null_mut();
+        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+        for _ in 0..3 {
+            assert_eq!(
+                unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
+                SQL_SUCCESS
+            );
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+        }
+        assert_eq!(
+            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
+            SQL_ERROR
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_INVALID_STRING_OR_BUFFER_LENGTH.state
+        );
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(dae.tvp_row_counts.get(&0), Some(&6));
     }
 
     #[test]

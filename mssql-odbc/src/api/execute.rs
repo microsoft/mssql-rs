@@ -109,6 +109,7 @@ struct DaeExecution {
     params: Vec<RpcParameter>,
     /// The streamed parameters, in original parameter order.
     dae_params: Vec<DaeParam>,
+    tvp_total_capacities: std::collections::BTreeMap<usize, SqlULen>,
     fractional_truncated: bool,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
@@ -345,6 +346,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_params,
+            tvp_total_capacities,
             fractional_truncated,
             mut prepared,
             mut orphaned,
@@ -409,6 +411,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     Some(prepared),
                     orphaned,
                     dae_params,
+                    tvp_total_capacities,
                     params,
                     None,
                     query_timeout,
@@ -463,6 +466,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     Some(prepared),
                     orphaned,
                     dae_params,
+                    tvp_total_capacities,
                     fractional_truncated,
                     "SQLExecute",
                 ),
@@ -1373,6 +1377,7 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
     let ParamsWithDae {
         params,
         dae_params,
+        tvp_total_capacities,
         fractional_truncated,
     } = unsafe { build_named_params(&mut stmt_state, marker_count, bind_offset, "SQLExecute") }?;
 
@@ -1403,6 +1408,7 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
         Ok(ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_params,
+            tvp_total_capacities,
             fractional_truncated,
             prepared,
             orphaned,
@@ -2501,6 +2507,7 @@ mod tests {
                     Some(execution.prepared),
                     execution.orphaned,
                     execution.dae_params,
+                    execution.tvp_total_capacities,
                     execution.params,
                     None,
                     0,
@@ -2514,6 +2521,7 @@ mod tests {
                     Some(execution.prepared),
                     execution.orphaned,
                     execution.dae_params,
+                    execution.tvp_total_capacities,
                     false,
                     "test",
                 )

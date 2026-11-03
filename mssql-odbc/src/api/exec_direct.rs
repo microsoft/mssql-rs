@@ -330,6 +330,7 @@ fn sql_exec_direct_w_operation(
     let ParamsWithDae {
         params,
         dae_params,
+        tvp_total_capacities,
         fractional_truncated,
     } = named_params;
 
@@ -415,6 +416,7 @@ fn sql_exec_direct_w_operation(
                 None,
                 None,
                 dae_params,
+                tvp_total_capacities,
                 params,
                 Some(rewritten_sql),
                 query_timeout,
@@ -454,6 +456,7 @@ fn sql_exec_direct_w_operation(
                 None,
                 None,
                 dae_params,
+                tvp_total_capacities,
                 fractional_truncated,
                 "SQLExecDirectW",
             ),

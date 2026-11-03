@@ -248,6 +248,7 @@ pub(super) fn park_dae_client(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
+    tvp_total_capacities: std::collections::BTreeMap<usize, SqlULen>,
     fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
@@ -263,7 +264,10 @@ pub(super) fn park_dae_client(
         error!("{op}: stmt mutex poisoned while parking DAE client");
         return SQL_ERROR;
     };
-    stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    stmt_state.dae = Some(
+        DaeState::new(client, prepared, orphaned, dae_params)
+            .with_tvp_total_capacities(tvp_total_capacities),
+    );
     if fractional_truncated {
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
     }
@@ -284,6 +288,7 @@ pub(super) fn park_deferred_dae(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
+    tvp_total_capacities: std::collections::BTreeMap<usize, SqlULen>,
     prebuilt: Vec<RpcParameter>,
     sql: Option<String>,
     timeout_secs: u32,
@@ -296,7 +301,9 @@ pub(super) fn park_deferred_dae(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(
-        DaeState::new(client, prepared, orphaned, dae_params).deferred(prebuilt, sql, timeout_secs),
+        DaeState::new(client, prepared, orphaned, dae_params)
+            .with_tvp_total_capacities(tvp_total_capacities)
+            .deferred(prebuilt, sql, timeout_secs),
     );
     if fractional_truncated {
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
@@ -850,6 +857,8 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
+    /// Top-level maximum row counts for data-at-execution TVPs.
+    pub(super) tvp_total_capacities: std::collections::BTreeMap<usize, SqlULen>,
     /// Whether a parameter before the first DAE marker lost fractional digits.
     /// With no DAE marker, covers the full parameter list.
     pub(super) fractional_truncated: bool,
@@ -1195,6 +1204,7 @@ pub(super) unsafe fn build_named_params_for_row(
 
     let mut params = Vec::with_capacity(marker_count + usize::from(!named));
     let mut dae_params = Vec::new();
+    let mut tvp_total_capacities = std::collections::BTreeMap::new();
     let mut fractional_truncated = false;
     for i in 0..marker_count {
         let Some(Some(snapshot)) = bound_params.get(i) else {
@@ -1221,6 +1231,7 @@ pub(super) unsafe fn build_named_params_for_row(
                 .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                     ParamRowBuildError::Layout { parameter: i + 1 }
                 })?;
+            let tvp_total_capacity = tvp_binding.column_size;
             if let Some(child_layout) = tvp_layouts.get(&ordinal) {
                 tvp_binding.column_size = child_layout.array_size;
             }
@@ -1250,6 +1261,7 @@ pub(super) unsafe fn build_named_params_for_row(
                     source,
                 })?;
                 dae_params.extend(staged);
+                tvp_total_capacities.insert(i, tvp_total_capacity);
                 let status = if crate::conversion::param_convert::is_output_direction(
                     tvp_binding.input_output_type,
                 ) {
@@ -1403,6 +1415,7 @@ pub(super) unsafe fn build_named_params_for_row(
     Ok(ParamsWithDae {
         params,
         dae_params,
+        tvp_total_capacities,
         fractional_truncated,
     })
 }
@@ -2661,6 +2674,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            std::collections::BTreeMap::new(),
             true,
             "SQLExecute",
         );
@@ -3924,7 +3938,7 @@ mod tests {
             input_output_type: SQL_PARAM_INPUT,
             c_type: crate::api::odbc_types::SQL_C_BINARY,
             sql_type: crate::api::odbc_types::SQL_SS_TABLE,
-            column_size: 2,
+            column_size: 6,
             decimal_digits: 0,
             app_datetime_interval_code: None,
             sql_datetime_interval_code: None,
@@ -3952,12 +3966,19 @@ mod tests {
         };
         let bound = [snap(tvp)];
         let tvp_columns = BTreeMap::from([(1, vec![Some(column)])]);
+        let layouts = BTreeMap::from([(
+            1,
+            crate::handles::desc::DescHeader {
+                array_size: 2,
+                ..Default::default()
+            },
+        )]);
 
         let built = unsafe {
             build_named_params_for_row(
                 &bound,
                 &tvp_columns,
-                &BTreeMap::new(),
+                &layouts,
                 1,
                 1,
                 0,
@@ -4007,6 +4028,8 @@ mod tests {
             }
         ));
         assert_eq!(built.dae_params[1].value_ptr, 0x2000usize as *mut c_void);
+        assert_eq!(built.dae_params[0].binding.column_size, 2);
+        assert_eq!(built.tvp_total_capacities.get(&0), Some(&6));
         assert_eq!(built.params.len(), 1);
     }
 
@@ -4570,7 +4593,16 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let lease = lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new()));
         assert_eq!(
-            park_dae_client(stmt, lease, None, None, Vec::new(), false, "test"),
+            park_dae_client(
+                stmt,
+                lease,
+                None,
+                None,
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                false,
+                "test",
+            ),
             SQL_NEED_DATA
         );
 
@@ -4624,6 +4656,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                std::collections::BTreeMap::new(),
                 false,
                 "test",
             ),

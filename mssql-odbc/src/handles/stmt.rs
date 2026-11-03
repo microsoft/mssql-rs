@@ -1098,6 +1098,8 @@ pub(crate) struct DaeState {
     pub(crate) tvp_cells: Vec<BufferedTvpCell>,
     /// Number of rows accepted from all input batches, by TVP parameter.
     pub(crate) tvp_row_counts: BTreeMap<usize, usize>,
+    /// Top-level bound row capacity, separate from each TVP's focused array size.
+    pub(crate) tvp_total_capacities: BTreeMap<usize, SqlULen>,
     /// `(first output row, exclusive end)` for the current input batch.
     pub(crate) tvp_batches: BTreeMap<usize, (usize, usize)>,
     /// Cached token boundary, row extent, and row-zero cell templates for TVPs
@@ -1156,6 +1158,7 @@ impl DaeState {
             buffered: Vec::new(),
             tvp_cells: Vec::new(),
             tvp_row_counts: BTreeMap::new(),
+            tvp_total_capacities: BTreeMap::new(),
             tvp_batches: BTreeMap::new(),
             tvp_staging: BTreeMap::new(),
             prebuilt: Vec::new(),
@@ -1289,6 +1292,14 @@ impl DaeState {
         self.params.get(self.cursor?)
     }
 
+    pub(crate) fn with_tvp_total_capacities(
+        mut self,
+        capacities: BTreeMap<usize, SqlULen>,
+    ) -> Self {
+        self.tvp_total_capacities = capacities;
+        self
+    }
+
     pub(crate) fn stage_tvp_batch(
         &mut self,
         tvp_index: usize,
@@ -1296,7 +1307,7 @@ impl DaeState {
         batch_count: usize,
     ) -> Result<(), TvpBatchStageError> {
         let current_index = self.cursor.ok_or(TvpBatchStageError::InvalidState)?;
-        let capacity = self
+        let (batch_capacity, total_capacity) = self
             .params
             .get(current_index)
             .filter(|param| {
@@ -1308,12 +1319,20 @@ impl DaeState {
                     } if target == tvp_index && target_row == row_index
                 )
             })
-            .map(|param| param.binding.column_size)
+            .map(|param| {
+                (
+                    param.binding.column_size,
+                    self.tvp_total_capacities
+                        .get(&tvp_index)
+                        .copied()
+                        .unwrap_or(param.binding.column_size),
+                )
+            })
             .ok_or(TvpBatchStageError::InvalidState)?;
         let batch_end = row_index
             .checked_add(batch_count)
             .ok_or(TvpBatchStageError::Overflow)?;
-        if batch_end > capacity {
+        if batch_count > batch_capacity || batch_end > total_capacity {
             return Err(TvpBatchStageError::CapacityExceeded);
         }
         if batch_count == 0 {
@@ -1564,6 +1583,7 @@ impl DaeState {
             buffered: Vec::new(),
             tvp_cells: Vec::new(),
             tvp_row_counts: BTreeMap::new(),
+            tvp_total_capacities: BTreeMap::new(),
             tvp_batches: BTreeMap::new(),
             tvp_staging: BTreeMap::new(),
             prebuilt: Vec::new(),
@@ -2955,10 +2975,30 @@ mod tests {
             },
         );
         row_control.binding.column_size = 2;
-        let mut dae = DaeState::for_test(vec![row_control], Some(0));
+        let mut dae = DaeState::for_test(vec![row_control], Some(0))
+            .with_tvp_total_capacities(BTreeMap::from([(0, 2)]));
 
         assert_eq!(
             dae.stage_tvp_batch(0, 2, 1),
+            Err(TvpBatchStageError::CapacityExceeded)
+        );
+        assert!(dae.tvp_staging.is_empty());
+    }
+
+    #[test]
+    fn tvp_batches_cannot_exceed_the_focused_array_capacity() {
+        let mut row_control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        row_control.binding.column_size = 2;
+        let mut dae = DaeState::for_test(vec![row_control], Some(0))
+            .with_tvp_total_capacities(BTreeMap::from([(0, 6)]));
+
+        assert_eq!(
+            dae.stage_tvp_batch(0, 0, 3),
             Err(TvpBatchStageError::CapacityExceeded)
         );
         assert!(dae.tvp_staging.is_empty());
