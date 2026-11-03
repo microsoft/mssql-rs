@@ -510,7 +510,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn aborting_an_interrupted_write_never_starts_the_drain_barrier() {
-        let (mut stream, ended, release, server) = stalled_stream(Release::Close).await;
+        let (mut stream, _, release, server) = stalled_stream(Release::Close).await;
+        let cancelled = stream.cancellation_probe();
         let drain_started = stream.drain_probe();
         assert!(!drain_started());
 
@@ -518,7 +519,7 @@ pub(crate) mod tests {
         drop(stream);
 
         assert!(!drain_started(), "hard abort must bypass graceful close");
-        ends_soon(ended).await;
+        ends_soon(cancelled).await;
         release.send(()).unwrap();
         within(server).await.unwrap();
         assert!(!drain_started(), "drop must not start a delayed drain");

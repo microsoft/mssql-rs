@@ -232,6 +232,8 @@ struct Inner {
     closing: Closing,
     #[cfg(test)]
     drain_started: bool,
+    #[cfg(test)]
+    cancellation_reported: bool,
     write_waker: Option<Waker>,
 }
 
@@ -241,6 +243,10 @@ impl Inner {
     /// Network.framework reports a failed handshake, or a certificate the verify
     /// block rejected, as `waiting` with an error rather than as `failed`.
     fn apply_state(&mut self, state: u32, failure: Option<Failure>) -> bool {
+        #[cfg(test)]
+        if state == STATE_CANCELLED {
+            self.cancellation_reported = true;
+        }
         let next = match (state, failure) {
             (STATE_READY, _) => Phase::Ready,
             (STATE_FAILED, failure) => Phase::Failed(failure.unwrap_or_else(Failure::unknown)),
@@ -566,6 +572,12 @@ impl NwStream {
     pub(super) fn drain_probe(&self) -> impl Fn() -> bool + Send + use<> {
         let shared = Arc::clone(&self.shared);
         move || shared.lock().drain_started
+    }
+
+    #[cfg(test)]
+    pub(super) fn cancellation_probe(&self) -> impl Fn() -> bool + Send + use<> {
+        let shared = Arc::clone(&self.shared);
+        move || shared.lock().cancellation_reported
     }
 
     fn receive(&self) {
@@ -1045,6 +1057,20 @@ mod tests {
         assert_eq!(failure.kind, io::ErrorKind::ConnectionAborted);
         assert!(Phase::Connecting.failure().is_none());
         assert!(Phase::Ready.failure().is_none());
+    }
+
+    #[test]
+    fn cancellation_probe_requires_a_framework_callback_after_local_abort() {
+        let mut inner = Inner {
+            phase: Phase::Cancelled,
+            closing: Closing::Aborted,
+            ..Inner::default()
+        };
+        assert!(!inner.cancellation_reported);
+        assert!(!inner.apply_state(STATE_READY, None));
+        assert!(!inner.cancellation_reported);
+        assert!(!inner.apply_state(STATE_CANCELLED, None));
+        assert!(inner.cancellation_reported);
     }
 
     #[test]
