@@ -23,18 +23,18 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME,
-    SQL_CA_SS_TYPE_NAME, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
-    SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME, SQL_CODE_DATE, SQL_CODE_TIME,
-    SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
-    SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
-    SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH,
-    SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
-    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
-    SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT,
-    SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_PREC_NUMERIC, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_UNNAMED, SqlHandle, SqlInteger, SqlLen,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME,
+    SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME,
+    SQL_CA_SS_UDT_TYPE_NAME, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME,
+    SQL_DECIMAL, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
+    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
+    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
+    SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT,
+    SQL_PREC_NUMERIC, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TYPE_DATE, SQL_TYPE_TIME,
+    SQL_TYPE_TIMESTAMP, SQL_UNNAMED, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_CANNOT_MODIFY_IRD, ERR_FUNCTION_SEQUENCE, ERR_INCONSISTENT_DESCRIPTOR_INFO,
@@ -175,7 +175,6 @@ fn sql_set_desc_field_w_safe(
                 | SQL_DESC_SCALE
                 | SQL_DESC_TYPE
         )
-        && (field != SQL_DESC_LENGTH || desc.kind == DescKind::ImpParam)
         && classify_field(desc.kind, field)
             .is_some_and(|access| access.writable && access.scope == FieldScope::Record)
     {
@@ -210,9 +209,12 @@ fn sql_set_desc_field_w_safe(
                 _ => None,
             };
             let focused_length = (field == SQL_DESC_OCTET_LENGTH).then_some(value_ptr as SqlLen);
+            let focused_app_length = (field == SQL_DESC_LENGTH && desc.kind.is_application())
+                .then_some(value_ptr as SqlULen);
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 Some(super::set_desc_rec::focused_tvp_initial_binding()),
+                focused_app_length,
                 |binding| {
                     if desc.kind == DescKind::ImpParam
                         && matches!(
@@ -337,6 +339,7 @@ fn sql_set_desc_field_w_safe(
                         return;
                     }
                     match field {
+                        SQL_DESC_LENGTH => {}
                         SQL_DESC_DATA_PTR => binding.parameter_value_ptr = value_ptr,
                         SQL_DESC_INDICATOR_PTR => {
                             binding.strlen_or_ind_ptr = value_ptr.cast::<SqlLen>()
@@ -858,7 +861,6 @@ fn set_record_field(
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
         | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
-        | SQL_CA_SS_CATALOG_NAME
         | SQL_CA_SS_SCHEMA_NAME
         | SQL_CA_SS_TYPE_NAME => {
             set_user_type_name(state, field, record_number, value_ptr, buffer_length)
@@ -1210,8 +1212,8 @@ fn read_descriptor_string(
     Some(unsafe { read_utf16(ptr, char_len) })
 }
 
-/// A `SQL_CA_SS_UDT_*` name write (IPD only). Reads the string under the same
-/// rules as [`set_name`], then stores it in the record's boxed UDT identity.
+/// A writable user-type name write (IPD only). Reads the string under the
+/// same rules as [`set_name`], then stores it in the record's boxed identity.
 ///
 /// Only the type name is required on the wire; an application that leaves the
 /// catalog and schema unset lets the server resolve the type against the
@@ -1233,7 +1235,7 @@ fn set_user_type_name(
         // wire, so writing it claims nothing and leaves the rest the server's to
         // supply.
         match field {
-            SQL_CA_SS_UDT_CATALOG_NAME | SQL_CA_SS_CATALOG_NAME => {
+            SQL_CA_SS_UDT_CATALOG_NAME => {
                 names.catalog = value;
                 r.udt_name_claimed.catalog = true;
             }
@@ -1315,9 +1317,9 @@ mod tests {
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
         SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_C_CHAR, SQL_C_LONG, SQL_C_TYPE_DATE,
-        SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_DECIMAL, SQL_INTEGER, SQL_INTERVAL_YEAR,
-        SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC, SQL_TYPE_DATE,
-        SqlNumericStruct,
+        SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_CA_SS_CATALOG_NAME, SQL_DECIMAL, SQL_INTEGER,
+        SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC,
+        SQL_TYPE_DATE, SqlNumericStruct,
     };
     use crate::api::set_stmt_attr::{sql_get_stmt_attr_w, sql_set_stmt_attr_w};
     use crate::api::sqlstate::ERR_FUNCTION_SEQUENCE;
@@ -1458,9 +1460,10 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let ipd = h.ipd();
 
-        // Write through the TVP spelling.
+        // The TVP catalog alias is read-only, so write the catalog through the
+        // UDT spelling and the schema/type through their TVP fields.
         for (field, value) in [
-            (SQL_CA_SS_CATALOG_NAME, "mydb"),
+            (SQL_CA_SS_UDT_CATALOG_NAME, "mydb"),
             (SQL_CA_SS_SCHEMA_NAME, "sales"),
             (SQL_CA_SS_TYPE_NAME, "OrderList"),
         ] {
@@ -1507,6 +1510,61 @@ mod tests {
                 "field {field}"
             );
         }
+    }
+
+    #[test]
+    fn tvp_catalog_alias_is_read_only() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let existing: Vec<u16> = "existing"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.ipd(),
+                    1,
+                    SQL_CA_SS_UDT_CATALOG_NAME as SqlSmallInt,
+                    existing.as_ptr() as SqlPointer,
+                    SqlInteger::from(SQL_NTS),
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let replacement: Vec<u16> = "replacement"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_CA_SS_CATALOG_NAME as SqlSmallInt,
+                replacement.as_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_DESCRIPTOR_FIELD);
+
+        let mut out = [0u16; 32];
+        let mut text_length = 0;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_field_w(
+                    h.ipd(),
+                    1,
+                    SQL_CA_SS_CATALOG_NAME as SqlSmallInt,
+                    out.as_mut_ptr() as SqlPointer,
+                    (out.len() * size_of::<u16>()) as SqlInteger,
+                    &mut text_length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let chars = text_length as usize / size_of::<u16>();
+        assert_eq!(String::from_utf16_lossy(&out[..chars]), "existing");
     }
 
     /// The assembly-qualified name never reaches the wire, so writing it is not
@@ -2617,7 +2675,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_apd_length_write_updates_the_descriptor_record() {
+    fn focused_apd_length_write_updates_the_child_descriptor_record() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
@@ -2626,8 +2684,20 @@ mod tests {
             unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_LENGTH, 20isize as SqlPointer, 0) },
             SQL_SUCCESS
         );
-        let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
-        assert_eq!(apd.inner.lock().unwrap().record(1).unwrap().length, 20);
+        assert_eq!(get_ulen(h.apd(), 1, SQL_DESC_LENGTH as SqlSmallInt), 20);
+        assert!(
+            unsafe { handle_from_raw::<DescHandle>(h.apd()) }
+                .inner
+                .lock()
+                .unwrap()
+                .records
+                .is_empty(),
+            "focused write must not create an outer APD record"
+        );
+        assert_eq!(
+            stmt.inner.lock().unwrap().tvp_column_apd_lengths[&1][0],
+            Some(20)
+        );
     }
 
     #[test]

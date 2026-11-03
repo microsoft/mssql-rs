@@ -386,38 +386,40 @@ impl TvpTableData {
             }
 
             for (col_idx, (column, cell)) in self.columns.iter().zip(row.iter()).enumerate() {
-                if std::mem::discriminant(cell) != std::mem::discriminant(&column.column_type) {
-                    return Err(Error::UsageError(format!(
-                        "TVP row {row_idx} column {col_idx} type mismatch: cell is {cell:?} \
-                         but the column is declared as {:?}",
-                        column.column_type
-                    )));
-                }
+                let cell_result = (|| -> TdsResult<()> {
+                    if std::mem::discriminant(cell) != std::mem::discriminant(&column.column_type) {
+                        return Err(Error::UsageError(format!(
+                            "TVP row {row_idx} column {col_idx} type mismatch: cell is {cell:?} \
+                             but the column is declared as {:?}",
+                            column.column_type
+                        )));
+                    }
 
-                let temporal_value = match cell {
-                    SqlType::Time(Some(value)) => Some(value),
-                    SqlType::DateTime2(Some(value)) => Some(&value.time),
-                    SqlType::DateTimeOffset(Some(value)) => Some(&value.datetime2.time),
-                    _ => None,
-                };
-                if let (Some(scale), Some(value)) = (column.temporal_scale(), temporal_value)
-                    && !temporal_value_fits_scale(value, scale)
-                {
-                    return Err(Error::UsageError(format!(
-                        "TVP row {row_idx} column {col_idx} value cannot be represented at \
-                         temporal scale {scale}"
-                    )));
-                }
+                    let temporal_value = match cell {
+                        SqlType::Time(Some(value)) => Some(value),
+                        SqlType::DateTime2(Some(value)) => Some(&value.time),
+                        SqlType::DateTimeOffset(Some(value)) => Some(&value.datetime2.time),
+                        _ => None,
+                    };
+                    if let (Some(scale), Some(value)) = (column.temporal_scale(), temporal_value)
+                        && !temporal_value_fits_scale(value, scale)
+                    {
+                        return Err(Error::UsageError(format!(
+                            "TVP row {row_idx} column {col_idx} value cannot be represented at \
+                             temporal scale {scale}"
+                        )));
+                    }
 
-                if let Some((precision, scale)) = column.decimal_metadata()
-                    && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
-                {
-                    // Rescale a copy and discard it: this only pre-flights the
-                    // conversion that `write_tvp_rows` performs for real, so a
-                    // rejectable value fails before any bytes reach the wire.
-                    let mut value = *value;
-                    apply_decimal_metadata(&mut value, precision, scale)?;
-                }
+                    if let Some((precision, scale)) = column.decimal_metadata()
+                        && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
+                    {
+                        // Preflight the same rescale that row serialization performs.
+                        let mut value = *value;
+                        apply_decimal_metadata(&mut value, precision, scale)?;
+                    }
+                    Ok(())
+                })();
+                cell_result.map_err(|error| error.with_tvp_cell_context(row_idx, col_idx))?;
             }
         }
 
@@ -1107,7 +1109,14 @@ mod tests {
             vec![TvpColumnDef::new(SqlType::Int(None))],
             vec![vec![SqlType::BigInt(Some(1))]],
         );
-        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        assert!(matches!(
+            data.validate(),
+            Err(Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1182,7 +1191,14 @@ mod tests {
             column.scale = Some(3);
             let data = TvpTableData::new(vec![column], vec![vec![value]]);
 
-            assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+            assert!(matches!(
+                data.validate(),
+                Err(Error::TvpCellSerialization {
+                    row: 1,
+                    column: 1,
+                    ..
+                })
+            ));
         }
     }
 
@@ -1197,7 +1213,14 @@ mod tests {
                 true, 9, 3, 123_456,
             )))]],
         );
-        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        assert!(matches!(
+            data.validate(),
+            Err(Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                ..
+            })
+        ));
 
         let mut column = TvpColumnDef::new(SqlType::Numeric(None));
         column.precision = Some(3);
@@ -1208,7 +1231,14 @@ mod tests {
                 true, 5, 2, 12_345,
             )))]],
         );
-        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        assert!(matches!(
+            data.validate(),
+            Err(Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

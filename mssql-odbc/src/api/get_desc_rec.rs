@@ -239,15 +239,21 @@ pub(super) fn focused_tvp_record_for_desc(
     desc: &DescHandle,
     record_number: SqlSmallInt,
 ) -> Result<Option<FocusedTvpRecord>, ()> {
-    let Some((count, binding)) = desc.focused_tvp_record_snapshot(record_number)? else {
+    let Some((count, binding, app_length)) = desc.focused_tvp_record_snapshot(record_number)?
+    else {
         return Ok(None);
     };
     if usize::try_from(record_number).map_err(|_| ())? > count {
         return Ok(Some(FocusedTvpRecord::PastCount));
     }
-    let record = binding
+    let mut record = binding
         .map(|binding| focused_tvp_record_from_binding(binding, desc.kind))
         .unwrap_or_else(|| DescRecord::default_for(desc.kind));
+    if desc.kind != DescKind::ImpParam
+        && let Some(length) = app_length
+    {
+        record.length = length;
+    }
     Ok(Some(FocusedTvpRecord::Record(record)))
 }
 
@@ -272,9 +278,10 @@ mod tests {
     use std::ptr;
 
     use super::*;
+    use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
-        SQL_C_DEFAULT, SQL_C_SLONG, SQL_DATETIME, SQL_DECIMAL, SQL_INTEGER, SQL_NULL_HANDLE,
-        SQL_NULLABLE, SQL_PARAM_INPUT, SQL_TYPE_TIMESTAMP,
+        SQL_C_DEFAULT, SQL_C_SLONG, SQL_DATETIME, SQL_DECIMAL, SQL_DESC_COUNT, SQL_INTEGER,
+        SQL_NULL_HANDLE, SQL_NULLABLE, SQL_PARAM_INPUT, SQL_TYPE_TIMESTAMP,
     };
     use crate::handles::StmtHandle;
     use crate::handles::desc::{DescKind, DescRecord};
@@ -447,16 +454,71 @@ mod tests {
         let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
         barrier.wait();
         for _ in 0..10_000 {
-            let (count, binding) = desc
+            let (count, binding, app_length) = desc
                 .focused_tvp_record_snapshot(1)
                 .unwrap()
                 .expect("the statement owns the focused IPD");
+            assert_eq!(app_length, None);
             assert!(
                 (count == 1 && binding.is_some()) || (count == 0 && binding.is_none()),
                 "count {count} and binding {binding:?} must come from the same focus"
             );
         }
         toggler.join().unwrap();
+    }
+
+    #[test]
+    fn shared_apd_with_conflicting_focused_shapes_returns_error() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let second_stmt = h.alloc_extra_stmt();
+        let shared_apd = h.alloc_explicit_desc();
+        for (stmt_handle, column_count) in [(h.stmt, 1), (second_stmt, 2)] {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.active_apd = Some(shared_apd);
+            state.vendor_attrs.store_param_focus(1);
+            state
+                .tvp_column_bindings
+                .insert(1, vec![None; column_count]);
+        }
+
+        let mut count: SqlSmallInt = -1;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_field_w(
+                    shared_apd,
+                    0,
+                    SQL_DESC_COUNT as SqlSmallInt,
+                    (&mut count as *mut SqlSmallInt).cast(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        let desc = unsafe { handle_from_raw::<DescHandle>(shared_apd) };
+        assert_eq!(
+            desc.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            SQLSTATE_HY000
+        );
+
+        assert_eq!(get_rec(shared_apd, 2, 0).rc, SQL_ERROR);
+        assert_eq!(
+            desc.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            SQLSTATE_HY000
+        );
     }
 
     #[test]

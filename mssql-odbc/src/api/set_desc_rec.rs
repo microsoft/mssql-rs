@@ -162,6 +162,7 @@ fn sql_set_desc_rec_safe(
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 Some(focused_tvp_initial_binding()),
+                None,
                 |binding| {
                     focused_tvp_ipd_desc_rec(
                         binding,
@@ -251,6 +252,7 @@ fn sql_set_desc_rec_safe(
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 Some(initial_binding),
+                None,
                 |binding| {
                     if !is_valid_c_type(requested_c_type) {
                         validation_diagnostic.set(Some(ERR_INVALID_C_DATA_TYPE));

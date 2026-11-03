@@ -353,6 +353,9 @@ fn sql_bind_parameter_safe(
             stmt_state
                 .tvp_column_bindings
                 .remove(&usize::from(parameter_number));
+            stmt_state
+                .tvp_column_apd_lengths
+                .remove(&usize::from(parameter_number));
             let child_layout = crate::handles::desc::DescHeader {
                 array_size: column_size,
                 ..Default::default()
@@ -423,6 +426,11 @@ fn sql_bind_parameter_safe(
             columns.resize(column_index + 1, None);
         }
         columns[column_index] = Some(bound);
+        if let Some(lengths) = stmt_state.tvp_column_apd_lengths.get_mut(&tvp_ordinal)
+            && let Some(length) = lengths.get_mut(column_index)
+        {
+            *length = None;
+        }
         debug!(
             tvp_ordinal,
             column = parameter_number,
@@ -718,6 +726,7 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
         // The TVP column captures are part of the parameter bindings this
         // option resets.
         stmt_state.tvp_column_bindings.clear();
+        stmt_state.tvp_column_apd_lengths.clear();
         stmt_state.tvp_column_layouts.clear();
         stmt_state.effective_apd(stmt)
     };
@@ -774,7 +783,7 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_BINARY, SQL_C_CHAR, SQL_C_SLONG, SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME,
+        SQL_C_BINARY, SQL_C_CHAR, SQL_C_SLONG, SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
         SQL_GUID, SQL_INTEGER, SQL_NTS, SQL_NULL_DATA, SQL_NULL_HANDLE, SQL_PARAM_OUTPUT,
         SQL_SS_TABLE, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
     };
@@ -1305,7 +1314,7 @@ mod tests {
         );
 
         for (field, value) in [
-            (SQL_CA_SS_CATALOG_NAME, "old_catalog"),
+            (SQL_CA_SS_UDT_CATALOG_NAME, "old_catalog"),
             (SQL_CA_SS_SCHEMA_NAME, "old_schema"),
         ] {
             let mut value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();

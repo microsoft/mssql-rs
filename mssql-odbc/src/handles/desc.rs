@@ -603,6 +603,9 @@ impl DescState {
     }
 }
 
+pub(crate) type FocusedTvpRecordSnapshot =
+    (usize, Option<crate::params::BoundParam>, Option<SqlULen>);
+
 impl DescHandle {
     /// Drops the UDT identities `SQLDescribeParam` auto-filled, keeping any the
     /// application set through `SQLSetDescField`. Call when new SQL supersedes
@@ -835,12 +838,14 @@ impl DescHandle {
         &self,
         record_number: SqlSmallInt,
         initial_binding: Option<crate::params::BoundParam>,
+        focused_app_length: Option<SqlULen>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         update: impl FnMut(&mut crate::params::BoundParam),
     ) -> Result<Option<bool>, ()> {
         self.update_focused_tvp_bindings_after_validation(
             record_number,
             initial_binding,
+            focused_app_length,
             is_valid,
             update,
             || {},
@@ -851,6 +856,7 @@ impl DescHandle {
         &self,
         record_number: SqlSmallInt,
         initial_binding: Option<crate::params::BoundParam>,
+        focused_app_length: Option<SqlULen>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         mut update: impl FnMut(&mut crate::params::BoundParam),
         after_validation: impl FnOnce(),
@@ -870,7 +876,7 @@ impl DescHandle {
         let mut found = false;
         for &raw in &dbc_state.statements {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
-            let Ok(state) = stmt.inner.lock() else {
+            let Ok(mut state) = stmt.inner.lock() else {
                 error!("validating focused TVP descriptor records: stmt mutex poisoned");
                 return Err(());
             };
@@ -899,6 +905,16 @@ impl DescHandle {
                 found = true;
                 if !is_valid(binding) {
                     return Ok(Some(false));
+                }
+                if focused_app_length.is_some() {
+                    let lengths = state.tvp_column_apd_lengths.entry(focus).or_default();
+                    if lengths.len() <= column_index {
+                        let additional = column_index + 1 - lengths.len();
+                        lengths.try_reserve_exact(additional).map_err(|_| {
+                            error!("updating focused TVP descriptor lengths: allocation failed");
+                        })?;
+                        lengths.resize(column_index + 1, None);
+                    }
                 }
             }
         }
@@ -936,7 +952,7 @@ impl DescHandle {
                 .and_then(|columns| columns.get(column_index))
                 .and_then(Option::as_ref)
                 .is_some();
-            if existing {
+            let binding_updated = if existing {
                 let Some(Some(binding)) = state
                     .tvp_column_bindings
                     .get_mut(&focus)
@@ -948,7 +964,7 @@ impl DescHandle {
                     return Ok(Some(false));
                 }
                 update(binding);
-                updated = true;
+                true
             } else if let Some(mut binding) = initial_binding {
                 if !is_valid(&binding) {
                     return Ok(Some(false));
@@ -963,6 +979,22 @@ impl DescHandle {
                     columns.resize(column_index + 1, None);
                 }
                 columns[column_index] = Some(binding);
+                true
+            } else {
+                false
+            };
+            if binding_updated {
+                if let Some(length) = focused_app_length {
+                    let Some(slot) = state
+                        .tvp_column_apd_lengths
+                        .get_mut(&focus)
+                        .and_then(|lengths| lengths.get_mut(column_index))
+                    else {
+                        error!("updating focused TVP descriptor lengths: reserved slot is missing");
+                        return Err(());
+                    };
+                    *slot = Some(length);
+                }
                 updated = true;
             }
         }
@@ -972,7 +1004,7 @@ impl DescHandle {
     pub(crate) fn focused_tvp_record_snapshot(
         &self,
         record_number: SqlSmallInt,
-    ) -> Result<Option<(usize, Option<crate::params::BoundParam>)>, ()> {
+    ) -> Result<Option<FocusedTvpRecordSnapshot>, ()> {
         let Some(column_index) = usize::try_from(record_number)
             .ok()
             .and_then(|number| number.checked_sub(1))
@@ -984,6 +1016,7 @@ impl DescHandle {
             error!("reading focused TVP descriptor record: dbc mutex poisoned");
             return Err(());
         };
+        let mut snapshot = None;
         for &raw in &dbc_state.statements {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
             let Ok(state) = stmt.inner.lock() else {
@@ -1011,9 +1044,26 @@ impl DescHandle {
                 .and_then(|columns| columns.get(column_index))
                 .copied()
                 .flatten();
-            return Ok(Some((count, binding)));
+            let app_length = if self.kind == DescKind::ImpParam {
+                None
+            } else {
+                state
+                    .tvp_column_apd_lengths
+                    .get(&focus)
+                    .and_then(|lengths| lengths.get(column_index))
+                    .copied()
+                    .flatten()
+            };
+            let current = (count, binding, app_length);
+            if snapshot.is_some_and(|snapshot| snapshot != current) {
+                error!(
+                    "reading focused TVP descriptor record: associated statements have conflicting projections"
+                );
+                return Err(());
+            }
+            snapshot = Some(current);
         }
-        Ok(None)
+        Ok(snapshot)
     }
 
     pub(crate) fn focused_tvp_layout_header(&self) -> Result<Option<DescHeader>, ()> {
@@ -1060,6 +1110,7 @@ impl DescHandle {
             error!("reading focused TVP descriptor count: dbc mutex poisoned");
             return Err(());
         };
+        let mut count = None;
         for &raw in &dbc_state.statements {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
             let Ok(state) = stmt.inner.lock() else {
@@ -1079,12 +1130,17 @@ impl DescHandle {
                 .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
                 .unwrap_or(0);
             if focus != 0 {
-                return Ok(Some(
-                    state.tvp_column_bindings.get(&focus).map_or(0, Vec::len),
-                ));
+                let focused_count = state.tvp_column_bindings.get(&focus).map_or(0, Vec::len);
+                if count.is_some_and(|count| count != focused_count) {
+                    error!(
+                        "reading focused TVP descriptor count: associated statements have conflicting projections"
+                    );
+                    return Err(());
+                }
+                count = Some(focused_count);
             }
         }
-        Ok(None)
+        Ok(count)
     }
 
     pub(crate) fn update_focused_tvp_record_count(
@@ -1360,24 +1416,19 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         // The server type identity. The UDT trio (1218-1220) is UDT-specific;
         // the un-prefixed trio (`SQL_CA_SS_CATALOG_NAME`/`SCHEMA_NAME`/
         // `TYPE_NAME`, 1225-1227) is what a TVP uses for its three-part table
-        // type name. Both are IPD-only, writable, and resolve to the same
-        // stored identity. An application writing here is one of two sources;
-        // the other is `refine_ipd`, which copies the server's
-        // `suggested_user_type_*` columns into any record the application has
-        // not claimed. The assembly-qualified name is accepted and echoed but
-        // never sent - the parameter header has no field for it, and msodbcsql
-        // stores it without writing it either.
+        // type name. Both spellings share storage; the TVP catalog alias is
+        // read-only per the descriptor contract.
         SQL_CA_SS_UDT_CATALOG_NAME
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
         | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
-        | SQL_CA_SS_CATALOG_NAME
         | SQL_CA_SS_SCHEMA_NAME
         | SQL_CA_SS_TYPE_NAME
             if is_ipd =>
         {
             (Record, true)
         }
+        SQL_CA_SS_CATALOG_NAME if is_ipd => (Record, false),
 
         _ => return None,
     };
@@ -1452,6 +1503,7 @@ mod tests {
 
         let result = desc.update_focused_tvp_bindings_after_validation(
             1,
+            None,
             None,
             |binding| binding.app_scale <= 5,
             |binding| binding.app_precision = 5,

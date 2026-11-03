@@ -28,7 +28,7 @@ use crate::handles::desc::{DescRecord, DescState, UdtNames};
 /// snapshot from those records immediately before each execute (see
 /// [`Self::all_from_descriptor_states`]) — the shape `build_named_params` and
 /// the data-at-execution lookups already expect.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct BoundParam {
     /// `SQL_PARAM_INPUT` / `SQL_PARAM_INPUT_OUTPUT` / `SQL_PARAM_OUTPUT`.

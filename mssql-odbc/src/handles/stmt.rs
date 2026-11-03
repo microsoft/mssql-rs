@@ -568,6 +568,9 @@ pub(crate) struct StmtState {
     /// the TVP's child descriptor. Read at execute to assemble the table's rows,
     /// and cleared whenever the parameter bindings are reset.
     pub(crate) tvp_column_bindings: BTreeMap<usize, Vec<Option<BoundParam>>>,
+    /// Application-side `SQL_DESC_LENGTH` overrides for focused TVP columns,
+    /// keyed by the TVP ordinal and then zero-based column ordinal.
+    pub(crate) tvp_column_apd_lengths: BTreeMap<usize, Vec<Option<SqlULen>>>,
     pub(crate) tvp_column_layouts: BTreeMap<usize, DescHeader>,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
@@ -2347,6 +2350,7 @@ impl StmtHandle {
                 parameter_udt_names: Vec::new(),
                 bound_params: Vec::new(),
                 tvp_column_bindings: BTreeMap::new(),
+                tvp_column_apd_lengths: BTreeMap::new(),
                 tvp_column_layouts: BTreeMap::new(),
                 pending_unprepare: None,
                 parameter_array: None,

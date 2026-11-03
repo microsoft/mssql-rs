@@ -149,6 +149,7 @@ fn sql_get_desc_field_w_safe(
                 | SQL_DESC_OCTET_LENGTH_PTR
                 | SQL_DESC_OCTET_LENGTH
                 | SQL_DESC_LENGTH
+                | SQL_DESC_NULLABLE
                 | SQL_DESC_CONCISE_TYPE
                 | SQL_DESC_DATETIME_INTERVAL_CODE
                 | SQL_DESC_PRECISION
@@ -520,7 +521,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{
         SQL_C_NUMERIC, SQL_DECIMAL, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE, SQL_NULL_HANDLE,
-        SQL_PARAM_INPUT, SQL_UNNAMED,
+        SQL_NULLABLE, SQL_PARAM_INPUT, SQL_UNNAMED,
     };
     use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::error::diag::DiagRecord;
@@ -547,6 +548,7 @@ mod tests {
     const SQL_DESC_PRECISION: SqlSmallInt =
         crate::api::odbc_types::SQL_DESC_PRECISION as SqlSmallInt;
     const SQL_DESC_SCALE: SqlSmallInt = crate::api::odbc_types::SQL_DESC_SCALE as SqlSmallInt;
+    const SQL_DESC_NULLABLE: SqlSmallInt = crate::api::odbc_types::SQL_DESC_NULLABLE as SqlSmallInt;
 
     fn desc_diags(handle: SqlHandle) -> Vec<DiagRecord> {
         let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
@@ -797,9 +799,35 @@ mod tests {
                 SQL_SUCCESS
             );
         }
+
         assert_eq!(concise, SQL_DECIMAL);
         assert_eq!(precision, 10);
         assert_eq!(scale, 2);
+    }
+
+    #[test]
+    fn focused_ipd_nullable_reads_from_the_child_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(1, vec![None, None]);
+        }
+
+        let mut nullable: SqlSmallInt = -1;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.ipd(),
+                2,
+                SQL_DESC_NULLABLE,
+                (&mut nullable as *mut SqlSmallInt).cast(),
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(nullable, SQL_NULLABLE);
     }
 
     #[test]
