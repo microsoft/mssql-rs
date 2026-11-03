@@ -30,8 +30,14 @@
 #     stage attempt so reruns don't collide with or match prior attempts; this
 #     job appends the same suffix to `expectedSentinels` via SENTINEL_SUFFIX.
 #   * The stage must depend directly on successful InitializeValidation.
-#     Host and consumers import its secret output, never regenerate it.
-#     The nonsecret generation ID isolates artifacts after reinitialization.
+#     Host and consumers map only its nonsecret SQL_CREDENTIAL_GENERATION,
+#     which isolates artifacts after reinitialization.
+#   * The dependent test job must set SENTINEL_ARTIFACT_NAME on the poll step
+#     to exactly the teardown artifact name it publishes. The poll script
+#     publishes an ephemeral RSA public key as `sql-key-<that name>`; this
+#     job's wait step encrypts its job-local sa password to that key and
+#     publishes `sql-cred-<that name>`. Fork PR builds receive no secret
+#     variables, so the password never crosses a job boundary as a variable.
 #
 # Cross-pool reachability assumption: the configured x64 pool and the ARM
 # pool that consumes the endpoint share a VNet, and the IP we publish is
@@ -73,21 +79,17 @@ jobs:
       demands:
         - ${{ parameters.poolImageOverride }}
     variables:
-      SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
       SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       INSTANCE_ID: ${{ parameters.instanceId }}
       SQL_IMAGE_TAG: ${{ parameters.sqlImageTag }}
       EXPECTED_SENTINELS: ${{ parameters.expectedSentinels }}
       MAX_LIFETIME_MINUTES: ${{ parameters.maxLifetimeMinutes }}
     steps:
-      - bash: |
-          set -euo pipefail
-          bash .pipeline/scripts/sql-host/import-sql-password.sh
-        displayName: 'Import shared SQL credential'
-        workingDirectory: '$(Build.SourcesDirectory)'
-        env:
-          SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
-          SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
+      # Job-local: consumers receive it only through the per-consumer key exchange
+      # in wait-for-teardown.sh.
+      - template: generate-sql-password-template.yml
+        parameters:
+          osType: Linux
 
       - task: DockerInstaller@0
         inputs:
@@ -134,7 +136,7 @@ jobs:
       - script: |
           set -euo pipefail
           bash .pipeline/scripts/sql-host/wait-for-teardown.sh
-        displayName: 'Wait for test-completion sentinels'
+        displayName: 'Serve SQL credentials and wait for test-completion sentinels'
         workingDirectory: '$(Build.SourcesDirectory)'
         env:
           EXPECTED_SENTINELS: $(EXPECTED_SENTINELS)
@@ -142,6 +144,8 @@ jobs:
           # their artifact names with the same value), so a rerun never matches
           # a previous attempt's leftover sentinels.
           SENTINEL_SUFFIX: '-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
           BUILD_BUILDID: $(Build.BuildId)
           SYSTEM_COLLECTIONURI: $(System.CollectionUri)
           SYSTEM_TEAMPROJECT: $(System.TeamProject)

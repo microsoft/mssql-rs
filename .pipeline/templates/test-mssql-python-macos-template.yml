@@ -31,6 +31,7 @@ steps:
 # ── 3. Build bindings (no Docker needed) ─────────────────────────────────────
 - script: |
     set -euo pipefail
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"
 
     MSSQL_PYTHON_DIR="$(Build.SourcesDirectory)/../mssql-python"
 

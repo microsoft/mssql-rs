@@ -40,6 +40,7 @@ steps:
 
   - script: |
       set -e
+      export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"
       cargo build --release --target "$(odbcTargetTriple)" --package mssqlodbc
     displayName: 'Build mssql-odbc driver (${{ parameters.architecture }})'
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))

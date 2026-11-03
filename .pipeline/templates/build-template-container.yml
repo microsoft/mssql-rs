@@ -47,20 +47,8 @@ parameters:
   default: false
 
 steps:
-# ARM64 integration tests connect cross-pool to an on-demand x64 SQL host
-# (Sql_Host_build_arm). Import the initialization secret before the generate
-# step, which then no-ops (it honors the SQL_PASSWORD_GENERATED marker).
-- ${{ if eq(parameters.architecture, 'ARM64') }}:
-  - bash: |
-      set -euo pipefail
-      bash .pipeline/scripts/sql-host/import-sql-password.sh
-    displayName: 'Import shared SQL credential (ARM cross-pool)'
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-    workingDirectory: '$(Build.SourcesDirectory)'
-    env:
-      SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
-      SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
-
+# On ARM64 PRs, the cross-pool poll step below replaces this job-local password
+# with the Sql_Host_build_arm password it receives through the key exchange.
 - template: generate-sql-password-template.yml
   parameters:
     osType: Linux
@@ -153,13 +141,14 @@ steps:
   - script: |
       set -euo pipefail
       bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
-    displayName: Wait for cross-pool SQL host endpoint
+    displayName: Wait for cross-pool SQL host endpoint and credential
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: '$(Build.SourcesDirectory)'
     env:
       # Suffix with the stage attempt so a stage rerun reads this attempt's
       # freshly-published endpoint, not a stale one from a prior attempt.
       ARTIFACT_NAME: 'sql-ready-build_arm-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+      SENTINEL_ARTIFACT_NAME: 'build_arm-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
       SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
       BUILD_BUILDID: $(Build.BuildId)
       BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
