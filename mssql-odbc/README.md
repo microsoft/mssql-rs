@@ -275,6 +275,12 @@ Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
 default wide-character fetching is unchanged; an explicitly selected narrow
 decoder must match the platform client encoding.
 
+On Windows, a streamed `varchar(max)`/`text` value whose collation code page is
+1252 is delivered to `SQL_C_CHAR` under ANSI code page 1252 without decoding
+and re-encoding, as msodbcsql does when the code pages match. The bytes are the
+same as converting them; the copy reads straight into the application buffer
+and may read ahead up to 64 KiB of the value.
+
 **Migration note:** narrow results were previously always UTF-8. Applications
 that assumed UTF-8 on a non-UTF-8 system should use wide retrieval or decode
 with the client encoding. Input `SQL_C_CHAR` parameters still use UTF-8 pending
