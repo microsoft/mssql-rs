@@ -200,11 +200,8 @@ fn sql_get_connect_attr_w_safe(
             SQL_SUCCESS
         }
         SQL_COPT_SS_LONGASMAX => {
-            if value_ptr.is_null() {
-                error!("SQLGetConnectAttrW: SQL_COPT_SS_LONGASMAX value pointer is null");
-                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
-                return SQL_ERROR;
-            }
+            // msodbcsql's shared numeric tail accepts either output as NULL
+            // (sqlcmisc.cpp, ExportImp::SQLGetConnectAttrW).
             let [b0, b1, b2, b3, ..] = state.long_as_max().to_le_bytes();
             unsafe {
                 write_if_some(
@@ -1005,13 +1002,18 @@ mod tests {
             }
             for (raw, expected) in [(0usize, 0u32), (1, 1), (2, 2), (usize::MAX, u32::MAX)] {
                 let rc = unsafe {
-                    sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_LONGASMAX, raw as SqlPointer, 0)
+                    crate::api::exports::SQLSetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        raw as SqlPointer,
+                        0,
+                    )
                 };
                 assert_eq!(rc, SQL_SUCCESS);
                 let mut value = 0u32;
                 let mut length = -1;
                 let rc = unsafe {
-                    sql_get_connect_attr_w(
+                    crate::api::exports::SQLGetConnectAttrW(
                         h.dbc,
                         SQL_COPT_SS_LONGASMAX,
                         (&raw mut value).cast(),
@@ -1024,6 +1026,50 @@ mod tests {
                 assert_eq!(length, 4);
                 assert_eq!(dbc.inner.lock().unwrap().long_as_max(), raw);
             }
+        }
+    }
+
+    #[test]
+    fn long_as_max_null_value_reports_length() {
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            let mut length = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(length, 4);
+        }
+    }
+
+    #[test]
+    fn long_as_max_allows_both_outputs_null() {
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
         }
     }
 
@@ -1048,7 +1094,6 @@ mod tests {
     fn vendor_attribute_null_pointer_is_rejected() {
         let h = TestHandles::with_env_dbc();
         for attribute in [
-            SQL_COPT_SS_LONGASMAX,
             SQL_COPT_SS_ENCRYPT,
             SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
             SQL_COPT_SS_INTEGRATED_SECURITY,
