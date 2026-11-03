@@ -230,7 +230,8 @@ so the test side polls for the right sentinel.
    case usually means the SQL host hit its lifetime cap while the test
    job was queued — and otherwise waits for and decrypts `sql-cred-<S>` (see
    *SA password key exchange*) before setting `SQL_PASSWORD`, `DB_HOST`, and
-   `DB_PORT`.
+   `DB_PORT`. It rechecks the remaining host lifetime after the credential wait
+   and rejects the endpoint if it has fallen below the same threshold.
 
 If the readiness probe fails, `start.sh` exits non-zero, the publish step
 is skipped, and the test job's poll script will time out at its

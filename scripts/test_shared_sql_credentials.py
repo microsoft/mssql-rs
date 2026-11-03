@@ -734,6 +734,34 @@ def test_endpoint_generation_and_deadline_guard(agent, shell, case):
         assert agent.uploads == []
 
 
+@pytest.mark.parametrize("shell", ["bash", "pwsh"])
+def test_endpoint_lifetime_is_rechecked_after_credential_wait(agent, shell):
+    password, generation = credential(), secrets.token_hex(16)
+    deadline = int(time.time()) + 10
+    publish_endpoint(agent, generation, f"127.0.0.1 14333 {deadline} {generation}")
+    agent.serve(password.encode())
+    answer = agent.on_upload
+
+    def answer_after_endpoint_expires(name):
+        if name.startswith("sql-key-"):
+            while time.time() <= deadline:
+                time.sleep(0.1)
+        answer(name)
+
+    agent.on_upload = answer_after_endpoint_expires
+    consumer = start_consumer(
+        agent, shell, generation, MIN_HOST_LIFE_REMAINING_SECONDS="3",
+        CREDENTIAL_WAIT_SECONDS="30",
+    )
+    assert consumer.wait() != 0, consumer.output
+    assert agent.errors == []
+    assert f"SQL credential sql-cred-test-{generation}-2 found." in consumer.output
+    assert "endpoint expires in" in consumer.output
+    assert "variable=SQL_PASSWORD" not in consumer.output
+    assert "variable=DB_HOST" not in consumer.output
+    assert "variable=DB_PORT" not in consumer.output
+
+
 def test_host_payload_contains_no_secret(tmp_path):
     if not BASH:
         pytest.skip("Bash is required")

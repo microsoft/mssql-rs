@@ -299,6 +299,15 @@ if [[ ! "${password}" =~ ^Aa1![A-Za-z0-9]{22}$ ]]; then
     echo "ERROR: ${cred_artifact} did not decrypt to a valid SQL password." >&2
     exit 1
 fi
+if [ -n "${deadline}" ]; then
+    now="$(date +%s)"
+    remaining=$(( deadline - now ))
+    if [ "${remaining}" -lt "${MIN_HOST_LIFE_REMAINING_SECONDS}" ]; then
+        echo "ERROR: SQL host endpoint expires in ${remaining}s after credential exchange (need >= ${MIN_HOST_LIFE_REMAINING_SECONDS}s)." >&2
+        exit 1
+    fi
+    echo "SQL host has ${remaining}s of life remaining after credential exchange."
+fi
 echo "##vso[task.setvariable variable=SQL_PASSWORD;issecret=true]${password}"
 echo "##vso[task.setvariable variable=SQL_PASSWORD_GENERATED]1"
 echo "Received SQL password from the SQL host (length=${#password})."

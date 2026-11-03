@@ -229,6 +229,11 @@ $password = [Text.Encoding]::ASCII.GetString($plain)
 if ($password -cnotmatch '\AAa1![A-Za-z0-9]{22}\z') {
     throw "$credArtifact did not decrypt to a valid SQL password."
 }
+$remaining = [int]$fields[2] - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+if ($remaining -lt $minHostLife) {
+    throw "SQL host endpoint expires in ${remaining}s after credential exchange (need >= ${minHostLife}s)."
+}
+Write-Host "SQL host has ${remaining}s of life remaining after credential exchange."
 Write-Host "##vso[task.setvariable variable=SQL_PASSWORD;issecret=true]$password"
 Write-Host '##vso[task.setvariable variable=SQL_PASSWORD_GENERATED]1'
 Write-Host "Received SQL password from the SQL host (length=$($password.Length))."
