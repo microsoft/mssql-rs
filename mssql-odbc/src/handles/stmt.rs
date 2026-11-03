@@ -518,8 +518,8 @@ pub(crate) struct StmtState {
     /// cursor close (`SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`, whose own
     /// drain can no longer discover it on the wire because the peek already
     /// consumed the terminating ERROR token) — to drain and fail on. The
-    /// connection-scoped close sweep (`SQLEndTran`/autocommit/isolation
-    /// change, `close_cursor_for_connection_op`) is the one exception: it
+    /// connection-scoped close sweep (`SQLEndTran`/autocommit/connection
+    /// reset, `close_cursor_for_connection_op`) is the one exception: it
     /// still posts this to the statement's diagnostics but does not fail its
     /// own return, since that return code specifically means "the stream
     /// failed to drain," which a stale diagnostic on an already-closed batch

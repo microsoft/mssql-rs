@@ -48,15 +48,6 @@ impl AlwaysEncryptedFeature {
             client_version,
         }
     }
-
-    /// Returns the version negotiated with the server after a successful ack.
-    ///
-    /// Returns `0` when the feature was not acknowledged or the server does not support it.
-    #[allow(dead_code)]
-    // Consumed once result-set decryption wiring reads the negotiated version.
-    pub fn negotiated_version(&self) -> u8 {
-        self.negotiated_version
-    }
 }
 
 impl Default for AlwaysEncryptedFeature {
@@ -92,6 +83,13 @@ impl Feature for AlwaysEncryptedFeature {
         // Client-supported version.
         packet_writer.write_byte_async(self.client_version).await?;
         Ok(())
+    }
+
+    /// Returns the version negotiated with the server.
+    ///
+    /// Returns `0` when the server does not support the feature.
+    fn negotiated_version(&self) -> u8 {
+        self.negotiated_version
     }
 
     fn deserialize(&mut self, data: &[u8]) -> TdsResult<()> {

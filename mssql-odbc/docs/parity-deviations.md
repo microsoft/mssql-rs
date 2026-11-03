@@ -1299,7 +1299,39 @@ msodbcsql build is measured.
     sign-off remains pending. Owned by AB#49637, with the
     [SQLGetInfo plan](sql-get-info-plan.md#active-statements-and-long-data-lengths).
 
-38. **Rebinding a TVP that is the last bound parameter does not preserve
+38. **A busy-rejected isolation change retains the last applied getter value.**
+    Both isolation attributes return `SQL_ERROR` / `HY000` without applying
+    the requested level or discarding application results. After that failure,
+    msodbcsql reports the rejected requested level through both
+    `SQL_ATTR_TXN_ISOLATION` and `SQL_COPT_SS_TXN_ISOLATION`; this driver
+    continues reporting the last successfully applied attribute value.
+
+    **Reference:** `ExportImp::SQLSetConnectAttrW` in
+    `Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp` normalizes the vendor alias
+    (:1755-1758), transfers an `ExecImmediate` failure without leaving the
+    switch (:1812-1828), then stores `vParam` unconditionally (:2940-2942).
+    `ExportImp::SQLGetConnectAttrW` reads that option slot (:3466-3469).
+    Source inspected at master `dc673881adda90a8c78e51ecfa1e7ec67d38ebc1`.
+
+    **Measurement:** Windows x64 retail DLL `2018.0187.0001.01`,
+    `SQL_DRIVER_VER=18.07.0001`, through Windows Driver Manager on 2026-11-02.
+    With READ COMMITTED initially selected, requesting SERIALIZABLE with
+    unread rows or an exhausted first result followed by a pending second
+    result returns `HY000`; both getters then report SERIALIZABLE. Closing
+    the cursor reveals that the server remains READ COMMITTED. Both setter
+    aliases were measured. `IsolationGetterAfterBusyRejection` pins each
+    driver's getter values, unchanged server level, and successful retry,
+    recording the tested driver's version on each comparison leg.
+
+    Retaining the applied value keeps getter state consistent with a failed
+    setter and prevents the existing same-value shortcut from suppressing a
+    close-and-retry's SET. That shortcut remains a separate implementation
+    gap tracked in [#798](https://github.com/microsoft/mssql-rs/issues/798);
+    this entry does not settle its eventual replacement. No runtime behavior
+    changes here; maintainer parity sign-off remains pending on
+    [PR #770](https://github.com/microsoft/mssql-rs/pull/770).
+
+39. **Rebinding a TVP that is the last bound parameter does not preserve
     parameter focus on msodbcsql 18.07.0001.** A measured end-to-end attempt
     accepts the second `SQLBindParameter`, then returns IM020 when the same
     statement is focused again. In msodbcsql, `SQLBindParameter` calls

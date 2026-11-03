@@ -1009,6 +1009,10 @@ impl TdsTransport for MockTransport {
         Ok(())
     }
 
+    fn abort_transport(&mut self) {
+        // This parser-only transport owns no network connection.
+    }
+
     async fn send_attention_with_timeout(
         &mut self,
         _context: &crate::io::token_stream::ParserContext,

@@ -19,8 +19,9 @@
 #include <string>
 #include <thread>
 
-// Relays TLS bytes unchanged. Pausing only the client-to-server direction lets
-// cancellation tests hold a packet write pending without stopping SQL Server.
+// Relays TLS bytes unchanged. Pausing the client-to-server direction lets
+// cancellation tests hold a packet write pending without stopping SQL Server;
+// pausing responses holds a read partway through a result.
 class TcpPauseProxy {
 #ifdef _WIN32
     using Socket = SOCKET;
@@ -146,10 +147,18 @@ public:
         paused_ = true;
     }
 
+    // Holds server-to-client bytes, so a read waits partway through a response.
+    void PauseResponses() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        responses_paused_ = true;
+    }
+
+    // Releases both directions.
     void Resume() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             paused_ = false;
+            responses_paused_ = false;
         }
         resumed_.notify_all();
     }
@@ -166,9 +175,11 @@ private:
 #endif
         char buffer[4096];
         while (!stopped_.load()) {
-            if (request) {
+            {
                 std::unique_lock<std::mutex> lock(mutex_);
-                resumed_.wait(lock, [&] { return !paused_ || stopped_.load(); });
+                resumed_.wait(lock, [&] {
+                    return !(request ? paused_ : responses_paused_) || stopped_.load();
+                });
                 if (stopped_.load()) return;
             }
             const auto received = recv(from, buffer, sizeof(buffer), 0);
@@ -203,6 +214,7 @@ private:
     std::mutex mutex_;
     std::condition_variable resumed_;
     bool paused_ = false;
+    bool responses_paused_ = false;
     unsigned port_ = 0;
     std::thread worker_;
 };

@@ -1,10 +1,10 @@
 # Scheduled multithreaded stress runs of the mssql-odbc C++ e2e suite (AB#49263).
 #
 # PR validation runs the ODBC_TEST_F concurrent variants once at 2 threads x 1
-# iteration, which catches tests unfit for concurrency but rarely a race. This
-# pipeline reruns only those variants (the <name>_mt ctest entries) at stress
-# size, without retries, so an intermittent failure is reported rather than
-# retried away:
+# iteration, in /SharedDbc only and only on Windows, which catches tests unfit
+# for concurrency but rarely a race. This pipeline reruns only those variants
+# (the <name>_mt ctest entries) in every mode at stress size, without retries,
+# so an intermittent failure is reported rather than retried away:
 #
 #   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
 #   weekly  16 x 50, the same modes
@@ -85,6 +85,9 @@ variables:
   msodbcsqlVersion: '18.6.2.1'
   # Resolved when the run starts: the schedule that fired it, or the manual choice.
   odbcMtProfile: $[ iif(eq('${{ parameters.profile }}', 'auto'), iif(eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'), 'weekly', 'nightly'), '${{ parameters.profile }}') ]
+  # Linux builds compile the <name>_mt entries only when asked (CMakeLists.txt);
+  # the build templates forward this into their containers.
+  ODBC_E2E_CONCURRENT: 'ON'
   # Job timeouts must be resolved during template expansion.
   ${{ if or(eq(parameters.profile, 'weekly'), and(eq(parameters.profile, 'auto'), eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'))) }}:
     odbcMtJobTimeoutInMinutes: 240
