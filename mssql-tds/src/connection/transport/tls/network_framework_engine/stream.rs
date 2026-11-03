@@ -206,6 +206,8 @@ enum Closing {
     /// Earlier sends had not gone out within [`DRAIN_LIMIT`], so the connection
     /// was cancelled regardless.
     Abandoned,
+    /// Hard abort bypassed graceful shutdown and discarded queued writes.
+    Aborted,
 }
 
 struct Chunk {
@@ -228,6 +230,8 @@ struct Inner {
     in_flight: usize,
     write_error: Option<Failure>,
     closing: Closing,
+    #[cfg(test)]
+    drain_started: bool,
     write_waker: Option<Waker>,
 }
 
@@ -558,6 +562,12 @@ impl NwStream {
         move || shared.lock().phase.is_terminal()
     }
 
+    #[cfg(test)]
+    pub(super) fn drain_probe(&self) -> impl Fn() -> bool + Send + use<> {
+        let shared = Arc::clone(&self.shared);
+        move || shared.lock().drain_started
+    }
+
     fn receive(&self) {
         let shared = Arc::clone(&self.shared);
         let on_received = RcBlock::new(
@@ -606,6 +616,10 @@ impl NwStream {
                 cancel(&connection);
             }
         };
+        #[cfg(test)]
+        {
+            self.shared.lock().drain_started = true;
+        }
         self.send(&barrier, drained);
         let cancel_late = {
             let connection = self.connection.clone();
@@ -752,6 +766,19 @@ impl AsyncWrite for NwStream {
 }
 
 impl Stream for NwStream {
+    fn abort(&mut self) {
+        let wakers = {
+            let mut inner = self.shared.lock();
+            inner.closing = Closing::Aborted;
+            inner.phase = Phase::Cancelled;
+            inner.take_wakers()
+        };
+        // SAFETY: the connection is live. Force cancellation disconnects protocols
+        // immediately rather than negotiating a TLS close or draining queued sends.
+        unsafe { ffi::nw_connection_force_cancel(self.connection.as_ptr()) };
+        wake_all(wakers);
+    }
+
     fn tls_handshake_starting(&mut self) {}
 
     fn tls_handshake_completed(&mut self) {}

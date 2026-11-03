@@ -1078,6 +1078,9 @@ pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + Sync {
     fn tls_handshake_starting(&mut self);
     /// Called after TLS handshake completes.
     fn tls_handshake_completed(&mut self);
+    /// Stops protocol work before a hard drop, without flushing or TLS shutdown.
+    /// Socket-backed streams need no extra work beyond being dropped.
+    fn abort(&mut self) {}
     /// Check whether the underlying connection is dead via a non-blocking socket poll.
     /// Returns `true` if the connection is known to be dead, `false` if alive or unknown.
     fn is_connection_dead(&self) -> bool {
@@ -1129,6 +1132,10 @@ impl Stream for TcpStream {
 }
 
 impl Stream for Box<dyn Stream> {
+    fn abort(&mut self) {
+        (**self).abort();
+    }
+
     fn tls_handshake_starting(&mut self) {
         (**self).tls_handshake_starting();
     }
@@ -1225,6 +1232,10 @@ impl AsyncWrite for SharedStream {
 }
 
 impl Stream for SharedStream {
+    fn abort(&mut self) {
+        self.lock().abort();
+    }
+
     /// Preserves the wrapped stream's TLS handshake transition.
     fn tls_handshake_starting(&mut self) {
         self.lock().tls_handshake_starting();
@@ -1636,6 +1647,9 @@ impl NetworkTransport {
     }
 
     pub(crate) fn abort_transport(&mut self) {
+        if let Some(stream) = &mut self.stream {
+            stream.abort();
+        }
         self.stream = None;
         self.extractable_stream_handle = None;
         self.known_dead = true;
@@ -3741,6 +3755,12 @@ pub(crate) mod tests {
         for with_extraction_handle in [false, true] {
             let (stream, mut peer) = duplex(16);
             let mut transport = build_duplex_transport(stream);
+            let events = Arc::new(Mutex::new([false; 5]));
+            let underlying = transport.stream.take().unwrap().into_inner().unwrap();
+            transport.stream = Some(SharedStream::new(Box::new(HookTrackingStream {
+                inner: underlying,
+                events: Arc::clone(&events),
+            })));
             if with_extraction_handle {
                 let underlying = transport.stream.take().unwrap().into_inner().unwrap();
                 let (handle, wrapper) = ExtractableStreamHandle::new(underlying);
@@ -3754,6 +3774,7 @@ pub(crate) mod tests {
             assert!(transport.stream.is_none());
             assert!(transport.known_dead);
             transport.close_transport().await.unwrap();
+            assert_eq!(*events.lock().unwrap(), [false, false, false, false, true]);
             let mut byte = [0];
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
@@ -4188,8 +4209,8 @@ pub(crate) mod tests {
     }
 
     struct HookTrackingStream {
-        inner: DuplexStream,
-        events: Arc<Mutex<[bool; 4]>>,
+        inner: Box<dyn Stream>,
+        events: Arc<Mutex<[bool; 5]>>,
     }
 
     impl AsyncRead for HookTrackingStream {
@@ -4225,6 +4246,11 @@ pub(crate) mod tests {
     }
 
     impl Stream for HookTrackingStream {
+        fn abort(&mut self) {
+            self.events.lock().unwrap()[4] = true;
+            self.inner.abort();
+        }
+
         fn tls_handshake_starting(&mut self) {
             self.events.lock().unwrap()[2] = true;
         }
@@ -4241,9 +4267,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shared_stream_forwards_hooks_and_requires_exclusive_extraction() {
         let (inner, mut peer) = duplex(MAX_BUFFER_SIZE);
-        let events = Arc::new(Mutex::new([false; 4]));
+        let events = Arc::new(Mutex::new([false; 5]));
         let mut stream = SharedStream::new(Box::new(HookTrackingStream {
-            inner,
+            inner: Box::new(inner),
             events: Arc::clone(&events),
         }));
 
@@ -4261,7 +4287,8 @@ pub(crate) mod tests {
         stream.tls_handshake_starting();
         stream.tls_handshake_completed();
         stream.shutdown().await.unwrap();
-        assert_eq!(*events.lock().unwrap(), [true; 4]);
+        stream.abort();
+        assert_eq!(*events.lock().unwrap(), [true; 5]);
 
         let outstanding = stream.clone();
         let error = stream

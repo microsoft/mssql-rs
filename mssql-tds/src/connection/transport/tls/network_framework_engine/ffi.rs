@@ -76,6 +76,7 @@ unsafe extern "C" {
     );
     pub(super) fn nw_connection_start(connection: Object);
     pub(super) fn nw_connection_cancel(connection: Object);
+    pub(super) fn nw_connection_force_cancel(connection: Object);
     pub(super) fn nw_connection_receive(
         connection: Object,
         minimum_incomplete_length: u32,

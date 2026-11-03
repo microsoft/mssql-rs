@@ -174,7 +174,9 @@ every non-Strict mode) stay on a socket with Secure Transport.
   still unsent when the connection ended. Closing a connection that has already
   ended with all writes sent succeeds, as on the socket path. A peer that
   closes the transport without `close_notify` reads as a clean end of stream,
-  as with Secure Transport; TDS framing catches a truncated response.
+  as with Secure Transport; TDS framing catches a truncated response. A hard
+  abort after an interrupted request write instead force-cancels the connection
+  immediately, without draining queued writes or negotiating TLS shutdown.
 - **Errors.** All TLS engines report handshake failures as
   `Error::TlsHandshakeError`. The displayed host is the name used for TLS
   server identity validation, which can differ from the network destination.

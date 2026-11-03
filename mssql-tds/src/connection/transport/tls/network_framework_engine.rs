@@ -496,11 +496,32 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dropping_a_stream_the_server_stopped_reading_still_ends_it() {
         let (stream, ended, release, server) = stalled_stream(Release::Close).await;
+        let drain_started = stream.drain_probe();
         drop(stream);
 
+        assert!(
+            drain_started(),
+            "normal drop must still start graceful close"
+        );
         ends_soon(ended).await;
         release.send(()).unwrap();
         within(server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborting_an_interrupted_write_never_starts_the_drain_barrier() {
+        let (mut stream, ended, release, server) = stalled_stream(Release::Close).await;
+        let drain_started = stream.drain_probe();
+        assert!(!drain_started());
+
+        stream.abort();
+        drop(stream);
+
+        assert!(!drain_started(), "hard abort must bypass graceful close");
+        ends_soon(ended).await;
+        release.send(()).unwrap();
+        within(server).await.unwrap();
+        assert!(!drain_started(), "drop must not start a delayed drain");
     }
 
     #[tokio::test]
