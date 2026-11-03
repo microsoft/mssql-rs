@@ -5,15 +5,18 @@
 
 use crate::protocol::{
     FEATURE_EXT_ENHANCED_ROUTING, PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError,
-    TM_BEGIN_XACT, build_attention_ack_packet, build_done_token, build_error_response,
-    build_feature_ext_ack_data_classification, build_feature_ext_ack_fedauth,
+    TM_BEGIN_XACT, TM_COMMIT_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
+    build_error_response, build_feature_ext_ack_data_classification, build_feature_ext_ack_fedauth,
     build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
     build_prelogin_response_with_fedauth, build_query_result_with_extras,
     build_routing_login_response, build_transaction_manager_response, parse_fedauth_token,
     parse_login7_auth, parse_sql_batch, parse_transaction_descriptor_header,
     parse_transaction_manager_request,
 };
-use crate::query_response::{LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
+use crate::query_response::{
+    ATTENTION_DELAY_KEY, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY,
+    TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
+};
 use bytes::BytesMut;
 use native_tls::Identity;
 use std::collections::BTreeMap;
@@ -284,11 +287,24 @@ impl ConnectionProcessor {
                     }
                     if let Some(ack) = self.try_take_attention()? {
                         debug!("Attention arrived during delay; abandoning the delayed response");
+                        self.delay_attention_ack().await;
                         return Ok(DelayOutcome::Attention(ack));
                     }
                     // Not a (complete) Attention — keep waiting out the remaining delay.
                 }
             }
+        }
+    }
+
+    async fn delay_attention_ack(&self) {
+        let delay = self
+            .query_registry
+            .lock()
+            .await
+            .get(ATTENTION_DELAY_KEY)
+            .and_then(|response| response.delay);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -679,6 +695,7 @@ impl ConnectionProcessor {
 
             PacketType::Attention => {
                 debug!("Handling Attention from {}", self.addr);
+                self.delay_attention_ack().await;
                 Some(build_attention_ack_packet())
             }
 
@@ -694,17 +711,18 @@ impl ConnectionProcessor {
                     request_type, self.addr
                 );
 
-                // A Begin request can be delayed the same way a registered
-                // SqlBatch/RPC response can, via the reserved
-                // `TM_BEGIN_DELAY_KEY` query — needed to prove
-                // SQL_ATTR_QUERY_TIMEOUT bounds the implicit transaction begin
-                // an autocommit-off connection issues before every statement.
-                if request_type == TM_BEGIN_XACT {
+                let delay_key = match request_type {
+                    TM_BEGIN_XACT => Some(TM_BEGIN_DELAY_KEY),
+                    TM_COMMIT_XACT => Some(TM_COMMIT_DELAY_KEY),
+                    TM_ROLLBACK_XACT => Some(TM_ROLLBACK_DELAY_KEY),
+                    _ => None,
+                };
+                if let Some(delay_key) = delay_key {
                     let delay = self
                         .query_registry
                         .lock()
                         .await
-                        .get(TM_BEGIN_DELAY_KEY)
+                        .get(delay_key)
                         .and_then(|r| r.delay);
                     match self.wait_out_delay_or_attention(socket, delay).await? {
                         DelayOutcome::Attention(ack) => return Ok(Some(ack)),

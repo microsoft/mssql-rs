@@ -1,0 +1,246 @@
+# filepath: .pipeline/templates/sign-windows-wheels-template.yml
+#
+# Authenticode-sign the native binaries (*.pyd, *.dll - including the injected
+# mssqlodbc.dll) inside the Windows wheels. ESRP calls must come from IPs with
+# approved service tags, so they run only in a managed OneBranch job
+# (pool type: windows), never on the custom RUST-* pools whose agents egress
+# through our VNet NAT. The work is split across three jobs:
+#
+#   unpack - custom build job: unpack the final wheels into
+#            $(ob_outputDirectory)\wheel-unpacked and remove the .whl files so
+#            no unsigned wheel is published.
+#   sign   - managed OneBranch job: download wheel-unpacked, ESRP malware-scan
+#            and sign it in place; OneBranch publishes $(ob_outputDirectory).
+#   repack - custom job on the target architecture: download the signed tree,
+#            repack the wheels into $(ob_outputDirectory)\wheels and verify
+#            every native binary carries a valid signature.
+#
+# The caller must load the 'ESRP Federated Creds (AME)' variable group in the
+# sign job.
+
+parameters:
+- name: phase
+  type: string
+  values:
+  - unpack
+  - sign
+  - repack
+# 'x64' or 'arm64'.
+- name: architecture
+  type: string
+# Pipeline artifact holding wheel-unpacked (sign and repack phases).
+- name: artifactName
+  type: string
+  default: ''
+# Python used to repack the wheels (repack phase).
+- name: pythonVersion
+  type: string
+  default: '3.12'
+- name: esrpConnectedServiceName
+  type: string
+  default: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
+
+steps:
+- ${{ if eq(parameters.phase, 'unpack') }}:
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+
+      $wheelsDir = "$(ob_outputDirectory)\wheels"
+      $unpackedRoot = "$(ob_outputDirectory)\wheel-unpacked"
+
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $unpackedRoot
+      New-Item -ItemType Directory -Force -Path $unpackedRoot | Out-Null
+
+      $wheels = @(Get-ChildItem $wheelsDir -Filter *.whl -File)
+      if ($wheels.Count -eq 0) {
+        Write-Error "No Windows wheels found to sign in $wheelsDir"
+        exit 1
+      }
+
+      foreach ($wheel in $wheels) {
+        Write-Host "Unpacking $($wheel.Name)"
+        $wheelUnpackDir = Join-Path $unpackedRoot $wheel.BaseName
+        New-Item -ItemType Directory -Force -Path $wheelUnpackDir | Out-Null
+        python -m wheel unpack "$($wheel.FullName)" --dest "$wheelUnpackDir"
+        if ($LASTEXITCODE -ne 0) { throw "wheel unpack failed for $($wheel.Name)" }
+      }
+
+      $nativeFiles = @(Get-ChildItem $unpackedRoot -Recurse -Include *.pyd,*.dll -File)
+      if ($nativeFiles.Count -eq 0) {
+        Write-Error "No native Windows binaries (*.pyd, *.dll) found in unpacked wheels"
+        exit 1
+      }
+
+      Write-Host "Native binaries to sign:"
+      $nativeFiles | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+      # Publish only the unpacked tree; an unsigned .whl must never reach an
+      # artifact that the Publish stage or the PyPI release could collect.
+      Remove-Item -Recurse -Force $wheelsDir
+    displayName: 'Unpack Windows ${{ parameters.architecture }} wheels for ESRP signing'
+
+- ${{ if eq(parameters.phase, 'sign') }}:
+  - task: DownloadPipelineArtifact@2
+    displayName: 'Download unsigned Windows ${{ parameters.architecture }} wheel contents'
+    inputs:
+      buildType: current
+      artifactName: '${{ parameters.artifactName }}'
+      itemPattern: 'wheel-unpacked/**'
+      targetPath: '$(ob_outputDirectory)'
+
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+      $unpackedRoot = "$(ob_outputDirectory)\wheel-unpacked"
+      $nativeFiles = @(Get-ChildItem $unpackedRoot -Recurse -Include *.pyd,*.dll -File)
+      if ($nativeFiles.Count -eq 0) {
+        Write-Error "No native Windows binaries (*.pyd, *.dll) found in $unpackedRoot"
+        exit 1
+      }
+      Write-Host "Native binaries to sign:"
+      $nativeFiles | ForEach-Object { Write-Host "  $($_.FullName)" }
+    displayName: 'List Windows ${{ parameters.architecture }} binaries to sign'
+
+  - task: EsrpMalwareScanning@6
+    displayName: 'ESRP Malware Scanning Windows ${{ parameters.architecture }} wheel binaries'
+    inputs:
+      ConnectedServiceName: '${{ parameters.esrpConnectedServiceName }}'
+      AppRegistrationClientId: '$(appRegistrationClientId)'
+      AppRegistrationTenantId: '$(appRegistrationTenantId)'
+      EsrpClientId: '$(EsrpClientId)'
+      FolderPath: '$(ob_outputDirectory)\wheel-unpacked'
+      Pattern: |
+        **/*.pyd
+        **/*.dll
+      UseMinimatch: true
+      UseMSIAuthentication: true
+      CleanupTempStorage: true
+      VerboseLogin: true
+
+  - task: EsrpCodeSigning@6
+    displayName: 'ESRP CodeSigning Windows ${{ parameters.architecture }} wheel binaries'
+    inputs:
+      ConnectedServiceName: '${{ parameters.esrpConnectedServiceName }}'
+      UseMSIAuthentication: true
+      AppRegistrationClientId: '$(appRegistrationClientId)'
+      AppRegistrationTenantId: '$(appRegistrationTenantId)'
+      EsrpClientId: '$(EsrpClientId)'
+      AuthAKVName: '$(AuthAKVName)'
+      AuthSignCertName: '$(AuthSignCertName)'
+      FolderPath: '$(ob_outputDirectory)\wheel-unpacked'
+      Pattern: |
+        **/*.pyd
+        **/*.dll
+      UseMinimatch: true
+      signConfigType: inlineSignParams
+      inlineOperation: |
+        [
+          {
+            "KeyCode": "CP-230012",
+            "OperationCode": "SigntoolSign",
+            "ToolName": "sign",
+            "ToolVersion": "1.0",
+            "Parameters": {
+              "OpusName": "Microsoft",
+              "OpusInfo": "https://www.microsoft.com",
+              "FileDigest": "/fd SHA256",
+              "PageHash": "/NPH",
+              "TimeStamp": "/tr \"http://rfc3161.gtm.corp.microsoft.com/TSS/HttpTspServer\" /td sha256"
+            }
+          },
+          {
+            "KeyCode": "CP-230012",
+            "OperationCode": "SigntoolVerify",
+            "ToolName": "sign",
+            "ToolVersion": "1.0",
+            "Parameters": {}
+          }
+        ]
+      VerboseLogin: true
+
+- ${{ if eq(parameters.phase, 'repack') }}:
+  - task: DownloadPipelineArtifact@2
+    displayName: 'Download signed Windows ${{ parameters.architecture }} wheel contents'
+    inputs:
+      buildType: current
+      artifactName: '${{ parameters.artifactName }}'
+      itemPattern: 'wheel-unpacked/**'
+      targetPath: '$(Agent.TempDirectory)\signed-wheel-contents'
+
+  - template: configure-python-certificates-windows.yml
+
+  - task: UsePythonVersion@0
+    displayName: 'Use Python ${{ parameters.pythonVersion }} to repack signed wheels'
+    inputs:
+      versionSpec: '${{ parameters.pythonVersion }}'
+      architecture: '${{ parameters.architecture }}'
+      addToPath: true
+
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+
+      python -m pip install wheel
+      if ($LASTEXITCODE -ne 0) { throw "pip install wheel failed with exit code $LASTEXITCODE" }
+
+      $unpackedRoot = "$(Agent.TempDirectory)\signed-wheel-contents\wheel-unpacked"
+      $wheelsDir = "$(ob_outputDirectory)\wheels"
+      $verifyRoot = "$(Agent.TempDirectory)\wheel-verify"
+
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $wheelsDir, $verifyRoot
+      New-Item -ItemType Directory -Force -Path $wheelsDir, $verifyRoot | Out-Null
+
+      $unpackedWheels = @(Get-ChildItem $unpackedRoot -Directory)
+      if ($unpackedWheels.Count -eq 0) {
+        Write-Error "No signed wheel contents found in $unpackedRoot"
+        exit 1
+      }
+
+      foreach ($wheelRoot in $unpackedWheels) {
+        $wheelDirs = @(Get-ChildItem $wheelRoot.FullName -Directory)
+        if ($wheelDirs.Count -ne 1) {
+          Write-Error "Expected one unpacked wheel directory under $($wheelRoot.FullName), found $($wheelDirs.Count)"
+          exit 1
+        }
+
+        Write-Host "Repacking signed wheel from $($wheelDirs[0].FullName)"
+        python -m wheel pack "$($wheelDirs[0].FullName)" --dest-dir "$wheelsDir"
+        if ($LASTEXITCODE -ne 0) { throw "wheel pack failed for $($wheelRoot.Name)" }
+      }
+
+      $signedWheels = @(Get-ChildItem $wheelsDir -Filter *.whl -File)
+      if ($signedWheels.Count -ne $unpackedWheels.Count) {
+        Write-Error "Expected $($unpackedWheels.Count) signed wheels, found $($signedWheels.Count)"
+        exit 1
+      }
+
+      foreach ($wheel in $signedWheels) {
+        Write-Host "Verifying signed wheel $($wheel.Name)"
+        $wheelVerifyDir = Join-Path $verifyRoot $wheel.BaseName
+        New-Item -ItemType Directory -Force -Path $wheelVerifyDir | Out-Null
+        python -m wheel unpack "$($wheel.FullName)" --dest "$wheelVerifyDir"
+        if ($LASTEXITCODE -ne 0) { throw "wheel unpack failed for $($wheel.Name)" }
+      }
+
+      $nativeFiles = @(Get-ChildItem $verifyRoot -Recurse -Include *.pyd,*.dll -File)
+      if ($nativeFiles.Count -eq 0) {
+        Write-Error "No native Windows binaries found after repacking signed wheels"
+        exit 1
+      }
+
+      $invalid = @()
+      foreach ($file in $nativeFiles) {
+        $signature = Get-AuthenticodeSignature $file.FullName
+        Write-Host "$($file.Name): $($signature.Status)"
+        if ($signature.Status -ne 'Valid') {
+          $invalid += $file.FullName
+        }
+      }
+
+      if ($invalid.Count -gt 0) {
+        Write-Error "Unsigned or invalid native binaries:`n$($invalid -join "`n")"
+        exit 1
+      }
+
+      Remove-Item -Recurse -Force $verifyRoot
+      Write-Host "Signed wheels:"
+      $signedWheels | Format-Table Name, Length
+    displayName: 'Repack and verify signed Windows ${{ parameters.architecture }} wheels'

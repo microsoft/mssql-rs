@@ -19,9 +19,11 @@
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
 #   pr       (default) every ctest entry; every mode except /SharedStmt, at the
-#            harness default of 2 threads x 1 iteration.
+#            harness default of 2 threads x 1 iteration. Linux and macOS build
+#            no <name>_mt entries unless ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
 #   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
 #   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
+#            Both build with ODBC_E2E_CONCURRENT=ON.
 # nightly and weekly ignore --retries (an intermittent failure is what they
 # look for) and run each entry under gdb through run_mt_test.sh when gdb is
 # installed, so a crash or a watchdog abort prints every thread's stack. With
@@ -212,6 +214,7 @@ apply_mt_profile() {
         pr)
             ;;
         nightly|weekly)
+            export ODBC_E2E_CONCURRENT=ON
             if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
             export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
             export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"

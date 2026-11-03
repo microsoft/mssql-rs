@@ -40,7 +40,7 @@ use uuid::Uuid;
 use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::post_claim_error;
-use crate::api::exec_common::release_busy_if_row_exhausted;
+use crate::api::exec_common::{RowDelivery, release_busy_if_row_exhausted};
 use crate::api::get_data::{
     TextError, column_value_to_bytes, column_value_to_text, convert_typed_c,
     converted_narrow_indicator, decode_narrow_into_pending, hex_buffer_elements,
@@ -935,6 +935,10 @@ fn fetch_scroll_operation(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        if stmt_state.error_result {
+            post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+            return SQL_ERROR;
+        }
         if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
             error!("SQLFetchScroll: a fetch is already in progress on this statement");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -1494,30 +1498,40 @@ fn fill_rowset(
     // re-derive which branch was taken or assume the helper's closure ran:
     // desyncing the two would either double-post the row diagnostics or drop
     // them, and nothing would catch it.
-    let (release_has_server_info, row_diags_posted, cancelled) = if fetch_error.is_some() {
-        if !dbc.return_lease(client, LeaseReturn::Release) {
-            return SQL_ERROR;
-        }
-        (false, false, false)
-    } else if peek_is_safe {
-        // Everything the rows produced goes in through the closure rather than
-        // being posted below: it all left the wire before anything the release
-        // peek finds, and posting it afterward would invert the order
-        // SQLGetDiagRec reports it in.
-        let Ok((posted, preceding_ran, cancelled)) =
-            release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, |s| {
-                post_row_diagnostics(s, &info_messages, worst)
-            })
-        else {
-            return SQL_ERROR;
+    let (release_has_server_info, row_diags_posted, cancelled, array_failed) =
+        if fetch_error.is_some() {
+            if !dbc.return_lease(client, LeaseReturn::Release) {
+                return SQL_ERROR;
+            }
+            (false, false, false, false)
+        } else if peek_is_safe {
+            // Everything the rows produced goes in through the closure rather than
+            // being posted below: it all left the wire before anything the release
+            // peek finds, and posting it afterward would invert the order
+            // SQLGetDiagRec reports it in.
+            // msodbcsql leaves a row buffered here for SQLGetData on the wire, so
+            // it has not read the set's DONE yet.
+            let delivery = if buffered_get_data_row.is_some() {
+                RowDelivery::Buffered
+            } else if rows_filled > 0 {
+                RowDelivery::Read
+            } else {
+                RowDelivery::None
+            };
+            let Ok(outcome) =
+                release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, delivery, |s| {
+                    post_row_diagnostics(s, &info_messages, worst)
+                })
+            else {
+                return SQL_ERROR;
+            };
+            outcome
+        } else {
+            if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+                return SQL_ERROR;
+            }
+            (false, false, false, false)
         };
-        (posted, preceding_ran, cancelled)
-    } else {
-        if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
-            return SQL_ERROR;
-        }
-        (false, false, false)
-    };
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFetchScroll: stmt mutex poisoned recording rowset");
@@ -1556,7 +1570,9 @@ fn fill_rowset(
     if rows_filled == 0 {
         stmt_state.reset_row_stream();
         debug!("SQLFetchScroll: end of rowset");
-        return SQL_NO_DATA;
+        // A parameter set that completed with an error and no status array to
+        // carry it fails the fetch that read its DONE, as msodbcsql's OnDone does.
+        return if array_failed { SQL_ERROR } else { SQL_NO_DATA };
     }
 
     // Mixed SQLGetData access is only well defined when the rowset holds a
@@ -1721,24 +1737,39 @@ fn finish_exhausted_fetch(
     rows_fetched_ptr: *mut SqlULen,
     row_status_ptr: *mut SqlUSmallInt,
 ) -> SqlReturn {
-    let rc = {
+    let (rc, deferred_array_update) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned finishing an exhausted cursor");
             return SQL_ERROR;
         };
         stmt_state.reset_row_stream();
+        let deferred_array_update = stmt_state.deferred_array_update.take();
         // That same peek can have found a trailing SQL Server error instead of
         // a clean end of set (see `release_busy_if_row_exhausted`): the call
         // that found it had already committed to delivering its own row
         // successfully, so the diagnostic was deferred here, to the call that
         // would have hit it directly without the peek's read-ahead.
-        if let Some(e) = stmt_state.pending_fetch_error.take() {
+        let rc = if let Some(e) = stmt_state.pending_fetch_error.take() {
             stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
             SQL_ERROR
         } else {
             SQL_NO_DATA
-        }
+        };
+        (rc, deferred_array_update)
+    };
+    // msodbcsql reads the set's DONE on this fetch when the previous call left
+    // it unread (an unbound row on the wire, or an ERROR token after the row).
+    // Measured on 18.6.2.1: a failed set reports `SQL_NO_DATA` with its
+    // diagnostic when a status array carries it, `SQL_ERROR` otherwise.
+    let rc = if deferred_array_update.is_some()
+        && !matches!(
+            super::execute::publish_deferred_parameter_array(stmt, deferred_array_update),
+            Ok(SQL_SUCCESS | SQL_SUCCESS_WITH_INFO)
+        ) {
+        SQL_ERROR
+    } else {
+        rc
     };
     unsafe { write_if_some(rows_fetched_ptr, 0) };
     // A freed ARD keeps the known `SQL_NO_DATA` and skips the walk (no safe

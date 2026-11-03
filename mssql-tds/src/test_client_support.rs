@@ -429,6 +429,9 @@ impl TdsTransport for TokenReplayTransport {
     async fn close_transport(&mut self) -> TdsResult<()> {
         Ok(())
     }
+    fn abort_transport(&mut self) {
+        self.known_dead = true;
+    }
     async fn send_attention_with_timeout(
         &mut self,
         _context: &ParserContext,
@@ -695,6 +698,15 @@ pub fn done_in_proc_more() -> ScriptedToken {
 pub fn done_proc_no_more() -> ScriptedToken {
     ScriptedToken(Tokens::DoneProc(DoneToken {
         status: DoneStatus::FINAL,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
+/// A `DONEPROC` ending one RPC of a batched request, with another RPC to follow.
+pub fn done_proc_in_batch_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneProc(DoneToken {
+        status: DoneStatus::MORE | DoneStatus::RPC_IN_BATCH,
         cur_cmd: CurrentCommand::Select,
         row_count: 0,
     }))
@@ -1016,6 +1028,9 @@ pub(crate) mod byte_stream {
         }
         async fn close_transport(&mut self) -> TdsResult<()> {
             Ok(())
+        }
+        fn abort_transport(&mut self) {
+            self.known_dead = true;
         }
         async fn send_attention_with_timeout(
             &mut self,

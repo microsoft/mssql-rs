@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
 #include <array>
@@ -48,7 +49,7 @@ protected:
     }
 };
 
-TEST_F(CallRoutingTest, OutputOnlyIgnoresDestinationContents) {
+ODBC_TEST_F(CallRoutingTest, OutputOnlyIgnoresDestinationContents) {
     ExecDirect("CREATE PROCEDURE #route @v varchar(8) OUTPUT AS SET @v='ok'");
     for (bool with_indicator : {true, false}) {
         SCOPED_TRACE(with_indicator);
@@ -69,7 +70,7 @@ TEST_F(CallRoutingTest, OutputOnlyIgnoresDestinationContents) {
 
 // Benefits-from-mock-tds: assert named text RPC declarations for both streamed
 // and buffered DAE, rather than just the result and return-value round trip.
-TEST_F(CallRoutingTest, DataAtExecutionKeepsNamedArgumentsAndReturnVariable) {
+ODBC_TEST_F(CallRoutingTest, DataAtExecutionKeepsNamedArgumentsAndReturnVariable) {
     ExecDirect("CREATE PROCEDURE #route @v varchar(max) AS "
                "SELECT @v; RETURN 37");
     for (SQLSMALLINT sql_type : {SQL_VARCHAR, SQL_INTEGER}) {
@@ -112,7 +113,7 @@ TEST_F(CallRoutingTest, DataAtExecutionKeepsNamedArgumentsAndReturnVariable) {
     }
 }
 
-TEST_F(CallRoutingTest, DefaultArgumentsPreservePositions) {
+ODBC_TEST_F(CallRoutingTest, DefaultArgumentsPreservePositions) {
     ExecDirect("CREATE PROCEDURE #route @a int=10,@b int=20,@c int=30 AS "
                "SELECT @a*100+@b*10+@c");
     SQLINTEGER first = 1, last = 3;
@@ -136,7 +137,7 @@ TEST_F(CallRoutingTest, DefaultArgumentsPreservePositions) {
 // ProcessRPCData reads names from the IPD. Set both so the canonical call
 // exercises Rust's text fallback and the reference driver's named RPC route.
 // Benefits-from-mock-tds: verify the named EXEC text instead of positional RPC.
-TEST_F(CallRoutingTest, ReorderedNamedInputsPreserveParameterNames) {
+ODBC_TEST_F(CallRoutingTest, ReorderedNamedInputsPreserveParameterNames) {
     ExecDirect("CREATE PROCEDURE #route @a int,@b int AS SELECT @a*10+@b");
     SQLINTEGER first = 2, second = 1;
     SQLLEN first_length = 0, second_length = 0;
@@ -166,7 +167,7 @@ TEST_F(CallRoutingTest, ReorderedNamedInputsPreserveParameterNames) {
 }
 
 // Benefits-from-mock-tds: verify OUTPUT stays attached to the named argument.
-TEST_F(CallRoutingTest, ReorderedNamedOutputsPreserveParameterNames) {
+ODBC_TEST_F(CallRoutingTest, ReorderedNamedOutputsPreserveParameterNames) {
     ExecDirect("CREATE PROCEDURE #route @a int,@b int OUTPUT AS "
                "SET @b=@a*10+COALESCE(@b,0)");
     for (bool prepared : {false, true}) {
@@ -197,7 +198,7 @@ TEST_F(CallRoutingTest, ReorderedNamedOutputsPreserveParameterNames) {
 }
 
 // Benefits-from-mock-tds: assert the RPC name's UTF-16 length on the wire.
-TEST_F(CallRoutingTest, UnicodeProcedureNamesExecuteDirectAndPrepared) {
+ODBC_TEST_F(CallRoutingTest, UnicodeProcedureNamesExecuteDirectAndPrepared) {
     for (size_t count : {2, 90}) {
         SCOPED_TRACE(count);
         const std::u16string name = u"[#" + std::u16string(count, u'\u8def') + u"]";
@@ -233,7 +234,7 @@ TEST_F(CallRoutingTest, UnicodeProcedureNamesExecuteDirectAndPrepared) {
     }
 }
 
-TEST_F(CallRoutingTest, TextCallsAnnotateOutputArguments) {
+ODBC_TEST_F(CallRoutingTest, TextCallsAnnotateOutputArguments) {
     ExecDirect("CREATE PROCEDURE #route @a int,@b int OUTPUT AS SET @b=@a+5");
     for (bool prepared : {false, true}) {
         for (SQLSMALLINT direction : {SQL_PARAM_OUTPUT, SQL_PARAM_INPUT_OUTPUT}) {
@@ -255,7 +256,7 @@ TEST_F(CallRoutingTest, TextCallsAnnotateOutputArguments) {
     }
 }
 
-TEST_F(CallRoutingTest, EmbeddedCallUsesGlobalMarkerOrdinals) {
+ODBC_TEST_F(CallRoutingTest, EmbeddedCallUsesGlobalMarkerOrdinals) {
     ExecDirect("CREATE PROCEDURE #route @a int,@b int OUTPUT AS SET @b=@a+5");
     SQLINTEGER input = 7, output = -1;
     SQLLEN input_length = 0, output_length = 0;
@@ -267,7 +268,7 @@ TEST_F(CallRoutingTest, EmbeddedCallUsesGlobalMarkerOrdinals) {
     EXPECT_EQ(12, output);
 }
 
-TEST_F(CallRoutingTest, PreparedDirectionChangesRebuildCallSite) {
+ODBC_TEST_F(CallRoutingTest, PreparedDirectionChangesRebuildCallSite) {
     ExecDirect("CREATE PROCEDURE #route @v int OUTPUT AS SET @v=91");
     ASSERT_SQL_OK(Prepare("{call #route(?)}"), SQL_HANDLE_STMT, stmt_);
     SQLINTEGER value = 1;
@@ -284,7 +285,7 @@ TEST_F(CallRoutingTest, PreparedDirectionChangesRebuildCallSite) {
     }
 }
 
-TEST_F(CallRoutingTest, TextReturnAssignmentDoesNotUseWrapperStatus) {
+ODBC_TEST_F(CallRoutingTest, TextReturnAssignmentDoesNotUseWrapperStatus) {
     ExecDirect("CREATE PROCEDURE #route @v int AS RETURN @v");
     for (bool prepared : {false, true}) {
         SQLINTEGER status = -1;
@@ -302,7 +303,7 @@ TEST_F(CallRoutingTest, TextReturnAssignmentDoesNotUseWrapperStatus) {
     }
 }
 
-TEST_F(CallRoutingTest, PreparedOutputDoesNotInheritPriorRpcReturnMapping) {
+ODBC_TEST_F(CallRoutingTest, PreparedOutputDoesNotInheritPriorRpcReturnMapping) {
     ExecDirect("CREATE PROCEDURE #status AS RETURN 37");
     ExecDirect("CREATE PROCEDURE #output @v int OUTPUT AS SET @v=91");
     SQLINTEGER value = -1;
