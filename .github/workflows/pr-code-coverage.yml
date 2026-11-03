@@ -114,8 +114,9 @@ jobs:
       pr_number: ${{ needs.authorize.outputs.pr_number }}
       head_sha: ${{ steps.build.outputs.head_sha }}
       report: ${{ steps.report.outputs.report }}
-    # Build runs ~45 min in ADO; the artifact wait can take up to 1h15m.
-    timeout-minutes: 120
+    # Outlast ADO's 120m macOS job plus scheduling and coverage aggregation.
+    # Leave reporting time after the artifact wait's 150m deadline.
+    timeout-minutes: 180
     steps:
       - name: Checkout trusted reporting tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
