@@ -1635,6 +1635,12 @@ impl NetworkTransport {
         Ok(())
     }
 
+    pub(crate) fn abort_transport(&mut self) {
+        self.stream = None;
+        self.extractable_stream_handle = None;
+        self.known_dead = true;
+    }
+
     /// How many consecutive payload-free end-of-message packets a bulk read
     /// tolerates before giving up.
     ///
@@ -3651,6 +3657,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         Ok(())
     }
 
+    fn abort_transport(&mut self) {
+        Self::abort_transport(self);
+    }
+
     /// Send an attention packet and wait for acknowledgment with a timeout.
     ///
     /// This implements the attention sending flow with a configurable timeout:
@@ -3686,6 +3696,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         self.known_dead
     }
 
+    fn response_fully_received(&self) -> bool {
+        self.tds_read_buffer.end_of_message
+    }
+
     fn mark_known_dead(&mut self) {
         self.known_dead = true;
     }
@@ -3713,6 +3727,43 @@ pub(crate) mod tests {
             |address| Ok(connect(address)),
         )
         .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abort_transport_drops_the_stream_before_explicit_close() {
+        use super::SharedStream;
+        use crate::connection::transport::extractable_stream::ExtractableStreamHandle;
+        use crate::connection::transport::tds_transport::TdsTransport;
+        use crate::test_packet_support::build_duplex_transport;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, duplex};
+
+        for with_extraction_handle in [false, true] {
+            let (stream, mut peer) = duplex(16);
+            let mut transport = build_duplex_transport(stream);
+            if with_extraction_handle {
+                let underlying = transport.stream.take().unwrap().into_inner().unwrap();
+                let (handle, wrapper) = ExtractableStreamHandle::new(underlying);
+                transport.stream = Some(SharedStream::new(Box::new(wrapper)));
+                transport.extractable_stream_handle = Some(handle);
+            }
+            assert!(transport.stream.is_some());
+
+            TdsTransport::abort_transport(&mut transport);
+
+            assert!(transport.stream.is_none());
+            assert!(transport.known_dead);
+            transport.close_transport().await.unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                    .await
+                    .expect("abort must release the underlying connection, not just its TLS owner")
+                    .unwrap(),
+                0,
+            );
+            assert!(transport.extractable_stream_handle.is_none());
+        }
     }
 
     #[tokio::test]
@@ -4773,6 +4824,35 @@ pub(crate) mod tests {
 
         assert!(!transport.try_read_tds_packet().unwrap());
         assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"only");
+    }
+
+    /// Statement close skips ATTENTION only once the response's final packet
+    /// has arrived; a new request's reader reset clears that knowledge.
+    #[tokio::test]
+    async fn response_fully_received_tracks_the_framed_end_of_message() {
+        use crate::connection::transport::tds_transport::TdsTransport;
+
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        assert!(!TdsTransport::response_fully_received(&transport));
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+        assert!(!TdsTransport::response_fully_received(&transport));
+        server
+            .write_all(&tabular_packet(b"last", true))
+            .await
+            .unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert!(TdsTransport::response_fully_received(&transport));
+        transport.tds_read_buffer.consume_bytes(9).unwrap();
+        TdsTransport::reset_reader(&mut transport);
+        assert!(!TdsTransport::response_fully_received(&transport));
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.

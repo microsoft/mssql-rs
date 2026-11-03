@@ -15,6 +15,7 @@ pub(crate) const SQLSTATE_01S02: [u8; 5] = *b"01S02";
 pub(crate) const SQLSTATE_01S05: [u8; 5] = *b"01S05";
 pub(crate) const SQLSTATE_01S07: [u8; 5] = *b"01S07";
 pub(crate) const SQLSTATE_07002: [u8; 5] = *b"07002";
+pub(crate) const SQLSTATE_07005: [u8; 5] = *b"07005";
 pub(crate) const SQLSTATE_07006: [u8; 5] = *b"07006";
 pub(crate) const SQLSTATE_07009: [u8; 5] = *b"07009";
 pub(crate) const SQLSTATE_07S01: [u8; 5] = *b"07S01";
@@ -140,6 +141,12 @@ pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
+};
+/// msodbcsql's text for describing a statement positioned on no result set
+/// (measured on 18.6.2.1).
+pub(crate) const ERR_NOT_CURSOR_SPECIFICATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_07005,
+    text: "Prepared statement is not a cursor-specification",
 };
 /// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
 /// allocated a connection. Reached either by a caller that skipped the

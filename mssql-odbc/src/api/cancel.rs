@@ -75,12 +75,8 @@ fn sql_cancel_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             return SQL_ERROR;
         };
         if stmt_state.dae.is_none() {
-            let rc = super::close_cursor::free_stmt_close_locked(
-                statement_handle,
-                stmt,
-                stmt_state,
-                true,
-            );
+            let rc =
+                super::close_cursor::free_stmt_close_locked(statement_handle, stmt, stmt_state);
             if !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
                 return rc;
             }
@@ -243,8 +239,11 @@ mod tests {
         }
     }
 
+    /// msodbcsql's close cancels the unread tail and reports none of its
+    /// errors (measured on 18.6.2.1: `SQL_SUCCESS`, no records). An error a
+    /// fetch already read ahead and deferred to the cursor is still reported.
     #[test]
-    fn idle_cancel_preserves_close_errors_without_posting_success_warning() {
+    fn idle_cancel_discards_tail_errors_but_reports_deferred_fetch_errors() {
         use crate::api::odbc_types::*;
         use mssql_tds::test_client_support::{
             done_select_no_more, sql_error, tds_client_from_int_rows_with_trailing_tokens,
@@ -271,22 +270,40 @@ mod tests {
             if deferred {
                 assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
                 assert!(stmt.inner.lock().unwrap().pending_fetch_error.is_some());
+                assert_eq!(SQL_ERROR, unsafe { crate::api::SQLCancel(h.stmt) });
+            } else {
+                assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+                    crate::api::SQLCancel(h.stmt)
+                });
             }
-            assert_eq!(SQL_ERROR, unsafe { crate::api::SQLCancel(h.stmt) });
             let state = stmt.inner.lock().unwrap();
             assert_eq!(state.diag_records.len(), 1);
-            assert_eq!(state.diag_records[0].sql_state, *b"42000");
-            assert_eq!(state.diag_records[0].native_error, 50000);
+            if deferred {
+                assert_eq!(state.diag_records[0].sql_state, *b"42000");
+                assert_eq!(state.diag_records[0].native_error, 50000);
+                assert!(
+                    state.diag_records[0]
+                        .message
+                        .contains("trailing close error")
+                );
+            } else {
+                assert_eq!(state.diag_records[0].sql_state, *b"01S05");
+            }
+            drop(state);
             assert!(
-                state.diag_records[0]
-                    .message
-                    .contains("trailing close error")
+                !dbc.inner
+                    .lock()
+                    .unwrap()
+                    .wire
+                    .client()
+                    .unwrap()
+                    .is_connection_dead()
             );
         }
     }
 
     #[test]
-    fn idle_cancel_appends_warning_after_close_info() {
+    fn idle_cancel_discards_tail_info() {
         use crate::api::odbc_types::*;
         use mssql_tds::test_client_support::{
             done_select_no_more, info, tds_client_from_int_rows_with_trailing_tokens,
@@ -312,10 +329,8 @@ mod tests {
             crate::api::SQLCancel(h.stmt)
         });
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records.len(), 2);
-        assert_eq!(state.diag_records[0].sql_state, *b"01000");
-        assert!(state.diag_records[0].message.contains("close info"));
-        assert_eq!(state.diag_records[1].sql_state, *b"01S05");
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, *b"01S05");
     }
 
     #[test]
@@ -717,8 +732,10 @@ mod tests {
         GetDataReadAhead,
         MoreResults,
         Close,
+        ConnectionClose,
         Idle,
         IdlePlp,
+        IdleClose,
     }
 
     fn cancel_cursor_phase(phase: CursorPhase, acknowledge: bool, stall: bool) {
@@ -924,9 +941,11 @@ mod tests {
             });
         }
         let raw = h.stmt as usize;
-        if stall {
+        let raw_dbc = h.dbc as usize;
+        let connection_close = matches!(phase, CursorPhase::ConnectionClose);
+        if stall || connection_close {
             // Change after execution to verify the current connection attribute,
-            // not the execute-time snapshot, controls SQLCancel's deadline.
+            // not the execute-time snapshot, controls cancellation settlement.
             assert_eq!(SQL_SUCCESS, unsafe {
                 crate::api::SQLSetConnectAttrW(
                     h.dbc,
@@ -937,7 +956,16 @@ mod tests {
             });
         }
         std::thread::scope(|scope| {
-            let idle = matches!(phase, CursorPhase::Idle | CursorPhase::IdlePlp);
+            let idle = matches!(
+                phase,
+                CursorPhase::Idle | CursorPhase::IdlePlp | CursorPhase::IdleClose
+            );
+            // SQLCancel reports 01S05; the close it performs reports nothing extra.
+            let idle_success = if matches!(phase, CursorPhase::IdleClose) {
+                SQL_SUCCESS
+            } else {
+                SQL_SUCCESS_WITH_INFO
+            };
             let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
             let idle_tx = cancel_tx.clone();
             let cancelled_at = Instant::now();
@@ -949,9 +977,24 @@ mod tests {
                         idle_tx.send(rc).unwrap();
                         rc
                     }
+                    CursorPhase::IdleClose => {
+                        let rc = crate::api::SQLFreeStmt(raw, SQL_CLOSE);
+                        idle_tx.send(rc).unwrap();
+                        rc
+                    }
                     CursorPhase::Fetch | CursorPhase::ReadAhead => crate::api::SQLFetch(raw),
                     CursorPhase::MoreResults => crate::api::SQLMoreResults(raw),
                     CursorPhase::Close => crate::api::SQLFreeStmt(raw, SQL_CLOSE),
+                    CursorPhase::ConnectionClose => {
+                        let rc = crate::api::SQLSetConnectAttrW(
+                            raw_dbc as SqlHandle,
+                            SQL_ATTR_TXN_ISOLATION,
+                            SQL_TXN_SERIALIZABLE as usize as SqlPointer,
+                            0,
+                        );
+                        idle_tx.send(rc).unwrap();
+                        rc
+                    }
                     _ => {
                         let mut data = [0u8; 64];
                         let mut length = 0;
@@ -986,7 +1029,7 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
-            let cancel = (!idle).then(|| {
+            let cancel = (!idle && !connection_close).then(|| {
                 scope.spawn(move || {
                     let rc = unsafe { crate::api::SQLCancel(raw as SqlHandle) };
                     cancel_tx.send(rc).unwrap();
@@ -1002,12 +1045,10 @@ mod tests {
                 ack_tx.send(()).unwrap();
             }
             assert_eq!(
-                if idle {
-                    if acknowledge {
-                        SQL_SUCCESS_WITH_INFO
-                    } else {
-                        SQL_ERROR
-                    }
+                if connection_close {
+                    if acknowledge { SQL_SUCCESS } else { SQL_ERROR }
+                } else if idle {
+                    if acknowledge { idle_success } else { SQL_ERROR }
                 } else {
                     SQL_SUCCESS
                 },
@@ -1023,13 +1064,19 @@ mod tests {
                 assert!(!state.has_state(STMT_STATE_CURSOR_OPEN), "{phase:?}");
                 assert!(state.active_plp.is_none());
                 assert!(state.pending_fetch_error.is_none());
-                if idle {
-                    if acknowledge {
-                        assert_eq!(state.diag_records.last().unwrap().sql_state, *b"01S05");
-                    } else {
+                if idle || connection_close {
+                    if !acknowledge {
                         assert!(!state.diag_records.is_empty());
                         assert!(state.diag_records.iter().all(|d| d.sql_state != *b"01S05"));
+                    } else if matches!(phase, CursorPhase::IdleClose) || connection_close {
+                        assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
+                    } else {
+                        assert_eq!(state.diag_records.last().unwrap().sql_state, *b"01S05");
                     }
+                } else if matches!(phase, CursorPhase::Close) {
+                    // Close already abandons the response with its own ATTENTION,
+                    // so SQLCancel waits for that settlement instead of interrupting it.
+                    assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
                 } else {
                     assert_eq!(state.diag_records[0].sql_state, *b"HY008");
                 }
@@ -1037,6 +1084,15 @@ mod tests {
             {
                 let state = dbc.inner.lock().unwrap();
                 assert!(state.wire.owner().is_none());
+                if connection_close {
+                    if acknowledge {
+                        assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
+                        assert_eq!(state.txn_isolation, SQL_TXN_SERIALIZABLE);
+                    } else {
+                        assert_eq!(state.diag_records[0].sql_state, *b"HY000");
+                        assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
+                    }
+                }
                 assert_eq!(
                     state.wire.client().unwrap().is_connection_dead(),
                     !acknowledge
@@ -1047,7 +1103,9 @@ mod tests {
             });
             assert_eq!(
                 if idle && acknowledge {
-                    SQL_SUCCESS_WITH_INFO
+                    idle_success
+                } else if matches!(phase, CursorPhase::Close) || (connection_close && acknowledge) {
+                    SQL_SUCCESS
                 } else {
                     SQL_ERROR
                 },
@@ -1079,6 +1137,16 @@ mod tests {
         cancel_cursor_phase(CursorPhase::Idle, false, true);
     }
 
+    /// msodbcsql's SQL_CLOSE cancels a response still arriving rather than
+    /// draining it (`Cancel` → `ProcessTDSStream(TDS_TIMEOUT)`), bounded by the
+    /// connection's cancellation timeout.
+    #[test]
+    fn free_stmt_close_abandons_a_pending_response_with_attention() {
+        cancel_cursor_phase(CursorPhase::IdleClose, true, false);
+        cancel_cursor_phase(CursorPhase::IdleClose, false, false);
+        cancel_cursor_phase(CursorPhase::IdleClose, false, true);
+    }
+
     #[test]
     fn cursor_cancellation_waits_for_ack_and_releases_all_cursor_state() {
         for phase in [
@@ -1102,6 +1170,12 @@ mod tests {
     #[test]
     fn connection_timeout_bounds_sql_cancel_and_retires_unacknowledged_connection() {
         cancel_cursor_phase(CursorPhase::Fetch, false, true);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_cursor_cleanup_before_an_attribute_change() {
+        cancel_cursor_phase(CursorPhase::ConnectionClose, true, false);
+        cancel_cursor_phase(CursorPhase::ConnectionClose, false, true);
     }
 
     /// Replays a SQLCancel that signals after a call's last read but before

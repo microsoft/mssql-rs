@@ -103,6 +103,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 The registry includes `SELECT 1` and `SELECT CAST(1 AS BIGINT), 2, 3` by default.
 Registering the same query again replaces its response.
 
+Use `QueryResponse::with_delay` with `TM_BEGIN_DELAY_KEY`, `TM_COMMIT_DELAY_KEY`,
+or `TM_ROLLBACK_DELAY_KEY` to delay transaction responses. `ATTENTION_DELAY_KEY`
+delays cancellation acknowledgements, including those interrupting a delayed
+query, so tests can exercise unresponsive-peer cleanup.
+
 ### Supported data types
 
 | SQL type | `SqlDataType` | `ColumnValue` payload |
