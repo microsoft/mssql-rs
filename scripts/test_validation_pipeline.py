@@ -156,12 +156,7 @@ def test_windows_stress_builds_once_and_shares_attempt_scoped_artifact(
 _WINDOWS_E2E = _ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.ps1"
 
 
-@pytest.mark.skipif(
-    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "cmake", "ctest")),
-    reason="needs Windows CMake, CTest, and PowerShell",
-)
-@pytest.mark.parametrize("build_jobs", [None, 2])
-def test_windows_build_only_parallelizes_and_stages_real_cpp_binaries(tmp_path, build_jobs):
+def _require_windows_cpp_toolchain():
     vswhere = Path(os.environ["ProgramFiles(x86)"]) / (
         "Microsoft Visual Studio/Installer/vswhere.exe"
     )
@@ -174,6 +169,42 @@ def test_windows_build_only_parallelizes_and_stages_real_cpp_binaries(tmp_path, 
     )
     if not compiler.stdout.strip():
         pytest.skip("needs Visual Studio C++ build tools")
+
+
+@pytest.fixture(scope="module")
+def windows_native_smoke(tmp_path_factory):
+    _require_windows_cpp_toolchain()
+    source = tmp_path_factory.mktemp("native-smoke")
+    (source / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.15)\nproject(fixture LANGUAGES CXX)\n"
+        "add_executable(smoke_test smoke.cpp)\n",
+        encoding="utf-8",
+    )
+    (source / "smoke.cpp").write_text(
+        "#include <cstdlib>\n"
+        "int main(int argc, char** argv) { return argc > 1 ? std::atoi(argv[1]) : 0; }\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("CMAKE_GENERATOR", None)
+    env.pop("CMAKE_GENERATOR_PLATFORM", None)
+    build = source / "build"
+    for args in (
+        ["cmake", "-S", str(source), "-B", str(build)],
+        ["cmake", "--build", str(build), "--config", "Debug", "--parallel", "2"],
+    ):
+        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stdout + result.stderr
+    return build / "Debug" / "smoke_test.exe"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "cmake", "ctest")),
+    reason="needs Windows CMake, CTest, and PowerShell",
+)
+@pytest.mark.parametrize("build_jobs", [None, 2])
+def test_windows_build_only_parallelizes_and_stages_real_cpp_binaries(tmp_path, build_jobs):
+    _require_windows_cpp_toolchain()
     producer = tmp_path / "producer" / "mssql-odbc" / "tests" / "e2e"
     producer.mkdir(parents=True)
     (producer / "CMakeLists.txt").write_text(
@@ -245,25 +276,24 @@ Set-Location (Split-Path -Parent $env:DROP)
 
 
 @pytest.mark.skipif(
-    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "ctest")),
-    reason="needs Windows CTest and PowerShell",
+    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "cmake", "ctest")),
+    reason="needs Windows CMake, CTest, and PowerShell",
 )
 @pytest.mark.parametrize(("exit_code", "filter_tests"), [(0, ""), (1, ""), (0, "^missing$")])
 def test_windows_prebuilt_drop_relocates_and_runs_both_legs_without_compiling(
-    tmp_path, exit_code, filter_tests
+    tmp_path, windows_native_smoke, exit_code, filter_tests
 ):
     producer = tmp_path / "producer checkout" / "tests" / "e2e"
     debug = producer / "build" / "Debug"
     debug.mkdir(parents=True)
-    shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe",
-                 debug / "smoke_test.exe")
+    shutil.copy2(windows_native_smoke, debug / "smoke_test.exe")
     for name in ("smoke_test.pdb", "mssqlodbc.dll", "mssqlodbc.pdb", "unused.lib"):
         (debug / name).write_bytes(b"fixture")
     (producer / "build" / "CMakeCache.txt").write_text("do not ship", encoding="utf-8")
     exe = (debug / "smoke_test.exe").as_posix()
     (producer / "build" / "CTestTestfile.cmake").write_text(
-        f'add_test(smoke_test "{exe}" /c exit {exit_code})\n'
-        f'add_test(smoke_test_mt "{exe}" /c exit {exit_code})\n'
+        f'add_test(smoke_test "{exe}" {exit_code})\n'
+        f'add_test(smoke_test_mt "{exe}" {exit_code})\n'
         'set_tests_properties(smoke_test_mt PROPERTIES LABELS mt TIMEOUT 30 '
         'SKIP_RETURN_CODE 77)\nsubdirs("nested")\n',
         encoding="utf-8",
@@ -271,7 +301,7 @@ def test_windows_prebuilt_drop_relocates_and_runs_both_legs_without_compiling(
     nested = producer / "build" / "nested"
     nested.mkdir()
     (nested / "CTestTestfile.cmake").write_text(
-        f'add_test(nested_test "{exe}" /c exit 0)\n', encoding="utf-8"
+        f'add_test(nested_test "{exe}" 0)\n', encoding="utf-8"
     )
     artifact = tmp_path / "published drop"
     # Execute the production packaging function, without building or touching HKLM.
