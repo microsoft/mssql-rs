@@ -1231,10 +1231,8 @@ fn set_user_type_name(
     };
     write_record_field(state, record_number, |r| {
         let names = Arc::make_mut(r.udt_names.get_or_insert_with(Default::default));
-        // Claim only the part written. The UDT and TVP spellings resolve to the
-        // same catalog/schema/type storage; the assembly name never reaches the
-        // wire, so writing it claims nothing and leaves the rest the server's to
-        // supply.
+        // Claim only the part written. Catalog and schema are shared aliases;
+        // UDT and TVP type names have separate storage.
         match field {
             SQL_CA_SS_UDT_CATALOG_NAME | SQL_CA_SS_CATALOG_NAME => {
                 names.catalog = value;
@@ -1244,9 +1242,13 @@ fn set_user_type_name(
                 names.schema = value;
                 r.udt_name_claimed.schema = true;
             }
-            SQL_CA_SS_UDT_TYPE_NAME | SQL_CA_SS_TYPE_NAME => {
+            SQL_CA_SS_UDT_TYPE_NAME => {
                 names.type_name = value;
                 r.udt_name_claimed.type_name = true;
+            }
+            SQL_CA_SS_TYPE_NAME => {
+                names.tvp_type_name = value;
+                r.udt_name_claimed.tvp_type_name = true;
             }
             SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => names.assembly_type_name = value,
             // `set_record_field` routes only the fields above here.
@@ -1450,23 +1452,19 @@ mod tests {
         }
     }
 
-    /// The TVP spelling of the server type-name fields
-    /// (`SQL_CA_SS_CATALOG_NAME`/`SCHEMA_NAME`/`TYPE_NAME`, 1225-1227) is what
-    /// mssql-python reads for a table-valued parameter. It must round-trip the
-    /// same way the UDT trio does, and must resolve to the same stored
-    /// catalog/schema/type - a name written through the UDT spelling reads back
-    /// through the TVP spelling and vice versa, since a parameter is never both.
+    /// Catalog and schema aliases share storage; TVP and UDT type names do not.
     #[test]
-    fn tvp_name_fields_round_trip_and_share_udt_storage() {
+    fn tvp_and_udt_name_fields_share_catalog_schema_but_not_type() {
         let h = TestHandles::with_env_dbc_stmt();
         let ipd = h.ipd();
 
-        // The TVP catalog alias is read-only, so write the catalog through the
-        // UDT spelling and the schema/type through their TVP fields.
+        // Catalog/schema aliases are shared, but the distinct type names are
+        // independently writable on the same record.
         for (field, value) in [
             (SQL_CA_SS_UDT_CATALOG_NAME, "mydb"),
             (SQL_CA_SS_SCHEMA_NAME, "sales"),
             (SQL_CA_SS_TYPE_NAME, "OrderList"),
+            (SQL_CA_SS_UDT_TYPE_NAME, "Point"),
         ] {
             let mut buf: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
             let ret = unsafe {
@@ -1478,18 +1476,17 @@ mod tests {
                     SqlInteger::from(SQL_NTS),
                 )
             };
-            assert_eq!(ret, SQL_SUCCESS, "SET failed for TVP field {field}");
+            assert_eq!(ret, SQL_SUCCESS, "SET failed for type-name field {field}");
         }
 
-        // Read back through both the TVP spelling and the UDT spelling: both
-        // resolve to the same catalog/schema/type storage.
+        // Read each alias through its own spelling.
         for (field, expected) in [
             (SQL_CA_SS_CATALOG_NAME, "mydb"),
             (SQL_CA_SS_UDT_CATALOG_NAME, "mydb"),
             (SQL_CA_SS_SCHEMA_NAME, "sales"),
             (SQL_CA_SS_UDT_SCHEMA_NAME, "sales"),
             (SQL_CA_SS_TYPE_NAME, "OrderList"),
-            (SQL_CA_SS_UDT_TYPE_NAME, "OrderList"),
+            (SQL_CA_SS_UDT_TYPE_NAME, "Point"),
         ] {
             let mut out = [0u16; 64];
             let mut text_len: SqlInteger = 0;

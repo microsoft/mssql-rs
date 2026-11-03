@@ -405,9 +405,8 @@ fn record_field_value(record: &DescRecord, field: SqlUSmallInt) -> Option<FieldV
         SQL_DESC_INDICATOR_PTR => FieldValue::Pointer(record.indicator_ptr),
         SQL_DESC_OCTET_LENGTH_PTR => FieldValue::Pointer(record.octet_length_ptr),
         // A type-name part that was never set reads back empty, the same answer
-        // a record with no server type identity at all gives. The UDT trio and
-        // the TVP trio (`SQL_CA_SS_CATALOG_NAME`/`SCHEMA_NAME`/`TYPE_NAME`)
-        // resolve to the same stored catalog/schema/type.
+        // a record with no server type identity at all gives. Catalog/schema
+        // aliases share storage, while UDT and TVP type names are distinct.
         SQL_CA_SS_UDT_CATALOG_NAME
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
@@ -418,7 +417,8 @@ fn record_field_value(record: &DescRecord, field: SqlUSmallInt) -> Option<FieldV
             let part = record.udt_names.as_deref().map(|n| match field {
                 SQL_CA_SS_UDT_CATALOG_NAME | SQL_CA_SS_CATALOG_NAME => &n.catalog,
                 SQL_CA_SS_UDT_SCHEMA_NAME | SQL_CA_SS_SCHEMA_NAME => &n.schema,
-                SQL_CA_SS_UDT_TYPE_NAME | SQL_CA_SS_TYPE_NAME => &n.type_name,
+                SQL_CA_SS_UDT_TYPE_NAME => &n.type_name,
+                SQL_CA_SS_TYPE_NAME => &n.tvp_type_name,
                 _ => &n.assembly_type_name,
             });
             FieldValue::Text(part.cloned().unwrap_or_default())

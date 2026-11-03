@@ -4058,7 +4058,7 @@ mod tests {
         };
         let mut snapshot = snap(tvp).unwrap();
         snapshot.udt_names = Some(std::sync::Arc::new(UdtNames {
-            type_name: "Rows".to_string(),
+            tvp_type_name: "Rows".to_string(),
             ..Default::default()
         }));
         let bound = [Some(snapshot)];

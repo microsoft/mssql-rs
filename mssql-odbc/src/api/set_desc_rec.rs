@@ -159,27 +159,31 @@ fn sql_set_desc_rec_safe(
             }
         };
         if may_route {
+            let validation_diagnostic = std::cell::RefCell::new(None);
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 Some(focused_tvp_initial_binding()),
                 None,
-                |binding| {
-                    focused_tvp_ipd_desc_rec(
-                        binding,
-                        record_number,
-                        field_type,
-                        sub_type,
-                        length,
-                        precision,
-                        scale,
-                        data_ptr,
-                        string_length_ptr,
-                        indicator_ptr,
-                    )
-                    .is_some()
+                |binding| match focused_tvp_ipd_desc_rec(
+                    binding,
+                    record_number,
+                    field_type,
+                    sub_type,
+                    length,
+                    precision,
+                    scale,
+                    data_ptr,
+                    string_length_ptr,
+                    indicator_ptr,
+                ) {
+                    Ok(_) => true,
+                    Err(diagnostic) => {
+                        *validation_diagnostic.borrow_mut() = diagnostic;
+                        false
+                    }
                 },
                 |binding| {
-                    if let Some((sql_type, length, precision, scale, interval_code)) =
+                    if let Ok((sql_type, length, precision, scale, interval_code)) =
                         focused_tvp_ipd_desc_rec(
                             binding,
                             record_number,
@@ -215,7 +219,10 @@ fn sql_set_desc_rec_safe(
                     return SQL_SUCCESS;
                 }
                 Ok(Some(false)) => {
-                    return post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE);
+                    return match validation_diagnostic.borrow_mut().take() {
+                        Some(diagnostic) => post_focused_tvp_record_diag(desc, diagnostic),
+                        None => post_focused_tvp_diag(desc, ERR_INVALID_PRECISION_OR_SCALE),
+                    };
                 }
                 Ok(None) => {}
                 Err(()) => {
@@ -372,10 +379,14 @@ fn focused_tvp_ipd_desc_rec(
     data_ptr: SqlPointer,
     string_length_ptr: *mut SqlLen,
     indicator_ptr: *mut SqlLen,
-) -> Option<(SqlSmallInt, SqlLen, SqlSmallInt, SqlSmallInt, SqlSmallInt)> {
+) -> Result<
+    (SqlSmallInt, SqlLen, SqlSmallInt, SqlSmallInt, SqlSmallInt),
+    Option<crate::error::DiagRecord>,
+> {
     let record_index = usize::try_from(record_number)
         .ok()
-        .and_then(|number| number.checked_sub(1))?;
+        .and_then(|number| number.checked_sub(1))
+        .ok_or(None)?;
     let mut apd_record = DescRecord::default_for(DescKind::AppParam);
     let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
     binding.write_to_records(&mut apd_record, &mut ipd_record);
@@ -400,16 +411,30 @@ fn focused_tvp_ipd_desc_rec(
         indicator_ptr,
     ) != SQL_SUCCESS
     {
-        return None;
+        return Err(state.diag_records.pop());
     }
-    let record = state.record(record_number)?;
-    Some((
+    let record = state.record(record_number).ok_or(None)?;
+    let length = SqlLen::try_from(record.length).map_err(|_| None)?;
+    Ok((
         record.concise_type,
-        SqlLen::try_from(record.length).ok()?,
+        length,
         record.precision,
         record.scale,
         record.datetime_interval_code,
     ))
+}
+
+fn post_focused_tvp_record_diag(
+    desc: &DescHandle,
+    diagnostic: crate::error::DiagRecord,
+) -> SqlReturn {
+    let Ok(mut state) = desc.inner.lock() else {
+        error!("SQLSetDescRec: desc mutex poisoned posting focused validation error");
+        return SQL_ERROR;
+    };
+    free_errors(&mut state);
+    state.diag_records.push(diagnostic);
+    SQL_ERROR
 }
 
 pub(super) fn current_odbc_version(desc: &DescHandle) -> Result<OdbcVersion, ()> {
@@ -630,7 +655,9 @@ mod tests {
         SqlTimestampStruct,
     };
     use crate::api::set_desc_field::sql_set_desc_field_w;
-    use crate::api::sqlstate::{ERR_CANNOT_MODIFY_IRD, ERR_INVALID_PRECISION_OR_SCALE};
+    use crate::api::sqlstate::{
+        ERR_CANNOT_MODIFY_IRD, ERR_INVALID_PRECISION_OR_SCALE, ERR_INVALID_SQL_DATA_TYPE,
+    };
     use crate::api::type_rules::canonical_c_type;
     use crate::handles::desc::DescRecord;
     use crate::test_support::TestHandles;
@@ -1420,6 +1447,59 @@ mod tests {
         assert_eq!(binding.sql_type, SQL_NUMERIC);
         assert_eq!(binding.column_size, 12);
         assert_eq!(binding.decimal_digits, 3);
+    }
+
+    #[test]
+    fn focused_ipd_set_desc_rec_preserves_invalid_sql_type_diagnostic() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        stmt.inner.lock().unwrap().tvp_column_bindings.insert(
+            1,
+            vec![Some(crate::params::BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type: SQL_C_NUMERIC,
+                sql_type: SQL_INTEGER,
+                column_size: 4,
+                decimal_digits: 0,
+                app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
+                app_precision: 10,
+                app_scale: 2,
+                parameter_value_ptr: ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: ptr::null_mut(),
+                octet_length_ptr: ptr::null_mut(),
+            })],
+        );
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_rec(
+                    h.ipd(),
+                    1,
+                    9999,
+                    0,
+                    8,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(
+            desc_diag_states(h.ipd())[0],
+            ERR_INVALID_SQL_DATA_TYPE.state
+        );
+        assert_eq!(record_count(h.ipd()), 0, "the outer IPD stays untouched");
+        let state = stmt.inner.lock().unwrap();
+        let binding = state.tvp_column_bindings[&1][0].as_ref().unwrap();
+        assert_eq!(binding.sql_type, SQL_INTEGER);
+        assert_eq!(binding.column_size, 4);
+        assert_eq!(binding.decimal_digits, 0);
     }
 
     #[test]

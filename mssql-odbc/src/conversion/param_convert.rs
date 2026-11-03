@@ -2496,13 +2496,13 @@ fn normalize_tvp_decimal(
 /// unqualified name against the default schema), and the catalog is omitted —
 /// SQL Server forbids a cross-database TVP type.
 fn tvp_type_name(names: Option<&UdtNames>) -> Result<TvpTypeName, ParamBuildError> {
-    let names = names.filter(|n| !n.type_name.is_empty());
+    let names = names.filter(|n| !n.tvp_type_name.is_empty());
     let Some(names) = names else {
         return Err(ParamBuildError::MissingTableTypeName);
     };
     Ok(TvpTypeName::new(
         Some(names.schema.clone()).filter(|s| !s.is_empty()),
-        names.type_name.clone(),
+        names.tvp_type_name.clone(),
     ))
 }
 
@@ -4477,7 +4477,8 @@ mod tests {
         let names = UdtNames {
             catalog: "mydb".into(),
             schema: "sales".into(),
-            type_name: "OrderList".into(),
+            type_name: String::new(),
+            tvp_type_name: "OrderList".into(),
             assembly_type_name: String::new(),
         };
         let name = tvp_type_name(Some(&names)).unwrap();
@@ -4486,7 +4487,7 @@ mod tests {
         assert_eq!(name.db_name, None);
 
         let unqualified = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let name = tvp_type_name(Some(&unqualified)).unwrap();
@@ -4579,7 +4580,7 @@ mod tests {
     #[test]
     fn tvp_build_reads_row_count_after_outer_bind_offset_once() {
         let names = UdtNames {
-            type_name: "Rows".into(),
+            tvp_type_name: "Rows".into(),
             ..Default::default()
         };
         let mut row_counts: [SqlLen; 3] = [0, 1, 0];
@@ -4642,7 +4643,7 @@ mod tests {
     fn build_tvp_param_handles_an_empty_table() {
         use crate::handles::desc::UdtNames;
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let mut default: SqlLen = SQL_DEFAULT_PARAM;
@@ -4663,7 +4664,7 @@ mod tests {
     fn build_tvp_param_assembles_rows_and_rejects_unbound_columns() {
         use crate::handles::desc::UdtNames;
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
 
@@ -4743,7 +4744,7 @@ mod tests {
         );
 
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let mut row_count: SqlLen = 1;
@@ -4802,7 +4803,7 @@ mod tests {
             value: None,
         }];
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
 
@@ -4838,7 +4839,7 @@ mod tests {
         ));
 
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let mut row_count: SqlLen = 1;
@@ -4893,7 +4894,7 @@ mod tests {
             value: None,
         }];
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
 
@@ -4912,7 +4913,7 @@ mod tests {
     #[test]
     fn empty_dae_tvp_has_the_same_default_status_as_a_bound_empty_table() {
         let names = crate::handles::desc::UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let mut count: SqlLen = 0;
@@ -4941,7 +4942,7 @@ mod tests {
         use crate::handles::desc::UdtNames;
         use crate::handles::stmt::BufferedTvpCell;
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let column = int_param(
@@ -4973,7 +4974,7 @@ mod tests {
     fn tvp_row_count_cannot_exceed_bound_capacity() {
         use crate::handles::desc::UdtNames;
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let mut count: SqlLen = 2;
@@ -4989,7 +4990,7 @@ mod tests {
     fn tvp_column_data_at_exec_is_reported_as_unsupported() {
         use crate::handles::desc::UdtNames;
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let mut count: SqlLen = 1;
@@ -5024,7 +5025,7 @@ mod tests {
     fn tvp_row_reservation_fails_without_aborting_for_extreme_counts() {
         use crate::handles::desc::UdtNames;
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
         let mut count = SqlLen::MAX;
@@ -5040,7 +5041,7 @@ mod tests {
     fn tvp_bind_offset_applies_to_top_level_and_column_indicators_and_values() {
         use crate::handles::desc::UdtNames;
         let names = UdtNames {
-            type_name: "OrderList".into(),
+            tvp_type_name: "OrderList".into(),
             ..Default::default()
         };
 
@@ -7460,6 +7461,7 @@ mod tests {
             catalog: catalog.to_string(),
             schema: schema.to_string(),
             type_name: type_name.to_string(),
+            tvp_type_name: String::new(),
             assembly_type_name: String::new(),
         }))
     }

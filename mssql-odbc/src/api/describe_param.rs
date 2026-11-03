@@ -696,12 +696,12 @@ fn refine_ipd(
     SQL_SUCCESS
 }
 
-/// Merges a describe's UDT identity into one IPD record, per wire part.
+/// Merges a described UDT or TVP identity into one IPD record, per field.
 ///
 /// A part the application claimed through `SQLSetDescField` wins; an unclaimed
 /// one takes the describe's value, or is emptied when the describe reports no
-/// UDT at this ordinal. Only the caller's guard decides whether there is
-/// anything to merge at all - see the allocation note there.
+/// user-defined type at this ordinal. Only the caller's guard decides whether
+/// there is anything to merge at all - see the allocation note there.
 fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>) {
     let empty = UdtNames::default();
     // A describe reporting no UDT here clears the unclaimed parts rather than
@@ -711,7 +711,7 @@ fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>
     let claims = record.udt_name_claimed;
     // Steady state: a replay after the first call finds the record already
     // holding exactly this identity, so there is nothing to write. Comparing
-    // the three wire parts costs no allocation, where rebuilding them cost one
+    // the stored identity fields costs no allocation, where rebuilding them cost one
     // owned copy per marker per cache-served answer - O(N^2) across a
     // describe-all pass.
     let merged = |part: fn(&UdtNames) -> &String, claimed: bool| -> &str {
@@ -725,16 +725,21 @@ fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>
         current.catalog == merged(|n| &n.catalog, claims.catalog)
             && current.schema == merged(|n| &n.schema, claims.schema)
             && current.type_name == merged(|n| &n.type_name, claims.type_name)
+            && current.tvp_type_name == merged(|n| &n.tvp_type_name, claims.tvp_type_name)
     });
     if !unchanged {
         // Nothing of the application's to preserve: share the describe's
-        // identity rather than copying its three strings per marker.
+        // identity rather than copying its strings per marker.
         if let Some(described) = described
             && claims.none()
             && record
                 .udt_names
                 .as_ref()
                 .is_none_or(|n| n.assembly_type_name.is_empty())
+            && record
+                .udt_names
+                .as_ref()
+                .is_none_or(|n| n.tvp_type_name.is_empty())
         {
             record.udt_names = Some(Arc::clone(described));
         } else {
@@ -751,6 +756,9 @@ fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>
             if !claims.type_name {
                 names.type_name.clone_from(&fresh.type_name);
             }
+            if !claims.tvp_type_name {
+                names.tvp_type_name.clone_from(&fresh.tvp_type_name);
+            }
         }
     }
     // Nothing left worth carrying: no claimed part, nothing described, no
@@ -761,6 +769,7 @@ fn merge_udt_identity(record: &mut DescRecord, described: Option<&Arc<UdtNames>>
             && n.catalog.is_empty()
             && n.schema.is_empty()
             && n.type_name.is_empty()
+            && n.tvp_type_name.is_empty()
     }) {
         record.udt_names = None;
     }
@@ -1115,18 +1124,24 @@ fn read_optional_string(row: &[ColumnValues], index: usize) -> Option<String> {
 /// The server-side type identity for a described `udt` or table-valued
 /// (`SQL_SS_TABLE`) parameter, or `None` for every other type. Both carry a
 /// three-part (catalog / schema / type) name in the same
-/// `suggested_user_type_*` columns, and both populate the same three IPD name
-/// fields; msodbcsql fills them the same way. A TVP has no assembly-qualified
-/// name, which is left empty exactly as it is for a UDT (see below).
+/// `suggested_user_type_*` columns; catalog and schema share IPD storage, while
+/// their type-name fields remain distinct as in msodbcsql. A TVP has no
+/// assembly-qualified name, which is left empty exactly as it is for a UDT.
 fn read_user_type_names(row: &[ColumnValues], data_type: SqlSmallInt) -> Option<Arc<UdtNames>> {
     if !matches!(data_type, SQL_SS_UDT | SQL_SS_TABLE) {
         return None;
     }
     let type_name = read_optional_string(row, SUGGESTED_USER_TYPE_NAME)?;
+    let (udt_type_name, tvp_type_name) = if data_type == SQL_SS_TABLE {
+        (String::new(), type_name)
+    } else {
+        (type_name, String::new())
+    };
     Some(Arc::new(UdtNames {
         catalog: read_optional_string(row, SUGGESTED_USER_TYPE_DATABASE).unwrap_or_default(),
         schema: read_optional_string(row, SUGGESTED_USER_TYPE_SCHEMA).unwrap_or_default(),
-        type_name,
+        type_name: udt_type_name,
+        tvp_type_name,
         // Left empty by choice, not because the server is silent:
         // `sp_describe_undeclared_parameters` does return
         // `suggested_assembly_qualified_type_name` (0-based column 11), and
@@ -1985,8 +2000,8 @@ mod tests {
 
     /// The server is the only source for a UDT's name when the application has
     /// not supplied one, matching msodbcsql's `AutoFillIPD`
-    /// (`sqlcdesc.cpp:9358`), which fills the same three IPD fields from the
-    /// same `suggested_user_type_*` columns.
+    /// (`sqlcdesc.cpp:9358`), which fills the corresponding IPD fields from
+    /// the `suggested_user_type_*` columns.
     #[test]
     fn udt_names_come_from_the_server_describe_columns() {
         let mut r = row(1, TdsDataType::Udt, 892, 0, 0);
@@ -2033,7 +2048,7 @@ mod tests {
             .expect("table type names");
         assert_eq!(names.catalog, "mydb");
         assert_eq!(names.schema, "sales");
-        assert_eq!(names.type_name, "OrderList");
+        assert_eq!(names.tvp_type_name, "OrderList");
         // A table type has no assembly-qualified name.
         assert_eq!(names.assembly_type_name, "");
     }
@@ -2347,7 +2362,15 @@ mod tests {
             catalog: String::new(),
             schema: String::new(),
             type_name: type_name.to_string(),
+            tvp_type_name: String::new(),
             assembly_type_name: String::new(),
+        })
+    }
+
+    fn tvp_identity(type_name: &str) -> Arc<UdtNames> {
+        Arc::new(UdtNames {
+            tvp_type_name: type_name.to_string(),
+            ..Default::default()
         })
     }
 
@@ -2386,6 +2409,7 @@ mod tests {
                 catalog: true,
                 schema: true,
                 type_name: true,
+                tvp_type_name: false,
             };
         }
         refine_ipd(stmt, &described, &[(0, udt_identity("geography"))]);
@@ -2394,6 +2418,48 @@ mod tests {
             "Point",
             "an application-supplied identity outranks the server's suggestion"
         );
+    }
+
+    #[test]
+    fn refine_ipd_merges_tvp_and_udt_type_names_independently() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let described = [param_description(SQL_SS_TABLE, 8000, 0, SQL_NULLABLE)];
+
+        refine_ipd(stmt, &described, &[(0, tvp_identity("OrderList"))]);
+        assert_eq!(
+            ipd_records(&h)[0].udt_names.as_ref().unwrap().tvp_type_name,
+            "OrderList"
+        );
+
+        // A UDT spelling is a separate field and cannot block the server's
+        // table-type name from refreshing.
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            let names = Arc::make_mut(record.udt_names.as_mut().unwrap());
+            names.type_name = "Point".to_string();
+            record.udt_name_claimed.type_name = true;
+        }
+        refine_ipd(stmt, &described, &[(0, tvp_identity("Rows"))]);
+        let names = ipd_records(&h)[0].udt_names.clone().unwrap();
+        assert_eq!(names.type_name, "Point");
+        assert_eq!(names.tvp_type_name, "Rows");
+
+        // The TVP spelling claims only its own type-name field.
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            let record = state.record_mut(1).unwrap();
+            Arc::make_mut(record.udt_names.as_mut().unwrap()).tvp_type_name =
+                "ChosenRows".to_string();
+            record.udt_name_claimed.tvp_type_name = true;
+        }
+        refine_ipd(stmt, &described, &[(0, tvp_identity("ServerRows"))]);
+        let names = ipd_records(&h)[0].udt_names.clone().unwrap();
+        assert_eq!(names.type_name, "Point");
+        assert_eq!(names.tvp_type_name, "ChosenRows");
     }
 
     /// Steps 1-4 of the sequence `clear_auto_filled_udt_names` sits in the
@@ -2611,6 +2677,7 @@ mod tests {
                 catalog: true,
                 schema: true,
                 type_name: true,
+                tvp_type_name: false,
             };
         }
 

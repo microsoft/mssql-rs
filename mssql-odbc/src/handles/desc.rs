@@ -257,28 +257,28 @@ pub(crate) struct DescRecord {
     /// bind — `concise_type != 0` alone can't tell the two apart, since
     /// `refine_ipd`'s own write leaves it non-zero too.
     pub(crate) explicitly_bound: bool,
-    /// `SQL_CA_SS_UDT_CATALOG_NAME` / `SQL_CA_SS_UDT_SCHEMA_NAME` /
-    /// `SQL_CA_SS_UDT_TYPE_NAME`. IPD only, and only for a `SQL_SS_UDT`
-    /// parameter, so it is boxed rather than costing three strings on every
-    /// record of every descriptor.
+    /// `SQL_CA_SS_*` type identity fields. IPD only, and relevant to UDT and
+    /// TVP parameters, so it is boxed rather than costing multiple strings on
+    /// every record of every descriptor.
     ///
     /// `Arc`, not `Box`: `parameter_definition` snapshots this for the
     /// before/after comparison that decides whether a prepared handle is
     /// stale, and `refine_ipd` takes that snapshot twice per record on every
-    /// cache-served describe. Deep-copying the three names there cost O(N^2)
-    /// string allocations across a describe-all pass; sharing makes each
-    /// snapshot a refcount bump. Writers use `Arc::make_mut`, so a record
+    /// cache-served describe. Deep-copying the names there cost O(N^2) string
+    /// allocations across a describe-all pass; sharing makes each snapshot a
+    /// refcount bump. Writers use `Arc::make_mut`, so a record
     /// whose identity is also held by a live snapshot is copied once, on
     /// write, rather than on every read.
     pub(crate) udt_names: Option<Arc<UdtNames>>,
-    /// IPD only: which of the three *wire* name parts the application set
-    /// through `SQLSetDescField`, as opposed to `refine_ipd` auto-filling them
-    /// from the server's `suggested_user_type_*` columns. Plays the same role
-    /// for the UDT identity that `explicitly_bound` plays for the type/size.
+    /// IPD only: which wire-name fields the application set through
+    /// `SQLSetDescField`, as opposed to `refine_ipd` auto-filling them from the
+    /// server's `suggested_user_type_*` columns. Plays the same role for user
+    /// type names that `explicitly_bound` plays for the type/size.
     ///
-    /// Per field, not one flag for the record: the three parts are
-    /// independently writable, so a single bit cannot express "the
-    /// application chose the schema, the server still owns the type name".
+    /// Per field, not one flag for the record: catalog, schema, and both
+    /// type-name aliases are independently writable, so a single bit cannot
+    /// express "the application chose the schema, the server still owns the
+    /// type name".
     /// Collapsing them let a re-`SQLPrepare` preserve a stale server-filled
     /// type name because the application had written only the schema, and let
     /// a describe overwrite a catalog the application had set.
@@ -288,40 +288,41 @@ pub(crate) struct DescRecord {
     pub(crate) udt_name_claimed: UdtNameClaims,
 }
 
-/// Which wire parts of a UDT identity the application claimed.
+/// Which wire-name fields the application claimed.
 ///
-/// One bool per part rather than one for the record: `SQLSetDescField` writes
-/// them independently, so provenance is per field. An unclaimed part stays the
-/// server's to supply and to refresh; a claimed one survives both a describe
-/// and the prepare-time clear.
+/// Catalog/schema are shared aliases, but UDT and TVP type names are distinct.
+/// An unclaimed field stays the server's to supply and to refresh; a claimed
+/// one survives both a describe and the prepare-time clear.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UdtNameClaims {
     pub(crate) catalog: bool,
     pub(crate) schema: bool,
     pub(crate) type_name: bool,
+    pub(crate) tvp_type_name: bool,
 }
 
 impl UdtNameClaims {
     /// True when the application has claimed no wire part, so the whole
     /// identity is still the server's to supply.
     pub(crate) fn none(&self) -> bool {
-        !self.catalog && !self.schema && !self.type_name
+        !self.catalog && !self.schema && !self.type_name && !self.tvp_type_name
     }
 }
 
-/// The server-side identity an application supplies for a UDT parameter.
+/// The server-side identity an application supplies for a UDT or TVP parameter.
 ///
 /// Only the type name is required; SQL Server resolves an unqualified name
-/// against the current database and default schema. `assembly_type_name` is
-/// stored and echoed back but never sent: the parameter `TYPE_INFO` has no
-/// field for it (`CRPCPolicy::WriteUDTHeader` writes three name parts), unlike
-/// the `UDT_INFO` in `COLMETADATA`. msodbcsql keeps it the same way
-/// (`sqlcdesc.cpp:4954` stores it; no RPC writer reads it).
+/// against the current database and default schema. Catalog and schema are
+/// shared by the UDT and TVP aliases; their type names are separate in
+/// msodbcsql. `assembly_type_name` is stored and echoed back but never sent:
+/// the parameter `TYPE_INFO` has no field for it (`CRPCPolicy::WriteUDTHeader`
+/// writes three name parts), unlike the `UDT_INFO` in `COLMETADATA`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct UdtNames {
     pub(crate) catalog: String,
     pub(crate) schema: String,
     pub(crate) type_name: String,
+    pub(crate) tvp_type_name: String,
     pub(crate) assembly_type_name: String,
 }
 
@@ -348,10 +349,9 @@ pub(crate) struct ParameterDefinition {
 }
 
 impl PartialEq for ParameterDefinition {
-    /// Compares the three *wire* name parts, never `assembly_type_name`: it
-    /// does not reach the declaration, so rewriting it must not orphan a
-    /// prepared handle. A derived impl would compare it, since it lives on the
-    /// shared `UdtNames`.
+    /// Compares the relevant type name for this SQL type, never the other
+    /// alias or `assembly_type_name`: neither reaches the declaration, so
+    /// rewriting either must not orphan a prepared handle.
     ///
     /// Pointer equality is checked first only as a fast path for the common
     /// case where both snapshots share one `Arc`; the value comparison behind
@@ -371,7 +371,13 @@ impl PartialEq for ParameterDefinition {
                 Arc::ptr_eq(a, b)
                     || (a.catalog == b.catalog
                         && a.schema == b.schema
-                        && a.type_name == b.type_name)
+                        && match self.sql_type {
+                            crate::api::odbc_types::SQL_SS_UDT => a.type_name == b.type_name,
+                            crate::api::odbc_types::SQL_SS_TABLE => {
+                                a.tvp_type_name == b.tvp_type_name
+                            }
+                            _ => true,
+                        })
             }
             _ => false,
         }
@@ -409,7 +415,7 @@ impl DescRecord {
             length,
             precision,
             scale,
-            // Only the three wire parts, and only on a record that actually
+            // Only the wire parts relevant to this structured SQL type, and only on a record that actually
             // declares a UDT or TVP: the concise type says so, and a type name is
             // present. The `SQL_CA_SS_UDT_*` fields are writable on any IPD
             // record (`classify_field` gates on kind, not type), so without
@@ -421,19 +427,17 @@ impl DescRecord {
             // such a record at all (`ERR_MISSING_UDT_TYPE_NAME`).
             //
             // "Has a wire identity" is a non-empty type name, the same test
-            // `udt_type_name` applies before an execute: a record holding only
-            // a catalog or schema declares nothing. Once a type name is
-            // present the catalog and schema travel with it, so changing
-            // either still invalidates, and a later switch away from
-            // either structured type invalidates through `sql_type`.
+            // the corresponding UDT/TVP builder applies before an execute: a
+            // record holding only a catalog or schema declares nothing. Once a
+            // type name is present the catalog and schema travel with it, so
+            // changing either still invalidates.
             udt: self
                 .udt_names
                 .as_ref()
-                .filter(|names| {
-                    matches!(
-                        self.concise_type,
-                        crate::api::odbc_types::SQL_SS_UDT | crate::api::odbc_types::SQL_SS_TABLE
-                    ) && !names.type_name.is_empty()
+                .filter(|names| match self.concise_type {
+                    crate::api::odbc_types::SQL_SS_UDT => !names.type_name.is_empty(),
+                    crate::api::odbc_types::SQL_SS_TABLE => !names.tvp_type_name.is_empty(),
+                    _ => false,
                 })
                 .map(Arc::clone),
         }
@@ -627,7 +631,13 @@ impl DescHandle {
             return SQL_ERROR;
         };
         for record in &mut state.records {
-            if record.udt_name_claimed == UdtNameClaims::default() && record.udt_names.is_none() {
+            if record.udt_name_claimed == UdtNameClaims::default()
+                && record.udt_names.as_ref().is_none_or(|names| {
+                    names.type_name.is_empty()
+                        && names.tvp_type_name.is_empty()
+                        && names.assembly_type_name.is_empty()
+                })
+            {
                 continue;
             }
             let Some(names) = record.udt_names.as_mut().map(Arc::make_mut) else {
@@ -647,8 +657,14 @@ impl DescHandle {
             if !record.udt_name_claimed.type_name {
                 names.type_name.clear();
             }
+            if !record.udt_name_claimed.tvp_type_name {
+                names.tvp_type_name.clear();
+            }
             // Nothing left worth keeping: no claimed part, no assembly name.
-            if record.udt_name_claimed.none() && names.assembly_type_name.is_empty() {
+            if record.udt_name_claimed.none()
+                && names.assembly_type_name.is_empty()
+                && names.tvp_type_name.is_empty()
+            {
                 record.udt_names = None;
             }
         }
@@ -1782,7 +1798,7 @@ mod tests {
         let handle = unsafe { crate::handles::handle_from_raw::<DescHandle>(h.ipd()) };
         {
             let mut state = handle.inner.lock().unwrap();
-            state.set_record_count(2, DescKind::ImpParam);
+            state.set_record_count(3, DescKind::ImpParam);
             let described = state.record_mut(1).unwrap();
             described.udt_names = Some(Arc::new(UdtNames {
                 type_name: "hierarchyid".to_string(),
@@ -1798,7 +1814,13 @@ mod tests {
                 catalog: true,
                 schema: true,
                 type_name: true,
+                tvp_type_name: false,
             };
+            let auto_filled_tvp = state.record_mut(3).unwrap();
+            auto_filled_tvp.udt_names = Some(Arc::new(UdtNames {
+                tvp_type_name: "Rows".to_string(),
+                ..Default::default()
+            }));
         }
 
         handle.clear_auto_filled_udt_names();
@@ -1806,6 +1828,7 @@ mod tests {
         let state = handle.inner.lock().unwrap();
         assert!(state.records[0].udt_names.is_none());
         assert_eq!(state.records[0].udt_name_claimed, UdtNameClaims::default());
+        assert!(state.records[2].udt_names.is_none());
         assert_eq!(
             state.records[1].udt_names.as_ref().unwrap().type_name,
             "Point"
@@ -1862,6 +1885,7 @@ mod tests {
             catalog: String::new(),
             schema: "dbo".to_string(),
             type_name: "Point".to_string(),
+            tvp_type_name: String::new(),
             assembly_type_name: String::new(),
         }));
         let point = record.parameter_definition();
@@ -1956,6 +1980,37 @@ mod tests {
         // ... and switching that record to a UDT does invalidate, name included.
         scalar.concise_type = crate::api::odbc_types::SQL_SS_UDT;
         assert_ne!(scalar_plain, scalar.parameter_definition());
+    }
+
+    #[test]
+    fn tvp_type_name_is_part_of_the_prepared_parameter_definition() {
+        let mut record = DescRecord::default_for(DescKind::ImpParam);
+        record.concise_type = crate::api::odbc_types::SQL_SS_TABLE;
+        let without_names = record.parameter_definition();
+
+        record.udt_names = Some(Arc::new(UdtNames {
+            type_name: "Point".to_string(),
+            tvp_type_name: "OrderList".to_string(),
+            ..Default::default()
+        }));
+        let order_list = record.parameter_definition();
+        assert_ne!(without_names, order_list);
+
+        let names = Arc::make_mut(record.udt_names.as_mut().unwrap());
+        names.type_name = "Shape".to_string();
+        assert_eq!(
+            order_list,
+            record.parameter_definition(),
+            "a UDT type name does not change a TVP declaration"
+        );
+
+        let names = Arc::make_mut(record.udt_names.as_mut().unwrap());
+        names.tvp_type_name = "OtherRows".to_string();
+        assert_ne!(
+            order_list,
+            record.parameter_definition(),
+            "the TVP type name changes the declaration"
+        );
     }
 
     #[test]

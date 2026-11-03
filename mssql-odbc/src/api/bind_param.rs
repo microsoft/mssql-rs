@@ -611,8 +611,8 @@ fn store_tvp_type_name(
         names.schema.clear();
         record.udt_name_claimed.catalog = false;
         record.udt_name_claimed.schema = false;
-        names.type_name = name;
-        record.udt_name_claimed.type_name = true;
+        names.tvp_type_name = name;
+        record.udt_name_claimed.tvp_type_name = true;
     }
     Ok(previous != record.parameter_definition())
 }
@@ -1286,8 +1286,8 @@ mod tests {
         let state = ipd.inner.lock().unwrap();
         let record = state.record(1).expect("ipd record 1");
         let names = record.udt_names.as_ref().expect("type name recorded");
-        assert_eq!(names.type_name, "OrderList");
-        assert!(record.udt_name_claimed.type_name, "name is claimed");
+        assert_eq!(names.tvp_type_name, "OrderList");
+        assert!(record.udt_name_claimed.tvp_type_name, "name is claimed");
     }
 
     #[test]
@@ -1358,11 +1358,11 @@ mod tests {
         let names = state.record(1).unwrap().udt_names.as_ref().unwrap();
         assert_eq!(names.catalog, "");
         assert_eq!(names.schema, "");
-        assert_eq!(names.type_name, "OtherRows");
+        assert_eq!(names.tvp_type_name, "OtherRows");
         let record = state.record(1).unwrap();
         assert!(!record.udt_name_claimed.catalog);
         assert!(!record.udt_name_claimed.schema);
-        assert!(record.udt_name_claimed.type_name);
+        assert!(record.udt_name_claimed.tvp_type_name);
     }
 
     #[test]

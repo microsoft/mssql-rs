@@ -512,6 +512,7 @@ pub fn fuzz_bound_param(data: &[u8]) {
             catalog: String::from_utf8_lossy(&catalog).into_owned(),
             schema: String::from_utf8_lossy(&schema).into_owned(),
             type_name: String::from_utf8_lossy(&type_name).into_owned(),
+            tvp_type_name: String::new(),
             assembly_type_name: String::new(),
         }
     });
