@@ -68,12 +68,13 @@ const char* const kConnectTimeSql =
 
 bool Kill(Connection& admin, const std::string& spid, std::string& error) {
     const SQLRETURN rc = ExecDirect(admin.stmt(), "KILL " + spid);
-    SQLFreeStmt(admin.stmt(), SQL_CLOSE);
-    if (!SQL_SUCCEEDED(rc)) {
+    // Read the diagnostic first: SQLFreeStmt clears it.
+    const bool killed = SQL_SUCCEEDED(rc);
+    if (!killed) {
         error = Describe("KILL", rc, SQL_HANDLE_STMT, admin.stmt());
-        return false;
     }
-    return true;
+    SQLFreeStmt(admin.stmt(), SQL_CLOSE);
+    return killed;
 }
 
 // The stall victim connects through TcpPauseProxy, which needs the server as
