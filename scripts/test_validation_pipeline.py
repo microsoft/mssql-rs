@@ -993,3 +993,32 @@ def test_macos_builds_set_a_supported_deployment_target():
     assert "${MACOSX_DEPLOYMENT_TARGET:-10.15}" in build["script"]
     sqlcmd = (_ROOT / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.sh").read_text()
     assert '*-apple-darwin*) export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"' in sqlcmd
+    python = load_template("test-mssql-python-macos-template.yml")["steps"]
+    build = next(step for step in python if "maturin build" in step.get("script", ""))
+    assert build["script"].index("export MACOSX_DEPLOYMENT_TARGET") < build["script"].index("maturin build")
+    assert "${MACOSX_DEPLOYMENT_TARGET:-10.15}" in build["script"]
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("deployment_target", "expected"),
+    [(None, "10.15"), ("", "10.15"), ("10.15", "10.15"), ("26.0", "26.0")],
+)
+def test_macos_python_build_preserves_supported_deployment_targets(deployment_target, expected):
+    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
+    build = next(step for step in steps if "maturin build" in step.get("script", ""))
+    export = next(
+        line for line in build["script"].splitlines()
+        if line.startswith("export MACOSX_DEPLOYMENT_TARGET=")
+    )
+    setup = (
+        "unset MACOSX_DEPLOYMENT_TARGET"
+        if deployment_target is None
+        else f"export MACOSX_DEPLOYMENT_TARGET='{deployment_target}'"
+    )
+    result = subprocess.run(
+        [_BASH, "-c", f'{setup}\n{export}\nprintf "%s" "$MACOSX_DEPLOYMENT_TARGET"'],
+        cwd=_ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
