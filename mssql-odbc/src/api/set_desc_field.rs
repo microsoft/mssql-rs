@@ -510,11 +510,11 @@ fn set_focused_tvp_header_field(
             Ok(Some(false)) | Err(()) => Some(post_focused_tvp_internal_error(desc)),
         };
     }
-    let headers = match desc.focused_tvp_layout_headers() {
-        Ok(headers) => headers,
+    let header = match desc.focused_tvp_layout_header() {
+        Ok(Some(header)) => header,
+        Ok(None) => return None,
         Err(()) => return Some(post_focused_tvp_internal_error(desc)),
     };
-    let header = headers.first().copied()?;
     let mut scratch = DescState {
         diag_records: Vec::new(),
         header,
@@ -2614,6 +2614,20 @@ mod tests {
                 .records
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn focused_apd_length_write_updates_the_descriptor_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+
+        assert_eq!(
+            unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_LENGTH, 20isize as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        assert_eq!(apd.inner.lock().unwrap().record(1).unwrap().length, 20);
     }
 
     #[test]

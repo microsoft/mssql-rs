@@ -86,11 +86,11 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   buffered and converted into the table value before execution. Only columns marked
   data-at-execution produce cell tokens; ordinary bound values and NULLs are captured from
   their positioned row buffers when the application supplies that row. Positive row-control
-  counts may describe multiple batches, each no larger than the focused array capacity; the
-  driver reuses that array for later batches and accumulates their rows into one table. A false
-  first row-control marker supplies an empty table. A row's DAE length is read when its cell
-  token is offered, so mixed ordinary/DAE rows retain their declared lengths without reading
-  unused future rows.
+  counts may describe multiple batches, each no larger than the focused array capacity; their
+  cumulative row count must not exceed the TVP parameter's bound `ColumnSize`. The driver reuses
+  that array for later batches and accumulates their rows into one table. A false first row-control
+  marker supplies an empty table. A row's DAE length is read when its cell token is offered, so
+  mixed ordinary/DAE rows retain their declared lengths without reading unused future rows.
 - **Execute** — the statement runs; procedure result sets are returned through the normal fetch
   path. TVPs are input-only and are never fetched back.
 

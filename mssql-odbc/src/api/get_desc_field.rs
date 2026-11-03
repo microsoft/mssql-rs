@@ -337,8 +337,9 @@ fn get_focused_tvp_header_field(
             &mut state,
         ));
     }
-    let headers = match desc.focused_tvp_layout_headers() {
-        Ok(headers) => headers,
+    let header = match desc.focused_tvp_layout_header() {
+        Ok(Some(header)) => header,
+        Ok(None) => return None,
         Err(()) => {
             error!("SQLGetDescFieldW: failed reading focused TVP descriptor headers");
             let Ok(mut state) = desc.inner.lock() else {
@@ -355,13 +356,12 @@ fn get_focused_tvp_header_field(
             return Some(SQL_ERROR);
         }
     };
-    let header = headers.first()?;
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLGetDescFieldW: desc mutex poisoned reading child header");
         return Some(SQL_ERROR);
     };
     free_errors(&mut state);
-    let Some(value) = header_field_value(header, field) else {
+    let Some(value) = header_field_value(&header, field) else {
         post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
         return Some(SQL_ERROR);
     };

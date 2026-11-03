@@ -158,7 +158,7 @@ pub(crate) struct DescHandle {
 /// `SQLGetDescFieldW`/`SQLSetDescFieldW`). Validity per kind is gated by
 /// [`classify_field`], not by field presence here — mirrors msodbcsql's
 /// shared `GENDESCTAG` (`sqlsrv.h:1167-1178`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DescHeader {
     /// `SQL_DESC_ALLOC_TYPE`, mirrored from [`DescHandle::alloc_type`] at
     /// construction (see that field's doc comment for why the value lives in
@@ -1016,13 +1016,13 @@ impl DescHandle {
         Ok(None)
     }
 
-    pub(crate) fn focused_tvp_layout_headers(&self) -> Result<Vec<DescHeader>, ()> {
+    pub(crate) fn focused_tvp_layout_header(&self) -> Result<Option<DescHeader>, ()> {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(self.parent_dbc) };
         let Ok(dbc_state) = dbc.inner.lock() else {
             error!("reading focused TVP descriptor headers: dbc mutex poisoned");
             return Err(());
         };
-        let mut headers = Vec::new();
+        let mut header = None;
         for &raw in &dbc_state.statements {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
             let Ok(state) = stmt.inner.lock() else {
@@ -1037,16 +1037,21 @@ impl DescHandle {
                 .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
                 .unwrap_or(0);
             if focus != 0 {
-                headers.push(
-                    state
-                        .tvp_column_layouts
-                        .get(&focus)
-                        .copied()
-                        .unwrap_or_default(),
-                );
+                let focused_header = state
+                    .tvp_column_layouts
+                    .get(&focus)
+                    .copied()
+                    .unwrap_or_default();
+                if header.is_some_and(|header| header != focused_header) {
+                    error!(
+                        "reading focused TVP descriptor headers: associated statements have conflicting layouts"
+                    );
+                    return Err(());
+                }
+                header = Some(focused_header);
             }
         }
-        Ok(headers)
+        Ok(header)
     }
 
     pub(crate) fn focused_tvp_record_count(&self) -> Result<Option<usize>, ()> {
@@ -1462,6 +1467,29 @@ mod tests {
         let b = state.tvp_column_bindings[&2][0].unwrap();
         assert_eq!((a.app_precision, a.app_scale), (10, 2));
         assert_eq!((b.app_precision, b.app_scale), (10, 8));
+    }
+
+    #[test]
+    fn shared_apd_rejects_conflicting_focused_tvp_layouts() {
+        let mut h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let second_stmt = h.alloc_extra_stmt();
+        let shared_apd = h.alloc_explicit_desc();
+        for (stmt_handle, focus, array_size) in [(h.stmt, 1, 1), (second_stmt, 2, 2)] {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.active_apd = Some(shared_apd);
+            state.vendor_attrs.store_param_focus(focus);
+            state.tvp_column_layouts.insert(
+                focus,
+                DescHeader {
+                    array_size,
+                    ..DescHeader::default()
+                },
+            );
+        }
+
+        let desc = unsafe { handle_from_raw::<DescHandle>(shared_apd) };
+        assert!(desc.focused_tvp_layout_header().is_err());
     }
 
     #[test]

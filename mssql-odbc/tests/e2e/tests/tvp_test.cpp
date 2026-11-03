@@ -831,9 +831,10 @@ TEST_F(TvpTest, DaeRefillsMultipleTvpBatchesBeforeScalarDae) {
     ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?, ?"), SQL_HANDLE_STMT, stmt_);
 
     auto type_w = ToSqlW(type);
+    constexpr SQLULEN max_rows = 6;
     SQLLEN tvp_indicator = SQL_DATA_AT_EXEC;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT, SQL_SS_TABLE,
-                                   2, 0, type_w.data(),
+                                   max_rows, 0, type_w.data(),
                                    static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)),
                                    &tvp_indicator),
                   SQL_HANDLE_STMT, stmt_);

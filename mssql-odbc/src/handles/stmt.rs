@@ -1310,12 +1310,12 @@ impl DaeState {
             })
             .map(|param| param.binding.column_size)
             .ok_or(TvpBatchStageError::InvalidState)?;
-        if batch_count > capacity {
-            return Err(TvpBatchStageError::CapacityExceeded);
-        }
         let batch_end = row_index
             .checked_add(batch_count)
             .ok_or(TvpBatchStageError::Overflow)?;
+        if batch_end > capacity {
+            return Err(TvpBatchStageError::CapacityExceeded);
+        }
         if batch_count == 0 {
             return Ok(());
         }
@@ -2944,6 +2944,24 @@ mod tests {
 
         assert_eq!(dae.cursor, Some(5));
         assert_eq!(dae.current_param().unwrap().bound_index, 1);
+    }
+
+    #[test]
+    fn tvp_batches_cannot_exceed_the_declared_total_row_capacity() {
+        let mut row_control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 2,
+            },
+        );
+        row_control.binding.column_size = 2;
+        let mut dae = DaeState::for_test(vec![row_control], Some(0));
+
+        assert_eq!(
+            dae.stage_tvp_batch(0, 2, 1),
+            Err(TvpBatchStageError::CapacityExceeded)
+        );
+        assert!(dae.tvp_staging.is_empty());
     }
 
     #[test]

@@ -213,6 +213,17 @@ unsafe fn sql_set_stmt_attr_w_safe(
     value_ptr: SqlPointer,
     string_length: SqlInteger,
 ) -> SqlReturn {
+    let _param_focus_guard = if tvp_layout_field(attribute).is_some() {
+        match stmt.param_focus_gate.lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                error!("SQLSetStmtAttrW: parameter-focus mutex poisoned");
+                return SQL_ERROR;
+            }
+        }
+    } else {
+        None
+    };
     let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLSetStmtAttrW: stmt mutex poisoned");
         return SQL_ERROR;

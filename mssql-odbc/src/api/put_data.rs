@@ -214,7 +214,7 @@ unsafe fn sql_put_data_operation(
                 if let Err(stage_error) = dae.stage_tvp_batch(tvp_index, row_index, batch_count) {
                     match stage_error {
                         TvpBatchStageError::CapacityExceeded | TvpBatchStageError::Overflow => {
-                            error!("SQLPutData: TVP row batch exceeds the bound capacity");
+                            error!("SQLPutData: TVP row count exceeds the bound capacity");
                             post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
                         }
                         TvpBatchStageError::MemoryAllocation => {
