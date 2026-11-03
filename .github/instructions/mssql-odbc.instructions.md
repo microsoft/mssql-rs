@@ -167,7 +167,8 @@ on the `master` branch.
     so `post_diag` stores a borrowed `&'static str` without allocating, which
     matters on hot paths such as the `01004` of a `SQLGetData` length probe.
   - `post_sql_error(state, sqlstate, native, message)` — the lower-level
-    primitive behind `post_diag`. Use it directly only for genuinely one-off
+    primitive for driver text built at runtime (`post_diag` bypasses it and
+    posts the precomputed `DiagMsg` text). Use it directly only for genuinely one-off
     or **dynamic** messages (text computed at runtime) that don't warrant a
     constant. Posts exactly one record.
   - `post_tds_error(state, &tds_err, default_sqlstate)` — for any

@@ -75,8 +75,9 @@ impl DiagRecord {
 ///
 /// The message is prefixed with [`DRIVER_DIAG_PREFIX`] so every record the
 /// driver surfaces via `SQLGetDiagRec` matches msodbcsql's format. Callers
-/// pass the bare message (server paths first prepend their `[SQL Server]`
-/// sub-source); they must not include the `[Microsoft]...` prefix themselves.
+/// pass the bare message and must not include the `[Microsoft]...` prefix
+/// themselves. Server-raised text goes through `post_server_message` in
+/// `sqlstate.rs` instead.
 pub(crate) fn post_sql_error(
     state: &mut impl HasDiagnostics,
     sql_state: SqlState,
