@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -142,25 +143,38 @@ inline std::vector<std::string> Synonyms(const std::string& key) {
 }
 
 // |base| with each override's keyword (and its synonyms) replaced by the
-// override, or removed when the override's value is empty. Values in braces
-// may contain ';'.
+// override, or removed when the override's value is empty. Splits values as
+// the driver's parser does (src/connection/connection_string_parser.rs): a
+// value is braced only when it starts with '{', may then contain ';', and ends
+// at the first single '}' ("}}" is a literal '}'). Values are kept verbatim.
 inline std::string ConnStrWith(const std::string& base,
                                const std::vector<std::pair<std::string, std::string>>& overrides) {
     std::vector<std::pair<std::string, std::string>> attributes;
-    size_t start = 0;
-    while (start < base.size()) {
-        size_t end = start;
-        bool braced = false;
-        while (end < base.size() && (braced || base[end] != ';')) {
-            braced = base[end] == '{' ? true : (base[end] == '}' ? false : braced);
-            ++end;
+    size_t i = 0;
+    while (i < base.size()) {
+        const size_t equals = base.find('=', i);
+        const size_t separator = base.find(';', i);
+        if (equals == std::string::npos || (separator != std::string::npos && separator < equals)) {
+            i = separator == std::string::npos ? base.size() : separator + 1;
+            continue;
         }
-        const std::string part = base.substr(start, end - start);
-        const auto equals = part.find('=');
-        if (equals != std::string::npos) {
-            attributes.emplace_back(Trim(part.substr(0, equals)), part.substr(equals + 1));
+        size_t end = equals + 1;
+        if (end < base.size() && base[end] == '{') {
+            for (++end; end < base.size(); ++end) {
+                if (base[end] == '}') {
+                    if (end + 1 < base.size() && base[end + 1] == '}') {
+                        ++end;
+                        continue;
+                    }
+                    ++end;
+                    break;
+                }
+            }
         }
-        start = end + 1;
+        end = (std::min)(base.find(';', end), base.size());
+        attributes.emplace_back(Trim(base.substr(i, equals - i)),
+                                base.substr(equals + 1, end - equals - 1));
+        i = end + 1;
     }
     for (const auto& item : overrides) {
         const auto names = Synonyms(item.first);
@@ -317,14 +331,34 @@ class Connection {
 
 // --- Workers ----------------------------------------------------------------
 
+// A run's position across all rounds: 0, 1, 2, ... in (round, worker,
+// iteration) order. Scenarios pick their case from it, so the mix of cases
+// does not depend on the profile's thread and iteration counts.
+inline long long RunIndex(int round, const Config& config, int worker, int iteration) {
+    return (static_cast<long long>(round) * config.threads + worker) * config.iterations +
+           iteration;
+}
+
+// At least |minimum| rounds, and enough that |cases| consecutive run indexes
+// occur even at the smallest profile size (the msodbcsql leg runs 2 x 1).
+inline int RoundsCovering(int minimum, int cases, const Config& config) {
+    const int per_round = config.threads * config.iterations;
+    return (std::max)(minimum, (cases + per_round - 1) / per_round);
+}
+
 // Runs |work(worker, iteration, error)| on config.threads threads released
-// together, each for config.iterations iterations, under the harness watchdog.
-// The first failure stops everyone. Returns the iterations completed.
-template <typename Work>
-int RunWorkers(const std::string& label, const Config& config, Failures& failures, Work work) {
+// together, each for config.iterations iterations, under the harness watchdog,
+// plus |spinners| threads that run |spin(spinner, keep_going, error)| from the
+// same start. |spin| loops while keep_going() - until every worker finishes or
+// one fails. The first failure stops everyone. Returns the iterations
+// completed.
+template <typename Work, typename Spin>
+int RunWorkers(const std::string& label, const Config& config, Failures& failures, Work work,
+               int spinners, Spin spin) {
     std::vector<std::atomic<int>> progress(static_cast<size_t>(config.threads));
     std::atomic<bool> stop{false};
-    StartGate gate(config.threads);
+    std::atomic<int> working{config.threads};
+    StartGate gate(config.threads + spinners);
     {
         Watchdog watchdog(label, std::chrono::seconds(config.timeout_seconds), progress);
         std::vector<std::thread> threads;
@@ -341,6 +375,17 @@ int RunWorkers(const std::string& label, const Config& config, Failures& failure
                     }
                     ++progress[static_cast<size_t>(w)];
                 }
+                --working;
+            });
+        }
+        for (int s = 0; s < spinners; ++s) {
+            threads.emplace_back([&, s] {
+                gate.ArriveAndWait();
+                std::string error;
+                if (!spin(s, [&] { return working > 0 && !stop; }, error)) {
+                    failures.Add(label + ": spinner " + std::to_string(s) + ": " + error);
+                    stop = true;
+                }
             });
         }
         for (auto& thread : threads) {
@@ -352,6 +397,12 @@ int RunWorkers(const std::string& label, const Config& config, Failures& failure
         completed += count.load();
     }
     return completed;
+}
+
+template <typename Work>
+int RunWorkers(const std::string& label, const Config& config, Failures& failures, Work work) {
+    return RunWorkers(label, config, failures, work, 0,
+                      [](int, const std::function<bool()>&, std::string&) { return true; });
 }
 
 // --- Process resources ------------------------------------------------------
@@ -407,9 +458,10 @@ inline ProcessCounts SampleProcess() {
 constexpr long kThreadSlack = 8;
 constexpr long kHandleSlack = 64;
 
-// Records both samples and fails if the later one grew past the slack. Call
-// it only for a run that otherwise passed: a failed run may legitimately
-// leave things behind.
+// Records both samples and fails if the later one grew past the slack, or
+// could not be taken although the first could (descriptor exhaustion can make
+// /proc unreadable). Call it only for a run that otherwise passed: a failed
+// run may legitimately leave things behind.
 inline void ExpectNoGrowth(const ProcessCounts& baseline, const ProcessCounts& after) {
     ::testing::Test::RecordProperty(
         "threads_after_round0_and_last",
@@ -418,10 +470,12 @@ inline void ExpectNoGrowth(const ProcessCounts& baseline, const ProcessCounts& a
         "handles_after_round0_and_last",
         std::to_string(baseline.handles) + " " + std::to_string(after.handles));
     if (baseline.threads >= 0) {
+        EXPECT_GE(after.threads, 0) << "the final thread count could not be sampled";
         EXPECT_LE(after.threads, baseline.threads + kThreadSlack)
             << "threads grew from " << baseline.threads << " after round 0 to " << after.threads;
     }
     if (baseline.handles >= 0) {
+        EXPECT_GE(after.handles, 0) << "the final handle count could not be sampled";
         EXPECT_LE(after.handles, baseline.handles + kHandleSlack)
             << "handles grew from " << baseline.handles << " after round 0 to " << after.handles;
     }
