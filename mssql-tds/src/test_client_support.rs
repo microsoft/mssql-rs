@@ -197,6 +197,7 @@ pub struct ScriptedToken(Tokens);
 pub(crate) struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     pending_rows: VecDeque<VecDeque<i32>>,
+    pending_rowsets: VecDeque<Vec<Vec<i32>>>,
     active_row: Option<VecDeque<i32>>,
     buffered_prefix_columns: Option<usize>,
     reset_mode: ResetConnectionMode,
@@ -209,6 +210,7 @@ impl TokenReplayTransport {
         Self {
             pending_tokens: VecDeque::from(tokens),
             pending_rows: VecDeque::new(),
+            pending_rowsets: VecDeque::new(),
             active_row: None,
             buffered_prefix_columns: None,
             reset_mode: ResetConnectionMode::None,
@@ -301,6 +303,11 @@ impl TdsTokenStreamReader for TokenReplayTransport {
         _cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens> {
         if let Some(tok) = self.pending_tokens.pop_front() {
+            if matches!(tok, Tokens::ColMetadata(_))
+                && let Some(rows) = self.pending_rowsets.pop_front()
+            {
+                self.pending_rows = rows.into_iter().map(VecDeque::from).collect();
+            }
             return Ok(tok);
         }
         Err(crate::error::Error::ConnectionClosed("test".to_string()))
@@ -429,6 +436,9 @@ impl TdsTransport for TokenReplayTransport {
     async fn close_transport(&mut self) -> TdsResult<()> {
         Ok(())
     }
+    fn abort_transport(&mut self) {
+        self.known_dead = true;
+    }
     async fn send_attention_with_timeout(
         &mut self,
         _context: &ParserContext,
@@ -499,6 +509,32 @@ pub fn tds_client_from_int_rows_with_trailing_tokens(
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
+    )
+}
+
+/// Replays integer result sets, then tokens for subsequent requests.
+pub fn tds_client_from_int_rowsets_with_trailing_tokens(
+    rowsets: Vec<Vec<Vec<i32>>>,
+    trailing_tokens: Vec<ScriptedToken>,
+) -> TdsClient {
+    let mut tokens = Vec::new();
+    for (index, rows) in rowsets.iter().enumerate() {
+        tokens.push(col_metadata(int_columns(rows.first().map_or(0, Vec::len))).0);
+        tokens.push(if index + 1 == rowsets.len() {
+            done_select_no_more().0
+        } else {
+            done_more_select_with_count(0).0
+        });
+    }
+    tokens.extend(trailing_tokens.into_iter().map(|token| token.0));
+    let mut transport = TokenReplayTransport::new(tokens);
+    transport.pending_rowsets = rowsets.into();
+    TdsClient::new(
+        AnyTransport::dynamic(transport),
+        create_test_negotiated_settings_internal(),
+        ExecutionContext::new(),
+        ClientContext::with_data_source("tcp:localhost,1433"),
         Vec::new(),
     )
 }
@@ -1025,6 +1061,9 @@ pub(crate) mod byte_stream {
         }
         async fn close_transport(&mut self) -> TdsResult<()> {
             Ok(())
+        }
+        fn abort_transport(&mut self) {
+            self.known_dead = true;
         }
         async fn send_attention_with_timeout(
             &mut self,
