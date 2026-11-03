@@ -9,8 +9,8 @@
 #   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
 #   weekly  16 x 50, the same modes
 #
-# Legs: Windows x64 (four parallel suite groups, debug driver, Windows Driver
-# Manager, msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21
+# Legs: Windows x64 (one shared build, four parallel suite groups, debug driver,
+# Windows Driver Manager, msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21
 # (musl), both running the release drops through unixODBC. /SharedStmt is left
 # out on unixODBC because its releases up to 2.3.14 corrupt their own diagnostic
 # list when two threads use one statement (unixODBC #243, fixed on master in
@@ -187,8 +187,45 @@ stages:
   displayName: Stress Windows
   dependsOn: []
   jobs:
+  - job: Build_Odbc_Windows
+    displayName: Build shared Windows driver and e2e binaries
+    timeoutInMinutes: 120
+    pool:
+      name: RUST-X64-WUS3
+      demands:
+        - imageOverride -equals RUST-W22-SQL25
+    variables:
+      # See https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+    steps:
+    - template: templates/cargo-authenticate-template.yml
+      parameters:
+        osType: Windows
+    - template: templates/install-dependencies.yml
+      parameters:
+        osType: Windows
+        enableJsDeps: false
+    - task: PowerShell@2
+      displayName: Install msodbcsql $(msodbcsqlVersion) SDK (header compatibility check)
+      inputs:
+        pwsh: true
+        filePath: $(Build.SourcesDirectory)/.pipeline/scripts/install-msodbcsql.ps1
+        arguments: -Version '$(msodbcsqlVersion)'
+    - pwsh: |
+        $buildJobs = [Math]::Min(4, [Environment]::ProcessorCount)
+        ./mssql-odbc/tests/e2e/run_e2e.ps1 -BuildOnly -BuildJobs $buildJobs `
+          -OutDir "$(Build.ArtifactStagingDirectory)\odbc-e2e"
+        Write-Host "##vso[task.setvariable variable=artifactName;isOutput=true]OdbcStress_Windows_$(System.JobAttempt)"
+      name: buildDrop
+      displayName: Build and stage Windows e2e drop (bounded parallel compilation)
+    - task: PublishPipelineArtifact@1
+      displayName: Publish shared Windows e2e drop
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)\odbc-e2e'
+        artifact: $(buildDrop.artifactName)
   - job: Stress_Windows
     displayName: ODBC stress Windows x64
+    dependsOn: Build_Odbc_Windows
     timeoutInMinutes: ${{ variables.odbcMtJobTimeoutInMinutes }}
     strategy:
       matrix:
@@ -214,18 +251,22 @@ stages:
       demands:
         - imageOverride -equals RUST-W22-SQL25
     variables:
-      # See https://eng.ms/docs/more/rust/topics/onebranch-workaround
-      CARGO_TARGET_DIR: C:\cargo_target_dir
+      odbcDropArtifact: $[ dependencies.Build_Odbc_Windows.outputs['buildDrop.artifactName'] ]
     steps:
     - template: templates/sql-setup-template.yml
       parameters:
         buildTarget: Windows
-    - template: templates/cargo-authenticate-template.yml
-      parameters:
-        osType: Windows
     - template: templates/install-dependencies.yml
       parameters:
         osType: Windows
+        skipRustupInstall: true
+        enableJsDeps: false
+    - task: DownloadPipelineArtifact@2
+      displayName: Download shared Windows e2e drop
+      inputs:
+        buildType: current
+        artifactName: $(odbcDropArtifact)
+        targetPath: '$(Build.SourcesDirectory)\mssql-odbc\tests\e2e'
     - task: PowerShell@2
       displayName: Install msodbcsql $(msodbcsqlVersion) (parity reference driver)
       inputs:
@@ -252,7 +293,7 @@ stages:
         try {
           # Empty matrix values leave $(var) macros unexpanded; the environment
           # copy of an empty value is empty.
-          ./mssql-odbc/tests/e2e/run_e2e.ps1 -CompareWithMsodbcsql `
+          ./mssql-odbc/tests/e2e/run_e2e.ps1 -SkipBuild -CompareWithMsodbcsql `
             -MtProfile '$(odbcMtProfile)' `
             -FilterTests "$env:FILTERTESTS" -ExcludeTests "$env:EXCLUDETESTS" `
             -MtDumpDir "$(Build.ArtifactStagingDirectory)/odbc-mt-dumps"
