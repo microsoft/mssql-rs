@@ -1258,10 +1258,9 @@ mod tests {
     }
 
     #[test]
-    fn tvp_dae_batches_can_exceed_the_reusable_array_capacity() {
+    fn tvp_dae_batches_cannot_exceed_the_bound_capacity() {
         use crate::api::exports::{SQLParamData, SQLPutData};
         use crate::api::odbc_types::SQL_SUCCESS;
-        use mssql_tds::datatypes::sqltypes::SqlType;
 
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1283,40 +1282,19 @@ mod tests {
         );
         assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
 
-        values[0] = 22;
-        values[1] = 33;
         assert_eq!(
             unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
-            SQL_SUCCESS
+            SQL_ERROR
         );
-        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
-
-        values[0] = 44;
-        values[1] = 55;
-        assert_eq!(values, [44, 55]);
-        assert_eq!(
-            unsafe { SQLPutData(h.stmt, 1usize as SqlPointer, 2) },
-            SQL_SUCCESS
-        );
-        assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
 
         let state = stmt.inner.lock().unwrap();
-        let dae = state.dae.as_ref().unwrap();
-        assert_eq!(dae.tvp_row_counts.get(&0), Some(&6));
         assert_eq!(
-            dae.tvp_cells
-                .iter()
-                .map(|cell| (cell.row_index, cell.value.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                (0, Some(SqlType::Int(Some(11)))),
-                (1, Some(SqlType::Int(Some(999)))),
-                (2, Some(SqlType::Int(Some(22)))),
-                (3, Some(SqlType::Int(Some(33)))),
-                (4, Some(SqlType::Int(Some(44)))),
-                (5, Some(SqlType::Int(Some(55)))),
-            ]
+            state.diag_records[0].sql_state,
+            ERR_INVALID_STRING_OR_BUFFER_LENGTH.state
         );
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(dae.tvp_row_counts.get(&0), Some(&2));
+        assert_eq!(dae.tvp_cells.len(), 2);
     }
 
     #[test]
