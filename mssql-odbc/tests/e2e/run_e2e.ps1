@@ -19,7 +19,7 @@
 #                      [-MtDumpDir PATH]
 #                      [-BuildJobs N] [-BuildOnly -OutDir PATH | -SkipBuild]
 #
-# -BuildJobs bounds parallel C++ build processes (default: at most 4 CPUs).
+# -BuildJobs bounds parallel C++ build processes (default: 1).
 # -BuildOnly -OutDir PATH stages a relocatable build/ drop without running tests
 # or registering drivers. Download its contents into this directory and run
 # -SkipBuild to reuse the driver and tests without Cargo or a C++ compiler.
@@ -93,7 +93,7 @@ param(
     [string]$MtProfile = 'pr',
     [string]$MtDumpDir = '',
     [ValidateRange(1, 64)]
-    [int]$BuildJobs = [Math]::Min(4, [Environment]::ProcessorCount),
+    [int]$BuildJobs = 1,
     [switch]$BuildOnly,
     [string]$OutDir = '',
     [switch]$SkipBuild

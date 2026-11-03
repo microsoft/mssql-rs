@@ -121,6 +121,8 @@ def test_windows_stress_builds_once_and_shares_attempt_scoped_artifact(
     assert windows_stress_job["dependsOn"] == build["job"]
     step = next(s for s in build["steps"] if s.get("name") == "buildDrop")
     assert "-BuildOnly" in step["pwsh"]
+    assert "$buildJobs = [Math]::Min(4, [Environment]::ProcessorCount)" in step["pwsh"]
+    assert "-BuildJobs $buildJobs" in step["pwsh"]
     assert '-OutDir "$(Build.ArtifactStagingDirectory)\\odbc-e2e"' in step["pwsh"]
     assert "OdbcStress_Windows_$(System.JobAttempt)" in step["pwsh"]
     assert "isOutput=true" in step["pwsh"]
@@ -154,9 +156,12 @@ def test_windows_stress_builds_once_and_shares_attempt_scoped_artifact(
 _WINDOWS_E2E = _ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.ps1"
 
 
-@pytest.mark.skipif(sys.platform != "win32" or shutil.which("pwsh") is None
-                    or shutil.which("cmake") is None, reason="needs Windows CMake and PowerShell")
-def test_windows_build_only_parallelizes_and_stages_real_cpp_binaries(tmp_path):
+@pytest.mark.skipif(
+    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "cmake", "ctest")),
+    reason="needs Windows CMake, CTest, and PowerShell",
+)
+@pytest.mark.parametrize("build_jobs", [None, 2])
+def test_windows_build_only_parallelizes_and_stages_real_cpp_binaries(tmp_path, build_jobs):
     vswhere = Path(os.environ["ProgramFiles(x86)"]) / (
         "Microsoft Visual Studio/Installer/vswhere.exe"
     )
@@ -211,17 +216,22 @@ function Restore-Registration { throw 'Build-only must not access the registry' 
 $source = [IO.File]::ReadAllText($env:RUNNER).Insert($main.Extent.StartOffset, $mocks + "`n")
 $runner = Join-Path $env:PRODUCER 'run_e2e.ps1'
 [IO.File]::WriteAllText($runner, $source)
-& $runner -BuildOnly -BuildJobs 2 -OutDir $env:DROP
+$buildArgs = @{}
+if ($env:BUILD_JOBS) { $buildArgs.BuildJobs = [int]$env:BUILD_JOBS }
+& $runner -BuildOnly -OutDir $env:DROP @buildArgs
 """
     log = tmp_path / "cmake.log"
     env = {**os.environ, "RUNNER": str(_WINDOWS_E2E), "PRODUCER": str(producer),
            "CARGO_FIXTURE": str(target.parent), "DROP": str(artifact),
            "REAL_CMAKE": shutil.which("cmake"), "CMAKE_LOG": str(log),
-           "CMAKE_GENERATOR": "Visual Studio 17 2022"}
+           "BUILD_JOBS": str(build_jobs) if build_jobs else ""}
+    env.pop("CMAKE_GENERATOR", None)
+    env.pop("CMAKE_GENERATOR_PLATFORM", None)
     result = subprocess.run(["pwsh", "-NoProfile", "-Command", command],
                             env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "--build build --config Debug --parallel 2" in log.read_text(encoding="utf-8")
+    expected_jobs = build_jobs if build_jobs else 1
+    assert f"--build build --config Debug --parallel {expected_jobs}" in log.read_text(encoding="utf-8")
     assert (artifact / "build" / "Debug" / "smoke_test.pdb").is_file()
     assert not (artifact / "build" / "CMakeCache.txt").exists()
     shutil.rmtree(producer.parents[2])
@@ -233,8 +243,10 @@ $runner = Join-Path $env:PRODUCER 'run_e2e.ps1'
     assert "100% tests passed" in result.stdout
 
 
-@pytest.mark.skipif(sys.platform != "win32" or shutil.which("pwsh") is None,
-                    reason="needs Windows PowerShell")
+@pytest.mark.skipif(
+    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "ctest")),
+    reason="needs Windows CTest and PowerShell",
+)
 @pytest.mark.parametrize(("exit_code", "filter_tests"), [(0, ""), (1, ""), (0, "^missing$")])
 def test_windows_prebuilt_drop_relocates_and_runs_both_legs_without_compiling(
     tmp_path, exit_code, filter_tests

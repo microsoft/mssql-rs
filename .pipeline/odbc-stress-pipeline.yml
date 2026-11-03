@@ -212,7 +212,8 @@ stages:
         filePath: $(Build.SourcesDirectory)/.pipeline/scripts/install-msodbcsql.ps1
         arguments: -Version '$(msodbcsqlVersion)'
     - pwsh: |
-        ./mssql-odbc/tests/e2e/run_e2e.ps1 -BuildOnly `
+        $buildJobs = [Math]::Min(4, [Environment]::ProcessorCount)
+        ./mssql-odbc/tests/e2e/run_e2e.ps1 -BuildOnly -BuildJobs $buildJobs `
           -OutDir "$(Build.ArtifactStagingDirectory)\odbc-e2e"
         Write-Host "##vso[task.setvariable variable=artifactName;isOutput=true]OdbcStress_Windows_$(System.JobAttempt)"
       name: buildDrop

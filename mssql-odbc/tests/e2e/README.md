@@ -631,9 +631,10 @@ Compilation and execution have separate job budgets.
 .\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile nightly -CompareWithMsodbcsql
 ```
 
-`-BuildJobs N` bounds parallel C++ build processes; the default is the smaller
-of four and the logical CPU count. Test concurrency is unchanged. Measure build
-duration and memory use before increasing the limit.
+`-BuildJobs N` bounds parallel C++ build processes. The stress producer selects
+the smaller of four and the logical CPU count; other runner invocations retain
+the serial default of one. Test concurrency is unchanged. Measure build duration
+and memory use before increasing the limit.
 
 The drop includes the driver, test binaries, and PDBs. Its generated CTest
 registration resolves executable paths relative to the downloaded drop, so
