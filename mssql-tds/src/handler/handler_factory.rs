@@ -642,7 +642,7 @@ impl LoginHandler<'_> {
 
         // Handle SSPI challenge-response loop for integrated authentication
         while login_response.get_status() == LoginResponseStatus::WaitingForSspi {
-            let sspi_challenge = login_response.sspi_token.as_ref().ok_or_else(|| {
+            let sspi_challenge = login_response.sspi_token.take().ok_or_else(|| {
                 Error::ProtocolError(
                     "Login response status is WaitingForSspi but no sspi_token present".to_string(),
                 )
@@ -661,7 +661,7 @@ impl LoginHandler<'_> {
 
             // Process the challenge and generate response
             let (handler, response_opt) = handler
-                .process_challenge_off_runtime(sspi_challenge.data.clone())
+                .process_challenge_off_runtime(sspi_challenge.data)
                 .await?;
             sspi_handler = Some(handler);
             match response_opt {
