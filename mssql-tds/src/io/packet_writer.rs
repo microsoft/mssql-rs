@@ -1922,56 +1922,46 @@ pub(crate) mod tests {
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
     }
 
-    /// A ready send can finish before expiry is observed, leaving `finalize`'s
-    /// terminating packet on the wire. Such a message needs cancelling, not
-    /// withdrawing: a second `EOM | IGNORE` would leave the server owing two
-    /// responses and the extra DONE for the next command.
-    #[test]
-    fn a_finalized_message_that_times_out_is_still_complete() {
+    /// An expired deadline must win before the final packet is sent, leaving no
+    /// partial message to withdraw.
+    #[tokio::test]
+    async fn an_expired_deadline_does_not_send_the_final_packet() {
         let mut mock = MockNetworkWriter::new(16);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
-        block_on(writer.write_async(&[0xABu8; 4])).unwrap();
+        writer.write_async(&[0xABu8; 4]).await.unwrap();
         writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
 
-        let result = block_on(writer.finalize());
+        let result = writer.finalize().await;
         let message = writer.suspend();
 
         assert!(result.is_err(), "the overrun budget must surface an error");
         assert!(
-            mock.data[1] & (PacketStatusFlags::Eom as u8) != 0,
-            "the terminating packet reached the wire"
+            mock.data.is_empty(),
+            "the expired deadline must precede send"
         );
-        assert!(
-            message.message_complete(),
-            "a terminated message must not be withdrawn as if it were partial"
-        );
+        assert!(!message.message_complete());
+        assert!(message.nothing_sent());
     }
 
-    /// A ready write can finish before expiry is observed, so this error path
-    /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
-    /// the flushed flag can tell the caller the server is mid-message, and
-    /// getting it wrong means the request is dropped instead of withdrawn.
-    #[test]
-    fn a_packet_that_lands_then_times_out_is_not_nothing_sent() {
+    /// A ready write must not be polled after its deadline has expired.
+    #[tokio::test]
+    async fn an_expired_deadline_is_checked_before_polling_the_transport() {
         let mut mock = MockNetworkWriter::new(16);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
         writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
 
-        let result = block_on(writer.write_async(&[0xABu8; 64]));
+        let result = writer.write_async(&[0xABu8; 64]).await;
         let message = writer.suspend();
 
         assert!(result.is_err(), "the overrun budget must surface an error");
         assert!(
-            !mock.data.is_empty(),
-            "the packet reached the wire before the budget was checked"
+            mock.data.is_empty(),
+            "the expired deadline must precede send"
         );
         assert!(
             message.is_first_packet,
             "the first-packet flag is still set on this path"
         );
-        assert!(
-            !message.nothing_sent(),
-            "a request the server has part of must be withdrawn, not discarded"
-        );
+        assert!(message.nothing_sent());
     }
 }

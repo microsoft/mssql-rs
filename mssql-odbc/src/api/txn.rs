@@ -1142,9 +1142,7 @@ mod tests {
         SQL_ROLLBACK, SqlInteger, SqlPointer,
     };
     use crate::test_support::{MockServer, TestHandles, connect_mock_server};
-    use mssql_mock_tds::{
-        ATTENTION_DELAY_KEY, QueryResponse, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
-    };
+    use mssql_mock_tds::{ATTENTION_DELAY_KEY, QueryResponse, TM_ROLLBACK_DELAY_KEY};
     use std::time::{Duration, Instant};
 
     const ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE";
@@ -1279,8 +1277,8 @@ mod tests {
             crate::api::SQLSetConnectAttrW(
                 h.dbc,
                 crate::api::odbc_types::SQL_ATTR_CURRENT_CATALOG,
-                catalog.as_ptr().cast(),
-                crate::api::odbc_types::SQL_NTS,
+                catalog.as_ptr().cast_mut().cast(),
+                crate::api::odbc_types::SQL_NTS.into(),
             )
         });
         assert_ne!(
@@ -1444,12 +1442,7 @@ mod tests {
         for commit in [false, true] {
             let (h, server) = timeout_fixture(ISOLATION_SQL);
             begin_user_transaction(&h);
-            let key = if commit {
-                TM_COMMIT_DELAY_KEY
-            } else {
-                TM_ROLLBACK_DELAY_KEY
-            };
-            server.register_query(key, QueryResponse::select_one().with_delay(SLOW_RESPONSE));
+            server.set_tm_end_delay(commit, SLOW_RESPONSE);
             assert_timed_out(&h, || unsafe {
                 crate::api::SQLEndTran(
                     SQL_HANDLE_DBC,
@@ -1459,7 +1452,7 @@ mod tests {
             });
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             assert!(!dbc.inner.lock().unwrap().local_tran_started);
-            server.register_query(key, QueryResponse::select_one());
+            server.set_tm_end_delay(commit, Duration::ZERO);
             assert_eq!(
                 set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON),
                 SQL_SUCCESS
@@ -1479,14 +1472,7 @@ mod tests {
                     SQL_SUCCESS
                 );
             }
-            server.register_query(
-                if user_work {
-                    TM_COMMIT_DELAY_KEY
-                } else {
-                    TM_ROLLBACK_DELAY_KEY
-                },
-                QueryResponse::select_one().with_delay(SLOW_RESPONSE),
-            );
+            server.set_tm_end_delay(user_work, SLOW_RESPONSE);
             assert_timed_out(&h, || set_attr(&h, SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON));
             assert_eq!(get_attr(&h, SQL_ATTR_AUTOCOMMIT), SQL_AUTOCOMMIT_OFF);
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
