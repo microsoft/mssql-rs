@@ -200,10 +200,6 @@ pub struct Login7AuthInfo {
     pub database: Option<String>,
     /// Every FeatureExt id the Login7 packet carried, in order
     pub feature_ids: Vec<u8>,
-    /// Whether Login7 requested session recovery (feature `0x01`)
-    pub session_recovery_requested: bool,
-    /// Whether that feature carried session state, which only a reconnect does
-    pub is_recovery_login: bool,
 }
 
 /// Decodes the UTF-16LE string that the Login7 offset/length pair at `entry` points to.
@@ -223,7 +219,15 @@ fn read_login7_string(data: &[u8], entry: usize) -> Option<String> {
 
 /// Parse Login7 packet to extract FedAuth feature extension with access token
 pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
+    parse_login7(packet_data).0
+}
+
+/// [`parse_login7_auth`], plus whether the session-recovery feature carried
+/// session state, which only a reconnect does. Kept out of [`Login7AuthInfo`]
+/// so that published struct keeps its shape.
+pub(crate) fn parse_login7(packet_data: &[u8]) -> (Login7AuthInfo, bool) {
     let mut auth_info = Login7AuthInfo::default();
+    let mut carries_session_state = false;
 
     // Login7 packet structure (offsets from start of Login7 body after TDS header):
     // - 4 bytes: Length (offset 0)
@@ -248,7 +252,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
 
     if data.len() < 56 {
         debug!("Login7 packet too short for server name parsing");
-        return auth_info;
+        return (auth_info, false);
     }
 
     // Parse ServerName from offset table
@@ -284,7 +288,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
 
     if !has_feature_ext {
         debug!("Login7 does not have feature extension");
-        return auth_info;
+        return (auth_info, false);
     }
 
     // The FeatureExt entry in the Login7 offset table is at bytes 56-59
@@ -293,7 +297,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
     // That DWORD is the actual offset to the feature extension list.
     if data.len() < 60 {
         debug!("Login7 packet too short for FeatureExt offset table entry");
-        return auth_info;
+        return (auth_info, false);
     }
 
     let feat_ext_ptr_offset = u16::from_le_bytes([data[56], data[57]]) as usize;
@@ -305,7 +309,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             feat_ext_ptr_offset,
             data.len()
         );
-        return auth_info;
+        return (auth_info, false);
     }
 
     let feature_ext_offset = u32::from_le_bytes([
@@ -326,7 +330,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             feature_ext_offset,
             data.len()
         );
-        return auth_info;
+        return (auth_info, false);
     }
 
     // Parse feature extension entries starting at feature_ext_offset
@@ -380,8 +384,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
         } else if feature_id == FEATURE_EXT_DATA_CLASSIFICATION && feat_len >= 1 {
             auth_info.data_classification_version = data.get(i + 5).copied();
         } else if feature_id == FEATURE_EXT_SESSION_RECOVERY {
-            auth_info.session_recovery_requested = true;
-            auth_info.is_recovery_login = feat_len > 0;
+            carries_session_state = feat_len > 0;
         } else if feature_id == FEATURE_EXT_USER_AGENT && i + 5 + feat_len <= data.len() {
             let feat_data = &data[i + 5..i + 5 + feat_len];
             if feat_data.len().is_multiple_of(2) {
@@ -405,7 +408,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
         i += 5 + feat_len;
     }
 
-    auth_info
+    (auth_info, carries_session_state)
 }
 
 /// Build a PreLogin response packet

@@ -31,6 +31,6 @@ pub use query_response::{
     Row, SqlDataType, TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
     TerminalError,
 };
-pub use server::{ConnectionInfo, ConnectionStore, MockTdsServer, RedirectionConfig};
+pub use server::{ConnectionInfo, ConnectionStore, LoginDetails, MockTdsServer, RedirectionConfig};
 pub use tds_tls_wrapper::TdsTlsWrapper;
 pub use tls_helper::{create_test_identity, load_identity_from_file};

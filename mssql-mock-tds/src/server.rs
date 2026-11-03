@@ -10,8 +10,8 @@ use crate::protocol::{
     build_feature_ext_ack, build_feature_ext_ack_fedauth, build_fedauth_challenge_response,
     build_login_ack, build_prelogin_response, build_prelogin_response_with_fedauth,
     build_query_results, build_routing_login_response, build_transaction_manager_response,
-    parse_fedauth_token, parse_login7_auth, parse_sql_batch, parse_transaction_descriptor_header,
-    parse_transaction_manager_request,
+    parse_fedauth_token, parse_login7, parse_login7_auth, parse_sql_batch,
+    parse_transaction_descriptor_header, parse_transaction_manager_request,
 };
 use crate::query_response::{
     ATTENTION_DELAY_KEY, DataClassificationAck, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY,
@@ -139,10 +139,7 @@ pub struct ConnectionProcessor {
     /// this connection has sent, in order. See
     /// [`ConnectionInfo::transaction_descriptor_headers`].
     transaction_descriptor_headers: Vec<(u64, u32)>,
-    /// Data Classification version the client requested in Login7, if any.
-    data_classification_requested: Option<u8>,
-    /// Whether Login7 carried session-recovery state, i.e. was a reconnect.
-    recovery_login: bool,
+    login_details: LoginDetails,
     /// Set after answering a query registered with
     /// [`QueryRegistry::close_connection_after`]; the connection loop then
     /// closes the socket.
@@ -184,8 +181,7 @@ impl ConnectionProcessor {
             redirection,
             connection_store,
             transaction_descriptor_headers: Vec::new(),
-            data_classification_requested: None,
-            recovery_login: false,
+            login_details: LoginDetails::default(),
             close_after_response: false,
         }
     }
@@ -400,7 +396,7 @@ impl ConnectionProcessor {
 
                 // Parse Login7 packet body (skip header) for authentication info
                 let packet_body = &packet_data[PACKET_HEADER_SIZE..];
-                let auth_info = parse_login7_auth(packet_body);
+                let (auth_info, carries_session_state) = parse_login7(packet_body);
                 self.user_agent = auth_info.user_agent.clone();
 
                 // Log the server name sent by client (important for verifying redirection behavior)
@@ -418,8 +414,10 @@ impl ConnectionProcessor {
                 self.received_database = auth_info.database.clone();
                 self.requested_feature_ids = auth_info.feature_ids.clone();
                 self.fedauth_workflow = auth_info.fedauth_workflow;
-                self.data_classification_requested = auth_info.data_classification_version;
-                self.recovery_login = auth_info.is_recovery_login;
+                self.login_details = LoginDetails {
+                    data_classification_requested: auth_info.data_classification_version,
+                    recovery_login: carries_session_state,
+                };
 
                 // Check if redirection is configured
                 if let Some(ref redir) = self.redirection {
@@ -502,7 +500,11 @@ impl ConnectionProcessor {
                     let mut acknowledged: Vec<(u8, Vec<u8>)> = Vec::new();
                     {
                         let registry = self.query_registry.lock().await;
-                        if auth_info.session_recovery_requested && registry.session_recovery() {
+                        if auth_info
+                            .feature_ids
+                            .contains(&FEATURE_EXT_SESSION_RECOVERY)
+                            && registry.session_recovery()
+                        {
                             acknowledged.push((FEATURE_EXT_SESSION_RECOVERY, Vec::new()));
                         }
                         if let Some(requested) = auth_info.data_classification_version {
@@ -848,6 +850,20 @@ pub struct ConnectionStore {
     /// Connection info keyed by unique connection id, ordered so that
     /// iteration and `.values().last()` yield the most recent connection.
     connections: BTreeMap<u64, ConnectionInfo>,
+    /// Login7 details beyond [`ConnectionInfo`], under the same ids. Held
+    /// apart so the published `ConnectionInfo` keeps its shape.
+    login_details: BTreeMap<u64, LoginDetails>,
+}
+
+/// Login7 details captured for a connection, read with
+/// [`ConnectionStore::login_details`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LoginDetails {
+    /// Data Classification version the client requested in Login7, if any.
+    pub data_classification_requested: Option<u8>,
+    /// Whether Login7 carried session-recovery state, i.e. was a reconnect.
+    pub recovery_login: bool,
 }
 
 /// Captured information from a completed connection
@@ -876,10 +892,6 @@ pub struct ConnectionInfo {
     /// (`TransactionDescriptor == 0`) must carry `OutstandingRequestCount ==
     /// 1` — without the mock server itself enforcing it.
     pub transaction_descriptor_headers: Vec<(u64, u32)>,
-    /// Data Classification version the client requested in Login7, if any.
-    pub data_classification_requested: Option<u8>,
-    /// Whether Login7 carried session-recovery state, i.e. was a reconnect.
-    pub recovery_login: bool,
 }
 
 impl ConnectionInfo {
@@ -905,9 +917,7 @@ impl ConnectionInfo {
 
 impl ConnectionStore {
     pub fn new() -> Self {
-        Self {
-            connections: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Upsert connection info keyed by the connection's unique id.
@@ -924,15 +934,20 @@ impl ConnectionStore {
             requested_feature_ids: processor.requested_feature_ids().to_vec(),
             fedauth_workflow: processor.fedauth_workflow(),
             transaction_descriptor_headers: processor.transaction_descriptor_headers().to_vec(),
-            data_classification_requested: processor.data_classification_requested,
-            recovery_login: processor.recovery_login,
         };
         self.connections.insert(processor.conn_id(), info);
+        self.login_details
+            .insert(processor.conn_id(), processor.login_details.clone());
     }
 
     /// Get connection info by connection id
     pub fn get(&self, conn_id: u64) -> Option<&ConnectionInfo> {
         self.connections.get(&conn_id)
+    }
+
+    /// Login7 details for a connection id
+    pub fn login_details(&self, conn_id: u64) -> Option<&LoginDetails> {
+        self.login_details.get(&conn_id)
     }
 
     /// Get all connection infos
@@ -948,6 +963,7 @@ impl ConnectionStore {
     /// Clear all stored connections
     pub fn clear(&mut self) {
         self.connections.clear();
+        self.login_details.clear();
     }
 }
 

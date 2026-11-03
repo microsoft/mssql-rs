@@ -197,13 +197,13 @@ mod data_classification_tests {
         /// Data Classification versions requested by the logins that carried
         /// session-recovery state, i.e. the reconnects.
         async fn recovery_login_requests(&self) -> Vec<Option<u8>> {
-            self.connections
-                .lock()
-                .await
+            let store = self.connections.lock().await;
+            store
                 .all()
-                .values()
-                .filter(|connection| connection.recovery_login)
-                .map(|connection| connection.data_classification_requested)
+                .keys()
+                .filter_map(|&id| store.login_details(id))
+                .filter(|details| details.recovery_login)
+                .map(|details| details.data_classification_requested)
                 .collect()
         }
 
