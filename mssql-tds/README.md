@@ -116,6 +116,12 @@ authentication loads GSSAPI at runtime. On macOS, TDS 7.x handshakes always use
 Secure Transport (TLS 1.2 maximum); see
 [TLS on macOS](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#tls-on-macos).
 
+The default Network.framework feature requires a macOS deployment target of
+10.15 or later. For x86_64 macOS builds, set `MACOSX_DEPLOYMENT_TARGET=10.15`
+(or later) for the entire build; lower targets fail at build time.
+Apple Silicon's default deployment target already meets this requirement.
+Disabling `tls-network-framework` removes this added minimum.
+
 ## Response lifecycle
 
 Drain a response with `close_query()` before reuse, or call

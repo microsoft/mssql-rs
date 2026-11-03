@@ -978,3 +978,18 @@ def test_non_windows_format_installs_rustfmt_first():
     assert install["script"] == "rustup component add rustfmt"
     assert install["condition"] == fmt["condition"]
     assert install["retryCountOnTaskFailure"] == 3
+
+
+def test_macos_builds_set_a_supported_deployment_target():
+    steps = load_template("build-template.yml")["steps"]
+    group = next(step for step in steps if "${{ if eq(parameters.osType, 'MacOS') }}" in step)
+    setup = group["${{ if eq(parameters.osType, 'MacOS') }}"][0]
+    assert setup["displayName"] == "Set macOS deployment target"
+    assert "${MACOSX_DEPLOYMENT_TARGET:-10.15}" in setup["bash"]
+    assert "task.setvariable variable=MACOSX_DEPLOYMENT_TARGET" in setup["bash"]
+    odbc = load_template("build-odbc-macos-template.yml")["steps"]
+    build = next(step for step in odbc if "cargo build" in step.get("script", ""))
+    assert build["script"].index("export MACOSX_DEPLOYMENT_TARGET") < build["script"].index("cargo build")
+    assert "${MACOSX_DEPLOYMENT_TARGET:-10.15}" in build["script"]
+    sqlcmd = (_ROOT / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.sh").read_text()
+    assert '*-apple-darwin*) export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"' in sqlcmd

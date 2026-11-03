@@ -121,6 +121,13 @@ therefore opened by Apple's Network.framework, which keeps all cryptography in
 the operating system. Handshakes tunneled through PreLogin packets (TDS 7.x,
 every non-Strict mode) stay on a socket with Secure Transport.
 
+- **Deployment target.** With `tls-network-framework` enabled, artifacts must
+  target macOS 10.15 or later. The build rejects a lower
+  `MACOSX_DEPLOYMENT_TARGET`, including Rust's default x86_64 target of 10.12.
+  Set `MACOSX_DEPLOYMENT_TARGET=10.15` (or later) for the entire build, so the
+  final executable or library advertises the correct floor. Apple Silicon's
+  default target already meets it. Disabling the feature removes this added
+  requirement; it does not lower other dependencies' platform requirements.
 - **Protocols and groups.** TLS 1.3 and 1.2 with ALPN `tds/8.0`; TLS 1.0 and 1.1
   are not offered. On macOS 26 and later the ClientHello carries `X25519MLKEM768`
   and X25519 key shares, so a server without post-quantum support, including

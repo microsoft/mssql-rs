@@ -87,7 +87,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   (AB#49295).
 
 - `mssql-tds`: TLS 1.3 and the post-quantum `X25519MLKEM768` key exchange on
-  macOS for TDS 8.0 (Strict) connections. Strict TCP connections are opened
+  macOS for TDS 8.0 (Strict) connections. The default-enabled Network.framework
+  feature requires a macOS deployment target of 10.15 or later; lower targets
+  fail at build time. Strict TCP connections are opened
   through Apple's Network.framework, with certificates still evaluated by
   Security.framework, so keychain roots and trust settings apply. The connect
   timeout covers the TLS handshake on this path. The post-quantum group needs
