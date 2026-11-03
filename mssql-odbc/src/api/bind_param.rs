@@ -426,6 +426,8 @@ fn sql_bind_parameter_safe(
             columns.resize(column_index + 1, None);
         }
         columns[column_index] = Some(bound);
+        // Keep the vector allocated: focused descriptor updates reserve its
+        // slot during validation, then commit the override in a second pass.
         if let Some(lengths) = stmt_state.tvp_column_apd_lengths.get_mut(&tvp_ordinal)
             && let Some(length) = lengths.get_mut(column_index)
         {

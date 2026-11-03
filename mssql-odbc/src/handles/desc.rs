@@ -1183,6 +1183,15 @@ impl DescHandle {
                         error!("updating focused TVP descriptor records: allocation failed");
                     })?;
             }
+            if let Some(lengths) = state.tvp_column_apd_lengths.get_mut(&focus)
+                && lengths.len() < record_count
+            {
+                lengths
+                    .try_reserve_exact(record_count - lengths.len())
+                    .map_err(|_| {
+                        error!("updating focused TVP descriptor lengths: allocation failed");
+                    })?;
+            }
         }
         if !found {
             return Ok(None);
@@ -1212,6 +1221,9 @@ impl DescHandle {
                     .entry(focus)
                     .or_default()
                     .resize(record_count, None);
+                if let Some(lengths) = state.tvp_column_apd_lengths.get_mut(&focus) {
+                    lengths.resize(record_count, None);
+                }
             }
         }
         Ok(Some(true))
@@ -1416,20 +1428,18 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         // The server type identity. The UDT trio (1218-1220) is UDT-specific;
         // the un-prefixed trio (`SQL_CA_SS_CATALOG_NAME`/`SCHEMA_NAME`/
         // `TYPE_NAME`, 1225-1227) is what a TVP uses for its three-part table
-        // type name. Both spellings share storage; the TVP catalog alias is
-        // read-only per the descriptor contract.
+        // type name. Both spellings share catalog/schema/type storage.
         SQL_CA_SS_UDT_CATALOG_NAME
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
         | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+        | SQL_CA_SS_CATALOG_NAME
         | SQL_CA_SS_SCHEMA_NAME
         | SQL_CA_SS_TYPE_NAME
             if is_ipd =>
         {
             (Record, true)
         }
-        SQL_CA_SS_CATALOG_NAME if is_ipd => (Record, false),
-
         _ => return None,
     };
     Some(FieldAccess { scope, writable })
