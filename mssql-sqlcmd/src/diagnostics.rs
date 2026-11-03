@@ -2058,6 +2058,7 @@ impl Diagnosis {
         check.deadline_ms = Some(self.request.timeout_ms());
         check.fields.push(Field::plain("port", port.to_string()));
         let mut records = Vec::new();
+        let mut tcp_acceptance_unknown = false;
         for step in &steps {
             let address = step
                 .detail(connect_stage::ADDRESS)
@@ -2091,6 +2092,18 @@ impl Diagnosis {
                     None,
                     Some(format!("no answer within the {budget_s} s time limit")),
                 ),
+            };
+            let message = if result == TcpResult::TimedOut
+                && step.detail(connect_stage::INCLUDES_TLS) == Some("true")
+            {
+                tcp_acceptance_unknown = true;
+                Some(
+                    "the combined TCP connection and TLS handshake exceeded the time limit; \
+                     whether TCP was accepted is unknown"
+                        .to_string(),
+                )
+            } else {
+                message
             };
             check.attempts.push(TcpAttempt {
                 address: address.clone(),
@@ -2166,6 +2179,24 @@ impl Diagnosis {
             return None;
         }
         let blocks = Some(Skip::BlockedBy(CheckId::TcpConnect));
+        if tcp_acceptance_unknown {
+            check.coverage = Coverage::Inconclusive;
+            check.domain = Some(Domain::undetermined(&[
+                "connectivity.network",
+                "target.sqlServer",
+            ]));
+            self.checks.push(check);
+            self.finding(
+                Certainty::Informational,
+                id,
+                format!(
+                    "TCP connection and TLS negotiation did not complete within the time limit \
+                     on port {port}. A server may have accepted TCP and stalled during TLS; \
+                     TCP reachability is unconfirmed."
+                ),
+            );
+            return blocks;
+        }
         // The addresses a local failure left untried say nothing either way:
         // the ones tried must all have failed here, and at least one was.
         let tried: Vec<&TcpAttempt> = check
@@ -4470,6 +4501,50 @@ pub(crate) mod tests {
         );
         assert_eq!(report.outcome, DiagnosticOutcome::IssueDetected);
         assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_combined_tcp_tls_timeout_does_not_claim_tcp_was_rejected() {
+        for ok in [Some(false), None] {
+            let stages = Stages::new()
+                .add(
+                    Stage::Dns,
+                    Some(true),
+                    0,
+                    1,
+                    &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+                )
+                .add(
+                    Stage::Tcp,
+                    ok,
+                    1,
+                    1001,
+                    &[
+                        (cs::ADDRESS, "10.0.0.1"),
+                        (cs::PORT, "1433"),
+                        (cs::INCLUDES_TLS, "true"),
+                        (cs::TIMED_OUT, "true"),
+                    ],
+                );
+            let report = observed(
+                request("tcp:db01,1433", Depth::NetworkReachability),
+                stages,
+                Ended::Failed(Error::TimeoutError(
+                    mssql_tds::error::TimeoutErrorType::String("connect deadline".to_string()),
+                )),
+            );
+            let check = checked(&report, CheckId::TcpConnect);
+            assert_eq!(check.coverage, Coverage::Inconclusive);
+            assert_eq!(check.attempts[0].result, TcpResult::TimedOut);
+            assert!(report.findings.iter().any(|f| {
+                f.check == CheckId::TcpConnect
+                    && f.certainty == Certainty::Informational
+                    && f.text.contains("TCP reachability is unconfirmed")
+            }));
+            assert!(!report.findings.iter().any(|f| {
+                f.text.contains("No address accepted") || f.text.contains("Nothing is listening")
+            }));
+        }
     }
 
     /// The addresses after the one the connection used are tried too: each

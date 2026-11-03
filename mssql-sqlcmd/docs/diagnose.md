@@ -110,6 +110,12 @@ enables nothing else, are the evidence: each stage (`dns`, `instance_lookup`,
 it succeeded or failed with what; a stage the time limit cut short was
 abandoned, which is not a failure.
 
+Strict (TDS 8.0) transport diagnostics include TLS negotiation. On macOS,
+Network.framework combines TCP connection and TLS negotiation in one attempt.
+If that attempt times out, `tcpConnect` is inconclusive: the report does not
+claim that no server accepted TCP, because the peer may have stalled during TLS.
+Successful attempts and explicit TCP refusals retain their usual results.
+
 A server given without a protocol prefix or port on Windows follows the
 client's protocol order: shared memory first for this computer (when it
 connects, the TCP checks do not apply), then TCP, then named pipes. The

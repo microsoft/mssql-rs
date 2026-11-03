@@ -38,6 +38,7 @@ fi
 # as on glibc.
 case "$target" in
   *-musl*) export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static" ;;
+  *-apple-darwin*) export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}" ;;
 esac
 
 log="$(mktemp "${TMPDIR:-/tmp}/mssql-sqlcmd.XXXXXX")"
