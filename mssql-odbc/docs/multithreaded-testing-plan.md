@@ -78,7 +78,7 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
 | `Single` | The body once, on the main thread | As `TEST_F` | - |
 | `CrossThread` | SetUp, body, and TearDown on three different threads | As `TEST_F`; catches thread affinity (handles move between threads in pools, async runtimes, and finalizers) | - |
 | `SharedEnv` | `THREADS` workers x `ITERS` runs; shared ENV, own DBC and STMT | Every run passes | Tests that change ENV, pooling, or process state; connect, disconnect, or driver-load tests; fixed-name permanent objects; reliance on `HasFatalFailure()` |
-| `SharedDbc` (opt-in via `ODBC_TEST_F_MODES` with `kAllModes`) | `THREADS` workers x `ITERS` runs; shared DBC, own STMT | Only `HY000` connection busy may fail, and is retried; the connection is idle afterward | As `SharedEnv`, plus connection-attribute or transaction changes, shared temp-object names, bodies unsafe to rerun |
+| `SharedDbc` (opt-in via `ODBC_TEST_F_MODES` with `kAllModes`) | `THREADS` workers x `ITERS` runs; shared DBC, own STMT | Only `HY000` connection busy may fail, and is retried; the connection is idle afterward | As `SharedEnv`, plus connection-attribute or transaction changes, shared temp-object names, connection-level diagnostics, bodies unsafe to rerun or that hold the connection for seconds |
 | `SharedStmt` | Owner runs the body `ITERS` times; `THREADS - 1` observers read its STMT and DBC diagnostics | Owner as `Single`; observers read in every iteration; every record well formed. Only the DBC reads overlap the owner's calls in the driver; STMT reads are serialized by the Driver Manager (see Driver Manager facts) | Bodies that free or replace `stmt_` or `dbc_` |
 
 - gtest keeps one result per test, not per thread. `SharedEnv` and `SharedDbc`
@@ -512,7 +512,7 @@ found so far, AB#49225, came from `SharedDbc`. Order of effort for finding
 races:
 
 1. `SharedDbc` opt-ins (scenario 3; the fetch and GetData suites opted in with
-   AB#49260).
+   AB#49260, the parameter and execution suites with AB#49258).
 2. Churn, pooling, and authentication (scenarios 7, 10, 11).
 3. Same-STMT and shared-APD races under ThreadSanitizer (scenarios 8, 9).
 4. Faults under load (scenario 12), and disconnect or free during use (see
@@ -523,7 +523,7 @@ races:
 
 | Profile | Where | Driver | Threads x iterations | Modes run | Retries |
 |---|---|---|---|---|---|
-| PR | validation pipeline, every PR | both | 2 x 1 | all; unixODBC skips `SharedStmt` | 3 |
+| PR | validation pipeline, every PR | both | 2 x 1 | Windows: `SharedDbc` only; Linux, macOS: none (not built) | 3 |
 | Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
 | Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
 | Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
@@ -533,11 +533,42 @@ races:
   only the `<name>_mt` entries. `run_e2e.sh --mt-profile` and
   `run_e2e.ps1 -MtProfile` apply a profile; a variable already set in the
   environment wins.
+- Linux and Windows stress jobs allow 240 minutes for weekly runs and 120
+  minutes for nightly runs. The 60-minute per-entry CTest limit and 5-minute
+  default phase watchdog are unchanged. Longer jobs can hold agent slots for
+  longer; this does not increase peak concurrency.
+- Windows runs four parallel jobs: fetch, parameters, metadata, and remaining
+  suites. Each job builds its own Debug driver and harness and runs its suite
+  group sequentially against both drivers on its own SQL Server agent. The
+  remaining-suites filter excludes the three named groups, so newly converted
+  suites are included automatically. Profiles, retries, and per-entry timeouts
+  are unchanged; test-run titles and dump, load, and trace artifact names include
+  the suite group. This trades additional agents and builds for less serial
+  test work per job without adding competing suite processes to one agent.
 - The nightly run exists to flush out obvious races while suites convert.
   Remove its schedule two to three weeks after it starts, once its findings
   are fixed; PR and weekly remain.
-- PRs do not hunt races: the 2 x 1 run catches tests unfit for concurrency
-  (fixed object names, process-wide settings) in the PR that adds them.
+- PRs do not hunt races, and run only `/SharedDbc`, only on Windows: the 2 x 1
+  run catches `SharedDbc` opt-ins unfit for concurrency (fixed object names,
+  process-wide settings) in the PR that adds them. Other `ODBC_TEST_F` tests,
+  and every concurrent variant on unixODBC, are first checked by the stress
+  profiles, so run their `_mt` entries locally in every mode before review.
+  With every mode, the `_mt` entries took 11 of the Windows job's 60 minutes
+  and up to 48 minutes of macOS e2e time (build 188193). With `/SharedDbc`
+  alone they took more than 15 minutes on macOS before the cancellation, where
+  Docker under Colima makes busy retries slow, and Test MacOS exceeded its
+  90-minute limit (build 188249).
+- Linux and macOS builds compile the concurrent variants only with
+  `ODBC_E2E_CONCURRENT=ON`, from the environment at CMake configure time (which
+  wins) or `-DODBC_E2E_CONCURRENT=ON` (cached); the
+  stress profiles set it, Windows builds them by default. Without it,
+  `ODBC_TEST_F` registers only the single-threaded test and no `<name>_mt`
+  entry exists. Compiling `execute`, `param_conversions` and `param_array` took
+  21 s instead of 89 s on Windows with it off; on macOS the C++ e2e build had
+  grown from 4.8 to 11.1 minutes with these suites converted. The stress
+  pipeline has no macOS leg, so no CI run exercises the concurrent variants on
+  macOS; run them locally with `--mt-profile=nightly` when a change is
+  macOS-specific.
 - msodbcsql is the reference: its stress-leg run checks that tests suit the
   concurrent modes, not its thread safety.
 - Scenarios 7-15 join the stress run as their suites land (AB#49261,
@@ -634,7 +665,7 @@ Tracked under AB#49256:
    and weekly profiles, crash and hang evidence, `msodbcsql.h` type check.
    PR #778 extends the unixODBC `/SharedStmt` skip to the PR profile until
    AB#49575.
-3. **AB#49260 (PR #756):** every `TEST_F` in the fetch and GetData suites
+3. **AB#49260 (merged):** every `TEST_F` in the fetch and GetData suites
    (`get_data`, `binary_fetch`, `bin_to_char`, `datetime_types`,
    `time_to_timestamp`, `numeric_types`, `text_money_types`, `fetch_scroll`,
    `fetch_error_semantics`, `col_attribute`, `describe_col`,
@@ -649,16 +680,30 @@ Tracked under AB#49256:
    connection state, or (three) starve on the Debug driver. Six bound-row-array
    tests run `SharedDbc` on mssql-odbc only: msodbcsql's `SQLCloseCursor`
    leaves the cursor open on a busy shared connection (`SKIP_MSODBCSQL_IN_MODE`).
-4. **AB#49258:** parameter and execution suites, plus worker-token tests; and
-   remaining cancel cases `cancel_test.cpp` does not cover, added to it
-   (idle cursor cleanup is covered by `connection_busy_test.cpp`, AB#49386):
-   - A cancel just before execute does not leak into that or the next
-     execution, through a Driver Manager (the driver's unit tests cover it
-     directly).
-   - A fetch blocked by a row lock held by a second connection, rather than a
-     `WAITFOR` inside the batch.
-   - A `SQLGetData` blocked mid-stream on a PLP column, the one operation in
-     the cancel list above with no e2e case.
+4. **AB#49258:** every test in the parameter and
+   execution suites (`execute`, `exec_direct`, `param_conversions`,
+   `param_char_conversions`, `param_binary_conversions`, `param_array`,
+   `output_params`, `dml_output`, `describe_param`, `call_routing`,
+   `escape_sequence`) runs in the default modes: 431 tests. `dml_output`'s
+   direct/prepared `TEST_P` became two fixtures over one set of bodies; the
+   ODBC-version `TEST_P` in `describe_param` stays single-threaded. The two
+   explicit-APD tests drop `SharedStmt` (Windows Driver Manager deadlock).
+   315 tests also run in `SharedDbc`; the rest use `#temp` objects or session
+   settings, change connection state, read `SQLNativeSql`'s connection-level
+   diagnostics (two, recorded), or hold the connection for a 2 s timeout (one,
+   recorded). Worker-token tests: prepared parameters across executes, two
+   20 KB data-at-execution streams, fifty parameter sets, and output
+   parameters through a per-worker temp procedure, all in every mode.
+   Busy retries release private statements, and permanent escape-test
+   procedures are dropped after closing the cursor, with bounded busy
+   retries. Cleanup failures are non-retryable, even when the driver reports
+   a busy connection. The new parameter-set status
+   checks start from `SQL_PARAM_UNUSED`, not the expected success value.
+   `cancel_test.cpp` gains the remaining cancel cases (idle cursor cleanup is
+   covered by `connection_busy_test.cpp`, AB#49386): a cancel just before
+   execute reaches neither it nor the next execute; a fetch blocked by
+   another connection's row lock; a `SQLGetData` blocked mid-PLP, through
+   `TcpPauseProxy::PauseResponses`.
 5. **AB#49262:** diagnostics, descriptor, metadata, and attribute suites;
    scenario 6.
 6. **AB#49261:** scenarios 7 and 10.

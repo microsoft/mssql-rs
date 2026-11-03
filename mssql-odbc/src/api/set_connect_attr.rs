@@ -419,8 +419,9 @@ unsafe fn sql_set_connect_attr_w_impl(
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
             // Publish to execution children here, not on every fetch/GetData call.
-            // Zero selects the native driver's 120-second cancellation default.
-            // General non-cancellation network-I/O timeout enforcement is separate.
+            // Connection operations also use this for request I/O and cancellation.
+            // Zero leaves requests unlimited and selects the native driver's
+            // 120-second default for explicit statement cancellation.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
             // warning rather than reusing msodbcsql's "Login timeout changed".
@@ -1375,7 +1376,7 @@ mod tests {
     #[test]
     fn setting_the_current_isolation_level_again_is_a_no_op() {
         // Matches the same-value short-circuit autocommit uses
-        // (`sqlcmisc.cpp:1720`): no cursor sweep and no round trip.
+        // (`sqlcmisc.cpp:1720`): no round trip.
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         h.mark_dbc_connected();

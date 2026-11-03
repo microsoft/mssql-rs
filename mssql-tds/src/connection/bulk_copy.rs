@@ -1087,16 +1087,8 @@ impl<'a> BulkCopy<'a> {
         // second batch's verdict would overwrite the first's, and a bulk copy
         // whose only substitution happened early would report none (AB#47598).
         //
-        // Unlike `accumulated_info`, this is mirrored back onto the client as
-        // soon as it is updated, so the invariant "the client holds the verdict
-        // for every batch attempted so far" holds at *every* point after a
-        // drain. The loop has exits that do not pass through an epilogue — the
-        // two timeout returns and the `begin_transaction` `?` below — and a
-        // restore placed only at the end would drop an earlier batch's
-        // substitution on each of them. Nothing between batches clears the flag
-        // (the transaction calls build their own `PacketWriter`s and never
-        // reach `finish_send`), so the mirrored value survives until the next
-        // batch assigns a fresh one.
+        // Mirror each drained batch immediately for timeout and transaction-
+        // completion error exits. Commit and rollback preserve the mirrored flag.
         let mut accumulated_cp_loss = false;
 
         loop {
@@ -1394,6 +1386,105 @@ mod tests {
     use crate::datatypes::bulk_copy_metadata::SystemTypeId;
 
     use super::*;
+
+    struct LossyTextRow;
+
+    #[async_trait::async_trait]
+    impl BulkLoadRow for LossyTextRow {
+        async fn write_to_packet(
+            &self,
+            writer: &mut crate::message::bulk_load::StreamingBulkLoadWriter<'_>,
+            column_index: &mut usize,
+        ) -> TdsResult<()> {
+            writer
+                .write_column_value(
+                    *column_index,
+                    &crate::datatypes::column_values::ColumnValues::String(
+                        crate::datatypes::sql_string::SqlString::from_utf8_string(
+                            "caf\u{65e5}".to_string(),
+                        ),
+                    ),
+                )
+                .await?;
+            *column_index += 1;
+            Ok(())
+        }
+    }
+
+    async fn assert_conversion_loss_survives_internal_transaction_error(commit_fails: bool) {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+        use crate::test_client_support::{
+            done_no_more, env_change_begin_transaction, env_change_rollback_transaction, sql_error,
+            tds_client_from_tokens,
+        };
+        use crate::token::tokens::SqlCollation;
+
+        let mut tokens = vec![
+            env_change_begin_transaction(1),
+            done_no_more(),
+            done_no_more(),
+        ];
+        if commit_fails {
+            tokens.extend([
+                done_no_more(),
+                sql_error(50001, 16, "internal commit failed"),
+                done_no_more(),
+            ]);
+        } else {
+            tokens.extend([
+                sql_error(50002, 16, "bulk batch failed"),
+                done_no_more(),
+                env_change_rollback_transaction(),
+                done_no_more(),
+            ]);
+        }
+        let mut client = tds_client_from_tokens(tokens);
+        let result = {
+            let mut copy = BulkCopy::new(&mut client, "#cp_loss").use_internal_transaction(true);
+            copy.destination_metadata = Some(vec![
+                BulkCopyColumnMetadata::new("v", SqlDbType::VarChar, TdsDataType::BigVarChar as u8)
+                    .with_length(8, TypeLength::Variable(8))
+                    .with_collation(SqlCollation {
+                        info: 0x0409,
+                        lcid_language_id: 0,
+                        col_flags: 0,
+                        sort_id: 0,
+                    }),
+            ]);
+            copy.write_to_server_zerocopy([LossyTextRow]).await
+        };
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains(if commit_fails {
+                "internal commit failed"
+            } else {
+                "bulk batch failed"
+            }),
+            "{error}"
+        );
+        if !commit_fails {
+            assert!(
+                !client.has_active_transaction(),
+                "the internal rollback must run"
+            );
+        }
+        assert!(
+            client.take_code_page_conversion_loss(),
+            "transaction completion must preserve the failed bulk operation's substitution"
+        );
+        assert!(!client.take_code_page_conversion_loss());
+    }
+
+    #[tokio::test]
+    async fn bulk_conversion_loss_survives_a_failed_internal_commit() {
+        assert_conversion_loss_survives_internal_transaction_error(true).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_conversion_loss_survives_rollback_after_batch_failure() {
+        assert_conversion_loss_survives_internal_transaction_error(false).await;
+    }
 
     struct UnreachableMetadataRetriever;
 

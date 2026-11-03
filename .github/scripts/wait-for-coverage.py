@@ -162,7 +162,7 @@ def duplicate_coverage(pr_number: str, build: dict, head_sha: str, *, deadline: 
     return None
 
 
-def wait_for_artifact(pr_number: str, timeout: float = 75 * 60) -> tuple[int, str]:
+def wait_for_artifact(pr_number: str, timeout: float = 150 * 60) -> tuple[int, str]:
     if not re.fullmatch(r"[1-9][0-9]*", pr_number):
         raise ValueError("Invalid PR number")
     deadline = time.monotonic() + timeout

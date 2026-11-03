@@ -1451,6 +1451,12 @@ impl NetworkTransport {
         Ok(())
     }
 
+    pub(crate) fn abort_transport(&mut self) {
+        self.stream = None;
+        self.extractable_stream_handle = None;
+        self.known_dead = true;
+    }
+
     /// How many consecutive payload-free end-of-message packets a bulk read
     /// tolerates before giving up.
     ///
@@ -3467,6 +3473,10 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         Ok(())
     }
 
+    fn abort_transport(&mut self) {
+        Self::abort_transport(self);
+    }
+
     /// Send an attention packet and wait for acknowledgment with a timeout.
     ///
     /// This implements the attention sending flow with a configurable timeout:
@@ -3513,6 +3523,43 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn abort_transport_drops_the_stream_before_explicit_close() {
+        use super::SharedStream;
+        use crate::connection::transport::extractable_stream::ExtractableStreamHandle;
+        use crate::connection::transport::tds_transport::TdsTransport;
+        use crate::test_packet_support::build_duplex_transport;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, duplex};
+
+        for with_extraction_handle in [false, true] {
+            let (stream, mut peer) = duplex(16);
+            let mut transport = build_duplex_transport(stream);
+            if with_extraction_handle {
+                let underlying = transport.stream.take().unwrap().into_inner().unwrap();
+                let (handle, wrapper) = ExtractableStreamHandle::new(underlying);
+                transport.stream = Some(SharedStream::new(Box::new(wrapper)));
+                transport.extractable_stream_handle = Some(handle);
+            }
+            assert!(transport.stream.is_some());
+
+            TdsTransport::abort_transport(&mut transport);
+
+            assert!(transport.stream.is_none());
+            assert!(transport.known_dead);
+            transport.close_transport().await.unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                    .await
+                    .expect("abort must release the underlying connection, not just its TLS owner")
+                    .unwrap(),
+                0,
+            );
+            assert!(transport.extractable_stream_handle.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn sequential_connect_walks_every_address_without_a_parallel_limit() {
         use std::cell::RefCell;
