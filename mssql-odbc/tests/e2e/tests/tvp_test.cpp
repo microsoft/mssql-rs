@@ -832,7 +832,7 @@ TEST_F(TvpTest, DaeRefillsMultipleTvpBatchesBeforeScalarDae) {
 
     auto type_w = ToSqlW(type);
     SQLLEN tvp_indicator = SQL_DATA_AT_EXEC;
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT, SQL_SS_TABLE,
                                    2, 0, type_w.data(),
                                    static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)),
                                    &tvp_indicator),
