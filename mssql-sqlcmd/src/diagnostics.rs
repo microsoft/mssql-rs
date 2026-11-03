@@ -2928,7 +2928,12 @@ impl Diagnosis {
                 }
                 let no_ticket_cache = check.field("kerberosTicketCache") == Some("notFound");
                 self.checks.push(check);
-                if no_ticket_cache && failed_phase == Some(Stage::Login) {
+                // A database the server would not open (4060, 4064) comes
+                // after a login that succeeded: no ticket was missing.
+                if no_ticket_cache
+                    && failed_phase == Some(Stage::Login)
+                    && classified.auth == AuthOutcome::Failed
+                {
                     self.finding(
                         Certainty::Suspected,
                         CheckId::ConnectionAttempt,
@@ -7065,6 +7070,16 @@ pub(crate) mod tests {
     /// replayed with the ticket cache lookup giving `state` (looked for in
     /// `KRB5CCNAME`), failing in `failed` (the login, or before it).
     fn integrated_login_refused(state: &'static str, failed: Stage) -> Report {
+        integrated_login_ended(state, failed, 18456, "Login failed.")
+    }
+
+    /// As [`integrated_login_refused`], with the server's error `number`.
+    fn integrated_login_ended(
+        state: &'static str,
+        failed: Stage,
+        number: u32,
+        message: &str,
+    ) -> Report {
         let mut integrated = request("tcp:db01,1433", Depth::ConnectionAttempt);
         integrated.authentication = Authentication::Integrated;
         let mut stages = Stages::new()
@@ -7100,7 +7115,7 @@ pub(crate) mod tests {
         observed_with(
             integrated,
             stages,
-            Ended::Failed(server_error(18456, "Login failed.")),
+            Ended::Failed(server_error(number, message)),
             |diagnosis| diagnosis.ticket_cache = Some(lookup),
         )
     }
@@ -7137,6 +7152,19 @@ pub(crate) mod tests {
             Some("login")
         );
         assert!(!claims(&report), "{:#?}", report.findings);
+
+        // A database the server would not open comes after a login that
+        // succeeded: a cache sqlcmd did not find (a KCM or KEYRING one, say)
+        // served it, and no missing ticket is suggested.
+        for number in DATABASE_ERRORS {
+            let report =
+                integrated_login_ended("notFound", Stage::Login, number, "Cannot open database");
+            let attempt = checked(&report, CheckId::ConnectionAttempt);
+            assert_eq!(attempt.field("kerberosTicketCache"), Some("notFound"));
+            assert_eq!(attempt.field("failedPhase"), Some("login"));
+            assert_eq!(report.authentication, Some(AuthOutcome::Succeeded));
+            assert!(!claims(&report), "{number}: {:#?}", report.findings);
+        }
     }
 
     /// The session's clock offset beyond what Kerberos tolerates by default
