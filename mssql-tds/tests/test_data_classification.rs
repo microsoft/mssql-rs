@@ -719,4 +719,58 @@ mod data_classification_tests {
 
         server.stop().await;
     }
+
+    /// [MS-TDS] 2.2.7.5: the per-column count is 0 or the COLMETADATA count.
+    /// A two-column result classified for one column breaks that, and the
+    /// client cannot tell which column the entry belongs to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn classification_column_count_must_match_the_result_set() {
+        const MISMATCHED: &str = "SELECT SSN, PHONE FROM MISMATCHED";
+        const NO_COLUMNS: &str = "SELECT SSN, PHONE FROM NO_COLUMNS";
+        let version = DataClassificationVersion::Version2;
+        let server = Server::start_recoverable(version).await;
+        {
+            let mut registry = server.registry.lock().await;
+            registry.register_with_data_classification(
+                MISMATCHED,
+                int_response(&["ssn", "phone"], 7),
+                token(version, &[("L", "L")], &[], 30, &[&[(0, UNSPECIFIED, 30)]]),
+            );
+            registry.register_with_data_classification(
+                NO_COLUMNS,
+                int_response(&["ssn", "phone"], 7),
+                token(version, &[("L", "L")], &[], 30, &[]),
+            );
+        }
+        let mut client = server.connect(Some(version)).await;
+
+        // Zero means no per-column data: accepted, with the dictionaries kept.
+        client.execute(NO_COLUMNS.to_string(), ()).await.unwrap();
+        let metadata = client.data_classification().expect("classification");
+        assert!(metadata.columns().is_empty());
+        assert_eq!(metadata.sensitivity_labels().len(), 1);
+        assert_eq!(metadata.rank(), Some(SensitivityRank::High));
+        client.close_query().await.unwrap();
+
+        // Equal is the ordinary case.
+        client.execute(CLASSIFIED.to_string(), ()).await.unwrap();
+        assert_eq!(client.data_classification().unwrap().columns().len(), 2);
+        client.close_query().await.unwrap();
+
+        let error = client
+            .execute(MISMATCHED.to_string(), ())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("classification for 1 columns does not match the 2 columns"),
+            "{error}"
+        );
+        assert!(client.is_connection_dead());
+        assert!(!client.is_session_recovery_enabled());
+        assert!(client.data_classification().is_none());
+
+        server.stop().await;
+    }
 }

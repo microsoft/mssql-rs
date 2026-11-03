@@ -6107,15 +6107,24 @@ impl TdsClient {
             if let Some(start) = start {
                 self.update_remaining_timeout(start);
             }
+            let result = result.and_then(|classification| {
+                classification
+                    .map(|classification| {
+                        Self::check_classification_columns(classification, metadata)
+                    })
+                    .transpose()
+            });
             match result {
                 Ok(classification) => classification,
                 Err(error) => {
                     let error = self.fail_read(error);
-                    // The token has no length prefix, so a failure partway
-                    // leaves the reader inside it. Under `BatchErrorMode::Abort`
-                    // nothing else retires the connection for the first result,
-                    // whose batch is not open yet. Under `Continue`, `fail_read`
-                    // has already retired it and this repeats harmlessly.
+                    // A read that fails partway leaves the reader inside a
+                    // token with no length prefix, and a token that breaks
+                    // MS-TDS cannot be trusted to describe the rows that follow.
+                    // Under `BatchErrorMode::Abort` nothing else retires the
+                    // connection for the first result, whose batch is not open
+                    // yet. Under `Continue`, `fail_read` has already retired it
+                    // and this repeats harmlessly.
                     if !matches!(
                         error,
                         crate::error::Error::TimeoutError(_)
@@ -6136,6 +6145,25 @@ impl TdsClient {
             })
         });
         Ok(())
+    }
+
+    /// [MS-TDS] 2.2.7.5: `NumResultSetColumns` is either 0, meaning no
+    /// per-column data, or exactly the COLMETADATA `Count`. SqlClient and JDBC
+    /// do not check this; SQL Server sends a matching count even when
+    /// `FOR BROWSE` adds hidden key columns.
+    fn check_classification_columns(
+        classification: DataClassificationMetadata,
+        metadata: &ColMetadataToken,
+    ) -> TdsResult<DataClassificationMetadata> {
+        let columns = classification.columns().len();
+        if columns != 0 && columns != usize::from(metadata.column_count) {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "DATACLASSIFICATION: classification for {columns} columns does not match the \
+                 {} columns in COLMETADATA",
+                metadata.column_count
+            )));
+        }
+        Ok(classification)
     }
 
     /// Resolves whether an RPC response has anything left after the no-row
@@ -11568,6 +11596,31 @@ mod tests {
         client
             .data_classification()
             .and_then(|metadata| metadata.rank)
+    }
+
+    #[test]
+    fn classification_columns_are_none_or_one_per_result_column() {
+        use crate::token::data_classification::{
+            ColumnSensitivity, DataClassificationMetadata, DataClassificationVersion,
+        };
+        let classification = |columns: usize| DataClassificationMetadata {
+            version: DataClassificationVersion::Version1,
+            sensitivity_labels: Vec::new(),
+            information_types: Vec::new(),
+            rank: None,
+            columns: vec![
+                ColumnSensitivity {
+                    properties: Vec::new()
+                };
+                columns
+            ],
+        };
+        let metadata = int_column_metadata(2);
+        for (columns, accepted) in [(0, true), (2, true), (1, false), (3, false)] {
+            let result =
+                TdsClient::check_classification_columns(classification(columns), &metadata);
+            assert_eq!(result.is_ok(), accepted, "{columns} columns: {result:?}");
+        }
     }
 
     /// DATACLASSIFICATION follows the COLMETADATA it classifies. One that does

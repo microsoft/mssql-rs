@@ -221,9 +221,9 @@ impl DataClassificationMetadata {
         self.rank
     }
 
-    /// Per-column sensitivity, in column order, as the token sent it. The
-    /// count is not checked against the result set's columns, so index with
-    /// `columns().get(i)` rather than assuming one entry per column.
+    /// Per-column sensitivity, in column order. Either one entry per
+    /// result-set column, or empty when the server sent no per-column data;
+    /// any other count is rejected as a protocol error.
     pub fn columns(&self) -> &[ColumnSensitivity] {
         &self.columns
     }
