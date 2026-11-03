@@ -28,9 +28,11 @@ pub(crate) use tracing_init::init_tracing;
 /// the scope outlives panic conversion and the return event, even when the body
 /// frees the handle. A disabled sink never resolves the handle or enters TLS.
 ///
-/// The untraced branch evaluates `$entry` only if a sink was installed after the
-/// branch was chosen, normally by this call's `init_tracing`, so the first
-/// traced call still logs its entry inside the panic boundary. The event goes
+/// The untraced branch evaluates `$entry` only if `trace_context::enabled()`
+/// became true after the branch was chosen, normally through this call's
+/// `init_tracing`, so the first traced call still logs its entry inside the
+/// panic boundary. A subscriber installed without `trace_context::enable()`
+/// receives no entry events, only return and panic events. The event goes
 /// through `cold_entry` to keep its expansion out of the hot closure, which
 /// otherwise stops inlining into the API and adds a frame to every untraced call.
 macro_rules! ffi_entry {
@@ -171,6 +173,7 @@ mod tests {
     #[test]
     fn a_panicking_entry_event_on_the_first_traced_call_returns_sql_error() {
         if std::env::var_os(CHILD).is_some() {
+            assert!(!mssql_tds::trace_context::enabled());
             let body_ran = AtomicBool::new(false);
             let ret = crate::ffi_entry!(
                 "PanicEntry",
