@@ -192,7 +192,7 @@ pub(super) fn free_stmt_close_locked(
 }
 
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
-/// (`SQLEndTran`, an autocommit switch, an isolation change, disconnect).
+/// (`SQLEndTran`, an autocommit switch, connection reset, disconnect).
 ///
 /// Reproduces what msodbcsql's sweep does to each statement. `CommitAbortTran`
 /// calls `SQLFreeStmt(lpstmt, SQL_CLOSE)` on every statement it visits
@@ -1197,7 +1197,7 @@ mod tests {
         assert!(ss.pending_fetch_error.is_none());
     }
 
-    /// The connection-scoped sweep (`SQLEndTran`/autocommit/isolation change)
+    /// The connection-scoped sweep (`SQLEndTran`/autocommit/connection reset)
     /// must NOT fail its own return over a pending fetch error on one
     /// statement: `SQL_ERROR` from this function specifically means "the
     /// stream failed to drain, unsafe to send a TM request next" — a stale

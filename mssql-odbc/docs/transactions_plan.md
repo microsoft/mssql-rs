@@ -55,10 +55,33 @@ driver therefore also accepts the vendor attribute `SQL_COPT_SS_TXN_ISOLATION`
 advertises in `SQL_TXN_ISOLATION_OPTION` is actually selectable. Both spellings
 drive the same code path and are readable back through `SQLGetConnectAttr`.
 
-Setting the level already in effect is a no-op, mirroring the same-value
-short-circuit `SetCommitModeOption` uses for autocommit (`sqlcmisc.cpp:1720`), so
-an application that explicitly selects the default at startup does not pay a
-cursor sweep and a round trip.
+Setting the cached level again is a retained driver-specific no-op, unless a
+connection reset has marked the server's isolation unknown. Both aliases return
+`SQL_SUCCESS` before checking busy state or an open manual transaction, without
+a round trip. Raw T-SQL can leave the cache stale: repeating the cached level
+does not restore the server's isolation. This differs from msodbcsql's isolation
+branch (`sqlcmisc.cpp:1761-1828`), which executes the `SET` even for the cached
+level; retail 18.07.0001 reports `HY000` when unread results are pending.
+Changing this pre-existing shortcut is tracked as an implementation gap in
+[#798](https://github.com/microsoft/mssql-rs/issues/798), outside this
+cursor-preservation fix.
+
+Changing isolation preserves application cursors, their result metadata, and
+statement diagnostics. Only the connection's diagnostics are cleared for the
+new call. Apart from the cached-value shortcut above, an exhausted batch does
+not prevent the change; unread results occupying the wire cause
+`SQL_ERROR` / `HY000` without discarding rows. Exhausting only the first result
+of a multi-result batch still leaves the wire busy. This cursor/diagnostic behavior
+matches msodbcsql's isolation branch, which executes and closes only its private
+driver statement (`sqlcmisc.cpp:1808-1822`), not the connection-wide cursor sweep
+used for transaction completion.
+
+The getter differs after busy rejection: msodbcsql reports the rejected requested
+level through both aliases, while this driver retains the last successfully
+applied level. The server remains unchanged in both. Copying that cache update
+while retaining the same-value shortcut would make a close-and-retry succeed
+without applying the level. See [parity entry 38](parity-deviations.md) and
+[#798](https://github.com/microsoft/mssql-rs/issues/798) for the shortcut interaction.
 
 ### G4 — Transaction-safe disconnect
 
@@ -148,7 +171,7 @@ the reference source; exact retail timing and diagnostics have not yet been
 measured against CI's pinned msodbcsql 18.6.2.1 build.
 The deliberate send-deadline and shared-budget differences, including statement
 and bulk-copy scope and the remaining RPC accounting difference, are recorded in
-[parity registry entry 38](parity-deviations.md).
+[parity registry entry 39](parity-deviations.md).
 
 ## 2. Non-goals
 
@@ -250,9 +273,11 @@ after `SQLEndTran(SQL_COMMIT)`, the next statement re-begins the transaction, so
 
 ```
 value ∉ {1, 2, 4, 8, 0x20}      → HYC00, SQL_ERROR   (sqlcmisc.cpp:347-355)
+value == cache, server known     → SQL_SUCCESS, no wire access (retained shortcut)
 local_tran_started              → HY011, SQL_ERROR   (sqlcmisc.cpp:360-364)
 not connected                   → store; applied at connect
-connected                       → SET TRANSACTION ISOLATION LEVEL <level>
+connected, wire busy            → HY000, SQL_ERROR; cursors and diagnostics preserved
+connected, wire idle            → SET TRANSACTION ISOLATION LEVEL <level>
 ```
 
 `SQLGetConnectAttr` returns the cached value — no server round trip, matching
@@ -277,7 +302,9 @@ free child statements; drop client; state = Disconnected
 | `SQLEndTran`, no transaction open | — | `SQL_SUCCESS` |
 | `SQLEndTran` on disconnected DBC | `08003` | `SQL_ERROR` |
 | `SQL_ATTR_TXN_ISOLATION` invalid value | `HYC00` | `SQL_ERROR` |
-| `SQL_ATTR_TXN_ISOLATION` while txn open | `HY011` | `SQL_ERROR` |
+| Either isolation attribute while txn open, after the cached-value shortcut | `HY011` | `SQL_ERROR` |
+| Either isolation attribute changes level with unread results pending | `HY000` | `SQL_ERROR` |
+| Either isolation attribute repeats the cached level, server isolation known | — | `SQL_SUCCESS` (no wire access) |
 | `SQL_ATTR_AUTOCOMMIT` invalid value | `HY024` | `SQL_ERROR` |
 | Autocommit OFF→ON with open txn | `01000` | `SQL_SUCCESS_WITH_INFO` |
 | `SQLDisconnect` with open txn | `25000` | `SQL_ERROR` |
@@ -307,8 +334,9 @@ free child statements; drop client; state = Disconnected
 Rust unit tests (`TestHandles`) cover argument validation, state transitions and
 diagnostics without a server. C++ e2e tests
 (`tests/e2e/tests/transaction_test.cpp`) run against a live SQL Server under
-`run_e2e.ps1 -CompareWithMsodbcsql`, so every assertion must hold for **both**
-drivers unless guarded by `SKIP_IF_COMPARING_MSODBCSQL()`.
+`run_e2e.ps1 -CompareWithMsodbcsql`. Shared assertions hold for **both**
+drivers; dedicated parity-registry cases assert each leg's measured outcome,
+and mssql-odbc-only cases use `SKIP_IF_COMPARING_MSODBCSQL()`.
 
 | # | Scenario | Layer |
 |---|---|---|
@@ -349,6 +377,10 @@ drivers unless guarded by `SKIP_IF_COMPARING_MSODBCSQL()`.
 | 33 | `SQLEndTran` closes cursors and frees the connection for other statements (§7.1) | e2e |
 | 34 | `SQLEndTran` on `SQL_HANDLE_ENV` posts a summary `HY000` when a connection fails | unit |
 | 35 | `SQLEndTran` on `SQL_HANDLE_ENV` leaves no diagnostic when every connection succeeds | unit |
+| 36 | Isolation changes preserve exhausted cursors, metadata, and statement diagnostics (both aliases) | unit + e2e |
+| 37 | Isolation changes with unread rows return `HY000`; rows and diagnostics survive close/retry (both aliases) | unit + e2e |
+| 38 | Isolation changes after exhausting only the first result return `HY000`; the second result remains fetchable and close/retry succeeds (both aliases) | unit + e2e |
+| 39 | Isolation getters after busy rejection retain the applied level here and report the requested level on msodbcsql; the server stays unchanged and retry applies the level (both aliases, parity entry 38) | e2e |
 
 ### 7.1 What the Driver Manager decides for us
 

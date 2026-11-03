@@ -521,17 +521,10 @@ stages:
 
   - job: Test_MacOS
     displayName: Test MacOS
-    # No explicit timeout here used to mean the ADO default of 60m, which this
-    # job can now genuinely exceed: nested virtualization (Colima's Linux VM
-    # under the macOS runner) makes Docker/SQL Server startup 2-3x more
-    # variable than on Linux or Windows, and it's the only test job running
-    # the full mssql-tds + mssqlodbc coverage-instrumented suite on that
-    # runner class. A run that is otherwise healthy (every test still passing,
-    # nothing hung) was seen canceled by the 60m ceiling rather than by a
-    # failure. Budgeted for headroom over the worst observed case, not to mask
-    # a real hang — a genuinely wedged step still fails via its own tighter,
-    # dedicated timeout long before this outer one would matter.
-    timeoutInMinutes: 90
+    # Colima startup plus the Rust and ODBC suites can exceed 90m: build 188168
+    # reached ODBC test 72/78 with every completed case passing before cancellation.
+    # Keep per-test hang limits intact; this is the whole job's budget.
+    timeoutInMinutes: 120
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest
