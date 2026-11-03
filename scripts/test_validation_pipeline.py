@@ -207,7 +207,7 @@ def test_unix_odbc_profiles_skip_shared_stmt(tmp_path, profile, threads, iterati
     assert function, "apply_mt_profile not found"
     script = f"""
 set -euo pipefail
-unset MSSQL_ODBC_MT_THREADS MSSQL_ODBC_MT_ITERS MSSQL_ODBC_MT_GDB
+unset MSSQL_ODBC_MT_THREADS MSSQL_ODBC_MT_ITERS MSSQL_ODBC_MT_GDB ODBC_E2E_CONCURRENT
 {override}
 MT_PROFILE={profile}
 RETRIES=0
@@ -220,6 +220,7 @@ bash -c 'printf "rust:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
 env ${{MS_LEG_ENV[@]+"${{MS_LEG_ENV[@]}}"}} \
 bash -c 'printf "reference:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
 "${{MSSQL_ODBC_MT_THREADS:-2}}" "${{MSSQL_ODBC_MT_ITERS:-1}}"'
+printf "concurrent:%s\\n" "${{ODBC_E2E_CONCURRENT:-}}"
 """
     script_path = tmp_path / "profile.sh"
     script_path.write_text(script, encoding="utf-8", newline="\n")
@@ -229,6 +230,9 @@ bash -c 'printf "reference:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"rust:{expected}:{threads}:{iterations}" in result.stdout.splitlines()
     assert f"reference:{expected}:2:1" in result.stdout.splitlines()
+    # Unix builds compile the <name>_mt entries only for the stress profiles.
+    concurrent = "" if profile == "pr" else "ON"
+    assert f"concurrent:{concurrent}" in result.stdout.splitlines()
 
 
 @pytest.mark.parametrize(
@@ -746,12 +750,11 @@ def test_odbc_runner_forwards_deselected_tests(tmp_path, env, expected):
     assert deselected == expected
 
 
-def test_mssql_python_odbc_job_deselects_only_tracked_tests():
+def test_mssql_python_odbc_job_deselects_only_timing_flaky_tests():
     template = load_template("test-mssql-python-odbc-template.yml")
     params = {p["name"]: p["default"] for p in template["parameters"]}
     assert params["pytestDeselect"] == [
         "tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release",
-        "tests/test_009_pooling.py::test_pool_checkout_validation_timeout",
     ]
     step = next(
         step for step in template["steps"]

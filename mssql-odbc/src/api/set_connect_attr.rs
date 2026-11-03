@@ -419,9 +419,9 @@ unsafe fn sql_set_connect_attr_w_impl(
             }
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
-            // Connection-owned requests read this at entry; statement execution
-            // keeps its own query timeout. Zero leaves requests unbounded but
-            // selects the 120-second cancellation settlement default.
+            // Connection-owned requests use this for request I/O; statement
+            // execution keeps its query timeout. Zero leaves requests unbounded
+            // and selects the 120-second cancellation settlement default.
             // Publish to execution children here, not on every fetch/GetData call.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the

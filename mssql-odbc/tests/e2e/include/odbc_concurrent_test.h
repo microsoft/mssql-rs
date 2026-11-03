@@ -79,7 +79,9 @@
 //
 // ctest runs the concurrent variants of each converted executable as a separate
 // entry, <name>_mt, so they do not hide its single-threaded results; see
-// tests/e2e/CMakeLists.txt and the runners' stress profiles.
+// tests/e2e/CMakeLists.txt and the runners' stress profiles. Builds with
+// ODBC_E2E_CONCURRENT off (the Linux and macOS default) define
+// ODBC_E2E_SINGLE_THREADED and compile only the single-threaded test.
 
 #pragma once
 
@@ -1291,6 +1293,12 @@ inline ::testing::Environment* const kUnattendedCrashReporting =
 
 template <typename T>
 void RunTest(T& test, Mode mode, const char* name) {
+#ifdef ODBC_E2E_SINGLE_THREADED
+    // Register() keeps only kSingle, and no mode runner is instantiated.
+    (void)mode;
+    (void)name;
+    test.ConcurrentBody();
+#else
     if (mode != kSingle) {
         unsigned skipped = 0;
         std::string error;
@@ -1318,12 +1326,16 @@ void RunTest(T& test, Mode mode, const char* name) {
             return;
     }
     ADD_FAILURE() << name << ": unhandled mode " << static_cast<unsigned>(mode);
+#endif
 }
 
 // The factory returns Fixture*, so gtest files these tests under the same
 // fixture id as TEST_F and both macros can share a suite.
 template <typename Fixture, typename T>
 bool Register(const char* suite, const char* name, const char* file, int line, unsigned modes) {
+#ifdef ODBC_E2E_SINGLE_THREADED
+    modes &= kSingle;
+#endif
     for (Mode mode : kModes) {
         if ((modes & mode) == 0) {
             continue;

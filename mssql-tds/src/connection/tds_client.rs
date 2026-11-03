@@ -141,11 +141,8 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(CANCEL_TIMEOUT_SECS as u64)
 
 /// Budget for the ignore packet itself, strictly below [`CANCEL_TIMEOUT`].
 ///
-/// `PacketWriter` checks this only after a write returns, so it can fire only
-/// while the stream is still intact — which yields the graceful arm, closing the
-/// transport normally. The outer deadline instead drops the write future and
-/// forces retirement without a shutdown, so a merely slow peer should reach this
-/// one first. Only the ordering matters; the exact value does not.
+/// A timed-out write may leave a partial packet, so its suspended state directs
+/// the caller to retire the transport without another write or TLS shutdown.
 const CANCEL_WRITE_TIMEOUT_SECS: u32 = CANCEL_TIMEOUT_SECS / 2;
 
 #[derive(Debug)]
@@ -573,8 +570,6 @@ struct BufferedRowSupport {
 #[derive(Debug)]
 pub struct TdsClient {
     pub(crate) transport: AnyTransport,
-    /// An interrupted packet/TLS record forbids even graceful shutdown writes.
-    transport_shutdown_unsafe: bool,
     pub(crate) negotiated_settings: NegotiatedSettings,
     pub(crate) execution_context: ExecutionContext,
     pub(crate) recovery_context: Box<RecoveryContext>,
@@ -800,7 +795,6 @@ impl TdsClient {
 
         Self {
             transport,
-            transport_shutdown_unsafe: false,
             negotiated_settings,
             execution_context,
             recovery_context: Box::new(recovery_context),
@@ -892,7 +886,7 @@ impl TdsClient {
         );
 
         // Close the dead transport (best-effort)
-        let _ = self.close_transport_if_safe().await;
+        let _ = self.transport.close_transport().await;
 
         let deadline = Instant::now() + timeout;
         let connect_retry_count = client_context.connect_retry_count;
@@ -1028,7 +1022,6 @@ impl TdsClient {
         session_state_tokens: &[crate::token::tokens::SessionStateToken],
     ) -> TdsResult<()> {
         self.transport = transport;
-        self.transport_shutdown_unsafe = false;
         let database_changes = self.negotiated_settings.database_change_count;
         self.negotiated_settings = settings;
         // A recovered session is a *different* session — new login, so the
@@ -1840,8 +1833,8 @@ impl TdsClient {
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
-        let send_started = self.request_timeout_start();
         self.transport.reset_reader();
+        let send_started = self.request_timeout_start();
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout, cancel);
@@ -1903,6 +1896,7 @@ impl TdsClient {
         self.ensure_force_column_encryption_supported(named_params.iter())?;
         let (timeout_sec, request_timeout, database_collation) =
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
+        self.ensure_parameter_features_supported(named_params.iter())?;
 
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
@@ -1968,6 +1962,7 @@ impl TdsClient {
         self.transport.reset_reader();
 
         let database_collation = self.negotiated_settings.database_collation;
+        let vector_version = self.negotiated_settings.vector_version();
         let send_started = self.request_timeout_start();
         let rows = rows.into_iter();
         let mut packet_writer = PacketType::RpcRequest.create_packet_writer(
@@ -1991,6 +1986,9 @@ impl TdsClient {
                     continue;
                 };
                 RpcParameter::reject_data_at_exec(positional_params.iter())?;
+                for param in &positional_params {
+                    param.ensure_vector_version_supported(vector_version)?;
+                }
                 if positional_params
                     .iter()
                     .any(RpcParameter::force_column_encryption)
@@ -2446,6 +2444,7 @@ impl TdsClient {
         }
 
         self.current_command_ce_setting = column_encryption;
+
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
         let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
@@ -2483,6 +2482,9 @@ impl TdsClient {
 
         let (timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
+        self.ensure_parameter_features_supported(
+            materialized_params.iter().chain(streamed_params.iter()),
+        )?;
         let rpc = self.build_sp_executesql_rpc(
             sql,
             materialized_params,
@@ -2872,7 +2874,7 @@ impl TdsClient {
         // RPC's first return value into the handle map.
         self.abort_pending_prepare_capture();
         self.transport.mark_known_dead();
-        if let Err(error) = self.close_transport_if_safe().await {
+        if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after streamed write abort");
         }
     }
@@ -3034,10 +3036,8 @@ impl TdsClient {
                 .without_cancellation(),
             self.transport.as_writer(),
         );
-        // `PacketWriter` only checks its budget once a write returns, so the
-        // ignore packet needs an outer deadline too. Reaching that one means the
-        // write never came back, so the future is dropped mid-record and the
-        // transport is retired without being written to again.
+        // A configured cancellation deadline replaces the writer's request
+        // budget. Either deadline must retire a write abandoned mid-record.
         let ignored = tokio::time::timeout_at(
             deadline.unwrap_or_else(|| tokio::time::Instant::now() + CANCEL_TIMEOUT),
             packet_writer.cancel_current_message(),
@@ -3072,7 +3072,7 @@ impl TdsClient {
             match tokio::time::timeout_at(deadline, self.drain_stream()).await {
                 Ok(result) => result,
                 Err(_) => {
-                    self.retire_without_writing();
+                    self.mark_failed_request_dead();
                     Err(crate::error::Error::TimeoutError(
                         crate::error::TimeoutErrorType::String(
                             "Timed out draining an ignored request".to_string(),
@@ -3145,34 +3145,27 @@ impl TdsClient {
     /// incomplete one, so the socket is all that is left to discard. Clearing
     /// the open-batch flag lets the next `check_and_reconnect` recover.
     async fn abort_partial_request(&mut self) {
-        self.execution_context.set_has_open_batch(false);
-        self.abort_pending_prepare_capture();
-        self.transport.mark_known_dead();
-        if let Err(error) = self.close_transport_if_safe().await {
+        self.mark_failed_request_dead();
+        if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after a partial request abort");
         }
     }
 
-    /// Retires the transport without shutting the stream down.
-    ///
-    /// For a write that was dropped mid-flight the stream may still hold a
-    /// half-flushed record, and `close_transport` shuts it down — which on the
-    /// native-tls engine emits a close_notify, one more write on exactly that
-    /// stream. `send_attention_and_wait` avoids it the same way, by marking the
-    /// connection dead and never writing again.
+    /// Discards an incomplete write without TLS shutdown, including on later close.
+    /// A completed send failure has already marked the transport dead and retains
+    /// its recovery policy; interrupting a still-live send disables recovery.
     fn retire_without_writing(&mut self) {
-        self.transport_shutdown_unsafe = true;
-        self.execution_context.set_has_open_batch(false);
-        self.abort_pending_prepare_capture();
+        if !self.transport.connection_known_dead() {
+            self.recovery_context.session_recovery_negotiated = false;
+        }
+        self.mark_failed_request_dead();
         self.transport.abort_transport();
     }
 
-    async fn close_transport_if_safe(&mut self) -> TdsResult<()> {
-        if self.transport_shutdown_unsafe {
-            self.transport.abort_transport();
-            return Ok(());
-        }
-        self.transport.close_transport().await
+    fn mark_failed_request_dead(&mut self) {
+        self.execution_context.set_has_open_batch(false);
+        self.abort_pending_prepare_capture();
+        self.transport.mark_known_dead();
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -3525,6 +3518,17 @@ impl TdsClient {
 
         // STEP 2: Send INSERT BULK command and consume response
         // Use the filtered metadata so the command only references mapped columns
+        if self.negotiated_settings.vector_version() < 2
+            && mapped_column_metadata.iter().any(|column| {
+                column.sql_type == crate::datatypes::bulk_copy_metadata::SqlDbType::Vector
+                    && column.scale == crate::datatypes::sqldatatypes::VectorBaseType::Float16 as u8
+            })
+        {
+            return Err(UsageError(format!(
+                "Vector float16 bulk copy requires negotiated vector version 2; current version is {}.",
+                self.negotiated_settings.vector_version()
+            )));
+        }
         let insert_bulk_command =
             build_insert_bulk_command(&table_name, &mapped_column_metadata, &options)?;
         self.send_batch_and_consume_response(insert_bulk_command, timeout_sec, cancel_handle)
@@ -3616,34 +3620,37 @@ impl TdsClient {
             writer.set_plaintext_ceks(plaintext_ceks);
         }
 
-        let serialize_result = async {
+        let write_result: TdsResult<()> = async {
             writer.begin().await?;
             for row in rows {
                 writer.write_row_zerocopy(&row).await?;
             }
-
             Ok(())
         }
         .await;
-        let (serialize_result, message) = writer.end_with_message(serialize_result).await;
 
-        // Rows preceding a failure may already be committed. Preserve their
-        // substitution verdict even when metadata, a row, or finalization fails.
-        self.code_page_conversion_loss = message.code_page_conversion_loss();
-        let rows_written = match serialize_result {
+        // Publish substitutions even on failure: earlier rows may already have
+        // been applied. Finalization only writes DONE and cannot change the verdict.
+        self.code_page_conversion_loss = writer.code_page_conversion_loss();
+
+        let write_result = match write_result {
+            Ok(()) => writer.finish().await,
+            Err(error) => Err(error),
+        };
+        let send_incomplete = writer.send_incomplete();
+        drop(writer);
+        let rows_written = match write_result {
             Ok(rows_written) => rows_written,
-            Err(error) => {
-                // A timeout can interrupt a packet/TLS record in any phase.
-                // Neither ATTENTION nor TLS shutdown is safe on that stream.
-                if message.send_incomplete() {
+            Err(original_error) => {
+                if send_incomplete {
+                    // Neither ATTENTION nor TLS shutdown is safe after a
+                    // partially written packet.
                     self.retire_without_writing();
                 } else {
-                    // INSERT BULK already put the server in bulk-load mode,
-                    // even if all BulkLoad bytes are still buffered locally.
-                    let timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
-                    let _ = self.send_attention_with_timeout(timeout).await;
+                    let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+                    let _ = self.send_attention_with_timeout(attention_timeout).await;
                 }
-                return Err(error);
+                return Err(original_error);
             }
         };
 
@@ -3828,7 +3835,7 @@ impl TdsClient {
         // form of the call) and encrypt them in place before sending the real
         // stored-procedure RPC. Positional parameters are described under
         // synthetic names bound by position; named parameters bind by name.
-        self.ensure_force_column_encryption_supported(
+        self.ensure_parameter_features_supported(
             positional_parameters
                 .iter()
                 .flatten()
@@ -3982,6 +3989,7 @@ impl TdsClient {
         // statement's id so a later sp_execute can encrypt values without
         // describing again. sp_prepare itself sends no user parameter values, so
         // nothing is encrypted here.
+        self.ensure_parameter_features_supported(named_params.iter())?;
         let describe_for_cache = if self.should_encrypt_parameters() && !named_params.is_empty() {
             let has_output = named_params.iter().any(|p| p.is_output());
             let describe = self
@@ -4506,6 +4514,10 @@ impl TdsClient {
         let (mut timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
 
+        self.ensure_parameter_features_supported(
+            materialized_params.iter().chain(streamed_params.iter()),
+        )?;
+
         if orphaned.is_some_and(|id| !self.prepared_handles.contains_key(&id)) {
             *orphaned = None;
         }
@@ -4779,7 +4791,7 @@ impl TdsClient {
         // sending the real RPC. The `@params` declaration keeps each parameter's
         // original type; only the value is replaced with ciphertext plus cipher
         // metadata.
-        self.ensure_force_column_encryption_supported(named_params.iter())?;
+        self.ensure_parameter_features_supported(named_params.iter())?;
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.pending_prepared_param_encryption = Some(
                 self.encrypt_parameters(
@@ -4946,7 +4958,7 @@ impl TdsClient {
         // the metadata captured when the statement was prepared, then send the
         // real RPC. sp_execute never describes — the metadata must already have
         // been cached by execute_sp_prepare on this connection.
-        self.ensure_force_column_encryption_supported(
+        self.ensure_parameter_features_supported(
             positional_parameters
                 .iter()
                 .flatten()
@@ -5256,8 +5268,8 @@ impl TdsClient {
     /// `close_transport` writes a TLS close_notify on a socket we just failed to
     /// read from, and its `?` returns before `self.stream = None`, so a
     /// swallowed error would leave the stream alive in exactly the degraded case
-    /// retirement exists for. Dropping the stream with no I/O is the fix; it
-    /// needs a new transport method and is left as follow-up.
+    /// retirement exists for. This drain path only marks the session dead;
+    /// interrupted writes additionally discard their transport without I/O.
     fn retire_after_failed_drain(&mut self, error: &crate::error::Error) {
         if self.take_settled_drain_interruption(error) {
             return;
@@ -6326,6 +6338,20 @@ impl TdsClient {
             && self.effective_command_ce_setting() == ExecutionColumnEncryptionSetting::Enabled
     }
 
+    /// Validate against the live session after recovery, before any RPC writes
+    /// (including an Always Encrypted describe request).
+    pub(in crate::connection) fn ensure_parameter_features_supported<'p>(
+        &self,
+        params: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> TdsResult<()> {
+        let vector_version = self.negotiated_settings.vector_version();
+        for param in params {
+            param.ensure_vector_version_supported(vector_version)?;
+            self.ensure_force_column_encryption_supported([param])?;
+        }
+        Ok(())
+    }
+
     /// Enforces the ForceColumnEncryption precondition: if any supplied parameter
     /// requires encryption but Always Encrypted is not enabled for this command,
     /// fail rather than sending it as plaintext. The per-parameter downgrade
@@ -6766,7 +6792,7 @@ impl TdsClient {
         // below and the trusted-master-key-path rejection in `decrypt_cek`. It is
         // deliberately distinct from the caller-misconfiguration case (the flag
         // set while Always Encrypted is off) that
-        // `ensure_force_column_encryption_supported` reports as a `UsageError`.
+        // `ensure_parameter_features_supported` reports as a `UsageError`.
         for index in 0..params.len() {
             if !params[index].force_column_encryption() {
                 continue;
@@ -9126,7 +9152,7 @@ impl TdsClient {
         // so a later call on a lingering handle cannot silently resurrect it.
         self.recovery_context.session_recovery_negotiated = false;
         self.transport.mark_known_dead();
-        self.close_transport_if_safe().await?;
+        self.transport.close_transport().await?;
         Ok(())
     }
 
@@ -9250,48 +9276,6 @@ impl TdsClient {
         .await
     }
 
-    async fn execute_transaction_request(
-        &mut self,
-        transaction_params: TransactionManagementType,
-        options: ExecuteOptions<'_>,
-    ) -> TdsResult<()> {
-        let ExecuteOptions {
-            timeout,
-            cancel,
-            on_error,
-            ..
-        } = options;
-        Self::note_on_error_ignored(on_error);
-
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
-        let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
-        let resolved = budget.into_timeout()?;
-        let timeout_sec = resolved.seconds();
-        self.remaining_request_timeout = resolved.duration();
-        self.cancel_handle = cancel.map(|handle| handle.child_handle());
-
-        let result = async {
-            let send_started = self.request_timeout_start();
-            let transaction =
-                TransactionManagementRequest::new(transaction_params, &self.execution_context);
-            let mut packet_writer =
-                transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
-            let sent = transaction.serialize(&mut packet_writer).await;
-            let message = packet_writer.suspend();
-            drop(transaction);
-            self.finish_send(sent, message).await?;
-            if let Some(start) = send_started {
-                self.update_remaining_timeout(start);
-            }
-            self.consume_transaction_response().await
-        }
-        .await;
-        self.remaining_request_timeout = None;
-        self.cancel_handle = None;
-        result
-    }
-
     /// Create a savepoint within the current transaction.
     ///
     /// The savepoint `name` can later be passed to
@@ -9321,6 +9305,8 @@ impl TdsClient {
     ///
     /// If `create_txn_params` is provided, a new transaction begins immediately
     /// after the commit (atomic commit-and-begin).
+    /// Runs unbounded; use [`commit_transaction_with_options`](Self::commit_transaction_with_options)
+    /// to supply a timeout or cancellation handle.
     #[instrument(skip(self), level = "info")]
     pub async fn commit_transaction(
         &mut self,
@@ -9331,10 +9317,8 @@ impl TdsClient {
             .await
     }
 
-    /// Like [`commit_transaction`](Self::commit_transaction), but with a request
-    /// timeout and cancellation handle. Recovery is checked only before sending;
-    /// an unknown commit outcome is never retried.
-    #[instrument(skip(self, options), level = "info")]
+    /// Commits with a request timeout and cancellation budget supplied through
+    /// `options`. Transaction completion never reconnects onto a new session.
     pub async fn commit_transaction_with_options<'a>(
         &mut self,
         name: Option<String>,
@@ -9360,6 +9344,8 @@ impl TdsClient {
     ///
     /// If `create_txn_params` is provided, a new transaction begins immediately
     /// after the rollback.
+    /// Runs unbounded; use [`rollback_transaction_with_options`](Self::rollback_transaction_with_options)
+    /// to supply a timeout or cancellation handle.
     #[instrument(skip(self), level = "info")]
     pub async fn rollback_transaction(
         &mut self,
@@ -9370,10 +9356,8 @@ impl TdsClient {
             .await
     }
 
-    /// Like [`rollback_transaction`](Self::rollback_transaction), but with a
-    /// request timeout and cancellation handle, including for named savepoints
-    /// and atomic rollback-and-begin.
-    #[instrument(skip(self, options), level = "info")]
+    /// Rolls back with a request timeout and cancellation budget supplied through
+    /// `options`. Transaction completion never reconnects onto a new session.
     pub async fn rollback_transaction_with_options<'a>(
         &mut self,
         name: Option<String>,
@@ -9393,6 +9377,69 @@ impl TdsClient {
             options.into(),
         )
         .await
+    }
+
+    async fn execute_transaction_request(
+        &mut self,
+        transaction_params: TransactionManagementType,
+        options: ExecuteOptions<'_>,
+    ) -> TdsResult<()> {
+        let ExecuteOptions {
+            timeout,
+            cancel,
+            on_error,
+            ..
+        } = options;
+        Self::note_on_error_ignored(on_error);
+
+        self.begin_command();
+        let reconnect_elapsed = if matches!(transaction_params, TransactionManagementType::Begin(_))
+        {
+            self.check_and_reconnect(timeout, cancel).await?
+        } else {
+            if self.is_connection_dead() {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "Cannot complete a transaction on a closed connection".to_string(),
+                ));
+            }
+            Duration::ZERO
+        };
+        let resolved = Self::deduct_timeout(timeout, reconnect_elapsed).into_timeout()?;
+        self.remaining_request_timeout = resolved.duration();
+        self.cancel_handle = cancel.map(|handle| handle.child_handle());
+        let prior_conversion_loss = matches!(
+            transaction_params,
+            TransactionManagementType::Commit { .. } | TransactionManagementType::Rollback { .. }
+        )
+        .then_some(self.code_page_conversion_loss);
+
+        let result = async {
+            let send_started = self.request_timeout_start();
+            let transaction =
+                TransactionManagementRequest::new(transaction_params, &self.execution_context);
+            let mut packet_writer = transaction.create_packet_writer(
+                self.transport.as_writer(),
+                resolved.seconds(),
+                cancel,
+            );
+            let sent = transaction.serialize(&mut packet_writer).await;
+            let message = packet_writer.suspend();
+            drop(transaction);
+            self.finish_send(sent, message).await?;
+            if let Some(start) = send_started {
+                self.update_remaining_timeout(start);
+            }
+            self.consume_transaction_response().await
+        }
+        .await;
+        // Internal transaction completion must retain the bulk batch's verdict,
+        // including when sending or consuming the transaction response fails.
+        if let Some(had_loss) = prior_conversion_loss {
+            self.code_page_conversion_loss = had_loss;
+        }
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        result
     }
 
     /// Retrieve the DTC (Distributed Transaction Coordinator) network address from the server.
@@ -9868,6 +9915,7 @@ mod tests {
     struct TestTransport {
         closed: bool,
         close_calls: Arc<std::sync::atomic::AtomicUsize>,
+        close_should_hang: bool,
         pending_tokens: VecDeque<Tokens>,
         reset_mode: ResetConnectionMode,
         /// Mirrors the production writer's dispatch record so client tests can
@@ -9891,6 +9939,8 @@ mod tests {
         /// When set, `send` never returns, so a test can drive a write deadline
         /// without a real stalled peer.
         send_should_hang: Arc<std::sync::atomic::AtomicBool>,
+        send_prefix_before_hang: bool,
+        stall_packet_type: Option<PacketType>,
         /// Fires after the first successful send, allowing a multi-packet
         /// request to be cancelled while the server holds its first packet.
         cancel_after_send: Option<tokio_util::sync::CancellationToken>,
@@ -9898,11 +9948,7 @@ mod tests {
         cancel_during_send: Option<tokio_util::sync::CancellationToken>,
         sends_before_cancel: usize,
         send_delay: Option<Duration>,
-        receive_delay: Option<Duration>,
-        /// Simulates a send completing in one poll after a stalled runtime,
-        /// so only the post-send budget check can observe the timeout.
         send_completion_delay: Option<Duration>,
-        partial_bulk_send: bool,
         /// Attentions requested, so a test can tell the cancel-a-sent-request
         /// path from the withdraw-a-partial-one path.
         attentions: Arc<std::sync::atomic::AtomicUsize>,
@@ -9913,6 +9959,8 @@ mod tests {
         /// packet had been framed.
         response_complete: bool,
         receive_error: Option<crate::error::Error>,
+        receive_delay: Option<Duration>,
+        receive_should_hang: bool,
         sync_header_available: bool,
         /// Returned by the next `try_receive_row_header`, as if the buffered
         /// bytes it read were rejected.
@@ -9930,6 +9978,7 @@ mod tests {
             Self {
                 closed: false,
                 close_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                close_should_hang: false,
                 pending_tokens: VecDeque::new(),
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
@@ -9940,18 +9989,20 @@ mod tests {
                 plp_read_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                send_prefix_before_hang: false,
+                stall_packet_type: None,
                 cancel_after_send: None,
                 cancel_on_writer_creation: None,
                 cancel_during_send: None,
                 sends_before_cancel: 0,
                 send_delay: None,
-                receive_delay: None,
                 send_completion_delay: None,
-                partial_bulk_send: false,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
                 response_complete: false,
                 receive_error: None,
+                receive_delay: None,
+                receive_should_hang: false,
                 sync_header_available: false,
                 sync_header_error: None,
                 sync_columns: VecDeque::new(),
@@ -10036,17 +10087,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(remaining_request_timeout);
-            if let Some(delay) = self.receive_delay.take() {
-                let receive = tokio::time::sleep(delay);
-                if let Some(timeout) = remaining_request_timeout {
-                    tokio::time::timeout(timeout, receive).await.map_err(|_| {
-                        crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
-                            "test response timed out".to_string(),
-                        ))
-                    })?;
-                } else {
-                    receive.await;
-                }
+            if self.receive_should_hang {
+                std::future::pending::<()>().await;
             }
             // Mirrors the production readers, which run every read under the
             // handle. Without this a cancelled read looks identical to a healthy
@@ -10057,6 +10099,18 @@ mod tests {
                 return Err(crate::error::Error::OperationCancelledError(
                     "Request was cancelled".to_string(),
                 ));
+            }
+            if let Some(delay) = self.receive_delay.take() {
+                let response = tokio::time::sleep(delay);
+                if let Some(timeout) = remaining_request_timeout {
+                    tokio::time::timeout(timeout, response).await.map_err(|_| {
+                        crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                            "mock response timed out".to_string(),
+                        ))
+                    })?;
+                } else {
+                    response.await;
+                }
             }
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(tok);
@@ -10164,12 +10218,13 @@ mod tests {
             if self
                 .send_should_hang
                 .load(std::sync::atomic::Ordering::SeqCst)
+                && self
+                    .stall_packet_type
+                    .is_none_or(|packet_type| data[0] == packet_type as u8)
             {
-                std::future::pending::<()>().await;
-            }
-            if self.partial_bulk_send && data[0] == PacketType::BulkLoad as u8 {
-                self.partial_bulk_send = false;
-                self.sent.lock().unwrap().extend_from_slice(&data[..8]);
+                if self.send_prefix_before_hang {
+                    self.sent.lock().unwrap().extend_from_slice(&data[..8]);
+                }
                 std::future::pending::<()>().await;
             }
             if self.sends_before_cancel == 0
@@ -10180,10 +10235,11 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             self.sends_before_cancel = self.sends_before_cancel.saturating_sub(1);
+            self.sent.lock().unwrap().extend_from_slice(data);
             if let Some(delay) = self.send_completion_delay.take() {
+                // Model a completed send winning the deadline race without yielding.
                 std::thread::sleep(delay);
             }
-            self.sent.lock().unwrap().extend_from_slice(data);
             if let Some(cancel) = self.cancel_after_send.take() {
                 cancel.cancel();
             }
@@ -10236,8 +10292,15 @@ mod tests {
         async fn close_transport(&mut self) -> TdsResult<()> {
             self.close_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.close_should_hang && !self.closed {
+                std::future::pending::<()>().await;
+            }
             self.closed = true;
             Ok(())
+        }
+        fn abort_transport(&mut self) {
+            self.closed = true;
+            self.known_dead = true;
         }
         async fn send_attention_with_timeout(
             &mut self,
@@ -10690,6 +10753,501 @@ mod tests {
             Vec::new(),
         );
         (client, sent)
+    }
+
+    fn set_vector_ack(client: &mut TdsClient, acknowledgement: Option<(u8, bool)>) {
+        use crate::message::features::vectorfeature::VectorFeature;
+        use crate::message::login::Feature;
+
+        client
+            .negotiated_settings
+            .session_settings
+            .supported_features
+            .clear();
+        if let Some((version, acknowledged)) = acknowledgement {
+            let mut feature = VectorFeature::default();
+            feature.deserialize(&[version]).unwrap();
+            feature.set_acknowledged(acknowledged);
+            client
+                .negotiated_settings
+                .session_settings
+                .supported_features
+                .push(Box::new(feature));
+        }
+    }
+
+    const VECTOR_RPC_ROUTES: [&str; 11] = [
+        "executesql",
+        "begin_atomic",
+        "begin_streamed",
+        "prepared_streamed_new",
+        "prepared_streamed_reused",
+        "stored_positional",
+        "stored_named",
+        "prepared_new",
+        "prepared_reused",
+        "execute_positional",
+        "prepare",
+    ];
+
+    async fn execute_vector_rpc(
+        client: &mut TdsClient,
+        route: &str,
+        param: RpcParameter,
+    ) -> TdsResult<()> {
+        match route {
+            "executesql" => client
+                .execute_sp_executesql("SELECT @v".to_string(), vec![param], ())
+                .await
+                .map(|_| ()),
+            "begin_atomic" => client
+                .begin_sp_executesql("SELECT @v".to_string(), vec![param], ())
+                .await
+                .map(|_| ()),
+            "begin_streamed" => {
+                client
+                    .begin_sp_executesql(
+                        "SELECT @v, @data".to_string(),
+                        vec![streamed_varbinary("@data"), param],
+                        (),
+                    )
+                    .await?;
+                client.write_streamed_null()?;
+                client.end_streamed_param().await.map(|_| ())
+            }
+            "prepared_streamed_new" | "prepared_streamed_reused" => {
+                let mut statement = PreparedStatement::new("SELECT @v, @data");
+                if route == "prepared_streamed_reused" {
+                    statement.id = Some(client.register_prepared_handle_for_test(7));
+                }
+                let mut orphaned = None;
+                client
+                    .begin_execute_prepared(
+                        &mut statement,
+                        vec![streamed_varbinary("@data"), param],
+                        &mut orphaned,
+                        (),
+                    )
+                    .await?;
+                client.write_streamed_null()?;
+                client
+                    .end_execute_prepared_param(&mut statement, &mut orphaned)
+                    .await
+                    .map(|_| ())
+            }
+            "stored_positional" => client
+                .execute_stored_procedure("dbo.p".to_string(), Some(vec![param]), None, ())
+                .await
+                .map(|_| ()),
+            "stored_named" => client
+                .execute_stored_procedure("dbo.p".to_string(), None, Some(vec![param]), ())
+                .await
+                .map(|_| ()),
+            "prepared_new" | "prepared_reused" => {
+                let mut statement = PreparedStatement::new("SELECT @v");
+                if route == "prepared_reused" {
+                    statement.id = Some(client.register_prepared_handle_for_test(7));
+                }
+                client
+                    .execute_prepared(&mut statement, vec![param], &mut None, ())
+                    .await
+                    .map(|_| ())
+            }
+            "execute_positional" => {
+                let id = client.register_prepared_handle_for_test(7);
+                client
+                    .execute_sp_execute(id, Some(vec![param]), None, false, ())
+                    .await
+                    .map(|_| ())
+            }
+            "prepare" => client
+                .execute_sp_prepare("SELECT @v".to_string(), vec![param], false, ())
+                .await
+                .map(|_| ()),
+            _ => unreachable!("unknown vector RPC route"),
+        }
+    }
+
+    #[tokio::test]
+    async fn float16_rpc_requires_acknowledged_version_two_before_writes() {
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for route in VECTOR_RPC_ROUTES {
+                for is_null in [false, true] {
+                    for flags in [StatusFlags::NONE, StatusFlags::BY_REF_VALUE] {
+                        let (mut client, sent) = create_capturing_client(vec![
+                            Tokens::ReturnValue(ae_return_value_token(
+                                "@handle",
+                                ColumnValues::Int(7),
+                                None,
+                            )),
+                            done_no_more(),
+                        ]);
+                        set_vector_ack(&mut client, acknowledgement);
+                        let value = if is_null {
+                            None
+                        } else {
+                            Some(SqlVector::try_from_f16(vec![1.0, -2.0]).unwrap())
+                        };
+                        let param = RpcParameter::new(
+                            Some("@v".to_string()),
+                            flags,
+                            SqlType::Vector(value, 2, VectorBaseType::Float16),
+                        );
+
+                        let result = execute_vector_rpc(&mut client, route, param).await;
+                        if acknowledgement == Some((2, true)) {
+                            result.unwrap_or_else(|e| panic!("{route}: {e}"));
+                            assert!(!sent.lock().unwrap().is_empty(), "{route}");
+                        } else {
+                            let err = result.expect_err(route);
+                            assert!(
+                                matches!(&err, UsageError(message) if message.contains("float16") && message.contains("version")),
+                                "{route}: {err}"
+                            );
+                            assert!(sent.lock().unwrap().is_empty(), "{route}");
+                            assert!(!client.has_open_batch(), "{route}");
+                            assert!(matches!(
+                                client.streamed_write_state,
+                                StreamedWriteState::Idle
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn float32_rpc_preserves_legacy_versions_and_off_behavior() {
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for route in VECTOR_RPC_ROUTES {
+                for is_null in [false, true] {
+                    let (mut client, sent) = create_capturing_client(vec![
+                        Tokens::ReturnValue(ae_return_value_token(
+                            "@handle",
+                            ColumnValues::Int(7),
+                            None,
+                        )),
+                        done_no_more(),
+                    ]);
+                    set_vector_ack(&mut client, acknowledgement);
+                    let value = if is_null {
+                        None
+                    } else {
+                        Some(SqlVector::try_from_f32(vec![1.0, -2.0]).unwrap())
+                    };
+                    let param = RpcParameter::new(
+                        Some("@v".to_string()),
+                        StatusFlags::NONE,
+                        SqlType::Vector(value, 2, VectorBaseType::Float32),
+                    );
+
+                    execute_vector_rpc(&mut client, route, param)
+                        .await
+                        .unwrap_or_else(|e| panic!("{route}: {e}"));
+                    assert!(!sent.lock().unwrap().is_empty(), "{route}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_tvp_checks_templates_and_cells_before_writes() {
+        use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        let float16 = SqlType::Vector(
+            Some(SqlVector::try_from_f16(vec![1.0, -2.0]).unwrap()),
+            2,
+            VectorBaseType::Float16,
+        );
+        let null16 = SqlType::Vector(None, 2, VectorBaseType::Float16);
+        let null32 = SqlType::Vector(None, 2, VectorBaseType::Float32);
+        let disguised16 = SqlType::Vector(
+            Some(SqlVector::try_from_f16(vec![1.0, -2.0]).unwrap()),
+            2,
+            VectorBaseType::Float32,
+        );
+        let cases = [
+            ("empty", null16.clone(), Vec::new()),
+            ("null_cell", null16.clone(), vec![vec![null16.clone()]]),
+            ("value", null16.clone(), vec![vec![float16.clone()]]),
+            ("cell_declaration", null32.clone(), vec![vec![null16]]),
+            (
+                "cell_payload",
+                null32.clone(),
+                vec![vec![disguised16.clone()]],
+            ),
+            ("template_payload", disguised16.clone(), Vec::new()),
+            (
+                "later_row",
+                null32.clone(),
+                vec![vec![null32], vec![disguised16]],
+            ),
+        ];
+
+        for (case, template, rows) in cases {
+            let param = RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::NONE,
+                SqlType::Table(
+                    TvpTypeName::new(Some("dbo".to_string()), "VectorTable".to_string()),
+                    Some(TvpTableData::new(
+                        vec![
+                            TvpColumnDef::new(SqlType::Int(None)),
+                            TvpColumnDef::new(template),
+                        ],
+                        rows.into_iter()
+                            .map(|mut row| {
+                                row.insert(0, SqlType::Int(Some(1)));
+                                row
+                            })
+                            .collect(),
+                    )),
+                ),
+            );
+            param.ensure_vector_version_supported(2).unwrap();
+            for acknowledgement in [None, Some((0, true)), Some((1, true)), Some((2, false))] {
+                for route in VECTOR_RPC_ROUTES {
+                    let (mut client, sent) = create_capturing_client(Vec::new());
+                    set_vector_ack(&mut client, acknowledgement);
+                    let err = execute_vector_rpc(&mut client, route, param.clone())
+                        .await
+                        .expect_err(case);
+                    assert!(
+                        matches!(&err, UsageError(message) if message.contains("float16") && message.contains("version")),
+                        "{case}/{route}: {err}"
+                    );
+                    assert!(sent.lock().unwrap().is_empty(), "{case}/{route}");
+                    assert!(!client.has_open_batch(), "{case}/{route}");
+                    assert!(matches!(
+                        client.streamed_write_state,
+                        StreamedWriteState::Idle
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_tvp_preserves_supported_and_null_tables() {
+        use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
+        use crate::datatypes::sql_vector::SqlVector;
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for base_type in [VectorBaseType::Float16, VectorBaseType::Float32] {
+                for row_count in [None, Some(0), Some(1), Some(2)] {
+                    if base_type == VectorBaseType::Float16
+                        && row_count.is_some()
+                        && acknowledgement != Some((2, true))
+                    {
+                        continue;
+                    }
+                    let template = SqlType::Vector(None, 2, base_type);
+                    let value = match base_type {
+                        VectorBaseType::Float16 => SqlVector::try_from_f16(vec![1.0, -2.0]),
+                        VectorBaseType::Float32 => SqlVector::try_from_f32(vec![1.0, -2.0]),
+                    }
+                    .unwrap();
+                    let param = RpcParameter::new(
+                        Some("@v".to_string()),
+                        StatusFlags::NONE,
+                        SqlType::Table(
+                            TvpTypeName::new(Some("dbo".to_string()), "VectorTable".to_string()),
+                            row_count.map(|count| {
+                                TvpTableData::new(
+                                    vec![TvpColumnDef::new(template.clone())],
+                                    [
+                                        vec![template.clone()],
+                                        vec![SqlType::Vector(Some(value), 2, base_type)],
+                                    ]
+                                    .into_iter()
+                                    .take(count)
+                                    .collect(),
+                                )
+                            }),
+                        ),
+                    );
+                    for route in VECTOR_RPC_ROUTES {
+                        let (mut client, sent) = create_capturing_client(vec![
+                            Tokens::ReturnValue(ae_return_value_token(
+                                "@handle",
+                                ColumnValues::Int(7),
+                                None,
+                            )),
+                            done_no_more(),
+                        ]);
+                        set_vector_ack(&mut client, acknowledgement);
+                        execute_vector_rpc(&mut client, route, param.clone())
+                            .await
+                            .unwrap_or_else(|e| panic!("{base_type:?}/{row_count:?}/{route}: {e}"));
+                        assert!(!sent.lock().unwrap().is_empty(), "{route}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_bulk_load_checks_negotiation_before_insert_bulk() {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::{VECTOR_HEADER_SIZE, VectorBaseType};
+
+        for acknowledgement in [
+            None,
+            Some((0, true)),
+            Some((1, true)),
+            Some((2, false)),
+            Some((2, true)),
+        ] {
+            for base_type in [VectorBaseType::Float16, VectorBaseType::Float32] {
+                for map_only_int in [false, true] {
+                    let (mut client, sent) =
+                        create_capturing_client(vec![done_no_more(), done_no_more()]);
+                    set_vector_ack(&mut client, acknowledgement);
+                    let length = (VECTOR_HEADER_SIZE + base_type.element_size_bytes()) as i32;
+                    let columns = vec![
+                        BulkCopyColumnMetadata::new(
+                            "v",
+                            SqlDbType::Vector,
+                            TdsDataType::Vector as u8,
+                        )
+                        .with_length(length, TypeLength::Variable(length))
+                        .with_scale(base_type as u8),
+                        BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
+                            .with_length(4, TypeLength::Fixed(4)),
+                    ];
+                    let mappings = if map_only_int {
+                        vec![ResolvedColumnMapping {
+                            source_index: 0,
+                            destination_index: 1,
+                            destination_name: "id".to_string(),
+                            destination_type: SqlDbType::Int,
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                    client.reconnect_elapsed_for_test = Some(Duration::ZERO);
+                    let result = client
+                        .execute_bulk_load_streaming_zerocopy(
+                            "#t".to_string(),
+                            columns,
+                            BulkCopyOptions::default(),
+                            None,
+                            None,
+                            std::iter::empty::<IntRow>(),
+                            &mappings,
+                        )
+                        .await;
+                    assert!(client.reconnect_elapsed_for_test.is_none());
+                    if base_type == VectorBaseType::Float16
+                        && !map_only_int
+                        && acknowledgement != Some((2, true))
+                    {
+                        assert!(matches!(result, Err(UsageError(message))
+                            if message.contains("float16 bulk copy requires negotiated vector version 2")));
+                        assert!(sent.lock().unwrap().is_empty());
+                        assert!(!client.has_open_batch());
+                    } else {
+                        assert_eq!(result.unwrap(), 0);
+                        assert!(!sent.lock().unwrap().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_validation_runs_after_recovery_check() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        for route in [
+            "executesql",
+            "begin_atomic",
+            "begin_streamed",
+            "prepared_streamed_new",
+            "prepared_streamed_reused",
+            "stored_named",
+            "prepared_new",
+            "prepared_reused",
+            "prepare",
+        ] {
+            let (mut client, sent) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, Some((1, true)));
+            client.reconnect_elapsed_for_test = Some(Duration::ZERO);
+            let param = RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Vector(None, 2, VectorBaseType::Float16),
+            );
+            let err = execute_vector_rpc(&mut client, route, param)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, UsageError(_)), "{route}");
+            assert!(client.reconnect_elapsed_for_test.is_none(), "{route}");
+            assert!(sent.lock().unwrap().is_empty(), "{route}");
+        }
+    }
+
+    #[test]
+    fn parameter_feature_validation_uses_current_session_settings() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        let mut client = create_test_client();
+        let param = RpcParameter::new(
+            Some("@v".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Vector(None, 2, VectorBaseType::Float16),
+        );
+        set_vector_ack(&mut client, Some((2, true)));
+        client
+            .ensure_parameter_features_supported([&param])
+            .unwrap();
+        set_vector_ack(&mut client, Some((1, true)));
+        assert!(
+            client
+                .ensure_parameter_features_supported([&param])
+                .is_err()
+        );
+        set_vector_ack(&mut client, None);
+        assert!(
+            client
+                .ensure_parameter_features_supported([&param])
+                .is_err()
+        );
+
+        let param = RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(7)))
+            .with_force_column_encryption(true);
+        let err = client
+            .ensure_parameter_features_supported([&param])
+            .unwrap_err();
+        assert!(matches!(err, UsageError(message) if message.contains("ForceColumnEncryption")));
     }
 
     /// Like [`create_capturing_client`], but shares the timeout each
@@ -14917,175 +15475,6 @@ mod tests {
         }
     }
 
-    async fn assert_bulk_partial_send_timeout(
-        column_count: usize,
-        row_count: usize,
-        active_transaction: bool,
-    ) {
-        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
-        use crate::datatypes::sqldatatypes::TdsDataType;
-
-        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
-        transport.partial_bulk_send = true;
-        let sent = Arc::clone(&transport.sent);
-        let closes = Arc::clone(&transport.close_calls);
-        let attentions = Arc::clone(&transport.attentions);
-        let mut client = create_test_client_with_transport(transport);
-        if active_transaction {
-            client.execution_context.set_transaction_descriptor(42);
-        } else {
-            client.recovery_context.session_recovery_negotiated = true;
-        }
-        let columns = (0..column_count)
-            .map(|index| {
-                BulkCopyColumnMetadata::new(
-                    format!("column_{index}"),
-                    SqlDbType::Int,
-                    TdsDataType::Int4 as u8,
-                )
-                .with_length(4, TypeLength::Fixed(4))
-            })
-            .collect();
-        let rows_visited = std::cell::Cell::new(0);
-        let rows = (0..row_count).map(|_| {
-            rows_visited.set(rows_visited.get() + 1);
-            IntRow(10)
-        });
-        let start = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.execute_bulk_load_streaming_zerocopy(
-                "#t".to_string(),
-                columns,
-                BulkCopyOptions::default(),
-                Some(1),
-                None,
-                rows,
-                &[],
-            ),
-        )
-        .await
-        .expect("bulk timeout cleanup must not hang");
-
-        assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
-        assert!(start.elapsed() <= Duration::from_secs(1));
-        if column_count > 1 {
-            assert_eq!(rows_visited.get(), 0, "metadata must fail before rows");
-        } else if row_count > 1 {
-            assert!(rows_visited.get() > 0 && rows_visited.get() < row_count);
-        } else {
-            assert_eq!(
-                rows_visited.get(),
-                row_count,
-                "finalization must follow rows"
-            );
-        }
-        assert!(client.transport.connection_known_dead());
-        assert!(!client.execution_context.has_open_batch());
-        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        let wire = sent.lock().unwrap().clone();
-        let mut offset = 0;
-        while wire[offset] == PacketType::SqlBatch as u8 {
-            offset += u16::from_be_bytes([wire[offset + 2], wire[offset + 3]]) as usize;
-        }
-        assert_eq!(wire[offset], PacketType::BulkLoad as u8);
-        assert_eq!(wire.len() - offset, 8, "no writes after the partial packet");
-        if active_transaction {
-            assert!(matches!(
-                client.rollback_transaction(None, None).await,
-                Err(crate::error::Error::ConnectionClosed(_))
-            ));
-        } else {
-            assert!(
-                client
-                    .recovery_context
-                    .is_recovery_possible(&client.execution_context)
-            );
-            let cancel = CancelHandle::new();
-            cancel.cancel();
-            assert!(matches!(
-                client.check_and_reconnect(Some(1), Some(&cancel)).await,
-                Err(crate::error::Error::SessionRecoveryFailed { .. })
-            ));
-            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-            client.close_connection().await.unwrap();
-            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        }
-        assert_eq!(
-            *sent.lock().unwrap(),
-            wire,
-            "cleanup and recovery must not write either"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bulk_metadata_timeout_retires_partial_send_without_writing() {
-        assert_bulk_partial_send_timeout(300, 1, true).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bulk_row_timeout_retires_partial_send_without_writing() {
-        assert_bulk_partial_send_timeout(1, 2000, true).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bulk_end_timeout_retires_partial_send_without_writing() {
-        assert_bulk_partial_send_timeout(1, 1, true).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bulk_interrupted_send_recovery_never_shuts_down_the_damaged_transport() {
-        for (columns, rows) in [(300, 1), (1, 2000), (1, 1)] {
-            assert_bulk_partial_send_timeout(columns, rows, false).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn bulk_buffered_row_failure_still_cancels_the_insert_bulk_preamble() {
-        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
-        use crate::datatypes::sqldatatypes::TdsDataType;
-
-        struct FailingRow;
-
-        #[async_trait]
-        impl BulkLoadRow for FailingRow {
-            async fn write_to_packet(
-                &self,
-                _writer: &mut StreamingBulkLoadWriter<'_>,
-                _column_index: &mut usize,
-            ) -> TdsResult<()> {
-                Err(UsageError("injected bulk row error".to_string()))
-            }
-        }
-
-        let transport = TestTransport::with_tokens(vec![done_no_more()]);
-        let attentions = Arc::clone(&transport.attentions);
-        let closes = Arc::clone(&transport.close_calls);
-        let mut client = create_test_client_with_transport(transport);
-        let result = client
-            .execute_bulk_load_streaming_zerocopy(
-                "#t".to_string(),
-                vec![
-                    BulkCopyColumnMetadata::new("id", SqlDbType::Int, TdsDataType::Int4 as u8)
-                        .with_length(4, TypeLength::Fixed(4)),
-                ],
-                BulkCopyOptions::default(),
-                None,
-                None,
-                std::iter::once(FailingRow),
-                &[],
-            )
-            .await;
-
-        assert!(matches!(result, Err(UsageError(message)) if message == "injected bulk row error"));
-        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(!client.transport.connection_known_dead());
-        assert!(!client.execution_context.has_open_batch());
-    }
-
     #[tokio::test]
     async fn bulk_load_reports_client_rows_not_server_done_count() {
         // Regression for #209: the count reported to callers must be the number
@@ -15135,6 +15524,141 @@ mod tests {
             reported, 3,
             "must report the 3 client-written rows, not the server DONE_COUNT (999)"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bulk_load_write_deadlines_retire_partial_metadata_rows_and_final_packets() {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        for phase in ["metadata", "rows", "finalize"] {
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.close_should_hang = true;
+            transport
+                .send_should_hang
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            transport.send_prefix_before_hang = true;
+            transport.stall_packet_type = Some(PacketType::BulkLoad);
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let closes = Arc::clone(&transport.close_calls);
+            let mut client = create_test_client_with_transport(transport);
+            client.recovery_context.session_recovery_negotiated = true;
+            let columns = (0..if phase == "metadata" { 512 } else { 1 })
+                .map(|index| {
+                    BulkCopyColumnMetadata::new(
+                        format!("c{index}"),
+                        SqlDbType::Int,
+                        TdsDataType::Int4 as u8,
+                    )
+                    .with_length(4, TypeLength::Fixed(4))
+                })
+                .collect();
+            let row_count = match phase {
+                "metadata" => 0,
+                "rows" => 2000,
+                "finalize" => 1,
+                _ => unreachable!(),
+            };
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.execute_bulk_load_streaming_zerocopy(
+                    "#stalled_bulk".to_string(),
+                    columns,
+                    BulkCopyOptions::default(),
+                    Some(1),
+                    None,
+                    (0..row_count).map(IntRow),
+                    &[],
+                ),
+            )
+            .await
+            .expect("the bulk write deadline must beat the watchdog");
+            assert!(
+                matches!(result, Err(crate::error::Error::TimeoutError(_))),
+                "{phase}"
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(1), "{phase}");
+            assert!(client.is_connection_dead(), "{phase}");
+            assert_eq!(
+                attentions.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{phase}"
+            );
+            assert_eq!(
+                closes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{phase}"
+            );
+            let length_before_retry = {
+                let wire = sent.lock().unwrap();
+                let mut offset = 0;
+                while wire[offset] != PacketType::BulkLoad as u8 {
+                    offset += usize::from(u16::from_be_bytes([wire[offset + 2], wire[offset + 3]]));
+                }
+                assert_eq!(
+                    wire.len() - offset,
+                    8,
+                    "{phase}: only the bulk header was written"
+                );
+                wire.len()
+            };
+            let retry = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions::new().timeout_secs(1),
+                ),
+            )
+            .await;
+            assert!(
+                matches!(&retry, Ok(Err(crate::error::Error::ConnectionClosed(_)))),
+                "{phase}: an interrupted bulk write must not enter recovery: {retry:?}"
+            );
+            assert!(!client.is_session_recovery_enabled(), "{phase}");
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(sent.lock().unwrap().len(), length_before_retry, "{phase}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_load_row_error_at_clean_packet_boundary_preserves_reuse() {
+        use crate::datatypes::bulk_copy_metadata::{SqlDbType, TypeLength};
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let transport = TestTransport::with_tokens(vec![done_no_more(), done_no_more()]);
+        let attentions = Arc::clone(&transport.attentions);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let columns = ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                BulkCopyColumnMetadata::new(name, SqlDbType::Int, TdsDataType::Int4 as u8)
+                    .with_length(4, TypeLength::Fixed(4))
+            })
+            .collect();
+        let error = client
+            .execute_bulk_load_streaming_zerocopy(
+                "#invalid_bulk_row".to_string(),
+                columns,
+                BulkCopyOptions::default(),
+                Some(1),
+                None,
+                [IntRow(1)].into_iter(),
+                &[],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsageError(message) if message.contains("Row 1 wrote 1 columns")),
+            "{error}"
+        );
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!client.is_connection_dead());
+        client.execute("SELECT 1".to_string(), ()).await.unwrap();
     }
 
     #[test]
@@ -15532,6 +16056,22 @@ mod tests {
             err.to_string().contains("Session not recoverable"),
             "Expected SessionNotRecoverable, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn abort_partial_request_preserves_recovery_after_safe_shutdown() {
+        let transport = TestTransport::new();
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        client.recovery_context.session_recovery_negotiated = true;
+        client.execution_context.set_has_open_batch(true);
+
+        client.abort_partial_request().await;
+
+        assert!(client.is_session_recovery_enabled());
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -18785,6 +19325,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_batch_rejects_float16_without_negotiated_vector_v2() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+
+        let float16 = || {
+            RpcParameter::new(
+                Some("@v".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Vector(None, 2, VectorBaseType::Float16),
+            )
+        };
+        let int = || RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(1)));
+
+        for ack in [Some((1, true)), None] {
+            // Reused handle: the first (and only) row carries the float16 value.
+            let (mut client, sent) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, ack);
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let error = client
+                .execute_sp_execute_batch_for_test(statement_id, vec![Ok((0, vec![float16()]))])
+                .await
+                .expect_err("float16 needs negotiated vector version 2");
+            assert!(
+                matches!(&error, UsageError(message) if message.contains("negotiated vector version 2")),
+                "{ack:?}"
+            );
+            assert!(sent.lock().unwrap().is_empty(), "{ack:?}");
+
+            // Fresh batch: a later row carries the float16 value.
+            let (mut client, _) = create_capturing_client(Vec::new());
+            set_vector_ack(&mut client, ack);
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let rows = vec![Ok((0, vec![int()])), Ok((1, vec![float16()]))];
+            let error = client
+                .execute_sp_execute_batch_for_test(statement_id, rows)
+                .await
+                .expect_err("a later float16 row must be rejected too");
+            assert!(
+                matches!(&error, UsageError(message) if message.contains("negotiated vector version 2")),
+                "{ack:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prepared_batch_streams_result_sets_and_reports_completed_indices() {
         let tokens = vec![
             empty_col_metadata(),
@@ -19881,6 +20465,7 @@ mod tests {
     #[tokio::test]
     async fn streamed_write_chunk_send_failure_aborts_stream() {
         let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+        client.recovery_context.session_recovery_negotiated = true;
 
         client
             .begin_sp_executesql(
@@ -19927,6 +20512,23 @@ mod tests {
             .await
             .expect_err("no active streamed parameter after abort");
         assert!(matches!(end, UsageError(_)));
+
+        // A zero login budget proves recovery is reached without opening a socket.
+        client
+            .recovery_context
+            .client_context
+            .as_mut()
+            .unwrap()
+            .connect_timeout = 0;
+        let retry = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&retry, Error::SessionRecoveryFailed { .. }),
+            "a transport failure must remain recoverable: {retry:?}"
+        );
+        assert!(client.is_session_recovery_enabled());
     }
 
     /// A send failure while finalizing the last streamed parameter (flushing the
@@ -20637,48 +21239,6 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn prepared_stream_interrupted_send_preserves_orphan_on_timeout() {
-        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
-
-        let mut transport = TestTransport::new();
-        transport.send_delay = Some(Duration::from_secs(60));
-        let sent = Arc::clone(&transport.sent);
-        let attentions = Arc::clone(&transport.attentions);
-        let closes = Arc::clone(&transport.close_calls);
-        let mut client = create_test_client_with_transport(transport);
-        let id = client.issue_statement_id();
-        client.prepared_handles.insert(id, 77);
-        client
-            .prepared_param_encryption
-            .insert(id, Arc::new(DescribeParameterEncryptionResult::new()));
-        let mut statement = PreparedStatement::new("SELECT @v");
-        let mut orphaned = Some(id);
-        client
-            .begin_execute_prepared(
-                &mut statement,
-                vec![streamed_varbinary("@v")],
-                &mut orphaned,
-                ExecuteOptions::new().timeout_secs(1),
-            )
-            .await
-            .unwrap();
-        let error = client
-            .end_execute_prepared_param(&mut statement, &mut orphaned)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, crate::error::Error::TimeoutError(_)));
-        assert!(statement.id().is_none());
-        assert_eq!(orphaned, Some(id));
-        assert_eq!(client.prepared_handles.get(&id), Some(&77));
-        assert!(client.prepared_param_encryption.contains_key(&id));
-        assert!(client.transport.connection_known_dead());
-        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(sent.lock().unwrap().is_empty());
-    }
-
     #[tokio::test]
     async fn prepared_stream_cross_identity_orphan_uses_standalone_release() {
         let (mut client, sent) = create_capturing_client(vec![
@@ -20804,97 +21364,358 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn transaction_completion_timeout_retires_a_stalled_write_without_retry() {
-        for commit in [true, false] {
-            let mut transport = TestTransport::new();
-            transport.send_delay = Some(Duration::from_secs(60));
-            let closes = Arc::clone(&transport.close_calls);
-            let attentions = Arc::clone(&transport.attentions);
-            let sent = Arc::clone(&transport.sent);
-            let mut client = create_test_client_with_transport(transport);
-            client.execution_context.set_transaction_descriptor(42);
-            let options = ExecuteOptions::new().timeout_secs(1);
-            let start = tokio::time::Instant::now();
-            let result = if commit {
-                client
-                    .commit_transaction_with_options(None, None, options)
-                    .await
-            } else {
-                client
-                    .rollback_transaction_with_options(None, None, options)
-                    .await
-            };
-            assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
-            assert_eq!(start.elapsed(), Duration::from_secs(1));
-            assert!(client.remaining_request_timeout.is_none());
-            assert!(client.cancel_handle.is_none());
-            assert!(client.is_connection_dead());
-            assert!(client.has_active_transaction());
-            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert!(sent.lock().unwrap().is_empty());
-            let result = if commit {
-                client.commit_transaction(None, None).await
-            } else {
-                client.rollback_transaction(None, None).await
-            };
-            assert!(matches!(
-                result,
-                Err(crate::error::Error::ConnectionClosed(_))
-            ));
-            assert!(sent.lock().unwrap().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn transaction_completion_deducts_reconnect_budget_before_send_and_read() {
-        for commit in [true, false] {
-            for reconnect_seconds in [2, 5] {
-                let transport = TestTransport::with_tokens(vec![done_no_more()]);
-                let timeouts = Arc::clone(&transport.receive_timeouts);
+    async fn request_write_timeout_retires_a_stalled_send_without_external_cancellation() {
+        for configured_cancel in [false, true] {
+            for operation in ["batch", "rpc", "begin", "commit", "rollback"] {
+                let mut cancel = CancelHandle::new();
+                cancel.set_cancel_timeout_secs(1);
+                let mut transport = TestTransport::new();
+                transport.close_should_hang = true;
+                transport
+                    .send_should_hang
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                transport.send_prefix_before_hang = true;
                 let sent = Arc::clone(&transport.sent);
+                let closes = Arc::clone(&transport.close_calls);
+                let attentions = Arc::clone(&transport.attentions);
                 let mut client = create_test_client_with_transport(transport);
-                client.reconnect_elapsed_for_test = Some(Duration::from_secs(reconnect_seconds));
-                let options = ExecuteOptions::new().timeout_secs(5);
-                let result = if commit {
-                    client
-                        .commit_transaction_with_options(None, None, options)
-                        .await
-                } else {
-                    client
-                        .rollback_transaction_with_options(None, None, options)
-                        .await
-                };
-                if reconnect_seconds == 5 {
-                    assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
-                    assert!(sent.lock().unwrap().is_empty());
-                    assert!(timeouts.lock().unwrap().is_empty());
-                } else {
-                    result.unwrap();
-                    assert!(!sent.lock().unwrap().is_empty());
-                    let timeouts = timeouts.lock().unwrap();
-                    assert_eq!(timeouts.len(), 1);
-                    let remaining = timeouts[0].unwrap();
-                    assert!(remaining > Duration::ZERO);
-                    assert!(remaining < Duration::from_secs(3));
-                }
+                client.recovery_context.session_recovery_negotiated = true;
+                let start = tokio::time::Instant::now();
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut options = ExecuteOptions::new().timeout_secs(1);
+                    if configured_cancel {
+                        options = options.cancel(&cancel);
+                    }
+                    match operation {
+                        "batch" => client
+                            .execute("SELECT 1".to_string(), options)
+                            .await
+                            .map(|_| ()),
+                        "rpc" => client
+                            .execute_sp_executesql("SELECT 1".to_string(), Vec::new(), options)
+                            .await
+                            .map(|_| ()),
+                        "begin" => {
+                            client
+                                .begin_transaction_with_options(
+                                    TransactionIsolationLevel::NoChange,
+                                    None,
+                                    options,
+                                )
+                                .await
+                        }
+                        "commit" => {
+                            client
+                                .commit_transaction_with_options(None, None, options)
+                                .await
+                        }
+                        "rollback" => {
+                            client
+                                .rollback_transaction_with_options(None, None, options)
+                                .await
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await
+                .expect("the request's write deadline must fire before the watchdog");
+                assert!(matches!(result, Err(crate::error::Error::TimeoutError(_))));
+                assert_eq!(start.elapsed(), Duration::from_secs(1), "{operation}");
+                assert!(!cancel.cancel_token.is_cancelled());
+                assert!(client.is_connection_dead(), "{operation}");
+                let retry = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.execute(
+                        "SELECT 1".to_string(),
+                        ExecuteOptions::new().timeout_secs(1),
+                    ),
+                )
+                .await;
+                assert!(
+                    matches!(&retry, Ok(Err(crate::error::Error::ConnectionClosed(_)))),
+                    "{operation}: an interrupted write must not enter recovery: {retry:?}"
+                );
+                assert!(!client.is_session_recovery_enabled(), "{operation}");
+                assert_eq!(sent.lock().unwrap().len(), 8, "{operation}");
+                assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
             }
         }
     }
 
-    #[tokio::test]
-    async fn request_charges_send_time_against_response_budget() {
-        for operation in ["batch", "begin", "commit", "rollback"] {
-            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
-            transport.send_delay = Some(Duration::from_millis(700));
-            transport.receive_delay = Some(Duration::from_millis(700));
-            let timeouts = Arc::clone(&transport.receive_timeouts);
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_also_bounds_cancellation_while_sending() {
+        for (request_timeout, cancellation_timeout, expected_millis) in [
+            (Some(1), 120, 1000),
+            (Some(5), 1, 1250),
+            (Some(0), 1, 1250),
+            (None, 1, 1250),
+        ] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(cancellation_timeout);
+            let mut transport = TestTransport::new();
+            transport.send_delay = Some(Duration::from_millis(250));
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            let sent = Arc::clone(&transport.sent);
+            let closes = Arc::clone(&transport.close_calls);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.execute(
+                    "SELECT 1".to_string(),
+                    ExecuteOptions {
+                        timeout: request_timeout,
+                        cancel: Some(&cancel),
+                        ..ExecuteOptions::default()
+                    },
+                ),
+            )
+            .await
+            .expect("overlapping cancellation must not extend the request write deadline");
+
+            assert!(matches!(
+                result,
+                Err(crate::error::Error::OperationCancelledError(_))
+            ));
+            assert_eq!(started.elapsed(), Duration::from_millis(expected_millis));
+            assert!(client.is_connection_dead());
+            assert_eq!(sent.lock().unwrap().len(), 8);
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn statement_write_timeout_retires_a_slow_send_without_a_grace_period() {
+        for operation in ["batch", "rpc"] {
+            let mut transport = TestTransport::new();
+            transport.send_delay = Some(Duration::from_secs(2));
+            let sent = Arc::clone(&transport.sent);
+            let closes = Arc::clone(&transport.close_calls);
+            let attentions = Arc::clone(&transport.attentions);
             let mut client = create_test_client_with_transport(transport);
             let options = ExecuteOptions::new().timeout_secs(1);
+            let started = tokio::time::Instant::now();
             let result = match operation {
                 "batch" => client
+                    .execute("SELECT 1".to_string(), options)
+                    .await
+                    .map(|_| ()),
+                "rpc" => client
+                    .execute_sp_executesql("SELECT 1".to_string(), Vec::new(), options)
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(result, Err(crate::error::Error::TimeoutError(_))),
+                "{operation}"
+            );
+            assert_eq!(started.elapsed(), Duration::from_secs(1), "{operation}");
+            assert!(client.is_connection_dead(), "{operation}");
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(client.execute("SELECT 1".to_string(), ()).await.is_err());
+            assert!(sent.lock().unwrap().is_empty(), "{operation}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_close_after_interrupted_write_never_shuts_down_the_stream() {
+        let mut transport = TestTransport::new();
+        transport
+            .send_should_hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        transport.send_prefix_before_hang = true;
+        transport.close_should_hang = true;
+        let sent = Arc::clone(&transport.sent);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        let started = tokio::time::Instant::now();
+        let error = client
+            .execute(
+                "SELECT 1".to_string(),
+                ExecuteOptions::new().timeout_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::TimeoutError(_)));
+
+        tokio::time::timeout(Duration::from_secs(1), client.close_connection())
+            .await
+            .expect("closing an interrupted stream must not attempt a TLS shutdown")
+            .unwrap();
+
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_request_write_does_not_inherit_the_cancellation_budget() {
+        for operation in ["batch", "commit"] {
+            for timeout in [None, Some(0)] {
+                let mut cancel = CancelHandle::new();
+                cancel.set_cancel_timeout_secs(1);
+                let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+                transport.send_delay = Some(Duration::from_secs(2));
+                let mut client = create_test_client_with_transport(transport);
+                let started = tokio::time::Instant::now();
+                let options = ExecuteOptions {
+                    timeout,
+                    cancel: Some(&cancel),
+                    ..ExecuteOptions::default()
+                };
+                let result = match operation {
+                    "batch" => client
+                        .execute("SELECT 1".to_string(), options)
+                        .await
+                        .map(|_| ()),
+                    "commit" => {
+                        client
+                            .commit_transaction_with_options(None, None, options)
+                            .await
+                    }
+                    _ => unreachable!(),
+                };
+                result.unwrap();
+                assert_eq!(started.elapsed(), Duration::from_secs(2), "{operation}");
+                assert!(!cancel.cancel_token.is_cancelled());
+                assert!(!client.is_connection_dead());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_requests_cancellation_bounds_and_retires_stalled_writes() {
+        for operation in ["begin", "commit", "rollback"] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(1);
+            let mut transport = TestTransport::new();
+            transport.cancel_during_send = Some(cancel.cancel_token.clone());
+            let sent = Arc::clone(&transport.sent);
+            let closes = Arc::clone(&transport.close_calls);
+            let mut client = create_test_client_with_transport(transport);
+            let start = tokio::time::Instant::now();
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                let options = ExecuteOptions::new().cancel(&cancel);
+                match operation {
+                    "begin" => {
+                        client
+                            .begin_transaction_with_options(
+                                TransactionIsolationLevel::NoChange,
+                                None,
+                                options,
+                            )
+                            .await
+                    }
+                    "commit" => {
+                        client
+                            .commit_transaction_with_options(None, None, options)
+                            .await
+                    }
+                    "rollback" => {
+                        client
+                            .rollback_transaction_with_options(None, None, options)
+                            .await
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(1), "{operation}");
+            assert!(client.is_connection_dead(), "{operation}");
+            assert!(!client.has_active_transaction());
+            assert_eq!(sent.lock().unwrap().len(), 8, "{operation}");
+            assert_eq!(
+                closes.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{operation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_options_bound_reads_without_leaking_into_later_requests() {
+        let transport =
+            TestTransport::with_tokens(vec![done_no_more(), done_no_more(), done_no_more()]);
+        let timeouts = Arc::clone(&transport.receive_timeouts);
+        let mut client = create_test_client_with_transport(transport);
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        client
+            .commit_transaction_with_options(
+                None,
+                None,
+                ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        assert!(timeouts.lock().unwrap()[0].is_some_and(|timeout| {
+            timeout > Duration::ZERO && timeout <= Duration::from_secs(1)
+        }));
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+
+        client.rollback_transaction(None, None).await.unwrap();
+        assert_eq!(timeouts.lock().unwrap()[1], None);
+        cancel.cancel();
+        let error = client
+            .rollback_transaction_with_options(
+                None,
+                None,
+                ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+        client.save_transaction("next".to_string()).await.unwrap();
+        assert_eq!(timeouts.lock().unwrap()[2], None);
+    }
+
+    #[tokio::test]
+    async fn request_response_timeout_includes_send_time() {
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
+
+        for operation in ["batch", "reset", "begin", "commit", "rollback"] {
+            let tokens = if operation == "reset" {
+                vec![
+                    Tokens::EnvChange(EnvChangeToken {
+                        sub_type: EnvChangeTokenSubType::ResetConnection,
+                        change_type: EnvChangeContainer::from((0u32, 0u32)),
+                    }),
+                    done_no_more(),
+                ]
+            } else {
+                vec![done_no_more()]
+            };
+            let mut transport = TestTransport::with_tokens(tokens);
+            transport.send_delay = Some(Duration::from_millis(750));
+            transport.receive_delay = Some(Duration::from_millis(750));
+            let read_timeouts = Arc::clone(&transport.receive_timeouts);
+            let mut client = create_test_client_with_transport(transport);
+            if operation == "reset" {
+                client.prepare_reset_connection(false);
+            }
+            let options = ExecuteOptions::new().timeout_secs(1);
+            let started = Instant::now();
+            let result = match operation {
+                "batch" | "reset" => client
                     .execute(
-                        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE".to_string(),
+                        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
                         options,
                     )
                     .await
@@ -20913,40 +21734,36 @@ mod tests {
                         .commit_transaction_with_options(None, None, options)
                         .await
                 }
-                _ => {
+                "rollback" => {
                     client
                         .rollback_transaction_with_options(None, None, options)
                         .await
                 }
+                _ => unreachable!(),
             };
             assert!(
                 matches!(result, Err(crate::error::Error::TimeoutError(_))),
-                "{operation}: {result:?}"
+                "{operation}"
             );
-            let response_budget = timeouts.lock().unwrap()[0].unwrap();
             assert!(
-                response_budget <= Duration::from_millis(300),
-                "{response_budget:?}"
+                started.elapsed() < Duration::from_millis(1400),
+                "{operation}"
+            );
+            assert!(
+                read_timeouts.lock().unwrap()[0]
+                    .is_some_and(|remaining| remaining <= Duration::from_millis(350)),
+                "{operation}: sending the request must consume the response budget"
             );
             assert!(client.remaining_request_timeout.is_none());
-            assert!(client.cancel_handle.is_none());
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn transaction_completion_cancellation_uses_its_own_settlement_budget() {
-        for commit in [true, false] {
-            let mut cancel = CancelHandle::new();
-            cancel.set_cancel_timeout_secs(3);
-            let mut transport = TestTransport::new();
-            transport.cancel_during_send = Some(cancel.cancel_token.clone());
-            let sent = Arc::clone(&transport.sent);
-            let closes = Arc::clone(&transport.close_calls);
-            let attentions = Arc::clone(&transport.attentions);
-            let mut client = create_test_client_with_transport(transport);
-            client.execution_context.set_transaction_descriptor(42);
-            let options = ExecuteOptions::new().timeout_secs(1).cancel(&cancel);
-            let start = tokio::time::Instant::now();
+    #[tokio::test]
+    async fn transaction_completion_never_writes_or_reconnects_a_retired_session() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client.mark_connection_dead();
+        for commit in [false, true] {
+            let options = ExecuteOptions::new().timeout_secs(1);
             let result = if commit {
                 client
                     .commit_transaction_with_options(None, None, options)
@@ -20958,131 +21775,11 @@ mod tests {
             };
             assert!(matches!(
                 result,
-                Err(crate::error::Error::OperationCancelledError(_))
+                Err(crate::error::Error::ConnectionClosed(_))
             ));
-            assert_eq!(start.elapsed(), Duration::from_secs(3));
-            assert!(client.remaining_request_timeout.is_none());
-            assert!(client.cancel_handle.is_none());
-            assert!(client.is_connection_dead());
-            assert!(client.has_active_transaction());
-            assert_eq!(sent.lock().unwrap().len(), 8);
-            assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(sent.lock().unwrap().is_empty());
+            assert_eq!(client.connection_recovery_count(), 0);
         }
-    }
-
-    #[tokio::test]
-    async fn transaction_completion_zero_and_legacy_timeouts_are_unlimited() {
-        for commit in [true, false] {
-            for legacy in [true, false] {
-                let transport = TestTransport::with_tokens(vec![done_no_more()]);
-                let timeouts = Arc::clone(&transport.receive_timeouts);
-                let mut client = create_test_client_with_transport(transport);
-                let result = match (commit, legacy) {
-                    (true, true) => client.commit_transaction(None, None).await,
-                    (false, true) => client.rollback_transaction(None, None).await,
-                    (true, false) => {
-                        client
-                            .commit_transaction_with_options(
-                                None,
-                                None,
-                                ExecuteOptions::new().timeout_secs(0),
-                            )
-                            .await
-                    }
-                    (false, false) => {
-                        client
-                            .rollback_transaction_with_options(
-                                None,
-                                None,
-                                ExecuteOptions::new().timeout_secs(0),
-                            )
-                            .await
-                    }
-                };
-                result.unwrap();
-                assert_eq!(*timeouts.lock().unwrap(), vec![None]);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn transaction_request_options_do_not_leak_into_later_requests() {
-        for commit in [true, false] {
-            for response_fails in [true, false] {
-                for dtc in [true, false] {
-                    let mut tokens = Vec::new();
-                    if response_fails {
-                        tokens.push(Tokens::Error(error_token_with_severity(16)));
-                    }
-                    tokens.extend([done_no_more(), done_no_more()]);
-                    let transport = TestTransport::with_tokens(tokens);
-                    let timeouts = Arc::clone(&transport.receive_timeouts);
-                    let mut client = create_test_client_with_transport(transport);
-                    client.execution_context.set_transaction_descriptor(42);
-                    let cancel = CancelHandle::new();
-                    let options = ExecuteOptions::new().timeout_secs(1).cancel(&cancel);
-                    let result = if commit {
-                        client
-                            .commit_transaction_with_options(None, None, options)
-                            .await
-                    } else {
-                        client
-                            .rollback_transaction_with_options(
-                                Some("savepoint".to_string()),
-                                None,
-                                options,
-                            )
-                            .await
-                    };
-                    assert_eq!(result.is_err(), response_fails);
-                    cancel.cancel();
-                    if dtc {
-                        client.get_dtc_address().await.unwrap();
-                    } else {
-                        client
-                            .save_transaction("next_savepoint".to_string())
-                            .await
-                            .unwrap();
-                    }
-                    assert_eq!(timeouts.lock().unwrap().last(), Some(&None));
-                    assert!(client.remaining_request_timeout.is_none());
-                    assert!(client.cancel_handle.is_none());
-                }
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn transaction_begin_cancellation_bounds_and_retires_a_stalled_write() {
-        let mut cancel = CancelHandle::new();
-        cancel.set_cancel_timeout_secs(1);
-        let mut transport = TestTransport::new();
-        transport.cancel_during_send = Some(cancel.cancel_token.clone());
-        let sent = Arc::clone(&transport.sent);
-        let closes = Arc::clone(&transport.close_calls);
-        let mut client = create_test_client_with_transport(transport);
-        let start = tokio::time::Instant::now();
-        let error = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.begin_transaction_with_options(
-                TransactionIsolationLevel::NoChange,
-                None,
-                ExecuteOptions::new().cancel(&cancel),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            crate::error::Error::OperationCancelledError(_)
-        ));
-        assert_eq!(start.elapsed(), Duration::from_secs(1));
-        assert!(client.is_connection_dead());
-        assert!(!client.has_active_transaction());
-        assert_eq!(sent.lock().unwrap().len(), 8);
-        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -21872,10 +22569,8 @@ mod tests {
         );
     }
 
-    /// `PacketWriter` only checks its budget once a write returns, so a stalled
-    /// peer would block the withdrawal forever. The deadline must fire, and the
-    /// transport must be retired rather than reused - dropping a write future
-    /// mid-flight is only safe because nothing writes to that stream again.
+    /// A stalled withdrawal must time out and retire the transport: dropping a
+    /// write mid-flight is safe only when nothing writes to that stream again.
     #[tokio::test(start_paused = true)]
     async fn the_ignore_packet_gives_up_on_a_stalled_peer() {
         let transport = TestTransport::new();
@@ -21963,6 +22658,58 @@ mod tests {
             client.is_connection_dead(),
             "an unacknowledged retraction leaves the stream desynchronized"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ignore_drain_timeout_preserves_session_recovery() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let mut transport = TestTransport::new();
+        transport.receive_should_hang = true;
+        let closes = Arc::clone(&transport.close_calls);
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        client.recovery_context.session_recovery_negotiated = true;
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        assert!(!message.send_incomplete());
+        cancel.cancel();
+        let started = tokio::time::Instant::now();
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.retract_partial_request(message),
+        )
+        .await
+        .expect("the IGNORE drain must be bounded");
+
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        {
+            let wire = sent.lock().unwrap();
+            let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+            assert_eq!(
+                last[1],
+                PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+            );
+        }
+        client
+            .recovery_context
+            .client_context
+            .as_mut()
+            .unwrap()
+            .connect_timeout = 0;
+        let retry = client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&retry, Error::SessionRecoveryFailed { .. }),
+            "a clean-boundary drain timeout must remain recoverable: {retry:?}"
+        );
+        assert!(client.is_session_recovery_enabled());
     }
 
     /// The liveness check is the cached flag, never the socket-polling
@@ -23148,54 +23895,6 @@ mod tests {
             8,
             "the recovered session must not reuse a count a cache could already hold"
         );
-    }
-
-    #[tokio::test]
-    async fn recovered_transport_can_shut_down_after_an_interrupted_old_transport() {
-        let mut client = create_test_client();
-        client.retire_without_writing();
-        let transport = TestTransport::new();
-        let closes = Arc::clone(&transport.close_calls);
-        client
-            .adopt_recovered_session(
-                AnyTransport::dynamic(transport),
-                crate::handler::handler_factory::create_test_negotiated_settings_internal(),
-                ExecutionContext::new(),
-                Vec::new(),
-                &[],
-            )
-            .unwrap();
-        client.close_connection().await.unwrap();
-        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn close_after_interrupted_send_disconnects_peer_while_client_is_retained() {
-        use tokio::io::AsyncReadExt;
-
-        let (stream, mut peer) = tokio::io::duplex(1);
-        let transport = crate::test_packet_support::build_duplex_transport(stream);
-        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
-        let error = client
-            .execute(
-                "SELECT 1".to_string(),
-                ExecuteOptions::new().timeout_secs(1),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::TimeoutError(_)));
-        client.close_connection().await.unwrap();
-        let mut received = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut received))
-            .await
-            .expect("close must release the socket without dropping the client")
-            .unwrap();
-        assert_eq!(
-            received.len(),
-            1,
-            "only the interrupted packet prefix was sent"
-        );
-        assert!(client.is_connection_dead());
     }
 
     /// Regression: the cursor RPCs consume their responses via `drain_stream`

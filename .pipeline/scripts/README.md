@@ -50,8 +50,8 @@ See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ### Windows Python certificate bootstrap
 
-The shared Windows wheel build and install-test templates run
-`configure-python-certificates-windows.yml` before selecting Python. It exports
+The shared Windows wheel build, signed-wheel repack, and install-test templates
+run `configure-python-certificates-windows.yml` before selecting Python. It exports
 the machine and current user's trusted roots to a PEM bundle in
 `Agent.TempDirectory` and sets `PIP_CERT` for subsequent tasks. This lets older
 bundled pip versions validate HTTPS using the agent's trusted roots during

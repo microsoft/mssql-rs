@@ -14,8 +14,8 @@ use crate::protocol::{
     parse_transaction_manager_request,
 };
 use crate::query_response::{
-    LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_COMPLETION_DELAY_KEY,
-    TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
+    ATTENTION_DELAY_KEY, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY,
+    TM_BEGIN_COMPLETION_DELAY_KEY, TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
 };
 use bytes::BytesMut;
 use native_tls::Identity;
@@ -287,11 +287,24 @@ impl ConnectionProcessor {
                     }
                     if let Some(ack) = self.try_take_attention()? {
                         debug!("Attention arrived during delay; abandoning the delayed response");
+                        self.delay_attention_ack().await;
                         return Ok(DelayOutcome::Attention(ack));
                     }
                     // Not a (complete) Attention — keep waiting out the remaining delay.
                 }
             }
+        }
+    }
+
+    async fn delay_attention_ack(&self) {
+        let delay = self
+            .query_registry
+            .lock()
+            .await
+            .get(ATTENTION_DELAY_KEY)
+            .and_then(|response| response.delay);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -682,6 +695,7 @@ impl ConnectionProcessor {
 
             PacketType::Attention => {
                 debug!("Handling Attention from {}", self.addr);
+                self.delay_attention_ack().await;
                 Some(build_attention_ack_packet())
             }
 

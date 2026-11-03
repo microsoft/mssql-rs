@@ -48,13 +48,10 @@ parameters:
   # wall-clock speedup for 10 concurrent connects, which measured 1.88x-2.82x on
   # CI agents and fails without a GIL or driver regression
   # (https://github.com/microsoft/mssql-rs/issues/762).
-  # Temporarily exclude all 15 checkout-timeout variants until AB#49673 fixes
-  # connection-timeout enforcement. Re-enable them as part of that task.
   - name: pytestDeselect
     type: object
     default:
       - tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release
-      - tests/test_009_pooling.py::test_pool_checkout_validation_timeout
 
 steps:
 - template: generate-sql-password-template.yml

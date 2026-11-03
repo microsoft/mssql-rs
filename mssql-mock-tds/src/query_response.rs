@@ -366,6 +366,8 @@ pub const TM_COMMIT_DELAY_KEY: &str = "__MOCK_TDS_TM_COMMIT_DELAY__";
 /// Delays a transaction rollback response, using only [`QueryResponse::delay`].
 pub const TM_ROLLBACK_DELAY_KEY: &str = "__MOCK_TDS_TM_ROLLBACK_DELAY__";
 
+/// Delays ATTENTION acknowledgement to exercise cancellation settlement limits.
+pub const ATTENTION_DELAY_KEY: &str = "__MOCK_TDS_ATTENTION_DELAY__";
 /// Reserved [`QueryRegistry`] key that delays the mock server's answer to an
 /// RPC request that matched no specific registration.
 ///

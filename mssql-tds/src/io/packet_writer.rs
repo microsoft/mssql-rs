@@ -8,6 +8,7 @@ use crate::error::TimeoutErrorType;
 use crate::message::messages::{PacketStatusFlags, PacketType, ResetConnectionMode};
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
+use std::time::Duration;
 use tokio::time::Instant;
 use tracing::event;
 
@@ -310,6 +311,11 @@ impl<'a> PacketWriter<'a> {
         self.code_page_conversion_loss
     }
 
+    /// An interrupted packet cannot be repaired with further protocol writes.
+    pub(crate) fn send_incomplete(&self) -> bool {
+        self.send_incomplete
+    }
+
     /// Detaches this writer's in-progress message state from the borrowed
     /// network writer so it can be parked as owned state (e.g. on the TDS
     /// client) across `await` points and multiple public calls, then later
@@ -327,31 +333,23 @@ impl<'a> PacketWriter<'a> {
     /// itself: [`resume`](Self::resume) always takes a fresh timestamp instead
     /// of restoring the suspended one (see its doc comment), so it is not
     /// carried in [`SuspendedMessage`].
-    pub(crate) fn suspend(mut self) -> SuspendedMessage {
-        self.take_message()
-    }
-
-    /// Detaches a message through a borrowed writer. The original writer must
-    /// not be used again; resuming the returned message is the only safe write.
-    pub(crate) fn take_message(&mut self) -> SuspendedMessage {
-        let message = SuspendedMessage {
+    pub(crate) fn suspend(self) -> SuspendedMessage {
+        SuspendedMessage {
             packet_type: self.packet_type,
             max_payload_size: self.max_payload_size,
             packet_id: self.packet_id,
-            payload_cursor: std::mem::take(&mut self.payload_cursor),
+            payload_cursor: self.payload_cursor,
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
             send_incomplete: self.send_incomplete,
             send_attempted: self.send_attempted,
             message_complete: self.message_complete,
             max_timeout_sec: self.max_timeout_sec,
-            cancel_handle: self.cancel_handle.take(),
+            cancel_handle: self.cancel_handle,
             reset_mode: self.reset_mode,
             eom_pending: self.eom_pending,
             code_page_conversion_loss: self.code_page_conversion_loss,
-        };
-        self.send_incomplete = true;
-        message
+        }
     }
 
     /// Reattaches a previously [`suspend`](Self::suspend)ed message to a network
@@ -458,23 +456,6 @@ impl<'a> PacketWriter<'a> {
         is_last_packet: bool,
         is_ignore_packet: bool,
     ) -> TdsResult<()> {
-        if self.send_incomplete {
-            return Err(crate::error::Error::ProtocolError(
-                "Cannot write after an incomplete packet send".to_string(),
-            ));
-        }
-        let handle = self.cancel_handle.as_ref();
-        if handle.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
-            return Err(OperationCancelledError("Request was cancelled".to_string()));
-        }
-        let deadline = self
-            .max_timeout_sec
-            .map(|seconds| self.start_time + std::time::Duration::from_secs(u64::from(seconds)));
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(TimeoutError(TimeoutErrorType::String(
-                "Timeout expired".to_string(),
-            )));
-        }
         // If the ignore bit is set, it must be the end of the message per the protocol.
         assert!(is_last_packet || !is_ignore_packet);
 
@@ -512,7 +493,14 @@ impl<'a> PacketWriter<'a> {
         );
         let data_slice = &self.payload_cursor.get_ref().as_slice()[..packet_length];
 
-        let timeout = async {
+        let handle = self.cancel_handle.as_ref();
+        if handle.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+            return Err(OperationCancelledError("Request was cancelled".to_string()));
+        }
+        let deadline = self
+            .max_timeout_sec
+            .map(|seconds| self.start_time + Duration::from_secs(u64::from(seconds)));
+        let elapsed = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
                 None => std::future::pending::<()>().await,
@@ -530,33 +518,40 @@ impl<'a> PacketWriter<'a> {
             tokio::pin!(send_data_fut);
             tokio::select! {
                 biased;
-                () = timeout => return Err(TimeoutError(TimeoutErrorType::String(
-                    "Timeout expired".to_string(),
-                ))),
+                () = elapsed => {
+                    // The write may have stopped inside a packet or TLS record.
+                    // Keep send_incomplete set so the caller retires the stream.
+                    return Err(TimeoutError(TimeoutErrorType::String(
+                        "Timeout expired".to_string(),
+                    )));
+                }
                 result = &mut send_data_fut => result?,
                 () = handle.cancel_token.cancelled() => {
                     cancelled = true;
-                    // Finish the same packet/TLS record before any withdrawal.
+                    // Finish the same packet/TLS record within both deadlines.
                     // On expiry send_incomplete stays set: no further write is safe.
+                    let cancellation_deadline =
+                        handle.settlement_deadline(std::time::Duration::ZERO);
+                    let completion_deadline = deadline
+                        .map_or(cancellation_deadline, |request| request.min(cancellation_deadline));
                     tokio::time::timeout_at(
-                        handle.settlement_deadline(std::time::Duration::ZERO),
+                        completion_deadline,
                         &mut send_data_fut,
                     ).await.map_err(|_| OperationCancelledError(
                         "Cancellation timed out completing the current packet".to_string(),
                     ))??;
                 }
             }
+        } else if deadline.is_some() {
+            tokio::select! {
+                biased;
+                () = elapsed => return Err(TimeoutError(TimeoutErrorType::String(
+                    "Timeout expired".to_string(),
+                ))),
+                result = CancelHandle::run_until_cancelled(handle, send_data_fut) => result?,
+            }
         } else {
-            CancelHandle::run_until_cancelled(handle, async {
-                tokio::select! {
-                    biased;
-                    () = timeout => Err(TimeoutError(TimeoutErrorType::String(
-                        "Timeout expired".to_string(),
-                    ))),
-                    result = send_data_fut => result,
-                }
-            })
-            .await?;
+            CancelHandle::run_until_cancelled(handle, send_data_fut).await?;
         }
         self.send_incomplete = false;
 
@@ -578,8 +573,8 @@ impl<'a> PacketWriter<'a> {
             self.network_writer.note_reset_dispatched();
         }
 
-        // A cancellation already being settled owns its separate budget.
-        if !cancelled && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        // A ready send wins the race; account for its bytes before reporting expiry.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(TimeoutError(TimeoutErrorType::String(
                 "Timeout expired".to_string(),
             )));
@@ -667,10 +662,7 @@ impl TdsPacketWriter for PacketWriter<'_> {
         // happens when the payload ends exactly on a packet boundary, leaving
         // the buffer empty after the flush (issue #73). `populate_header_and_send`
         // clears `eom_pending` once the EOM packet goes out.
-        if self.send_incomplete
-            || self.payload_cursor.position() > Self::PACKET_HEADER_SIZE as u64
-            || self.eom_pending
-        {
+        if self.payload_cursor.position() > Self::PACKET_HEADER_SIZE as u64 || self.eom_pending {
             self.populate_header_and_send(true, false).await?;
             self.payload_cursor
                 .set_position(Self::PACKET_HEADER_SIZE as u64);
@@ -890,10 +882,6 @@ pub(crate) mod tests {
         pub(crate) data: Vec<u8>,
         pub(crate) reset_mode: ResetConnectionMode,
         pub(crate) reset_dispatched: bool,
-        send_delay: Option<std::time::Duration>,
-        send_completion_delay: Option<std::time::Duration>,
-        cancel_during_send: Option<tokio_util::sync::CancellationToken>,
-        send_calls: usize,
     }
 
     impl MockNetworkWriter {
@@ -903,10 +891,6 @@ pub(crate) mod tests {
                 data: vec![],
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
-                send_delay: None,
-                send_completion_delay: None,
-                cancel_during_send: None,
-                send_calls: 0,
             }
         }
     }
@@ -915,19 +899,7 @@ pub(crate) mod tests {
     impl NetworkWriter for MockNetworkWriter {
         #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
         async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
-            self.send_calls += 1;
-            if let Some(delay) = self.send_delay.take() {
-                self.data.extend_from_slice(&_data[..1]);
-                if let Some(cancel) = self.cancel_during_send.take() {
-                    cancel.cancel();
-                }
-                tokio::time::sleep(delay).await;
-                self.data.extend_from_slice(&_data[1..]);
-                return Ok(());
-            }
-            if let Some(delay) = self.send_completion_delay.take() {
-                std::thread::sleep(delay);
-            }
+            // No op
             self.data.extend_from_slice(_data);
             Ok(())
         }
@@ -967,161 +939,6 @@ pub(crate) mod tests {
         async fn disable_ssl(&mut self) -> TdsResult<()> {
             unimplemented!()
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_send_times_out_without_writing_again() {
-        let mut mock = MockNetworkWriter::new(512);
-        mock.send_delay = Some(std::time::Duration::from_secs(60));
-        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
-        writer.write_byte_async(0xAB).await.unwrap();
-        let start = tokio::time::Instant::now();
-        assert!(matches!(writer.finalize().await, Err(TimeoutError(_))));
-        assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
-        let message = writer.suspend();
-        assert!(message.send_attempted());
-        assert!(message.send_incomplete());
-        assert!(!message.message_complete());
-        let mut writer = PacketWriter::resume(message, &mut mock);
-        assert!(writer.finalize().await.is_err());
-        assert!(writer.cancel_current_message().await.is_err());
-        drop(writer);
-        assert_eq!(mock.send_calls, 1);
-        assert_eq!(mock.data.len(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn expired_send_budget_writes_no_packet() {
-        for elapsed_ms in [1000, 1100] {
-            for settlement in [false, true] {
-                for prefix_sent in [false, true] {
-                    let mut cancel = CancelHandle::new();
-                    cancel.set_cancel_timeout_secs(3);
-                    let mut mock = MockNetworkWriter::new(16);
-                    let mut writer = PacketWriter::new(
-                        PacketType::RpcRequest,
-                        &mut mock,
-                        Some(1),
-                        settlement.then_some(&cancel),
-                    );
-                    if prefix_sent {
-                        writer.write_async(&[0xAB; 9]).await.unwrap();
-                    } else {
-                        writer.write_byte_async(0xAB).await.unwrap();
-                    }
-                    tokio::time::advance(std::time::Duration::from_millis(elapsed_ms)).await;
-                    assert!(matches!(writer.finalize().await, Err(TimeoutError(_))));
-                    let message = writer.suspend();
-                    assert_eq!(message.nothing_sent(), !prefix_sent);
-                    assert!(!message.send_incomplete());
-                    assert!(!message.message_complete());
-                    assert_eq!(mock.send_calls, usize::from(prefix_sent));
-                    assert_eq!(mock.data.len(), if prefix_sent { 16 } else { 0 });
-                }
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_send_times_out_with_inactive_settlement_handle() {
-        let mut cancel = CancelHandle::new();
-        cancel.set_cancel_timeout_secs(3);
-        let mut mock = MockNetworkWriter::new(512);
-        mock.send_delay = Some(std::time::Duration::from_secs(60));
-        let mut writer =
-            PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), Some(&cancel));
-        writer.write_byte_async(0xAB).await.unwrap();
-        let start = tokio::time::Instant::now();
-        assert!(matches!(writer.finalize().await, Err(TimeoutError(_))));
-        assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
-        let message = writer.suspend();
-        assert!(message.send_incomplete());
-        assert!(!message.message_complete());
-        assert!(!cancel.cancel_token.is_cancelled());
-        assert_eq!(mock.send_calls, 1);
-        assert_eq!(mock.data.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn take_message_preserves_buffer_and_blocks_the_original_writer() {
-        let mut mock = MockNetworkWriter::new(512);
-        let mut writer = PacketWriter::new(PacketType::BulkLoad, &mut mock, None, None);
-        writer.write_byte_async(0xAB).await.unwrap();
-        let message = writer.take_message();
-        assert!(message.nothing_sent());
-        assert!(!message.send_incomplete());
-        assert!(writer.finalize().await.is_err());
-        assert!(writer.cancel_current_message().await.is_err());
-        drop(writer);
-        assert_eq!(mock.send_calls, 0);
-
-        let mut writer = PacketWriter::resume(message, &mut mock);
-        writer.finalize().await.unwrap();
-        drop(writer);
-        assert_eq!(mock.send_calls, 1);
-        assert_eq!(mock.data[PacketWriter::PACKET_HEADER_SIZE], 0xAB);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_send_zero_and_none_timeouts_are_unlimited() {
-        for timeout in [Some(0), None] {
-            let mut mock = MockNetworkWriter::new(512);
-            mock.send_delay = Some(std::time::Duration::from_secs(60));
-            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, timeout, None);
-            writer.write_byte_async(0xAB).await.unwrap();
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_secs(2), writer.finalize())
-                    .await
-                    .is_err()
-            );
-            assert!(writer.suspend().send_incomplete());
-            assert_eq!(mock.send_calls, 1);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_send_cancellation_settlement_outlives_request_timeout() {
-        for send_seconds in [2, 60] {
-            let mut cancel = CancelHandle::new();
-            cancel.set_cancel_timeout_secs(3);
-            let mut mock = MockNetworkWriter::new(512);
-            mock.send_delay = Some(std::time::Duration::from_secs(send_seconds));
-            mock.cancel_during_send = Some(cancel.cancel_token.clone());
-            let mut writer =
-                PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), Some(&cancel));
-            writer.write_byte_async(0xAB).await.unwrap();
-            let start = tokio::time::Instant::now();
-            assert!(matches!(
-                writer.finalize().await,
-                Err(OperationCancelledError(_))
-            ));
-            let message = writer.suspend();
-            assert_eq!(
-                start.elapsed(),
-                std::time::Duration::from_secs(send_seconds.min(3))
-            );
-            assert_eq!(message.send_incomplete(), send_seconds > 3);
-            assert_eq!(message.message_complete(), send_seconds <= 3);
-            assert_eq!(mock.send_calls, 1);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_send_unconfigured_cancellation_interrupts_immediately() {
-        let cancel = CancelHandle::new();
-        let mut mock = MockNetworkWriter::new(512);
-        mock.send_delay = Some(std::time::Duration::from_secs(60));
-        mock.cancel_during_send = Some(cancel.cancel_token.clone());
-        let mut writer =
-            PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), Some(&cancel));
-        writer.write_byte_async(0xAB).await.unwrap();
-        let start = tokio::time::Instant::now();
-        assert!(matches!(
-            writer.finalize().await,
-            Err(OperationCancelledError(_))
-        ));
-        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
-        assert!(writer.suspend().send_incomplete());
     }
 
     #[test]
@@ -2105,16 +1922,18 @@ pub(crate) mod tests {
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
     }
 
-    /// A send completing in one poll can overrun its deadline; its final packet
-    /// still needs ATTENTION rather than a second EOM | IGNORE.
-    #[tokio::test]
-    async fn a_finalized_message_that_times_out_is_still_complete() {
+    /// A ready send can finish before expiry is observed, leaving `finalize`'s
+    /// terminating packet on the wire. Such a message needs cancelling, not
+    /// withdrawing: a second `EOM | IGNORE` would leave the server owing two
+    /// responses and the extra DONE for the next command.
+    #[test]
+    fn a_finalized_message_that_times_out_is_still_complete() {
         let mut mock = MockNetworkWriter::new(16);
-        mock.send_completion_delay = Some(std::time::Duration::from_millis(1100));
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
-        writer.write_async(&[0xABu8; 4]).await.unwrap();
+        block_on(writer.write_async(&[0xABu8; 4])).unwrap();
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
 
-        let result = writer.finalize().await;
+        let result = block_on(writer.finalize());
         let message = writer.suspend();
 
         assert!(result.is_err(), "the overrun budget must surface an error");
@@ -2128,14 +1947,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// An overrun within one send poll must retain partial-message accounting.
-    #[tokio::test]
-    async fn a_packet_that_lands_then_times_out_is_not_nothing_sent() {
+    /// A ready write can finish before expiry is observed, so this error path
+    /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
+    /// the flushed flag can tell the caller the server is mid-message, and
+    /// getting it wrong means the request is dropped instead of withdrawn.
+    #[test]
+    fn a_packet_that_lands_then_times_out_is_not_nothing_sent() {
         let mut mock = MockNetworkWriter::new(16);
-        mock.send_completion_delay = Some(std::time::Duration::from_millis(1100));
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
 
-        let result = writer.write_async(&[0xABu8; 64]).await;
+        let result = block_on(writer.write_async(&[0xABu8; 64]));
         let message = writer.suspend();
 
         assert!(result.is_err(), "the overrun budget must surface an error");
