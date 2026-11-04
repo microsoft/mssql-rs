@@ -2034,8 +2034,10 @@ impl TdsClient {
                     &self.execution_context,
                     first,
                 );
-                rpc.serialize_batch_command(&mut packet_writer, first)
-                    .await?;
+                if !rpc.try_write_batch_command_within_packet(&mut packet_writer, first)? {
+                    rpc.serialize_batch_command(&mut packet_writer, first)
+                        .await?;
+                }
                 first = false;
                 row_indices.push(row_index);
             }
