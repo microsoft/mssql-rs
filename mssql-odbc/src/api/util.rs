@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::fmt::Write as _;
+
+#[cfg(any(test, fuzzing))]
 use crate::api::escape::CodeScan;
 use crate::api::odbc_types::{
     SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlInteger, SqlReturn, SqlSmallInt, SqlWChar,
@@ -345,9 +348,108 @@ pub(crate) unsafe fn write_wide_attr(
 ///
 /// This is phase 2 of statement preparation. Phase 1,
 /// [`crate::api::escape::translate_escapes`], runs first on the execution path
-/// and shares the same [`CodeScan`] lexer, so the two cannot disagree about
-/// what is a comment. `SQLNativeSql` runs phase 1 only.
+/// on the [`CodeScan`] lexer. This function lexes bytes instead, skipping to
+/// the next delimiter and copying whole spans, because it runs on every
+/// execute over the full statement text. Its classification must stay
+/// identical to `CodeScan`'s; [`rewrite_param_markers_reference`] is the
+/// differential oracle the tests and the escape fuzz target hold it to.
+/// `SQLNativeSql` runs phase 1 only.
+///
+/// Every delimiter is ASCII and UTF-8 never reuses an ASCII byte inside a
+/// multi-byte character, so byte offsets found here are always char
+/// boundaries.
 pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
+    let bytes = sql.as_bytes();
+    if !bytes.contains(&b'?') {
+        return (sql.to_owned(), 0);
+    }
+
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut count: usize = 0;
+    let mut copied = 0;
+    let mut at = 0;
+    // One past the most recent block comment's `*/`, for the `*)--` look-behind.
+    let mut block_comment_end = None;
+
+    while let Some(skip) = bytes[at..]
+        .iter()
+        .position(|&b| matches!(b, b'?' | b'\'' | b'"' | b'[' | b'-' | b'/'))
+    {
+        at += skip;
+        match bytes[at] {
+            b'?' => {
+                out.push_str(&sql[copied..at]);
+                count += 1;
+                // Writing to a String cannot fail.
+                let _ = write!(out, "@P{count}");
+                at += 1;
+                copied = at;
+            }
+            b'\'' => at = skip_quoted(bytes, at + 1, b'\''),
+            b'"' => at = skip_quoted(bytes, at + 1, b'"'),
+            b'[' => at = skip_quoted(bytes, at + 1, b']'),
+            b'-' if bytes.get(at + 1) == Some(&b'-')
+                && !is_canonical_extension_dash(bytes, at, block_comment_end) =>
+            {
+                at = bytes[at + 2..]
+                    .iter()
+                    .position(|&b| b == b'\n' || b == b'\r')
+                    .map_or(bytes.len(), |end| at + 2 + end + 1);
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at = match sql[at + 2..].find("*/") {
+                    Some(end) => {
+                        let close = at + 2 + end + 2;
+                        block_comment_end = Some(close);
+                        close
+                    }
+                    None => bytes.len(),
+                };
+            }
+            _ => at += 1,
+        }
+    }
+    out.push_str(&sql[copied..]);
+
+    (out, count)
+}
+
+/// Returns the offset just past the closer of a quoted region whose body
+/// starts at `from`, treating a doubled closer as an escaped one. An
+/// unterminated region runs to the end of the text.
+fn skip_quoted(bytes: &[u8], mut from: usize, closer: u8) -> usize {
+    while let Some(i) = bytes[from..].iter().position(|&b| b == closer) {
+        let close = from + i;
+        if bytes.get(close + 1) != Some(&closer) {
+            return close + 1;
+        }
+        from = close + 2;
+    }
+    bytes.len()
+}
+
+/// Whether the code `--` at `at` stays code because it opens `--(*` or closes
+/// `*)--`.
+///
+/// `CodeScan` looks behind at the first character of each of its previous two
+/// steps, not at raw characters. A `)` cannot end a multi-character step, so
+/// the previous step is the `)` at `at - 1`. The step before it starts with
+/// `*` either as a lone code `*` at `at - 2` or as the `*/` that closed a block
+/// comment at `at - 1`. The second case makes `/*x*/)--` code where msodbcsql's
+/// raw look-behind sees `/)` and starts a comment; keep it until that parity
+/// gap is fixed in `CodeScan` too.
+fn is_canonical_extension_dash(bytes: &[u8], at: usize, block_comment_end: Option<usize>) -> bool {
+    let opens = bytes.get(at + 2) == Some(&b'(') && bytes.get(at + 3) == Some(&b'*');
+    let closes = at >= 2
+        && bytes[at - 1] == b')'
+        && (bytes[at - 2] == b'*' || block_comment_end == Some(at - 1));
+    opens || closes
+}
+
+/// The step-by-step [`CodeScan`] rewrite that [`rewrite_param_markers`]
+/// replaced, kept as its differential oracle.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn rewrite_param_markers_reference(sql: &str) -> (String, usize) {
     let mut out = String::with_capacity(sql.len() + 8);
     let mut count: usize = 0;
     let mut scan = CodeScan::new(sql);
@@ -370,7 +472,7 @@ mod tests {
     use super::{
         copy_cp1252_with_nul, copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252,
         is_high_surrogate, is_low_surrogate, is_surrogate_pair, read_utf16, read_utf16_attr,
-        read_utf16_long, rewrite_param_markers, write_if_some,
+        read_utf16_long, rewrite_param_markers, rewrite_param_markers_reference, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
 
@@ -914,6 +1016,52 @@ mod tests {
         let (out, n) = rewrite_param_markers("{?= call dbo.p(?)}");
         assert_eq!(out, "{@P1= call dbo.p(@P2)}");
         assert_eq!(n, 2);
+    }
+
+    /// Lexer edge cases pinned to exact output, and to the CodeScan oracle.
+    #[test]
+    fn rewrite_pins_lexer_edge_cases() {
+        for (sql, expected, count) in [
+            // `--` after a block comment's `*/` and `)` stays code: CodeScan
+            // looks behind at step starts, msodbcsql at raw characters.
+            ("(1 /*x*/)--?", "(1 /*x*/)--@P1", 1),
+            ("/*x*/*)--?", "/*x*/*)--@P1", 1),
+            ("'*')--?", "'*')--?", 0),
+            ("[*])--?", "[*])--?", 0),
+            ("*)--?", "*)--@P1", 1),
+            ("*)---?", "*)---?", 0),
+            (")--?", ")--?", 0),
+            ("--(", "--(", 0),
+            ("--(?", "--(?", 0),
+            ("--(\n?", "--(\n@P1", 1),
+            ("--(*?", "--(*@P1", 1),
+            ("--(*--?", "--(*--?", 0),
+            ("--x\r?", "--x\r@P1", 1),
+            ("/*/?", "/*/?", 0),
+            ("/**/?", "/**/@P1", 1),
+            ("]]?", "]]@P1", 1),
+            ("[]]?]?", "[]]?]@P1", 1),
+            ("'''?", "'''?", 0),
+            ("?-", "@P1-", 1),
+            ("?/", "@P1/", 1),
+            ("?'", "@P1'", 1),
+            ("?--", "@P1--", 1),
+            ("?/*", "@P1/*", 1),
+            ("?", "@P1", 1),
+            ("?x?", "@P1x@P2", 2),
+            ("東?'東?'?", "東@P1'東?'@P2", 2),
+        ] {
+            assert_eq!(
+                rewrite_param_markers(sql),
+                (expected.to_owned(), count),
+                "{sql:?}"
+            );
+            assert_eq!(
+                rewrite_param_markers_reference(sql),
+                (expected.to_owned(), count),
+                "{sql:?}"
+            );
+        }
     }
 
     #[test]
