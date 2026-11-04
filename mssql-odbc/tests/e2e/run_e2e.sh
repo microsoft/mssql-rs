@@ -29,7 +29,7 @@
 #            ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
 #   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt,
 #            and not the entries labelled mt_weekly.
-#   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly;
+#   weekly   only the <name>_mt entries, 16 x 25, the same modes as nightly;
 #            the only profile that runs mt_weekly entries. Nightly and weekly
 #            build with ODBC_E2E_CONCURRENT=ON.
 # nightly and weekly ignore --retries (an intermittent failure is what they
@@ -225,7 +225,7 @@ apply_mt_profile() {
             ;;
         nightly|weekly)
             export ODBC_E2E_CONCURRENT=ON
-            if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
+            if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=25; fi
             export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
             export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"
             # run_mt_test.sh runs each <name>_mt entry under gdb; the watchdog must

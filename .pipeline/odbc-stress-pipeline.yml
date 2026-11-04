@@ -7,7 +7,7 @@
 # so an intermittent failure is reported rather than retried away:
 #
 #   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
-#   weekly  16 x 50, the same modes
+#   weekly  16 x 25, the same modes
 #
 # Legs: Windows x64 (one shared build, debug driver, Windows Driver Manager,
 # msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21 (musl),

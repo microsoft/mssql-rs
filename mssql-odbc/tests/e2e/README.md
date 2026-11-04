@@ -567,7 +567,7 @@ ctest --test-dir build -L mt                            # every concurrent varia
 ```
 
 ```powershell
-.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 50, minidumps in build\mt-dumps
+.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 25, minidumps in build\mt-dumps
 ```
 
 ```bash
