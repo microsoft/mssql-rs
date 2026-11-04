@@ -2032,7 +2032,7 @@ mod tests {
 
     const LEXER_ALPHABET: &[&str] = &[
         "'", "\"", "[", "]", "-", "/", "*", "?", "{", "}", "(", ")", "\r", "\n", "N", ";", " ",
-        "東",
+        "é", "東", "😀",
     ];
 
     /// Delimiter pairs and quirk triggers that single characters rarely form.
@@ -2070,15 +2070,12 @@ mod tests {
         sql
     }
 
-    fn assert_matches_code_scan(sql: &str, rng: &mut SplitMix64, check_translation: bool) {
+    fn assert_matches_code_scan(sql: &str, rng: &mut SplitMix64) {
         assert_eq!(
             super::super::util::rewrite_param_markers(sql),
             super::super::util::rewrite_param_markers_reference(sql),
             "{sql:?}"
         );
-        if !check_translation {
-            return;
-        }
         let outputs: Vec<bool> = (0..rng.below(4)).map(|_| rng.next() & 1 == 1).collect();
         assert_eq!(
             translate_for_execution(sql, false, &outputs),
@@ -2087,13 +2084,11 @@ mod tests {
         );
     }
 
-    /// Translation is checked on a quarter of the inputs, both shapes alike:
-    /// its reference runs four CodeScan passes and would push the test past
-    /// CI's timeout.
-    #[test]
-    fn byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text() {
-        let mut rng = SplitMix64(0x6D73_7371_6C2D_7273);
-        for i in 0..1_000_000usize {
+    /// One of eight 125k-input shards, so the 1M inputs stay inside nextest's
+    /// per-test timeout under coverage instrumentation.
+    fn short_text_shard(shard: u64) {
+        let mut rng = SplitMix64(0x6D73_7371_6C2D_7273 ^ shard);
+        for i in 0..125_000usize {
             let sql = if i.is_multiple_of(2) {
                 (0..rng.below(65))
                     .map(|_| LEXER_ALPHABET[rng.below(LEXER_ALPHABET.len())])
@@ -2102,8 +2097,30 @@ mod tests {
                 let pieces = rng.below(33);
                 lexer_input(&mut rng, pieces, 20)
             };
-            assert_matches_code_scan(&sql, &mut rng, i % 8 < 2);
+            assert_matches_code_scan(&sql, &mut rng);
         }
+    }
+
+    macro_rules! short_text_shards {
+        ($($name:ident = $shard:literal),* $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    short_text_shard($shard);
+                }
+            )*
+        };
+    }
+
+    short_text_shards! {
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_0 = 0,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_1 = 1,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_2 = 2,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_3 = 3,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_4 = 4,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_5 = 5,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_6 = 6,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_7 = 7,
     }
 
     #[test]
@@ -2117,7 +2134,7 @@ mod tests {
             if i.is_multiple_of(4) {
                 sql.retain(|c| c != '{');
             }
-            assert_matches_code_scan(&sql, &mut rng, true);
+            assert_matches_code_scan(&sql, &mut rng);
         }
     }
 

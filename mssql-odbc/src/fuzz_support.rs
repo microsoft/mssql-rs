@@ -98,7 +98,6 @@ pub fn fuzz_escape_sequences(input: &str) {
     let _ = translate_and_rewrite(input, false);
     let _ = describe_text(input);
 
-    // The byte-level rewrite and the `{` shortcut must match the CodeScan path.
     assert_eq!(
         rewrite_param_markers(input),
         rewrite_param_markers_reference(input),

@@ -348,10 +348,10 @@ pub(crate) unsafe fn write_wide_attr(
 ///
 /// This is phase 2 of statement preparation. Phase 1,
 /// [`crate::api::escape::translate_escapes`], runs first on the execution path
-/// on the [`CodeScan`] lexer. This function lexes bytes instead, skipping to
+/// on the `CodeScan` lexer. This function lexes bytes instead, skipping to
 /// the next delimiter and copying whole spans, because it runs on every
 /// execute over the full statement text. Its classification must stay
-/// identical to `CodeScan`'s; [`rewrite_param_markers_reference`] is the
+/// identical to `CodeScan`'s; `rewrite_param_markers_reference` is the
 /// differential oracle the tests and the escape fuzz target hold it to.
 /// `SQLNativeSql` runs phase 1 only.
 ///
@@ -446,7 +446,7 @@ fn is_canonical_extension_dash(bytes: &[u8], at: usize, block_comment_end: Optio
     opens || closes
 }
 
-/// The step-by-step [`CodeScan`] rewrite that [`rewrite_param_markers`]
+/// The step-by-step `CodeScan` rewrite that [`rewrite_param_markers`]
 /// replaced, kept as its differential oracle.
 #[cfg(any(test, fuzzing))]
 pub(crate) fn rewrite_param_markers_reference(sql: &str) -> (String, usize) {
