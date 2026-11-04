@@ -229,6 +229,8 @@ impl PyAsyncConnection {
     /// separate five-second settlement limit; a cleanup timeout fails login
     /// even if the close coroutine suppresses cancellation. Keep the originating
     /// loop running until credential tasks have settled.
+    /// Cancelled connect futures cannot publish tokens from queued acquisition
+    /// or credential-close completions.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false, *, token_provider=None))]
     fn connect<'py>(
@@ -345,6 +347,7 @@ impl PyAsyncConnection {
             ),
         )?;
         if let Some(callback) = auth_cancellation_callback {
+            callback.borrow(py).bind_future(&future)?;
             future.call_method1("add_done_callback", (callback,))?;
         }
         Ok(future)

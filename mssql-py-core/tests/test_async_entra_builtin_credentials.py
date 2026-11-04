@@ -422,14 +422,17 @@ def test_cancel_connect_does_not_abandon_owned_cleanup(
 
 
 @pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("completion_queued", [False, True])
 def test_cancelled_connect_cannot_send_token_before_tokio_processes_cancellation(
-    builtin_context, builtin_sdk, mock_tds_server, owned
+    builtin_context, builtin_sdk, mock_tds_server, monkeypatch, owned, completion_queued
 ):
     async def run():
         loop = asyncio.get_running_loop()
         closing = asyncio.Event()
         release = asyncio.Event()
         native_settled = asyncio.Event()
+        native_settled_sync = threading.Event()
+        settled_before_observer = []
         messages = []
 
         class Logger:
@@ -440,6 +443,7 @@ def test_cancelled_connect_cannot_send_token_before_tokio_processes_cancellation
                     or "PyAsyncConnection::connect: connection established" in message
                     or "PyAsyncConnection::connect: failed:" in message
                 ):
+                    native_settled_sync.set()
                     loop.call_soon_threadsafe(native_settled.set)
 
         async def close(instance):
@@ -474,14 +478,33 @@ def test_cancelled_connect_cannot_send_token_before_tokio_processes_cancellation
         assert callbacks
         for callback in callbacks:
             future.remove_done_callback(callback)
-        future.cancel()
+        if completion_queued:
+            call_soon = loop.call_soon
+            completion_type = "CredentialCloseCompletion" if owned else "TokenCompletion"
+
+            def queue_completion(callback, *args, context=None):
+                if type(callback).__name__ == completion_type:
+                    def complete_before_observer():
+                        callback(*args)
+                        # Let Tokio settle while asyncio's done callbacks remain queued.
+                        settled_before_observer.append(native_settled_sync.wait(2))
+
+                    call_soon(future.cancel)
+                    return call_soon(complete_before_observer, context=context)
+                return call_soon(callback, *args, context=context)
+
+            monkeypatch.setattr(loop, "call_soon", queue_completion)
+        else:
+            future.cancel()
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await future
-        release.set()
         await asyncio.wait_for(native_settled.wait(), 2)
-        assert any("token acquisition cancelled" in message for message in messages)
+        if completion_queued:
+            assert settled_before_observer == [True]
         assert builtin_sdk.instances[0].close_calls == (1 if owned else 0)
         assert not mock_tds_server.has_received_token(builtin_sdk.instances[0].token)
+        assert any("token acquisition cancelled" in message for message in messages)
 
     asyncio.run(run())
 

@@ -7,11 +7,13 @@
 //! a non-empty JWT string in `token`. Acquisition runs on the captured asyncio
 //! loop; dropping the Rust operation schedules cancellation there, and a done
 //! callback observes the outcome even after the caller has stopped waiting.
+//! Successful tokens check the connect future's cancellation state on that loop
+//! before publication, without waiting for its deferred done callbacks.
 //! Custom providers remain caller-owned. Built-in credentials are acquired and
 //! closed on the same loop for each token attempt, before the token reaches TDS.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use mssql_tds::connection::client_context::{EntraIdTokenFactory, TdsAuthenticationMethod};
@@ -42,7 +44,7 @@ pub(crate) struct AsyncPythonEntraIdTokenFactory {
     provider: TokenProvider,
     locals: TaskLocals,
     dispatch: tracing::Dispatch,
-    connect_cancelled: Arc<AtomicBool>,
+    connect_cancellation: Arc<ConnectCancellationState>,
 }
 
 impl AsyncPythonEntraIdTokenFactory {
@@ -59,7 +61,7 @@ impl AsyncPythonEntraIdTokenFactory {
             provider: TokenProvider::Custom(Arc::new(provider)),
             locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
-            connect_cancelled: Arc::new(AtomicBool::new(false)),
+            connect_cancellation: Arc::default(),
         })
     }
 
@@ -69,18 +71,20 @@ impl AsyncPythonEntraIdTokenFactory {
             provider: TokenProvider::BuiltIn(Arc::new(config)),
             locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
-            connect_cancelled: Arc::new(AtomicBool::new(false)),
+            connect_cancellation: Arc::default(),
         })
     }
 
-    pub(crate) fn connection_cancellation_callback(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub(crate) fn connection_cancellation_callback(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Py<ConnectCancellation>> {
         Py::new(
             py,
             ConnectCancellation {
-                cancelled: self.connect_cancelled.clone(),
+                state: self.connect_cancellation.clone(),
             },
         )
-        .map(Py::into_any)
     }
 
     async fn acquire_token(&self, spn: &str, sts_url: &str) -> PyResult<Vec<u8>> {
@@ -94,6 +98,7 @@ impl AsyncPythonEntraIdTokenFactory {
                     owned_provider: None,
                     task: None,
                     dispatch: self.dispatch.clone(),
+                    connect_cancellation: self.connect_cancellation.clone(),
                 },
             )?;
             let request = Py::new(
@@ -142,7 +147,7 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
         // SessionRecoveryFailed, so recovery preserves initial-login semantics.
         let result = self.acquire_token(&spn, &sts_url).await;
         // The caller loop can observe cancellation before Tokio drops this future.
-        if self.connect_cancelled.load(Ordering::Acquire) {
+        if self.connect_cancellation.cancelled.load(Ordering::Acquire) {
             return Err(Error::OperationCancelledError(
                 "Async Entra token acquisition cancelled".into(),
             ));
@@ -165,16 +170,56 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
     }
 }
 
+#[derive(Default)]
+struct ConnectCancellationState {
+    cancelled: AtomicBool,
+    // A strong reference would retain the future through its own done callback.
+    future: OnceLock<Py<PyAny>>,
+}
+
+impl ConnectCancellationState {
+    fn before_publish(&self, py: Python<'_>, result: PyResult<Vec<u8>>) -> PyResult<Vec<u8>> {
+        result.and_then(|bytes| {
+            if let Some(reference) = self.future.get() {
+                let future = reference.bind(py).call0()?;
+                if !future.is_none() && future.call_method0("cancelled")?.is_truthy()? {
+                    self.cancelled.store(true, Ordering::Release);
+                }
+            }
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(PyErr::from_value(
+                    py.import("asyncio")?.getattr("CancelledError")?.call0()?,
+                ));
+            }
+            Ok(bytes)
+        })
+    }
+}
+
 #[pyclass]
-struct ConnectCancellation {
-    cancelled: Arc<AtomicBool>,
+pub(crate) struct ConnectCancellation {
+    state: Arc<ConnectCancellationState>,
+}
+
+impl ConnectCancellation {
+    pub(crate) fn bind_future(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
+        let reference = future
+            .py()
+            .import("weakref")?
+            .getattr("ref")?
+            .call1((future,))?;
+        self.state
+            .future
+            .set(reference.unbind())
+            .map_err(|_| PyRuntimeError::new_err("Async Entra connect future already bound"))
+    }
 }
 
 #[pymethods]
 impl ConnectCancellation {
     fn __call__(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
         if future.call_method0("cancelled")?.is_truthy()? {
-            self.cancelled.store(true, Ordering::Release);
+            self.state.cancelled.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -304,6 +349,7 @@ struct TokenCompletion {
     // asyncio keeps only weak references to tasks, including cancelled ones.
     task: Option<Py<PyAny>>,
     dispatch: tracing::Dispatch,
+    connect_cancellation: Arc<ConnectCancellationState>,
 }
 
 impl TokenCompletion {
@@ -320,6 +366,7 @@ impl TokenCompletion {
                         task: None,
                         timer: None,
                         dispatch: self.dispatch.clone(),
+                        connect_cancellation: self.connect_cancellation.clone(),
                     },
                 )?;
                 let close = provider.call_method0(py, "close")?;
@@ -349,18 +396,18 @@ impl TokenCompletion {
                 }
                 Err(error) => {
                     tracing::warn!("Failed to schedule driver-owned Entra credential cleanup");
-                    self.send(result.and(Err(error)));
+                    self.send(py, result.and(Err(error)));
                     return;
                 }
             }
         }
-        self.send(result);
+        self.send(py, result);
     }
 
-    fn send(&mut self, result: PyResult<Vec<u8>>) {
+    fn send(&mut self, py: Python<'_>, result: PyResult<Vec<u8>>) {
         if let Some(sender) = self.sender.take() {
             // A dropped receiver means the native operation was cancelled.
-            let _ = sender.send(result);
+            let _ = sender.send(self.connect_cancellation.before_publish(py, result));
         }
     }
 }
@@ -415,14 +462,16 @@ struct CredentialCloseCompletion {
     task: Option<Py<PyAny>>,
     timer: Option<Py<PyAny>>,
     dispatch: tracing::Dispatch,
+    connect_cancellation: Arc<ConnectCancellationState>,
 }
 
 impl CredentialCloseCompletion {
-    fn finish(&mut self, closed: PyResult<()>) {
+    fn finish(&mut self, py: Python<'_>, closed: PyResult<()>) {
         if let Some(sender) = self.sender.take()
             && let Some(result) = self.result.take()
         {
-            let _ = sender.send(result.and_then(|bytes| closed.map(|_| bytes)));
+            let result = result.and_then(|bytes| closed.map(|_| bytes));
+            let _ = sender.send(self.connect_cancellation.before_publish(py, result));
         }
     }
 }
@@ -443,9 +492,12 @@ impl CredentialCloseCompletion {
         }
         // wait_for can exceed its timeout when close suppresses cancellation.
         // Keep observing the task, but never publish its token after the deadline.
-        self.finish(Err(PyTimeoutError::new_err(
-            "Timed out closing driver-owned async Entra credential",
-        )));
+        self.finish(
+            py,
+            Err(PyTimeoutError::new_err(
+                "Timed out closing driver-owned async Entra credential",
+            )),
+        );
     }
 
     fn __call__(&mut self, task: &Bound<'_, PyAny>) {
@@ -464,7 +516,7 @@ impl CredentialCloseCompletion {
             tracing::debug!("Driver-owned async Entra credential closed");
         }
         self.provider.take();
-        self.finish(closed);
+        self.finish(task.py(), closed);
     }
 }
 
