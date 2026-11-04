@@ -77,6 +77,13 @@ pub(super) fn get_access_mode(
             return SQL_ERROR;
         };
         free_errors(&mut state);
+        if value_ptr.is_null() {
+            // The integer width is known without querying database updateability.
+            unsafe {
+                write_if_some(string_length_ptr, 4);
+            }
+            return SQL_SUCCESS;
+        }
     }
     let read_only = match database_read_only(dbc) {
         Ok(value) => value,
@@ -590,22 +597,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_buffers_do_not_issue_or_cache_a_lookup() {
+    fn invalid_info_buffer_does_not_issue_or_cache_a_lookup() {
         let (h, _server) = fixture(response("Y").with_delay(Duration::from_secs(8)));
         let started = Instant::now();
-        assert_eq!(
-            unsafe {
-                SQLGetConnectAttrW(
-                    h.dbc,
-                    SQL_ATTR_ACCESS_MODE,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                )
-            },
-            SQL_ERROR
-        );
-        assert_diag(&h, b"HY009");
         assert_eq!(
             unsafe {
                 SQLGetInfoW(
@@ -620,6 +614,32 @@ mod tests {
         );
         assert_diag(&h, b"HY090");
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(dbc(&h).inner.lock().unwrap().database_read_only.is_none());
+    }
+
+    #[test]
+    fn null_access_mode_outputs_succeed_without_a_lookup() {
+        let (h, _server) = fixture(response("Y").with_delay(Duration::from_secs(8)));
+        let mut length = -1;
+        assert_eq!(
+            unsafe {
+                SQLGetConnectAttrW(h.dbc, SQL_ATTR_ACCESS_MODE, ptr::null_mut(), 0, &mut length)
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(length, 4);
+        assert_eq!(
+            unsafe {
+                SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_ATTR_ACCESS_MODE,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
         assert!(dbc(&h).inner.lock().unwrap().database_read_only.is_none());
     }
 
