@@ -13,6 +13,7 @@ the behavior is tested. The owning user story is
 | [AB#47086](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47086) | Closed | First-release support for the 21 information types then blocking mssql-python. |
 | [AB#48149](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/48149) | Active | 61 mssql-python payload names representing 59 distinct information IDs. `SQL_OWNER_USAGE` aliases `SQL_SCHEMA_USAGE`; `SQL_QUALIFIER_USAGE` aliases `SQL_CATALOG_USAGE`. |
 | [AB#47996](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47996) | Active | The remaining ODBC 3.x public information types: 25 conversion masks, the supported-SQL / SQL-92 / driver capability masks, the SQL limits, `SQL_COLLATION_SEQ`, and the deprecated `SQL_LOCK_TYPES` / `SQL_POS_OPERATIONS`. |
+| [AB#49637](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49637) | New | Report the single concurrent activity accurately; retain and document unknown-length long-data support. |
 
 [AB#46406](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46406),
 `SQLGetTypeInfoW`, is another closed child of AB#46381. It is deliberately
@@ -86,6 +87,46 @@ This driver matches that: `state.packet_size`/`ConnectionParams::packet_size`
 stay `0` through `SQLGetConnectAttr`/`SQLGetInfo` while disconnected, and only
 `ClientContext` (which cannot hold a literal `0`) resolves to its own default
 at connect time.
+
+## Active statements and long-data lengths
+
+`SQL_ACTIVE_STATEMENTS` (the legacy name for
+`SQL_MAX_CONCURRENT_ACTIVITIES`) reports `1`, not `0` ("no stated limit").
+This is the number of concurrently active statements, not the number of
+allocated statement handles. The connection's single wire owner prevents
+another statement from executing while results remain pending.
+
+`SQL_NEED_LONG_DATA_LEN` remains `"N"`: `SQL_DATA_AT_EXEC` supplies long
+input without declaring its total byte count. Both the streamed PLP path
+and deferred buffering accept it. Enforcing a positive
+`SQL_LEN_DATA_AT_EXEC(n)` declaration is a separate promise and does not
+make declaring a total mandatory.
+
+**Evidence:** the classic `SQLGetInfoTable` in
+`Sql/Ntdbms/sqlncli/odbc/sqlcinfo.cpp:278,388`, returned by
+`ExportImp::SQLGetInfoW`, advertises `1` and `"Y"`. Windows x64 retail
+18.7.1.1 (`SQL_DRIVER_VER=18.07.0001`) measured directly on an allocated,
+unconnected DBC agrees. Before this correction, main `b746d40c` returned
+`0` and `"N"`. Against the local SQL Server, both drivers rejected a second
+statement with pending results using `HY000` and accepted it after closing
+the first. Both also accepted unknown-length `SQL_LONGVARCHAR`,
+`SQL_WLONGVARCHAR`, and `SQL_LONGVARBINARY` in 8192-byte chunks, returning
+the expected 60000, 120000, and 60000 bytes respectively. Retail's `"Y"`
+therefore does not establish a modern-server execution requirement.
+
+Keep the truthful `"N"` rather than add a length requirement or advertise
+one that the implementation does not have. AB#49637 owns this deliberate
+metadata difference; the author approved retaining it on 2026-11-02.
+See [parity registry entry 37](parity-deviations.md). The reference execution
+path and the limits of this measurement are recorded there.
+
+Rust's `execution_capabilities_are_reported_through_export` pins both values
+and their widths before connect. E2E
+`ActiveStatementsReportsSingleConcurrentActivity` asserts `1` on both legs;
+`NeedLongDataLengthReflectsDriverContract` explicitly asserts Rust `"N"`
+and retail `"Y"` without skipping either leg.
+`UnknownLengthLongDataStreamsInChunks` round-trips all three long types on
+both legs, independently of the metadata difference.
 
 ## Database read-only state
 

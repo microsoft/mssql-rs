@@ -87,6 +87,17 @@ validation until connect; a successful cached set is not driver acceptance.
 [shared connection policy and migration guide](../mssql-tds/README.md#connection-policy-and-migration)
 for the full precedence and applicability rules.
 
+### Connection-operation timeouts
+
+`SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-scoped network requests,
+including pooled reset, isolation and autocommit changes, transaction completion,
+and cancellation settlement when those operations close pending cursors.
+Cursor cleanup abandons unfinished server work rather than draining it.
+Zero leaves request I/O unlimited and uses the default cancellation budget.
+Cancellation settlement and a pool's replacement login can add time; this is not
+an end-to-end pool-checkout deadline. A connection that cannot finish cancellation
+is retired rather than returned with an unsynchronized response stream.
+
 ### Data-at-execution parameters
 
 PLP-capable values supplied through `SQLParamData`/`SQLPutData` are streamed to
@@ -135,6 +146,10 @@ parameters remain chunked in both modes.
 Install the repository's pinned Rust toolchain. Linux and macOS builds also
 need unixODBC development headers; the C++ end-to-end tests additionally need
 CMake and a C++17 compiler.
+
+Default-feature macOS builds require macOS 10.15 or later (11.0 or later on
+Apple Silicon). Set `MACOSX_DEPLOYMENT_TARGET=10.15` or later for x86_64 builds
+to meet the Network.framework requirement.
 
 From the repository root:
 

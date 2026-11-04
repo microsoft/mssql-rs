@@ -96,9 +96,9 @@ stages:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
     - bash: |
         set -euo pipefail
-        python3 .pipeline/scripts/sql-host/generate-shared-password.py
+        python3 .pipeline/scripts/sql-host/generate-credential-generation.py
       name: GenerateSqlCredential
-      displayName: Generate shared SQL credential
+      displayName: Generate SQL credential generation ID
       condition: and(succeeded(), ne(variables['SetDuplicateState.skipDuplicate'], 'true'))
 - stage: Build
   displayName: Build Stage
@@ -154,7 +154,7 @@ stages:
       # Packaging and artifact gates must be tested even when PR runs skip them.
       - pwsh: |
           python -m pip install --quiet pytest pyyaml packaging
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_shared_sql_credentials.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_versions.py scripts/test_bump_mssql_python_release.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_sync_pipeline.py scripts/test_benchmark_pipeline.py scripts/test_docker_cargo_run.py -q
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py scripts/test_macos_deployment_target.py scripts/test_shared_sql_credentials.py scripts/test_repair_glibc_wheels.py scripts/test_bump_released_versions.py scripts/test_bump_mssql_python_release.py scripts/test_python_wheel_install.py scripts/test_coverage_report.py scripts/test_ghcr_parameters.py scripts/test_sync_pipeline.py scripts/test_benchmark_pipeline.py scripts/test_docker_cargo_run.py -q
         displayName: 'Unit test packaging scripts and pipeline configuration'
       - template: build-template.yml
         parameters:
@@ -248,7 +248,6 @@ stages:
         - imageOverride -equals RUST-WINSRV-ARM
     variables:
       ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
-        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
         SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
       CARGO_TARGET_DIR: C:\cargo_target_dir
@@ -441,7 +440,6 @@ stages:
         - imageOverride -equals ${{ parameters.linuxArmImage }}
     variables:
       ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
-        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
         SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       CARGO_TARGET_DIR: $(Build.SourcesDirectory)
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
@@ -521,17 +519,10 @@ stages:
 
   - job: Test_MacOS
     displayName: Test MacOS
-    # No explicit timeout here used to mean the ADO default of 60m, which this
-    # job can now genuinely exceed: nested virtualization (Colima's Linux VM
-    # under the macOS runner) makes Docker/SQL Server startup 2-3x more
-    # variable than on Linux or Windows, and it's the only test job running
-    # the full mssql-tds + mssqlodbc coverage-instrumented suite on that
-    # runner class. A run that is otherwise healthy (every test still passing,
-    # nothing hung) was seen canceled by the 60m ceiling rather than by a
-    # failure. Budgeted for headroom over the worst observed case, not to mask
-    # a real hang — a genuinely wedged step still fails via its own tighter,
-    # dedicated timeout long before this outer one would matter.
-    timeoutInMinutes: 90
+    # Colima startup plus the Rust and ODBC suites can exceed 90m: build 188168
+    # reached ODBC test 72/78 with every completed case passing before cancellation.
+    # Keep per-test hang limits intact; this is the whole job's budget.
+    timeoutInMinutes: 120
     pool:
       name: Azure Pipelines
       vmImage: macOS-latest

@@ -162,9 +162,13 @@ on the `master` branch.
     mirroring msodbcsql's `IDS_*` resource entries. In new code, prefer
     adding/using an `ERR_*` `DiagMsg` constant over inlining `post_sql_error`
     with a literal — especially when the same `(SQLSTATE, message)` pair
-    appears, or could appear, in more than one place.
+    appears, or could appear, in more than one place. Declare new constants
+    inside the `diag_msgs!` block: it builds the prefixed text at compile time
+    so `post_diag` stores a borrowed `&'static str` without allocating, which
+    matters on hot paths such as the `01004` of a `SQLGetData` length probe.
   - `post_sql_error(state, sqlstate, native, message)` — the lower-level
-    primitive behind `post_diag`. Use it directly only for genuinely one-off
+    primitive for driver text built at runtime (`post_diag` bypasses it and
+    posts the precomputed `DiagMsg` text). Use it directly only for genuinely one-off
     or **dynamic** messages (text computed at runtime) that don't warrant a
     constant. Posts exactly one record.
   - `post_tds_error(state, &tds_err, default_sqlstate)` — for any
@@ -541,7 +545,16 @@ on; these guarantees were verified against msodbcsql's behavior.
 - Write new behavioral e2e tests with `ODBC_TEST_F` (from
   `odbc_concurrent_test.h`) instead of `TEST_F`. The body is unchanged; the macro
   also runs it across threads (`/CrossThread`, `/SharedEnv`, `/SharedStmt`), so
-  concurrency coverage comes without a second copy of the test.
+  concurrency coverage comes without a second copy of the test. PR validation
+  runs only `/SharedDbc`, and only on Windows; the other modes run in the
+  stress pipeline (Windows and Linux, no macOS leg). Linux and macOS compile
+  the variants only with `ODBC_E2E_CONCURRENT=ON` (environment, or
+  `-DODBC_E2E_CONCURRENT=ON`) when CMake configures.
+  - Before review, run the `<name>_mt` entry of a test you add or convert in
+    every mode (`MSSQL_ODBC_MT_SKIP_MODES=none`, plus `ODBC_E2E_CONCURRENT=ON`
+    on Unix, or `--mt-profile=nightly` / `-MtProfile nightly`):
+    PR validation does not cover a test that keeps out of `/SharedDbc`, nor
+    any concurrent variant on unixODBC.
   - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests
     that change ENV, pooling, or process state, test connect, disconnect, or
     driver loading, create fixed-name permanent objects, free or replace
@@ -556,8 +569,11 @@ on; these guarantees were verified against msodbcsql's behavior.
   - Opt into `/SharedDbc` with `ODBC_TEST_F_MODES(..., odbc_concurrency::kAllModes)`
     only when the body changes no connection attributes or transactions, gives
     temporary objects per-worker names (including `#temp` tables and
-    procedures, which workers on one DBC share), and is safe to rerun after a
-    busy retry. PR and stress runs execute the mode.
+    procedures, which workers on one DBC share), reads no connection-level
+    diagnostics (another worker's call on the DBC clears them), and is safe to
+    rerun after a busy retry. A bare assertion on a statement other than
+    `stmt_` must stream that statement's diagnostic, so a busy connection is
+    retried rather than failed. PR and stress runs execute the mode.
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
     connect races) go under `tests/e2e/tests/multithreaded_tests/`.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
@@ -623,8 +639,13 @@ For ODBC hot paths:
     do not add avoidable per-row allocation or metadata cloning.
     Across fetch calls, retain only the empty binding vector's allocation and
     rebuild its contents under the ARD lock. Descriptor writes, reassociation,
-    and unbinding must remain visible on the next fetch. Only the statement's
-    own implicit ARD can bypass the global descriptor-liveness lookup.
+    and unbinding must remain visible on the next fetch. Only a statement's
+    own implicit ARD, APD, IRD, and IPD can bypass the global
+    descriptor-liveness lookup, and only by exact pointer equality
+    (`StmtHandle::owns_implicit_desc`): they are allocated in
+    `StmtHandle::new`, never reassigned, rejected by `free_desc` with `HY017`,
+    and freed only when the statement drops. Explicit descriptors keep the
+    lookup.
     Keep `RowIssue` and `RowOutcome` within two bytes: converters return the
     compact `ConvError`, mapped to a canonical diagnostic only on failure.
     Carrying a full diagnostic enlarges every successful column conversion

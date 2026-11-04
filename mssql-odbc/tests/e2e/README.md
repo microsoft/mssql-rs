@@ -384,11 +384,15 @@ infrastructure works (`runtests.c`).
   fixed by [lurcher/unixODBC#244](https://github.com/lurcher/unixODBC/pull/244)
   but not yet released). Until the pipelines test against a unixODBC build with
   the fix ([AB#49575](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49575)),
-  all Unix runner profiles (including PR) skip `/SharedStmt` for both drivers.
-  Single-threaded tests and `/CrossThread`, `/SharedEnv`, and `/SharedDbc`
-  remain enabled; Windows profiles are unchanged. This temporarily removes
+  all Unix runner profiles skip `/SharedStmt` for both drivers. Linux and
+  macOS build the `<name>_mt` entries only with `ODBC_E2E_CONCURRENT=ON`, set
+  in the environment at configure time or as `-DODBC_E2E_CONCURRENT=ON` (the
+  stress profiles set it), so Unix PR runs have none; Windows PR runs only
+  `/SharedDbc`. Single-threaded tests and `/CrossThread`, `/SharedEnv`, and
+  `/SharedDbc` remain enabled in the stress profiles. This temporarily removes
   same-statement diagnostic-observer coverage on unixODBC. Set
-  `MSSQL_ODBC_MT_SKIP_MODES=none` when validating a patched Driver Manager.
+  `MSSQL_ODBC_MT_SKIP_MODES=none` (with `ODBC_E2E_CONCURRENT=ON`) when
+  validating a patched Driver Manager.
   Separately,
   the `/SharedStmt` variants of
   `GetDataLiveTest.DefaultTargetStreamsAVarcharMaxAcrossChunks` and
@@ -612,7 +616,45 @@ Each test calls standard ODBC C APIs (`SQLAllocHandle`, `SQLDriverConnect`,
 etc.) through the Driver Manager, which loads our shared library — the same
 code path a real application uses.
 
-## CI: prebuilt artifact flow (build once, test on many distros)
+## CI: prebuilt artifact flow
+
+### Windows stress jobs
+
+The Windows stress pipeline builds the debug driver and C++ suite once, then
+shares that drop across the Fetch, Parameters, Metadata, and Other jobs. Each
+execution job keeps its existing stress profile and msodbcsql comparison leg.
+Compilation and execution have separate job budgets.
+
+```powershell
+pwsh -File .\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\odbc-e2e
+# Download/copy the drop's build\ directory into the consumer's tests\e2e\.
+.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile nightly -CompareWithMsodbcsql
+```
+
+`-BuildOnly` requires PowerShell 7 or later (`pwsh`) and rejects Windows
+PowerShell 5.1 before starting a build. Relative `-OutDir` paths resolve against
+the current PowerShell location. `-BuildOnly -Release` is rejected: the drop
+requires a debug driver with symbols.
+
+`-BuildJobs N` bounds parallel C++ build processes. The stress producer selects
+the smaller of four and the logical CPU count; other runner invocations retain
+the serial default of one. Test concurrency is unchanged. Measure build duration
+and memory use before increasing the limit.
+
+The drop includes the driver, test binaries, and PDBs. Its generated CTest
+registration resolves executable paths relative to the downloaded drop, so
+consumer checkout paths may differ from the producer's. No CMake cache, object
+files, or compiler installation is needed for `-SkipBuild`; CTest,
+the runtime dependencies, and administrator privileges for
+driver registration are still required. `-BuildOnly` does not register drivers
+or require SQL Server. `-SkipBuild` cannot be combined with `-Coverage` or
+`-Release`; the prebuilt drop determines the driver build.
+
+The producer publishes an attempt-scoped artifact name and passes that name
+to consumers through a job output, so retrying the build does not collide with
+an earlier attempt's drop.
+
+### Linux distro jobs
 
 CI (the main-branch pipeline) does not rebuild the driver in every distro. It
 splits the flow into a build half and a run half so a single set of binaries can

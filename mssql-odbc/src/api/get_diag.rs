@@ -541,7 +541,7 @@ mod tests {
             .lock()
             .unwrap()
             .diag_records
-            .push(DiagRecord::new(sql_state, native, msg));
+            .push(DiagRecord::new(sql_state, native, msg.to_owned()));
     }
 
     fn utf16_to_string(buf: &[u16]) -> String {
@@ -1367,5 +1367,96 @@ mod tests {
             assert_eq!(buf[0], 0); // NUL-terminated empty string
         }
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    const TRUNCATION_TEXT: &str =
+        "[Microsoft][ODBC Driver 18 for SQL Server]String data, right truncation";
+
+    fn stmt_with_truncation_warning() -> crate::test_support::TestHandles {
+        use crate::api::sqlstate::{WARN_STRING_TRUNCATION, post_diag};
+        use crate::handles::StmtHandle;
+
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        post_diag(&mut stmt.inner.lock().unwrap(), WARN_STRING_TRUNCATION);
+        h
+    }
+
+    #[test]
+    fn diag_rec_round_trips_driver_warning_at_every_buffer_size() {
+        let h = stmt_with_truncation_warning();
+        let expected: Vec<u16> = TRUNCATION_TEXT.encode_utf16().collect();
+        let len = expected.len();
+
+        for buffer_chars in [256, len + 1, len, 1] {
+            let mut state = [0u16; 6];
+            let mut native: SqlInteger = -1;
+            let mut msg = [0xFFFFu16; 256];
+            let mut text_len: SqlSmallInt = -1;
+            let ret = unsafe {
+                sql_get_diag_rec_w(
+                    SQL_HANDLE_STMT,
+                    h.stmt,
+                    1,
+                    state.as_mut_ptr(),
+                    &mut native,
+                    msg.as_mut_ptr(),
+                    buffer_chars as SqlSmallInt,
+                    &mut text_len,
+                )
+            };
+            let copied = len.min(buffer_chars - 1);
+            let want = if copied == len {
+                SQL_SUCCESS
+            } else {
+                SQL_SUCCESS_WITH_INFO
+            };
+            assert_eq!(ret, want, "buffer {buffer_chars}");
+            assert_eq!(utf16_to_string(&state), "01004");
+            assert_eq!(native, 0);
+            assert_eq!(text_len as usize, len, "buffer {buffer_chars}");
+            assert_eq!(&msg[..copied], &expected[..copied], "buffer {buffer_chars}");
+            assert_eq!(msg[copied], 0, "buffer {buffer_chars}");
+            assert!(msg[buffer_chars..].iter().all(|&c| c == 0xFFFF));
+        }
+    }
+
+    #[test]
+    fn diag_field_round_trips_driver_warning_at_every_buffer_size() {
+        let h = stmt_with_truncation_warning();
+        let expected: Vec<u16> = TRUNCATION_TEXT.encode_utf16().collect();
+        let len = expected.len();
+        let char_size = mem::size_of::<SqlWChar>();
+
+        for buffer_chars in [256, len + 1, len, 1] {
+            let mut msg = [0xFFFFu16; 256];
+            let mut string_len: SqlSmallInt = -1;
+            let ret = unsafe {
+                sql_get_diag_field_w(
+                    SQL_HANDLE_STMT,
+                    h.stmt,
+                    1,
+                    SQL_DIAG_MESSAGE_TEXT,
+                    msg.as_mut_ptr() as SqlPointer,
+                    (buffer_chars * char_size) as SqlSmallInt,
+                    &mut string_len,
+                )
+            };
+            let copied = len.min(buffer_chars - 1);
+            let want = if copied == len {
+                SQL_SUCCESS
+            } else {
+                SQL_SUCCESS_WITH_INFO
+            };
+            assert_eq!(ret, want, "buffer {buffer_chars}");
+            assert_eq!(
+                string_len as usize,
+                len * char_size,
+                "buffer {buffer_chars}"
+            );
+            assert_eq!(&msg[..copied], &expected[..copied], "buffer {buffer_chars}");
+            assert_eq!(msg[copied], 0, "buffer {buffer_chars}");
+            assert!(msg[buffer_chars..].iter().all(|&c| c == 0xFFFF));
+        }
     }
 }

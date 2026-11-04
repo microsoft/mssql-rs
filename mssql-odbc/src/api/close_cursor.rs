@@ -192,7 +192,7 @@ pub(super) fn free_stmt_close_locked(
 }
 
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
-/// (`SQLEndTran`, an autocommit switch, an isolation change, disconnect).
+/// (`SQLEndTran`, an autocommit switch, connection reset, disconnect).
 ///
 /// Reproduces what msodbcsql's sweep does to each statement. `CommitAbortTran`
 /// calls `SQLFreeStmt(lpstmt, SQL_CLOSE)` on every statement it visits
@@ -300,6 +300,15 @@ fn abandon_and_release_inner(
     statement_handle: SqlHandle,
     process_is_shutting_down: bool,
 ) -> DrainOutcome {
+    abandon_and_release_with_hook(stmt, statement_handle, process_is_shutting_down, || {})
+}
+
+fn abandon_and_release_with_hook(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    process_is_shutting_down: bool,
+    after_claim: impl FnOnce(),
+) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
     let (mut client, cancel_timeout) = {
@@ -333,6 +342,9 @@ fn abandon_and_release_inner(
             }
         }
     };
+
+    // Let the test observe the lease without holding the DBC mutex.
+    after_claim();
 
     // The drain is a server round-trip, so it needs the scheduler's worker to
     // drive the socket. During `DLL_PROCESS_DETACH` the OS has already
@@ -1185,7 +1197,7 @@ mod tests {
         assert!(ss.pending_fetch_error.is_none());
     }
 
-    /// The connection-scoped sweep (`SQLEndTran`/autocommit/isolation change)
+    /// The connection-scoped sweep (`SQLEndTran`/autocommit/connection reset)
     /// must NOT fail its own return over a pending fetch error on one
     /// statement: `SQL_ERROR` from this function specifically means "the
     /// stream failed to drain, unsafe to send a TM request next" — a stale
@@ -1398,11 +1410,10 @@ mod tests {
     }
 
     /// AB#49225: closing an early-released cursor (AB#47508) checks the client
-    /// out; an execute in that window must get the busy error. Holding A's
-    /// statement lock parks the close right after its checkout.
+    /// out; an execute in that window must get the busy error.
     #[test]
     fn closing_an_early_released_cursor_reports_busy_to_a_concurrent_execute() {
-        use std::time::{Duration, Instant};
+        use std::{sync::mpsc, time::Duration};
 
         use crate::api::exec_common::{claim_connection, return_client_idle};
         use crate::api::odbc_types::{SQL_ERROR, SqlHandle};
@@ -1420,45 +1431,55 @@ mod tests {
             .wire
             .put_client_for_test(tds_client_from_tokens(Vec::new()));
 
-        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let parked = stmt_a.inner.lock().unwrap();
-
         // Raw handles are not `Send`; move the address instead.
         let stmt_a_addr = h.stmt as usize;
-        let closer = std::thread::spawn(move || {
-            let handle = stmt_a_addr as SqlHandle;
-            let stmt_a = unsafe { handle_from_raw::<StmtHandle>(handle) };
-            matches!(abandon_and_release(stmt_a, handle), DrainOutcome::Clean)
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !dbc.inner.lock().unwrap().wire.is_checked_out() {
-            assert!(
-                Instant::now() < deadline,
-                "the close never checked the client out"
-            );
-            std::thread::yield_now();
-        }
-        assert_eq!(
-            dbc.inner.lock().unwrap().wire.statement_owner(),
-            Some(h.stmt),
-            "the close must reserve the wire for its own statement"
-        );
-
         let other = unsafe { handle_from_raw::<StmtHandle>(stmt_b) };
-        let claim = claim_connection(dbc, other, stmt_b, "SQLExecDirectW");
-        assert!(matches!(claim, Err(SQL_ERROR)));
-        {
-            let ss = other.inner.lock().unwrap();
-            assert_eq!(ss.diag_records.len(), 1);
-            assert_last_diag(&ss.diag_records, ERR_CONNECTION_BUSY);
-        }
 
-        drop(parked);
-        assert!(
-            closer.join().unwrap(),
-            "the close itself must still succeed"
-        );
+        std::thread::scope(|scope| {
+            let (claimed_tx, claimed_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel::<()>();
+            let closer = scope.spawn(move || {
+                let handle = stmt_a_addr as SqlHandle;
+                // SAFETY: the scoped thread joins before the handles are freed.
+                let stmt_a = unsafe { handle_from_raw::<StmtHandle>(handle) };
+                matches!(
+                    abandon_and_release_with_hook(stmt_a, handle, false, || {
+                        if claimed_tx.send(()).is_ok() {
+                            // Dropping the sender also resumes close on a test failure.
+                            assert!(resume_rx.recv().is_err());
+                        }
+                    }),
+                    DrainOutcome::Clean
+                )
+            });
+
+            claimed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the close never checked the client out");
+            {
+                let ds = dbc.inner.lock().unwrap();
+                assert!(ds.wire.is_checked_out());
+                assert_eq!(
+                    ds.wire.statement_owner(),
+                    Some(h.stmt),
+                    "the close must reserve the wire for its own statement"
+                );
+            }
+
+            let claim = claim_connection(dbc, other, stmt_b, "SQLExecDirectW");
+            assert!(matches!(claim, Err(SQL_ERROR)));
+            {
+                let ss = other.inner.lock().unwrap();
+                assert_eq!(ss.diag_records.len(), 1);
+                assert_last_diag(&ss.diag_records, ERR_CONNECTION_BUSY);
+            }
+
+            drop(resume_tx);
+            assert!(
+                closer.join().unwrap(),
+                "the close itself must still succeed"
+            );
+        });
         {
             let ds = dbc.inner.lock().unwrap();
             assert_eq!(ds.wire.owner(), None, "the close must release the wire");

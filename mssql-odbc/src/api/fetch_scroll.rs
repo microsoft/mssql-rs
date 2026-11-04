@@ -7001,13 +7001,7 @@ mod tests {
                     if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
                         (RowIssue::Restricted, ERR_RESTRICTED_DATA_TYPE)
                     } else if matches!(target, SQL_C_CHAR | SQL_C_WCHAR) {
-                        (
-                            RowIssue::Unsupported,
-                            DiagMsg {
-                                state: SQLSTATE_HYC00,
-                                text: "Column type conversion not yet implemented",
-                            },
-                        )
+                        (RowIssue::Unsupported, ERR_COLUMN_CONVERSION_NOT_IMPLEMENTED)
                     } else {
                         (*issue, *expected_diagnostic)
                     };

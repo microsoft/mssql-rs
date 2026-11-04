@@ -732,6 +732,8 @@ mod tests {
         GetDataReadAhead,
         MoreResults,
         Close,
+        EndTran,
+        AutocommitOn,
         Idle,
         IdlePlp,
         IdleClose,
@@ -887,6 +889,19 @@ mod tests {
             state.wire.install(client);
             state.connection_state = crate::handles::dbc::ConnectionState::Connected;
         }
+        let connection_end_tran = matches!(phase, CursorPhase::EndTran);
+        let connection_autocommit = matches!(phase, CursorPhase::AutocommitOn);
+        let connection_close = connection_end_tran || connection_autocommit;
+        if connection_close {
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLSetConnectAttrW(
+                    h.dbc,
+                    SQL_ATTR_AUTOCOMMIT,
+                    SQL_AUTOCOMMIT_OFF as usize as SqlPointer,
+                    0,
+                )
+            });
+        }
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(
             SQL_SUCCESS,
@@ -896,6 +911,12 @@ mod tests {
             "{:?}",
             stmt.inner.lock().unwrap().diag_records
         );
+        if connection_close {
+            let state = dbc.inner.lock().unwrap();
+            assert!(!state.autocommit);
+            assert!(state.local_tran_started);
+            assert!(state.wire.client().unwrap().has_active_transaction());
+        }
         let mut bound = 0i32;
         let mut length = 0;
         if matches!(
@@ -940,9 +961,10 @@ mod tests {
             });
         }
         let raw = h.stmt as usize;
-        if stall {
+        let raw_dbc = h.dbc as usize;
+        if stall || connection_close {
             // Change after execution to verify the current connection attribute,
-            // not the execute-time snapshot, controls SQLCancel's deadline.
+            // not the execute-time snapshot, controls cancellation settlement.
             assert_eq!(SQL_SUCCESS, unsafe {
                 crate::api::SQLSetConnectAttrW(
                     h.dbc,
@@ -982,6 +1004,25 @@ mod tests {
                     CursorPhase::Fetch | CursorPhase::ReadAhead => crate::api::SQLFetch(raw),
                     CursorPhase::MoreResults => crate::api::SQLMoreResults(raw),
                     CursorPhase::Close => crate::api::SQLFreeStmt(raw, SQL_CLOSE),
+                    CursorPhase::EndTran => {
+                        let rc = crate::api::SQLEndTran(
+                            SQL_HANDLE_DBC,
+                            raw_dbc as SqlHandle,
+                            SQL_COMMIT,
+                        );
+                        idle_tx.send(rc).unwrap();
+                        rc
+                    }
+                    CursorPhase::AutocommitOn => {
+                        let rc = crate::api::SQLSetConnectAttrW(
+                            raw_dbc as SqlHandle,
+                            SQL_ATTR_AUTOCOMMIT,
+                            SQL_AUTOCOMMIT_ON as usize as SqlPointer,
+                            0,
+                        );
+                        idle_tx.send(rc).unwrap();
+                        rc
+                    }
                     _ => {
                         let mut data = [0u8; 64];
                         let mut length = 0;
@@ -1016,7 +1057,7 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
-            let cancel = (!idle).then(|| {
+            let cancel = (!idle && !connection_close).then(|| {
                 scope.spawn(move || {
                     let rc = unsafe { crate::api::SQLCancel(raw as SqlHandle) };
                     cancel_tx.send(rc).unwrap();
@@ -1032,7 +1073,15 @@ mod tests {
                 ack_tx.send(()).unwrap();
             }
             assert_eq!(
-                if idle {
+                if connection_close {
+                    if !acknowledge {
+                        SQL_ERROR
+                    } else if connection_autocommit {
+                        SQL_SUCCESS_WITH_INFO
+                    } else {
+                        SQL_SUCCESS
+                    }
+                } else if idle {
                     if acknowledge { idle_success } else { SQL_ERROR }
                 } else {
                     SQL_SUCCESS
@@ -1049,11 +1098,11 @@ mod tests {
                 assert!(!state.has_state(STMT_STATE_CURSOR_OPEN), "{phase:?}");
                 assert!(state.active_plp.is_none());
                 assert!(state.pending_fetch_error.is_none());
-                if idle {
+                if idle || connection_close {
                     if !acknowledge {
                         assert!(!state.diag_records.is_empty());
                         assert!(state.diag_records.iter().all(|d| d.sql_state != *b"01S05"));
-                    } else if matches!(phase, CursorPhase::IdleClose) {
+                    } else if matches!(phase, CursorPhase::IdleClose) || connection_close {
                         assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
                     } else {
                         assert_eq!(state.diag_records.last().unwrap().sql_state, *b"01S05");
@@ -1069,6 +1118,21 @@ mod tests {
             {
                 let state = dbc.inner.lock().unwrap();
                 assert!(state.wire.owner().is_none());
+                if connection_close {
+                    if !acknowledge {
+                        assert_eq!(state.diag_records[0].sql_state, *b"HY000");
+                    } else if connection_autocommit {
+                        assert_eq!(state.diag_records.len(), 1);
+                        assert_eq!(state.diag_records[0].sql_state, *b"01000");
+                    } else {
+                        assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
+                    }
+                    assert_eq!(state.autocommit, connection_autocommit && acknowledge);
+                    assert_eq!(state.local_tran_started, !acknowledge);
+                    if acknowledge {
+                        assert!(!state.wire.client().unwrap().has_active_transaction());
+                    }
+                }
                 assert_eq!(
                     state.wire.client().unwrap().is_connection_dead(),
                     !acknowledge
@@ -1080,7 +1144,11 @@ mod tests {
             assert_eq!(
                 if idle && acknowledge {
                     idle_success
-                } else if matches!(phase, CursorPhase::Close) {
+                } else if connection_autocommit && acknowledge {
+                    SQL_SUCCESS_WITH_INFO
+                } else if matches!(phase, CursorPhase::Close)
+                    || (connection_end_tran && acknowledge)
+                {
                     SQL_SUCCESS
                 } else {
                     SQL_ERROR
@@ -1146,6 +1214,18 @@ mod tests {
     #[test]
     fn connection_timeout_bounds_sql_cancel_and_retires_unacknowledged_connection() {
         cancel_cursor_phase(CursorPhase::Fetch, false, true);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_cursor_cleanup_before_end_tran() {
+        cancel_cursor_phase(CursorPhase::EndTran, true, false);
+        cancel_cursor_phase(CursorPhase::EndTran, false, true);
+    }
+
+    #[test]
+    fn connection_timeout_bounds_cursor_cleanup_before_an_attribute_change() {
+        cancel_cursor_phase(CursorPhase::AutocommitOn, true, false);
+        cancel_cursor_phase(CursorPhase::AutocommitOn, false, true);
     }
 
     /// Replays a SQLCancel that signals after a call's last read but before

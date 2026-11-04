@@ -11,7 +11,7 @@
 #
 # Required env:
 #   INSTANCE_ID                    Unique id (e.g. "shared", "shared_musl").
-#   SQL_PASSWORD                   Imported initialization secret.
+#   SQL_PASSWORD                   Job-local sa password (generate-sql-password-template.yml).
 #   SQL_CREDENTIAL_GENERATION      Nonsecret initialization generation ID.
 #   SQL_IMAGE_TAG                  e.g. "2025-latest".
 #   BUILD_ARTIFACTSTAGINGDIRECTORY ADO-provided staging dir for artifacts.
@@ -40,9 +40,9 @@ set -euo pipefail
 : "${SQL_IMAGE_TAG:?SQL_IMAGE_TAG is required}"
 : "${BUILD_ARTIFACTSTAGINGDIRECTORY:?BUILD_ARTIFACTSTAGINGDIRECTORY is required}"
 
-if [[ ! "${SQL_PASSWORD}" =~ ^Aa1![0-9a-f]{48}$ ]] \
+if [[ ! "${SQL_PASSWORD}" =~ ^Aa1![A-Za-z0-9]{22}$ ]] \
     || [[ ! "${SQL_CREDENTIAL_GENERATION:-}" =~ ^[0-9a-f]{32}$ ]]; then
-    echo "ERROR: shared SQL credential output is missing or invalid." >&2
+    echo "ERROR: SQL password or credential generation is missing or invalid." >&2
     exit 1
 fi
 

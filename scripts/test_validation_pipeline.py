@@ -4,6 +4,8 @@
 """Regression tests for validation pipeline builds, tests, and artifacts."""
 
 import importlib.util
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -13,6 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+
+from test_release_pipeline import evaluate
 
 _ROOT = Path(__file__).parents[1]
 _TEMPLATES = _ROOT / ".pipeline" / "templates"
@@ -28,6 +32,484 @@ _SPEC.loader.exec_module(verify_python)
 
 def load_template(name):
     return yaml.safe_load((_TEMPLATES / name).read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def stress_pipeline():
+    return yaml.safe_load(
+        (_ROOT / ".pipeline" / "odbc-stress-pipeline.yml").read_text(encoding="utf-8")
+    )
+
+
+@pytest.fixture
+def windows_stress_job(stress_pipeline):
+    stage = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
+    )
+    assert stage["dependsOn"] == []
+    return next(job for job in stage["jobs"] if job["job"] == "Stress_Windows")
+
+
+@pytest.mark.parametrize(
+    ("profile", "schedule", "expected"),
+    [
+        ("auto", None, 120),
+        ("auto", "", 120),
+        ("auto", "Nightly ODBC stress", 120),
+        ("auto", "Weekly ODBC stress", 240),
+        ("weekly", None, 240),
+        ("weekly", "Nightly ODBC stress", 240),
+        ("nightly", "Weekly ODBC stress", 120),
+    ],
+)
+def test_stress_job_timeout_follows_profile(stress_pipeline, profile, schedule, expected):
+    variables = stress_pipeline["variables"]
+    conditional = next(key for key in variables if key.startswith("${{ if "))
+    condition = conditional.removeprefix("${{ if ").removesuffix(" }}")
+    weekly = evaluate(
+        condition, {"profile": profile},
+        variables={"Build.CronSchedule.DisplayName": schedule},
+    )
+    selected = variables[conditional if weekly else "${{ else }}"]
+    assert selected["odbcMtJobTimeoutInMinutes"] == expected
+    timeout = "${{ variables.odbcMtJobTimeoutInMinutes }}"
+    windows = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
+    )
+    execution = next(job for job in windows["jobs"] if job["job"] == "Stress_Windows")
+    assert execution["timeoutInMinutes"] == timeout
+    linux = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Linux"
+    )
+    assert len(linux["jobs"]) == 2
+    for job in linux["jobs"]:
+        assert job["parameters"]["timeoutInMinutes"] == timeout
+        assert len(job["parameters"]["matrix"]) == 1
+    build = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Build_Linux_Drops"
+    )
+    assert build["jobs"][0]["timeoutInMinutes"] == 90
+
+
+def test_windows_stress_matrix_preserves_profiles_and_parity(windows_stress_job):
+    matrix = windows_stress_job["strategy"]["matrix"]
+    assert set(matrix) == {"Fetch", "Parameters", "Metadata", "Other"}
+    assert {group["suiteGroup"] for group in matrix.values()} == set(matrix)
+    assert "maxParallel" not in windows_stress_job["strategy"]
+    # Matrix variables are not expanded in the job name; Azure appends the leg.
+    assert "$(" not in windows_stress_job["displayName"]
+    assert windows_stress_job["timeoutInMinutes"] == "${{ variables.odbcMtJobTimeoutInMinutes }}"
+    step = next(step for step in windows_stress_job["steps"] if "pwsh" in step)
+    command = step["pwsh"]
+    assert "-CompareWithMsodbcsql" in command
+    assert "-SkipBuild" in command
+    assert "-MtProfile '$(odbcMtProfile)'" in command
+    assert '-FilterTests "$env:FILTERTESTS" -ExcludeTests "$env:EXCLUDETESTS"' in command
+    # Azure leaves $(name) literal when a matrix value is empty.
+    for name in {key for group in matrix.values() for key, value in group.items() if not value}:
+        assert f"$({name})" not in command
+
+
+def test_windows_stress_builds_once_and_shares_attempt_scoped_artifact(
+    stress_pipeline, windows_stress_job
+):
+    stage = next(s for s in stress_pipeline["stages"] if s["stage"] == "Stress_Windows")
+    build = next(j for j in stage["jobs"] if j["job"] == "Build_Odbc_Windows")
+    assert build["pool"] == windows_stress_job["pool"]
+    assert "strategy" not in build
+    assert build["timeoutInMinutes"] == 120
+    assert windows_stress_job["dependsOn"] == build["job"]
+    step = next(s for s in build["steps"] if s.get("name") == "buildDrop")
+    assert "-BuildOnly" in step["pwsh"]
+    assert "$buildJobs = [Math]::Min(4, [Environment]::ProcessorCount)" in step["pwsh"]
+    assert "-BuildJobs $buildJobs" in step["pwsh"]
+    assert '-OutDir "$(Build.ArtifactStagingDirectory)\\odbc-e2e"' in step["pwsh"]
+    assert "OdbcStress_Windows_$(System.JobAttempt)" in step["pwsh"]
+    assert "isOutput=true" in step["pwsh"]
+    publish = next(s for s in build["steps"] if s.get("task") == "PublishPipelineArtifact@1")
+    assert publish["inputs"]["artifact"] == "$(buildDrop.artifactName)"
+    assert publish.get("condition", "succeeded()") == "succeeded()"
+    assert windows_stress_job["variables"]["odbcDropArtifact"] == (
+        "$[ dependencies.Build_Odbc_Windows.outputs['buildDrop.artifactName'] ]"
+    )
+    download = next(
+        s for s in windows_stress_job["steps"]
+        if s.get("task") == "DownloadPipelineArtifact@2"
+    )
+    assert download["inputs"] == {
+        "buildType": "current",
+        "artifactName": "$(odbcDropArtifact)",
+        "targetPath": "$(Build.SourcesDirectory)\\mssql-odbc\\tests\\e2e",
+    }
+    deps = next(
+        s for s in windows_stress_job["steps"]
+        if s.get("template") == "templates/install-dependencies.yml"
+    )
+    assert deps["parameters"]["skipRustupInstall"] is True
+    assert deps["parameters"]["enableJsDeps"] is False
+    assert not any(
+        s.get("template") == "templates/cargo-authenticate-template.yml"
+        for s in windows_stress_job["steps"]
+    )
+
+
+_WINDOWS_E2E = _ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.ps1"
+
+
+def _require_windows_cpp_toolchain():
+    vswhere = Path(os.environ["ProgramFiles(x86)"]) / (
+        "Microsoft Visual Studio/Installer/vswhere.exe"
+    )
+    if not vswhere.is_file():
+        pytest.skip("needs Visual Studio C++ build tools")
+    compiler = subprocess.run(
+        [str(vswhere), "-latest", "-products", "*", "-requires",
+         "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
+        capture_output=True, text=True, check=True,
+    )
+    if not compiler.stdout.strip():
+        pytest.skip("needs Visual Studio C++ build tools")
+
+
+@pytest.fixture(scope="module")
+def windows_native_smoke(tmp_path_factory):
+    _require_windows_cpp_toolchain()
+    source = tmp_path_factory.mktemp("native-smoke")
+    (source / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.15)\nproject(fixture LANGUAGES CXX)\n"
+        "add_executable(smoke_test smoke.cpp)\n",
+        encoding="utf-8",
+    )
+    (source / "smoke.cpp").write_text(
+        "#include <cstdlib>\n"
+        "int main(int argc, char** argv) { return argc > 1 ? std::atoi(argv[1]) : 0; }\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("CMAKE_GENERATOR", None)
+    env.pop("CMAKE_GENERATOR_PLATFORM", None)
+    build = source / "build"
+    for args in (
+        ["cmake", "-S", str(source), "-B", str(build)],
+        ["cmake", "--build", str(build), "--config", "Debug", "--parallel", "2"],
+    ):
+        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stdout + result.stderr
+    return build / "Debug" / "smoke_test.exe"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "cmake", "ctest")),
+    reason="needs Windows CMake, CTest, and PowerShell",
+)
+@pytest.mark.parametrize("build_jobs", [None, 2])
+def test_windows_build_only_parallelizes_and_stages_real_cpp_binaries(tmp_path, build_jobs):
+    _require_windows_cpp_toolchain()
+    producer = tmp_path / "producer" / "mssql-odbc" / "tests" / "e2e"
+    producer.mkdir(parents=True)
+    (producer / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.15)\nproject(fixture LANGUAGES CXX)\n"
+        "enable_testing()\nadd_executable(smoke_test smoke.cpp)\n"
+        "add_test(NAME smoke_test COMMAND smoke_test)\n",
+        encoding="utf-8",
+    )
+    (producer / "smoke.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+    finalize = producer.parents[1] / "scripts"
+    finalize.mkdir()
+    shutil.copy2(_ROOT / "mssql-odbc" / "scripts" / "finalize-artifact.ps1", finalize)
+    target = tmp_path / "cargo-target" / "debug"
+    target.mkdir(parents=True)
+    for name in ("mssqlodbc.dll", "mssqlodbc.pdb"):
+        (target / name).write_bytes(b"fixture")
+    artifact = tmp_path / "drop"
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:RUNNER, [ref]$null, [ref]$null)
+$main = $ast.EndBlock.Statements |
+    Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] } |
+    Select-Object -Last 1
+$mocks = @'
+function cargo {
+    if ($args[0] -eq 'metadata') {
+        @{ target_directory = $env:CARGO_FIXTURE } | ConvertTo-Json -Compress
+    } elseif ($args[0] -ne 'build') { throw "Unexpected cargo args: $args" }
+    $global:LASTEXITCODE = 0
+}
+function cmake {
+    ($args -join ' ') | Add-Content $env:CMAKE_LOG
+    & $env:REAL_CMAKE @args
+}
+function Set-MtProfile { throw 'Build-only must not set a stress profile' }
+function Initialize-DevSqlEnv { throw 'Build-only must not connect to SQL Server' }
+function Save-OriginalRegistration { throw 'Build-only must not access the registry' }
+function Restore-Registration { throw 'Build-only must not access the registry' }
+'@
+$source = [IO.File]::ReadAllText($env:RUNNER).Insert($main.Extent.StartOffset, $mocks + "`n")
+$runner = Join-Path $env:PRODUCER 'run_e2e.ps1'
+[IO.File]::WriteAllText($runner, $source)
+$buildArgs = @{}
+if ($env:BUILD_JOBS) { $buildArgs.BuildJobs = [int]$env:BUILD_JOBS }
+Set-Location (Split-Path -Parent $env:DROP)
+& $runner -BuildOnly -OutDir (Split-Path -Leaf $env:DROP) @buildArgs
+"""
+    log = tmp_path / "cmake.log"
+    env = {**os.environ, "RUNNER": str(_WINDOWS_E2E), "PRODUCER": str(producer),
+           "CARGO_FIXTURE": str(target.parent), "DROP": str(artifact),
+           "REAL_CMAKE": shutil.which("cmake"), "CMAKE_LOG": str(log),
+           "BUILD_JOBS": str(build_jobs) if build_jobs else ""}
+    env.pop("CMAKE_GENERATOR", None)
+    env.pop("CMAKE_GENERATOR_PLATFORM", None)
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", command],
+                            env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected_jobs = build_jobs if build_jobs else 1
+    assert f"--build build --config Debug --parallel {expected_jobs}" in log.read_text(encoding="utf-8")
+    assert (artifact / "build" / "Debug" / "smoke_test.pdb").is_file()
+    assert not (artifact / "build" / "CMakeCache.txt").exists()
+    shutil.rmtree(producer.parents[2])
+    consumer = tmp_path / "relocated real build"
+    shutil.copytree(artifact, consumer)
+    result = subprocess.run(["ctest", "-C", "Debug", "--output-on-failure"],
+                            cwd=consumer / "build", capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "100% tests passed" in result.stdout
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or any(shutil.which(tool) is None for tool in ("pwsh", "cmake", "ctest")),
+    reason="needs Windows CMake, CTest, and PowerShell",
+)
+@pytest.mark.parametrize(("exit_code", "filter_tests"), [(0, ""), (1, ""), (0, "^missing$")])
+def test_windows_prebuilt_drop_relocates_and_runs_both_legs_without_compiling(
+    tmp_path, windows_native_smoke, exit_code, filter_tests
+):
+    producer = tmp_path / "producer checkout" / "tests" / "e2e"
+    debug = producer / "build" / "Debug"
+    debug.mkdir(parents=True)
+    shutil.copy2(windows_native_smoke, debug / "smoke_test.exe")
+    for name in ("smoke_test.pdb", "mssqlodbc.dll", "mssqlodbc.pdb", "unused.lib"):
+        (debug / name).write_bytes(b"fixture")
+    (producer / "build" / "CMakeCache.txt").write_text("do not ship", encoding="utf-8")
+    exe = (debug / "smoke_test.exe").as_posix()
+    (producer / "build" / "CTestTestfile.cmake").write_text(
+        f'add_test(smoke_test "{exe}" {exit_code})\n'
+        f'add_test(smoke_test_mt "{exe}" {exit_code})\n'
+        'set_tests_properties(smoke_test_mt PROPERTIES LABELS mt TIMEOUT 30 '
+        'SKIP_RETURN_CODE 77)\nsubdirs("nested")\n',
+        encoding="utf-8",
+    )
+    nested = producer / "build" / "nested"
+    nested.mkdir()
+    (nested / "CTestTestfile.cmake").write_text(
+        f'add_test(nested_test "{exe}" 0)\n', encoding="utf-8"
+    )
+    artifact = tmp_path / "published drop"
+    # Execute the production packaging function, without building or touching HKLM.
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:RUNNER, [ref]$null, [ref]$null)
+$function = $ast.Find({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Export-PrebuiltTests'
+}, $true)
+. ([scriptblock]::Create($function.Extent.Text))
+$ScriptDir = $env:PRODUCER
+Export-PrebuiltTests "$ScriptDir\build\Debug\mssqlodbc.dll" $env:DROP
+"""
+    env = {**os.environ, "RUNNER": str(_WINDOWS_E2E), "PRODUCER": str(producer),
+           "DROP": str(artifact)}
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", command],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (artifact / "build" / "CMakeCache.txt").exists()
+    assert not (artifact / "build" / "Debug" / "unused.lib").exists()
+    assert (artifact / "build" / "Debug" / "mssqlodbc.pdb").is_file()
+    shutil.rmtree(producer.parents[1])
+    consumer = tmp_path / "different consumer path" / "tests" / "e2e"
+    shutil.copytree(artifact, consumer)
+    registration = subprocess.run(
+        ["ctest", "--show-only=json-v1", "-C", "Debug"], cwd=consumer / "build",
+        capture_output=True, text=True, check=True,
+    )
+    tests = json.loads(registration.stdout)["tests"]
+    assert {t["name"] for t in tests} == {"smoke_test", "smoke_test_mt", "nested_test"}
+    for test in tests:
+        assert Path(test["command"][0]).resolve() == consumer / "build" / "Debug" / "smoke_test.exe"
+    props = {p["name"]: p["value"] for p in next(
+        t for t in tests if t["name"] == "smoke_test_mt"
+    )["properties"]}
+    assert props["LABELS"] == ["mt"]
+    assert props["TIMEOUT"] == 30
+    assert props["SKIP_RETURN_CODE"] == 77
+
+    # Isolate registry access; execute the production main block, CTest, stress
+    # selection and parity reporting. Any compile attempt is a test failure.
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:RUNNER, [ref]$null, [ref]$null)
+$main = $ast.EndBlock.Statements |
+    Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] } |
+    Select-Object -Last 1
+$mocks = @'
+function cargo { throw 'Unexpected Cargo invocation in prebuilt mode' }
+function cmake { throw 'Unexpected CMake invocation in prebuilt mode' }
+function Save-OriginalRegistration {}
+function Register-RustDriver([string]$DriverPath) {
+    if (-not (Test-Path $DriverPath)) { throw 'Missing driver' }
+}
+function Restore-Registration {}
+function Get-MsodbcsqlDriverPath { return "$PSScriptRoot\reference.dll" }
+'@
+$source = [IO.File]::ReadAllText($env:RUNNER).Insert($main.Extent.StartOffset, $mocks + "`n")
+$runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
+[IO.File]::WriteAllText($runner, $source)
+& $runner -SkipBuild -MtProfile nightly -CompareWithMsodbcsql -FilterTests $env:FIXTURE_FILTER
+"""
+    (consumer / "reference.dll").write_bytes(b"reference")
+    dumps = consumer / "build" / "mt-dumps"
+    dumps.mkdir()
+    (dumps / "fixture.dmp").write_bytes(b"fixture")
+    env.update(CONSUMER=str(consumer), ODBC_TEST_SERVER="fixture",
+               MSSQL_ODBC_MT_THREADS="8", MSSQL_ODBC_MT_ITERS="20",
+               MSSQL_ODBC_MT_SKIP_MODES="none", FIXTURE_FILTER=filter_tests)
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", command],
+                            env=env, capture_output=True, text=True)
+    assert {p.name for p in (dumps / "symbols").iterdir()} == {
+        "mssqlodbc.dll", "mssqlodbc.pdb", "smoke_test.exe", "smoke_test.pdb"
+    }
+    if exit_code or filter_tests:
+        assert result.returncode != 0
+        expected = "Parity check FAILED" if exit_code else "No tests were executed"
+        assert expected in result.stdout + result.stderr
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "MT profile: nightly (threads=8 iterations=20" in result.stdout
+    for leg in ("mssql-odbc", "msodbcsql"):
+        junit = (consumer / "build" / f"junit-{leg}.xml").read_text(encoding="utf-8")
+        assert 'name="smoke_test_mt"' in junit
+        assert 'name="smoke_test"' not in junit
+        assert 'name="nested_test"' not in junit
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs pwsh")
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (["-BuildOnly"], "-BuildOnly and -OutDir"),
+        (["-OutDir", "unused"], "-BuildOnly and -OutDir"),
+        (["-BuildOnly", "-SkipBuild"], "-BuildOnly cannot be combined"),
+        (["-BuildOnly", "-Release", "-OutDir", "unused"],
+         "-BuildOnly cannot be combined with -Release"),
+        (["-SkipBuild", "-Coverage"], "-SkipBuild cannot be combined"),
+        (["-SkipBuild", "-Release"], "-SkipBuild cannot be combined with -Release"),
+        (["-BuildJobs", "0"], "BuildJobs"),
+    ],
+)
+def test_windows_e2e_rejects_incompatible_build_options(args, error):
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(_WINDOWS_E2E), *args],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert error in result.stderr
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or shutil.which("powershell.exe") is None,
+    reason="needs Windows PowerShell",
+)
+def test_windows_build_only_rejects_legacy_powershell_before_building(tmp_path):
+    script = str(_WINDOWS_E2E).replace("'", "''")
+    drop = str(tmp_path / "drop").replace("'", "''")
+    command = (
+        "function cargo { throw 'Unexpected build' }; "
+        f"& '{script}' -BuildOnly -OutDir '{drop}'"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "-BuildOnly requires PowerShell 7 or later" in result.stderr
+    assert "Unexpected build" not in result.stderr
+    assert not (tmp_path / "drop").exists()
+
+
+def test_windows_stress_groups_cover_current_concurrent_suites(windows_stress_job):
+    e2e = _ROOT / "mssql-odbc" / "tests" / "e2e"
+    concurrent = {
+        f"{source.stem}_mt"
+        for source in (e2e / "tests").rglob("*.cpp")
+        if re.search(r"^ODBC_TEST_F(_MODES)?\(", source.read_text(encoding="utf-8"), re.M)
+    }
+    assert concurrent
+    for name, group in windows_stress_job["strategy"]["matrix"].items():
+        selected = {
+            suite for suite in concurrent
+            if (not group["filterTests"] or re.search(group["filterTests"], suite))
+            and (not group["excludeTests"] or not re.search(group["excludeTests"], suite))
+        }
+        assert selected, f"{name} selects no concurrent suites"
+
+
+@pytest.mark.skipif(shutil.which("ctest") is None, reason="CTest is required")
+def test_windows_stress_ctest_groups_are_exhaustive_and_disjoint(tmp_path, windows_stress_job):
+    cmake = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    # Model every suite as converted, including ones not converted yet.
+    suites = set(re.findall(r"^add_odbc_(?:direct_load_)?test\((\w+)", cmake, re.M))
+    suites.add("future_suite_test")
+    entries = {f"{suite}_mt" for suite in suites}
+    testfile = tmp_path / "CTestTestfile.cmake"
+    testfile.write_text(
+        "\n".join(
+            f'add_test("{suite}" "unused")\n'
+            f'add_test("{suite}_mt" "unused")\n'
+            f'set_tests_properties("{suite}_mt" PROPERTIES LABELS "mt")'
+            for suite in sorted(suites)
+        ),
+        encoding="utf-8",
+    )
+    seen = set()
+    for name, group in windows_stress_job["strategy"]["matrix"].items():
+        args = [shutil.which("ctest"), "--show-only=json-v1", "-L", "mt"]
+        if group["filterTests"]:
+            args += ["-R", group["filterTests"]]
+        if group["excludeTests"]:
+            args += ["-E", group["excludeTests"]]
+        result = subprocess.run(args, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        selected = {test["name"] for test in json.loads(result.stdout)["tests"]}
+        assert selected, f"{name} selects no suites"
+        assert not seen & selected, f"{name} duplicates {seen & selected}"
+        seen.update(selected)
+    assert seen == entries
+
+
+def test_windows_stress_results_and_artifacts_are_group_scoped(windows_stress_job):
+    def artifacts(steps):
+        for step in steps:
+            if step.get("task") == "PublishPipelineArtifact@1":
+                yield step["inputs"]["artifact"]
+            for key, value in step.items():
+                if key.startswith("${{ if "):
+                    yield from artifacts(value)
+
+    names = list(artifacts(windows_stress_job["steps"]))
+    assert len(names) == 3
+    assert len(set(names)) == len(names)
+    for name in names:
+        assert "$(suiteGroup)" in name
+        assert "$(System.JobAttempt)" in name
+    results = [
+        step for step in windows_stress_job["steps"]
+        if step.get("task") == "PublishTestResults@2"
+    ]
+    assert len(results) == 2
+    for step in results:
+        assert "$(suiteGroup)" in step["inputs"]["testRunTitle"]
+        assert step["condition"] == "succeededOrFailed()"
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
@@ -53,7 +535,7 @@ def test_unix_odbc_profiles_skip_shared_stmt(tmp_path, profile, threads, iterati
     assert function, "apply_mt_profile not found"
     script = f"""
 set -euo pipefail
-unset MSSQL_ODBC_MT_THREADS MSSQL_ODBC_MT_ITERS MSSQL_ODBC_MT_GDB
+unset MSSQL_ODBC_MT_THREADS MSSQL_ODBC_MT_ITERS MSSQL_ODBC_MT_GDB ODBC_E2E_CONCURRENT
 {override}
 MT_PROFILE={profile}
 RETRIES=0
@@ -66,6 +548,7 @@ bash -c 'printf "rust:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
 env ${{MS_LEG_ENV[@]+"${{MS_LEG_ENV[@]}}"}} \
 bash -c 'printf "reference:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
 "${{MSSQL_ODBC_MT_THREADS:-2}}" "${{MSSQL_ODBC_MT_ITERS:-1}}"'
+printf "concurrent:%s\\n" "${{ODBC_E2E_CONCURRENT:-}}"
 """
     script_path = tmp_path / "profile.sh"
     script_path.write_text(script, encoding="utf-8", newline="\n")
@@ -75,6 +558,9 @@ bash -c 'printf "reference:%s:%s:%s\\n" "$MSSQL_ODBC_MT_SKIP_MODES" \
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"rust:{expected}:{threads}:{iterations}" in result.stdout.splitlines()
     assert f"reference:{expected}:2:1" in result.stdout.splitlines()
+    # Unix builds compile the <name>_mt entries only for the stress profiles.
+    concurrent = "" if profile == "pr" else "ON"
+    assert f"concurrent:{concurrent}" in result.stdout.splitlines()
 
 
 @pytest.mark.parametrize(
@@ -592,12 +1078,11 @@ def test_odbc_runner_forwards_deselected_tests(tmp_path, env, expected):
     assert deselected == expected
 
 
-def test_mssql_python_odbc_job_deselects_only_tracked_tests():
+def test_mssql_python_odbc_job_deselects_only_timing_flaky_tests():
     template = load_template("test-mssql-python-odbc-template.yml")
     params = {p["name"]: p["default"] for p in template["parameters"]}
     assert params["pytestDeselect"] == [
         "tests/test_021_concurrent_connection_perf.py::test_concurrent_connection_gil_release",
-        "tests/test_009_pooling.py::test_pool_checkout_validation_timeout",
     ]
     step = next(
         step for step in template["steps"]
@@ -821,3 +1306,47 @@ def test_non_windows_format_installs_rustfmt_first():
     assert install["script"] == "rustup component add rustfmt"
     assert install["condition"] == fmt["condition"]
     assert install["retryCountOnTaskFailure"] == 3
+
+
+def test_macos_builds_set_a_supported_deployment_target():
+    steps = load_template("build-template.yml")["steps"]
+    group = next(step for step in steps if "${{ if eq(parameters.osType, 'MacOS') }}" in step)
+    setup = group["${{ if eq(parameters.osType, 'MacOS') }}"][0]
+    assert setup["displayName"] == "Set macOS deployment target"
+    assert "${MACOSX_DEPLOYMENT_TARGET:-10.15}" in setup["bash"]
+    assert "task.setvariable variable=MACOSX_DEPLOYMENT_TARGET" in setup["bash"]
+    odbc = load_template("build-odbc-macos-template.yml")["steps"]
+    build = next(step for step in odbc if "cargo build" in step.get("script", ""))
+    assert build["script"].index("export MACOSX_DEPLOYMENT_TARGET") < build["script"].index("cargo build")
+    assert "${MACOSX_DEPLOYMENT_TARGET:-10.15}" in build["script"]
+    sqlcmd = (_ROOT / ".pipeline" / "scripts" / "build-mssql-sqlcmd-native.sh").read_text()
+    assert '*-apple-darwin*) export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"' in sqlcmd
+    python = load_template("test-mssql-python-macos-template.yml")["steps"]
+    build = next(step for step in python if "maturin build" in step.get("script", ""))
+    assert build["script"].index("export MACOSX_DEPLOYMENT_TARGET") < build["script"].index("maturin build")
+    assert "${MACOSX_DEPLOYMENT_TARGET:-10.15}" in build["script"]
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("deployment_target", "expected"),
+    [(None, "10.15"), ("", "10.15"), ("10.15", "10.15"), ("26.0", "26.0")],
+)
+def test_macos_python_build_preserves_supported_deployment_targets(deployment_target, expected):
+    steps = load_template("test-mssql-python-macos-template.yml")["steps"]
+    build = next(step for step in steps if "maturin build" in step.get("script", ""))
+    export = next(
+        line for line in build["script"].splitlines()
+        if line.startswith("export MACOSX_DEPLOYMENT_TARGET=")
+    )
+    setup = (
+        "unset MACOSX_DEPLOYMENT_TARGET"
+        if deployment_target is None
+        else f"export MACOSX_DEPLOYMENT_TARGET='{deployment_target}'"
+    )
+    result = subprocess.run(
+        [_BASH, "-c", f'{setup}\n{export}\nprintf "%s" "$MACOSX_DEPLOYMENT_TARGET"'],
+        cwd=_ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected

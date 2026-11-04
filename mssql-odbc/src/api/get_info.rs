@@ -981,7 +981,7 @@ fn sql_get_info_w_safe(
             // 0 means "no stated limit" per ODBC.
             write_u16(info_value_ptr, 0, string_length_ptr)
         }
-        SQL_ACTIVE_STATEMENTS => write_u16(info_value_ptr, 0, string_length_ptr),
+        SQL_ACTIVE_STATEMENTS => write_u16(info_value_ptr, 1, string_length_ptr),
         SQL_DRIVER_NAME => write_wide_str(
             &mut state,
             info_value_ptr,
@@ -1925,7 +1925,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         for (info_type, expected) in [
             (SQL_MAX_DRIVER_CONNECTIONS, 0u16),
-            (SQL_ACTIVE_STATEMENTS, 0),
+            (SQL_ACTIVE_STATEMENTS, 1),
             (SQL_ODBC_API_CONFORMANCE, SQL_OAC_LEVEL2),
             (SQL_ODBC_SQL_CONFORMANCE, SQL_OSC_CORE),
             (SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CB_CLOSE),
@@ -1940,6 +1940,37 @@ mod tests {
             assert_eq!(val, expected, "info_type {info_type}");
             assert_eq!(len, 2, "info_type {info_type}");
         }
+    }
+
+    #[test]
+    fn execution_capabilities_are_reported_through_export() {
+        let h = TestHandles::with_env_dbc();
+        let mut active = 0xAAAAu16;
+        let mut len = -1;
+        let rc = unsafe {
+            crate::api::exports::SQLGetInfoW(
+                h.dbc,
+                SQL_ACTIVE_STATEMENTS,
+                ptr::from_mut(&mut active).cast(),
+                2,
+                &mut len,
+            )
+        };
+        assert_eq!((rc, active, len), (SQL_SUCCESS, 1, 2));
+
+        let mut need_length = [0xAAAAu16; 2];
+        let rc = unsafe {
+            crate::api::exports::SQLGetInfoW(
+                h.dbc,
+                SQL_NEED_LONG_DATA_LEN,
+                need_length.as_mut_ptr().cast(),
+                4,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(need_length, [u16::from(b'N'), 0]);
+        assert_eq!(len, 2);
     }
 
     #[test]
@@ -2073,7 +2104,7 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_SUCCESS);
-        assert_eq!(val, 0);
+        assert_eq!(val, 1);
     }
 
     #[test]
