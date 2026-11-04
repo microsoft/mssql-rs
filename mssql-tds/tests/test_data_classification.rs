@@ -14,7 +14,7 @@ mod data_classification_tests {
     };
     use mssql_tds::connection::client_context::ClientContext;
     use mssql_tds::connection::tds_client::{
-        ExecuteOptions, ResultSet, StatementResult, TdsClient,
+        BatchErrorMode, ExecuteOptions, ResultSet, StatementResult, TdsClient,
     };
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{CancelHandle, EncryptionOptions, EncryptionSetting};
@@ -770,6 +770,64 @@ mod data_classification_tests {
         assert!(client.is_connection_dead());
         assert!(!client.is_session_recovery_enabled());
         assert!(client.data_classification().is_none());
+
+        server.stop().await;
+    }
+
+    /// A `0xA3` the client did not negotiate is rejected after its token ID
+    /// is read, with the rest of the token unread. Here those bytes begin
+    /// `FD 00 00 C1 00`, which a drain would read as a final DONE, so the
+    /// rejection itself must retire the connection, in either batch error mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unrequested_classification_token_retires_the_connection() {
+        const ALIASES_DONE: &str = "SELECT SSN FROM ALIASES_DONE";
+        let version = DataClassificationVersion::Version2;
+        let server = Server::start_recoverable(version).await;
+        // 253 labels (`FD 00`), the first with an empty name (`00`) and an
+        // id of 193 characters (`C1`).
+        let id = "a".repeat(0xC1);
+        let mut labels = vec![("", id.as_str())];
+        labels.extend(std::iter::repeat_n(("L", "L"), 252));
+        let bytes = token(version, &labels, &[], 30, &[&[(0, UNSPECIFIED, 30)]]);
+        assert_eq!(bytes[..5], [0xA3, 0xFD, 0x00, 0x00, 0xC1]);
+        server
+            .registry
+            .lock()
+            .await
+            .register_with_data_classification(ALIASES_DONE, int_response(&["ssn"], 7), bytes);
+
+        for mode in [BatchErrorMode::Abort, BatchErrorMode::Continue] {
+            let mut client = server.connect(None).await;
+            assert!(client.is_session_recovery_enabled());
+
+            client
+                .execute(
+                    ALIASES_DONE.to_string(),
+                    ExecuteOptions::new().on_error(mode),
+                )
+                .await
+                .unwrap();
+            let error = client.next_row().await.unwrap_err();
+            assert!(
+                error.to_string().contains("not negotiated"),
+                "{mode:?}: {error}"
+            );
+            assert!(client.is_connection_dead(), "{mode:?}");
+            assert!(!client.is_session_recovery_enabled(), "{mode:?}");
+
+            // Cleanup has nothing left to read, and the connection is not
+            // handed back for another request, nor silently reconnected.
+            client.close_query().await.unwrap();
+            let error = client
+                .execute(UNCLASSIFIED.to_string(), ())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::ConnectionClosed(_)),
+                "{mode:?}: {error}"
+            );
+            assert_eq!(client.connection_recovery_count(), 0, "{mode:?}");
+        }
 
         server.stop().await;
     }

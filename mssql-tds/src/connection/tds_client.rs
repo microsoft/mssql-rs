@@ -28,6 +28,9 @@ use crate::message::transaction_management::{
 };
 use crate::query::result::ReturnValue;
 use crate::token::data_classification::{DataClassificationMetadata, DataClassificationVersion};
+use crate::token::parsers::data_classification_parser::{
+    classification_error, is_classification_error,
+};
 use crate::token::tokens::{SessionStateToken, SqlCollation};
 use crate::{
     connection::execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
@@ -5425,6 +5428,12 @@ impl TdsClient {
                 Ok(result) => result,
                 Err(error) => {
                     self.settle_interrupted_read(&error);
+                    // See `fail_read`: the stream cannot be trusted after a
+                    // rejected DATACLASSIFICATION token, and the prepared-batch
+                    // drain does not retire on its own.
+                    if is_classification_error(&error) {
+                        return Err(self.abandon_failed_statement(error));
+                    }
                     return Err(error);
                 }
             };
@@ -6118,13 +6127,12 @@ impl TdsClient {
                 Ok(classification) => classification,
                 Err(error) => {
                     let error = self.fail_read(error);
-                    // A read that fails partway leaves the reader inside a
-                    // token with no length prefix, and a token that breaks
-                    // MS-TDS cannot be trusted to describe the rows that follow.
-                    // Under `BatchErrorMode::Abort` nothing else retires the
-                    // connection for the first result, whose batch is not open
-                    // yet. Under `Continue`, `fail_read` has already retired it
-                    // and this repeats harmlessly.
+                    // `fail_read` has retired the connection for a rejected
+                    // token and for any error under `Continue`. A reader error
+                    // under `Abort` still leaves the reader inside a token with
+                    // no length prefix, and before the first result boundary no
+                    // batch is open for a later drain to fail on, so it is
+                    // retired here. The repeat for the other cases is harmless.
                     if !matches!(
                         error,
                         crate::error::Error::TimeoutError(_)
@@ -6157,9 +6165,9 @@ impl TdsClient {
     ) -> TdsResult<DataClassificationMetadata> {
         let columns = classification.columns().len();
         if columns != 0 && columns != usize::from(metadata.column_count) {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "DATACLASSIFICATION: classification for {columns} columns does not match the \
-                 {} columns in COLMETADATA",
+            return Err(classification_error(format!(
+                "classification for {columns} columns does not match the {} columns in \
+                 COLMETADATA",
                 metadata.column_count
             )));
         }
@@ -8774,8 +8782,16 @@ impl TdsClient {
     /// Settles a read that failed while consuming the response and returns the
     /// error to report, closing a [`BatchErrorMode::Continue`] walk the failure
     /// leaves unreadable (see [`end_walk_on_read_error`](Self::end_walk_on_read_error)).
+    ///
+    /// A rejected DATACLASSIFICATION token ends the walk in either mode. It
+    /// has no length prefix, so its unread bytes can pass for other tokens,
+    /// a final DONE among them, and a later drain would report success over a
+    /// desynchronized stream.
     fn fail_read(&mut self, error: crate::error::Error) -> crate::error::Error {
         self.settle_interrupted_read(&error);
+        if is_classification_error(&error) {
+            return self.abandon_failed_statement(error);
+        }
         self.end_walk_on_read_error(error)
     }
 
@@ -10102,6 +10118,9 @@ mod tests {
         /// Returned by the `receive_data_classification` call with this
         /// zero-based index instead of reading.
         classification_error: Option<(usize, crate::error::Error)>,
+        /// Returned by `receive_row_into` once the queued tokens run out,
+        /// instead of the default `ConnectionClosed`.
+        row_read_error: Option<crate::error::Error>,
     }
 
     impl TestTransport {
@@ -10142,6 +10161,7 @@ mod tests {
                 classification_delay: None,
                 classification_calls: 0,
                 classification_error: None,
+                row_read_error: None,
             }
         }
 
@@ -10312,6 +10332,9 @@ mod tests {
             // closed connection.
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(RowReadResult::Token(tok));
+            }
+            if let Some(error) = self.row_read_error.take() {
+                return Err(error);
             }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
@@ -11818,6 +11841,30 @@ mod tests {
         assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
         assert_eq!(classification_rank(&client), None);
         assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+    }
+
+    /// The prepared-batch drain reads rows itself rather than through
+    /// `fail_read`, and its caller only closes the batch, so it needs the same
+    /// rule for a rejected DATACLASSIFICATION token.
+    #[tokio::test]
+    async fn a_rejected_classification_in_the_prepared_batch_drain_retires_the_connection() {
+        let mut transport = TestTransport::with_tokens(vec![empty_col_metadata()]);
+        transport.row_read_error = Some(classification_error(
+            "token received but the feature was not negotiated",
+        ));
+        let mut client = create_test_client_with_transport(transport);
+        client.recovery_context.session_recovery_negotiated = true;
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+
+        let error = client
+            .execute_prepared_batch(&mut statement, vec![Ok((0, Vec::new()))], &mut None, ())
+            .await
+            .unwrap_err();
+        assert!(is_classification_error(&error), "{error}");
+        assert!(client.is_connection_dead());
+        assert!(!client.is_session_recovery_enabled());
+        assert!(!client.has_open_batch());
     }
 
     /// Under `Continue` one error can be reflected by both the failing

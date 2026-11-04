@@ -149,8 +149,17 @@ impl ParseBudget {
     }
 }
 
-fn classification_error(message: impl Into<String>) -> Error {
-    Error::ProtocolError(format!("DATACLASSIFICATION: {}", message.into()))
+const ERROR_PREFIX: &str = "DATACLASSIFICATION: ";
+
+pub(crate) fn classification_error(message: impl Into<String>) -> Error {
+    Error::ProtocolError(format!("{ERROR_PREFIX}{}", message.into()))
+}
+
+/// Whether `error` reports a DATACLASSIFICATION token that could not be
+/// accepted. The token has no length prefix, so after such an error the
+/// reader may be anywhere inside it.
+pub(crate) fn is_classification_error(error: &Error) -> bool {
+    matches!(error, Error::ProtocolError(message) if message.starts_with(ERROR_PREFIX))
 }
 
 fn preallocated(count: u16) -> usize {
