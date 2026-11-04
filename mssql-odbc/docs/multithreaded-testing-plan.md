@@ -325,9 +325,16 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   `<name>_mt` entries. Entries labelled `mt_weekly` (every multithreaded-only
   entry) run only in the weekly profile. A variable already set in the
   environment overrides the profile.
-- Windows runs four parallel stress jobs (fetch, parameters, metadata, and the
-  remaining suites), each with its own Debug build and SQL Server agent. Jobs
-  allow 240 minutes weekly and 120 nightly; each ctest entry still has 60.
+- Each leg builds once, then runs four parallel jobs (fetch, parameters,
+  metadata, and the remaining suites), each on its own agent and SQL Server;
+  see the Windows
+  [prebuilt runner commands](../tests/e2e/README.md#windows-stress-jobs). The
+  groups' regexes are shared by all three legs (`odbc-stress-pipeline.yml`),
+  and the remaining-suites group is their complement, so a newly converted
+  suite is still run. Jobs allow 240 minutes weekly and 120 nightly; each ctest
+  entry still has 60. Run serially, the Linux weekly needed about 280 minutes
+  (build 188696, cancelled at 240); split, its largest group (parameters) has
+  about 90 minutes of tests.
 - Nightly flushes out obvious races while suites convert. It started
   2026-10-28; remove its schedule once its findings are fixed (target
   mid-November). PR and weekly remain. Nightly failures need a named triage
