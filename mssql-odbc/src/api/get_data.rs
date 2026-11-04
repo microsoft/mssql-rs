@@ -13039,6 +13039,32 @@ mod tests {
         }
     }
 
+    /// Output is identical on both paths by design, so this observes the branch
+    /// itself: the verbatim stream never builds a decoder or converted carry.
+    #[test]
+    fn plp_cp1252_verbatim_bypasses_the_narrow_decoder() {
+        let (_, chunks) = every_byte_plp_chunks(14);
+        for transcode in [true, false] {
+            let (h, _server) = open_mock_cp1252_plp(chunks.clone());
+            client_code_page(&h, 1252, false);
+            FORCE_NARROW_TRANSCODE.with(|force| force.set(transcode));
+            let mut output = [0xcc; 5];
+            let (rc, _) = read_plp_test_chunk(&h, SQL_C_CHAR, &mut output);
+            FORCE_NARROW_TRANSCODE.with(|force| force.set(false));
+            assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            let stream = state.active_plp.as_ref().unwrap();
+            let verbatim = cfg!(windows) && !transcode;
+            assert_eq!(stream.narrow_verbatim, verbatim, "transcode {transcode}");
+            assert_eq!(
+                stream.narrow_decoder.is_some(),
+                !verbatim,
+                "transcode {transcode}"
+            );
+        }
+    }
+
     #[test]
     fn plp_narrow_verbatim_requires_the_client_code_page() {
         use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
