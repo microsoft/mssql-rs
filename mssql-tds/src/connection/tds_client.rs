@@ -11808,6 +11808,42 @@ mod tests {
         }
     }
 
+    /// Under `Abort`, `fail_read` retires nothing but a rejected token, and on
+    /// the first result no batch is open yet for a later drain to fail on. A
+    /// reader error during the look-ahead is retired there instead: a lost
+    /// transport keeps recovery armed, a desynchronized stream disarms it.
+    #[tokio::test]
+    async fn a_reader_error_in_the_first_look_ahead_retires_the_connection() {
+        for (error, recovery_stays_armed) in [
+            (
+                crate::error::Error::ConnectionClosed("lost".to_string()),
+                true,
+            ),
+            (
+                crate::error::Error::ProtocolError("bad packet header".to_string()),
+                false,
+            ),
+        ] {
+            let mut transport = TestTransport::with_tokens(vec![
+                int_col_metadata(1),
+                done_count(CurrentCommand::Select, 0, false),
+            ]);
+            transport.classification_error = Some((0, error));
+            let mut client = create_test_client_with_transport(transport);
+            client.recovery_context.session_recovery_negotiated = true;
+
+            let error = client.execute("q".to_string(), ()).await.unwrap_err();
+            assert!(!is_classification_error(&error), "{error}");
+            assert!(client.is_connection_dead(), "{error}");
+            assert_eq!(
+                client.is_session_recovery_enabled(),
+                recovery_stays_armed,
+                "{error}"
+            );
+            assert!(client.data_classification().is_none());
+        }
+    }
+
     /// A batched prepared execution positions its result sets through its own
     /// reader, which must attach classification the same way.
     #[tokio::test]
