@@ -220,6 +220,23 @@ pub trait SecurityContext: Send + Sync {
     }
 }
 
+/// Replaces the built-in SSPI/GSSAPI [`SecurityContext`] for integrated auth,
+/// e.g. NTLM on Unix via the `sspi` crate. Like `SspiContextProvider` in
+/// Microsoft.Data.SqlClient.
+///
+/// Called once per login, after TLS. `config.channel_bindings` holds the TLS
+/// channel binding token only when the TLS engine exposes one (today only
+/// Windows Schannel-direct); elsewhere it is `None`.
+pub trait SecurityContextProvider: Send + Sync {
+    /// Creates a context for one login to `server:port`.
+    fn create_context(
+        &self,
+        config: &IntegratedAuthConfig,
+        server: &str,
+        port: u16,
+    ) -> Result<Box<dyn SecurityContext>, super::SecurityError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

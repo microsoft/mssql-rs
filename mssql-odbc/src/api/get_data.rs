@@ -4310,13 +4310,7 @@ mod tests {
             finish_typed_conv(&mut state, Err(ConvError::NotHandledHere)),
             SQL_ERROR
         );
-        assert_last_diag(
-            &state.diag_records,
-            DiagMsg {
-                state: SQLSTATE_HYC00,
-                text: "Column type conversion not yet implemented",
-            },
-        );
+        assert_last_diag(&state.diag_records, ERR_COLUMN_CONVERSION_NOT_IMPLEMENTED);
     }
 
     #[test]

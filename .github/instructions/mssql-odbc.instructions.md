@@ -162,9 +162,13 @@ on the `master` branch.
     mirroring msodbcsql's `IDS_*` resource entries. In new code, prefer
     adding/using an `ERR_*` `DiagMsg` constant over inlining `post_sql_error`
     with a literal — especially when the same `(SQLSTATE, message)` pair
-    appears, or could appear, in more than one place.
+    appears, or could appear, in more than one place. Declare new constants
+    inside the `diag_msgs!` block: it builds the prefixed text at compile time
+    so `post_diag` stores a borrowed `&'static str` without allocating, which
+    matters on hot paths such as the `01004` of a `SQLGetData` length probe.
   - `post_sql_error(state, sqlstate, native, message)` — the lower-level
-    primitive behind `post_diag`. Use it directly only for genuinely one-off
+    primitive for driver text built at runtime (`post_diag` bypasses it and
+    posts the precomputed `DiagMsg` text). Use it directly only for genuinely one-off
     or **dynamic** messages (text computed at runtime) that don't warrant a
     constant. Posts exactly one record.
   - `post_tds_error(state, &tds_err, default_sqlstate)` — for any
@@ -635,8 +639,13 @@ For ODBC hot paths:
     do not add avoidable per-row allocation or metadata cloning.
     Across fetch calls, retain only the empty binding vector's allocation and
     rebuild its contents under the ARD lock. Descriptor writes, reassociation,
-    and unbinding must remain visible on the next fetch. Only the statement's
-    own implicit ARD can bypass the global descriptor-liveness lookup.
+    and unbinding must remain visible on the next fetch. Only a statement's
+    own implicit ARD, APD, IRD, and IPD can bypass the global
+    descriptor-liveness lookup, and only by exact pointer equality
+    (`StmtHandle::owns_implicit_desc`): they are allocated in
+    `StmtHandle::new`, never reassigned, rejected by `free_desc` with `HY017`,
+    and freed only when the statement drops. Explicit descriptors keep the
+    lookup.
     Keep `RowIssue` and `RowOutcome` within two bytes: converters return the
     compact `ConvError`, mapped to a canonical diagnostic only on failure.
     Carrying a full diagnostic enlarges every successful column conversion

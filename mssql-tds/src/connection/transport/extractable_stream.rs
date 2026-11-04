@@ -134,6 +134,16 @@ impl AsyncWrite for ExtractableStream {
 }
 
 impl Stream for ExtractableStream {
+    fn abort(&mut self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(stream) = &mut *guard {
+            stream.abort();
+        }
+    }
+
     fn tls_handshake_starting(&mut self) {
         if let Ok(mut guard) = self.inner.lock()
             && let Some(ref mut stream) = *guard

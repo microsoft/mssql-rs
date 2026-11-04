@@ -642,13 +642,13 @@ impl LoginHandler<'_> {
 
         // Handle SSPI challenge-response loop for integrated authentication
         while login_response.get_status() == LoginResponseStatus::WaitingForSspi {
-            let sspi_challenge = login_response.sspi_token.as_ref().ok_or_else(|| {
+            let sspi_challenge = login_response.sspi_token.take().ok_or_else(|| {
                 Error::ProtocolError(
                     "Login response status is WaitingForSspi but no sspi_token present".to_string(),
                 )
             })?;
 
-            let handler = sspi_handler.as_mut().ok_or_else(|| {
+            let handler = sspi_handler.take().ok_or_else(|| {
                 Error::ProtocolError(
                     "Received SSPI challenge but no SSPI handler available".to_string(),
                 )
@@ -660,7 +660,10 @@ impl LoginHandler<'_> {
             );
 
             // Process the challenge and generate response
-            let response_opt = handler.process_challenge(&sspi_challenge.data)?;
+            let (handler, response_opt) = handler
+                .process_challenge_off_runtime(sspi_challenge.data)
+                .await?;
+            sspi_handler = Some(handler);
             match response_opt {
                 Some(response_token) => {
                     debug!("Sending SSPI response ({} bytes)", response_token.len());
@@ -775,7 +778,7 @@ impl LoginHandler<'_> {
 
         // If using integrated security, create SSPI handler and get initial token
         let (sspi_token, sspi_handler) = if is_integrated_security {
-            let mut config = context.integrated_auth_config();
+            let mut config = context.integrated_auth_config_for(transport_context);
 
             // Bind the authentication exchange to the TLS channel (Extended
             // Protection for Authentication). The token is only present when
@@ -798,8 +801,11 @@ impl LoginHandler<'_> {
                 server, port
             );
 
-            let handler =
-                off_runtime_thread(move || SspiAuthHandler::new(&config, &server, port)).await?;
+            let provider = context.security_context_provider.clone();
+            let handler = off_runtime_thread(move || {
+                SspiAuthHandler::new(&config, &server, port, provider.as_deref())
+            })
+            .await?;
             self.login_stage
                 .record(connect_stage::SPN, handler.target_spn());
             let (handler, initial_token) = off_runtime_thread(move || {
