@@ -185,11 +185,10 @@ without a parser). The connection is retired at that read, in either batch
 error mode, with session recovery disarmed, so `close_query` has nothing to
 drain and a pool discards the connection.
 
-Before this, only `BatchErrorMode::Continue` retired at the read. Under the
-default `Abort`, retirement waited for `close_query` to fail on the bytes after
-the token, and a payload that reads as a final DONE (`FD 00 00 C1 00 …`) let
-that drain succeed and the desynchronized connection be reused. This is the
-same aliasing that #743 closed for a rejected `0xA3`.
+Retiring at the read matters under the default `BatchErrorMode::Abort`.
+Otherwise `close_query` would drain the token's unread bytes, and a payload
+that reads as a final DONE (`FD 00 00 C1 00 …`) would let that drain succeed
+over a desynchronized stream. A rejected `0xA3` is retired the same way.
 
 The reference drivers also break the connection at the token:
 
