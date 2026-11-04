@@ -95,10 +95,12 @@ The token has no length prefix, so it is parsed field by field
 - Indexes must be in range or `0xFFFF`; ranks must be -1, 0, 10, 20, 30 or 40.
 - Every count is checked against the remaining byte budget before anything is
   allocated, and initial capacity is capped at 1,024 entries per list.
-- The token may not exceed 16 MiB. The worst case SQL Server produces is
-  4,251,658 bytes: 4,096 columns, each with its own label and information type,
-  all four strings at the 128-character `sysname` maximum. Live, 252 such
-  columns produce 261,586 bytes, matching the formula.
+- The token may not exceed 16 MiB. When each column references one classified
+  source, the worst case SQL Server produces is 4,251,658 bytes: 4,096
+  columns, each with its own label and information type, all four strings at
+  the 128-character `sysname` maximum. Live, 252 such columns produce 261,586
+  bytes, matching the formula. Derived columns add 8 bytes per extra source
+  (see [Limitations](#limitations-and-assumptions)).
 - An unpaired UTF-16 surrogate in a name or id is replaced with U+FFFD. SQL
   Server stores such strings as given.
 
@@ -144,8 +146,8 @@ dead session negotiated is never reused.
 
 ## Unknown tokens
 
-An unrecognized token type is a hard protocol error, and the connection is
-retired. This is unchanged, and Data Classification does not rely on skipping:
+An unrecognized token type is a hard protocol error, and the read that meets
+it retires the connection. Data Classification does not rely on skipping:
 `0xA3` is a known token type with its own parser.
 
 [MS-TDS] 2.2.4.2.1 assigns each token a framing class by bits 5–4 of its type
@@ -171,27 +173,43 @@ Blast radius of keeping the error: an unknown token can appear only if the
 server sends a token this client never asked for, since servers introduce new
 tokens behind a LOGIN7 feature or TDS version. The query that meets it fails
 with `Unknown token type: 0x..` (or `No parser implemented` for a known type
-without a parser), the connection is retired with session recovery disarmed,
-and a pool discards it. The reference drivers do the same:
+without a parser). The connection is retired at that read, in either batch
+error mode, with session recovery disarmed, so `close_query` has nothing to
+drain and a pool discards the connection.
+
+Before this, only `BatchErrorMode::Continue` retired at the read. Under the
+default `Abort`, retirement waited for `close_query` to fail on the bytes after
+the token, and a payload that reads as a final DONE (`FD 00 00 C1 00 …`) let
+that drain succeed and the desynchronized connection be reused. This is the
+same aliasing that #743 closed for a rejected `0xA3`.
+
+The reference drivers also break the connection at the token:
 
 - msodbcsql: `default: // Unknown token, out of sync!` raises a protocol error
-  (`Parse.cpp:2002`).
+  and sets a parse error state (`Parse.cpp:2002`).
 - SqlClient: `IsValidTdsToken` (`TdsParser.cs:2447`) fails, the connection is
   broken and `InvalidTdsTokenReceived` is thrown.
 - JDBC: `throwUnexpectedTokenException` (`tdsparser.java:141`) terminates the
   connection.
 
-Regression coverage: `tokens_without_a_parser_are_fatal_on_every_read_path`
-(`io/token_stream.rs`), `a_token_without_a_parser_fails_closed`
-(`tests/test_unknown_token.rs`), and
-`an_unknown_token_in_the_attention_drain_retires_the_connection`
-(`connection/transport/network_transport.rs`).
+Regression coverage:
+
+- `a_token_without_a_parser_fails_closed` (`tests/test_unknown_token.rs`):
+  an unknown and an unparsed token, each with an ordinary payload and with one
+  that reads as a final DONE, in both batch error modes, with and without
+  session recovery.
+- `an_unreadable_token_in_the_prepared_batch_drain_retires_the_connection`
+  (`connection/tds_client.rs`): the prepared-batch row drain.
+- `tokens_without_a_parser_are_fatal_on_every_read_path`
+  (`io/token_stream.rs`) and
+  `an_unknown_token_in_the_attention_drain_retires_the_connection`
+  (`connection/transport/network_transport.rs`).
 
 ## Differences from the reference drivers
 
 | Aspect | msodbcsql | SqlClient / JDBC | mssql-tds |
 |---|---|---|---|
-| Requested by default | Version 1 on every login | Opt-in | Opt-in |
+| Requested by default | Version 1 on every login | Version 2 on every login | Opt-in |
 | `IsEnabled = 0` | Ignored | Feature off | Feature off |
 | Layout | Acknowledged version | Acknowledged, bounded by 2 | `min(requested, acknowledged)` |
 | Exposed as | Raw token bytes | Typed objects | Typed model |
@@ -201,6 +219,14 @@ Regression coverage: `tokens_without_a_parser_are_fatal_on_every_read_path`
 | Unpaired surrogate | Raw bytes | U+FFFD (SqlClient) | U+FFFD |
 | Token size | Unbounded | Unbounded | 16 MiB |
 | After a no-row result | Previous buffer may remain | — | `None` |
+
+mssql-tds is the only one of these clients that does not request the feature
+on every login (msodbcsql `sqlcfunc.cpp:3487`, SqlClient
+`SqlConnectionInternal.cs:3423`, JDBC `SQLServerConnection.java:7809`). It
+stays opt-in so existing callers keep their LOGIN7 and token stream unchanged,
+and so a server's classification cannot fail a query or retire a connection for
+a caller that never reads it. The ODBC layer is expected to request it by
+default to match msodbcsql (see [Follow-up](#follow-up-for-the-odbc-layer)).
 
 ## Validation
 
@@ -233,7 +259,8 @@ and the test confirmed to fail.
 
 `tests/test_data_classification_live.rs` runs against a real server. Each test
 creates its own table in tempdb (`dc_live_<random>`), applies
-`ADD SENSITIVITY CLASSIFICATION`, and drops the table even when the test fails.
+`ADD SENSITIVITY CLASSIFICATION`, and drops the table even when the test or
+its setup fails.
 The login needs permission to create tables in tempdb, add classifications,
 and (for the recovery test) `KILL` its own session.
 

@@ -89,15 +89,28 @@ mod data_classification_live {
         /// database part (error 16110), so the batch runs in tempdb with
         /// two-part names.
         async fn create(setup: impl FnOnce(&str) -> String) -> Self {
+            use futures::FutureExt;
             use rand::Rng;
             let table = format!("dc_live_{:016x}", rand::rng().random::<u64>());
-            let mut admin = connect(None).await;
-            exec_and_drain(&mut admin, "USE tempdb").await;
-            exec_and_drain(&mut admin, &setup(&table)).await;
-            admin.close_connection().await.unwrap();
-            Self {
-                name: format!("tempdb.dbo.{table}"),
+            let batch = setup(&table);
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let mut admin = connect(None).await;
+                exec_and_drain(&mut admin, "USE tempdb").await;
+                exec_and_drain(&mut admin, &batch).await;
+                admin.close_connection().await.unwrap();
+            })
+            .catch_unwind()
+            .await;
+            let name = format!("tempdb.dbo.{table}");
+            if let Err(panic) = outcome {
+                // The batch can fail after CREATE TABLE, for instance when
+                // the login may not add classifications.
+                let mut admin = connect(None).await;
+                exec_and_drain(&mut admin, &format!("DROP TABLE IF EXISTS {name}")).await;
+                admin.close_connection().await.unwrap();
+                std::panic::resume_unwind(panic);
             }
+            Self { name }
         }
 
         async fn drop(self) {
