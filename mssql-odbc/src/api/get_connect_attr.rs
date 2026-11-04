@@ -1053,6 +1053,29 @@ mod tests {
     }
 
     #[test]
+    fn long_as_max_null_length_returns_value() {
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            let mut value = u32::MAX;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        (&raw mut value).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 0);
+        }
+    }
+
+    #[test]
     fn long_as_max_allows_both_outputs_null() {
         use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
 
