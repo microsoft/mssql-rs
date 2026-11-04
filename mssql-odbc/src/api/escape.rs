@@ -2138,6 +2138,19 @@ mod tests {
         }
     }
 
+    /// Unclosed braces never form an escape, but they must still reach the
+    /// nesting check: the shortcut keys on `{` alone.
+    #[test]
+    fn brace_shortcut_still_rejects_unclosed_nesting() {
+        let unclosed = format!("{}?", "{".repeat(65));
+        assert_eq!(
+            translate_for_execution(&unclosed, false, &[])
+                .unwrap_err()
+                .state(),
+            SQLSTATE_42000
+        );
+    }
+
     #[test]
     fn native_escapes_translate_nested_nonnative_escapes() {
         assert_eq!(
