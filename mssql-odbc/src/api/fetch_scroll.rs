@@ -1775,7 +1775,7 @@ fn finish_exhausted_fetch(
         mark_no_rows(row_status_ptr, 0, snapshot.array_size);
     }
     if poisoned {
-        error!("SQLFetchScroll: ard mutex poisoned on an exhausted cursor");
+        error!("SQLFetchScroll: failed to access ard on an exhausted cursor");
     }
     // Released only after the walk, in the same acquisition that posts any
     // diagnostic: dropping the claim earlier would reopen the window it exists
