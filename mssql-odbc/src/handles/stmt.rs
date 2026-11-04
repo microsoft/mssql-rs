@@ -69,6 +69,9 @@ pub(crate) struct ActivePlpStream {
     /// the first call's target, which would leave a `SQL_C_BINARY`-first stream
     /// unable to convert later.
     pub(crate) narrow_encoding: Option<ResolvedEncoding>,
+    /// The wire bytes are already in the client's code page, so `SQL_C_CHAR`
+    /// copies them without decoding. Resolved when the stream opens.
+    pub(crate) narrow_verbatim: bool,
     /// Incremental decoder over `narrow_encoding`, built by
     /// [`Self::ensure_narrow_decoder`] the first time a target actually needs to
     /// convert. Serves both directions: to UTF-16LE for `SQL_C_WCHAR`
@@ -146,6 +149,7 @@ impl ActivePlpStream {
             pending_loss_ranges: Vec::new(),
             pending_narrow_source: None,
             narrow_encoding,
+            narrow_verbatim: false,
             narrow_decoder: None,
             narrow_decoder_finished: false,
             pending_units: Vec::new(),
@@ -306,6 +310,7 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("pending_byte", &self.pending_byte)
             .field("pending_high_surrogate", &self.pending_high_surrogate)
             .field("pending_bytes", &self.pending_bytes.len())
+            .field("narrow_verbatim", &self.narrow_verbatim)
             .field("narrow_decoder", &self.narrow_decoder.is_some())
             .field("narrow_decoder_finished", &self.narrow_decoder_finished)
             .field("pending_units", &self.pending_units.len())

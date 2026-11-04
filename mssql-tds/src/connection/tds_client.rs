@@ -1462,7 +1462,7 @@ impl TdsClient {
     /// The Windows code page the current database collation selects, as
     /// msodbcsql derives it for `SQL_COLLATION_SEQ` (`CodePageFromTDSCollation`).
     pub fn collation_code_page(&self) -> Option<u16> {
-        crate::datatypes::sql_string::collation_code_page(self.get_collation())
+        self.get_collation().code_page()
     }
 
     /// Returns `true` if the connection is known to be dead.
