@@ -155,7 +155,7 @@ stress profiles set it; Windows builds them by default). Entries pass `--gtest_f
 ctest -R '^get_data_test$'       # single-threaded only
 ctest -L mt                      # every concurrent variant
 ./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt
-./run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 50, Windows
+./run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 25, Windows
 
 # One executable by hand (match mode suffixes: TEST_P names contain "/" too)
 MSSQL_ODBC_MT_THREADS=8 MSSQL_ODBC_MT_ITERS=20 \
@@ -255,7 +255,7 @@ Ordered by value; the backlog is done top-down.
 
 | # | Scenario | Checks | Value | Needs | Status |
 |---|---|---|---|---|---|
-| 7 | **Handle churn** (`handle_lifecycle_test.cpp`) | Threads allocate, connect, query, disconnect, and free ENV/DBC/STMT trees, on private ENVs and on one shared ENV: 20 rounds, 16,000 trees per test weekly. On the shared ENV, THREADS / 4 spinner threads allocate, set an attribute on, and free STMTs on their own connections throughout (DBC and ENV allocations reach the driver only at connect through a Driver Manager), so handle registration overlaps the churn. Thread and handle (fd) counts after the last round match those after round 0. | Catches runtime, socket, and thread leaks that successful API calls hide; a leaked ENV runtime fails it | - | Implemented (AB#49261) |
+| 7 | **Handle churn** (`handle_lifecycle_test.cpp`) | Threads allocate, connect, query, disconnect, and free ENV/DBC/STMT trees, on private ENVs and on one shared ENV: 20 rounds, 8,000 trees per test weekly. On the shared ENV, THREADS / 4 spinner threads allocate, set an attribute on, and free STMTs on their own connections throughout (DBC and ENV allocations reach the driver only at connect through a Driver Manager), so handle registration overlaps the churn. Thread and handle (fd) counts after the last round match those after round 0. | Catches runtime, socket, and thread leaks that successful API calls hide; a leaked ENV runtime fails it | - | Implemented (AB#49261) |
 | 8 | **Killed or stalled connection under load** (`fault_recovery_test.cpp`) | THREADS - 1 workers query nonstop on the shared ENV while a victim on that ENV is faulted. Killed: an admin connection `KILL`s it, alternately idle and mid-`WAITFOR`; an idle victim recovers (new `connect_time`) and returns its token, an executing one fails within 10 s and frees cleanly. Stalled: the victim reads 8 MB through `TcpPauseProxy`, which holds the response mid-value for 15 s without closing; the read stays blocked, then delivers every byte. Healthy workers never fail or wait over 8 s between queries. | One dead connection must not stall or break the others sharing its runtime; covers Idle Connection Resiliency under load | `VIEW SERVER STATE`, `ALTER ANY CONNECTION`; `ODBC_TEST_SERVER` for the stall proxy | Implemented (AB#49261) |
 | 9 | **Timeout and cancel churn** (`fault_recovery_test.cpp`) | Each worker keeps a connection and in turn times out a `WAITFOR` (`HYT00`), has another thread cancel one once the server shows it running (`HY008`), cancels a data-at-execution stream, or has another thread cancel a 20,000-row read at a random point (before send, mid-execute, mid-fetch, between fetches, or after the last row; any valid outcome); then selects its token on the same STMT. Every fault runs at any profile size; counts return. | Recovery paths most likely to leave a connection busy or leak results, diagnostics, or tasks | `VIEW SERVER STATE` | Implemented (AB#49261) |
 | 10 | **Failed-connect churn** (`handle_lifecycle_test.cpp`) | Four in five logins fail - unknown login, unknown database, refused port, a listener that never answers (1 s login timeout) - interleaved with real logins on private and shared ENVs. Each reports its SQLSTATE in bounded time; counts return. | Partly built connections are a common leak and hang source; real logins must be unaffected | - | Implemented (AB#49261) |
@@ -317,7 +317,7 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
 |---|---|---|---|---|---|
 | PR | validation pipeline, every PR | both | 2 x 1 | Windows: `SharedDbc` only; Linux, macOS: none (not built) | 3 |
 | Nightly (temporary) | `.pipeline/odbc-stress-pipeline.yml`, Mon-Sat 02:00 UTC | mssql-odbc | 8 x 20 | all; unixODBC skips `SharedStmt` | 0 |
-| Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 50 | same as nightly | 0 |
+| Weekly | same, Sun 02:00 UTC | mssql-odbc | 16 x 25 | same as nightly | 0 |
 | Nightly, weekly | same, Windows leg | msodbcsql | 2 x 1 | same as nightly | 0 |
 
 - Stress legs: Windows x64 (Debug driver, Windows DM), Ubuntu 24.04 and
@@ -332,9 +332,15 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   groups' regexes are shared by all three legs (`odbc-stress-pipeline.yml`),
   and the remaining-suites group is their complement, so a newly converted
   suite is still run. Jobs allow 240 minutes weekly and 120 nightly; each ctest
-  entry still has 60. Run serially, the Linux weekly needed about 280 minutes
+  entry still has 60. Run serially at 16 x 50, the Linux weekly needed about 280 minutes
   (build 188696, cancelled at 240); split, its largest group (parameters) has
   about 90 minutes of tests.
+- Weekly is 16 x 25, not 16 x 50: once the fetch and parameter suites ran in
+  every mode (#756, #780), 16 x 50 needed about 5,300 s for
+  `get_data_test_mt` and 4,500 s for `param_conversions_test_mt`, past the
+  3,600 s per-entry limit (build 189118). Run time scales with threads x
+  iterations, so 16 x 25 halves it and keeps the 16-thread width that
+  separates weekly from nightly; iterations mostly repeat interleavings.
 - Nightly flushes out obvious races while suites convert. It started
   2026-10-28; remove its schedule once its findings are fixed (target
   mid-November). PR and weekly remain. Nightly failures need a named triage
