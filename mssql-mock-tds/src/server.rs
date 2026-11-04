@@ -371,10 +371,10 @@ impl ConnectionProcessor {
             // only the last carries EOM. Answer once, for the whole batch.
             if header.packet_type == PacketType::SqlBatch {
                 if header.status.is_ignore() {
-                    // The server discards a withdrawn batch and acknowledges
-                    // it with a DONE.
+                    // MS-TDS 2.2.1.7: the server discards a withdrawn batch
+                    // and answers with a single DONE carrying DONE_ERROR.
                     self.pending_batch.clear();
-                    let done = build_done_token(0);
+                    let done = crate::protocol::build_done_token_with_status(0x0002, 0); // DONE_ERROR
                     let total_length = (PACKET_HEADER_SIZE + done.len()) as u16;
                     let mut packet = BytesMut::with_capacity(total_length as usize);
                     PacketHeader::new(PacketType::TabularResult, total_length, 1)
@@ -1749,7 +1749,11 @@ mod tests {
         body
     }
 
-    async fn first_token_of_reply(processor: &mut ConnectionProcessor, packets: &[Vec<u8>]) -> u8 {
+    /// The reply's first token type and, for a DONE, its status.
+    async fn first_token_of_reply(
+        processor: &mut ConnectionProcessor,
+        packets: &[Vec<u8>],
+    ) -> (u8, u16) {
         for packet in packets {
             processor.buffer_mut().extend_from_slice(packet);
         }
@@ -1759,13 +1763,16 @@ mod tests {
             .unwrap()
             .expect("a complete message is answered");
         assert!(processor.pending_batch.is_empty());
-        reply[PACKET_HEADER_SIZE]
+        let token = &reply[PACKET_HEADER_SIZE..];
+        (token[0], u16::from_le_bytes([token[1], token[2]]))
     }
 
     #[tokio::test]
     async fn abandoned_partial_batch_does_not_prefix_the_next_batch() {
         const COLMETADATA: u8 = 0x81;
         const DONE: u8 = 0xFD;
+        const DONE_ERROR: u16 = 0x0002;
+        const DONE_ATTN: u16 = 0x0020;
 
         let registry = Arc::new(Mutex::new(QueryRegistry::new()));
         registry.lock().await.register(
@@ -1778,15 +1785,17 @@ mod tests {
         let select_one = packet(PacketType::SqlBatch, 0x01, &batch_body("SELECT 1"));
 
         // EOM | IGNORE withdraws the message: the server discards it rather
-        // than running what was sent, and acknowledges with a DONE.
+        // than running what was sent, and answers with DONE_ERROR (MS-TDS 2.2.1.7).
         let withdrawn = packet(PacketType::SqlBatch, 0x00, &batch_body("SELECT 1"));
         let ignore = packet(PacketType::SqlBatch, 0x03, &[]);
         assert_eq!(
             first_token_of_reply(&mut processor, &[withdrawn, ignore]).await,
-            DONE
+            (DONE, DONE_ERROR)
         );
         assert_eq!(
-            first_token_of_reply(&mut processor, std::slice::from_ref(&select_one)).await,
+            first_token_of_reply(&mut processor, std::slice::from_ref(&select_one))
+                .await
+                .0,
             COLMETADATA
         );
 
@@ -1795,10 +1804,10 @@ mod tests {
         let attention = packet(PacketType::Attention, 0x01, &[]);
         assert_eq!(
             first_token_of_reply(&mut processor, &[partial, attention]).await,
-            DONE
+            (DONE, DONE_ATTN)
         );
         assert_eq!(
-            first_token_of_reply(&mut processor, &[select_one]).await,
+            first_token_of_reply(&mut processor, &[select_one]).await.0,
             COLMETADATA
         );
     }
