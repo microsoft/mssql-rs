@@ -268,6 +268,53 @@ impl ConnectionProcessor {
         }
     }
 
+    /// The TabularResult packet that completes a login: LOGINACK, the
+    /// acknowledgements for the features Login7 requested, and DONE. A login
+    /// finished after a FedAuth challenge uses it too, so it acknowledges the
+    /// same features as a direct one.
+    async fn login_response_packet(&self, fedauth: bool) -> BytesMut {
+        let mut response = build_login_ack();
+        if fedauth {
+            debug!("Including FeatureExtAck for FedAuth");
+            response.extend_from_slice(&build_feature_ext_ack_fedauth());
+        }
+
+        // Session recovery and Data Classification share one FEATUREEXTACK
+        // token, as SQL Server sends them.
+        let mut acknowledged: Vec<(u8, Vec<u8>)> = Vec::new();
+        {
+            let registry = self.query_registry.lock().await;
+            if self
+                .requested_feature_ids
+                .contains(&FEATURE_EXT_SESSION_RECOVERY)
+                && registry.session_recovery()
+            {
+                acknowledged.push((FEATURE_EXT_SESSION_RECOVERY, Vec::new()));
+            }
+            if let Some(requested) = self.login_details.data_classification_requested {
+                let version = match registry.data_classification_ack() {
+                    DataClassificationAck::Requested => Some(requested),
+                    DataClassificationAck::Version(version) => Some(version),
+                    DataClassificationAck::Omitted => None,
+                };
+                if let Some(version) = version {
+                    debug!("Acknowledging Data Classification v{version}");
+                    acknowledged.push((FEATURE_EXT_DATA_CLASSIFICATION, vec![version, 1]));
+                }
+            }
+        }
+        if !acknowledged.is_empty() {
+            response.extend_from_slice(&build_feature_ext_ack(&acknowledged));
+        }
+        response.extend_from_slice(&build_done_token(0));
+
+        let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
+        let mut packet = BytesMut::with_capacity(total_length as usize);
+        PacketHeader::new(PacketType::TabularResult, total_length, 1).write(&mut packet);
+        packet.extend_from_slice(&response);
+        packet
+    }
+
     /// Waits out `delay` (if any) before a registered response is sent,
     /// interruptibly: races the delay against reading more bytes from
     /// `socket`, so a client-sent `Attention` arriving mid-delay is answered
@@ -487,54 +534,8 @@ impl ConnectionProcessor {
                     }
 
                     // Build response with LoginAck + optional FeatureExtAck + Done
-                    let mut response = build_login_ack();
-
-                    // If client sent FedAuth, respond with FeatureExtAck
-                    if auth_info.has_fedauth {
-                        debug!("Including FeatureExtAck for FedAuth");
-                        response.extend_from_slice(&build_feature_ext_ack_fedauth());
-                    }
-
-                    // Session recovery and Data Classification share one
-                    // FEATUREEXTACK token, as SQL Server sends them.
-                    let mut acknowledged: Vec<(u8, Vec<u8>)> = Vec::new();
-                    {
-                        let registry = self.query_registry.lock().await;
-                        if auth_info
-                            .feature_ids
-                            .contains(&FEATURE_EXT_SESSION_RECOVERY)
-                            && registry.session_recovery()
-                        {
-                            acknowledged.push((FEATURE_EXT_SESSION_RECOVERY, Vec::new()));
-                        }
-                        if let Some(requested) = auth_info.data_classification_version {
-                            let version = match registry.data_classification_ack() {
-                                DataClassificationAck::Requested => Some(requested),
-                                DataClassificationAck::Version(version) => Some(version),
-                                DataClassificationAck::Omitted => None,
-                            };
-                            if let Some(version) = version {
-                                debug!("Acknowledging Data Classification v{version}");
-                                acknowledged
-                                    .push((FEATURE_EXT_DATA_CLASSIFICATION, vec![version, 1]));
-                            }
-                        }
-                    }
-                    if !acknowledged.is_empty() {
-                        response.extend_from_slice(&build_feature_ext_ack(&acknowledged));
-                    }
-
-                    response.extend_from_slice(&build_done_token(0));
-
-                    // Wrap in packet
-                    let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
-                    let mut packet = BytesMut::with_capacity(total_length as usize);
-                    let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
-                    resp_header.write(&mut packet);
-                    packet.extend_from_slice(&response);
-
                     self.record_to_store().await;
-                    Some(packet)
+                    Some(self.login_response_packet(auth_info.has_fedauth).await)
                 }
             }
 
@@ -560,18 +561,8 @@ impl ConnectionProcessor {
                             self.awaiting_fedauth_token = false;
                             self.is_authenticated = true;
 
-                            let mut response = build_login_ack();
-                            response.extend_from_slice(&build_done_token(0));
-
-                            let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
-                            let mut packet = BytesMut::with_capacity(total_length as usize);
-                            let resp_header =
-                                PacketHeader::new(PacketType::TabularResult, total_length, 1);
-                            resp_header.write(&mut packet);
-                            packet.extend_from_slice(&response);
-
                             self.record_to_store().await;
-                            Some(packet)
+                            Some(self.login_response_packet(true).await)
                         }
                         Err(e) => {
                             warn!("Failed to parse FedAuthToken from {}: {}", self.addr, e);

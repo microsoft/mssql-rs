@@ -5,15 +5,43 @@
 
 #[cfg(test)]
 mod mock_server_fedauth_tests {
-    use mssql_mock_tds::MockTdsServer;
+    use mssql_mock_tds::{
+        ColumnDefinition, ColumnValue, MockTdsServer, QueryResponse, Row, SqlDataType,
+    };
     use mssql_tds::connection::client_context::{
         ClientContext, EntraIdTokenFactory, TdsAuthenticationMethod,
     };
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+    use mssql_tds::token::data_classification::{DataClassificationVersion, SensitivityRank};
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
     use tracing_subscriber::FmtSubscriber;
+
+    // Upper case, as the mock matches registered queries.
+    const CLASSIFIED: &str = "SELECT SSN FROM PEOPLE";
+
+    /// A V2 DATACLASSIFICATION token labelling one column "Confidential"
+    /// (`L1`) at rank High, with the result set at rank High.
+    fn confidential_column_token() -> Vec<u8> {
+        fn b_varchar(bytes: &mut Vec<u8>, value: &str) {
+            let units: Vec<u16> = value.encode_utf16().collect();
+            bytes.push(u8::try_from(units.len()).unwrap());
+            units
+                .iter()
+                .for_each(|unit| bytes.extend_from_slice(&unit.to_le_bytes()));
+        }
+        let high = 30i32.to_le_bytes();
+        let mut bytes = vec![0xA3, 1, 0];
+        b_varchar(&mut bytes, "Confidential");
+        b_varchar(&mut bytes, "L1");
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&high);
+        bytes.extend_from_slice(&[1, 0, 1, 0, 0, 0, 0xFF, 0xFF]);
+        bytes.extend_from_slice(&high);
+        bytes
+    }
 
     fn init_tracing() {
         let subscriber = FmtSubscriber::builder()
@@ -393,6 +421,21 @@ mod mock_server_fedauth_tests {
         let server = MockTdsServer::new("127.0.0.1:0").await?;
         let server_addr = server.local_addr();
         let connection_store = server.connection_store();
+        // The features Login7 requested must still be acknowledged when the
+        // login completes after the challenge.
+        {
+            let registry = server.query_registry();
+            let mut registry = registry.lock().await;
+            registry.set_session_recovery(true);
+            registry.register_with_data_classification(
+                CLASSIFIED,
+                QueryResponse::new(
+                    vec![ColumnDefinition::new("ssn", SqlDataType::Int)],
+                    vec![Row::new(vec![ColumnValue::Int(7)])],
+                ),
+                confidential_column_token(),
+            );
+        }
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let server_handle =
@@ -421,10 +464,31 @@ mod mock_server_fedauth_tests {
                 calls: Arc::clone(&factory_calls),
             }),
         );
+        context.requested_data_classification_version = Some(DataClassificationVersion::Version2);
 
         let provider = TdsConnectionProvider {};
         let mut client = provider.create_client(context, &datasource, None).await?;
         client.execute("SELECT 1".to_string(), ()).await?;
+        client.close_query().await?;
+
+        assert_eq!(
+            client.negotiated_data_classification_version(),
+            Some(DataClassificationVersion::Version2)
+        );
+        assert!(client.is_session_recovery_enabled());
+        client.execute(CLASSIFIED.to_string(), ()).await?;
+        let classification = client
+            .data_classification()
+            .expect("the classified result set carries its classification");
+        let [column] = classification.columns() else {
+            panic!("expected one column, got {:?}", classification.columns());
+        };
+        let label = classification
+            .resolve_label(column.properties()[0].sensitivity_label())
+            .expect("label");
+        assert_eq!((label.name(), label.id()), ("Confidential", "L1"));
+        assert_eq!(classification.rank(), Some(SensitivityRank::High));
+        client.close_query().await?;
         drop(client);
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
