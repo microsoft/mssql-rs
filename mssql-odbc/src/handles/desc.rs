@@ -607,10 +607,11 @@ impl DescState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TvpColumnLengths {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TvpColumnOverrides {
     pub(crate) app_length: Option<SqlULen>,
     pub(crate) ipd_octet_length: Option<SqlLen>,
+    pub(crate) ipd_name: Option<Arc<String>>,
 }
 
 impl DescHandle {
@@ -857,7 +858,7 @@ impl DescHandle {
         &self,
         record_number: SqlSmallInt,
         initial_binding: Option<crate::params::BoundParam>,
-        focused_lengths: Option<TvpColumnLengths>,
+        focused_lengths: Option<TvpColumnOverrides>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         update: impl FnMut(&mut crate::params::BoundParam),
     ) -> Result<Option<bool>, ()> {
@@ -875,7 +876,7 @@ impl DescHandle {
         &self,
         record_number: SqlSmallInt,
         initial_binding: Option<crate::params::BoundParam>,
-        focused_lengths: Option<TvpColumnLengths>,
+        focused_lengths: Option<TvpColumnOverrides>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         mut update: impl FnMut(&mut crate::params::BoundParam),
         after_validation: impl FnOnce(),
@@ -926,7 +927,7 @@ impl DescHandle {
                     return Ok(Some(false));
                 }
                 if focused_lengths.is_some() {
-                    let lengths = state.tvp_column_lengths.entry(focus).or_default();
+                    let lengths = state.tvp_column_overrides.entry(focus).or_default();
                     if lengths.len() <= column_index {
                         let additional = column_index + 1 - lengths.len();
                         lengths.try_reserve_exact(additional).map_err(|_| {
@@ -1003,9 +1004,9 @@ impl DescHandle {
                 false
             };
             if binding_updated {
-                if let Some(lengths) = focused_lengths {
+                if let Some(lengths) = focused_lengths.as_ref() {
                     let Some(slot) = state
-                        .tvp_column_lengths
+                        .tvp_column_overrides
                         .get_mut(&focus)
                         .and_then(|lengths| lengths.get_mut(column_index))
                     else {
@@ -1018,6 +1019,9 @@ impl DescHandle {
                     }
                     if let Some(length) = lengths.ipd_octet_length {
                         target.ipd_octet_length = Some(length);
+                    }
+                    if let Some(name) = lengths.ipd_name.as_ref() {
+                        target.ipd_name = Some(Arc::clone(name));
                     }
                 }
                 updated = true;
@@ -1082,15 +1086,18 @@ impl DescHandle {
                 app_record
             };
             let lengths = state
-                .tvp_column_lengths
+                .tvp_column_overrides
                 .get(&focus)
                 .and_then(|lengths| lengths.get(column_index))
-                .copied()
+                .cloned()
                 .flatten();
             if let Some(lengths) = lengths {
                 if self.kind == DescKind::ImpParam {
                     if let Some(length) = lengths.ipd_octet_length {
                         record.octet_length = length;
+                    }
+                    if let Some(name) = lengths.ipd_name {
+                        record.name = name.as_ref().clone();
                     }
                 } else if let Some(length) = lengths.app_length {
                     record.length = length;
@@ -1228,7 +1235,7 @@ impl DescHandle {
                         error!("updating focused TVP descriptor records: allocation failed");
                     })?;
             }
-            if let Some(lengths) = state.tvp_column_lengths.get_mut(&focus)
+            if let Some(lengths) = state.tvp_column_overrides.get_mut(&focus)
                 && lengths.len() < record_count
             {
                 lengths
@@ -1266,7 +1273,7 @@ impl DescHandle {
                     .entry(focus)
                     .or_default()
                     .resize(record_count, None);
-                if let Some(lengths) = state.tvp_column_lengths.get_mut(&focus) {
+                if let Some(lengths) = state.tvp_column_overrides.get_mut(&focus) {
                     lengths.resize(record_count, None);
                 }
             }

@@ -4077,6 +4077,84 @@ mod tests {
     }
 
     #[test]
+    fn fixed_tvp_rows_detect_child_dae_and_honor_separate_null_indicators() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        let mut row_count = 3;
+        let mut values = [11i32, 22, 33];
+        let mut indicators = [0, SQL_DATA_AT_EXEC, crate::api::odbc_types::SQL_NULL_DATA];
+        let mut lengths = indicators;
+        let tvp = BoundParam {
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 3,
+            strlen_or_ind_ptr: &mut row_count,
+            octet_length_ptr: &mut row_count,
+            ..char_param(&mut [], &mut 0)
+        };
+        let column = BoundParam {
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: crate::api::odbc_types::SQL_INTEGER,
+            column_size: 10,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: size_of::<i32>() as SqlLen,
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: lengths.as_mut_ptr(),
+            ..tvp
+        };
+        let mut snapshot = snap(tvp).unwrap();
+        snapshot.udt_names = Some(std::sync::Arc::new(crate::handles::desc::UdtNames {
+            tvp_type_name: "test_table".into(),
+            ..Default::default()
+        }));
+        let bound = [Some(snapshot)];
+        let mut columns = BTreeMap::from([(1, vec![Some(column)])]);
+        let built = unsafe {
+            build_named_params_for_row(
+                &bound,
+                &columns,
+                &BTreeMap::new(),
+                1,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }
+        .unwrap_or_else(|_| panic!("fixed TVP staging failed"));
+        assert_eq!(built.tvp_row_counts, BTreeMap::from([(0, 3)]));
+        assert_eq!(built.dae_params.len(), 3);
+        for (row, param) in built.dae_params.iter().enumerate() {
+            assert!(matches!(param.target, DaeTarget::TvpCell {
+                tvp_index: 0, row_index, column_index: 0
+            } if row_index == row));
+        }
+        indicators.fill(crate::api::odbc_types::SQL_NULL_DATA);
+        lengths.fill(SQL_DATA_AT_EXEC);
+        columns.insert(1, vec![Some(column)]);
+        let built = unsafe {
+            build_named_params_for_row(
+                &bound,
+                &columns,
+                &BTreeMap::new(),
+                1,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }
+        .unwrap_or_else(|error| panic!("NULL TVP materialization failed: {}", error.diag().text));
+        assert!(built.dae_params.is_empty());
+        match mssql_tds::test_client_support::rpc_parameter_value(&built.params[0]).unwrap() {
+            SqlType::Table(_, Some(data)) => {
+                assert_eq!(data.rows, vec![vec![SqlType::Int(None)]; 3])
+            }
+            other => panic!("expected NULL table rows, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn tvp_parameter_array_applies_bind_offset_once_to_parent_and_child() {
         use crate::api::odbc_types::{SQL_C_BINARY, SQL_C_SLONG, SQL_SS_TABLE};
         use crate::handles::desc::{DescHeader, UdtNames};

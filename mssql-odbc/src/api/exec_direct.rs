@@ -587,6 +587,136 @@ mod tests {
     use crate::test_support::TestHandles;
 
     #[test]
+    fn canonical_call_with_child_dae_parks_complete_named_parameters() {
+        use crate::api::exports::{SQLBindParameter, SQLParamData, SQLPutData};
+        use crate::api::odbc_types::*;
+        use crate::handles::DbcHandle;
+        for returns_status in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().wire.put_client_for_test(
+                mssql_tds::test_client_support::tds_client_from_tokens(vec![
+                    mssql_tds::test_client_support::done_no_more(),
+                ]),
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let ordinal = if returns_status { 2 } else { 1 };
+            let mut rows = 1;
+            let mut type_name: Vec<u16> = "dbo.test_table\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        ordinal,
+                        SQL_PARAM_INPUT,
+                        SQL_C_DEFAULT,
+                        SQL_SS_TABLE,
+                        1,
+                        0,
+                        type_name.as_mut_ptr().cast(),
+                        SQL_NTS as SqlLen,
+                        &mut rows,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let mut scalar = 42i32;
+            let mut scalar_length = 0;
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        ordinal + 1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        (&mut scalar as *mut i32).cast(),
+                        4,
+                        &mut scalar_length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let mut status = 0i32;
+            let mut status_length = 0;
+            if returns_status {
+                assert_eq!(
+                    unsafe {
+                        SQLBindParameter(
+                            h.stmt,
+                            1,
+                            SQL_PARAM_OUTPUT,
+                            SQL_C_SLONG,
+                            SQL_INTEGER,
+                            0,
+                            0,
+                            (&mut status as *mut i32).cast(),
+                            4,
+                            &mut status_length,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+            }
+            stmt.inner
+                .lock()
+                .unwrap()
+                .vendor_attrs
+                .store_param_focus(ordinal as usize);
+            let mut value = [b'x'];
+            let mut length = SQL_DATA_AT_EXEC;
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_CHAR,
+                        SQL_VARCHAR,
+                        1,
+                        0,
+                        value.as_mut_ptr().cast(),
+                        1,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(0);
+            let sql: Vec<u16> = if returns_status {
+                "{? = call dbo.p(?, ?)}"
+            } else {
+                "{call dbo.p(?, ?)}"
+            }
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+            assert_eq!(
+                unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+                SQL_NEED_DATA
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                let dae = state.dae.as_ref().unwrap();
+                assert_eq!(dae.prebuilt.len(), if returns_status { 3 } else { 2 });
+                assert!(dae.deferred);
+                assert_eq!(dae.tvp_row_counts.get(&(ordinal as usize - 1)), Some(&1));
+            }
+            let mut token = std::ptr::null_mut();
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+            assert_eq!(token, value.as_mut_ptr().cast());
+            assert_eq!(
+                unsafe { SQLPutData(h.stmt, value.as_mut_ptr().cast(), 1) },
+                SQL_SUCCESS
+            );
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_SUCCESS);
+        }
+    }
+
+    #[test]
     fn null_handle_returns_invalid_handle() {
         let sql: Vec<u16> = "SELECT 1"
             .encode_utf16()

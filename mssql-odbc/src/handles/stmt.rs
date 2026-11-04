@@ -570,7 +570,7 @@ pub(crate) struct StmtState {
     pub(crate) tvp_column_bindings: BTreeMap<usize, Vec<Option<BoundParam>>>,
     /// Independent APD length and IPD octet-length overrides for focused TVP columns,
     /// keyed by the TVP ordinal and then zero-based column ordinal.
-    pub(crate) tvp_column_lengths: BTreeMap<usize, Vec<Option<super::desc::TvpColumnLengths>>>,
+    pub(crate) tvp_column_overrides: BTreeMap<usize, Vec<Option<super::desc::TvpColumnOverrides>>>,
     pub(crate) tvp_column_layouts: BTreeMap<usize, DescHeader>,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
@@ -2340,7 +2340,7 @@ impl StmtHandle {
                 parameter_udt_names: Vec::new(),
                 bound_params: Vec::new(),
                 tvp_column_bindings: BTreeMap::new(),
-                tvp_column_lengths: BTreeMap::new(),
+                tvp_column_overrides: BTreeMap::new(),
                 tvp_column_layouts: BTreeMap::new(),
                 pending_unprepare: None,
                 parameter_array: None,

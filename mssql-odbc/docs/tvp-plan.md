@@ -81,8 +81,10 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   are bound, and focus is then restored. `SQL_ATTR_PARAMSET_SIZE`,
   `SQL_ATTR_PARAM_BIND_TYPE`, and `SQL_ATTR_PARAM_BIND_OFFSET_PTR` under focus belong to
   that TVP's independent column layout, not the statement's outer parameter array.
-  Focused datetime IPD precision and scale share the fractional-second precision;
-  setting either preserves the column length.
+  Focused standard DATE/TIME/TIMESTAMP IPD precision and scale share the
+  fractional-second precision; setting either preserves the column length.
+  Focused IPD parameter names are stored on the child, not the table parameter;
+  `SQL_DESC_UNNAMED` or a null name pointer clears the child name.
   Shared application descriptors compare their projected child records, so
   statement-local IPD differences do not prevent APD reads.
 - **Supply TVP content with data-at-execution** — the driver returns the table token, then
@@ -96,7 +98,9 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   marker supplies an empty table. A row's DAE length is read when its cell token is offered, so
   mixed ordinary/DAE rows retain their declared lengths without reading unused future rows.
   A materialized parent row count may also contain DAE cells; only those cell tokens are offered,
-  without table row-control tokens. DAE row-control staging starts with one row and grows with
+  without table row-control tokens. Fixed-row cell storage is reserved fallibly
+  before collection and reports `HY001` on allocation failure.
+  DAE row-control staging starts with one row and grows with
   supplied batches instead of allocating tokens for the bound capacity up front.
   A NULL indicator takes precedence over a separate DAE octet-length indicator and
   does not produce a cell token.

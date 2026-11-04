@@ -408,6 +408,20 @@ TEST_F(TvpTest, FocusedDescriptorWritesLeaveParentUnchanged) {
     ASSERT_SQL_OK(SQLGetDiagRecW(SQL_HANDLE_DESC, Ipd(), 1, state, &native, message,
                                  256, &message_length), SQL_HANDLE_DESC, Ipd());
     EXPECT_EQ(SqlWToAscii(state, 5), "HY092");
+    child_name = ToSqlW("@child");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_name.data(), SQL_NTS),
+                  SQL_HANDLE_DESC, Ipd());
+    SQLWCHAR child_readback[32]{};
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_readback,
+                                   sizeof(child_readback), nullptr), SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(SqlWToAscii(child_readback, 32), "@child");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, nullptr, 0),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_readback,
+                                   sizeof(child_readback), nullptr), SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(SqlWToAscii(child_readback, 32), "");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_name.data(), SQL_NTS),
+                  SQL_HANDLE_DESC, Ipd());
     ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_UNNAMED,
                                    reinterpret_cast<SQLPOINTER>(SQL_UNNAMED), 0),
                   SQL_HANDLE_DESC, Ipd());

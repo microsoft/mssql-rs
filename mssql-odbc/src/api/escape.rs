@@ -944,7 +944,7 @@ fn is_identifier_part(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '#' || c == '@' || c == '$'
 }
 
-fn is_regular_identifier(name: &str) -> bool {
+pub(super) fn is_regular_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if is_identifier_start(c)) && chars.all(is_identifier_part)
 }
