@@ -128,7 +128,8 @@ token was read whole, so the connection is unaffected.
 | Out-of-range index, unknown rank, budget exceeded | Protocol error | Retired; session recovery disarmed |
 | `0xA3` on a connection that did not negotiate it | Protocol error | Retired; session recovery disarmed |
 | Transport error or truncation inside the token | The reader error | Retired; recovery kept armed for a lost transport |
-| Timeout or cancellation during the read | Timeout or cancellation error | Settled through ATTENTION; usable afterwards |
+| Request timeout or `CancelHandle` during the read | Timeout or cancellation error | Settled through ATTENTION; usable afterwards |
+| Caller drops the future during the read | None | Not settled; must not be reused |
 | Fewer classified columns than result columns | Accepted | Unaffected |
 | More classified columns than result columns | Classification dropped, warning logged | Unaffected |
 | Unpaired surrogate in a string | Replaced with U+FFFD | Unaffected |
@@ -137,6 +138,12 @@ A rejected token leaves the rest of it unread, and those bytes can pass for
 other tokens, a final DONE among them. The connection is therefore retired in
 both batch error modes, so a later `close_query` cannot report success over a
 desynchronized stream.
+
+Dropping a read future, for example with `tokio::select!` or an outer
+`tokio::time::timeout`, skips the ATTENTION settlement. As with a row, column
+metadata or PLP value split across packets, the reader can be left inside the
+token, so drop the client rather than reuse it. Use the request timeout or a
+`CancelHandle` to interrupt a read and keep the connection.
 
 ### Session recovery
 
