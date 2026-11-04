@@ -221,6 +221,13 @@ error followed by a result set, and `register_with_trailing_info` for messages
 after rows. `LOGIN_DELAY_KEY`, `RPC_DELAY_KEY`, and `TM_BEGIN_DELAY_KEY` delay
 login, unmatched RPCs, and transaction-begin replies respectively.
 
+`register_with_data_classification` and `register_result_sets` (with
+`ResultSetResponse`) send raw DATACLASSIFICATION token bytes after a result
+set's metadata. `set_data_classification_ack` (`DataClassificationAck`) controls
+how Login7's Data Classification request is acknowledged; with
+`set_session_recovery` and `close_connection_after`, tests can drive session
+recovery.
+
 ## Current limitations
 
 | Area | Behavior |
