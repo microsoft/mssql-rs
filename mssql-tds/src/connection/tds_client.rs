@@ -5500,6 +5500,11 @@ impl TdsClient {
                 self.last_return_status = ReturnStatus::Received(return_status.value);
                 info!(?return_status);
             }
+            // Belongs to a result set the drain discards. Only the token is
+            // named: its labels and information types describe the data.
+            Tokens::DataClassification(_) => {
+                debug!("Skipping DATACLASSIFICATION while draining");
+            }
             other => {
                 info!(?other);
             }
@@ -11907,6 +11912,70 @@ mod tests {
         assert!(client.is_connection_dead());
         assert!(!client.is_session_recovery_enabled());
         assert!(!client.has_open_batch());
+    }
+
+    /// A drain discards classification without logging what it says: its
+    /// labels and information types describe the data, so only the token is
+    /// named. The capture is checked to have seen the drain.
+    #[tokio::test]
+    async fn draining_a_classification_logs_no_labels_or_information_types() {
+        use crate::token::data_classification::{
+            ColumnSensitivity, DataClassificationMetadata, DataClassificationVersion,
+            InformationType, SensitivityLabel,
+        };
+        use tracing::instrument::WithSubscriber;
+
+        let classification = Tokens::DataClassification(DataClassificationMetadata {
+            version: DataClassificationVersion::Version1,
+            sensitivity_labels: vec![SensitivityLabel {
+                name: "LabelNameMarker".to_string(),
+                id: "LabelIdMarker".to_string(),
+            }],
+            information_types: vec![InformationType {
+                name: "TypeNameMarker".to_string(),
+                id: "TypeIdMarker".to_string(),
+            }],
+            rank: None,
+            columns: vec![ColumnSensitivity {
+                properties: Vec::new(),
+            }],
+        });
+        let (mut client, _) = create_capturing_client(vec![
+            int_col_metadata(1),
+            classification,
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ]);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("off,mssql_tds=trace")
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        client
+            .execute_prepared_batch(&mut statement, vec![Ok((0, Vec::new()))], &mut None, ())
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        let logs = std::fs::read_to_string(logs.path()).unwrap();
+        assert!(
+            logs.contains("Skipping DATACLASSIFICATION while draining"),
+            "{logs}"
+        );
+        for marker in [
+            "LabelNameMarker",
+            "LabelIdMarker",
+            "TypeNameMarker",
+            "TypeIdMarker",
+        ] {
+            assert!(!logs.contains(marker), "{marker} logged:\n{logs}");
+        }
+        assert!(!client.is_connection_dead());
     }
 
     /// Under `Continue` one error can be reflected by both the failing
