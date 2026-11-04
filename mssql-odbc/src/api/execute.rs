@@ -1635,12 +1635,17 @@ mod tests {
         assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
     }
 
-    fn edit_ipd_record(raw: SqlHandle, value: SqlPointer, indicator: *mut SqlLen) {
+    fn edit_ipd_record(
+        raw: SqlHandle,
+        record_number: SqlSmallInt,
+        value: SqlPointer,
+        indicator: *mut SqlLen,
+    ) {
         assert_eq!(
             unsafe {
                 crate::api::SQLSetDescRec(
                     raw,
-                    1,
+                    record_number,
                     crate::api::odbc_types::SQL_SMALLINT,
                     0,
                     2,
@@ -1685,6 +1690,7 @@ mod tests {
                     std::thread::spawn(move || {
                         edit_ipd_record(
                             ipd as SqlHandle,
+                            1,
                             value as SqlPointer,
                             indicator as *mut SqlLen,
                         );
@@ -1731,7 +1737,19 @@ mod tests {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let (staging, _) = stage_execution(stmt).unwrap();
             assert!(stmt.inner.lock().unwrap().prepared.is_none());
-            edit_ipd_record(h.ipd(), values.as_mut_ptr().cast(), indicators.as_mut_ptr());
+            edit_ipd_record(
+                h.ipd(),
+                1,
+                values.as_mut_ptr().cast(),
+                indicators.as_mut_ptr(),
+            );
+            // A later edit outside this SQL's markers must not hide ordinal 1.
+            edit_ipd_record(
+                h.ipd(),
+                2,
+                values.as_mut_ptr().cast(),
+                indicators.as_mut_ptr(),
+            );
             let (plan, orphaned) = staged_plan(staging);
             {
                 let mut state = stmt.inner.lock().unwrap();
