@@ -1133,8 +1133,8 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
     // sequence must keep that sequence's own frozen snapshot if this call
     // turns out to be a rejected re-entry rather than a real new execute.
     //
-    // A snapshot failure (poisoned mutex, or an explicit APD freed out from
-    // under a concurrent reassociation) must still post a diagnostic —
+    // A snapshot failure (a poisoned mutex or an inaccessible descriptor
+    // association) must still post a diagnostic —
     // mirroring `SQLExecDirectW`'s handling of the same failure — rather
     // than leave `SQLGetDiagRec` reporting `SQL_NO_DATA` or a stale record
     // from a previous call.

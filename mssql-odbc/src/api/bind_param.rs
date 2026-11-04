@@ -440,8 +440,9 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
     // afterwards (`SQLSetDescField`/`SQLSetDescRec`, no matching IPD write)
     // would otherwise pick the old type, direction and size back up at the
     // next execute. `stmt.ipd` is never reassociated or independently freed
-    // (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so this needs no liveness
-    // recheck the way the APD's resolution does below.
+    // (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so its lifetime follows the
+    // statement. An explicit APD is instead protected by the scoped parent
+    // guard below.
     let apd = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFreeStmt(SQL_RESET_PARAMS): stmt mutex poisoned");
