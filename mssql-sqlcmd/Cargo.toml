@@ -22,11 +22,12 @@ workspace = true
 # diagnostics out; mssql_sqlcmd_diagnostics_run reports it as unsupported there.
 [target.'cfg(target_pointer_width = "64")'.dependencies]
 mssql-tds = { path = "../mssql-tds" }
-tokio = { version = "1.48.0", features = ["rt", "time", "macros"] }
+tokio = { version = "1.48.0", features = ["rt", "time", "macros", "sync"] }
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", default-features = false, features = ["registry", "std"] }
 
-# diagnostics: the client's operating-system version.
+# diagnostics: the client's operating-system version and, off Windows, the
+# Kerberos ticket cache of the user.
 [target.'cfg(all(target_pointer_width = "64", unix))'.dependencies]
 libc = "0.2"
 
