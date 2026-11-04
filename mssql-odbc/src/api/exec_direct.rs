@@ -978,11 +978,18 @@ mod tests {
     }
 
     /// The DM rejects these with HY090 before the driver sees them, so the
-    /// driver only asserts the contract, as msodbcsql relies on it too.
+    /// driver only asserts the contract, as msodbcsql relies on it too. The
+    /// mock answers any batch, so only the assert keeps this an error.
     #[cfg(debug_assertions)]
     #[test]
     fn negative_text_length_other_than_nts_violates_dm_contract() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+
         let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
 
@@ -992,14 +999,21 @@ mod tests {
                 SQL_ERROR,
                 "TextLength {text_length}"
             );
-            assert!(
-                !stmt
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .has_state(STMT_STATE_EXEC_STARTED)
-            );
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.diag_records.is_empty(), "TextLength {text_length}");
+            assert!(!state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN));
+            drop(state);
+            assert!(dbc.inner.lock().unwrap().wire.owner().is_none());
         }
+
+        assert_eq!(
+            unsafe { crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), 8) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { crate::api::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_CLOSE) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
     }
 
     /// A plain batch whose first statement is a no-row result (DML row count)

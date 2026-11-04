@@ -79,6 +79,11 @@ impl PacketStatus {
     pub fn is_end_of_message(&self) -> bool {
         self.0 & 0x01 != 0
     }
+
+    /// Set with EOM when a client withdraws a partly sent message.
+    pub fn is_ignore(&self) -> bool {
+        self.0 & 0x02 != 0
+    }
 }
 
 /// TDS Packet Header

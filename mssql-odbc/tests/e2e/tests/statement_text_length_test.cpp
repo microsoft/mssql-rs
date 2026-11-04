@@ -8,6 +8,7 @@
 #include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,8 @@ ODBC_TEST_F(StatementTextLengthTest, PrepareReadsFullTextLength) {
 // The Driver Manager rejects these before either driver sees them.
 ODBC_TEST_F(StatementTextLengthTest, NonPositiveTextLengthOtherThanNtsIsHy090) {
     auto sql = PaddedSelect(16, 1);
+    // The DM's HY090 is cleaned up before unixODBC takes its statement lock.
+    std::unique_lock<OdbcDiagnosticsMutex> lock(diagnostics_mutex_);
     for (SQLINTEGER length : {SQLINTEGER{0}, SQLINTEGER{-1}}) {
         SCOPED_TRACE(length);
         EXPECT_SQL_ERROR(SQLExecDirectW(stmt_, sql.data(), length));
@@ -84,4 +87,7 @@ ODBC_TEST_F(StatementTextLengthTest, NonPositiveTextLengthOtherThanNtsIsHy090) {
         EXPECT_SQL_ERROR(SQLPrepareW(stmt_, sql.data(), length));
         EXPECT_EQ("HY090", StmtDiagState());
     }
+    SQLULEN timeout = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, &timeout, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
 }

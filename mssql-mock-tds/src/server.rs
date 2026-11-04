@@ -370,6 +370,18 @@ impl ConnectionProcessor {
             // A batch larger than the packet size spans several packets, and
             // only the last carries EOM. Answer once, for the whole batch.
             if header.packet_type == PacketType::SqlBatch {
+                if header.status.is_ignore() {
+                    // The server discards a withdrawn batch and acknowledges
+                    // it with a DONE.
+                    self.pending_batch.clear();
+                    let done = build_done_token(0);
+                    let total_length = (PACKET_HEADER_SIZE + done.len()) as u16;
+                    let mut packet = BytesMut::with_capacity(total_length as usize);
+                    PacketHeader::new(PacketType::TabularResult, total_length, 1)
+                        .write(&mut packet);
+                    packet.extend_from_slice(&done);
+                    return Ok(Some(packet));
+                }
                 if !header.status.is_end_of_message() {
                     if self.pending_batch.is_empty() {
                         self.pending_batch.extend_from_slice(&packet_data);
@@ -384,6 +396,8 @@ impl ConnectionProcessor {
                     batch.extend_from_slice(&packet_data[PACKET_HEADER_SIZE..]);
                     break (header, batch);
                 }
+            } else {
+                self.pending_batch.clear();
             }
             break (header, packet_data);
         };
@@ -1717,5 +1731,75 @@ mod tests {
             .expect("mock server should bind to an ephemeral localhost port");
         let addr = server.local_addr();
         assert!(addr.port() > 0);
+    }
+
+    fn packet(packet_type: PacketType, status: u8, body: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(PACKET_HEADER_SIZE + body.len()).unwrap();
+        let mut packet = vec![packet_type as u8, status];
+        packet.extend_from_slice(&length.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 1, 0]);
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    /// An ALL_HEADERS section with no headers, then `sql` as UTF-16LE.
+    fn batch_body(sql: &str) -> Vec<u8> {
+        let mut body = 4u32.to_le_bytes().to_vec();
+        body.extend(sql.encode_utf16().flat_map(u16::to_le_bytes));
+        body
+    }
+
+    async fn first_token_of_reply(processor: &mut ConnectionProcessor, packets: &[Vec<u8>]) -> u8 {
+        for packet in packets {
+            processor.buffer_mut().extend_from_slice(packet);
+        }
+        let reply = processor
+            .process_packet(&mut tokio::io::empty())
+            .await
+            .unwrap()
+            .expect("a complete message is answered");
+        assert!(processor.pending_batch.is_empty());
+        reply[PACKET_HEADER_SIZE]
+    }
+
+    #[tokio::test]
+    async fn abandoned_partial_batch_does_not_prefix_the_next_batch() {
+        const COLMETADATA: u8 = 0x81;
+        const DONE: u8 = 0xFD;
+
+        let registry = Arc::new(Mutex::new(QueryRegistry::new()));
+        registry.lock().await.register(
+            "SELECT 1",
+            crate::query_response::QueryResponse::select_one(),
+        );
+        let mut processor =
+            ConnectionProcessor::new(0, "127.0.0.1:1".parse().unwrap(), registry, None);
+        processor.is_authenticated = true;
+        let select_one = packet(PacketType::SqlBatch, 0x01, &batch_body("SELECT 1"));
+
+        // EOM | IGNORE withdraws the message: the server discards it rather
+        // than running what was sent, and acknowledges with a DONE.
+        let withdrawn = packet(PacketType::SqlBatch, 0x00, &batch_body("SELECT 1"));
+        let ignore = packet(PacketType::SqlBatch, 0x03, &[]);
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[withdrawn, ignore]).await,
+            DONE
+        );
+        assert_eq!(
+            first_token_of_reply(&mut processor, std::slice::from_ref(&select_one)).await,
+            COLMETADATA
+        );
+
+        // A different message type abandons the partial batch.
+        let partial = packet(PacketType::SqlBatch, 0x00, &batch_body("SELECT 2 /*"));
+        let attention = packet(PacketType::Attention, 0x01, &[]);
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[partial, attention]).await,
+            DONE
+        );
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[select_one]).await,
+            COLMETADATA
+        );
     }
 }
