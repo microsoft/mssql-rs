@@ -88,7 +88,8 @@ protected:
                       SQL_HANDLE_DBC, dbc_);
         SQLUINTEGER actual = 0;
         SQLINTEGER length = -1;
-        ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual, 0, &length),
+        ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual,
+                                       sizeof(actual), &length),
                       SQL_HANDLE_DBC, dbc_);
         EXPECT_EQ(static_cast<SQLUINTEGER>(value), actual);
         EXPECT_EQ(sizeof(actual), static_cast<size_t>(length));
@@ -406,7 +407,8 @@ TEST_F(LongParameterConnectTest, KeywordsAndPreconnectAttributesHaveNativePreced
             const SQLULEN expected = override.value_or(keyword == "Yes" ? SQL_XL_ON : SQL_XL_OFF);
             SQLUINTEGER actual = 99;
             SQLINTEGER length = -1;
-            ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual, 0, &length),
+            ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual,
+                                           sizeof(actual), &length),
                           SQL_HANDLE_DBC, dbc_);
             ASSERT_EQ(expected, actual);
             ASSERT_EQ(4, length);
