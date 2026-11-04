@@ -228,9 +228,14 @@ bool HasExpectedState(int kind, SQLHDBC dbc) {
     return false;
 }
 
-// Short, for volume: only the failing logins use it.
-constexpr SQLULEN kLoginTimeoutSeconds = 1;
-// A failed login must return within the login timeout plus this.
+// Short, for volume, where only the timeout can end the login (a refused port
+// is retried until it on Windows). Logins the server rejects keep a normal
+// timeout: 16 of them at once on a loaded CI agent missed 1 s and reported
+// HYT00 instead of 42000 (stress build 188696).
+SQLULEN LoginTimeoutSeconds(int kind) {
+    return kind == kRefused || kind == kNoAnswer ? 1 : 15;
+}
+// A failed login must return within its login timeout plus this.
 constexpr long long kFailureSlackMs = 10000;
 
 class ConnectCases {
@@ -285,9 +290,10 @@ bool FailConnect(SQLHENV shared_env, int kind, const std::string& connstr, Conne
         error = Describe("SQLAllocHandle(DBC)", rc, SQL_HANDLE_ENV, env);
         return false;
     }
+    const SQLULEN timeout_seconds = LoginTimeoutSeconds(kind);
+    const long long timeout_ms = static_cast<long long>(timeout_seconds) * 1000;
     if (!SQL_SUCCEEDED(rc = SQLSetConnectAttr(dbc, SQL_ATTR_LOGIN_TIMEOUT,
-                                              reinterpret_cast<SQLPOINTER>(kLoginTimeoutSeconds),
-                                              0))) {
+                                              reinterpret_cast<SQLPOINTER>(timeout_seconds), 0))) {
         error = Describe("SQLSetConnectAttr(LOGIN_TIMEOUT)", rc, SQL_HANDLE_DBC, dbc);
     } else {
         const Clock::time_point start = Clock::now();
@@ -302,12 +308,10 @@ bool FailConnect(SQLHENV shared_env, int kind, const std::string& connstr, Conne
                 error = std::string(KindName(kind)) + " login expected SQL_ERROR with [" +
                         ExpectedStates(kind)[0] + "]; " +
                         Describe("SQLDriverConnect", rc, SQL_HANDLE_DBC, dbc);
-            } else if (elapsed_ms >
-                       static_cast<long long>(kLoginTimeoutSeconds) * 1000 + kFailureSlackMs) {
+            } else if (elapsed_ms > timeout_ms + kFailureSlackMs) {
                 error = std::string(KindName(kind)) + " login took " +
                         std::to_string(elapsed_ms) + " ms";
-            } else if (kind == kNoAnswer &&
-                       elapsed_ms < static_cast<long long>(kLoginTimeoutSeconds) * 1000 - 500) {
+            } else if (kind == kNoAnswer && elapsed_ms < timeout_ms - 500) {
                 error = "no_answer login gave up after " + std::to_string(elapsed_ms) +
                         " ms, before its login timeout";
             }
@@ -325,7 +329,7 @@ bool FailConnect(SQLHENV shared_env, int kind, const std::string& connstr, Conne
 // Plan scenario 10: churn where four in five logins fail - an unknown login, an
 // unknown database, a refused port, and a server that never answers (login
 // timeout) - on private and shared ENVs alike, interleaved with real logins.
-// Each run's index picks its kind and ENV, so every kind runs on both kinds of
+// Each run's slot picks its kind and ENV, so every kind runs on both kinds of
 // ENV at any profile size (at 2 x 1, in five rounds). Failed logins must
 // report their SQLSTATE in bounded time and release what they allocated; the
 // real logins between them must still succeed.
@@ -357,8 +361,14 @@ TEST_F(HandleLifecycleTest, ChurnWithFailedConnects) {
                 TestLabel() + " round " + std::to_string(round), config_, failures,
                 [&, round](int worker, int iteration, std::string& error) {
                     const long long run = RunIndex(round, config_, worker, iteration);
-                    const int kind = static_cast<int>(run % kKinds);
-                    const bool shared = (run / kKinds) % 2 == 1;
+                    // Iteration-major, so workers running the same iteration
+                    // get different kinds instead of all failing alike at once.
+                    const long long slot =
+                        (static_cast<long long>(round) * config_.iterations + iteration) *
+                            config_.threads +
+                        worker;
+                    const int kind = static_cast<int>(slot % kKinds);
+                    const bool shared = (slot / kKinds) % 2 == 1;
                     cases.Ran(kind, shared);
                     const SQLHENV env = shared ? env_ : SQL_NULL_HENV;
                     if (kind == kConnects) {
