@@ -216,8 +216,11 @@ async fn read_b_varchar<T: TdsPacketReader + Send + Sync>(
     for _ in 0..character_count {
         units.push(reader.read_uint16().await?);
     }
-    String::from_utf16(&units)
-        .map_err(|error| classification_error(format!("invalid UTF-16 in {field}: {error}")))
+    // SQL Server stores an unpaired surrogate in a label or information type
+    // as given. The token is read whole either way, so replace it rather than
+    // reject the token and the connection with it; SqlClient decodes it the
+    // same way, and msodbcsql passes the raw bytes through.
+    Ok(String::from_utf16_lossy(&units))
 }
 
 /// Validates a dictionary index; `None` is the `0xFFFF` "unspecified" value.
@@ -618,20 +621,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_invalid_utf16_in_label_name() {
+    async fn replaces_an_unpaired_surrogate_in_a_label_name() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1u16.to_le_bytes()); // label count
-        bytes.push(1); // name: one UTF-16 code unit
-        bytes.extend_from_slice(&0xD800u16.to_le_bytes()); // lone high surrogate
+        bytes.push(3); // name: three UTF-16 code units
+        for unit in [u16::from(b'A'), 0xD800, u16::from(b'B')] {
+            bytes.extend_from_slice(&unit.to_le_bytes()); // lone high surrogate in the middle
+        }
         bytes.push(0); // empty id
         bytes.extend_from_slice(&0u16.to_le_bytes()); // information-type count
         bytes.extend_from_slice(&0u16.to_le_bytes()); // column count
+        let mut reader = MockReader::new(bytes);
 
-        let error = parse(bytes, DataClassificationVersion::Version1)
+        let metadata = DataClassificationTokenParser
+            .parse_with_version(&mut reader, DataClassificationVersion::Version1)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_single_classification_error(&error, "invalid UTF-16 in sensitivity label 0 name");
+        assert_eq!(metadata.sensitivity_labels[0].name, "A\u{FFFD}B");
+        assert_eq!(reader.remaining(), 0);
     }
 
     #[tokio::test]
