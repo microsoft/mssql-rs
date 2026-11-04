@@ -952,18 +952,9 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
         (stmt_state.effective_apd(stmt), stmt.ipd)
     };
 
-    // `apd` can be an explicit descriptor resolved under the STMT lock,
-    // already dropped by now — re-check liveness right before dereferencing
-    // to narrow (not fully close) the race against a concurrent
-    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor. `ipd` is
-    // always `stmt.ipd`, freed only with the statement itself.
-    if !stmt.owns_implicit_desc(apd)
-        && crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc)
-    {
-        error!("snapshotting parameters: apd freed concurrently");
-        return Err(SQL_ERROR);
-    }
-    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let apd_desc = stmt
+        .access_descriptor(crate::handles::stmt::StatementDescriptor::Apd, apd)
+        .map_err(|()| SQL_ERROR)?;
     let Ok(apd_state) = apd_desc.inner.lock() else {
         error!("snapshotting parameters: apd mutex poisoned");
         return Err(SQL_ERROR);
@@ -2994,18 +2985,8 @@ mod tests {
         ));
     }
 
-    /// The narrow race `snapshot_bound_params`'s liveness check guards
-    /// against: `effective_apd` resolves an explicit descriptor under the
-    /// STMT lock, which is dropped before the descriptor is actually locked
-    /// and read. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes
-    /// in that window, the stale pointer must fail cleanly (`Err`), not
-    /// dereference freed memory. Reassociating the APD and then freeing it
-    /// reproduces the state that window leaves behind — `active_apd` still
-    /// points at the freed handle, since only a *subsequent* `SQLBindCol`/
-    /// `SQLBindParameter`-family call re-resolves it via `free_desc`'s
-    /// association reset.
     #[test]
-    fn snapshot_bound_params_fails_cleanly_on_a_freed_apd() {
+    fn snapshot_bound_params_uses_implicit_apd_after_explicit_free() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit_apd = h.alloc_explicit_desc();
         unsafe {
@@ -3016,25 +2997,136 @@ mod tests {
                 0,
             )
         };
-        {
-            // Directly clears the tracked association without going through
-            // `free_desc`'s association-reset walk, so `active_apd` is left
-            // dangling exactly as it would be mid-race — `h.free_explicit_desc`
-            // goes through the real `SQLFreeHandle` path, which already resets
-            // the association and would defeat the point of this test.
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let mut ss = stmt.inner.lock().unwrap();
-            ss.active_apd = None;
-        }
-        unsafe {
-            crate::handles::free_handle::<DescHandle>(explicit_apd);
-        }
+        assert_eq!(h.free_explicit_desc(explicit_apd), SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut ss = stmt.inner.lock().unwrap();
-            ss.active_apd = Some(explicit_apd);
+        assert!(snapshot_bound_params(stmt).unwrap().params.is_empty());
+    }
+
+    #[test]
+    fn explicit_descriptor_free_overlaps_live_statement_bindings_and_snapshots() {
+        use crate::api::odbc_types::{
+            SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_ROW_ARRAY_SIZE,
+            SQL_FETCH_NEXT, SQL_RESET_PARAMS, SQL_UNBIND, SqlPointer,
+        };
+        use std::sync::Barrier;
+
+        const ITERATIONS: usize = 64;
+        const OPERATIONS: usize = 8;
+        let mut h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let statements = [h.stmt.addr(), h.alloc_extra_stmt().addr()];
+        for address in statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(address as SqlHandle) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.result_set_exhausted = true;
         }
-        assert!(snapshot_bound_params(stmt).is_err());
+        let gate = Barrier::new(3);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = statements
+                .iter()
+                .map(|&address| {
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        let raw = address as SqlHandle;
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                        let mut value = 7i32;
+                        let mut indicator = 4isize;
+                        let mut failures = Vec::new();
+                        // Keep both workers on the same API so a sibling fetch
+                        // does not intentionally reject a header write with HY010.
+                        for step in 0..ITERATIONS * OPERATIONS {
+                            let operation = step % OPERATIONS;
+                            gate.wait();
+                            // Only the live STMT is submitted; the descriptor may
+                            // disappear, but these application buffers remain live.
+                            let mut size = 0usize;
+                            let rc = match operation {
+                                0 => unsafe {
+                                    crate::api::SQLBindCol(
+                                        raw,
+                                        1,
+                                        SQL_C_LONG,
+                                        (&raw mut value).cast(),
+                                        4,
+                                        &mut indicator,
+                                    )
+                                },
+                                1 => unsafe {
+                                    crate::api::SQLBindParameter(
+                                        raw,
+                                        1,
+                                        SQL_PARAM_INPUT,
+                                        SQL_C_LONG,
+                                        SQL_INTEGER,
+                                        10,
+                                        0,
+                                        (&raw mut value).cast(),
+                                        4,
+                                        &mut indicator,
+                                    )
+                                },
+                                2 => snapshot_bound_params(stmt).map_or(SQL_ERROR, |_| SQL_SUCCESS),
+                                3 => unsafe {
+                                    crate::api::SQLSetStmtAttrW(
+                                        raw,
+                                        SQL_ATTR_ROW_ARRAY_SIZE,
+                                        1usize as SqlPointer,
+                                        0,
+                                    )
+                                },
+                                4 => unsafe {
+                                    crate::api::SQLGetStmtAttrW(
+                                        raw,
+                                        SQL_ATTR_ROW_ARRAY_SIZE,
+                                        (&raw mut size).cast(),
+                                        0,
+                                        std::ptr::null_mut(),
+                                    )
+                                },
+                                5 => unsafe { crate::api::SQLFetchScroll(raw, SQL_FETCH_NEXT, 0) },
+                                6 => unsafe { crate::api::SQLFreeStmt(raw, SQL_UNBIND) },
+                                _ => unsafe { crate::api::SQLFreeStmt(raw, SQL_RESET_PARAMS) },
+                            };
+                            let expected = if operation == 5 {
+                                SQL_NO_DATA
+                            } else {
+                                SQL_SUCCESS
+                            };
+                            if rc != expected {
+                                failures.push(format!(
+                                    "operation {operation} returned {rc}: {:?}",
+                                    stmt.inner.lock().unwrap().diag_records
+                                ));
+                            }
+                            gate.wait();
+                        }
+                        failures
+                    })
+                })
+                .collect();
+            for _ in 0..ITERATIONS * OPERATIONS {
+                let explicit = h.alloc_explicit_desc();
+                for address in statements {
+                    for attr in [SQL_ATTR_APP_ROW_DESC, SQL_ATTR_APP_PARAM_DESC] {
+                        assert_eq!(
+                            unsafe {
+                                crate::api::SQLSetStmtAttrW(address as SqlHandle, attr, explicit, 0)
+                            },
+                            SQL_SUCCESS
+                        );
+                    }
+                }
+                gate.wait();
+                let freed = h.free_explicit_desc(explicit);
+                gate.wait();
+                assert_eq!(freed, SQL_SUCCESS);
+            }
+            for worker in workers {
+                let failures = worker.join().unwrap();
+                assert!(failures.is_empty(), "{failures:?}");
+            }
+        });
     }
 
     /// A poisoned DBC must fail the snapshot rather than silently default the

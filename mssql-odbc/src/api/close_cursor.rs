@@ -495,8 +495,13 @@ mod tests {
                     crate::api::SQLSetStmtAttrW(array.h.stmt, attribute, value, 0)
                 });
             }
-            stmt.inner.lock().unwrap().prepared.as_mut().unwrap().stmt =
-                PreparedStatement::materialized_for_test("SELECT @P1", id);
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                // Synthetic materialization replaces the first execution snapshot.
+                state.apply_parameter_definition_changes();
+                state.prepared.as_mut().unwrap().stmt =
+                    PreparedStatement::materialized_for_test("SELECT @P1", id);
+            }
             array.execute_rc = unsafe { crate::api::SQLExecute(array.h.stmt) };
             array
         }
@@ -1030,8 +1035,12 @@ mod tests {
                     crate::api::SQLSetStmtAttrW(h.stmt, attribute, value, 0)
                 });
             }
-            stmt.inner.lock().unwrap().prepared.as_mut().unwrap().stmt =
-                PreparedStatement::materialized_for_test("SELECT @P1", id);
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.apply_parameter_definition_changes();
+                state.prepared.as_mut().unwrap().stmt =
+                    PreparedStatement::materialized_for_test("SELECT @P1", id);
+            }
             assert_eq!(
                 SQL_SUCCESS,
                 unsafe { crate::api::SQLExecute(h.stmt) },

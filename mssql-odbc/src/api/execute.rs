@@ -226,6 +226,9 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         Err(rc) => return rc,
     };
 
+    #[cfg(test)]
+    tests::after_execution_staging();
+
     match staging {
         ExecutionStaging::Ready(Execution {
             named_params,
@@ -1099,6 +1102,9 @@ fn stage_execution(stmt: &StmtHandle) -> Result<(ExecutionStaging, CancelHandle)
             return Err(SQL_ERROR);
         }
 
+        // Consume before snapshotting, not when the staged plan is restored:
+        // that execution may still materialize the snapshot's old declaration.
+        stmt_state.apply_parameter_definition_changes();
         let cancel_handle = stmt.new_execution_cancel()?;
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         mssql_tds::trace_context::activate_execution();
@@ -1127,8 +1133,8 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
     // sequence must keep that sequence's own frozen snapshot if this call
     // turns out to be a rejected re-entry rather than a real new execute.
     //
-    // A snapshot failure (poisoned mutex, or an explicit APD freed out from
-    // under a concurrent reassociation) must still post a diagnostic —
+    // A snapshot failure (a poisoned mutex or an inaccessible descriptor
+    // association) must still post a diagnostic —
     // mirroring `SQLExecDirectW`'s handling of the same failure — rather
     // than leave `SQLGetDiagRec` reporting `SQL_NO_DATA` or a stale record
     // from a previous call.
@@ -1154,6 +1160,9 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
             return Err(rc);
         }
     };
+
+    #[cfg(test)]
+    tests::after_parameter_snapshot();
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecute: stmt mutex poisoned");
@@ -1412,6 +1421,27 @@ mod tests {
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
+    std::thread_local! {
+        static AFTER_PARAMETER_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        static AFTER_EXECUTION_STAGING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_parameter_snapshot() {
+        let hook = AFTER_PARAMETER_SNAPSHOT.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(super) fn after_execution_staging() {
+        let hook = AFTER_EXECUTION_STAGING.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Sets an attribute through `SQLSetStmtAttrW`, wherever the driver keeps it.
     fn set_param_attr(stmt: SqlHandle, attribute: SqlInteger, value: SqlULen) {
         assert_eq!(
@@ -1603,6 +1633,239 @@ mod tests {
             "IPD mutation must invalidate before SQLExecute"
         );
         assert_eq!(stage_and_restore_plan(h.stmt), (None, Some(id)));
+    }
+
+    fn edit_ipd_record(
+        raw: SqlHandle,
+        record_number: SqlSmallInt,
+        value: SqlPointer,
+        indicator: *mut SqlLen,
+    ) {
+        assert_eq!(
+            unsafe {
+                crate::api::SQLSetDescRec(
+                    raw,
+                    record_number,
+                    crate::api::odbc_types::SQL_SMALLINT,
+                    0,
+                    2,
+                    5,
+                    0,
+                    value,
+                    indicator,
+                    indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    fn staged_plan(staging: ExecutionStaging) -> (PreparedPlan, Option<StatementId>) {
+        match staging {
+            ExecutionStaging::Ready(execution) => (execution.prepared, execution.orphaned),
+            ExecutionStaging::Batch(execution) => (execution.prepared, execution.orphaned),
+            ExecutionStaging::NeedData(_) => {
+                panic!("materialized buffers must not enter Need Data")
+            }
+        }
+    }
+
+    #[test]
+    fn ipd_edit_after_snapshot_survives_plan_restoration() {
+        for array_size in [1, 2] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let mut values = [7i32, 8];
+            let mut indicators = [4isize; 2];
+            bind_cached_test_value(h.stmt, &mut values[0]);
+            set_array_size(h.apd(), array_size);
+            let old_id = StatementId::from_raw_for_test(42);
+            materialize_test_plan(h.stmt, old_id);
+
+            let ipd = h.ipd().addr();
+            let value = values.as_mut_ptr().addr();
+            let indicator = indicators.as_mut_ptr().addr();
+            AFTER_PARAMETER_SNAPSHOT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::thread::spawn(move || {
+                        edit_ipd_record(
+                            ipd as SqlHandle,
+                            1,
+                            value as SqlPointer,
+                            indicator as *mut SqlLen,
+                        );
+                    })
+                    .join()
+                    .unwrap();
+                }));
+            });
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let (staging, _) = stage_execution(stmt).unwrap();
+            let (mut plan, orphaned) = staged_plan(staging);
+            assert_eq!(plan.stmt.id(), None);
+            assert_eq!(orphaned, Some(old_id));
+
+            // The old snapshot can materialize a new server handle after the edit.
+            let current_id = StatementId::from_raw_for_test(43);
+            plan.stmt = PreparedStatement::materialized_for_test(plan.stmt.sql(), current_id);
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.prepared = Some(plan);
+                state.pending_unprepare = None;
+                state.clear_state(STMT_STATE_EXEC_STARTED);
+            }
+            assert_eq!(
+                stage_and_restore_plan(h.stmt),
+                (None, Some(current_id)),
+                "array size {array_size}: a stale snapshot must not repopulate the cache"
+            );
+        }
+    }
+
+    #[test]
+    fn ipd_edit_while_plan_is_staged_survives_restoration() {
+        for array_size in [1, 2] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let mut values = [7i32, 8];
+            let mut indicators = [4isize; 2];
+            bind_cached_test_value(h.stmt, &mut values[0]);
+            set_array_size(h.apd(), array_size);
+            let id = StatementId::from_raw_for_test(42);
+            materialize_test_plan(h.stmt, id);
+
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let (staging, _) = stage_execution(stmt).unwrap();
+            assert!(stmt.inner.lock().unwrap().prepared.is_none());
+            edit_ipd_record(
+                h.ipd(),
+                1,
+                values.as_mut_ptr().cast(),
+                indicators.as_mut_ptr(),
+            );
+            // A later edit outside this SQL's markers must not hide ordinal 1.
+            edit_ipd_record(
+                h.ipd(),
+                2,
+                values.as_mut_ptr().cast(),
+                indicators.as_mut_ptr(),
+            );
+            let (plan, orphaned) = staged_plan(staging);
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.prepared = Some(plan);
+                state.pending_unprepare = orphaned;
+                state.clear_state(STMT_STATE_EXEC_STARTED);
+            }
+            assert_eq!(
+                stage_and_restore_plan(h.stmt),
+                (None, Some(id)),
+                "array size {array_size}: restoring a staged plan must preserve invalidation"
+            );
+        }
+    }
+
+    #[test]
+    fn exported_execute_preserves_concurrent_ipd_invalidation_on_success_and_failure() {
+        use crate::api::odbc_types::{SQL_DECIMAL, SQL_SMALLINT};
+        use mssql_tds::test_client_support::{
+            done_proc_in_batch_more, done_proc_no_more, tds_client_from_tokens,
+        };
+
+        for array_size in [1, 2] {
+            for connected in [false, true] {
+                for (ordinal, sql_type, scale, changed) in [
+                    (1, SQL_SMALLINT, 0, true),
+                    (1, SQL_INTEGER, 0, false),
+                    (2, SQL_SMALLINT, 0, false),
+                    (1, SQL_DECIMAL, 3, true),
+                ] {
+                    let h = TestHandles::with_env_dbc_stmt();
+                    h.mark_dbc_connected();
+                    let mut values = [7i32, 8];
+                    let mut text_values = [b'7', 0, b'8', 0];
+                    if scale == 3 {
+                        assert_eq!(
+                            unsafe {
+                                sql_bind_parameter(
+                                    h.stmt,
+                                    1,
+                                    SQL_PARAM_INPUT,
+                                    SQL_C_CHAR,
+                                    SQL_INTEGER,
+                                    10,
+                                    0,
+                                    text_values.as_mut_ptr().cast(),
+                                    2,
+                                    std::ptr::null_mut(),
+                                )
+                            },
+                            SQL_SUCCESS
+                        );
+                    } else {
+                        bind_cached_test_value(h.stmt, &mut values[0]);
+                    }
+                    set_array_size(h.apd(), array_size);
+                    let tokens = if array_size == 1 {
+                        vec![done_proc_no_more()]
+                    } else {
+                        vec![done_proc_in_batch_more(), done_proc_no_more()]
+                    };
+                    let mut client = tds_client_from_tokens(tokens);
+                    let id = client.register_prepared_handle_for_test(42);
+                    materialize_test_plan(h.stmt, id);
+                    let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                    if connected {
+                        stmt.parent_dbc()
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .wire
+                            .put_client_for_test(client);
+                    }
+
+                    let ipd = h.ipd().addr();
+                    AFTER_EXECUTION_STAGING.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            std::thread::spawn(move || {
+                                let rc = unsafe {
+                                    crate::api::SQLSetDescRec(
+                                        ipd as SqlHandle,
+                                        ordinal,
+                                        sql_type,
+                                        0,
+                                        4,
+                                        2,
+                                        scale,
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                assert_eq!(rc, if scale == 3 { SQL_ERROR } else { SQL_SUCCESS });
+                            })
+                            .join()
+                            .unwrap();
+                        }));
+                    });
+                    assert_eq!(
+                        unsafe { crate::api::SQLExecute(h.stmt) },
+                        if connected { SQL_SUCCESS } else { SQL_ERROR },
+                        "{:?}",
+                        stmt.inner.lock().unwrap().diag_records
+                    );
+                    assert_eq!(
+                        stage_and_restore_plan(h.stmt),
+                        if changed {
+                            (None, Some(id))
+                        } else {
+                            (Some(id), None)
+                        },
+                        "array={array_size}, connected={connected}, ordinal={ordinal}, type={sql_type}, scale={scale}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
