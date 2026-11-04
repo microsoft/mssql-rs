@@ -209,7 +209,7 @@ fn version_is_safe(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[derive(Default)]
@@ -224,6 +224,33 @@ mod tests {
                 .expect("in-memory telemetry lock")
                 .push(event.clone());
         }
+    }
+
+    impl EventSink for Arc<InMemorySink> {
+        fn record(&self, event: &TelemetryEvent) {
+            self.as_ref().record(event);
+        }
+    }
+
+    #[test]
+    fn installed_sink_observes_public_capture_flow() {
+        let sink = Arc::new(InMemorySink::default());
+        install_event_sink(Arc::clone(&sink)).expect("install in-memory telemetry sink");
+
+        record_invocation(Some("18.4.1"));
+        record_completion(Some("18.4.1"), CompletionOutcome::Succeeded);
+
+        let events = sink.events.lock().expect("in-memory telemetry lock");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].name(), INVOCATION_EVENT_NAME);
+        assert_eq!(events[1].name(), COMPLETION_EVENT_NAME);
+        assert_eq!(
+            events[1],
+            TelemetryEvent::Completion(CompletionEvent {
+                common: events[1].common().clone(),
+                outcome: CompletionOutcome::Succeeded,
+            })
+        );
     }
 
     #[test]
