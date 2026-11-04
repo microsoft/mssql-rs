@@ -59,15 +59,17 @@ def builtin_sdk(monkeypatch):
                 loop=asyncio.get_running_loop(),
                 thread=threading.get_ident(),
                 scopes=[],
+                token_kwargs=[],
                 close_calls=0,
                 close_finished=False,
                 token=f"{name}-token",
             )
 
-            async def get_token(scope):
+            async def get_token(scope, **kwargs):
                 assert asyncio.get_running_loop() is instance.loop
                 assert threading.get_ident() == instance.thread
                 instance.scopes.append(scope)
+                instance.token_kwargs.append(kwargs)
                 if state.get_hook is not None:
                     return await state.get_hook(instance)
                 await asyncio.sleep(0)
@@ -122,6 +124,9 @@ def test_builtin_mode_constructs_aio_credential_and_sends_token(
             instance = builtin_sdk.instances[0]
             assert instance.name == class_name
             assert instance.scopes == ["https://database.windows.net/.default"]
+            assert instance.token_kwargs == [
+                {"tenant_id": "test-tenant"} if class_name == "DefaultAzureCredential" else {}
+            ]
             assert instance.close_calls == 1
             assert instance.close_finished
             assert mock_tds_server.get_last_access_token() == instance.token
@@ -183,12 +188,12 @@ def test_get_token_startup_failure_still_closes_owned_credential(
     def create(**kwargs):
         instance = construct(**kwargs)
 
-        def get_token(scope):
+        def get_token(scope, **kwargs):
             if failure == "synchronous-error":
                 raise RuntimeError("private-startup-diagnostic")
             return None
 
-        async def cancelled(scope):
+        async def cancelled(scope, **kwargs):
             raise asyncio.CancelledError
 
         instance.get_token = cancelled if failure == "cancelled" else get_token
@@ -821,7 +826,10 @@ def test_actual_sdk_construction_and_close_without_token_network(
         credential = actual_class(**kwargs)
         actual_close = credential.close
 
-        async def get_token(scope):
+        async def get_token(scope, **token_kwargs):
+            assert token_kwargs == (
+                {"tenant_id": "test-tenant"} if class_name == "DefaultAzureCredential" else {}
+            )
             return SimpleNamespace(token="sdk-construction-test")
 
         async def close():

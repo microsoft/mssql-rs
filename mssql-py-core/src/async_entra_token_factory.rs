@@ -250,17 +250,26 @@ impl TokenRequest {
             matches!(self.provider, TokenProvider::BuiltIn(_))
         );
         let result = (|| {
-            let provider = match &self.provider {
-                TokenProvider::Custom(provider) => provider.clone_ref(py),
+            let (provider, token_tenant) = match &self.provider {
+                TokenProvider::Custom(provider) => (provider.clone_ref(py), None),
                 TokenProvider::BuiltIn(config) => {
-                    let provider = config.create(py, &self.scope, &self.sts_url)?;
+                    let (provider, token_tenant) = config.create(py, &self.scope, &self.sts_url)?;
                     self.completion.borrow_mut(py).owned_provider = Some(provider.clone_ref(py));
-                    provider
+                    (provider, token_tenant)
                 }
             };
-            let awaitable = provider
-                .bind(py)
-                .call_method1("get_token", (&self.scope,))?;
+            let token_kwargs = token_tenant
+                .map(|tenant| {
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("tenant_id", tenant)?;
+                    Ok::<_, PyErr>(kwargs)
+                })
+                .transpose()?;
+            let awaitable = provider.bind(py).call_method(
+                "get_token",
+                (&self.scope,),
+                token_kwargs.as_ref(),
+            )?;
             let task = schedule_awaitable(&awaitable)?;
             self.completion.borrow_mut(py).task = Some(task.clone().unbind());
             task.call_method1("add_done_callback", (self.completion.bind(py),))?;

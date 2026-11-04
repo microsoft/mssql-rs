@@ -223,6 +223,8 @@ impl PyAsyncConnection {
     /// ActiveDirectoryServicePrincipal use azure.identity.aio. They require the
     /// azure-async extra and support Azure Public Cloud only. Driver-created
     /// credentials are closed after each acquisition attempt.
+    /// Built-in Default requests the validated FedAuth tenant; custom providers
+    /// retain their own tenant policy and receive only the scope argument.
     /// Acquisition shares the native login deadline. Owned cleanup has a
     /// separate five-second settlement limit; a cleanup timeout fails login
     /// even if the close coroutine suppresses cancellation. Keep the originating

@@ -73,7 +73,12 @@ impl BuiltInEntraCredential {
         Ok(())
     }
 
-    pub(crate) fn create(&self, py: Python<'_>, scope: &str, sts_url: &str) -> PyResult<Py<PyAny>> {
+    pub(crate) fn create(
+        &self,
+        py: Python<'_>,
+        scope: &str,
+        sts_url: &str,
+    ) -> PyResult<(Py<PyAny>, Option<String>)> {
         if scope != "https://database.windows.net/.default" {
             return Err(PyValueError::new_err(
                 "Built-in async Entra authentication supports only the Azure Public SQL scope",
@@ -93,18 +98,19 @@ impl BuiltInEntraCredential {
                 "ManagedIdentityCredential"
             }
             Self::ClientSecret { client_id, secret } => {
-                kwargs.set_item("tenant_id", tenant)?;
+                kwargs.set_item("tenant_id", &tenant)?;
                 kwargs.set_item("client_id", client_id)?;
                 kwargs.set_item("client_secret", secret)?;
                 kwargs.set_item("authority", PUBLIC_AUTHORITY)?;
                 "ClientSecretCredential"
             }
         };
-        Ok(py
+        let provider = py
             .import("azure.identity.aio")?
             .getattr(class_name)?
             .call((), Some(&kwargs))?
-            .unbind())
+            .unbind();
+        Ok((provider, matches!(self, Self::Default).then_some(tenant)))
     }
 }
 
