@@ -335,7 +335,10 @@ fn sql_get_connect_attr_w_safe(
         // symmetric. `SQL_ATTR_ANSI_APP` lands here deliberately (the Driver
         // Manager sets it and ODBC defines no way to read it back), and so does
         // `SQL_ATTR_QUERY_TIMEOUT`, which msodbcsql accepts on a connection but
-        // refuses to report back; both stay `HY092`. See `attributes.rs`.
+        // refuses to report back; both stay `HY092`. The recognized
+        // `SQL_COPT_SS_CONNECTION_DEAD` also stays unsupported: msodbcsql's
+        // getter dereferences `pvParam` without a NULL check. See
+        // `attributes.rs`.
         _ => {
             post_diag(
                 &mut state,
