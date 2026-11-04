@@ -77,13 +77,6 @@ pub(super) fn get_access_mode(
             return SQL_ERROR;
         };
         free_errors(&mut state);
-        if value_ptr.is_null() {
-            // The integer width is known without querying database updateability.
-            unsafe {
-                write_if_some(string_length_ptr, 4);
-            }
-            return SQL_SUCCESS;
-        }
     }
     let read_only = match database_read_only(dbc) {
         Ok(value) => value,
@@ -618,9 +611,35 @@ mod tests {
     }
 
     #[test]
-    fn null_access_mode_outputs_succeed_without_a_lookup() {
-        let (h, _server) = fixture(response("Y").with_delay(Duration::from_secs(8)));
+    fn null_access_mode_outputs_follow_lookup_result() {
+        let (h, server) = fixture(response("Y").with_leading_error(LeadingError::new(
+            229,
+            14,
+            "Lookup permission denied",
+        )));
         let mut length = -1;
+        assert_eq!(
+            unsafe {
+                SQLGetConnectAttrW(h.dbc, SQL_ATTR_ACCESS_MODE, ptr::null_mut(), 0, &mut length)
+            },
+            SQL_ERROR
+        );
+        assert_eq!(length, -1);
+        assert_eq!(
+            unsafe {
+                SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_ATTR_ACCESS_MODE,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        assert!(dbc(&h).inner.lock().unwrap().database_read_only.is_none());
+
+        server.register_query(READ_ONLY_QUERY, response("Y"));
         assert_eq!(
             unsafe {
                 SQLGetConnectAttrW(h.dbc, SQL_ATTR_ACCESS_MODE, ptr::null_mut(), 0, &mut length)
@@ -640,7 +659,16 @@ mod tests {
             },
             SQL_SUCCESS
         );
-        assert!(dbc(&h).inner.lock().unwrap().database_read_only.is_none());
+        assert!(
+            dbc(&h)
+                .inner
+                .lock()
+                .unwrap()
+                .database_read_only
+                .as_ref()
+                .unwrap()
+                .read_only
+        );
     }
 
     #[test]
