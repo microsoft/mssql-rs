@@ -265,6 +265,52 @@ fn sql_exec_direct_w_operation(
                     return Err(SQL_ERROR);
                 };
                 has_dae |= unsafe { data_at_exec_indicator(&positioned) }.is_some();
+                if positioned.sql_type == crate::api::odbc_types::SQL_SS_TABLE
+                    && !has_dae
+                    && call.as_ref().is_some_and(CallSite::is_rpc_eligible)
+                {
+                    let ordinal = index + 1;
+                    let layout = stmt_state
+                        .tvp_column_layouts
+                        .get(&ordinal)
+                        .copied()
+                        .unwrap_or_default();
+                    let columns = stmt_state
+                        .tvp_column_bindings
+                        .get(&ordinal)
+                        .map_or(&[][..], Vec::as_slice);
+                    let column_offset = if layout.bind_offset_ptr.is_null() {
+                        0
+                    } else {
+                        unsafe {
+                            layout
+                                .bind_offset_ptr
+                                .cast::<crate::api::odbc_types::SqlLen>()
+                                .read_unaligned()
+                        }
+                    };
+                    let mut tvp = positioned;
+                    if stmt_state.tvp_column_layouts.contains_key(&ordinal) {
+                        tvp.column_size = layout.array_size;
+                    }
+                    has_dae = unsafe {
+                        super::exec_common::tvp_dae_cell_rows(
+                            &tvp,
+                            columns,
+                            column_offset,
+                            layout.bind_type,
+                        )
+                    }
+                    .map_err(|source| {
+                        let error = super::exec_common::ParamRowBuildError::Conversion {
+                            parameter: ordinal,
+                            source,
+                        };
+                        super::exec_common::post_param_row_build_error(&mut stmt_state, &error, 0);
+                        SQL_ERROR
+                    })?
+                    .is_some();
+                }
             }
             // Both streaming implementations execute text, so they need every named
             // variable, including a return assignment, rather than RPC arguments.

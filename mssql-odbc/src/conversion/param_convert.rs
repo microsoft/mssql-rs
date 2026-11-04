@@ -228,6 +228,17 @@ pub(crate) unsafe fn data_at_exec_indicator(param: &BoundParam) -> Option<SqlLen
     is_data_at_exec_indicator(indicator).then_some(indicator)
 }
 
+/// # Safety
+/// The binding's non-null indicator pointers must remain readable.
+pub(crate) unsafe fn tvp_cell_data_at_exec_indicator(param: &BoundParam) -> Option<SqlLen> {
+    if !param.strlen_or_ind_ptr.is_null()
+        && unsafe { param.strlen_or_ind_ptr.read_unaligned() } == SQL_NULL_DATA
+    {
+        return None;
+    }
+    unsafe { data_at_exec_indicator(param) }
+}
+
 /// Converts a bound parameter into an RPC parameter, optionally named
 /// (`@P1`-style).
 ///
@@ -2272,7 +2283,7 @@ pub(crate) unsafe fn build_tvp_param(
                 .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                     ParamBuildError::InvalidBufferLength
                 })?;
-            if unsafe { data_at_exec_indicator(&positioned) }.is_some() {
+            if unsafe { tvp_cell_data_at_exec_indicator(&positioned) }.is_some() {
                 return Err(ParamBuildError::TvpColumnDataAtExec(index));
             }
             let value = unsafe { bound_tvp_cell_to_value(&positioned) }.map_err(|error| {

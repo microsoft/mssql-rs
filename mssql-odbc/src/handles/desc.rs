@@ -1080,7 +1080,16 @@ impl DescHandle {
                 .get(&focus)
                 .and_then(|lengths| lengths.get(column_index))
                 .copied()
-                .flatten();
+                .flatten()
+                .map(|mut lengths| {
+                    if self.kind == DescKind::ImpParam {
+                        lengths.app_length = None;
+                    } else {
+                        lengths.ipd_octet_length = None;
+                    }
+                    lengths
+                })
+                .filter(|lengths| *lengths != TvpColumnLengths::default());
             let current = (count, binding, lengths);
             if snapshot.is_some_and(|snapshot| snapshot != current) {
                 error!(
@@ -1579,6 +1588,86 @@ mod tests {
 
         let desc = unsafe { handle_from_raw::<DescHandle>(shared_apd) };
         assert!(desc.focused_tvp_layout_header().is_err());
+    }
+
+    #[test]
+    fn shared_apd_ignores_focused_ipd_octet_length() {
+        use crate::api::{SQLGetDescFieldW, SQLSetDescFieldW};
+
+        let mut h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let second_stmt = h.alloc_extra_stmt();
+        let shared_apd = h.alloc_explicit_desc();
+        for raw in [h.stmt, second_stmt] {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.active_apd = Some(shared_apd);
+            state.vendor_attrs.store_param_focus(1);
+        }
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    shared_apd,
+                    1,
+                    SQL_DESC_OCTET_LENGTH as SqlSmallInt,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    h.ipd(),
+                    1,
+                    SQL_DESC_OCTET_LENGTH as SqlSmallInt,
+                    8isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut length: SqlULen = SqlULen::MAX;
+        assert_eq!(
+            unsafe {
+                SQLGetDescFieldW(
+                    shared_apd,
+                    1,
+                    SQL_DESC_LENGTH as SqlSmallInt,
+                    (&mut length as *mut SqlULen).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(length, 0);
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    shared_apd,
+                    1,
+                    SQL_DESC_LENGTH as SqlSmallInt,
+                    12isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                SQLGetDescFieldW(
+                    shared_apd,
+                    1,
+                    SQL_DESC_LENGTH as SqlSmallInt,
+                    (&mut length as *mut SqlULen).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(length, 12);
     }
 
     #[test]

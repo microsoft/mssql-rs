@@ -438,6 +438,136 @@ TEST_F(TvpTest, FocusedDescriptorWritesLeaveParentUnchanged) {
     EXPECT_EQ(octets, 0);
 }
 
+TEST_F(TvpTest, FocusedTimestampPrecisionAliasesScaleAndPreservesLength) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    SQL_TIMESTAMP_STRUCT value{};
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP,
+                                   SQL_TYPE_TIMESTAMP, 27, 7, &value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_PRECISION, reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    SQLSMALLINT precision = -1, scale = -1;
+    SQLULEN length = 0;
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_PRECISION, &precision, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_SCALE, &scale, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_LENGTH, &length, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(precision, 3);
+    EXPECT_EQ(scale, 3);
+    EXPECT_EQ(length, 27);
+    SQLWCHAR name[8]{};
+    SQLSMALLINT name_length = 0, type = 0, subtype = 0, nullable = 0;
+    SQLLEN octet_length = 0;
+    ASSERT_SQL_OK(SQLGetDescRecW(Ipd(), 1, name, 8, &name_length, &type, &subtype,
+                                 &octet_length, &precision, &scale, &nullable),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(precision, 3);
+    EXPECT_EQ(scale, 3);
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_SCALE, reinterpret_cast<SQLPOINTER>(5), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_PRECISION, &precision, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(precision, 5);
+    RestoreFocus();
+}
+
+// Benefits-from-mock-tds: Assert typed NULL payload without a deferred RPC.
+TEST_F(TvpTest, NullCellIndicatorOverridesSeparateDaeLength) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    SQLINTEGER id = 42;
+    SQLLEN id_length = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &id, sizeof(id), &id_length), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR label[8]{};
+    SQLLEN indicator = SQL_NULL_DATA, length = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   50, 0, label, sizeof(label), &indicator), SQL_HANDLE_STMT, stmt_);
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 2, SQL_DESC_OCTET_LENGTH_PTR, &length, 0),
+                  SQL_HANDLE_DESC, apd);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLLEN actual_length = 0;
+    SQLINTEGER actual_id = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual_id, 0, &actual_length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual_id, 42);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_WCHAR, label, sizeof(label), &actual_length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual_length, SQL_NULL_DATA);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Benefits-from-mock-tds: Assert complete named declarations on the deferred text RPC.
+TEST_F(TvpTest, DirectCallWithChildDaeKeepsScalarAndReturnBindings) {
+    const std::string proc = "direct_dae_proc_" + suffix_;
+    cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]"};
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type_name_ +
+                           "] READONLY, @n INT AS SELECT id + @n, label FROM @t; RETURN 37"),
+                  SQL_HANDLE_STMT, stmt_);
+    for (bool returns_status : {false, true}) {
+        SCOPED_TRACE(returns_status);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        const SQLUSMALLINT table_ordinal = returns_status ? 2 : 1;
+        BindTvp(table_ordinal, type_name_, 1);
+        SQLINTEGER status = -1, scalar = 13;
+        SQLLEN status_length = 0, scalar_length = 0;
+        if (returns_status) {
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER,
+                                           0, 0, &status, sizeof(status), &status_length),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, table_ordinal + 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                       SQL_INTEGER, 0, 0, &scalar, sizeof(scalar), &scalar_length),
+                      SQL_HANDLE_STMT, stmt_);
+        Focus(table_ordinal);
+        SQLINTEGER id = 42;
+        SQLLEN id_length = 0, label_length = SQL_DATA_AT_EXEC;
+        SQLWCHAR label_token[8]{};
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                       0, 0, &id, sizeof(id), &id_length), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                       50, 0, label_token, sizeof(label_token), &label_length),
+                      SQL_HANDLE_STMT, stmt_);
+        RestoreFocus();
+        auto sql = ODBCTestUtils::ToSqlTStr(
+            std::string(returns_status ? "{? = call dbo.[" : "{call dbo.[") + proc + "](?, ?)}");
+        ASSERT_EQ(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS), SQL_NEED_DATA)
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        SQLPOINTER token = nullptr;
+        ASSERT_EQ(SQLParamData(stmt_, &token), SQL_NEED_DATA);
+        EXPECT_EQ(token, label_token);
+        auto text = ToSqlW("hello");
+        ASSERT_SQL_OK(SQLPutData(stmt_, text.data(), 5 * sizeof(SQLWCHAR)), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLParamData(stmt_, &token), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER actual = 0;
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual, 0, &length), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(actual, 55);
+        char label[16]{};
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, label, sizeof(label), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(std::string(label), "hello");
+        EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+        SQLRETURN more;
+        while ((more = SQLMoreResults(stmt_)) == SQL_SUCCESS) {}
+        EXPECT_EQ(more, SQL_NO_DATA);
+        if (returns_status) EXPECT_EQ(status, 37);
+    }
+}
+
 // Benefits-from-mock-tds: Assert row and column order in the assembled TVP payload.
 TEST_F(TvpTest, MaterializedParentOffersOnlyDaeCellTokens) {
     ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);

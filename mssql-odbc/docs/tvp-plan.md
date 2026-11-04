@@ -81,6 +81,8 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   are bound, and focus is then restored. `SQL_ATTR_PARAMSET_SIZE`,
   `SQL_ATTR_PARAM_BIND_TYPE`, and `SQL_ATTR_PARAM_BIND_OFFSET_PTR` under focus belong to
   that TVP's independent column layout, not the statement's outer parameter array.
+  Focused datetime IPD precision and scale share the fractional-second precision;
+  setting either preserves the column length.
 - **Supply TVP content with data-at-execution** — the driver returns the table token, then
   row-control and cell tokens in the order expected by the ODBC TVP protocol. Cell bytes are
   buffered and converted into the table value before execution. Only columns marked
@@ -94,8 +96,12 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   A materialized parent row count may also contain DAE cells; only those cell tokens are offered,
   without table row-control tokens. DAE row-control staging starts with one row and grows with
   supplied batches instead of allocating tokens for the bound capacity up front.
+  A NULL indicator takes precedence over a separate DAE octet-length indicator and
+  does not produce a cell token.
 - **Execute** — the statement runs; procedure result sets are returned through the normal fetch
-  path. TVPs are input-only and are never fetched back.
+  path. Direct canonical calls containing DAE cells use the named text-execution path,
+  retaining scalar arguments and return-status bindings. TVPs are input-only and are never
+  fetched back.
 
 ---
 

@@ -363,8 +363,12 @@ fn sql_set_desc_field_w_safe(
                             }
                             SQL_DESC_PRECISION => {
                                 if let Some((_, precision, _, _)) = focused_type.get() {
-                                    binding.column_size =
-                                        SqlULen::try_from(precision).unwrap_or_default();
+                                    if datetime_interval_code_for(binding.sql_type) != 0 {
+                                        binding.decimal_digits = precision;
+                                    } else {
+                                        binding.column_size =
+                                            SqlULen::try_from(precision).unwrap_or_default();
+                                    }
                                 }
                             }
                             SQL_DESC_SCALE => {

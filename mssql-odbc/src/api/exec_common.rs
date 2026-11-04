@@ -1454,7 +1454,7 @@ pub(super) fn validate_parameter_focus(state: &mut StmtState, op: &str) -> Resul
 
 /// # Safety
 /// Parent and child indicator buffers must remain readable for their positioned rows.
-unsafe fn tvp_dae_cell_rows(
+pub(super) unsafe fn tvp_dae_cell_rows(
     tvp: &BoundParam,
     columns: &[Option<BoundParam>],
     bind_offset: isize,
@@ -1474,8 +1474,10 @@ unsafe fn tvp_dae_cell_rows(
                 .ok_or(ParamBuildError::TvpColumnUnbound(index))?
                 .for_row(row, bind_offset, bind_type)
                 .map_err(|_| ParamBuildError::InvalidBufferLength)?;
-            if unsafe { crate::conversion::param_convert::data_at_exec_indicator(&binding) }
-                .is_some()
+            if unsafe {
+                crate::conversion::param_convert::tvp_cell_data_at_exec_indicator(&binding)
+            }
+            .is_some()
             {
                 return Ok(Some(rows));
             }
