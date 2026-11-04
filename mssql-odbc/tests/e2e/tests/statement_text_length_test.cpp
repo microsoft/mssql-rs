@@ -23,8 +23,8 @@ constexpr SQLINTEGER kLengths[] = {32767, 32768, 40000, 65533, 65536, 70000};
 std::vector<SQLWCHAR> PaddedSelect(SQLINTEGER length, int id) {
     const std::string prefix = "SELECT " + std::to_string(id) + " /*";
     const std::string suffix = "*/";
-    std::string text = prefix + std::string(static_cast<size_t>(length) - prefix.size() - suffix.size(), 'x') + suffix;
-    text += " SELECT -1";
+    const size_t fill = static_cast<size_t>(length) - prefix.size() - suffix.size();
+    std::string text = prefix + std::string(fill, 'x') + suffix + " SELECT -1";
     std::vector<SQLWCHAR> units(text.begin(), text.end());
     units.push_back(0);
     return units;
