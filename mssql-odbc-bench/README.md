@@ -25,8 +25,9 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_ENCRYPT` | `Mandatory` | `Encrypt` value |
 | `ODBC_BENCH_PACKET_SIZE` | `16192` | Cross-platform encrypted-lab value honored exactly by Microsoft ODBC 18.6.2.1 and both Rust builds; set through both ODBC attribute and connection keyword, then read back |
 | `ODBC_BENCH_PACKET_SIZE_KEYWORD` | `PacketSize` | `PacketSize` or Microsoft driver spelling `Packet Size` |
-| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, or `write` |
+| `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, `getdata`, `write`, or `latency` |
 | `ODBC_BENCH_WRITE_MODE` | `parameter_array` | Use one parameter-array execute, or `sequential` for a driver without array support |
+| `ODBC_BENCH_LATENCY_CALLS` | catalog size | Override calls per `latency` sample (1-1000000) for short local runs; the perf lab leaves it unset |
 
 Missing required values, connection errors, absent/invalid tables, ODBC
 warnings during retrieval, and correctness failures make the process fail.
@@ -106,7 +107,8 @@ After both legs:
 
 ## Workloads
 
-Fourteen measurements over nine tables, all of them C++ calls into the driver.
+Seventeen measurements, all of them C++ calls into the driver: fourteen over nine
+tables, and three `latency` ones that need no table.
 Every id encodes the data shape, the row and column counts, and the access shape,
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
@@ -223,10 +225,40 @@ and rejects `SQL_ATTR_PARAMSET_SIZE > 1`, so it runs the explicitly reported
 sequential mode instead; the result is a sequential-baseline comparison, not a
 claim that the pinned baseline executed a parameter array.
 
+### `latency` — small calls where per-call overhead is the cost
+
+One row, one `INT` column, one held connection: what an application pays per
+statement when payload is negligible. Each sample is a fixed batch of complete
+call cycles, so microsecond differences add up to a wall time the comparator
+can resolve; `us_per_call` in the JSON is the per-call figure.
+
+- `latency/exec_direct_select1` — 5,000 × `SQLExecDirectW("SELECT 1")`,
+  `SQLFetch`, `SQLCloseCursor`.
+- `latency/prepared_select_param` — `SQLPrepareW("SELECT ?")` once with one bound
+  `SQL_C_SLONG` parameter, then 5,000 × a new parameter value, `SQLExecute`,
+  `SQLFetch`, `SQLCloseCursor`. The ORM shape.
+- `latency/exec_direct_16k_text` — 2,000 × the `exec_direct_select1` cycle with
+  `SELECT 1` padded by a block comment to 16,384 UTF-16 characters, so
+  client-side statement-text scanning and conversion dominate while the server
+  does no extra work.
+
+Statement text goes through the W entry points on Linux too, matching
+`mssql-python`. Each workload uses its own statement handle, so the prepared
+plan and the column and parameter bindings persist across samples as they do in
+an application. Every call checks the fetched value and indicator; the prepared
+workload sends a different value each call, so a stale buffer cannot pass.
+Preflight checks the result shape (one `INT` column, exactly one row) and then
+runs 500 untimed, validated warm-up calls.
+
+These are microsecond-scale on a shared lab VM, and the regression gate covers
+every benchmark. Measure their run-to-run noise on `main` before relying on them
+to gate.
+
 ## Measurement boundaries
 
 Each Google Benchmark sample is one full result-set retrieval
-(`Iterations(1)`). `--benchmark_repetitions` controls the sample count.
+(`Iterations(1)`), or one fixed batch of calls for `latency/*`.
+`--benchmark_repetitions` controls the sample count.
 Steady-clock timing starts immediately before `SQLExecDirect` and ends after the
 result is exhausted and the row count is checked. What is inside depends on the
 access shape:
@@ -237,6 +269,7 @@ access shape:
 | `bind_cycle_*` | the same, but describe + bind + row-array set + fetch + row-array reset + `SQLFreeStmt(SQL_UNBIND)` repeated once per rowset |
 | `getdata/*` | `SQLExecDirect`, the initial describe, then per row: `SQLFetch`, and per column a `SQLDescribeCol` plus its `SQLGetData` calls (including LOB continuations and the variant probe/`SQLColAttribute` pair) |
 | `write/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
+| `latency/*` | the whole batch: per call `SQLExecDirectW` or `SQLExecute`, `SQLFetch`, the value check, and `SQLCloseCursor`; no per-phase timestamps |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it
 mirrors `SQLGetData_wrap`, which re-describes every column on every row, so it is
@@ -252,7 +285,8 @@ JSON results include rows, cells, logical bytes, `SQLGetData` call count, and
 execute, metadata-plus-bind (absent for `bind_cycle_*`), and fetch phase
 counters, plus rows/s, cells/s, and logical bytes/s. Logical bytes are the
 generator's own byte total, so all three drivers are credited with identical
-payload regardless of representation.
+payload regardless of representation. `latency/*` emit `calls` and
+`us_per_call` instead of the phase counters, and count one row per call.
 
 Preflight checks all indicators, row identity/coverage, an order-independent
 checksum, representative values for every generated type, the exact generated
