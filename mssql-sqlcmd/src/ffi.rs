@@ -31,6 +31,7 @@ use crate::diagnostics::SettingOrigin;
 #[cfg(target_pointer_width = "64")]
 use crate::diagnostics::{self, Authentication, Depth, Encrypt, Request, SettingSources};
 use crate::formatter::json::{Column, Connection, JsonDocument, Message, RunEnd};
+use crate::telemetry::{self, CompletionOutcome};
 
 /// The call succeeded.
 pub const MSSQL_SQLCMD_OK: i32 = 0;
@@ -65,6 +66,49 @@ static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 #[unsafe(no_mangle)]
 pub extern "C" fn mssql_sqlcmd_version() -> *const std::ffi::c_char {
     VERSION.as_ptr().cast()
+}
+
+/// Records one sqlcmd invocation through the global OpenTelemetry meter.
+///
+/// The version is included only when it is a bounded version-like value.
+/// Telemetry is best effort: a panic is caught and never crosses the ABI.
+///
+/// # Safety
+/// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_invocation(sqlcmd_version: MssqlSqlcmdText) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: forwarded from the caller's guarantees.
+        let version = unsafe { read_text(sqlcmd_version) };
+        telemetry::record_invocation(version.as_deref());
+    }));
+}
+
+/// Records one sqlcmd completion through the global OpenTelemetry meter.
+///
+/// Only a bounded outcome category is recorded. The raw exit code is not.
+/// Telemetry is best effort: a panic is caught and never crosses the ABI.
+///
+/// # Safety
+/// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_completion(
+    sqlcmd_version: MssqlSqlcmdText,
+    exit_code: i32,
+    end: i32,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: forwarded from the caller's guarantees.
+        let version = unsafe { read_text(sqlcmd_version) };
+        let outcome = match end {
+            MSSQL_SQLCMD_RUN_FINISHED if exit_code == 0 => CompletionOutcome::Succeeded,
+            MSSQL_SQLCMD_RUN_FINISHED => CompletionOutcome::Failed,
+            MSSQL_SQLCMD_RUN_CANCELED => CompletionOutcome::Canceled,
+            MSSQL_SQLCMD_RUN_INVALID_INVOCATION => CompletionOutcome::InvalidInvocation,
+            _ => CompletionOutcome::Unknown,
+        };
+        telemetry::record_completion(version.as_deref(), outcome);
+    }));
 }
 
 /// A UTF-16 string with an explicit length. It need not be NUL-terminated and

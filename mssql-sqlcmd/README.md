@@ -60,6 +60,13 @@ returns `MSSQL_SQLCMD_UNSUPPORTED`.
 See the [diagnose reference](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/diagnose.md)
 for the depths, the report, the exit codes and what is shown or labelled.
 
+## Telemetry
+
+The library exposes privacy-safe invocation and completion metrics through the
+global OpenTelemetry meter. It does not configure an exporter or send telemetry
+by itself. See the [telemetry contract](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
+for the stable properties, excluded data, and integration boundary.
+
 ## Build from source
 
 From the repository root:
