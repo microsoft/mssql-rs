@@ -2758,7 +2758,7 @@ mod tests {
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(
-            unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_SUCCESS
         );
         let mut input = 7_i32;

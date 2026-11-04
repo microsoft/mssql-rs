@@ -655,7 +655,7 @@ fn run_exec_fetch(dbc: SqlHandle, target_type: SqlSmallInt) {
     }
 
     let query: Vec<SqlWChar> = "SELECT 1".encode_utf16().collect();
-    let rc = unsafe { SQLExecDirectW(stmt, query.as_ptr(), query.len() as SqlSmallInt) };
+    let rc = unsafe { SQLExecDirectW(stmt, query.as_ptr(), query.len() as SqlInteger) };
     if rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO {
         let mut ncols: SqlSmallInt = 0;
         if unsafe { SQLNumResultCols(stmt, &mut ncols) } == SQL_SUCCESS {

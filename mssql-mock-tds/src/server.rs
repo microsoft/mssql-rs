@@ -130,6 +130,9 @@ pub struct ConnectionProcessor {
     query_registry: Arc<Mutex<QueryRegistry>>,
     /// Packet buffer for this connection
     buffer: BytesMut,
+    /// The first header and the bodies so far of a `SqlBatch` awaiting its
+    /// EOM packet
+    pending_batch: BytesMut,
     /// Optional redirection configuration
     redirection: Option<RedirectionConfig>,
     /// Shared store used to record connection state as soon as it is known
@@ -173,6 +176,7 @@ impl ConnectionProcessor {
             awaiting_fedauth_token: false,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
+            pending_batch: BytesMut::new(),
             redirection,
             connection_store,
             transaction_descriptor_headers: Vec::new(),
@@ -336,34 +340,53 @@ impl ConnectionProcessor {
     where
         S: AsyncRead + Unpin + Send,
     {
-        if self.buffer.len() < PACKET_HEADER_SIZE {
-            return Ok(None);
-        }
+        let (header, packet_data) = loop {
+            if self.buffer.len() < PACKET_HEADER_SIZE {
+                return Ok(None);
+            }
 
-        // Parse packet header
-        let header = {
-            let mut buf_clone = self.buffer.clone();
-            match PacketHeader::parse(&mut buf_clone) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!("Failed to parse packet header: {}", e);
-                    return Ok(None);
+            let header = {
+                let mut buf_clone = self.buffer.clone();
+                match PacketHeader::parse(&mut buf_clone) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("Failed to parse packet header: {}", e);
+                        return Ok(None);
+                    }
+                }
+            };
+
+            if self.buffer.len() < header.length as usize {
+                debug!(
+                    "Incomplete packet: have {} bytes, need {}",
+                    self.buffer.len(),
+                    header.length
+                );
+                return Ok(None);
+            }
+
+            let packet_data = self.buffer.split_to(header.length as usize);
+
+            // A batch larger than the packet size spans several packets, and
+            // only the last carries EOM. Answer once, for the whole batch.
+            if header.packet_type == PacketType::SqlBatch {
+                if !header.status.is_end_of_message() {
+                    if self.pending_batch.is_empty() {
+                        self.pending_batch.extend_from_slice(&packet_data);
+                    } else {
+                        self.pending_batch
+                            .extend_from_slice(&packet_data[PACKET_HEADER_SIZE..]);
+                    }
+                    continue;
+                }
+                if !self.pending_batch.is_empty() {
+                    let mut batch = std::mem::take(&mut self.pending_batch);
+                    batch.extend_from_slice(&packet_data[PACKET_HEADER_SIZE..]);
+                    break (header, batch);
                 }
             }
+            break (header, packet_data);
         };
-
-        // Check if we have the full packet
-        if self.buffer.len() < header.length as usize {
-            debug!(
-                "Incomplete packet: have {} bytes, need {}",
-                self.buffer.len(),
-                header.length
-            );
-            return Ok(None);
-        }
-
-        // Extract the complete packet
-        let packet_data = self.buffer.split_to(header.length as usize);
 
         // Process the packet and build response
         let response = match header.packet_type {

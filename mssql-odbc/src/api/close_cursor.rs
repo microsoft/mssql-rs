@@ -456,7 +456,7 @@ mod tests {
                 crate::api::SQLPrepareW(
                     array.h.stmt,
                     sql.as_ptr(),
-                    i16::try_from(sql.len()).unwrap(),
+                    i32::try_from(sql.len()).unwrap(),
                 )
             });
             let (c_type, buffer, length): (SqlSmallInt, SqlPointer, isize) = if chars.is_some() {
@@ -1002,7 +1002,7 @@ mod tests {
             let mut statuses = [SQL_PARAM_UNUSED; 2];
             let mut processed = 0usize;
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             assert_eq!(SQL_SUCCESS, unsafe {
                 crate::api::SQLBindParameter(

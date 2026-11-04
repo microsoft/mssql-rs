@@ -339,6 +339,65 @@ mod mock_server_tests {
         Ok(())
     }
 
+    /// A batch larger than the packet size arrives as several packets with EOM
+    /// only on the last; the mock must answer once, for the whole text.
+    #[tokio::test]
+    async fn test_multi_packet_batch_is_reassembled() -> Result<(), Box<dyn std::error::Error>> {
+        use mssql_mock_tds::QueryResponse;
+
+        init_tracing();
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        let long_query = format!("SELECT 1 /*{}*/", "x".repeat(10_000));
+        server
+            .query_registry()
+            .lock()
+            .await
+            .register(&long_query, QueryResponse::select_one());
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        // The single-packet query afterwards proves no partial batch lingers.
+        for query in [long_query.as_str(), "SELECT 1"] {
+            client.execute(query.to_string(), ()).await?;
+            let mut row_count = 0;
+            if client.on_rows() {
+                while client.next_row().await?.is_some() {
+                    row_count += 1;
+                }
+            }
+            assert_eq!(row_count, 1, "query of {} chars", query.len());
+            client.close_query().await?;
+        }
+
+        client.close_connection().await?;
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
     /// Repro for https://github.com/microsoft/mssql-rs/issues/587: a series
     /// of plain autocommit queries, each fully drained before the next is
     /// sent, used to carry a growing `OutstandingRequestCount` on the wire —
