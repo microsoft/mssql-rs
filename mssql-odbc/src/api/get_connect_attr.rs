@@ -186,11 +186,6 @@ fn sql_get_connect_attr_w_safe(
             }
         }
         SQL_ATTR_LOGIN_TIMEOUT => {
-            if value_ptr.is_null() {
-                error!("SQLGetConnectAttrW: SQL_ATTR_LOGIN_TIMEOUT value pointer is null");
-                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
-                return SQL_ERROR;
-            }
             // SQLUINTEGER attribute: write the current value into the caller's
             // buffer. `Some(0)` reflects an app-set "wait indefinitely"; an
             // unset attribute reports the driver default.
@@ -200,11 +195,8 @@ fn sql_get_connect_attr_w_safe(
             SQL_SUCCESS
         }
         SQL_COPT_SS_LONGASMAX => {
-            if value_ptr.is_null() {
-                error!("SQLGetConnectAttrW: SQL_COPT_SS_LONGASMAX value pointer is null");
-                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
-                return SQL_ERROR;
-            }
+            // msodbcsql's shared numeric tail accepts either output as NULL
+            // (sqlcmisc.cpp, ExportImp::SQLGetConnectAttrW).
             let [b0, b1, b2, b3, ..] = state.long_as_max().to_le_bytes();
             unsafe {
                 write_if_some(
@@ -222,22 +214,9 @@ fn sql_get_connect_attr_w_safe(
         | SQL_ATTR_PACKET_SIZE
         | SQL_ATTR_AUTOCOMMIT
         | SQL_ATTR_TXN_ISOLATION
-        | SQL_COPT_SS_TXN_ISOLATION
-        | SQL_COPT_SS_WARN_ON_CP_ERROR => {
-            if value_ptr.is_null() {
-                error!(attribute, "SQLGetConnectAttrW: value pointer is null");
-                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
-                return SQL_ERROR;
-            }
+        | SQL_COPT_SS_TXN_ISOLATION => {
             let value = match attribute {
                 SQL_ATTR_CONNECTION_TIMEOUT => dbc.connection_timeout(),
-                SQL_COPT_SS_WARN_ON_CP_ERROR => {
-                    if state.warn_on_cp_error {
-                        SQL_WARN_YES as u32
-                    } else {
-                        SQL_WARN_NO as u32
-                    }
-                }
                 // Read from the cached value rather than the server: msodbcsql
                 // does the same for both (`sqlcmisc.cpp:3426`), so a get never
                 // costs a round trip.
@@ -257,6 +236,22 @@ fn sql_get_connect_attr_w_safe(
             debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
             SQL_SUCCESS
         }
+        SQL_COPT_SS_WARN_ON_CP_ERROR => {
+            let value = if state.warn_on_cp_error {
+                SQL_WARN_YES as u32
+            } else {
+                SQL_WARN_NO as u32
+            };
+            // msodbcsql's GetParamValue(..., true) writes the length only
+            // when the value pointer is present.
+            unsafe {
+                write_if_some(value_ptr.cast::<u32>(), value);
+                if !value_ptr.is_null() {
+                    write_if_some(string_length_ptr, 4);
+                }
+            }
+            SQL_SUCCESS
+        }
         // The `SQL_COPT_SS_*` forms of Encrypt / TrustServerCertificate /
         // Trusted_Connection / MultiSubnetFailover / TransparentNetworkIPResolution.
         // While connected this reports the resolved setting, whether it came
@@ -271,11 +266,6 @@ fn sql_get_connect_attr_w_safe(
         | SQL_COPT_SS_INTEGRATED_SECURITY
         | SQL_COPT_SS_MULTISUBNET_FAILOVER
         | SQL_COPT_SS_TNIR => {
-            if value_ptr.is_null() {
-                error!(attribute, "SQLGetConnectAttrW: value pointer is null");
-                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
-                return SQL_ERROR;
-            }
             let settings = if state.connection_state == ConnectionState::Connected {
                 state.effective_vendor_settings.as_ref()
             } else {
@@ -308,11 +298,6 @@ fn sql_get_connect_attr_w_safe(
             SQL_SUCCESS
         }
         SQL_ATTR_CONNECTION_DEAD => {
-            if value_ptr.is_null() {
-                error!("SQLGetConnectAttrW: SQL_ATTR_CONNECTION_DEAD value pointer is null");
-                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
-                return SQL_ERROR;
-            }
             // Cached, never-probe liveness (D1/D2): report DEAD unless the DBC is
             // connected and its client has not been observed dead. Peek the
             // client under the DBC mutex — never `take` it (D8) and never touch
@@ -350,7 +335,10 @@ fn sql_get_connect_attr_w_safe(
         // symmetric. `SQL_ATTR_ANSI_APP` lands here deliberately (the Driver
         // Manager sets it and ODBC defines no way to read it back), and so does
         // `SQL_ATTR_QUERY_TIMEOUT`, which msodbcsql accepts on a connection but
-        // refuses to report back; both stay `HY092`. See `attributes.rs`.
+        // refuses to report back; both stay `HY092`. The recognized
+        // `SQL_COPT_SS_CONNECTION_DEAD` is an unimplemented round-trip liveness
+        // probe. If implemented, note that msodbcsql dereferences `pvParam`
+        // without a NULL check there. See `attributes.rs`.
         _ => {
             post_diag(
                 &mut state,
@@ -618,21 +606,6 @@ mod tests {
     }
 
     #[test]
-    fn login_timeout_get_null_pointer_is_rejected() {
-        let h = TestHandles::with_env_dbc();
-        let get = unsafe {
-            sql_get_connect_attr_w(
-                h.dbc,
-                SQL_ATTR_LOGIN_TIMEOUT,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(get, SQL_ERROR);
-    }
-
-    #[test]
     fn unsupported_attribute_returns_error() {
         let h = TestHandles::with_env_dbc();
         // 99999 is not an attribute identifier in any namespace -> HY092, not
@@ -891,21 +864,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_dead_null_pointer_is_rejected() {
-        let h = TestHandles::with_env_dbc();
-        let get = unsafe {
-            sql_get_connect_attr_w(
-                h.dbc,
-                SQL_ATTR_CONNECTION_DEAD,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(get, SQL_ERROR);
-    }
-
-    #[test]
     fn vendor_attributes_read_back_the_value_the_set_side_stored() {
         let h = TestHandles::with_env_dbc();
         // 7 exercises the folding the set side applies: any non-zero encrypt
@@ -1005,13 +963,18 @@ mod tests {
             }
             for (raw, expected) in [(0usize, 0u32), (1, 1), (2, 2), (usize::MAX, u32::MAX)] {
                 let rc = unsafe {
-                    sql_set_connect_attr_w(h.dbc, SQL_COPT_SS_LONGASMAX, raw as SqlPointer, 0)
+                    crate::api::exports::SQLSetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        raw as SqlPointer,
+                        0,
+                    )
                 };
                 assert_eq!(rc, SQL_SUCCESS);
                 let mut value = 0u32;
                 let mut length = -1;
                 let rc = unsafe {
-                    sql_get_connect_attr_w(
+                    crate::api::exports::SQLGetConnectAttrW(
                         h.dbc,
                         SQL_COPT_SS_LONGASMAX,
                         (&raw mut value).cast(),
@@ -1023,6 +986,128 @@ mod tests {
                 assert_eq!(value, expected);
                 assert_eq!(length, 4);
                 assert_eq!(dbc.inner.lock().unwrap().long_as_max(), raw);
+            }
+        }
+    }
+
+    #[test]
+    fn long_as_max_null_value_reports_length() {
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            let mut length = -99;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(length, 4);
+        }
+    }
+
+    #[test]
+    fn long_as_max_null_length_returns_value() {
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            let mut value = u32::MAX;
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        (&raw mut value).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 0);
+        }
+    }
+
+    #[test]
+    fn long_as_max_allows_both_outputs_null() {
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            assert_eq!(
+                unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        SQL_COPT_SS_LONGASMAX,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn integer_getters_allow_null_value_and_length_outputs() {
+        use crate::api::odbc_types::{SQL_OV_ODBC3, SQL_OV_ODBC3_80};
+
+        let attributes = [
+            (SQL_ATTR_ACCESS_MODE, true),
+            (SQL_ATTR_LOGIN_TIMEOUT, true),
+            (SQL_ATTR_CONNECTION_TIMEOUT, true),
+            (SQL_ATTR_PACKET_SIZE, true),
+            (SQL_ATTR_AUTOCOMMIT, true),
+            (SQL_ATTR_TXN_ISOLATION, true),
+            (SQL_COPT_SS_TXN_ISOLATION, true),
+            (SQL_COPT_SS_WARN_ON_CP_ERROR, false),
+            (SQL_COPT_SS_ENCRYPT, true),
+            (SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, true),
+            (SQL_COPT_SS_INTEGRATED_SECURITY, true),
+            (SQL_COPT_SS_MULTISUBNET_FAILOVER, true),
+            (SQL_COPT_SS_TNIR, true),
+            (SQL_ATTR_CONNECTION_DEAD, true),
+        ];
+
+        for version in [SQL_OV_ODBC3, SQL_OV_ODBC3_80] {
+            let h = TestHandles::with_env_dbc_version(version);
+            for (attribute, writes_length_without_value) in attributes {
+                let mut length = -99;
+                let rc = unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        attribute,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut length,
+                    )
+                };
+                assert_eq!(rc, SQL_SUCCESS, "null value pointer for {attribute}");
+                assert_eq!(
+                    length,
+                    if writes_length_without_value { 4 } else { -99 },
+                    "length output for {attribute}"
+                );
+
+                let rc = unsafe {
+                    crate::api::exports::SQLGetConnectAttrW(
+                        h.dbc,
+                        attribute,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(rc, SQL_SUCCESS, "both outputs null for {attribute}");
             }
         }
     }
@@ -1042,30 +1127,6 @@ mod tests {
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_LONGASMAX), 1);
         dbc.inner.lock().unwrap().connection_state = ConnectionState::Disconnected;
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_LONGASMAX), 0);
-    }
-
-    #[test]
-    fn vendor_attribute_null_pointer_is_rejected() {
-        let h = TestHandles::with_env_dbc();
-        for attribute in [
-            SQL_COPT_SS_LONGASMAX,
-            SQL_COPT_SS_ENCRYPT,
-            SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
-            SQL_COPT_SS_INTEGRATED_SECURITY,
-            SQL_COPT_SS_MULTISUBNET_FAILOVER,
-            SQL_COPT_SS_TNIR,
-        ] {
-            let get = unsafe {
-                sql_get_connect_attr_w(
-                    h.dbc,
-                    attribute,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(get, SQL_ERROR, "null value pointer for {attribute}");
-        }
     }
 
     /// msodbcsql writes `sizeof(UDWORD)` for every integer connection attribute
@@ -1115,7 +1176,7 @@ mod tests {
                 &mut length,
             )
         };
-        assert_eq!(rc, SQL_ERROR);
-        assert_eq!(length, -777);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(length, 4);
     }
 }
