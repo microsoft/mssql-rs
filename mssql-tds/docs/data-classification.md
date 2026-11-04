@@ -99,8 +99,9 @@ The token has no length prefix, so it is parsed field by field
   source, the worst case SQL Server produces is 4,251,658 bytes: 4,096
   columns, each with its own label and information type, all four strings at
   the 128-character `sysname` maximum. Live, 252 such columns produce 261,586
-  bytes, matching the formula. Derived columns add 8 bytes per extra source
-  (see [Limitations](#limitations-and-assumptions)).
+  bytes, matching the formula. Derived columns add 8 bytes per extra source,
+  plus up to 514 bytes for each label or information type no other column
+  uses (see [Limitations](#limitations-and-assumptions)).
 - An unpaired UTF-16 surrogate in a name or id is replaced with U+FFFD. SQL
   Server stores such strings as given.
 
@@ -301,8 +302,9 @@ coverage points, with no crashes, timeouts or out-of-memory errors.
 - The per-column count is not required to match COLMETADATA, because SQL
   Server does not match it for server cursors.
 - Tokens above 16 MiB are rejected. SQL Server's single-classification worst
-  case is about a quarter of that; a derived column with many classified
-  sources adds 8 bytes per source and has no documented upper bound.
+  case is about a quarter of that. A derived column with many classified
+  sources adds 8 bytes per source, plus up to 514 bytes for each label or
+  information type no other column uses, and has no documented upper bound.
 - Unpaired surrogates are replaced, so the strings may differ from the bytes
   the server sent.
 - Unknown token types stay fatal.
