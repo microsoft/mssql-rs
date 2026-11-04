@@ -659,6 +659,20 @@ mod tests {
             },
             SQL_SUCCESS
         );
+        let mut value = u32::MAX;
+        assert_eq!(
+            unsafe {
+                SQLGetConnectAttrW(
+                    h.dbc,
+                    SQL_ATTR_ACCESS_MODE,
+                    ptr::from_mut(&mut value).cast(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, SQL_MODE_READ_ONLY);
         assert!(
             dbc(&h)
                 .inner
