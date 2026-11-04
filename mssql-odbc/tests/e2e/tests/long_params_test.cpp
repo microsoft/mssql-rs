@@ -87,11 +87,12 @@ protected:
                                        reinterpret_cast<SQLPOINTER>(value), 0),
                       SQL_HANDLE_DBC, dbc_);
         SQLUINTEGER actual = 0;
-        // The Windows DM can leave numeric lengths untouched; direct-driver
-        // tests cover the four-byte length independently.
-        ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual, 0, nullptr),
+        SQLINTEGER length = -1;
+        ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual,
+                                       sizeof(actual), &length),
                       SQL_HANDLE_DBC, dbc_);
         EXPECT_EQ(static_cast<SQLUINTEGER>(value), actual);
+        EXPECT_EQ(sizeof(actual), static_cast<size_t>(length));
     }
 
     void ReadProbe(const LongType& type, bool as_max,
@@ -405,9 +406,12 @@ TEST_F(LongParameterConnectTest, KeywordsAndPreconnectAttributesHaveNativePreced
                           SQL_HANDLE_DBC, dbc_);
             const SQLULEN expected = override.value_or(keyword == "Yes" ? SQL_XL_ON : SQL_XL_OFF);
             SQLUINTEGER actual = 99;
-            ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual, 0, nullptr),
+            SQLINTEGER length = -1;
+            ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_LONGASMAX, &actual,
+                                           sizeof(actual), &length),
                           SQL_HANDLE_DBC, dbc_);
             ASSERT_EQ(expected, actual);
+            ASSERT_EQ(4, length);
             ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt_), SQL_HANDLE_DBC, dbc_);
             Probe(kTypes[0], expected == SQL_XL_ON, true, false, ValueKind::Value, "keyword");
             FreeStmt(stmt_);

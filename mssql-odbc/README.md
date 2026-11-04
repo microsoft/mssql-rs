@@ -126,7 +126,7 @@ Explicit connection attributes take precedence over the keyword.
 
 The `SQL_COPT_SS_LONGASMAX` getter accepts NULL value and length pointers
 independently. Direct driver calls report a four-byte value length when
-requested; a Driver Manager may handle numeric attribute lengths itself.
+requested.
 
 **Migration note:** earlier alpha builds always substituted MAX types. Use
 `LongAsMax=Yes` to retain that behavior. `ColumnSize` bounds still apply to
