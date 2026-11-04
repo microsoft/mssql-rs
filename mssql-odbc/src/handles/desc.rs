@@ -210,7 +210,7 @@ impl Default for DescHeader {
 /// is gated by [`classify_field`], mirroring msodbcsql's shared `cpbaseTag`
 /// record base (`sqlsrv.h:1146-1165`) plus kind-specific validation rather
 /// than four separate record types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DescRecord {
     /// `SQL_DESC_CONCISE_TYPE`. `SQL_DESC_TYPE` (verbose) is derived from
     /// this plus `datetime_interval_code` for the datetime/interval families;
@@ -612,12 +612,6 @@ pub(crate) struct TvpColumnLengths {
     pub(crate) app_length: Option<SqlULen>,
     pub(crate) ipd_octet_length: Option<SqlLen>,
 }
-
-pub(crate) type FocusedTvpRecordSnapshot = (
-    usize,
-    Option<crate::params::BoundParam>,
-    Option<TvpColumnLengths>,
-);
 
 impl DescHandle {
     /// Drops the UDT identities `SQLDescribeParam` auto-filled, keeping any the
@@ -1035,7 +1029,7 @@ impl DescHandle {
     pub(crate) fn focused_tvp_record_snapshot(
         &self,
         record_number: SqlSmallInt,
-    ) -> Result<Option<FocusedTvpRecordSnapshot>, ()> {
+    ) -> Result<Option<(usize, DescRecord)>, ()> {
         let Some(column_index) = usize::try_from(record_number)
             .ok()
             .and_then(|number| number.checked_sub(1))
@@ -1075,23 +1069,38 @@ impl DescHandle {
                 .and_then(|columns| columns.get(column_index))
                 .copied()
                 .flatten();
+            let mut app_record = DescRecord::default_for(self.kind);
+            let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
+            if let Some(binding) = binding {
+                binding.write_to_records(&mut app_record, &mut ipd_record);
+                app_record.precision = binding.app_precision;
+                app_record.scale = binding.app_scale;
+            }
+            let mut record = if self.kind == DescKind::ImpParam {
+                ipd_record
+            } else {
+                app_record
+            };
             let lengths = state
                 .tvp_column_lengths
                 .get(&focus)
                 .and_then(|lengths| lengths.get(column_index))
                 .copied()
-                .flatten()
-                .map(|mut lengths| {
-                    if self.kind == DescKind::ImpParam {
-                        lengths.app_length = None;
-                    } else {
-                        lengths.ipd_octet_length = None;
+                .flatten();
+            if let Some(lengths) = lengths {
+                if self.kind == DescKind::ImpParam {
+                    if let Some(length) = lengths.ipd_octet_length {
+                        record.octet_length = length;
                     }
-                    lengths
-                })
-                .filter(|lengths| *lengths != TvpColumnLengths::default());
-            let current = (count, binding, lengths);
-            if snapshot.is_some_and(|snapshot| snapshot != current) {
+                } else if let Some(length) = lengths.app_length {
+                    record.length = length;
+                }
+            }
+            let current = (count, record);
+            if snapshot
+                .as_ref()
+                .is_some_and(|snapshot| *snapshot != current)
+            {
                 error!(
                     "reading focused TVP descriptor record: associated statements have conflicting projections"
                 );
@@ -1668,6 +1677,148 @@ mod tests {
             SQL_SUCCESS
         );
         assert_eq!(length, 12);
+    }
+
+    #[test]
+    fn shared_apd_reads_ignore_focused_ipd_scale_and_type() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_NUMERIC, SQL_PARAM_OUTPUT, SQL_VARCHAR};
+        use crate::api::{SQLGetDescFieldW, SQLGetDescRecW, SQLSetDescFieldW};
+
+        let mut h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let second_stmt = h.alloc_extra_stmt();
+        let shared_apd = h.alloc_explicit_desc();
+        for raw in [h.stmt, second_stmt] {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.active_apd = Some(shared_apd);
+                state.vendor_attrs.store_param_focus(1);
+            }
+        }
+        for (field, value) in [
+            (SQL_DESC_CONCISE_TYPE, SQL_C_NUMERIC as isize),
+            (SQL_DESC_PRECISION, 10),
+            (SQL_DESC_SCALE, 2),
+        ] {
+            assert_eq!(
+                unsafe {
+                    SQLSetDescFieldW(shared_apd, 1, field as SqlSmallInt, value as SqlPointer, 0)
+                },
+                SQL_SUCCESS
+            );
+        }
+        for raw in [h.stmt, second_stmt] {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+            assert_eq!(
+                unsafe {
+                    SQLSetDescFieldW(
+                        stmt.ipd,
+                        1,
+                        SQL_DESC_CONCISE_TYPE as SqlSmallInt,
+                        SQL_NUMERIC as isize as SqlPointer,
+                        0,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        for (field, value) in [
+            (SQL_DESC_PRECISION, 12isize),
+            (SQL_DESC_SCALE, 3),
+            (SQL_DESC_LENGTH, 20),
+            (SQL_DESC_PARAMETER_TYPE, SQL_PARAM_OUTPUT as isize),
+            (SQL_DESC_CONCISE_TYPE, SQL_VARCHAR as isize),
+        ] {
+            assert_eq!(
+                unsafe {
+                    SQLSetDescFieldW(h.ipd(), 1, field as SqlSmallInt, value as SqlPointer, 0)
+                },
+                SQL_SUCCESS
+            );
+            let mut scale: SqlSmallInt = -1;
+            assert_eq!(
+                unsafe {
+                    SQLGetDescFieldW(
+                        shared_apd,
+                        1,
+                        SQL_DESC_SCALE as SqlSmallInt,
+                        (&mut scale as *mut SqlSmallInt).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS,
+                "IPD field {field}"
+            );
+            assert_eq!(scale, 2);
+            let mut precision = -1;
+            assert_eq!(
+                unsafe {
+                    SQLGetDescRecW(
+                        shared_apd,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut precision,
+                        &mut scale,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS,
+                "IPD field {field}"
+            );
+            assert_eq!((precision, scale), (10, 2));
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(second_stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .tvp_column_bindings
+            .get_mut(&1)
+            .unwrap()[0]
+            .as_mut()
+            .unwrap()
+            .app_scale = 1;
+        let desc = unsafe { handle_from_raw::<DescHandle>(shared_apd) };
+        assert!(desc.focused_tvp_record_snapshot(1).is_err());
+        let mut scale: SqlSmallInt = -1;
+        assert_eq!(
+            unsafe {
+                SQLGetDescFieldW(
+                    shared_apd,
+                    1,
+                    SQL_DESC_SCALE as SqlSmallInt,
+                    (&mut scale as *mut SqlSmallInt).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(scale, -1);
+        assert_eq!(
+            unsafe {
+                SQLGetDescRecW(
+                    shared_apd,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut scale,
+                    std::ptr::null_mut(),
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(scale, -1);
     }
 
     #[test]

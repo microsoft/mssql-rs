@@ -239,41 +239,13 @@ pub(super) fn focused_tvp_record_for_desc(
     desc: &DescHandle,
     record_number: SqlSmallInt,
 ) -> Result<Option<FocusedTvpRecord>, ()> {
-    let Some((count, binding, lengths)) = desc.focused_tvp_record_snapshot(record_number)? else {
+    let Some((count, record)) = desc.focused_tvp_record_snapshot(record_number)? else {
         return Ok(None);
     };
     if usize::try_from(record_number).map_err(|_| ())? > count {
         return Ok(Some(FocusedTvpRecord::PastCount));
     }
-    let mut record = binding
-        .map(|binding| focused_tvp_record_from_binding(binding, desc.kind))
-        .unwrap_or_else(|| DescRecord::default_for(desc.kind));
-    if let Some(lengths) = lengths {
-        if desc.kind == DescKind::ImpParam {
-            if let Some(length) = lengths.ipd_octet_length {
-                record.octet_length = length;
-            }
-        } else if let Some(length) = lengths.app_length {
-            record.length = length;
-        }
-    }
     Ok(Some(FocusedTvpRecord::Record(record)))
-}
-
-pub(super) fn focused_tvp_record_from_binding(
-    binding: crate::params::BoundParam,
-    kind: DescKind,
-) -> DescRecord {
-    let mut app_record = DescRecord::default_for(kind);
-    let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
-    binding.write_to_records(&mut app_record, &mut ipd_record);
-    if kind == DescKind::ImpParam {
-        ipd_record
-    } else {
-        app_record.precision = binding.app_precision;
-        app_record.scale = binding.app_scale;
-        app_record
-    }
 }
 
 #[cfg(test)]
@@ -455,16 +427,21 @@ mod tests {
         });
 
         let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        let empty_record = DescRecord::default_for(DescKind::ImpParam);
+        let mut bound_record = empty_record.clone();
+        binding.write_to_records(
+            &mut DescRecord::default_for(DescKind::AppParam),
+            &mut bound_record,
+        );
         barrier.wait();
         for _ in 0..10_000 {
-            let (count, binding, app_length) = desc
+            let (count, record) = desc
                 .focused_tvp_record_snapshot(1)
                 .unwrap()
                 .expect("the statement owns the focused IPD");
-            assert_eq!(app_length, None);
             assert!(
-                (count == 1 && binding.is_some()) || (count == 0 && binding.is_none()),
-                "count {count} and binding {binding:?} must come from the same focus"
+                (count == 1 && record == bound_record) || (count == 0 && record == empty_record),
+                "count {count} and record {record:?} must come from the same focus"
             );
         }
         toggler.join().unwrap();

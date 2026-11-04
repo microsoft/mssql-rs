@@ -83,6 +83,8 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   that TVP's independent column layout, not the statement's outer parameter array.
   Focused datetime IPD precision and scale share the fractional-second precision;
   setting either preserves the column length.
+  Shared application descriptors compare their projected child records, so
+  statement-local IPD differences do not prevent APD reads.
 - **Supply TVP content with data-at-execution** — the driver returns the table token, then
   row-control and cell tokens in the order expected by the ODBC TVP protocol. Cell bytes are
   buffered and converted into the table value before execution. Only columns marked
