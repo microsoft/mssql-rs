@@ -5,6 +5,11 @@
 # restores it to mssql-odbc/tests/e2e/build, brings up SQL Server on a shared
 # docker network, then reruns the prebuilt binaries in each distro container via
 # run_e2e.sh --skip-build (no rebuild). Mirrors test-matrix-template.yml.
+#
+# Each matrix row sets container and entry, and may set filterTests and
+# excludeTests (ctest -R and -E regexes) to run part of the suite, as the
+# stress pipeline's suite groups do. They are read from the environment, so a
+# row that leaves them out runs everything.
 
 parameters:
   matrix: {}
@@ -26,6 +31,9 @@ parameters:
   collectLoad: false
   jobDisplayName: 'ODBC e2e Linux amd64'
   timeoutInMinutes: 60
+  # Append the matrix row (System.JobName) to the test run title, so rows that
+  # run different suite groups publish distinguishable runs.
+  testRunTitleWithRow: false
 
 jobs:
   - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
@@ -143,6 +151,8 @@ jobs:
             -e "ODBC_TEST_TRUST_CERT=Yes" \
             -e "ODBC_E2E_RETRIES=${{ parameters.retries }}" \
             -e "ODBC_E2E_MT_PROFILE=${{ parameters.mtProfile }}" \
+            -e "ODBC_E2E_FILTER=${FILTERTESTS:-}" \
+            -e "ODBC_E2E_EXCLUDE=${EXCLUDETESTS:-}" \
             -e "RUST_BACKTRACE=full" \
             "${trace_args[@]}" \
             --network testnet \
@@ -165,7 +175,10 @@ jobs:
         inputs:
           testResultsFormat: "JUnit"
           testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
-          testRunTitle: $(System.PhaseName)
+          ${{ if eq(parameters.testRunTitleWithRow, true) }}:
+            testRunTitle: $(System.PhaseName) $(System.JobName)
+          ${{ else }}:
+            testRunTitle: $(System.PhaseName)
       - ${{ if eq(parameters.collectLoad, true) }}:
         - task: PublishPipelineArtifact@1
           displayName: Publish agent load samples
