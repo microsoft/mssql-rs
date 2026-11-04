@@ -107,11 +107,20 @@ migration, timeouts, and DNS caching.
 |---|---|---|
 | `integrated-auth` | On | Enables `sspi` (Windows) and `gssapi` (Unix Kerberos). |
 | `tls-schannel-direct-on-windows` | On | Enables `tls-schannel-direct`: the in-tree Windows Schannel TLS engine. |
+| `tls-network-framework-on-macos` | On | Enables `tls-network-framework`: on macOS, TDS 8.0 (Strict) TCP connections are opened through Apple's Network.framework, adding TLS 1.3 and the `X25519MLKEM768` post-quantum key exchange. |
 
 Set `default-features = false` to omit integrated authentication and use
 `native-tls` on all platforms. Individual auth and TLS features can be enabled
 separately. Linux builds require OpenSSL development libraries; Unix integrated
-authentication loads GSSAPI at runtime.
+authentication loads GSSAPI at runtime. On macOS, TDS 7.x handshakes always use
+Secure Transport (TLS 1.2 maximum); see
+[TLS on macOS](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#tls-on-macos).
+
+The default Network.framework feature requires a macOS deployment target of
+10.15 or later. For x86_64 macOS builds, set `MACOSX_DEPLOYMENT_TARGET=10.15`
+(or later) for the entire build; lower targets fail at build time.
+Apple Silicon's default deployment target already meets this requirement.
+Disabling `tls-network-framework` removes this added minimum.
 
 ## Response lifecycle
 

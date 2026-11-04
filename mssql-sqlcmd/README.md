@@ -29,6 +29,9 @@ runtimes/<rid>/native/native-static-libs.txt
 Restore the NuGet package from your configured feed, include `mssql_sqlcmd.h`,
 and link the archive for your runtime **plus the system libraries listed in
 `native-static-libs.txt`**. Rust dependencies are compiled into the archive.
+
+macOS consumers must target macOS 10.15 or later (11.0 or later for Apple
+Silicon), matching the archive's default-enabled Network.framework dependency.
 The package does not supply automatic MSBuild integration.
 
 ## JSON output

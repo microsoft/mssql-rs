@@ -537,14 +537,19 @@ races:
   minutes for nightly runs. The 60-minute per-entry CTest limit and 5-minute
   default phase watchdog are unchanged. Longer jobs can hold agent slots for
   longer; this does not increase peak concurrency.
-- Windows runs four parallel jobs: fetch, parameters, metadata, and remaining
-  suites. Each job builds its own Debug driver and harness and runs its suite
-  group sequentially against both drivers on its own SQL Server agent. The
+- Windows builds the Debug driver and harness once in a separate 120-minute
+  job. C++ compilation uses at most four parallel build processes by default,
+  capped by the agent's logical CPU count. The relocatable drop includes PDBs
+  and uses an attempt-scoped artifact name passed to consumers as a job output.
+  Four parallel execution jobs (fetch, parameters, metadata, and remaining
+  suites) download that drop without compiling, then run each suite group
+  sequentially against both drivers on their own SQL Server agents. The
   remaining-suites filter excludes the three named groups, so newly converted
   suites are included automatically. Profiles, retries, and per-entry timeouts
   are unchanged; test-run titles and dump, load, and trace artifact names include
-  the suite group. This trades additional agents and builds for less serial
-  test work per job without adding competing suite processes to one agent.
+  the suite group. This removes repeated builds and separates compilation from
+  execution budgets without adding competing suite processes to one agent.
+  See the [prebuilt runner commands](../tests/e2e/README.md#windows-stress-jobs).
 - The nightly run exists to flush out obvious races while suites convert.
   Remove its schedule two to three weeks after it starts, once its findings
   are fixed; PR and weekly remain.
