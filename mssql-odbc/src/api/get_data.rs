@@ -2471,8 +2471,13 @@ fn stream_active_plp_chunk_once<'a>(
             )
             | (SQL_C_BINARY, Some(_))
     ) && !transcode_narrow_to_utf8;
-    let direct_wire_output =
+    let read_ahead =
         max_read > 0 && !target_value_ptr.is_null() && !staged_binary_read && wire_shaped_output;
+    // A direct read zeroes its whole window first, so a final short read would
+    // leave zeros after the terminator. msodbcsql's same-code-page copy leaves
+    // those bytes untouched, so verbatim narrow text is staged and copied with
+    // its terminator only. It keeps read-ahead: its bytes are still the output.
+    let direct_wire_output = read_ahead && !(narrow_verbatim && target_type == SQL_C_CHAR);
     let mut inline_payload = [0_u8; 256];
     let mut heap_payload = if typed_target {
         std::mem::take(&mut progress.typed_scratch)
@@ -2561,12 +2566,7 @@ fn stream_active_plp_chunk_once<'a>(
         // Read-ahead that ran dry short of the budget is topped up from the wire,
         // as an unbuffered read would have been.
         let buffered = prefetched_read.map_or(0, |(read, ..)| read);
-        match read_plp_wire(
-            stmt,
-            statement_handle,
-            &mut payload[buffered..],
-            direct_wire_output,
-        ) {
+        match read_plp_wire(stmt, statement_handle, &mut payload[buffered..], read_ahead) {
             Ok(Ok(chunk)) => Ok(PlpChunk {
                 read: buffered + chunk.read,
                 ..chunk
@@ -3236,7 +3236,7 @@ fn read_plp_wire(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     payload: &mut [u8],
-    direct_wire_output: bool,
+    read_ahead: bool,
 ) -> Result<TdsResult<PlpChunk>, SqlReturn> {
     #[cfg(test)]
     tests::PLP_WIRE_READS.with(|reads| reads.set(reads.get() + 1));
@@ -3292,7 +3292,7 @@ fn read_plp_wire(
                     .and_then(|total| total.checked_sub(chunk.total_read as u64))
                     .and_then(|bytes| usize::try_from(bytes).ok());
                 let prefetch_len = remaining.filter(|remaining| {
-                    direct_wire_output
+                    read_ahead
                         && *remaining > 0
                         && *remaining <= MAX_PLP_PREFETCH_BYTES
                         && !chunk.reached_end
@@ -12822,13 +12822,13 @@ mod tests {
                 stream.pending_units.extend_from_slice(wide_carry);
             }
             drop(state);
-            if rc == SQL_SUCCESS {
-                // Bytes past the final chunk's terminator are unspecified, and
-                // reads straight into the caller's buffer zero them.
+            if rc == SQL_SUCCESS && target != SQL_C_CHAR {
+                // Direct wide and binary reads zero their window, so bytes past
+                // the final terminator differ by path there. Narrow text keeps
+                // them untouched, as msodbcsql does.
                 let terminator = match target {
                     SQL_C_WCHAR => 2,
-                    SQL_C_BINARY => 0,
-                    _ => 1,
+                    _ => 0,
                 };
                 output.truncate(usize::try_from(indicator).unwrap() + terminator);
             }
@@ -13062,6 +13062,26 @@ mod tests {
                 !verbatim,
                 "transcode {transcode}"
             );
+        }
+    }
+
+    /// msodbcsql leaves the caller's buffer past the terminator untouched; pinned
+    /// by the `Issue627CharGetDataIndicatorIncludesExpansion` e2e parity test.
+    #[test]
+    fn plp_cp1252_verbatim_leaves_bytes_after_the_terminator() {
+        for capacity in [2, 3, 4, 8192] {
+            let (h, _server) = open_mock_cp1252_plp(vec![vec![0x80]]);
+            client_code_page(&h, 1252, false);
+            let (trace, _) = trace_narrow_plp(&h, &[(SQL_C_CHAR, capacity)], &[], &[], 1);
+            let mut expected = vec![0xcc; capacity + 1];
+            expected[..2].copy_from_slice(&[0x80, 0]);
+            let (rc, indicator, output, _) = &trace[0];
+            if cfg!(windows) {
+                assert_eq!((*rc, *indicator), (SQL_SUCCESS, 1), "capacity {capacity}");
+                assert_eq!(output, &expected, "capacity {capacity}");
+            } else {
+                assert_eq!(output[capacity], 0xcc, "capacity {capacity}");
+            }
         }
     }
 
