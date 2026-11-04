@@ -875,7 +875,7 @@ fn set_desc_header(
         ArraySizeClamp::ToI32Max => clamp_array_size(value_ptr as SqlULen),
         ArraySizeClamp::None => (value_ptr as SqlULen, false),
     };
-    if crate::handles::live_type(raw) != Some(HandleType::Desc) {
+    if !stmt.owns_implicit_desc(raw) && crate::handles::live_type(raw) != Some(HandleType::Desc) {
         return (
             desc_header_error(stmt, "descriptor was freed concurrently"),
             stored,
@@ -1262,7 +1262,7 @@ unsafe fn get_desc_header(
     value_ptr: SqlPointer,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    if crate::handles::live_type(raw) != Some(HandleType::Desc) {
+    if !stmt.owns_implicit_desc(raw) && crate::handles::live_type(raw) != Some(HandleType::Desc) {
         return desc_header_error(stmt, "descriptor was freed concurrently");
     }
     let desc = unsafe { handle_from_raw::<DescHandle>(raw) };

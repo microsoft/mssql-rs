@@ -1613,4 +1613,77 @@ mod tests {
             );
         }
     }
+
+    /// The provider must see the endpoint being dialled, not `context.transport_context`.
+    #[tokio::test]
+    async fn security_context_provider_sees_the_attempted_endpoint() {
+        use crate::connection::client_context::TdsAuthenticationMethod;
+        use crate::core::{EncryptionOptions, EncryptionSetting};
+        use crate::security::mock::MockSecurityContext;
+        use crate::security::{
+            IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityError,
+        };
+        use mssql_mock_tds::MockTdsServer;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingProvider(Mutex<Vec<(String, u16, bool)>>);
+
+        impl SecurityContextProvider for RecordingProvider {
+            fn create_context(
+                &self,
+                config: &IntegratedAuthConfig,
+                server: &str,
+                port: u16,
+            ) -> Result<Box<dyn SecurityContext>, SecurityError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((server.to_string(), port, config.is_loopback));
+                Ok(Box::new(MockSecurityContext::single_round(b"t".to_vec())))
+            }
+        }
+
+        let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().port();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = server.run_with_shutdown(shutdown_rx).await;
+        });
+
+        let recorder = Arc::new(RecordingProvider::default());
+        let mut context = ClientContext {
+            tds_authentication_method: TdsAuthenticationMethod::SSPI,
+            security_context_provider: Some(recorder.clone()),
+            encryption_options: EncryptionOptions {
+                mode: EncryptionSetting::PreferOff,
+                trust_server_certificate: true,
+                host_name_in_cert: None,
+                server_certificate: None,
+            },
+            ..Default::default()
+        };
+        context
+            .prepare_datasource("tcp:sql.contoso.com,1433")
+            .unwrap();
+        assert!(!context.transport_context.is_loopback());
+
+        let attempted = TransportContext::Tcp {
+            host: "127.0.0.1".to_string(),
+            port,
+            instance_name: None,
+        };
+        let result =
+            TdsConnectionProvider::connect_with_transport_context(&context, &attempted, None, None)
+                .await;
+        assert!(result.is_ok(), "connect failed: {:?}", result.err());
+
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![("127.0.0.1".to_string(), port, true)]
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+    }
 }

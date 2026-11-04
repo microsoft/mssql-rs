@@ -37,7 +37,9 @@ mod spn;
 
 // Re-export public types
 pub use error::SecurityError;
-pub use security_context::{IntegratedAuthConfig, SecurityContext, SecurityPackage, SspiAuthToken};
+pub use security_context::{
+    IntegratedAuthConfig, SecurityContext, SecurityContextProvider, SecurityPackage, SspiAuthToken,
+};
 pub use spn::{canonicalize_hostname, is_loopback_address, make_spn, make_spn_canonicalized};
 
 // Always Encrypted key store provider API.

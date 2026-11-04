@@ -2402,6 +2402,17 @@ impl StmtHandle {
         // mutated, and the DBC outlives this STMT per the DM contract.
         unsafe { &*(self.parent_dbc as *const DbcHandle) }
     }
+
+    /// Whether `raw` is exactly one of this statement's implicit descriptors.
+    ///
+    /// Those are allocated in `new`, never reassigned, rejected by `free_desc`
+    /// with `HY017`, and freed only in `Drop`, so they are live for as long as
+    /// `&self` is. A caller holding `&self` may dereference such a `raw`
+    /// without the process-global `live_type` lookup; every other descriptor,
+    /// explicit ones in particular, still needs it.
+    pub(crate) fn owns_implicit_desc(&self, raw: *mut c_void) -> bool {
+        raw == self.ard || raw == self.apd || raw == self.ird || raw == self.ipd
+    }
 }
 
 impl HasObjectType for StmtHandle {
@@ -2428,6 +2439,23 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_ATTR_CONNECTION_TIMEOUT, SQL_SUCCESS};
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
+
+    #[test]
+    fn owns_implicit_desc_matches_only_this_statements_implicit_descriptors() {
+        let mut h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let explicit = h.alloc_explicit_desc();
+        let sibling = h.alloc_extra_stmt();
+        let stmt = unsafe { crate::handles::handle_from_raw::<StmtHandle>(h.stmt) };
+        let sibling = unsafe { crate::handles::handle_from_raw::<StmtHandle>(sibling) };
+
+        for own in [h.ard(), h.apd(), h.ird(), h.ipd()] {
+            assert!(stmt.owns_implicit_desc(own));
+            assert!(!sibling.owns_implicit_desc(own));
+        }
+        assert!(!stmt.owns_implicit_desc(explicit));
+        assert!(!stmt.owns_implicit_desc(std::ptr::null_mut()));
+        assert!(!stmt.owns_implicit_desc(h.stmt));
+    }
 
     #[test]
     fn uncontended_operations_do_not_lock_cancellation_state() {

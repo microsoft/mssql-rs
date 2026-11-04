@@ -996,7 +996,9 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
     // to narrow (not fully close) the race against a concurrent
     // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor. `ipd` is
     // always `stmt.ipd`, freed only with the statement itself.
-    if crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc) {
+    if !stmt.owns_implicit_desc(apd)
+        && crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc)
+    {
         error!("snapshotting parameters: apd freed concurrently");
         return Err(SQL_ERROR);
     }

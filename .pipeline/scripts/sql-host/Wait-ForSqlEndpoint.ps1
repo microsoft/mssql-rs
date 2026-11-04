@@ -8,8 +8,17 @@
 # downstream steps. See sql-host-template.yml for why the rendezvous uses
 # pipeline artifacts in both directions instead of ADO `dependsOn`.
 #
+# Password key exchange (see wait-for-teardown.sh): fork PR builds receive no
+# secret variables, so the password cannot arrive as one. Before waiting for
+# the endpoint, this script creates an in-memory RSA-3072 key and publishes the
+# public key as sql-key-<SENTINEL_ARTIFACT_NAME>. The SQL host answers with
+# sql-cred-<SENTINEL_ARTIFACT_NAME>, the password encrypted to that key with
+# RSA-OAEP (SHA-256), which this script decrypts and exports as SQL_PASSWORD.
+#
 # Required env:
 #   ARTIFACT_NAME         Name of the sql-ready sentinel artifact.
+#   SENTINEL_ARTIFACT_NAME  Exact teardown sentinel artifact name this job
+#                         publishes; it names the key and credential artifacts.
 #   SQL_CREDENTIAL_GENERATION  Nonsecret initialization generation ID.
 #   BUILD_BUILDID
 #   SYSTEM_COLLECTIONURI
@@ -23,6 +32,8 @@
 #   SYSTEM_STAGEATTEMPT              used to detect a partial "Rerun failed jobs"
 #   RERUN_HINT_AFTER_SECONDS         default 600
 #   MIN_HOST_LIFE_REMAINING_SECONDS  default 300
+#   CREDENTIAL_WAIT_SECONDS          default 600; wait for the host's answer
+#                                    after the endpoint appears
 
 $ErrorActionPreference = 'Stop'
 
@@ -42,11 +53,55 @@ $maxWait = if ($env:MAX_WAIT_SECONDS) { [int]$env:MAX_WAIT_SECONDS } else { 3600
 $stageAttempt = if ($env:SYSTEM_STAGEATTEMPT) { [int]$env:SYSTEM_STAGEATTEMPT } else { 1 }
 $rerunHintAfter = if ($env:RERUN_HINT_AFTER_SECONDS) { [int]$env:RERUN_HINT_AFTER_SECONDS } else { 600 }
 $minHostLife = if ($env:MIN_HOST_LIFE_REMAINING_SECONDS) { [int]$env:MIN_HOST_LIFE_REMAINING_SECONDS } else { 300 }
+$credentialWait = if ($env:CREDENTIAL_WAIT_SECONDS) { [int]$env:CREDENTIAL_WAIT_SECONDS } else { 600 }
+
+# The name is embedded in ##vso logging commands, and the suffix keeps the key
+# and credential artifacts unique per initialization and stage attempt.
+$sentinelArtifact = $env:SENTINEL_ARTIFACT_NAME
+if ($sentinelArtifact -cnotmatch '\A[A-Za-z0-9_.-]+\z' -or
+    -not $sentinelArtifact.EndsWith("-$($env:SQL_CREDENTIAL_GENERATION)-$stageAttempt", [StringComparison]::Ordinal)) {
+    throw "SENTINEL_ARTIFACT_NAME must be this job's teardown artifact name."
+}
+$keyArtifact = "sql-key-$sentinelArtifact"
+$credArtifact = "sql-cred-$sentinelArtifact"
 
 $headers = @{ Authorization = "Bearer $($env:SYSTEM_ACCESSTOKEN)" }
 $collection = $env:SYSTEM_COLLECTIONURI.TrimEnd('/')
 $projectEnc = [uri]::EscapeDataString($env:SYSTEM_TEAMPROJECT)
 $url = "$collection/$projectEnc/_apis/build/builds/$($env:BUILD_BUILDID)/artifacts?api-version=7.1"
+
+function Get-ArtifactDownloadUrl([string]$Name) {
+    $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+    $match = $response.value | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+    if ($match) { $match.resource.downloadUrl }
+}
+
+# Downloads and extracts an artifact, returning the extraction directory.
+# Transient 5xx / connection resets shouldn't fail the rendezvous after the
+# artifact list already showed the artifact.
+function Save-Artifact([string]$Name, [string]$DownloadUrl) {
+    $directory = Join-Path $env:AGENT_TEMPDIRECTORY $Name
+    $extractDir = Join-Path $directory 'extracted'
+    Remove-Item -Recurse -Force $directory -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $zipPath = Join-Path $directory 'artifact.zip'
+    $downloaded = $false
+    foreach ($attempt in 1..5) {
+        try {
+            Invoke-WebRequest -Uri $DownloadUrl -Headers $headers -OutFile $zipPath -UseBasicParsing
+            $downloaded = $true
+            break
+        } catch {
+            Write-Warning "$Name download attempt $attempt failed: $_"
+            Start-Sleep -Seconds ($attempt * 5)
+        }
+    }
+    if (-not $downloaded) {
+        throw "failed to download $Name after 5 attempts."
+    }
+    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+    $extractDir
+}
 
 Write-Host '=== sql-host/Wait-ForSqlEndpoint.ps1 ==='
 Write-Host "  ARTIFACT_NAME = $artifactName"
@@ -54,6 +109,18 @@ Write-Host "  Build         = $($env:BUILD_BUILDID)"
 Write-Host "  Poll URL      = $url"
 Write-Host "  Poll every    = ${pollInterval}s"
 Write-Host "  Max wait      = ${maxWait}s"
+
+# Publish before the endpoint wait so the host can answer as soon as it is up.
+# The agent uploads asynchronously, so the public key file must outlive this
+# script; the private key stays in this process.
+$rsa = [System.Security.Cryptography.RSA]::Create(3072)
+$spki = [Convert]::ToBase64String($rsa.ExportSubjectPublicKeyInfo())
+$pemLines = @('-----BEGIN PUBLIC KEY-----') + ($spki -split '(.{64})' | Where-Object { $_ }) + @('-----END PUBLIC KEY-----', '')
+$publicDir = Join-Path $env:AGENT_TEMPDIRECTORY $keyArtifact
+Remove-Item -Recurse -Force $publicDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $publicDir -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $publicDir 'key.pem'), ($pemLines -join "`n"))
+Write-Host "##vso[artifact.upload containerfolder=$keyArtifact;artifactname=$keyArtifact]$publicDir"
 
 # The SQL host is a sibling job released as soon as tests finish, so ADO's
 # "Rerun failed jobs" never restarts it and no host publishes a sentinel for the
@@ -81,10 +148,8 @@ while ($true) {
     }
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
-        $match = $response.value | Where-Object { $_.name -eq $artifactName } | Select-Object -First 1
-        if ($match) {
-            $downloadUrl = $match.resource.downloadUrl
+        $downloadUrl = Get-ArtifactDownloadUrl $artifactName
+        if ($downloadUrl) {
             Write-Host "Endpoint sentinel $artifactName found."
             break
         }
@@ -101,29 +166,7 @@ while ($true) {
     Start-Sleep -Seconds $pollInterval
 }
 
-$downloadDir = Join-Path $env:AGENT_TEMPDIRECTORY $artifactName
-$extractDir = Join-Path $downloadDir 'extracted'
-Remove-Item -Recurse -Force $downloadDir -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-$zipPath = Join-Path $downloadDir 'artifact.zip'
-
-$downloaded = $false
-foreach ($attempt in 1..5) {
-    try {
-        Invoke-WebRequest -Uri $downloadUrl -Headers $headers -OutFile $zipPath -UseBasicParsing
-        $downloaded = $true
-        break
-    } catch {
-        Write-Warning "artifact download attempt $attempt failed: $_"
-        Start-Sleep -Seconds ($attempt * 5)
-    }
-}
-if (-not $downloaded) {
-    throw "failed to download $artifactName after 5 attempts."
-}
-
-Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-
+$extractDir = Save-Artifact $artifactName $downloadUrl
 $endpointFile = Get-ChildItem -Path $extractDir -Filter 'endpoint.txt' -Recurse -File | Select-Object -First 1
 if (-not $endpointFile) {
     Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object { Write-Host $_.FullName }
@@ -147,6 +190,53 @@ if ($remaining -lt $minHostLife) {
     throw "SQL host endpoint expires in ${remaining}s (need >= ${minHostLife}s)."
 }
 Write-Host "SQL host has ${remaining}s of life remaining (over the ${minHostLife}s threshold)."
+
+$credDeadline = (Get-Date).AddSeconds($credentialWait)
+$credUrl = $null
+while ($true) {
+    $now = Get-Date
+    if ($now -ge $credDeadline) {
+        Write-Host "##vso[task.logissue type=error]SQL credential $credArtifact did not appear within ${credentialWait}s. Check the SQL host job's credential-serving step for a rejected $keyArtifact."
+        throw "SQL credential $credArtifact did not appear within ${credentialWait}s."
+    }
+    try {
+        $credUrl = Get-ArtifactDownloadUrl $credArtifact
+        if ($credUrl) {
+            Write-Host "SQL credential $credArtifact found."
+            break
+        }
+    } catch {
+        Write-Warning "artifact list HTTP error: $_"
+    }
+    Write-Host "$($now.ToUniversalTime().ToString('HH:mm:ss')) waiting for $credArtifact; $([int]($credDeadline - $now).TotalSeconds)s left."
+    Start-Sleep -Seconds $pollInterval
+}
+
+$credExtractDir = Save-Artifact $credArtifact $credUrl
+$credFile = Get-ChildItem -Path $credExtractDir -Filter 'credential.bin' -Recurse -File | Select-Object -First 1
+if (-not $credFile) {
+    throw "credential.bin not found inside $credArtifact artifact."
+}
+try {
+    $plain = $rsa.Decrypt([IO.File]::ReadAllBytes($credFile.FullName), [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+} catch {
+    throw "$credArtifact could not be decrypted with this job's key."
+} finally {
+    $rsa.Dispose()
+}
+$password = [Text.Encoding]::ASCII.GetString($plain)
+[Array]::Clear($plain, 0, $plain.Length)
+if ($password -cnotmatch '\AAa1![A-Za-z0-9]{22}\z') {
+    throw "$credArtifact did not decrypt to a valid SQL password."
+}
+$remaining = [int]$fields[2] - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+if ($remaining -lt $minHostLife) {
+    throw "SQL host endpoint expires in ${remaining}s after credential exchange (need >= ${minHostLife}s)."
+}
+Write-Host "SQL host has ${remaining}s of life remaining after credential exchange."
+Write-Host "##vso[task.setvariable variable=SQL_PASSWORD;issecret=true]$password"
+Write-Host '##vso[task.setvariable variable=SQL_PASSWORD_GENERATED]1'
+Write-Host "Received SQL password from the SQL host (length=$($password.Length))."
 
 Write-Host "Resolved SQL endpoint: host=$dbHost port=$dbPort"
 Write-Host "##vso[task.setvariable variable=DB_HOST]$dbHost"
