@@ -14,6 +14,7 @@ use mssql_tds::datatypes::sql_string::EncodingType;
 use mssql_tds::encoding_rs::{CoderResult, WINDOWS_1252};
 
 const CP1252_SCRATCH_UNITS: usize = 256;
+const UTF16_READ_CHUNK_UNITS: usize = 64;
 
 /// Resolve only when delivery can proceed: unknown LCIDs use the shared
 /// resolver's CP1252 fallback and warning, without a second generic decode.
@@ -251,11 +252,75 @@ pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -
             Ok(len) => len,
         }
     };
-    let units = (0..len).map(|index| {
-        // SAFETY: each unit is within the caller's readable extent. Do not
-        // form a slice: even an empty slice requires an aligned pointer.
-        unsafe { ptr.add(index).read_unaligned() }
-    });
+
+    // Statement text is mostly ASCII, so whole chunks are narrowed at once and
+    // only chunks holding a non-ASCII unit are decoded scalar by scalar.
+    let mut text = String::with_capacity(len);
+    let mut chunk = [0_u16; UTF16_READ_CHUNK_UNITS];
+    let mut ascii = [0_u8; UTF16_READ_CHUNK_UNITS];
+    let mut start = 0;
+    while start < len {
+        let count = (len - start).min(UTF16_READ_CHUNK_UNITS);
+        // SAFETY: `start + count <= len` stays within the caller's readable
+        // extent. Copying bytes into the aligned stack buffer permits an
+        // unaligned source without forming a slice over application memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr.add(start).cast::<u8>(),
+                chunk.as_mut_ptr().cast::<u8>(),
+                count * size_of::<SqlWChar>(),
+            );
+        }
+        let units = chunk.get(..count).unwrap_or_default();
+        if units.iter().fold(0, |any, &unit| any | unit) < 0x80 {
+            for (byte, &unit) in ascii.iter_mut().zip(units) {
+                [*byte, _] = unit.to_le_bytes();
+            }
+            // Every byte is below 0x80, so the conversion cannot fail.
+            let narrowed = ascii.get(..count).unwrap_or_default();
+            text.push_str(std::str::from_utf8(narrowed).unwrap_or_default());
+            start += count;
+            continue;
+        }
+        // A high surrogate ending a chunk is left for the next one, so a pair
+        // straddling the edge decodes whole. Only a full chunk can be followed
+        // by more input, so the decoded prefix is never empty.
+        let decoded = match units.split_last() {
+            Some((&last, head)) if is_high_surrogate(last) && start + count < len => head,
+            _ => units,
+        };
+        text.extend(
+            char::decode_utf16(decoded.iter().copied())
+                .map(|scalar| scalar.unwrap_or(char::REPLACEMENT_CHARACTER)),
+        );
+        start += decoded.len();
+    }
+    text
+}
+
+/// The per-scalar decoder [`read_utf16_long`] replaced, kept as its
+/// differential oracle.
+///
+/// # Safety
+/// Same contract as [`read_utf16_long`].
+#[cfg(test)]
+unsafe fn read_utf16_long_reference(ptr: *const SqlWChar, length: SqlInteger) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let len = if length == SqlInteger::from(SQL_NTS) {
+        let mut len = 0usize;
+        while unsafe { ptr.add(len).read_unaligned() } != 0 {
+            len += 1;
+        }
+        len
+    } else {
+        match usize::try_from(length) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(len) => len,
+        }
+    };
+    let units = (0..len).map(|index| unsafe { ptr.add(index).read_unaligned() });
     char::decode_utf16(units)
         .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect()
@@ -472,7 +537,8 @@ mod tests {
     use super::{
         copy_cp1252_with_nul, copy_utf16_with_nul, copy_utf16le_with_nul, copy_with_nul, is_cp1252,
         is_high_surrogate, is_low_surrogate, is_surrogate_pair, read_utf16, read_utf16_attr,
-        read_utf16_long, rewrite_param_markers, rewrite_param_markers_reference, write_if_some,
+        read_utf16_long, read_utf16_long_reference, rewrite_param_markers,
+        rewrite_param_markers_reference, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlSmallInt, SqlWChar};
 
@@ -846,6 +912,151 @@ mod tests {
             unsafe { read_utf16_long(buf.as_ptr(), SqlInteger::from(SQL_NTS)) },
             "a"
         );
+    }
+
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Unit classes the chunked decoder treats differently: ASCII edges,
+    /// BMP scalars, noncharacters, BOM, paired and unpaired surrogates, NUL.
+    const DECODE_ALPHABET: &[u16] = &[
+        0x41, 0x7F, 0x80, 0xE9, 0x07FF, 0x0800, 0x6771, 0xFFFE, 0xFFFF, 0xFEFF, 0xD83D, 0xDE00,
+        0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0,
+    ];
+
+    /// Compares the chunked reader with its oracle at both alignments, with
+    /// an explicit count and with `SQL_NTS`.
+    fn assert_read_matches_reference(units: &[u16]) {
+        let mut storage = vec![0_u16; units.len() + 2];
+        for offset in [0, 1] {
+            let base = storage.as_mut_ptr().cast::<u8>().wrapping_add(offset);
+            for (index, unit) in units.iter().chain(&[0]).enumerate() {
+                unsafe { base.cast::<u16>().add(index).write_unaligned(*unit) };
+            }
+            let ptr = base.cast::<SqlWChar>().cast_const();
+            let len = SqlInteger::try_from(units.len()).unwrap();
+            for length in [len, SqlInteger::from(SQL_NTS)] {
+                assert_eq!(
+                    unsafe { read_utf16_long(ptr, length) },
+                    unsafe { read_utf16_long_reference(ptr, length) },
+                    "{units:04X?} offset {offset} length {length}"
+                );
+            }
+        }
+    }
+
+    fn random_units(rng: &mut SplitMix64) -> Vec<u16> {
+        let len = rng.below(301);
+        match rng.below(3) {
+            0 => (0..len)
+                .map(|_| match rng.below(8) {
+                    0 => DECODE_ALPHABET[rng.below(DECODE_ALPHABET.len())],
+                    _ => 1 + rng.below(0x7F) as u16,
+                })
+                .collect(),
+            1 => (0..len)
+                .map(|_| DECODE_ALPHABET[rng.below(DECODE_ALPHABET.len())])
+                .collect(),
+            _ => (0..len).map(|_| rng.next() as u16).collect(),
+        }
+    }
+
+    /// One of sixteen 62.5k-input shards, so the 1M inputs stay inside
+    /// nextest's per-test timeout under coverage instrumentation.
+    fn chunked_decode_shard(shard: u64) {
+        let mut rng = SplitMix64(0x7574_6631_362D_7264 ^ shard);
+        for _ in 0..62_500 {
+            assert_read_matches_reference(&random_units(&mut rng));
+        }
+    }
+
+    macro_rules! chunked_decode_shards {
+        ($($name:ident = $shard:literal),* $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    chunked_decode_shard($shard);
+                }
+            )*
+        };
+    }
+
+    chunked_decode_shards! {
+        chunked_utf16_read_matches_scalar_decode_0 = 0,
+        chunked_utf16_read_matches_scalar_decode_1 = 1,
+        chunked_utf16_read_matches_scalar_decode_2 = 2,
+        chunked_utf16_read_matches_scalar_decode_3 = 3,
+        chunked_utf16_read_matches_scalar_decode_4 = 4,
+        chunked_utf16_read_matches_scalar_decode_5 = 5,
+        chunked_utf16_read_matches_scalar_decode_6 = 6,
+        chunked_utf16_read_matches_scalar_decode_7 = 7,
+        chunked_utf16_read_matches_scalar_decode_8 = 8,
+        chunked_utf16_read_matches_scalar_decode_9 = 9,
+        chunked_utf16_read_matches_scalar_decode_10 = 10,
+        chunked_utf16_read_matches_scalar_decode_11 = 11,
+        chunked_utf16_read_matches_scalar_decode_12 = 12,
+        chunked_utf16_read_matches_scalar_decode_13 = 13,
+        chunked_utf16_read_matches_scalar_decode_14 = 14,
+        chunked_utf16_read_matches_scalar_decode_15 = 15,
+    }
+
+    #[test]
+    fn surrogates_at_every_chunk_edge_decode_like_scalar_decode() {
+        let patterns: &[&[u16]] = &[
+            &[0xD83D, 0xDE00],
+            &[0xD83D],
+            &[0xDE00],
+            &[0xD83D, 0xD83D, 0xDE00],
+            &[0xD83D, 0x41],
+            &[0xDE00, 0xD83D],
+            &[0xE9],
+            &[0x6771, 0xD83D, 0xDE00],
+        ];
+        for &pattern in patterns {
+            for prefix in 0..=200 {
+                for suffix in [0, 1, 62, 63, 64, 65] {
+                    let units: Vec<u16> = std::iter::repeat_n(0x61, prefix)
+                        .chain(pattern.iter().copied())
+                        .chain(std::iter::repeat_n(0x62, suffix))
+                        .collect();
+                    assert_read_matches_reference(&units);
+                }
+            }
+        }
+        let paired: Vec<u16> = "😀".encode_utf16().collect();
+        let mut units = vec![0x61; 63];
+        units.extend_from_slice(&paired);
+        units.push(0x62);
+        assert_eq!(
+            unsafe { read_utf16_long(units.as_ptr(), 66) },
+            format!("{}😀b", "a".repeat(63))
+        );
+    }
+
+    #[test]
+    fn chunked_utf16_read_handles_16_kib_statements() {
+        let mut rng = SplitMix64(0x0016_4B1B_D7C0);
+        for _ in 0..64 {
+            let mut units: Vec<u16> = (0..16_384).map(|_| 0x20 + rng.below(0x5F) as u16).collect();
+            for _ in 0..rng.below(8) {
+                let at = rng.below(units.len());
+                units[at] = DECODE_ALPHABET[rng.below(DECODE_ALPHABET.len() - 1)];
+            }
+            assert_read_matches_reference(&units);
+        }
     }
 
     #[test]
