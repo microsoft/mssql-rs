@@ -6,9 +6,7 @@
 //! The global OpenTelemetry meter is a no-op unless the host installs a meter
 //! provider. This crate deliberately does not choose or configure an exporter.
 
-use opentelemetry::metrics::{Counter, Meter};
 use opentelemetry::{KeyValue, global};
-use std::sync::OnceLock;
 
 const INSTRUMENTATION_SCOPE: &str = "mssql-sqlcmd";
 const SCHEMA_VERSION: &str = "1";
@@ -26,29 +24,6 @@ const OUTCOME_KEY: &str = "sqlcmdcli_outcome";
 
 const INVOCATION_METRIC: &str = "sqlcmdcli_invocation";
 const COMPLETION_METRIC: &str = "sqlcmdcli_completion";
-
-static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
-
-#[derive(Debug)]
-struct Instruments {
-    invocation: Counter<u64>,
-    completion: Counter<u64>,
-}
-
-impl Instruments {
-    fn new(meter: &Meter) -> Self {
-        Self {
-            invocation: meter
-                .u64_counter(INVOCATION_METRIC)
-                .with_description("Number of sqlcmd invocations")
-                .build(),
-            completion: meter
-                .u64_counter(COMPLETION_METRIC)
-                .with_description("Number of completed sqlcmd invocations")
-                .build(),
-        }
-    }
-}
 
 /// Bounded outcome categories for a completed sqlcmd invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,8 +49,10 @@ impl CompletionOutcome {
 
 /// Records one process invocation using only bounded common properties.
 pub fn record_invocation(sqlcmd_version: Option<&str>) {
-    instruments()
-        .invocation
+    global::meter(INSTRUMENTATION_SCOPE)
+        .u64_counter(INVOCATION_METRIC)
+        .with_description("Number of sqlcmd invocations")
+        .build()
         .add(1, &common_attributes(sqlcmd_version));
 }
 
@@ -83,11 +60,11 @@ pub fn record_invocation(sqlcmd_version: Option<&str>) {
 pub fn record_completion(sqlcmd_version: Option<&str>, outcome: CompletionOutcome) {
     let mut attributes = common_attributes(sqlcmd_version);
     attributes.push(KeyValue::new(OUTCOME_KEY, outcome.as_str()));
-    instruments().completion.add(1, &attributes);
-}
-
-fn instruments() -> &'static Instruments {
-    INSTRUMENTS.get_or_init(|| Instruments::new(&global::meter(INSTRUMENTATION_SCOPE)))
+    global::meter(INSTRUMENTATION_SCOPE)
+        .u64_counter(COMPLETION_METRIC)
+        .with_description("Number of completed sqlcmd invocations")
+        .build()
+        .add(1, &attributes);
 }
 
 fn common_attributes(sqlcmd_version: Option<&str>) -> Vec<KeyValue> {
