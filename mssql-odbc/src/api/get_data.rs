@@ -6457,7 +6457,9 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT plp_info\0".encode_utf16().collect();
         assert_eq!(
-            unsafe { crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe {
+                crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into())
+            },
             SQL_SUCCESS
         );
         assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);
@@ -10761,7 +10763,11 @@ mod tests {
         let query: Vec<u16> = "SELECT carry\0".encode_utf16().collect();
         assert_eq!(
             unsafe {
-                crate::api::exec_direct::sql_exec_direct_w(handles.stmt, query.as_ptr(), SQL_NTS)
+                crate::api::exec_direct::sql_exec_direct_w(
+                    handles.stmt,
+                    query.as_ptr(),
+                    SQL_NTS.into(),
+                )
             },
             SQL_SUCCESS
         );
@@ -11016,7 +11022,7 @@ mod tests {
                     crate::api::exec_direct::sql_exec_direct_w(
                         handles.stmt,
                         query.as_ptr(),
-                        SQL_NTS,
+                        SQL_NTS.into(),
                     )
                 },
                 SQL_SUCCESS
@@ -11133,7 +11139,11 @@ mod tests {
             let next_stmt = handles.alloc_extra_stmt();
             assert_eq!(
                 unsafe {
-                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        next_stmt,
+                        query.as_ptr(),
+                        SQL_NTS.into(),
+                    )
                 },
                 SQL_SUCCESS
             );
@@ -11199,7 +11209,7 @@ mod tests {
                     crate::api::exec_direct::sql_exec_direct_w(
                         handles.stmt,
                         query.as_ptr(),
-                        SQL_NTS,
+                        SQL_NTS.into(),
                     )
                 },
                 SQL_SUCCESS
@@ -11279,7 +11289,11 @@ mod tests {
             let next_stmt = handles.alloc_extra_stmt();
             assert_eq!(
                 unsafe {
-                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        next_stmt,
+                        query.as_ptr(),
+                        SQL_NTS.into(),
+                    )
                 },
                 SQL_SUCCESS
             );
@@ -12487,7 +12501,7 @@ mod tests {
             let sql: Vec<u16> = "SELECT null_plp\0".encode_utf16().collect();
             assert_eq!(
                 unsafe {
-                    crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS)
+                    crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into())
                 },
                 SQL_SUCCESS
             );
@@ -12602,7 +12616,9 @@ mod tests {
         let server = crate::test_support::connect_mock_server(dbc, "SELECT plp_switch", response);
         let sql: Vec<u16> = "SELECT plp_switch\0".encode_utf16().collect();
         assert_eq!(
-            unsafe { crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe {
+                crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into())
+            },
             SQL_SUCCESS
         );
         assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);

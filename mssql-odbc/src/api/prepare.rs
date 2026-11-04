@@ -9,10 +9,9 @@ use mssql_tds::connection::tds_client::PreparedStatement;
 
 use super::escape::translate_and_rewrite;
 use super::sqlstate::*;
-use super::util::read_utf16;
+use super::util::read_utf16_long;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
-    SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS, SqlHandle, SqlInteger, SqlReturn, SqlWChar,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
@@ -35,7 +34,7 @@ use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 pub(crate) unsafe fn sql_prepare_w(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     crate::ffi_entry!(
         "SQLPrepareW",
@@ -57,7 +56,7 @@ pub(crate) unsafe fn sql_prepare_w(
 unsafe fn sql_prepare_w_impl(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLPrepareW: statement_handle is null");
@@ -77,11 +76,11 @@ unsafe fn sql_prepare_w_impl(
         "SQLPrepareW: statement_text is null — DM should have rejected this"
     );
     debug_assert!(
-        text_length == SQL_NTS || text_length >= 0,
+        text_length == SqlInteger::from(SQL_NTS) || text_length >= 0,
         "SQLPrepareW: invalid text_length ({text_length}) — DM should have rejected this"
     );
 
-    let sql = unsafe { read_utf16(statement_text, text_length) };
+    let sql = unsafe { read_utf16_long(statement_text, text_length) };
     sql_prepare_w_safe(stmt, sql)
 }
 
@@ -188,7 +187,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_prepare_w(SQL_NULL_HANDLE, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_prepare_w(SQL_NULL_HANDLE, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
     }
 
@@ -201,7 +200,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_SUCCESS);
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -245,7 +244,7 @@ mod tests {
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(
-            unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_SUCCESS
         );
 
@@ -271,7 +270,7 @@ mod tests {
     fn null_statement_text_returns_error() {
         let h = TestHandles::with_env_dbc_stmt();
 
-        let ret = unsafe { sql_prepare_w(h.stmt, std::ptr::null(), SQL_NTS) };
+        let ret = unsafe { sql_prepare_w(h.stmt, std::ptr::null(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_ERROR);
     }
 
@@ -283,8 +282,64 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         // DBC is not connected — prepare needs a live connection.
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    /// `TextLength` is a `SQLINTEGER`. Read as 16 bits, 40000 and 65536 became
+    /// empty text, 70000 a 4464-unit prefix, and 65533 `SQL_NTS`.
+    #[test]
+    fn prepare_reads_text_length_beyond_i16() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        for len in [32_767, 32_768, 40_000, 65_533, 65_536, 70_000] {
+            let (text, buffer) = crate::test_support::padded_statement_text(len);
+            let text_length = SqlInteger::try_from(len).unwrap();
+            assert_eq!(
+                unsafe { crate::api::SQLPrepareW(h.stmt, buffer.as_ptr(), text_length) },
+                SQL_SUCCESS,
+                "TextLength {len}"
+            );
+            let state = stmt.inner.lock().unwrap();
+            let plan = state.prepared.as_ref().expect("statement prepared");
+            assert_eq!(plan.original_sql, text, "TextLength {len}");
+            assert_eq!(plan.stmt.sql(), text, "TextLength {len}");
+        }
+    }
+
+    /// The DM rejects these with HY090 before the driver sees them, so the
+    /// driver only asserts the contract, as msodbcsql relies on it too.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn negative_text_length_other_than_nts_violates_dm_contract() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+
+        for text_length in [-1, -2, -4, -32_768, SqlInteger::MIN] {
+            assert_eq!(
+                unsafe { crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), text_length) },
+                SQL_ERROR,
+                "TextLength {text_length}"
+            );
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.prepared.is_none());
+            assert!(!state.has_state(STMT_STATE_PREPARED));
+        }
+
+        let terminated: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe { crate::api::SQLPrepareW(h.stmt, terminated.as_ptr(), SQL_NTS.into()) },
+            SQL_SUCCESS
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.prepared.as_ref().map(|p| p.stmt.sql()),
+            Some("SELECT 1")
+        );
     }
 }

@@ -185,7 +185,7 @@ mod tests {
                     crate::api::SQLExecDirectW(
                         handle,
                         sql.as_ptr(),
-                        i16::try_from(sql.len()).unwrap(),
+                        i32::try_from(sql.len()).unwrap(),
                     )
                 };
                 assert_eq!(SQL_SUCCESS, exec(h.stmt));
@@ -265,7 +265,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             if deferred {
                 assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -323,7 +323,7 @@ mod tests {
             ));
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
             crate::api::SQLCancel(h.stmt)
@@ -355,7 +355,7 @@ mod tests {
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         for handle in [h.stmt, other] {
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(handle, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             if handle == h.stmt {
                 for _ in 0..3 {
@@ -406,7 +406,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             let exec = || unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             };
             assert_eq!(SQL_SUCCESS, exec());
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -552,7 +552,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         let exec = |handle| unsafe {
-            crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(handle, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         };
         assert_eq!(SQL_SUCCESS, exec(h.stmt));
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -637,7 +637,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT ? + ?".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             let mut indicators = [SQL_DATA_AT_EXEC; 2];
             let mut tokens = [0u8; 2];
@@ -717,7 +717,7 @@ mod tests {
             });
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         }
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(
             SQL_SUCCESS,
             unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             },
             "{:?}",
             stmt.inner.lock().unwrap().diag_records
@@ -1161,7 +1161,7 @@ mod tests {
         });
         if acknowledge {
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         }
@@ -1267,7 +1267,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         let exec = || unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         };
         assert_eq!(SQL_SUCCESS, exec());
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -1315,7 +1315,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         assert!(dbc.inner.lock().unwrap().wire.owner().is_none());
@@ -1330,7 +1330,7 @@ mod tests {
             crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
         });
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         assert_eq!(SQL_SUCCESS, unsafe {
@@ -1421,7 +1421,7 @@ mod tests {
         before_reuse();
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         let mut value = 0i32;
@@ -1503,7 +1503,7 @@ mod tests {
             }
             .encode_utf16()
             .collect();
-            let sql_len = i16::try_from(sql.len()).unwrap();
+            let sql_len = i32::try_from(sql.len()).unwrap();
             let mut values = [7i32, 8];
             let mut indicator = SQL_DATA_AT_EXEC;
             if matches!(path, "streamed" | "deferred") {
@@ -1663,7 +1663,7 @@ mod tests {
             }
             .encode_utf16()
             .collect();
-            let sql_len = i16::try_from(sql.len()).unwrap();
+            let sql_len = i32::try_from(sql.len()).unwrap();
             if prepared {
                 assert_eq!(SQL_SUCCESS, unsafe {
                     crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), sql_len)
