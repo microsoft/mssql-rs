@@ -500,6 +500,12 @@ impl<'a> PacketWriter<'a> {
         let deadline = self
             .max_timeout_sec
             .map(|seconds| self.start_time + Duration::from_secs(u64::from(seconds)));
+        // The timer driver may not have observed expiry during synchronous work.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(TimeoutError(TimeoutErrorType::String(
+                "Timeout expired".to_string(),
+            )));
+        }
         let elapsed = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -882,6 +888,7 @@ pub(crate) mod tests {
         pub(crate) data: Vec<u8>,
         pub(crate) reset_mode: ResetConnectionMode,
         pub(crate) reset_dispatched: bool,
+        blocking_send: Option<Duration>,
     }
 
     impl MockNetworkWriter {
@@ -891,6 +898,7 @@ pub(crate) mod tests {
                 data: vec![],
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
+                blocking_send: None,
             }
         }
     }
@@ -899,7 +907,9 @@ pub(crate) mod tests {
     impl NetworkWriter for MockNetworkWriter {
         #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
         async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
-            // No op
+            if let Some(duration) = self.blocking_send {
+                std::thread::sleep(duration);
+            }
             self.data.extend_from_slice(_data);
             Ok(())
         }
@@ -1920,6 +1930,68 @@ pub(crate) mod tests {
         // Two packets were needed; payload reassembles to the full 16 bytes.
         assert!(mock.data.len() > packet_size as usize);
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_after_synchronous_work_does_not_send() {
+        for with_settlement in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            writer.write_async(&[0xAB; 4]).await.unwrap();
+            // Keep the runtime's timer driver from observing expiry first.
+            std::thread::sleep(Duration::from_millis(1100));
+
+            let result = writer.finalize().await;
+            let message = writer.suspend();
+            assert!(matches!(result, Err(TimeoutError(_))), "{result:?}");
+            assert!(message.nothing_sent());
+            assert!(!message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.message_complete());
+            assert!(mock.data.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_send_overrun_preserves_message_accounting() {
+        for (final_packet, with_settlement) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.blocking_send = Some(Duration::from_millis(1100));
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            let result = if final_packet {
+                writer.write_async(&[0xAB; 4]).await.unwrap();
+                writer.finalize().await
+            } else {
+                writer.write_async(&[0xAB; 9]).await
+            };
+            let message = writer.suspend();
+            assert!(matches!(result, Err(TimeoutError(_))), "{result:?}");
+            assert!(message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.nothing_sent());
+            assert_eq!(message.message_complete(), final_packet);
+            assert!(!mock.data.is_empty());
+            assert_eq!(
+                mock.data[1] & PacketStatusFlags::Eom as u8 != 0,
+                final_packet
+            );
+        }
     }
 
     /// An expired deadline must win before the final packet is sent, leaving no

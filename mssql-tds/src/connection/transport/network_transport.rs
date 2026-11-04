@@ -4232,10 +4232,10 @@ pub(crate) mod tests {
         use crate::connection::transport::tds_transport::TdsTransport;
 
         let (inner, mut peer) = duplex(1);
-        let events = Arc::new(Mutex::new([false; 4]));
+        let events = Arc::new(Mutex::new([false; 5]));
         let (handle, stream) =
             extractable_stream::ExtractableStreamHandle::new(Box::new(HookTrackingStream {
-                inner,
+                inner: Box::new(inner),
                 events: Arc::clone(&events),
             }));
         let context = ClientContext::default();
@@ -4258,7 +4258,7 @@ pub(crate) mod tests {
             .expect("abort must release all stream owners")
             .unwrap();
         assert!(received.is_empty());
-        assert_eq!(*events.lock().unwrap(), [false; 4]);
+        assert_eq!(*events.lock().unwrap(), [false, false, false, false, true]);
         assert!(transport.stream.is_none());
         assert!(transport.extractable_stream_handle.is_none());
         assert!(transport.connection_known_dead());
