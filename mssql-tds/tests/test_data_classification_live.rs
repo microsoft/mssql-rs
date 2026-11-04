@@ -436,6 +436,69 @@ mod data_classification_live {
         assert_classification_shapes(DataClassificationVersion::Version1).await;
     }
 
+    /// A STATIC server cursor adds a trailing ROWSTAT column that SQL Server
+    /// does not classify, so its classification covers one column fewer than
+    /// the result set. msodbcsql requests V1 and uses `sp_cursoropen` for
+    /// STATIC cursors, so this shape must not fail the query or the connection.
+    async fn assert_static_cursor_classification(version: DataClassificationVersion) {
+        with_classified_table(|select| async move {
+            let mut client = connect(Some(version)).await;
+            let mut result = client
+                .execute(
+                    format!(
+                        "DECLARE @cursor INT, @rows INT; \
+                         EXEC sp_cursoropen @cursor OUTPUT, N'{select}', 8, 1, @rows OUTPUT; \
+                         EXEC sp_cursorfetch @cursor, 2, 1, 10; \
+                         EXEC sp_cursorclose @cursor;"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut cursor_results = 0;
+            let mut rows = 0;
+            while result != StatementResult::End {
+                if result == StatementResult::Rows {
+                    cursor_results += 1;
+                    assert_eq!(client.get_metadata().len(), 5, "4 columns and ROWSTAT");
+                    let metadata = client
+                        .data_classification()
+                        .expect("SQL Server sent no classification")
+                        .clone();
+                    assert_eq!(metadata.columns().len(), 4);
+                    assert_column(&metadata, 0, None, version);
+                    assert_column(&metadata, 1, Some(&SSN), version);
+                    assert_column(&metadata, 2, Some(&EMAIL), version);
+                    assert_column(&metadata, 3, None, version);
+                    while client.next_row().await.unwrap().is_some() {
+                        rows += 1;
+                    }
+                }
+                result = client.advance().await.unwrap();
+            }
+            assert_eq!(cursor_results, 2, "the open and the fetch");
+            assert_eq!(rows, ROWS.len());
+            client.close_query().await.unwrap();
+            assert!(!client.is_connection_dead());
+
+            client.execute(select, ()).await.unwrap();
+            assert_classified_result(&mut client, version).await;
+            client.close_query().await.unwrap();
+            client.close_connection().await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn live_v1_static_cursor_classification_skips_rowstat() {
+        assert_static_cursor_classification(DataClassificationVersion::Version1).await;
+    }
+
+    #[tokio::test]
+    async fn live_v2_static_cursor_classification_skips_rowstat() {
+        assert_static_cursor_classification(DataClassificationVersion::Version2).await;
+    }
+
     /// Without the feature SQL Server sends no `0xA3`, so the query reads as before.
     #[tokio::test]
     async fn live_unrequested_connection_receives_no_classification() {

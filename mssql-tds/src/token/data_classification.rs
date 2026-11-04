@@ -221,9 +221,11 @@ impl DataClassificationMetadata {
         self.rank
     }
 
-    /// Per-column sensitivity, in column order. Either one entry per
-    /// result-set column, or empty when the server sent no per-column data;
-    /// any other count is rejected as a protocol error.
+    /// Per-column sensitivity, in column order. Empty when the server sent no
+    /// per-column data. Otherwise it covers the result set's leading columns:
+    /// usually all of them, but for a server cursor SQL Server does not
+    /// classify the trailing ROWSTAT column, so look entries up with
+    /// `columns().get(i)` and treat a missing one as unclassified.
     pub fn columns(&self) -> &[ColumnSensitivity] {
         &self.columns
     }

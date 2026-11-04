@@ -720,21 +720,30 @@ mod data_classification_tests {
         server.stop().await;
     }
 
-    /// [MS-TDS] 2.2.7.5: the per-column count is 0 or the COLMETADATA count.
-    /// A two-column result classified for one column breaks that, and the
-    /// client cannot tell which column the entry belongs to.
+    /// The per-column data may cover fewer columns than the result set, as SQL
+    /// Server sends for a server cursor's trailing ROWSTAT column; those
+    /// columns are unclassified. Covering more cannot be mapped, so it is
+    /// dropped. Neither desynchronizes the stream, so the connection, its
+    /// rows and its next command are unaffected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn classification_column_count_must_match_the_result_set() {
-        const MISMATCHED: &str = "SELECT SSN, PHONE FROM MISMATCHED";
+    async fn classification_covers_at_most_the_result_columns() {
+        const FEWER: &str = "SELECT SSN, PHONE FROM FEWER";
+        const MORE: &str = "SELECT SSN, PHONE FROM MORE";
         const NO_COLUMNS: &str = "SELECT SSN, PHONE FROM NO_COLUMNS";
         let version = DataClassificationVersion::Version2;
         let server = Server::start_recoverable(version).await;
+        let column = [(0, UNSPECIFIED, 30)];
         {
             let mut registry = server.registry.lock().await;
             registry.register_with_data_classification(
-                MISMATCHED,
+                FEWER,
                 int_response(&["ssn", "phone"], 7),
-                token(version, &[("L", "L")], &[], 30, &[&[(0, UNSPECIFIED, 30)]]),
+                token(version, &[("L", "L")], &[], 30, &[&column]),
+            );
+            registry.register_with_data_classification(
+                MORE,
+                int_response(&["ssn", "phone"], 7),
+                token(version, &[("L", "L")], &[], 30, &[&column, &[], &column]),
             );
             registry.register_with_data_classification(
                 NO_COLUMNS,
@@ -757,19 +766,32 @@ mod data_classification_tests {
         assert_eq!(client.data_classification().unwrap().columns().len(), 2);
         client.close_query().await.unwrap();
 
-        let error = client
-            .execute(MISMATCHED.to_string(), ())
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("classification for 1 columns does not match the 2 columns"),
-            "{error}"
+        client.execute(FEWER.to_string(), ()).await.unwrap();
+        let metadata = client.data_classification().expect("classification");
+        let [first] = metadata.columns() else {
+            panic!("expected one column, got {:?}", metadata.columns());
+        };
+        assert!(first.is_classified());
+        assert!(metadata.columns().get(1).is_none());
+        assert_eq!(
+            client.next_row().await.unwrap(),
+            Some(vec![ColumnValues::Int(7), ColumnValues::Int(7)])
         );
-        assert!(client.is_connection_dead());
-        assert!(!client.is_session_recovery_enabled());
+        client.close_query().await.unwrap();
+
+        client.execute(MORE.to_string(), ()).await.unwrap();
         assert!(client.data_classification().is_none());
+        assert_eq!(
+            client.next_row().await.unwrap(),
+            Some(vec![ColumnValues::Int(7), ColumnValues::Int(7)])
+        );
+        client.close_query().await.unwrap();
+
+        assert!(!client.is_connection_dead());
+        assert!(client.is_session_recovery_enabled());
+        client.execute(CLASSIFIED.to_string(), ()).await.unwrap();
+        assert_eq!(client.data_classification().unwrap().columns().len(), 2);
+        client.close_query().await.unwrap();
 
         server.stop().await;
     }

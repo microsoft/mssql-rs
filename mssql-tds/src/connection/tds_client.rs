@@ -28,9 +28,7 @@ use crate::message::transaction_management::{
 };
 use crate::query::result::ReturnValue;
 use crate::token::data_classification::{DataClassificationMetadata, DataClassificationVersion};
-use crate::token::parsers::data_classification_parser::{
-    classification_error, is_classification_error,
-};
+use crate::token::parsers::data_classification_parser::is_classification_error;
 use crate::token::tokens::{SessionStateToken, SqlCollation};
 use crate::{
     connection::execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
@@ -6116,12 +6114,10 @@ impl TdsClient {
             if let Some(start) = start {
                 self.update_remaining_timeout(start);
             }
-            let result = result.and_then(|classification| {
-                classification
-                    .map(|classification| {
-                        Self::check_classification_columns(classification, metadata)
-                    })
-                    .transpose()
+            let result = result.map(|classification| {
+                classification.and_then(|classification| {
+                    Self::check_classification_columns(classification, metadata)
+                })
             });
             match result {
                 Ok(classification) => classification,
@@ -6155,23 +6151,31 @@ impl TdsClient {
         Ok(())
     }
 
-    /// [MS-TDS] 2.2.7.5: `NumResultSetColumns` is either 0, meaning no
-    /// per-column data, or exactly the COLMETADATA `Count`. SqlClient and JDBC
-    /// do not check this; SQL Server sends a matching count even when
-    /// `FOR BROWSE` adds hidden key columns.
+    /// Keeps a classification that covers at most the result set's columns.
+    ///
+    /// [MS-TDS] 2.2.7.5 has `NumResultSetColumns` either 0 or the COLMETADATA
+    /// `Count`, but for a STATIC or FAST_FORWARD server cursor SQL Server
+    /// classifies only the selected columns and not the trailing ROWSTAT
+    /// column it adds (checked against SQL Server 2022), so fewer entries are
+    /// accepted and the trailing columns are left unclassified. msodbcsql,
+    /// SqlClient and JDBC do not check the count at all. More entries than
+    /// columns cannot be mapped to them, so that classification is dropped.
+    /// The token was read whole, so the stream is still synchronized and the
+    /// connection stays usable.
     fn check_classification_columns(
         classification: DataClassificationMetadata,
         metadata: &ColMetadataToken,
-    ) -> TdsResult<DataClassificationMetadata> {
+    ) -> Option<DataClassificationMetadata> {
         let columns = classification.columns().len();
-        if columns != 0 && columns != usize::from(metadata.column_count) {
-            return Err(classification_error(format!(
-                "classification for {columns} columns does not match the {} columns in \
-                 COLMETADATA",
-                metadata.column_count
-            )));
+        if columns > usize::from(metadata.column_count) {
+            warn!(
+                classified = columns,
+                result_columns = metadata.column_count,
+                "Dropping DATACLASSIFICATION that classifies more columns than the result set has"
+            );
+            return None;
         }
-        Ok(classification)
+        Some(classification)
     }
 
     /// Resolves whether an RPC response has anything left after the no-row
@@ -11622,7 +11626,7 @@ mod tests {
     }
 
     #[test]
-    fn classification_columns_are_none_or_one_per_result_column() {
+    fn classification_never_covers_more_columns_than_the_result_set() {
         use crate::token::data_classification::{
             ColumnSensitivity, DataClassificationMetadata, DataClassificationVersion,
         };
@@ -11639,10 +11643,10 @@ mod tests {
             ],
         };
         let metadata = int_column_metadata(2);
-        for (columns, accepted) in [(0, true), (2, true), (1, false), (3, false)] {
+        for (columns, kept) in [(0, true), (1, true), (2, true), (3, false)] {
             let result =
                 TdsClient::check_classification_columns(classification(columns), &metadata);
-            assert_eq!(result.is_ok(), accepted, "{columns} columns: {result:?}");
+            assert_eq!(result.is_some(), kept, "{columns} columns: {result:?}");
         }
     }
 
@@ -11885,9 +11889,11 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_classification_in_the_prepared_batch_drain_retires_the_connection() {
         let mut transport = TestTransport::with_tokens(vec![empty_col_metadata()]);
-        transport.row_read_error = Some(classification_error(
-            "token received but the feature was not negotiated",
-        ));
+        transport.row_read_error = Some(
+            crate::token::parsers::data_classification_parser::classification_error(
+                "token received but the feature was not negotiated",
+            ),
+        );
         let mut client = create_test_client_with_transport(transport);
         client.recovery_context.session_recovery_negotiated = true;
         let statement_id = client.register_prepared_handle_for_test(42);
