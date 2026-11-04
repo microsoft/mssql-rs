@@ -68,10 +68,11 @@ pub extern "C" fn mssql_sqlcmd_version() -> *const std::ffi::c_char {
     VERSION.as_ptr().cast()
 }
 
-/// Records one sqlcmd invocation through the global OpenTelemetry meter.
+/// Captures one discrete sqlcmd invocation for the installed telemetry sink.
 ///
 /// The version is included only when it is a bounded version-like value.
-/// Telemetry is best effort: a panic is caught and never crosses the ABI.
+/// With no installed sink this is a no-op. Telemetry is best effort: a panic is
+/// caught and never crosses the ABI.
 ///
 /// # Safety
 /// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.
@@ -84,10 +85,11 @@ pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_invocation(sqlcmd_version
     }));
 }
 
-/// Records one sqlcmd completion through the global OpenTelemetry meter.
+/// Captures one discrete sqlcmd completion for the installed telemetry sink.
 ///
 /// Only a bounded outcome category is recorded. The raw exit code is not.
-/// Telemetry is best effort: a panic is caught and never crosses the ABI.
+/// With no installed sink this is a no-op. Telemetry is best effort: a panic is
+/// caught and never crosses the ABI.
 ///
 /// # Safety
 /// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.

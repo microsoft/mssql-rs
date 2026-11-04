@@ -62,10 +62,11 @@ for the depths, the report, the exit codes and what is shown or labelled.
 
 ## Telemetry
 
-The library exposes privacy-safe invocation and completion metrics through the
-global OpenTelemetry meter. It does not configure an exporter or send telemetry
-by itself. See the [telemetry contract](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
-for the stable properties, excluded data, and integration boundary.
+The library captures privacy-safe, discrete invocation and completion records
+behind an exporter-independent sink. With no approved provider installed,
+capture is a no-op and sends nothing. See the [telemetry architecture](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
+for the native and Rust flows, stable schema, privacy rules, and unresolved
+Application Insights and DataX onboarding.
 
 ## Build from source
 

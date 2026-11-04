@@ -11,7 +11,6 @@ description = "sqlcmd components in Rust, linked into native sqlcmd through a C 
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-opentelemetry = { version = "0.31", default-features = false, features = ["metrics"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

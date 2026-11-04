@@ -46,10 +46,10 @@ typedef struct MssqlSqlcmdText {
     size_t len; /* in UTF-16 code units, not bytes */
 } MssqlSqlcmdText;
 
-/* Privacy-safe, exporter-independent product telemetry. These calls use the
-   global OpenTelemetry meter, which is a no-op unless the host installs an
-   approved meter provider. sqlcmd_version is included only when it is a
-   bounded version-like value. Failures are ignored and never affect sqlcmd. */
+/* Privacy-safe, exporter-independent product telemetry. These calls capture
+   discrete typed invocation and completion records for an approved provider.
+   With no provider they are no-ops. sqlcmd_version is included only when it is
+   a bounded version-like value. Failures are ignored and never affect sqlcmd. */
 void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_invocation(
     MssqlSqlcmdText sqlcmd_version);
 void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_completion(

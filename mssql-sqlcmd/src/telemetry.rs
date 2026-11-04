@@ -3,27 +3,106 @@
 
 //! Privacy-safe, exporter-independent product telemetry for native sqlcmd.
 //!
-//! The global OpenTelemetry meter is a no-op unless the host installs a meter
-//! provider. This crate deliberately does not choose or configure an exporter.
+//! OpenTelemetry has no first-class custom-event signal. This module preserves
+//! discrete typed event records behind a sink boundary so an approved provider
+//! can map them to Application Insights `AppEvents` without changing capture.
 
-use opentelemetry::{KeyValue, global};
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
-const INSTRUMENTATION_SCOPE: &str = "mssql-sqlcmd";
+pub const INVOCATION_EVENT_NAME: &str = "sqlcmdcli_invocation";
+pub const COMPLETION_EVENT_NAME: &str = "sqlcmdcli_completion";
+
 const SCHEMA_VERSION: &str = "1";
 const IMPLEMENTATION: &str = "mssql-sqlcmd-rust";
 const RUNTIME: &str = "native";
 const MAX_VERSION_LEN: usize = 64;
 
-const SCHEMA_VERSION_KEY: &str = "sqlcmdcli_schema_version";
-const SQLCMD_VERSION_KEY: &str = "sqlcmdcli_version";
-const OS_KEY: &str = "sqlcmdcli_os";
-const ARCH_KEY: &str = "sqlcmdcli_arch";
-const IMPLEMENTATION_KEY: &str = "sqlcmdcli_implementation";
-const RUNTIME_KEY: &str = "sqlcmdcli_runtime";
-const OUTCOME_KEY: &str = "sqlcmdcli_outcome";
+static EVENT_SINK: OnceLock<Box<dyn EventSink>> = OnceLock::new();
 
-const INVOCATION_METRIC: &str = "sqlcmdcli_invocation";
-const COMPLETION_METRIC: &str = "sqlcmdcli_completion";
+/// A discrete product event ready for an approved provider to export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TelemetryEvent {
+    Invocation(InvocationEvent),
+    Completion(CompletionEvent),
+}
+
+impl TelemetryEvent {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Invocation(_) => INVOCATION_EVENT_NAME,
+            Self::Completion(_) => COMPLETION_EVENT_NAME,
+        }
+    }
+
+    pub fn common(&self) -> &CommonProperties {
+        match self {
+            Self::Invocation(event) => &event.common,
+            Self::Completion(event) => &event.common,
+        }
+    }
+}
+
+/// Common bounded properties shared by every sqlcmd product event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommonProperties {
+    timestamp: SystemTime,
+    schema_version: &'static str,
+    sqlcmd_version: Option<String>,
+    os: &'static str,
+    architecture: &'static str,
+    implementation: &'static str,
+    runtime: &'static str,
+}
+
+impl CommonProperties {
+    pub fn timestamp(&self) -> SystemTime {
+        self.timestamp
+    }
+
+    pub fn schema_version(&self) -> &'static str {
+        self.schema_version
+    }
+
+    pub fn sqlcmd_version(&self) -> Option<&str> {
+        self.sqlcmd_version.as_deref()
+    }
+
+    pub fn os(&self) -> &'static str {
+        self.os
+    }
+
+    pub fn architecture(&self) -> &'static str {
+        self.architecture
+    }
+
+    pub fn implementation(&self) -> &'static str {
+        self.implementation
+    }
+
+    pub fn runtime(&self) -> &'static str {
+        self.runtime
+    }
+}
+
+/// One native sqlcmd process invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationEvent {
+    common: CommonProperties,
+}
+
+/// One completed native sqlcmd process invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionEvent {
+    common: CommonProperties,
+    outcome: CompletionOutcome,
+}
+
+impl CompletionEvent {
+    pub fn outcome(&self) -> CompletionOutcome {
+        self.outcome
+    }
+}
 
 /// Bounded outcome categories for a completed sqlcmd invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +115,7 @@ pub enum CompletionOutcome {
 }
 
 impl CompletionOutcome {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -47,37 +126,76 @@ impl CompletionOutcome {
     }
 }
 
-/// Records one process invocation using only bounded common properties.
+/// Provider boundary implemented by a future approved Application Insights
+/// exporter. Implementations must handle their own failures without panicking.
+pub trait EventSink: Send + Sync {
+    fn record(&self, event: &TelemetryEvent);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventSinkAlreadyInstalled;
+
+/// Installs the process-wide event sink before native sqlcmd records events.
+///
+/// The first provider wins so event routing cannot change during a process.
+pub fn install_event_sink(sink: impl EventSink + 'static) -> Result<(), EventSinkAlreadyInstalled> {
+    EVENT_SINK
+        .set(Box::new(sink))
+        .map_err(|_| EventSinkAlreadyInstalled)
+}
+
+/// Captures one process invocation. With no installed provider this is a no-op.
 pub fn record_invocation(sqlcmd_version: Option<&str>) {
-    global::meter(INSTRUMENTATION_SCOPE)
-        .u64_counter(INVOCATION_METRIC)
-        .with_description("Number of sqlcmd invocations")
-        .build()
-        .add(1, &common_attributes(sqlcmd_version));
+    record_invocation_at(sqlcmd_version, SystemTime::now(), installed_sink());
 }
 
-/// Records one process completion without the exit code or error details.
+/// Captures one process completion. With no installed provider this is a no-op.
 pub fn record_completion(sqlcmd_version: Option<&str>, outcome: CompletionOutcome) {
-    let mut attributes = common_attributes(sqlcmd_version);
-    attributes.push(KeyValue::new(OUTCOME_KEY, outcome.as_str()));
-    global::meter(INSTRUMENTATION_SCOPE)
-        .u64_counter(COMPLETION_METRIC)
-        .with_description("Number of completed sqlcmd invocations")
-        .build()
-        .add(1, &attributes);
+    record_completion_at(sqlcmd_version, outcome, SystemTime::now(), installed_sink());
 }
 
-fn common_attributes(sqlcmd_version: Option<&str>) -> Vec<KeyValue> {
-    let mut attributes = Vec::with_capacity(6);
-    attributes.push(KeyValue::new(SCHEMA_VERSION_KEY, SCHEMA_VERSION));
-    attributes.push(KeyValue::new(OS_KEY, std::env::consts::OS));
-    attributes.push(KeyValue::new(ARCH_KEY, std::env::consts::ARCH));
-    attributes.push(KeyValue::new(IMPLEMENTATION_KEY, IMPLEMENTATION));
-    attributes.push(KeyValue::new(RUNTIME_KEY, RUNTIME));
-    if let Some(version) = sqlcmd_version.filter(|version| version_is_safe(version)) {
-        attributes.push(KeyValue::new(SQLCMD_VERSION_KEY, version.to_owned()));
+fn installed_sink() -> Option<&'static dyn EventSink> {
+    EVENT_SINK.get().map(Box::as_ref)
+}
+
+fn record_invocation_at(
+    sqlcmd_version: Option<&str>,
+    timestamp: SystemTime,
+    sink: Option<&dyn EventSink>,
+) {
+    if let Some(sink) = sink {
+        sink.record(&TelemetryEvent::Invocation(InvocationEvent {
+            common: common_properties(sqlcmd_version, timestamp),
+        }));
     }
-    attributes
+}
+
+fn record_completion_at(
+    sqlcmd_version: Option<&str>,
+    outcome: CompletionOutcome,
+    timestamp: SystemTime,
+    sink: Option<&dyn EventSink>,
+) {
+    if let Some(sink) = sink {
+        sink.record(&TelemetryEvent::Completion(CompletionEvent {
+            common: common_properties(sqlcmd_version, timestamp),
+            outcome,
+        }));
+    }
+}
+
+fn common_properties(sqlcmd_version: Option<&str>, timestamp: SystemTime) -> CommonProperties {
+    CommonProperties {
+        timestamp,
+        schema_version: SCHEMA_VERSION,
+        sqlcmd_version: sqlcmd_version
+            .filter(|version| version_is_safe(version))
+            .map(ToOwned::to_owned),
+        os: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+        implementation: IMPLEMENTATION,
+        runtime: RUNTIME,
+    }
 }
 
 fn version_is_safe(version: &str) -> bool {
@@ -91,44 +209,77 @@ fn version_is_safe(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry::Value;
+    use std::sync::Mutex;
+    use std::time::{Duration, UNIX_EPOCH};
 
-    fn attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a Value> {
-        attributes
-            .iter()
-            .find(|attribute| attribute.key.as_str() == key)
-            .map(|attribute| &attribute.value)
+    #[derive(Default)]
+    struct InMemorySink {
+        events: Mutex<Vec<TelemetryEvent>>,
+    }
+
+    impl EventSink for InMemorySink {
+        fn record(&self, event: &TelemetryEvent) {
+            self.events
+                .lock()
+                .expect("in-memory telemetry lock")
+                .push(event.clone());
+        }
     }
 
     #[test]
-    fn common_properties_have_stable_bounded_values() {
-        let attributes = common_attributes(Some("18.4.1-preview.2"));
+    fn invocation_is_captured_as_an_exact_discrete_record() {
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1_730_736_000);
+        let sink = InMemorySink::default();
+
+        record_invocation_at(Some("18.4.1-preview.2"), timestamp, Some(&sink));
 
         assert_eq!(
-            attribute(&attributes, SCHEMA_VERSION_KEY),
-            Some(&Value::from(SCHEMA_VERSION))
+            *sink.events.lock().expect("in-memory telemetry lock"),
+            vec![TelemetryEvent::Invocation(InvocationEvent {
+                common: CommonProperties {
+                    timestamp,
+                    schema_version: "1",
+                    sqlcmd_version: Some("18.4.1-preview.2".to_owned()),
+                    os: std::env::consts::OS,
+                    architecture: std::env::consts::ARCH,
+                    implementation: "mssql-sqlcmd-rust",
+                    runtime: "native",
+                },
+            })]
         );
+    }
+
+    #[test]
+    fn completion_is_captured_as_an_exact_discrete_record() {
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1_730_736_001);
+        let sink = InMemorySink::default();
+
+        record_completion_at(
+            Some("18.4.1"),
+            CompletionOutcome::Canceled,
+            timestamp,
+            Some(&sink),
+        );
+
+        let events = sink.events.lock().expect("in-memory telemetry lock");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name(), COMPLETION_EVENT_NAME);
+        assert_eq!(events[0].common().timestamp, timestamp);
         assert_eq!(
-            attribute(&attributes, SQLCMD_VERSION_KEY),
-            Some(&Value::from("18.4.1-preview.2"))
+            events[0],
+            TelemetryEvent::Completion(CompletionEvent {
+                common: CommonProperties {
+                    timestamp,
+                    schema_version: "1",
+                    sqlcmd_version: Some("18.4.1".to_owned()),
+                    os: std::env::consts::OS,
+                    architecture: std::env::consts::ARCH,
+                    implementation: "mssql-sqlcmd-rust",
+                    runtime: "native",
+                },
+                outcome: CompletionOutcome::Canceled,
+            })
         );
-        assert_eq!(
-            attribute(&attributes, OS_KEY),
-            Some(&Value::from(std::env::consts::OS))
-        );
-        assert_eq!(
-            attribute(&attributes, ARCH_KEY),
-            Some(&Value::from(std::env::consts::ARCH))
-        );
-        assert_eq!(
-            attribute(&attributes, IMPLEMENTATION_KEY),
-            Some(&Value::from(IMPLEMENTATION))
-        );
-        assert_eq!(
-            attribute(&attributes, RUNTIME_KEY),
-            Some(&Value::from(RUNTIME))
-        );
-        assert_eq!(attributes.len(), 6);
     }
 
     #[test]
@@ -140,14 +291,28 @@ mod tests {
             "18.4\\path",
             "x".repeat(MAX_VERSION_LEN + 1).as_str(),
         ] {
-            let attributes = common_attributes(Some(version));
-            assert_eq!(attribute(&attributes, SQLCMD_VERSION_KEY), None);
-            assert_eq!(attributes.len(), 5);
+            let properties = common_properties(Some(version), UNIX_EPOCH);
+            assert_eq!(properties.sqlcmd_version, None);
         }
     }
 
     #[test]
-    fn completion_outcomes_are_bounded() {
+    fn no_provider_is_a_no_op() {
+        record_invocation_at(Some("18.4.1"), UNIX_EPOCH, None);
+        record_completion_at(
+            Some("18.4.1"),
+            CompletionOutcome::Succeeded,
+            UNIX_EPOCH,
+            None,
+        );
+    }
+
+    #[test]
+    fn event_names_and_outcomes_are_bounded() {
+        let invocation = TelemetryEvent::Invocation(InvocationEvent {
+            common: common_properties(None, UNIX_EPOCH),
+        });
+        assert_eq!(invocation.name(), INVOCATION_EVENT_NAME);
         assert_eq!(CompletionOutcome::Succeeded.as_str(), "succeeded");
         assert_eq!(CompletionOutcome::Failed.as_str(), "failed");
         assert_eq!(CompletionOutcome::Canceled.as_str(), "canceled");
