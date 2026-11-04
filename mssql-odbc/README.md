@@ -140,6 +140,13 @@ An already-executed prepared statement retains its server-side declaration
 when the option changes; prepare it again to select a new declaration. DAE
 parameters remain chunked in both modes.
 
+### Integer connection-attribute getters
+
+Supported integer getters accept NULL value and length pointers independently.
+Successful getters report a four-byte value length when requested, except
+`SQL_COPT_SS_WARN_ON_CP_ERROR`, which writes the length only when the value
+pointer is non-NULL.
+
 ## Platform artifacts
 
 | Platform | Driver Manager | Library |
