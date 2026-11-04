@@ -239,8 +239,7 @@ pub(super) fn focused_tvp_record_for_desc(
     desc: &DescHandle,
     record_number: SqlSmallInt,
 ) -> Result<Option<FocusedTvpRecord>, ()> {
-    let Some((count, binding, app_length)) = desc.focused_tvp_record_snapshot(record_number)?
-    else {
+    let Some((count, binding, lengths)) = desc.focused_tvp_record_snapshot(record_number)? else {
         return Ok(None);
     };
     if usize::try_from(record_number).map_err(|_| ())? > count {
@@ -249,10 +248,14 @@ pub(super) fn focused_tvp_record_for_desc(
     let mut record = binding
         .map(|binding| focused_tvp_record_from_binding(binding, desc.kind))
         .unwrap_or_else(|| DescRecord::default_for(desc.kind));
-    if desc.kind != DescKind::ImpParam
-        && let Some(length) = app_length
-    {
-        record.length = length;
+    if let Some(lengths) = lengths {
+        if desc.kind == DescKind::ImpParam {
+            if let Some(length) = lengths.ipd_octet_length {
+                record.octet_length = length;
+            }
+        } else if let Some(length) = lengths.app_length {
+            record.length = length;
+        }
     }
     Ok(Some(FocusedTvpRecord::Record(record)))
 }

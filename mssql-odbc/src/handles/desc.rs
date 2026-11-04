@@ -607,8 +607,17 @@ impl DescState {
     }
 }
 
-pub(crate) type FocusedTvpRecordSnapshot =
-    (usize, Option<crate::params::BoundParam>, Option<SqlULen>);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TvpColumnLengths {
+    pub(crate) app_length: Option<SqlULen>,
+    pub(crate) ipd_octet_length: Option<SqlLen>,
+}
+
+pub(crate) type FocusedTvpRecordSnapshot = (
+    usize,
+    Option<crate::params::BoundParam>,
+    Option<TvpColumnLengths>,
+);
 
 impl DescHandle {
     /// Drops the UDT identities `SQLDescribeParam` auto-filled, keeping any the
@@ -854,14 +863,14 @@ impl DescHandle {
         &self,
         record_number: SqlSmallInt,
         initial_binding: Option<crate::params::BoundParam>,
-        focused_app_length: Option<SqlULen>,
+        focused_lengths: Option<TvpColumnLengths>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         update: impl FnMut(&mut crate::params::BoundParam),
     ) -> Result<Option<bool>, ()> {
         self.update_focused_tvp_bindings_after_validation(
             record_number,
             initial_binding,
-            focused_app_length,
+            focused_lengths,
             is_valid,
             update,
             || {},
@@ -872,7 +881,7 @@ impl DescHandle {
         &self,
         record_number: SqlSmallInt,
         initial_binding: Option<crate::params::BoundParam>,
-        focused_app_length: Option<SqlULen>,
+        focused_lengths: Option<TvpColumnLengths>,
         is_valid: impl Fn(&crate::params::BoundParam) -> bool,
         mut update: impl FnMut(&mut crate::params::BoundParam),
         after_validation: impl FnOnce(),
@@ -922,8 +931,8 @@ impl DescHandle {
                 if !is_valid(binding) {
                     return Ok(Some(false));
                 }
-                if focused_app_length.is_some() {
-                    let lengths = state.tvp_column_apd_lengths.entry(focus).or_default();
+                if focused_lengths.is_some() {
+                    let lengths = state.tvp_column_lengths.entry(focus).or_default();
                     if lengths.len() <= column_index {
                         let additional = column_index + 1 - lengths.len();
                         lengths.try_reserve_exact(additional).map_err(|_| {
@@ -1000,16 +1009,22 @@ impl DescHandle {
                 false
             };
             if binding_updated {
-                if let Some(length) = focused_app_length {
+                if let Some(lengths) = focused_lengths {
                     let Some(slot) = state
-                        .tvp_column_apd_lengths
+                        .tvp_column_lengths
                         .get_mut(&focus)
                         .and_then(|lengths| lengths.get_mut(column_index))
                     else {
                         error!("updating focused TVP descriptor lengths: reserved slot is missing");
                         return Err(());
                     };
-                    *slot = Some(length);
+                    let target = slot.get_or_insert_default();
+                    if let Some(length) = lengths.app_length {
+                        target.app_length = Some(length);
+                    }
+                    if let Some(length) = lengths.ipd_octet_length {
+                        target.ipd_octet_length = Some(length);
+                    }
                 }
                 updated = true;
             }
@@ -1060,17 +1075,13 @@ impl DescHandle {
                 .and_then(|columns| columns.get(column_index))
                 .copied()
                 .flatten();
-            let app_length = if self.kind == DescKind::ImpParam {
-                None
-            } else {
-                state
-                    .tvp_column_apd_lengths
-                    .get(&focus)
-                    .and_then(|lengths| lengths.get(column_index))
-                    .copied()
-                    .flatten()
-            };
-            let current = (count, binding, app_length);
+            let lengths = state
+                .tvp_column_lengths
+                .get(&focus)
+                .and_then(|lengths| lengths.get(column_index))
+                .copied()
+                .flatten();
+            let current = (count, binding, lengths);
             if snapshot.is_some_and(|snapshot| snapshot != current) {
                 error!(
                     "reading focused TVP descriptor record: associated statements have conflicting projections"
@@ -1199,7 +1210,7 @@ impl DescHandle {
                         error!("updating focused TVP descriptor records: allocation failed");
                     })?;
             }
-            if let Some(lengths) = state.tvp_column_apd_lengths.get_mut(&focus)
+            if let Some(lengths) = state.tvp_column_lengths.get_mut(&focus)
                 && lengths.len() < record_count
             {
                 lengths
@@ -1237,7 +1248,7 @@ impl DescHandle {
                     .entry(focus)
                     .or_default()
                     .resize(record_count, None);
-                if let Some(lengths) = state.tvp_column_apd_lengths.get_mut(&focus) {
+                if let Some(lengths) = state.tvp_column_lengths.get_mut(&focus) {
                     lengths.resize(record_count, None);
                 }
             }

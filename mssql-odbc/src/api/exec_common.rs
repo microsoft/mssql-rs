@@ -248,7 +248,7 @@ pub(super) fn park_dae_client(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
-    tvp_total_capacities: std::collections::BTreeMap<usize, SqlULen>,
+    tvp_row_counts: std::collections::BTreeMap<usize, usize>,
     fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
@@ -265,8 +265,7 @@ pub(super) fn park_dae_client(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(
-        DaeState::new(client, prepared, orphaned, dae_params)
-            .with_tvp_total_capacities(tvp_total_capacities),
+        DaeState::new(client, prepared, orphaned, dae_params).with_tvp_row_counts(tvp_row_counts),
     );
     if fractional_truncated {
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
@@ -288,7 +287,7 @@ pub(super) fn park_deferred_dae(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
-    tvp_total_capacities: std::collections::BTreeMap<usize, SqlULen>,
+    tvp_row_counts: std::collections::BTreeMap<usize, usize>,
     prebuilt: Vec<RpcParameter>,
     sql: Option<String>,
     timeout_secs: u32,
@@ -302,7 +301,7 @@ pub(super) fn park_deferred_dae(
     };
     stmt_state.dae = Some(
         DaeState::new(client, prepared, orphaned, dae_params)
-            .with_tvp_total_capacities(tvp_total_capacities)
+            .with_tvp_row_counts(tvp_row_counts)
             .deferred(prebuilt, sql, timeout_secs),
     );
     if fractional_truncated {
@@ -858,7 +857,7 @@ pub(super) struct ParamsWithDae {
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
     /// Top-level maximum row counts for data-at-execution TVPs.
-    pub(super) tvp_total_capacities: std::collections::BTreeMap<usize, SqlULen>,
+    pub(super) tvp_row_counts: std::collections::BTreeMap<usize, usize>,
     /// Whether a parameter before the first DAE marker lost fractional digits.
     /// With no DAE marker, covers the full parameter list.
     pub(super) fractional_truncated: bool,
@@ -1206,7 +1205,7 @@ pub(super) unsafe fn build_named_params_for_row(
 
     let mut params = Vec::with_capacity(marker_count + usize::from(!named));
     let mut dae_params = Vec::new();
-    let mut tvp_total_capacities = std::collections::BTreeMap::new();
+    let mut tvp_row_counts = std::collections::BTreeMap::new();
     let mut fractional_truncated = false;
     for i in 0..marker_count {
         let Some(Some(snapshot)) = bound_params.get(i) else {
@@ -1233,7 +1232,6 @@ pub(super) unsafe fn build_named_params_for_row(
                 .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                     ParamRowBuildError::Layout { parameter: i + 1 }
                 })?;
-            let tvp_total_capacity = tvp_binding.column_size;
             if let Some(child_layout) = tvp_layouts.get(&ordinal) {
                 tvp_binding.column_size = child_layout.array_size;
             }
@@ -1246,9 +1244,19 @@ pub(super) unsafe fn build_named_params_for_row(
                     source: crate::conversion::param_convert::ParamBuildError::InvalidTvpRowCount,
                 });
             }
-            if unsafe { crate::conversion::param_convert::data_at_exec_indicator(&tvp_binding) }
-                .is_some()
-            {
+            let parent_dae =
+                unsafe { crate::conversion::param_convert::data_at_exec_indicator(&tvp_binding) }
+                    .is_some();
+            let fixed_dae_rows = if parent_dae {
+                None
+            } else {
+                unsafe { tvp_dae_cell_rows(&tvp_binding, columns, column_offset, layout.bind_type) }
+                    .map_err(|source| ParamRowBuildError::Conversion {
+                        parameter: i + 1,
+                        source,
+                    })?
+            };
+            if parent_dae || fixed_dae_rows.is_some() {
                 let staged = build_tvp_dae_params(
                     i,
                     &tvp_binding,
@@ -1257,13 +1265,16 @@ pub(super) unsafe fn build_named_params_for_row(
                     column_offset,
                     layout.bind_type,
                     snapshot.long_as_max,
+                    fixed_dae_rows,
                 )
                 .map_err(|source| ParamRowBuildError::Conversion {
                     parameter: i + 1,
                     source,
                 })?;
                 dae_params.extend(staged);
-                tvp_total_capacities.insert(i, tvp_total_capacity);
+                if let Some(count) = fixed_dae_rows {
+                    tvp_row_counts.insert(i, count);
+                }
                 let status = if crate::conversion::param_convert::is_output_direction(
                     tvp_binding.input_output_type,
                 ) {
@@ -1417,7 +1428,7 @@ pub(super) unsafe fn build_named_params_for_row(
     Ok(ParamsWithDae {
         params,
         dae_params,
-        tvp_total_capacities,
+        tvp_row_counts,
         fractional_truncated,
     })
 }
@@ -1441,6 +1452,39 @@ pub(super) fn validate_parameter_focus(state: &mut StmtState, op: &str) -> Resul
     Ok(())
 }
 
+/// # Safety
+/// Parent and child indicator buffers must remain readable for their positioned rows.
+unsafe fn tvp_dae_cell_rows(
+    tvp: &BoundParam,
+    columns: &[Option<BoundParam>],
+    bind_offset: isize,
+    bind_type: SqlULen,
+) -> Result<Option<usize>, ParamBuildError> {
+    let rows = unsafe { crate::conversion::param_convert::tvp_row_count(tvp, 0) }?.unwrap_or(0);
+    if rows > tvp.column_size {
+        return Err(ParamBuildError::InvalidTvpRowCount);
+    }
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    for row in 0..rows {
+        for (index, column) in columns.iter().enumerate() {
+            let binding = column
+                .as_ref()
+                .ok_or(ParamBuildError::TvpColumnUnbound(index))?
+                .for_row(row, bind_offset, bind_type)
+                .map_err(|_| ParamBuildError::InvalidBufferLength)?;
+            if unsafe { crate::conversion::param_convert::data_at_exec_indicator(&binding) }
+                .is_some()
+            {
+                return Ok(Some(rows));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_tvp_dae_params(
     tvp_index: usize,
     tvp: &BoundParam,
@@ -1449,15 +1493,17 @@ pub(super) fn build_tvp_dae_params(
     bind_offset: isize,
     bind_type: SqlULen,
     long_as_max: bool,
+    fixed_rows: Option<usize>,
 ) -> Result<Vec<DaeParam>, ParamBuildError> {
-    let row_capacity = tvp.column_size;
+    let row_capacity = fixed_rows.unwrap_or(tvp.column_size.min(1));
+    let controls = usize::from(fixed_rows.is_none());
     let per_row = columns
         .len()
-        .checked_add(1)
+        .checked_add(controls)
         .ok_or(ParamBuildError::MemoryAllocation)?;
     let count = row_capacity
         .checked_mul(per_row)
-        .and_then(|count| count.checked_add(1))
+        .and_then(|count| count.checked_add(controls))
         .ok_or(ParamBuildError::MemoryAllocation)?;
     let mut staged = Vec::new();
     staged
@@ -1465,44 +1511,56 @@ pub(super) fn build_tvp_dae_params(
         .map_err(|_| ParamBuildError::MemoryAllocation)?;
 
     for row_index in 0..row_capacity {
-        staged.push(
-            DaeParam::new(
-                tvp_index,
-                None,
-                true,
-                None,
-                *tvp,
-                udt_names.clone(),
-                long_as_max,
-            )
-            .with_target(DaeTarget::TvpRowControl {
-                tvp_index,
-                row_index,
-            }),
-        );
+        if fixed_rows.is_none() {
+            staged.push(
+                DaeParam::new(
+                    tvp_index,
+                    None,
+                    true,
+                    None,
+                    *tvp,
+                    udt_names.clone(),
+                    long_as_max,
+                )
+                .with_target(DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index,
+                }),
+            );
+        }
         for (column_index, column) in columns.iter().enumerate() {
             let binding = column
                 .as_ref()
                 .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
             staged.push(
-                DaeParam::new(tvp_index, None, true, None, *binding, None, long_as_max)
-                    .with_target(DaeTarget::TvpCell {
-                        tvp_index,
-                        row_index,
-                        column_index,
-                    })
-                    .with_tvp_cell_binding(*binding, bind_offset, bind_type),
+                DaeParam::new(
+                    tvp_index,
+                    None,
+                    true,
+                    None,
+                    *binding,
+                    udt_names.clone(),
+                    long_as_max,
+                )
+                .with_target(DaeTarget::TvpCell {
+                    tvp_index,
+                    row_index,
+                    column_index,
+                })
+                .with_tvp_cell_binding(*binding, bind_offset, bind_type),
             );
         }
     }
-    staged.push(
-        DaeParam::new(tvp_index, None, true, None, *tvp, udt_names, long_as_max).with_target(
-            DaeTarget::TvpRowControl {
-                tvp_index,
-                row_index: row_capacity,
-            },
-        ),
-    );
+    if fixed_rows.is_none() {
+        staged.push(
+            DaeParam::new(tvp_index, None, true, None, *tvp, udt_names, long_as_max).with_target(
+                DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index: row_capacity,
+                },
+            ),
+        );
+    }
     Ok(staged)
 }
 
@@ -1602,8 +1660,11 @@ pub(super) fn rebuild_deferred_params(
 
     let mut rebuilt_tvps = BTreeSet::new();
     for dae in dae_params {
-        let DaeTarget::TvpRowControl { tvp_index, .. } = dae.target else {
-            continue;
+        let tvp_index = match dae.target {
+            DaeTarget::TvpRowControl { tvp_index, .. } | DaeTarget::TvpCell { tvp_index, .. } => {
+                tvp_index
+            }
+            DaeTarget::Parameter => continue,
         };
         if !rebuilt_tvps.insert(tvp_index) {
             continue;
@@ -3843,29 +3904,20 @@ mod tests {
             0,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             false,
+            None,
         )
         .unwrap();
-        assert_eq!(staged.len(), 7);
+        assert_eq!(staged.len(), 4);
         assert_eq!(
             staged[1].binding.parameter_value_ptr,
             values.as_mut_ptr().cast()
         );
-        assert_eq!(
-            staged[4].binding.parameter_value_ptr,
-            values.as_mut_ptr().cast()
-        );
-        assert_eq!(staged[4].binding.strlen_or_ind_ptr, indicators.as_mut_ptr());
+        assert_eq!(staged[1].binding.strlen_or_ind_ptr, indicators.as_mut_ptr());
         assert_eq!(staged[2].expected_len, None);
-        assert_eq!(staged[5].expected_len, None);
         assert_eq!(
             staged[2].binding.strlen_or_ind_ptr,
             dae_indicators.as_mut_ptr()
         );
-        assert_eq!(
-            staged[5].binding.strlen_or_ind_ptr,
-            dae_indicators.as_mut_ptr()
-        );
-        assert_eq!(staged[2].value_ptr, staged[5].value_ptr);
     }
 
     #[test]
@@ -3905,9 +3957,11 @@ mod tests {
             0,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             false,
+            None,
         )
         .unwrap();
-        let mut dae = DaeState::for_test(staged, None);
+        let mut dae = DaeState::for_test(staged, Some(0));
+        dae.stage_tvp_batch(0, 0, 2).unwrap();
 
         dae.cursor = Some(1);
         dae.tvp_batches.insert(0, (0, 2));
@@ -3991,7 +4045,7 @@ mod tests {
         }
         .unwrap_or_else(|_| panic!("TVP DAE staging failed"));
 
-        assert_eq!(built.dae_params.len(), 5);
+        assert_eq!(built.dae_params.len(), 3);
         assert!(matches!(
             built.dae_params[0].target,
             DaeTarget::TvpRowControl {
@@ -4014,24 +4068,9 @@ mod tests {
                 row_index: 1
             }
         ));
-        assert!(matches!(
-            built.dae_params[3].target,
-            DaeTarget::TvpCell {
-                tvp_index: 0,
-                row_index: 1,
-                column_index: 0
-            }
-        ));
-        assert!(matches!(
-            built.dae_params[4].target,
-            DaeTarget::TvpRowControl {
-                tvp_index: 0,
-                row_index: 2
-            }
-        ));
         assert_eq!(built.dae_params[1].value_ptr, 0x2000usize as *mut c_void);
         assert_eq!(built.dae_params[0].binding.column_size, 2);
-        assert_eq!(built.tvp_total_capacities.get(&0), Some(&6));
+        assert!(built.tvp_row_counts.is_empty());
         assert_eq!(built.params.len(), 1);
     }
 

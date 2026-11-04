@@ -99,6 +99,77 @@ fn sql_param_data_safe(
     super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
 }
 
+fn collect_bound_tvp_cells(
+    dae: &mut crate::handles::stmt::DaeState,
+) -> Result<(), super::exec_common::ParamRowBuildError> {
+    use crate::conversion::param_convert::{
+        ParamBuildError, bound_tvp_cell_to_value, data_at_exec_indicator,
+    };
+    use crate::handles::stmt::BufferedTvpCell;
+    loop {
+        match dae.current_param().map(|param| param.target) {
+            Some(DaeTarget::TvpRowControl {
+                tvp_index,
+                row_index,
+            }) if dae
+                .tvp_batches
+                .get(&tvp_index)
+                .is_some_and(|(_, batch_end)| row_index < *batch_end) =>
+            {
+                dae.advance();
+                continue;
+            }
+            Some(DaeTarget::TvpCell { .. }) => {}
+            _ => return Ok(()),
+        }
+        let Some(DaeTarget::TvpCell {
+            tvp_index,
+            row_index,
+            column_index,
+        }) = dae.current_param().map(|param| param.target)
+        else {
+            return Ok(());
+        };
+        let row_error = |source| super::exec_common::ParamRowBuildError::Conversion {
+            parameter: tvp_index + 1,
+            source,
+        };
+        dae.position_current_tvp_cell()
+            .map_err(|()| row_error(ParamBuildError::InvalidBufferLength))?;
+        let Some(param) = dae.current_param() else {
+            return Err(row_error(ParamBuildError::InvalidBufferLength));
+        };
+        let is_null = !param.binding.strlen_or_ind_ptr.is_null()
+            && unsafe {
+                param.binding.strlen_or_ind_ptr.read_unaligned()
+                    == crate::api::odbc_types::SQL_NULL_DATA
+            };
+        if !is_null && let Some(indicator) = unsafe { data_at_exec_indicator(&param.binding) } {
+            if let Some(param) = dae.current_param_mut() {
+                param.expected_len = super::exec_common::dae_expected_length(indicator);
+            }
+            return Ok(());
+        }
+        // Bound cell buffers remain application-owned throughout Need Data.
+        let value = unsafe { bound_tvp_cell_to_value(&param.binding) }.map_err(|error| {
+            row_error(ParamBuildError::TvpCellConversion {
+                row: row_index,
+                column: column_index,
+                diagnostic: error.diag(),
+            })
+        })?;
+        dae.tvp_cells.push(BufferedTvpCell {
+            tvp_index,
+            row_index,
+            column_index,
+            bytes: Vec::new(),
+            is_null: false,
+            value: Some(value),
+        });
+        dae.advance();
+    }
+}
+
 fn sql_param_data_operation(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
@@ -110,7 +181,7 @@ fn sql_param_data_operation(
     // The first call has no open parameter to close: it opens parameter 0 and
     // hands the application its token. Every later call closes the parameter
     // the cursor is on before advancing.
-    let (is_first_call, current_ptr) = {
+    let (is_first_call, current_ptr, cell_error) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned");
             return SQL_ERROR;
@@ -132,11 +203,23 @@ fn sql_param_data_operation(
             return SQL_ERROR;
         };
         let first = dae.cursor.is_none();
-        if first {
+        let cell_error = if first {
             dae.advance();
-        }
-        (first, stmt_state.dae_current_value_ptr())
+            collect_bound_tvp_cells(dae).err()
+        } else {
+            None
+        };
+        (first, stmt_state.dae_current_value_ptr(), cell_error)
     };
+
+    if let Some(error) = cell_error {
+        let rc = abort_dae_with_diag(dbc, stmt, statement_handle, error.diag());
+        if let Ok(mut state) = stmt.inner.lock() {
+            free_errors(&mut state);
+            super::exec_common::post_param_row_build_error(&mut state, &error, 0);
+        }
+        return rc;
+    }
 
     // Write the current parameter's application token to *value_ptr_ptr.
     unsafe { write_if_some(value_ptr_ptr, current_ptr) };
@@ -312,86 +395,7 @@ fn sql_param_data_operation(
             if !matches!(target, DaeTarget::TvpRowControl { .. }) {
                 dae.advance();
             }
-            let mut cell_error = None;
-            loop {
-                match dae.current_param().map(|param| param.target) {
-                    Some(DaeTarget::TvpRowControl {
-                        tvp_index,
-                        row_index,
-                    }) if dae
-                        .tvp_batches
-                        .get(&tvp_index)
-                        .is_some_and(|(_, batch_end)| row_index < *batch_end) =>
-                    {
-                        dae.advance();
-                        continue;
-                    }
-                    Some(DaeTarget::TvpCell { .. }) => {}
-                    _ => break,
-                }
-                let Some(DaeTarget::TvpCell {
-                    tvp_index,
-                    row_index,
-                    column_index,
-                }) = dae.current_param().map(|param| param.target)
-                else {
-                    break;
-                };
-                if dae.position_current_tvp_cell().is_err() {
-                    cell_error = Some(super::exec_common::ParamRowBuildError::Conversion {
-                        parameter: tvp_index + 1,
-                        source:
-                            crate::conversion::param_convert::ParamBuildError::InvalidBufferLength,
-                    });
-                    break;
-                }
-                let Some(param) = dae.current_param() else {
-                    break;
-                };
-                let is_null = !param.binding.strlen_or_ind_ptr.is_null()
-                    && unsafe {
-                        param.binding.strlen_or_ind_ptr.read_unaligned()
-                            == crate::api::odbc_types::SQL_NULL_DATA
-                    };
-                if !is_null
-                    && let Some(indicator) = unsafe {
-                        crate::conversion::param_convert::data_at_exec_indicator(&param.binding)
-                    }
-                {
-                    if let Some(param) = dae.current_param_mut() {
-                        param.expected_len = super::exec_common::dae_expected_length(indicator);
-                    }
-                    break;
-                }
-                // Ordinary buffers remain application-owned throughout Need Data.
-                let value = unsafe {
-                    crate::conversion::param_convert::bound_tvp_cell_to_value(&param.binding)
-                };
-                match value {
-                    Ok(value) => {
-                        dae.tvp_cells.push(crate::handles::stmt::BufferedTvpCell {
-                            tvp_index,
-                            row_index,
-                            column_index,
-                            bytes: Vec::new(),
-                            is_null: false,
-                            value: Some(value),
-                        });
-                        dae.advance();
-                    }
-                    Err(error) => {
-                        cell_error = Some(super::exec_common::ParamRowBuildError::Conversion {
-                            parameter: tvp_index + 1,
-                            source: crate::conversion::param_convert::ParamBuildError::TvpCellConversion {
-                                row: row_index,
-                                column: column_index,
-                                diagnostic: error.diag(),
-                            },
-                        });
-                        break;
-                    }
-                }
-            }
+            let cell_error = collect_bound_tvp_cells(dae).err();
             let has_more = dae.current_param().is_some();
             let buffered_done = dae.buffered_phase_complete();
             dae.return_client(client);
@@ -1126,21 +1130,21 @@ mod tests {
         indicators: &mut [SqlLen; 2],
         lengths: &mut [SqlLen; 2],
     ) -> DaeState {
-        tvp_array_dae_with_total_capacity(h, values, indicators, lengths, 2)
+        tvp_array_dae_with_capacity(h, values, indicators, lengths, 2)
     }
 
-    fn tvp_array_dae_with_total_capacity(
+    fn tvp_array_dae_with_capacity(
         h: &TestHandles,
         values: &mut [i32; 2],
         indicators: &mut [SqlLen; 2],
         lengths: &mut [SqlLen; 2],
-        total_capacity: crate::api::odbc_types::SqlULen,
+        capacity: crate::api::odbc_types::SqlULen,
     ) -> DaeState {
         let tvp = crate::params::BoundParam {
             input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
             c_type: crate::api::odbc_types::SQL_C_BINARY,
             sql_type: crate::api::odbc_types::SQL_SS_TABLE,
-            column_size: 2,
+            column_size: capacity,
             decimal_digits: 0,
             app_datetime_interval_code: None,
             sql_datetime_interval_code: None,
@@ -1169,6 +1173,7 @@ mod tests {
             0,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
             false,
+            None,
         )
         .unwrap();
         for param in &mut params {
@@ -1187,7 +1192,6 @@ mod tests {
             None,
             params,
         )
-        .with_tvp_total_capacities(std::collections::BTreeMap::from([(0, total_capacity)]))
         .deferred(Vec::new(), Some("SELECT ?".into()), 0)
     }
 
@@ -1309,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn tvp_dae_batches_use_focused_and_total_capacities_independently() {
+    fn tvp_dae_batches_accumulate_up_to_focused_capacity() {
         use crate::api::exports::{SQLParamData, SQLPutData};
         use crate::api::odbc_types::SQL_SUCCESS;
 
@@ -1318,7 +1322,7 @@ mod tests {
         let mut values = [11, 999];
         let mut indicators = [std::mem::size_of::<i32>() as SqlLen; 2];
         let mut lengths = indicators;
-        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae_with_total_capacity(
+        stmt.inner.lock().unwrap().dae = Some(tvp_array_dae_with_capacity(
             &h,
             &mut values,
             &mut indicators,

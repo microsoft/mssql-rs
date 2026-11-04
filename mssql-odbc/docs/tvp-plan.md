@@ -86,11 +86,14 @@ At a high level, mssql-python performs the following, identical to msodbcsql18:
   buffered and converted into the table value before execution. Only columns marked
   data-at-execution produce cell tokens; ordinary bound values and NULLs are captured from
   their positioned row buffers when the application supplies that row. Positive row-control
-  counts may describe multiple batches, each no larger than the focused array capacity; their
-  cumulative row count must not exceed the TVP parameter's bound `ColumnSize`. The driver reuses
+  counts may describe multiple batches; their cumulative row count must not exceed the focused
+  child array size, initialized from `ColumnSize` and replaced by focused `PARAMSET_SIZE`. The driver reuses
   that array for later batches and accumulates their rows into one table. A false first row-control
   marker supplies an empty table. A row's DAE length is read when its cell token is offered, so
   mixed ordinary/DAE rows retain their declared lengths without reading unused future rows.
+  A materialized parent row count may also contain DAE cells; only those cell tokens are offered,
+  without table row-control tokens. DAE row-control staging starts with one row and grows with
+  supplied batches instead of allocating tokens for the bound capacity up front.
 - **Execute** — the statement runs; procedure result sets are returned through the normal fetch
   path. TVPs are input-only and are never fetched back.
 
@@ -111,11 +114,13 @@ mssql-odbc will add the following capabilities:
 - **Assemble the bound columns into rows** for transmission, applying the same per-cell
   conversion and null semantics as top-level scalar parameters. Numeric bindings use the
   scalar application-descriptor defaults; decimal values are rescaled to the fixed TVP
-  column metadata, rounding half away from zero when reducing scale and rejecting
+  column metadata, truncating toward zero when reducing scale and rejecting
   precision overflow before transmission.
 - **Support data-at-execution for TVP content** — consume row-control markers and per-cell
   payloads, preserving row order and NULL values while assembling the table parameter.
 - **Handle empty TVPs and all-NULL columns** correctly.
+- **Normalize LONG TVP columns to MAX types**, including NULLs and DAE cells, independently
+  of the scalar `LongAsMax` option.
 - **Preserve deferred descriptor fields** — row counts/default markers use the top-level
   octet-length pointer independently of its NULL indicator. An omitted schema remains
   unqualified in the SQL declaration and resolves against the caller's default schema.

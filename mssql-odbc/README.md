@@ -116,6 +116,10 @@ parameters remain, subsequent PLP values stream normally. Validation that
 depends on the completed value can occur during `SQLPutData` or when
 `SQLParamData` closes the parameter rather than at bind time.
 
+TVP DAE cells are buffered until the complete table can be sent. Row-control
+staging grows with supplied batches rather than the bound row capacity; the
+collected table still requires memory proportional to its actual contents.
+
 ### Legacy LOB parameters
 
 `SQL_LONGVARCHAR`, `SQL_WLONGVARCHAR`, and `SQL_LONGVARBINARY` parameters use
@@ -123,6 +127,9 @@ depends on the completed value can occur during `SQLPutData` or when
 `LongAsMax=Yes` in the connection string, or set `SQL_COPT_SS_LONGASMAX` to
 `SQL_XL_ON`, to use `varchar(max)`, `nvarchar(max)`, and `varbinary(max)`.
 Explicit connection attributes take precedence over the keyword.
+
+TVP columns always use the corresponding MAX types, including NULL and DAE
+cells, regardless of `LongAsMax`.
 
 **Migration note:** earlier alpha builds always substituted MAX types. Use
 `LongAsMax=Yes` to retain that behavior. `ColumnSize` bounds still apply to

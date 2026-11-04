@@ -38,10 +38,11 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{
     ERR_CANNOT_MODIFY_IRD, ERR_FUNCTION_SEQUENCE, ERR_INCONSISTENT_DESCRIPTOR_INFO,
-    ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_FIELD,
-    ERR_INVALID_DESCRIPTOR_INDEX, ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAMETER_TYPE,
-    ERR_INVALID_PRECISION_OR_SCALE, ERR_INVALID_SQL_DATA_TYPE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
-    ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, WARN_ARRAY_SIZE_CHANGED, post_diag,
+    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_C_DATA_TYPE,
+    ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX, ERR_INVALID_NULL_POINTER,
+    ERR_INVALID_PARAMETER_TYPE, ERR_INVALID_PRECISION_OR_SCALE, ERR_INVALID_SQL_DATA_TYPE,
+    ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED,
+    WARN_ARRAY_SIZE_CHANGED, post_diag,
 };
 use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
@@ -139,6 +140,16 @@ fn sql_set_desc_field_w_safe(
         return result;
     }
 
+    if desc.kind == DescKind::ImpParam
+        && matches!(SqlUSmallInt::try_from(field_identifier), Ok(SQL_DESC_NAME))
+    {
+        match desc.focused_tvp_record_count() {
+            Ok(Some(_)) => return post_focused_tvp_diag(desc, ERR_INVALID_ATTRIBUTE_IDENTIFIER),
+            Ok(None) => {}
+            Err(()) => return post_focused_tvp_internal_error(desc),
+        }
+    }
+
     let update = |state: &mut DescState| {
         set_desc_field(
             state,
@@ -156,6 +167,9 @@ fn sql_set_desc_field_w_safe(
                 && matches!(
                     field,
                     SQL_DESC_LENGTH
+                        | SQL_DESC_UNNAMED
+                        | SQL_DESC_PARAMETER_TYPE
+                        | SQL_DESC_OCTET_LENGTH
                         | SQL_DESC_CONCISE_TYPE
                         | SQL_DESC_DATETIME_INTERVAL_CODE
                         | SQL_DESC_PRECISION
@@ -165,6 +179,8 @@ fn sql_set_desc_field_w_safe(
         && matches!(
             field,
             SQL_DESC_DATA_PTR
+                | SQL_DESC_UNNAMED
+                | SQL_DESC_PARAMETER_TYPE
                 | SQL_DESC_INDICATOR_PTR
                 | SQL_DESC_OCTET_LENGTH_PTR
                 | SQL_DESC_OCTET_LENGTH
@@ -209,13 +225,35 @@ fn sql_set_desc_field_w_safe(
                 _ => None,
             };
             let focused_length = (field == SQL_DESC_OCTET_LENGTH).then_some(value_ptr as SqlLen);
-            let focused_app_length = (field == SQL_DESC_LENGTH && desc.kind.is_application())
-                .then_some(value_ptr as SqlULen);
+            let focused_lengths = match (field, desc.kind.is_application()) {
+                (SQL_DESC_LENGTH, true) => Some(crate::handles::desc::TvpColumnLengths {
+                    app_length: Some(value_ptr as SqlULen),
+                    ..Default::default()
+                }),
+                (SQL_DESC_OCTET_LENGTH, false) => Some(crate::handles::desc::TvpColumnLengths {
+                    ipd_octet_length: Some(value_ptr as SqlLen),
+                    ..Default::default()
+                }),
+                _ => None,
+            };
             let updated = desc.update_focused_tvp_bindings(
                 record_number,
                 Some(super::set_desc_rec::focused_tvp_initial_binding()),
-                focused_app_length,
+                focused_lengths,
                 |binding| {
+                    if field == SQL_DESC_UNNAMED && value_ptr as SqlLen != SQL_UNNAMED {
+                        validation_diagnostic.set(Some(ERR_INVALID_DESCRIPTOR_FIELD));
+                        return false;
+                    }
+                    if field == SQL_DESC_PARAMETER_TYPE
+                        && !matches!(
+                            SqlSmallInt::try_from(value_ptr as SqlLen),
+                            Ok(SQL_PARAM_INPUT | SQL_PARAM_INPUT_OUTPUT | SQL_PARAM_OUTPUT)
+                        )
+                    {
+                        validation_diagnostic.set(Some(ERR_INVALID_PARAMETER_TYPE));
+                        return false;
+                    }
                     if desc.kind == DescKind::ImpParam
                         && matches!(
                             field,
@@ -303,6 +341,11 @@ fn sql_set_desc_field_w_safe(
                 |binding| {
                     if desc.kind == DescKind::ImpParam {
                         match field {
+                            SQL_DESC_PARAMETER_TYPE => {
+                                if let Ok(direction) = SqlSmallInt::try_from(value_ptr as SqlLen) {
+                                    binding.input_output_type = direction;
+                                }
+                            }
                             SQL_DESC_LENGTH => {
                                 binding.column_size = value_ptr as SqlULen;
                             }
@@ -2560,6 +2603,83 @@ mod tests {
     }
 
     #[test]
+    fn focused_ipd_writes_never_modify_the_parent_record() {
+        use crate::api::exports::SQLSetDescFieldW;
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut parent_name: Vec<u16> = "parent\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    h.ipd(),
+                    1,
+                    SQL_DESC_NAME,
+                    parent_name.as_mut_ptr().cast(),
+                    SqlInteger::from(SQL_NTS),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        let mut child_name: Vec<u16> = "child\0".encode_utf16().collect();
+        assert_eq!(
+            unsafe {
+                SQLSetDescFieldW(
+                    h.ipd(),
+                    1,
+                    SQL_DESC_NAME,
+                    child_name.as_mut_ptr().cast(),
+                    SqlInteger::from(SQL_NTS),
+                )
+            },
+            SQL_ERROR
+        );
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        assert_eq!(
+            ipd.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"HY092"
+        );
+        for (field, value) in [
+            (SQL_DESC_UNNAMED, SQL_UNNAMED),
+            (SQL_DESC_PARAMETER_TYPE, SqlLen::from(SQL_PARAM_OUTPUT)),
+            (SqlSmallInt::try_from(SQL_DESC_OCTET_LENGTH).unwrap(), 8),
+        ] {
+            assert_eq!(
+                unsafe { SQLSetDescFieldW(h.ipd(), 1, field, value as SqlPointer, 0) },
+                SQL_SUCCESS
+            );
+        }
+        assert_eq!(
+            get_small_int(h.ipd(), 1, SQL_DESC_PARAMETER_TYPE),
+            SQL_PARAM_OUTPUT
+        );
+        assert_eq!(
+            get_small_int(h.ipd(), 1, SQL_DESC_UNNAMED),
+            SQL_UNNAMED as SqlSmallInt
+        );
+        let mut octets: SqlLen = -1;
+        assert_eq!(
+            unsafe {
+                crate::api::exports::SQLGetDescFieldW(
+                    h.ipd(),
+                    1,
+                    SqlSmallInt::try_from(SQL_DESC_OCTET_LENGTH).unwrap(),
+                    (&raw mut octets).cast(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(octets, 8);
+        let state = ipd.inner.lock().unwrap();
+        let parent = state.record(1).unwrap();
+        assert_eq!(parent.name, "parent");
+        assert_eq!(parent.parameter_type, SQL_PARAM_INPUT);
+        assert_eq!(parent.octet_length, 0);
+    }
+
+    #[test]
     fn focused_ipd_type_and_precision_writes_update_the_child_sql_binding() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -2693,7 +2813,9 @@ mod tests {
             "focused write must not create an outer APD record"
         );
         assert_eq!(
-            stmt.inner.lock().unwrap().tvp_column_apd_lengths[&1][0],
+            stmt.inner.lock().unwrap().tvp_column_lengths[&1][0]
+                .unwrap()
+                .app_length,
             Some(20)
         );
     }

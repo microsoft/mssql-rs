@@ -354,7 +354,7 @@ fn sql_bind_parameter_safe(
                 .tvp_column_bindings
                 .remove(&usize::from(parameter_number));
             stmt_state
-                .tvp_column_apd_lengths
+                .tvp_column_lengths
                 .remove(&usize::from(parameter_number));
             let child_layout = crate::handles::desc::DescHeader {
                 array_size: column_size,
@@ -428,7 +428,7 @@ fn sql_bind_parameter_safe(
         columns[column_index] = Some(bound);
         // Keep the vector allocated: focused descriptor updates reserve its
         // slot during validation, then commit the override in a second pass.
-        if let Some(lengths) = stmt_state.tvp_column_apd_lengths.get_mut(&tvp_ordinal)
+        if let Some(lengths) = stmt_state.tvp_column_lengths.get_mut(&tvp_ordinal)
             && let Some(length) = lengths.get_mut(column_index)
         {
             *length = None;
@@ -729,7 +729,7 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
         // The TVP column captures are part of the parameter bindings this
         // option resets.
         stmt_state.tvp_column_bindings.clear();
-        stmt_state.tvp_column_apd_lengths.clear();
+        stmt_state.tvp_column_lengths.clear();
         stmt_state.tvp_column_layouts.clear();
         stmt_state.effective_apd(stmt)
     };
@@ -1530,7 +1530,7 @@ mod tests {
         use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
         use mssql_tds::datatypes::sqltypes::SqlType;
 
-        for (magnitude, positive, expected) in [(120u128, 1, 12u128), (125, 1, 13), (125, 0, 13)] {
+        for (magnitude, positive, expected) in [(120u128, 1, 12u128), (125, 1, 12), (125, 0, 12)] {
             let h = TestHandles::with_env_dbc_stmt();
             bind_and_focus_tvp(&h, 1);
             let mut value = SqlNumericStruct {

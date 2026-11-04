@@ -646,7 +646,11 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     // elapsing is likewise independent of the caller's context: ODBC reserves
     // `HYT00` specifically so an application can distinguish "my deadline
     // passed" from a generic failure, matching msodbcsql.
-    let sqlstate = match err {
+    let mut cause = err;
+    while let TdsError::TvpCellSerialization { source, .. } = cause {
+        cause = source;
+    }
+    let sqlstate = match cause {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
         TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
@@ -750,6 +754,29 @@ mod tests {
         fn diag_records_mut(&mut self) -> &mut Vec<crate::error::DiagRecord> {
             &mut self.records
         }
+    }
+
+    #[test]
+    fn post_tds_error_preserves_tvp_overflow_sqlstate_and_context() {
+        let mut state = FakeState::default();
+        let error = TdsError::TvpCellSerialization {
+            parameter: mssql_tds::error::TvpParameterRef::OdbcOrdinal(1),
+            row: 2,
+            column: 3,
+            source: Box::new(TdsError::EncodedValueTooLong {
+                actual: 6,
+                maximum: 2,
+            }),
+        };
+        post_tds_error(&mut state, &error, SQLSTATE_HY000);
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.records[0].sql_state, SQLSTATE_22001);
+        assert!(
+            state.records[0]
+                .message
+                .contains("ODBC ordinal 1, row 2, column 3")
+        );
+        assert!(state.records[0].message.ends_with(&error.to_string()));
     }
 
     #[test]
