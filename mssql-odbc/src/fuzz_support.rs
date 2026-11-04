@@ -13,6 +13,7 @@
 
 use crate::api::escape::{
     describe_text, executable_marker_count, translate_and_rewrite, translate_escapes,
+    translate_for_execution, translate_for_execution_reference,
 };
 use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DATE, SQL_C_DOUBLE,
@@ -25,8 +26,8 @@ use crate::api::odbc_types::{
     SQL_PARAM_INPUT, SQL_SS_UDT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_VARCHAR, SQL_WVARCHAR,
     SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
-use crate::api::util::rewrite_param_markers;
 use crate::api::util::{read_utf16, read_utf16_attr, read_utf16_long};
+use crate::api::util::{rewrite_param_markers, rewrite_param_markers_reference};
 use crate::api::{
     SQLAllocHandle, SQLExecDirectW, SQLFetch, SQLFreeHandle, SQLGetData, SQLNumResultCols,
     SQLSetEnvAttr,
@@ -67,9 +68,11 @@ pub fn fuzz_connection_string(input: &str) {
 /// Drive ODBC escape-sequence translation and both marker-rewriting phases.
 ///
 /// A hand-written lexer over application-supplied text is exactly the shape
-/// fuzzing pays for. Two invariants are asserted beyond "does not panic":
-/// translation never invents or loses a parameter marker, and the NOSCAN path
-/// is byte-identical to marker rewriting on its own.
+/// fuzzing pays for. Beyond "does not panic", it asserts that translation
+/// never invents or loses a parameter marker, that the NOSCAN path is
+/// byte-identical to marker rewriting on its own, and that the byte-level
+/// marker rewrite and the execution path's `{` shortcut match their
+/// `CodeScan` references.
 pub fn fuzz_escape_sequences(input: &str) {
     let markers = executable_marker_count(input);
 
@@ -94,6 +97,17 @@ pub fn fuzz_escape_sequences(input: &str) {
 
     let _ = translate_and_rewrite(input, false);
     let _ = describe_text(input);
+
+    assert_eq!(
+        rewrite_param_markers(input),
+        rewrite_param_markers_reference(input),
+        "{input:?}"
+    );
+    assert_eq!(
+        translate_for_execution(input, false, &[true, false]),
+        translate_for_execution_reference(input, &[true, false]),
+        "{input:?}"
+    );
 }
 
 /// Drive character→numeric parsing and every downstream narrowing.
