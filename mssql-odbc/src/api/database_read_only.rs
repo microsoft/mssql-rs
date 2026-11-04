@@ -16,8 +16,8 @@ use super::odbc_types::{
 };
 use super::secondary_lookup::{Route, cache_is_current, read_on_secondary, select_route};
 use super::sqlstate::{
-    ERR_CONNECTION_BUSY, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE,
-    ERR_INVALID_NULL_POINTER, SQLSTATE_HY000, post_diag, post_tds_error,
+    ERR_CONNECTION_BUSY, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_HY000,
+    post_diag, post_tds_error,
 };
 use super::txn::try_claim_idle_dbc_client;
 use super::util::write_if_some;
@@ -77,10 +77,6 @@ pub(super) fn get_access_mode(
             return SQL_ERROR;
         };
         free_errors(&mut state);
-        if value_ptr.is_null() {
-            post_diag(&mut state, ERR_INVALID_NULL_POINTER);
-            return SQL_ERROR;
-        }
     }
     let read_only = match database_read_only(dbc) {
         Ok(value) => value,

@@ -124,10 +124,6 @@ depends on the completed value can occur during `SQLPutData` or when
 `SQL_XL_ON`, to use `varchar(max)`, `nvarchar(max)`, and `varbinary(max)`.
 Explicit connection attributes take precedence over the keyword.
 
-The `SQL_COPT_SS_LONGASMAX` getter accepts NULL value and length pointers
-independently. Direct driver calls report a four-byte value length when
-requested.
-
 **Migration note:** earlier alpha builds always substituted MAX types. Use
 `LongAsMax=Yes` to retain that behavior. `ColumnSize` bounds still apply to
 LONG bindings in either mode; use the ordinary variable-length SQL types with
@@ -136,6 +132,13 @@ LONG bindings in either mode; use the ordinary variable-length SQL types with
 An already-executed prepared statement retains its server-side declaration
 when the option changes; prepare it again to select a new declaration. DAE
 parameters remain chunked in both modes.
+
+### Integer connection-attribute getters
+
+Supported integer getters accept NULL value and length pointers independently.
+Successful getters report a four-byte value length when requested, except
+`SQL_COPT_SS_WARN_ON_CP_ERROR`, which writes the length only when the value
+pointer is non-NULL.
 
 ## Platform artifacts
 
