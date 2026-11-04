@@ -122,6 +122,15 @@ The default Network.framework feature requires a macOS deployment target of
 Apple Silicon's default deployment target already meets this requirement.
 Disabling `tls-network-framework` removes this added minimum.
 
+## Data Classification
+
+Set `ClientContext::requested_data_classification_version` to receive the
+sensitivity labels, information types and ranks SQL Server assigns to result
+columns, read through `ResultSet::data_classification()`. It is off by
+default. See the
+[Data Classification guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/data-classification.md)
+for negotiation, connection-safety behavior and limitations.
+
 ## Response lifecycle
 
 Drain a response with `close_query()` before reuse, or call
