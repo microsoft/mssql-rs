@@ -1311,7 +1311,11 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), crate::api::odbc_types::SQL_NTS)
+                crate::api::SQLExecDirectW(
+                    h.stmt,
+                    sql.as_ptr(),
+                    crate::api::odbc_types::SQL_NTS.into(),
+                )
             },
             SQL_SUCCESS
         );

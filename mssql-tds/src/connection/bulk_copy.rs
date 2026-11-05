@@ -1185,10 +1185,7 @@ impl<'a> BulkCopy<'a> {
                     // This mirrors .NET SqlBulkCopy.CommitTransaction() behavior
                     // ═══════════════════════════════════════════════════════════
                     let commit_result = if use_internal_transaction {
-                        let result = self.client.commit_transaction(None, None).await;
-                        self.client
-                            .set_code_page_conversion_loss(accumulated_cp_loss);
-                        result
+                        self.client.commit_transaction(None, None).await
                     } else {
                         Ok(())
                     };
@@ -1223,8 +1220,6 @@ impl<'a> BulkCopy<'a> {
                     if use_internal_transaction && self.client.has_active_transaction() {
                         // Attempt rollback, but don't mask the original error
                         let _ = self.client.rollback_transaction(None, None).await;
-                        self.client
-                            .set_code_page_conversion_loss(accumulated_cp_loss);
                     }
 
                     // Restore the INFO accumulated up to the failure so a mid-stream
