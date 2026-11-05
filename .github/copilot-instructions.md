@@ -179,5 +179,5 @@ For performance-sensitive changes:
 - Make conditional snapshots and metadata work lazy when the common path does not
   need them.
 - Record user-visible performance behavior and intentional trade-offs in the
-  nearest component README when the optimization changes architecture or
-  buffering.
+  component README or a behavior guide linked from it when the optimization
+  changes architecture or buffering.
