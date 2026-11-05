@@ -36,6 +36,13 @@ payload before transmission. Tests inspect the final request body and require
 exactly one `Microsoft.ApplicationInsights.Event` envelope and no
 `Microsoft.ApplicationInsights.RemoteDependency` envelope.
 
+The exporter has no documented option to retain a custom event while
+suppressing its enclosing span envelope. Filtering the exporter's serialized
+HTTP request is the least invasive supported integration: it keeps
+`Exporter::new_from_connection_string` and the exporter's event mapping and
+serialization, without forking the crate or duplicating its private envelope
+model.
+
 ## Event schema
 
 The event name is `sqlcmdcli_usage`. It contains only these bounded properties:
@@ -51,6 +58,10 @@ The event name is `sqlcmdcli_usage`. It contains only these bounded properties:
 
 The version is omitted unless it is 1-64 ASCII bytes containing only letters,
 digits, `.`, `-`, `+`, or `_`.
+
+The transport rejects an event with any other custom property, requires the
+exact event envelope and name, and removes all exporter-generated envelope
+tags, including automatic SDK and operation attributes, before transmission.
 
 There is no completion event and no successful-connection event. The model
 does not include diagnose, JSON, `devdeviceid`, or human/agent classification.
@@ -81,9 +92,18 @@ Initialization, queueing, export, filtering, flush, and shutdown are best
 effort. Errors are available only as debug tracing and do not write to sqlcmd's
 normal output. Rust panics are caught at the C boundary.
 
-The queue and export batch are each limited to one span. Native sqlcmd must call
-shutdown after recording the event. Shutdown uses the caller's timeout capped
-at one second; after the bound expires, sqlcmd continues exiting.
+The queue and export batch are bounded at two items and normal export is
+deferred until shutdown, so filtering, compression, HTTP, and response errors
+can be reflected in the shutdown result. An all-filtered or malformed request
+is an error rather than a synthetic success. For partial-ingestion responses,
+filtered response indices are translated to the original exporter batch and
+the original received/accepted counts are preserved for correct retry
+semantics.
+
+Native sqlcmd must call shutdown after recording the event. Shutdown uses the
+caller's timeout capped at one second; after the bound expires, sqlcmd continues
+exiting. The HTTP request timeout is two seconds so the one-second process-exit
+bound remains authoritative.
 
 ## C ABI
 
@@ -110,3 +130,5 @@ The transport uses `opentelemetry`, `opentelemetry_sdk`,
 repository's native-TLS convention. The Application Insights exporter is a
 community crate and explicitly states that it is not an official Microsoft
 product. Shipping approval for that dependency remains an owning-team decision.
+The implementation has been validated only with in-memory HTTP clients and
+synthetic connection strings; it does not claim live DataX delivery.
