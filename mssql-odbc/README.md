@@ -64,8 +64,10 @@ flowchart LR
 
 Install the repository's pinned Rust toolchain and a native linker. Linux
 builds need OpenSSL development libraries and `pkg-config` (for example,
-`libssl-dev` and `pkg-config` on Debian/Ubuntu). The C++ end-to-end tests also
-need unixODBC development headers on Linux/macOS, CMake, and a C++17 compiler.
+`libssl-dev` and `pkg-config` on Debian/Ubuntu). On macOS, Rust unit tests also
+need OpenSSL development libraries for the `mssql-mock-tds` dev-dependency.
+The C++ end-to-end tests also need unixODBC development headers on Linux/macOS,
+CMake, and a C++17 compiler.
 
 Default-feature macOS builds require macOS 10.15 or later (11.0 or later on
 Apple Silicon). Set `MACOSX_DEPLOYMENT_TARGET=10.15` or later for x86_64 builds
