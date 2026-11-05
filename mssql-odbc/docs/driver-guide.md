@@ -104,7 +104,7 @@ msodbcsql does. Set `SQL_COPT_SS_DATACLASSIFICATION_VERSION` (1400) to `2` to
 also receive sensitivity ranks; values outside `1..=2` return `HY024`. The
 attribute can be set while connected, and the new value is requested at the
 next login. unixODBC frees the driver's connection at `SQLDisconnect` and
-replays only attributes set before connecting, so set it before
+replays only attributes set before connecting, so there set it before
 `SQLDriverConnect`.
 
 A result set's classification is read from its IRD header (`RecNumber` 0):
@@ -119,10 +119,8 @@ A result set's classification is read from its IRD header (`RecNumber` 0):
 
 `SQLColAttribute` does not answer either field. Each result set reports only
 its own classification: as in msodbcsql, it is dropped when an execution
-starts or fails, at the end of the batch, and when the cursor of a statement
-that is not prepared is closed. mssql-python can set the attribute through
-`attrs_before`, but it does not call `SQLGetDescField`, so it cannot read the
-metadata yet.
+starts, when an execution or row read fails or is cancelled, at the end of the
+batch, and when the cursor of a statement that is not prepared is closed.
 
 ## Integer connection-attribute getters
 
