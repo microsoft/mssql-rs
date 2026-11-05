@@ -25,6 +25,7 @@ extern "C" {
 #define MSSQL_SQLCMD_INTERNAL_ERROR 3
 #define MSSQL_SQLCMD_INVALID_ARGUMENT 4
 #define MSSQL_SQLCMD_UNSUPPORTED 5 /* not in this build: diagnostics when 32-bit */
+#define MSSQL_SQLCMD_TELEMETRY_TIMEOUT 6
 
 /* How the run ended: the end argument of mssql_sqlcmd_json_render. With the
    exit code it decides executionStatus and operationOutcome. */
@@ -45,6 +46,20 @@ typedef struct MssqlSqlcmdText {
     const uint16_t* data;
     size_t len; /* in UTF-16 code units, not bytes */
 } MssqlSqlcmdText;
+
+/* Privacy-safe product telemetry. The usage call lazily configures the direct
+   Application Insights exporter from APPLICATIONINSIGHTS_CONNECTION_STRING.
+   Missing or invalid configuration is a no-op. sqlcmd_version is included only
+   when it is a bounded version-like value. Failures are ignored and never
+   affect sqlcmd. */
+void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
+    MssqlSqlcmdText sqlcmd_version);
+
+/* Stops new telemetry capture and flushes once. timeout_ms is capped at 1000.
+   Returns 0 when completed, unconfigured, or already started; 6 on timeout;
+   or 3 on provider failure or panic. Callers must treat every result as
+   fail-open and preserve sqlcmd behavior. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_shutdown(uint32_t timeout_ms);
 
 /* A result-set column, as the driver describes it. Only the name is always
    given; a negative number or a NULL or empty type name means the driver did

@@ -31,6 +31,7 @@ use crate::diagnostics::SettingOrigin;
 #[cfg(target_pointer_width = "64")]
 use crate::diagnostics::{self, Authentication, Depth, Encrypt, Request, SettingSources};
 use crate::formatter::json::{Column, Connection, JsonDocument, Message, RunEnd};
+use crate::telemetry::{self, FlushOutcome};
 
 /// The call succeeded.
 pub const MSSQL_SQLCMD_OK: i32 = 0;
@@ -46,6 +47,8 @@ pub const MSSQL_SQLCMD_INTERNAL_ERROR: i32 = 3;
 pub const MSSQL_SQLCMD_INVALID_ARGUMENT: i32 = 4;
 /// This build does not have the feature: diagnostics in a 32-bit build.
 pub const MSSQL_SQLCMD_UNSUPPORTED: i32 = 5;
+/// Telemetry flush did not complete before its bounded timeout.
+pub const MSSQL_SQLCMD_TELEMETRY_TIMEOUT: i32 = 6;
 
 /// [`mssql_sqlcmd_json_render`]'s `end`: sqlcmd ran to its end, and the exit
 /// code says whether the work succeeded.
@@ -65,6 +68,39 @@ static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 #[unsafe(no_mangle)]
 pub extern "C" fn mssql_sqlcmd_version() -> *const std::ffi::c_char {
     VERSION.as_ptr().cast()
+}
+
+/// Captures the single usage event for one sqlcmd run.
+///
+/// The version is included only when it is a bounded version-like value.
+/// With no valid Application Insights configuration this is a no-op. Telemetry
+/// is best effort: a panic is caught and never crosses the ABI.
+///
+/// # Safety
+/// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_usage(sqlcmd_version: MssqlSqlcmdText) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let version = if sqlcmd_version.len <= 64 {
+            // SAFETY: forwarded from the caller's guarantees.
+            unsafe { read_text(sqlcmd_version) }
+        } else {
+            None
+        };
+        telemetry::record_usage(version.as_deref());
+    }));
+}
+
+/// Flushes and shuts down telemetry within `timeout_ms`, capped at one second.
+#[unsafe(no_mangle)]
+pub extern "C" fn mssql_sqlcmd_telemetry_shutdown(timeout_ms: u32) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        telemetry::shutdown(std::time::Duration::from_millis(u64::from(timeout_ms)))
+    })) {
+        Ok(FlushOutcome::Completed) => MSSQL_SQLCMD_OK,
+        Ok(FlushOutcome::TimedOut) => MSSQL_SQLCMD_TELEMETRY_TIMEOUT,
+        Ok(FlushOutcome::Failed) | Err(_) => MSSQL_SQLCMD_INTERNAL_ERROR,
+    }
 }
 
 /// A UTF-16 string with an explicit length. It need not be NUL-terminated and
@@ -1949,6 +1985,10 @@ mod tests {
                 MSSQL_SQLCMD_INVALID_ARGUMENT,
             ),
             ("MSSQL_SQLCMD_UNSUPPORTED", MSSQL_SQLCMD_UNSUPPORTED),
+            (
+                "MSSQL_SQLCMD_TELEMETRY_TIMEOUT",
+                MSSQL_SQLCMD_TELEMETRY_TIMEOUT,
+            ),
             ("MSSQL_SQLCMD_RUN_FINISHED", MSSQL_SQLCMD_RUN_FINISHED),
             ("MSSQL_SQLCMD_RUN_CANCELED", MSSQL_SQLCMD_RUN_CANCELED),
             (
