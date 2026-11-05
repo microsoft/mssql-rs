@@ -1126,23 +1126,34 @@ impl Stream for TcpStream {
         // No-op for plain TCP streams
     }
 
+    /// Non-blocking 1-byte read on an idle connection: WouldBlock is alive, EOF
+    /// or an error is dead. Any unsolicited byte is consumed and reported alive;
+    /// it would be raw (possibly TLS) stream data, so the session is already
+    /// invalid. This differs from msodbcsql, whose probe never consumes data.
     fn is_connection_dead(&self) -> bool {
-        // Non-blocking socket poll to detect a dead connection.
-        // try_read will consume a byte if data is available, but this is safe because
-        // is_connection_dead() is only called on idle connections (before sending a new
-        // command, when no TDS response data is expected on the socket).
-        // WouldBlock means the socket is alive (no data available, connection still open).
-        // Ok(0) means EOF (server closed connection). Any other error means broken.
-        // Ok(n > 0) means unexpected data — treat connection as alive; the data loss is
-        // not an issue because the connection state is already invalid if unsolicited data
-        // arrives.
-        match self.try_read(&mut [0u8; 1]) {
+        match probe_one_byte(self) {
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => false,
             Ok(0) => true,
             Err(_) => true,
             Ok(_) => false,
         }
     }
+}
+
+/// Bypasses tokio/mio on Windows: a WouldBlock through `try_read` makes mio
+/// cancel and re-arm the socket's AFD poll on the calling thread, which put
+/// that cost ahead of every send. The next real read pays it instead, while
+/// the server is working. Tokio and mio readiness state is not touched.
+#[cfg(windows)]
+fn probe_one_byte(stream: &TcpStream) -> std::io::Result<usize> {
+    socket2::SockRef::from(stream).recv(&mut [std::mem::MaybeUninit::uninit(); 1])
+}
+
+/// Unix `try_read` skips the syscall while tokio readiness is clear, which is
+/// the common idle case after a response has been fully read.
+#[cfg(not(windows))]
+fn probe_one_byte(stream: &TcpStream) -> std::io::Result<usize> {
+    stream.try_read(&mut [0u8; 1])
 }
 
 impl Stream for Box<dyn Stream> {
@@ -5551,6 +5562,161 @@ pub(crate) mod tests {
 
             // Dead
             assert!(boxed.is_connection_dead());
+        }
+    }
+
+    /// The Windows probe reads the socket outside tokio and mio, so these pin
+    /// that it neither loses a read wakeup nor changes the probe's verdicts.
+    #[cfg(windows)]
+    mod windows_liveness_probe_tests {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::time::Instant;
+        use tokio::net::TcpListener;
+
+        async fn connected_pair() -> (TcpStream, std::net::TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let server = server.into_std().unwrap();
+            server.set_nonblocking(false).unwrap();
+            server.set_nodelay(true).unwrap();
+            (client, server)
+        }
+
+        fn spin_for(delay: Duration) {
+            let start = Instant::now();
+            while start.elapsed() < delay {
+                std::hint::spin_loop();
+            }
+        }
+
+        /// Readiness left clear by a WouldBlock, as after a fully drained reply.
+        fn drain_tokio_readiness(client: &TcpStream) {
+            let mut buf = [0u8; 64];
+            loop {
+                match client.try_read(&mut buf) {
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+                    Ok(n) if n > 0 => continue,
+                    other => panic!("unexpected read result: {other:?}"),
+                }
+            }
+        }
+
+        async fn probe_then_round_trip_race() {
+            const ITERATIONS: u32 = 1000;
+            let (mut client, mut server) = connected_pair().await;
+            let peer = std::thread::spawn(move || {
+                let mut request = [0u8; 4];
+                for i in 0..ITERATIONS {
+                    server.read_exact(&mut request).unwrap();
+                    assert_eq!(u32::from_le_bytes(request), i);
+                    spin_for(Duration::from_micros(u64::from(i % 201)));
+                    server.write_all(&request).unwrap();
+                }
+            });
+            let mut reply = [0u8; 4];
+            for i in 0..ITERATIONS {
+                assert!(!client.is_connection_dead(), "iteration {i}");
+                client.write_all(&i.to_le_bytes()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+                    .await
+                    .unwrap_or_else(|_| panic!("read wakeup lost at iteration {i}"))
+                    .unwrap();
+                assert_eq!(u32::from_le_bytes(reply), i);
+            }
+            peer.join().unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn probe_does_not_lose_read_wakeup_multi_thread() {
+            probe_then_round_trip_race().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_does_not_lose_read_wakeup_current_thread() {
+            probe_then_round_trip_race().await;
+        }
+
+        async fn probe_with_cleared_readiness() {
+            let (mut client, mut server) = connected_pair().await;
+            drain_tokio_readiness(&client);
+            assert!(!client.is_connection_dead());
+
+            server.write_all(&[0x5A]).unwrap();
+            let mut byte = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut byte))
+                .await
+                .expect("read wakeup lost after a probe with cleared readiness")
+                .unwrap();
+            assert_eq!(byte, [0x5A]);
+
+            drain_tokio_readiness(&client);
+            drop(server);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(client.is_connection_dead());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn probe_with_cleared_readiness_multi_thread() {
+            probe_with_cleared_readiness().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn probe_with_cleared_readiness_current_thread() {
+            probe_with_cleared_readiness().await;
+        }
+
+        async fn unsolicited_byte_consumed_once() {
+            let (mut client, mut server) = connected_pair().await;
+            server.write_all(&[0xAB, 0xCD]).unwrap();
+            client.readable().await.unwrap();
+
+            assert!(!client.is_connection_dead());
+            let mut byte = [0u8; 1];
+            client.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, [0xCD], "probe must consume exactly one byte");
+            assert!(!client.is_connection_dead());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unsolicited_byte_consumed_once_multi_thread() {
+            unsolicited_byte_consumed_once().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn unsolicited_byte_consumed_once_current_thread() {
+            unsolicited_byte_consumed_once().await;
+        }
+
+        async fn peer_states_give_same_verdicts() {
+            let (client, server) = connected_pair().await;
+            assert!(!client.is_connection_dead(), "idle");
+            assert!(!client.is_connection_dead(), "idle, repeated");
+            drop(server);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(client.is_connection_dead(), "FIN");
+            assert!(client.is_connection_dead(), "FIN, repeated");
+
+            let (client, server) = connected_pair().await;
+            socket2::SockRef::from(&server)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(server);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(client.is_connection_dead(), "RST");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn peer_states_give_same_verdicts_multi_thread() {
+            peer_states_give_same_verdicts().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn peer_states_give_same_verdicts_current_thread() {
+            peer_states_give_same_verdicts().await;
         }
     }
 
