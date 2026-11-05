@@ -85,7 +85,7 @@ pub(crate) const SQLSTATE_HY008: [u8; 5] = *b"HY008";
 /// Only `diag_msgs!` builds these, so `full` is always
 /// [`DRIVER_DIAG_PREFIX`](crate::error::diag::DRIVER_DIAG_PREFIX) + `text`
 /// resolved at compile time and [`post_diag`] can post it without allocating.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiagMsg {
     pub(crate) state: [u8; 5],
     pub(crate) text: &'static str,
@@ -270,6 +270,10 @@ diag_msgs! {
     ERR_MISSING_UDT_TYPE_NAME = (
         SQLSTATE_HY000,
         "A UDT parameter requires SQL_CA_SS_UDT_TYPE_NAME to be set"
+    );
+    ERR_MISSING_TVP_TYPE_NAME = (
+        SQLSTATE_HY000,
+        "A table-valued parameter requires SQL_CA_SS_TYPE_NAME to be set"
     );
     // A streamed parameter is either NULL or a sequence of value chunks; mixing the
     // two in one `SQL_NEED_DATA` window has no representation on the wire
@@ -642,7 +646,11 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     // elapsing is likewise independent of the caller's context: ODBC reserves
     // `HYT00` specifically so an application can distinguish "my deadline
     // passed" from a generic failure, matching msodbcsql.
-    let sqlstate = match err {
+    let mut cause = err;
+    while let TdsError::TvpCellSerialization { source, .. } = cause {
+        cause = source;
+    }
+    let sqlstate = match cause {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
         TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
@@ -746,6 +754,29 @@ mod tests {
         fn diag_records_mut(&mut self) -> &mut Vec<crate::error::DiagRecord> {
             &mut self.records
         }
+    }
+
+    #[test]
+    fn post_tds_error_preserves_tvp_overflow_sqlstate_and_context() {
+        let mut state = FakeState::default();
+        let error = TdsError::TvpCellSerialization {
+            parameter: mssql_tds::error::TvpParameterRef::OdbcOrdinal(1),
+            row: 2,
+            column: 3,
+            source: Box::new(TdsError::EncodedValueTooLong {
+                actual: 6,
+                maximum: 2,
+            }),
+        };
+        post_tds_error(&mut state, &error, SQLSTATE_HY000);
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.records[0].sql_state, SQLSTATE_22001);
+        assert!(
+            state.records[0]
+                .message
+                .contains("ODBC ordinal 1, row 2, column 3")
+        );
+        assert!(state.records[0].message.ends_with(&error.to_string()));
     }
 
     #[test]

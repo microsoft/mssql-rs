@@ -677,12 +677,12 @@ suites; none of it came from `msodbcsql.h`.
 | 1233 | `QUERYNOTIFICATION_TIMEOUT` | int | **432000** | `1..=i32::MAX` — **0 is rejected** |
 | 1234 | `QUERYNOTIFICATION_MSGTEXT` | **string** | `""` | any string; `StringLength` ≥ 0 or `SQL_NTS` |
 | 1235 | `QUERYNOTIFICATION_OPTIONS` | **string** | `""` | any string; `StringLength` ≥ 0 or `SQL_NTS` |
-| 1236 | `PARAM_FOCUS` | int | 0 | **always `HY024`** |
+| 1236 | `PARAM_FOCUS` | int | 0 | 0 restores top-level binding; a bound TVP ordinal selects its columns; other values are `HY024` |
 | 1237 | `NAME_SCOPE` | int | 0 | range `0..=3` |
 | 1238 | `COLUMN_ENCRYPTION` | int | 0 | **always `HY024`** |
 
-A rejected set leaves the previous value in place. `PARAM_FOCUS` and
-`COLUMN_ENCRYPTION` reject *every* value including 0 — `COLUMN_ENCRYPTION` does
+A rejected set leaves the previous value in place.
+`COLUMN_ENCRYPTION` rejects *every* value including 0 — it does
 so even on a connection opened with `ColumnEncryption=Enabled`, so the rejection
 is unconditional rather than a licence check. The QN timeout ceiling is
 `i32::MAX`, not the full `SQLULEN` width the pointer slot can carry on a 64-bit
@@ -777,9 +777,9 @@ driver refuses. Variation 29 is therefore inverted from "this one is not
 implemented" into a completeness sweep asserting that all 41 comparable
 identifiers answer with neither `HY092` nor `HYC00`.
 
-**Cross-story notes:** `PARAM_FOCUS` rejects every value today, which matches
-msodbcsql; if AB#46374 (Descriptors) later implements it, the rejection is the
-single line to revisit.
+**Cross-story notes:** AB#49353 implements `PARAM_FOCUS` for TVP column binding.
+Its binding and execution coverage lives in `tvp_test`; the unsupported-feature
+attribute test now covers only `COLUMN_ENCRYPTION`.
 
 **Size:** M. **Depends on:** S1, S3 (string I/O), S4 (`begin_batch` call sites).
 

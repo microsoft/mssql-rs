@@ -1330,3 +1330,22 @@ msodbcsql build is measured.
     this entry does not settle its eventual replacement. No runtime behavior
     changes here; maintainer parity sign-off remains pending on
     [PR #770](https://github.com/microsoft/mssql-rs/pull/770).
+
+39. **Rebinding a TVP that is the last bound parameter does not preserve
+    parameter focus on msodbcsql 18.07.0001.** A measured end-to-end attempt
+    accepts the second `SQLBindParameter`, then returns IM020 when the same
+    statement is focused again. In msodbcsql, `SQLBindParameter` calls
+    `UnbindParam` when replacing a TVP child descriptor
+    (`sqlcdesc.cpp:3230-3247`); `UnbindParam` deletes that parameter with
+    `PlDeleteI` (`sqlcdesc.cpp:3246`, `sqlcfunc.cpp:1505-1522`), which reduces
+    the descriptor's item count only when deleting its last item. The next
+    focus validation rejects an ordinal beyond that count
+    (`sqlcdesc.cpp:3478-3509`). This explains the measured last-parameter
+    case; it does not establish that rebinding a non-last TVP behaves the same.
+    This driver treats the new TVP bind as a fresh identity, clears the prior
+    catalog/schema, and supports rebinding its child columns under the caller's
+    default schema. `RebindingUnqualifiedTypeClearsPreviousSchema` now asserts
+    successful execution on this driver and IM020 on the msodbcsql comparison
+    leg, keeping the reference behavior measured. No existing call sequence is
+    changed. The runtime evidence was collected with the C++ test against the
+    local SQL Server and ODBC Driver 18.07.0001. Tracked in AB#49353.
