@@ -62,6 +62,17 @@ the next fetch. The connection retains one heap-allocated protocol client to
 avoid large client copies during result retrieval; cancellation and connection
 ownership behavior are unchanged.
 
+### Descriptors
+
+Binding and descriptor APIs share the same records. Freeing an explicit
+descriptor restores associated statements' implicit descriptors. Application
+buffers must remain valid until outstanding operations finish.
+
+IPD SQL-definition changes take effect on the next prepared execution, including
+edits overlapping a synchronous execution. Equivalent definitions and
+application-buffer-only changes retain cached plans. During Need Data, complete
+or cancel the data-at-execution sequence before changing bindings.
+
 ### Connection defaults
 
 Eligible TCP connections use MultiSubnetFailover (MSF) by default. Set
@@ -116,6 +127,10 @@ parameters remain, subsequent PLP values stream normally. Validation that
 depends on the completed value can occur during `SQLPutData` or when
 `SQLParamData` closes the parameter rather than at bind time.
 
+TVP DAE cells are buffered until the complete table can be sent. Row-control
+staging grows with supplied batches rather than the bound row capacity; the
+collected table still requires memory proportional to its actual contents.
+
 ### Legacy LOB parameters
 
 `SQL_LONGVARCHAR`, `SQL_WLONGVARCHAR`, and `SQL_LONGVARBINARY` parameters use
@@ -123,6 +138,9 @@ depends on the completed value can occur during `SQLPutData` or when
 `LongAsMax=Yes` in the connection string, or set `SQL_COPT_SS_LONGASMAX` to
 `SQL_XL_ON`, to use `varchar(max)`, `nvarchar(max)`, and `varbinary(max)`.
 Explicit connection attributes take precedence over the keyword.
+
+TVP columns always use the corresponding MAX types, including NULL and DAE
+cells, regardless of `LongAsMax`.
 
 **Migration note:** earlier alpha builds always substituted MAX types. Use
 `LongAsMax=Yes` to retain that behavior. `ColumnSize` bounds still apply to
@@ -132,6 +150,13 @@ LONG bindings in either mode; use the ordinary variable-length SQL types with
 An already-executed prepared statement retains its server-side declaration
 when the option changes; prepare it again to select a new declaration. DAE
 parameters remain chunked in both modes.
+
+### Integer connection-attribute getters
+
+Supported integer getters accept NULL value and length pointers independently.
+Successful getters report a four-byte value length when requested, except
+`SQL_COPT_SS_WARN_ON_CP_ERROR`, which writes the length only when the value
+pointer is non-NULL.
 
 ## Platform artifacts
 
@@ -146,6 +171,10 @@ parameters remain chunked in both modes.
 Install the repository's pinned Rust toolchain. Linux and macOS builds also
 need unixODBC development headers; the C++ end-to-end tests additionally need
 CMake and a C++17 compiler.
+
+Default-feature macOS builds require macOS 10.15 or later (11.0 or later on
+Apple Silicon). Set `MACOSX_DEPLOYMENT_TARGET=10.15` or later for x86_64 builds
+to meet the Network.framework requirement.
 
 From the repository root:
 
@@ -263,6 +292,11 @@ Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
 `SQL_C_BINARY` continues to return unconverted wire bytes. mssql-python's
 default wide-character fetching is unchanged; an explicitly selected narrow
 decoder must match the platform client encoding.
+
+On Windows, a streamed `varchar(max)` value whose collation code page is 1252
+is delivered to `SQL_C_CHAR` under ANSI code page 1252 without decoding and
+re-encoding, as msodbcsql does when the code pages match. The bytes are the
+same as converting them, and the copy may read ahead up to 64 KiB of the value.
 
 **Migration note:** narrow results were previously always UTF-8. Applications
 that assumed UTF-8 on a non-UTF-8 system should use wide retrieval or decode

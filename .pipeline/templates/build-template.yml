@@ -47,6 +47,11 @@ parameters:
   default: false
 
 steps:
+- ${{ if eq(parameters.osType, 'MacOS') }}:
+  - bash: |
+      echo "##vso[task.setvariable variable=MACOSX_DEPLOYMENT_TARGET]${MACOSX_DEPLOYMENT_TARGET:-10.15}"
+    displayName: Set macOS deployment target
+
 - template: generate-sql-password-template.yml
   parameters:
     osType: ${{ parameters.osType }}

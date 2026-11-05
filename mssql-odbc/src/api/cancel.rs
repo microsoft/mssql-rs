@@ -185,7 +185,7 @@ mod tests {
                     crate::api::SQLExecDirectW(
                         handle,
                         sql.as_ptr(),
-                        i16::try_from(sql.len()).unwrap(),
+                        i32::try_from(sql.len()).unwrap(),
                     )
                 };
                 assert_eq!(SQL_SUCCESS, exec(h.stmt));
@@ -265,7 +265,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             if deferred {
                 assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -323,7 +323,7 @@ mod tests {
             ));
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
             crate::api::SQLCancel(h.stmt)
@@ -355,7 +355,7 @@ mod tests {
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         for handle in [h.stmt, other] {
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(handle, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             if handle == h.stmt {
                 for _ in 0..3 {
@@ -406,7 +406,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             let exec = || unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             };
             assert_eq!(SQL_SUCCESS, exec());
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -552,7 +552,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         let exec = |handle| unsafe {
-            crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(handle, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         };
         assert_eq!(SQL_SUCCESS, exec(h.stmt));
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -637,7 +637,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT ? + ?".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             let mut indicators = [SQL_DATA_AT_EXEC; 2];
             let mut tokens = [0u8; 2];
@@ -717,7 +717,7 @@ mod tests {
             });
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         }
@@ -732,7 +732,8 @@ mod tests {
         GetDataReadAhead,
         MoreResults,
         Close,
-        ConnectionClose,
+        EndTran,
+        AutocommitOn,
         Idle,
         IdlePlp,
         IdleClose,
@@ -888,15 +889,34 @@ mod tests {
             state.wire.install(client);
             state.connection_state = crate::handles::dbc::ConnectionState::Connected;
         }
+        let connection_end_tran = matches!(phase, CursorPhase::EndTran);
+        let connection_autocommit = matches!(phase, CursorPhase::AutocommitOn);
+        let connection_close = connection_end_tran || connection_autocommit;
+        if connection_close {
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLSetConnectAttrW(
+                    h.dbc,
+                    SQL_ATTR_AUTOCOMMIT,
+                    SQL_AUTOCOMMIT_OFF as usize as SqlPointer,
+                    0,
+                )
+            });
+        }
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(
             SQL_SUCCESS,
             unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             },
             "{:?}",
             stmt.inner.lock().unwrap().diag_records
         );
+        if connection_close {
+            let state = dbc.inner.lock().unwrap();
+            assert!(!state.autocommit);
+            assert!(state.local_tran_started);
+            assert!(state.wire.client().unwrap().has_active_transaction());
+        }
         let mut bound = 0i32;
         let mut length = 0;
         if matches!(
@@ -942,7 +962,6 @@ mod tests {
         }
         let raw = h.stmt as usize;
         let raw_dbc = h.dbc as usize;
-        let connection_close = matches!(phase, CursorPhase::ConnectionClose);
         if stall || connection_close {
             // Change after execution to verify the current connection attribute,
             // not the execute-time snapshot, controls cancellation settlement.
@@ -985,11 +1004,20 @@ mod tests {
                     CursorPhase::Fetch | CursorPhase::ReadAhead => crate::api::SQLFetch(raw),
                     CursorPhase::MoreResults => crate::api::SQLMoreResults(raw),
                     CursorPhase::Close => crate::api::SQLFreeStmt(raw, SQL_CLOSE),
-                    CursorPhase::ConnectionClose => {
+                    CursorPhase::EndTran => {
+                        let rc = crate::api::SQLEndTran(
+                            SQL_HANDLE_DBC,
+                            raw_dbc as SqlHandle,
+                            SQL_COMMIT,
+                        );
+                        idle_tx.send(rc).unwrap();
+                        rc
+                    }
+                    CursorPhase::AutocommitOn => {
                         let rc = crate::api::SQLSetConnectAttrW(
                             raw_dbc as SqlHandle,
-                            SQL_ATTR_TXN_ISOLATION,
-                            SQL_TXN_SERIALIZABLE as usize as SqlPointer,
+                            SQL_ATTR_AUTOCOMMIT,
+                            SQL_AUTOCOMMIT_ON as usize as SqlPointer,
                             0,
                         );
                         idle_tx.send(rc).unwrap();
@@ -1046,7 +1074,13 @@ mod tests {
             }
             assert_eq!(
                 if connection_close {
-                    if acknowledge { SQL_SUCCESS } else { SQL_ERROR }
+                    if !acknowledge {
+                        SQL_ERROR
+                    } else if connection_autocommit {
+                        SQL_SUCCESS_WITH_INFO
+                    } else {
+                        SQL_SUCCESS
+                    }
                 } else if idle {
                     if acknowledge { idle_success } else { SQL_ERROR }
                 } else {
@@ -1085,12 +1119,18 @@ mod tests {
                 let state = dbc.inner.lock().unwrap();
                 assert!(state.wire.owner().is_none());
                 if connection_close {
-                    if acknowledge {
-                        assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
-                        assert_eq!(state.txn_isolation, SQL_TXN_SERIALIZABLE);
-                    } else {
+                    if !acknowledge {
                         assert_eq!(state.diag_records[0].sql_state, *b"HY000");
-                        assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
+                    } else if connection_autocommit {
+                        assert_eq!(state.diag_records.len(), 1);
+                        assert_eq!(state.diag_records[0].sql_state, *b"01000");
+                    } else {
+                        assert!(state.diag_records.is_empty(), "{:?}", state.diag_records);
+                    }
+                    assert_eq!(state.autocommit, connection_autocommit && acknowledge);
+                    assert_eq!(state.local_tran_started, !acknowledge);
+                    if acknowledge {
+                        assert!(!state.wire.client().unwrap().has_active_transaction());
                     }
                 }
                 assert_eq!(
@@ -1104,7 +1144,11 @@ mod tests {
             assert_eq!(
                 if idle && acknowledge {
                     idle_success
-                } else if matches!(phase, CursorPhase::Close) || (connection_close && acknowledge) {
+                } else if connection_autocommit && acknowledge {
+                    SQL_SUCCESS_WITH_INFO
+                } else if matches!(phase, CursorPhase::Close)
+                    || (connection_end_tran && acknowledge)
+                {
                     SQL_SUCCESS
                 } else {
                     SQL_ERROR
@@ -1117,7 +1161,7 @@ mod tests {
         });
         if acknowledge {
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         }
@@ -1173,9 +1217,15 @@ mod tests {
     }
 
     #[test]
+    fn connection_timeout_bounds_cursor_cleanup_before_end_tran() {
+        cancel_cursor_phase(CursorPhase::EndTran, true, false);
+        cancel_cursor_phase(CursorPhase::EndTran, false, true);
+    }
+
+    #[test]
     fn connection_timeout_bounds_cursor_cleanup_before_an_attribute_change() {
-        cancel_cursor_phase(CursorPhase::ConnectionClose, true, false);
-        cancel_cursor_phase(CursorPhase::ConnectionClose, false, true);
+        cancel_cursor_phase(CursorPhase::AutocommitOn, true, false);
+        cancel_cursor_phase(CursorPhase::AutocommitOn, false, true);
     }
 
     /// Replays a SQLCancel that signals after a call's last read but before
@@ -1217,7 +1267,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         let exec = || unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         };
         assert_eq!(SQL_SUCCESS, exec());
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -1265,7 +1315,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         assert!(dbc.inner.lock().unwrap().wire.owner().is_none());
@@ -1280,7 +1330,7 @@ mod tests {
             crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
         });
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         assert_eq!(SQL_SUCCESS, unsafe {
@@ -1371,7 +1421,7 @@ mod tests {
         before_reuse();
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         let mut value = 0i32;
@@ -1453,7 +1503,7 @@ mod tests {
             }
             .encode_utf16()
             .collect();
-            let sql_len = i16::try_from(sql.len()).unwrap();
+            let sql_len = i32::try_from(sql.len()).unwrap();
             let mut values = [7i32, 8];
             let mut indicator = SQL_DATA_AT_EXEC;
             if matches!(path, "streamed" | "deferred") {
@@ -1613,7 +1663,7 @@ mod tests {
             }
             .encode_utf16()
             .collect();
-            let sql_len = i16::try_from(sql.len()).unwrap();
+            let sql_len = i32::try_from(sql.len()).unwrap();
             if prepared {
                 assert_eq!(SQL_SUCCESS, unsafe {
                     crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), sql_len)

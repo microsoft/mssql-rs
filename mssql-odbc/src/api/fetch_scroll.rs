@@ -1007,7 +1007,7 @@ fn fetch_scroll_operation(
     // AB#47437: the ARD is the fill loop's single source of truth, derived
     // fresh from its records every fetch rather than cached, so a
     // descriptor-field bind (`SQLSetDescFieldW`) and a `SQLBindCol` bind are
-    // indistinguishable here. A freed or poisoned ARD now fails the fetch
+    // indistinguishable here. An inaccessible or poisoned ARD fails the fetch
     // outright (SQL_ERROR), clearing STMT_STATE_FETCH_IN_PROGRESS so the
     // statement is not left permanently stuck mid-fetch: silently treating it
     // as "nothing bound" would advance the cursor and report success for a
@@ -1019,11 +1019,7 @@ fn fetch_scroll_operation(
         ..
     }) = ard_read
     else {
-        if matches!(ard_read, ArdRead::Gone) {
-            error!("SQLFetchScroll: ard freed concurrently; failing the fetch");
-        } else {
-            error!("SQLFetchScroll: ard mutex poisoned; failing the fetch");
-        }
+        error!("SQLFetchScroll: failed to access ard; failing the fetch");
         release_fetch_claim(stmt, Some("Internal error reading column bindings"));
         return SQL_ERROR;
     };
@@ -1658,10 +1654,7 @@ fn dispatch_rows(row_budget: SqlULen, mut dispatch: impl FnMut() -> bool) {
 /// What one ARD acquisition yielded for a fetch.
 enum ArdRead {
     Read(ArdSnapshot),
-    /// The descriptor was freed concurrently. There is nothing to read, but
-    /// nothing is internally broken.
-    Gone,
-    /// The descriptor's mutex is poisoned — an internal synchronization
+    /// Descriptor access failed — an internal synchronization
     /// failure, which the crate requires be reported as `SQL_ERROR` rather
     /// than absorbed (`.github/instructions/mssql-odbc.instructions.md`,
     /// "No panics").
@@ -1678,19 +1671,17 @@ struct ArdSnapshot {
     bindings: Vec<ColumnBinding>,
 }
 
-/// Reads the ARD resolved under a since-dropped STMT lock. A freed descriptor
-/// and a poisoned one are kept apart: only the latter is an internal failure.
+/// Reads the effective ARD, re-resolving explicit associations under the DBC lock.
 fn read_ard(
     stmt: &StmtHandle,
     ard: SqlHandle,
     with_bindings: bool,
     mut bindings: Vec<ColumnBinding>,
 ) -> ArdRead {
-    // The implicit ARD lives with the statement. Explicit descriptors can be freed.
-    if ard != stmt.ard && crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
-        return ArdRead::Gone;
-    }
-    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+    let Ok(desc) = stmt.access_descriptor(crate::handles::stmt::StatementDescriptor::Ard, ard)
+    else {
+        return ArdRead::Poisoned;
+    };
     let Ok(desc_state) = desc.inner.lock() else {
         return ArdRead::Poisoned;
     };
@@ -1772,9 +1763,7 @@ fn finish_exhausted_fetch(
         rc
     };
     unsafe { write_if_some(rows_fetched_ptr, 0) };
-    // A freed ARD keeps the known `SQL_NO_DATA` and skips the walk (no safe
-    // extent); a poisoned one is an internal failure and is always reported.
-    //
+    // An inaccessible descriptor is an internal failure, even on exhaustion.
     // Filling the status array here diverges from msodbcsql, which leaves it
     // untouched (measured, 18.6.2.1). The divergence predates AB#48943 and is
     // confined to this path. Pinned by
@@ -1786,7 +1775,7 @@ fn finish_exhausted_fetch(
         mark_no_rows(row_status_ptr, 0, snapshot.array_size);
     }
     if poisoned {
-        error!("SQLFetchScroll: ard mutex poisoned on an exhausted cursor");
+        error!("SQLFetchScroll: failed to access ard on an exhausted cursor");
     }
     // Released only after the walk, in the same acquisition that posts any
     // diagnostic: dropping the claim earlier would reopen the window it exists
@@ -5880,13 +5869,8 @@ mod tests {
         }
     }
 
-    /// A descriptor freed inside the resolve/lock window must **not** be an
-    /// error: the verdict was computed before the ARD was consulted, and the
-    /// only thing lost is an optional status-array fill. Without this, nothing
-    /// distinguishes `ArdRead::Gone` from `ArdRead::Poisoned` — flipping
-    /// `Gone` to return `SQL_ERROR` otherwise leaves the whole suite green.
     #[test]
-    fn exhausted_cursor_fast_path_tolerates_a_freed_ard() {
+    fn exhausted_cursor_fast_path_uses_implicit_ard_after_explicit_free() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit = h.alloc_explicit_desc();
         open_cursor(&h);
@@ -5899,11 +5883,8 @@ mod tests {
             set_rows_fetched_ptr(&h, &mut rows_fetched);
             set_row_status_ptr(&h, statuses.as_mut_ptr());
         }
-        // Free through the fixture so the DBC stops tracking it, then restore
-        // the association: that is the state the resolve/lock window leaves
-        // behind, with `active_ard` pointing at a dead handle.
-        assert_eq!(h.free_explicit_desc(explicit), SQL_SUCCESS);
         stmt.inner.lock().unwrap().active_ard = Some(explicit);
+        assert_eq!(h.free_explicit_desc(explicit), SQL_SUCCESS);
 
         assert_eq!(
             unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
@@ -5912,11 +5893,10 @@ mod tests {
         );
         assert_eq!(rows_fetched, 0, "the fetched count is still reported");
         assert_eq!(
-            statuses, [0xBEEF_u16; 2],
-            "no extent is knowable, so the application's array is left alone"
+            statuses,
+            [SQL_ROW_NOROW, 0xBEEF],
+            "the implicit ARD's extent applies after the association is reset"
         );
-
-        stmt.inner.lock().unwrap().active_ard = None;
     }
 
     /// A poisoned ARD must not be absorbed into normal completion: reporting
@@ -7001,13 +6981,7 @@ mod tests {
                     if matches!(value, ColumnValues::Time(_)) && target == SQL_C_TYPE_DATE {
                         (RowIssue::Restricted, ERR_RESTRICTED_DATA_TYPE)
                     } else if matches!(target, SQL_C_CHAR | SQL_C_WCHAR) {
-                        (
-                            RowIssue::Unsupported,
-                            DiagMsg {
-                                state: SQLSTATE_HYC00,
-                                text: "Column type conversion not yet implemented",
-                            },
-                        )
+                        (RowIssue::Unsupported, ERR_COLUMN_CONVERSION_NOT_IMPLEMENTED)
                     } else {
                         (*issue, *expected_diagnostic)
                     };

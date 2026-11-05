@@ -23,8 +23,8 @@ use crate::api::sqlstate::{
 };
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ColumnBinding, STMT_STATE_FETCH_IN_PROGRESS};
-use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::stmt::{ColumnBinding, STMT_STATE_FETCH_IN_PROGRESS, StatementDescriptor};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Implements SQLBindCol.
 ///
@@ -171,7 +171,7 @@ fn sql_bind_col_safe(
         if target_value_ptr.is_null() {
             let ard = stmt_state.effective_ard(stmt);
             drop(stmt_state);
-            let Ok(()) = unbind_ard_column(ard, column_number) else {
+            let Ok(()) = unbind_ard_column(stmt, ard, column_number) else {
                 error!("SQLBindCol: ard mutex poisoned; unbind failed");
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     post_sql_error(
@@ -223,7 +223,7 @@ fn sql_bind_col_safe(
         // SQLSetDescFieldW/SQLSetDescRec.
         octet_length_ptr: strlen_or_ind_ptr,
     };
-    let Ok(()) = bind_ard_column(ard, binding) else {
+    let Ok(()) = bind_ard_column(stmt, ard, binding) else {
         error!("SQLBindCol: ard mutex poisoned or missing record after growth");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
@@ -240,13 +240,8 @@ fn sql_bind_col_safe(
 }
 
 /// Writes `binding` into `ard`'s record at `binding.column_number`, growing
-/// the record list first if that ordinal doesn't exist yet. `Err(())` if
-/// `ard` is no longer a live descriptor (freed by a concurrent
-/// `SQLFreeHandle(SQL_HANDLE_DESC)` on the explicit descriptor between
-/// `effective_ard` resolving it and this call locking it — a narrow race this
-/// check does not fully close, but converts from a raw-pointer dereference of
-/// freed memory into a clean `SQL_ERROR` in the overwhelming majority of
-/// timings), a poisoned ARD mutex, or a missing record after growth — the
+/// the record list first if that ordinal doesn't exist yet. `Err(())` on a
+/// poisoned mutex or a missing record after growth — the
 /// caller decides how to report that against the statement, since bind
 /// errors are always posted to the STMT handle, never the descriptor.
 /// `binding.column_number` must already fit `SqlSmallInt` (`sql_bind_col_safe`
@@ -254,11 +249,8 @@ fn sql_bind_col_safe(
 /// conversion here is not expected to fail in practice — but this still
 /// reports it as an error rather than panicking or silently truncating to the
 /// wrong record.
-fn bind_ard_column(ard: SqlHandle, binding: ColumnBinding) -> Result<(), ()> {
-    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
-        return Err(());
-    }
-    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+fn bind_ard_column(stmt: &StmtHandle, ard: SqlHandle, binding: ColumnBinding) -> Result<(), ()> {
+    let desc = stmt.access_descriptor(StatementDescriptor::Ard, ard)?;
     let Ok(mut desc_state) = desc.inner.lock() else {
         return Err(());
     };
@@ -277,18 +269,17 @@ fn bind_ard_column(ard: SqlHandle, binding: ColumnBinding) -> Result<(), ()> {
 /// — this driver's "unbound" signal (`ColumnBinding::from_record`). A no-op,
 /// not an error, if no record exists yet at that ordinal (never bound): that
 /// is not something `SQLBindCol` can meaningfully fail on the way a genuine
-/// bind can. `Err(())` if `ard` is no longer a live descriptor (see
-/// `bind_ard_column`'s identical concurrent-free note) or its mutex is
-/// poisoned — the caller decides how to report that against the statement,
+/// bind can. `Err(())` on a poisoned mutex — the caller reports that against the statement,
 /// since bind/unbind errors are always posted to the STMT handle, never a
 /// descriptor: reporting `SQL_SUCCESS` here would tell the application an
 /// unbind happened when it didn't, and a stale bound column would keep
 /// writing through a possibly-freed application buffer on the next fetch.
-fn unbind_ard_column(ard: SqlHandle, column_number: SqlUSmallInt) -> Result<(), ()> {
-    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
-        return Err(());
-    }
-    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+fn unbind_ard_column(
+    stmt: &StmtHandle,
+    ard: SqlHandle,
+    column_number: SqlUSmallInt,
+) -> Result<(), ()> {
+    let desc = stmt.access_descriptor(StatementDescriptor::Ard, ard)?;
     let Ok(mut desc_state) = desc.inner.lock() else {
         return Err(());
     };
@@ -345,8 +336,8 @@ fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {
         stmt_state.effective_ard(stmt)
     };
 
-    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
-        error!("SQLFreeStmt(SQL_UNBIND): ard freed concurrently; unbind failed");
+    let Ok(desc) = stmt.access_descriptor(StatementDescriptor::Ard, ard) else {
+        error!("SQLFreeStmt(SQL_UNBIND): failed to access ard");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
                 &mut stmt_state,
@@ -356,8 +347,7 @@ fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {
             );
         }
         return SQL_ERROR;
-    }
-    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+    };
     let Ok(mut desc_state) = desc.inner.lock() else {
         error!("SQLFreeStmt(SQL_UNBIND): ard mutex poisoned; unbind failed");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -381,9 +371,12 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_DATE, SQL_C_DEFAULT, SQL_C_INTERVAL_YEAR, SQL_C_NUMERIC, SQL_C_SLONG,
-        SQL_C_TIME, SQL_C_TIMESTAMP, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
+        SQL_ATTR_APP_ROW_DESC, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROWS_FETCHED_PTR, SQL_C_CHAR,
+        SQL_C_DATE, SQL_C_DEFAULT, SQL_C_INTERVAL_YEAR, SQL_C_NUMERIC, SQL_C_SLONG, SQL_C_TIME,
+        SQL_C_TIMESTAMP, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SqlInteger,
+        SqlULen,
     };
+    use crate::handles::DescHandle;
     use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
     use crate::test_support::TestHandles;
 
@@ -908,15 +901,8 @@ mod tests {
         assert_eq!(bindings_len(&h), 1);
     }
 
-    /// The narrow race `bind_ard_column`'s liveness check guards against:
-    /// `effective_ard` resolves an explicit descriptor under the STMT lock,
-    /// which is dropped before the descriptor is actually locked and
-    /// written. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes in
-    /// that window, the stale pointer must fail cleanly (`Err`), not
-    /// dereference freed memory. Calling the helper directly with an
-    /// already-freed handle reproduces the state that window leaves behind.
     #[test]
-    fn bind_ard_column_fails_cleanly_on_a_freed_descriptor() {
+    fn bind_ard_column_reresolves_after_explicit_descriptor_free() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit_ard = h.alloc_explicit_desc();
         assert_eq!(h.free_explicit_desc(explicit_ard), SQL_SUCCESS);
@@ -929,15 +915,164 @@ mod tests {
             strlen_or_ind_ptr: ptr::null_mut(),
             octet_length_ptr: ptr::null_mut(),
         };
-        assert!(bind_ard_column(explicit_ard, binding).is_err());
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(bind_ard_column(stmt, explicit_ard, binding).is_ok());
+        assert_eq!(bindings_len(&h), 1);
     }
 
-    /// Same race, same guard, for `unbind_ard_column`.
     #[test]
-    fn unbind_ard_column_fails_cleanly_on_a_freed_descriptor() {
+    fn unbind_ard_column_reresolves_after_explicit_descriptor_free() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit_ard = h.alloc_explicit_desc();
         assert_eq!(h.free_explicit_desc(explicit_ard), SQL_SUCCESS);
-        assert!(unbind_ard_column(explicit_ard, 1).is_err());
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(unbind_ard_column(stmt, explicit_ard, 1).is_ok());
+    }
+
+    fn set_stmt_attr(h: &TestHandles, attribute: SqlInteger, value: SqlPointer) -> SqlReturn {
+        unsafe { crate::api::set_stmt_attr::sql_set_stmt_attr_w(h.stmt, attribute, value, 0) }
+    }
+
+    fn get_stmt_attr(h: &TestHandles, attribute: SqlInteger) -> (SqlReturn, SqlULen) {
+        let mut value: SqlULen = 0;
+        let rc = unsafe {
+            crate::api::set_stmt_attr::sql_get_stmt_attr_w(
+                h.stmt,
+                attribute,
+                &mut value as *mut SqlULen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        (rc, value)
+    }
+
+    /// The per-row sequence a single-row bound fetch loop issues, run twice
+    /// with different buffers and header values, entirely on the statement's
+    /// implicit ARD and IRD: every write must be visible to the next read.
+    #[test]
+    fn rebinding_and_header_writes_on_implicit_descriptors_stay_visible() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut buffers = [[0i32; 3]; 2];
+        let mut fetched: [SqlULen; 2] = [0; 2];
+
+        for round in 0..2 {
+            let row_array_size = (round + 2) as SqlULen;
+            let fetched_ptr = &mut fetched[round] as *mut SqlULen;
+            for col in 1..=3u16 {
+                let target = &mut buffers[round][usize::from(col - 1)] as *mut i32;
+                let rc = unsafe {
+                    sql_bind_col(
+                        h.stmt,
+                        col,
+                        SQL_C_SLONG,
+                        target as SqlPointer,
+                        0,
+                        ptr::null_mut(),
+                    )
+                };
+                assert_eq!(rc, SQL_SUCCESS);
+            }
+            assert_eq!(
+                set_stmt_attr(&h, SQL_ATTR_ROW_ARRAY_SIZE, row_array_size as SqlPointer),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                set_stmt_attr(&h, SQL_ATTR_ROWS_FETCHED_PTR, fetched_ptr as SqlPointer),
+                SQL_SUCCESS
+            );
+
+            let bound = bindings(&h);
+            assert_eq!(bound.len(), 3);
+            for (binding, expected) in bound.iter().zip(buffers[round].iter_mut()) {
+                assert_eq!(binding.target_value_ptr, expected as *mut i32 as SqlPointer);
+            }
+            assert_eq!(
+                get_stmt_attr(&h, SQL_ATTR_ROW_ARRAY_SIZE),
+                (SQL_SUCCESS, row_array_size)
+            );
+            assert_eq!(
+                get_stmt_attr(&h, SQL_ATTR_ROWS_FETCHED_PTR),
+                (SQL_SUCCESS, fetched_ptr as SqlULen)
+            );
+
+            let rc = unsafe {
+                sql_bind_col(h.stmt, 2, SQL_C_SLONG, ptr::null_mut(), 0, ptr::null_mut())
+            };
+            assert_eq!(rc, SQL_SUCCESS);
+            assert_eq!(bindings_len(&h), 2);
+            assert_eq!(record_count(&h), 3);
+
+            assert_eq!(unsafe { sql_free_stmt_unbind(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(record_count(&h), 0);
+            assert_eq!(
+                get_stmt_attr(&h, SQL_ATTR_ROW_ARRAY_SIZE),
+                (SQL_SUCCESS, row_array_size),
+                "SQL_UNBIND must not touch the ARD header"
+            );
+        }
+    }
+
+    /// The implicit-descriptor bypass must not extend to an explicit ARD:
+    /// every ARD-resolving entry point still fails cleanly once the explicit
+    /// descriptor it resolved has been freed.
+    #[test]
+    fn entry_points_still_reject_a_freed_explicit_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_ard = h.alloc_explicit_desc();
+        assert_eq!(
+            set_stmt_attr(&h, SQL_ATTR_APP_ROW_DESC, explicit_ard as SqlPointer),
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // Same dangling-association setup as set_stmt_attr's
+        // `array_size_fails_cleanly_on_a_freed_descriptor`: clear the
+        // association so `free_desc` cannot reset it, free through the
+        // fixture, then restore the stale pointer.
+        stmt.inner.lock().unwrap().active_ard = None;
+        assert_eq!(h.free_explicit_desc(explicit_ard), SQL_SUCCESS);
+        stmt.inner.lock().unwrap().active_ard = Some(explicit_ard);
+
+        let mut buf = 0i32;
+        let rc = unsafe {
+            sql_bind_col(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                &mut buf as *mut i32 as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_ERROR, "SQLBindCol");
+        assert_eq!(last_state(&h), *b"HY000");
+
+        let rc =
+            unsafe { sql_bind_col(h.stmt, 1, SQL_C_SLONG, ptr::null_mut(), 0, ptr::null_mut()) };
+        assert_eq!(rc, SQL_ERROR, "SQLBindCol unbind");
+        assert_eq!(last_state(&h), *b"HY000");
+
+        assert_eq!(
+            unsafe { sql_free_stmt_unbind(h.stmt) },
+            SQL_ERROR,
+            "SQL_UNBIND"
+        );
+        assert_eq!(last_state(&h), *b"HY000");
+
+        assert_eq!(
+            set_stmt_attr(&h, SQL_ATTR_ROW_ARRAY_SIZE, 4 as SqlPointer),
+            SQL_ERROR,
+            "SQLSetStmtAttrW"
+        );
+        assert_eq!(last_state(&h), *b"HY000");
+
+        assert_eq!(
+            get_stmt_attr(&h, SQL_ATTR_ROW_ARRAY_SIZE).0,
+            SQL_ERROR,
+            "SQLGetStmtAttrW"
+        );
+        assert_eq!(last_state(&h), *b"HY000");
+
+        stmt.inner.lock().unwrap().active_ard = None;
     }
 }

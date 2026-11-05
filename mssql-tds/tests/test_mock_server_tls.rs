@@ -21,7 +21,7 @@ mod mock_server_tls_tests {
     use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
-    #[cfg(not(windows))]
+    use mssql_tds::error::Error;
     use std::fs;
     use std::path::Path;
     use tokio::sync::oneshot;
@@ -346,6 +346,57 @@ mod mock_server_tls_tests {
 
         client.close_query().await?;
         client.close_connection().await?;
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
+    /// Test that a strict TLS (TDS 8.0) connection is refused when the pinned
+    /// ServerCertificate is not the certificate the server presents
+    #[tokio::test]
+    async fn test_strict_tls_rejects_a_different_server_certificate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        init_tracing();
+
+        let identity = load_test_identity()?;
+
+        let server = MockTdsServer::new_with_strict_tls("127.0.0.1:0", identity).await?;
+        let server_addr = server.local_addr();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // The last byte belongs to the signature, so the file still parses.
+        let mut other_certificate = fs::read("tests/test_certificates/valid_cert.der")?;
+        *other_certificate.last_mut().unwrap() ^= 0xff;
+        let pin = tempfile::NamedTempFile::new()?;
+        fs::write(pin.path(), other_certificate)?;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::Strict,
+            trust_server_certificate: false,
+            host_name_in_cert: None,
+            server_certificate: Some(pin.path().to_path_buf()),
+        };
+
+        let provider = TdsConnectionProvider {};
+        let result = provider.create_client(context, &datasource, None).await;
+
+        assert!(
+            matches!(result, Err(Error::CertificateMismatch)),
+            "Expected a certificate mismatch, got {:?}",
+            result.err()
+        );
 
         let _ = shutdown_tx.send(());
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;

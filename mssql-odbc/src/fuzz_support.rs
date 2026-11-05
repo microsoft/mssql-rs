@@ -13,6 +13,7 @@
 
 use crate::api::escape::{
     describe_text, executable_marker_count, translate_and_rewrite, translate_escapes,
+    translate_for_execution, translate_for_execution_reference,
 };
 use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DATE, SQL_C_DOUBLE,
@@ -25,8 +26,8 @@ use crate::api::odbc_types::{
     SQL_PARAM_INPUT, SQL_SS_UDT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_VARCHAR, SQL_WVARCHAR,
     SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
-use crate::api::util::rewrite_param_markers;
 use crate::api::util::{read_utf16, read_utf16_attr, read_utf16_long};
+use crate::api::util::{rewrite_param_markers, rewrite_param_markers_reference};
 use crate::api::{
     SQLAllocHandle, SQLExecDirectW, SQLFetch, SQLFreeHandle, SQLGetData, SQLNumResultCols,
     SQLSetEnvAttr,
@@ -67,9 +68,11 @@ pub fn fuzz_connection_string(input: &str) {
 /// Drive ODBC escape-sequence translation and both marker-rewriting phases.
 ///
 /// A hand-written lexer over application-supplied text is exactly the shape
-/// fuzzing pays for. Two invariants are asserted beyond "does not panic":
-/// translation never invents or loses a parameter marker, and the NOSCAN path
-/// is byte-identical to marker rewriting on its own.
+/// fuzzing pays for. Beyond "does not panic", it asserts that translation
+/// never invents or loses a parameter marker, that the NOSCAN path is
+/// byte-identical to marker rewriting on its own, and that the byte-level
+/// marker rewrite and the execution path's `{` shortcut match their
+/// `CodeScan` references.
 pub fn fuzz_escape_sequences(input: &str) {
     let markers = executable_marker_count(input);
 
@@ -94,6 +97,17 @@ pub fn fuzz_escape_sequences(input: &str) {
 
     let _ = translate_and_rewrite(input, false);
     let _ = describe_text(input);
+
+    assert_eq!(
+        rewrite_param_markers(input),
+        rewrite_param_markers_reference(input),
+        "{input:?}"
+    );
+    assert_eq!(
+        translate_for_execution(input, false, &[true, false]),
+        translate_for_execution_reference(input, &[true, false]),
+        "{input:?}"
+    );
 }
 
 /// Drive character→numeric parsing and every downstream narrowing.
@@ -512,6 +526,7 @@ pub fn fuzz_bound_param(data: &[u8]) {
             catalog: String::from_utf8_lossy(&catalog).into_owned(),
             schema: String::from_utf8_lossy(&schema).into_owned(),
             type_name: String::from_utf8_lossy(&type_name).into_owned(),
+            tvp_type_name: String::new(),
             assembly_type_name: String::new(),
         }
     });
@@ -553,6 +568,8 @@ pub fn fuzz_bound_param(data: &[u8]) {
         decimal_digits,
         app_precision: 0,
         app_scale: 0,
+        app_datetime_interval_code: None,
+        sql_datetime_interval_code: None,
         parameter_value_ptr: value_ptr,
         buffer_length: fuzz_len,
         strlen_or_ind_ptr: ind_ptr,
@@ -655,7 +672,8 @@ fn run_exec_fetch(dbc: SqlHandle, target_type: SqlSmallInt) {
     }
 
     let query: Vec<SqlWChar> = "SELECT 1".encode_utf16().collect();
-    let rc = unsafe { SQLExecDirectW(stmt, query.as_ptr(), query.len() as SqlSmallInt) };
+    let query_len = SqlInteger::try_from(query.len()).unwrap_or(SqlInteger::MAX);
+    let rc = unsafe { SQLExecDirectW(stmt, query.as_ptr(), query_len) };
     if rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO {
         let mut ncols: SqlSmallInt = 0;
         if unsafe { SQLNumResultCols(stmt, &mut ncols) } == SQL_SUCCESS {

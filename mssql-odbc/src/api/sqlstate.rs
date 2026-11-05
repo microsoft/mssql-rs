@@ -3,7 +3,8 @@
 
 //! SQLSTATE constants and the SQL Server error-number → SQLSTATE map.
 
-use crate::error::{HasDiagnostics, post_sql_error};
+use crate::error::diag::post_prefixed;
+use crate::error::{DiagRecord, HasDiagnostics, post_sql_error};
 use crate::handles::wire::ClaimError;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::error::SqlInfoMessage;
@@ -80,10 +81,31 @@ pub(crate) const SQLSTATE_HY008: [u8; 5] = *b"HY008";
 // this — their text comes from the wire (see `post_tds_error`).
 
 /// A driver-raised diagnostic: a fixed SQLSTATE and its canonical message.
-#[derive(Debug, Clone, Copy)]
+///
+/// Only `diag_msgs!` builds these, so `full` is always
+/// [`DRIVER_DIAG_PREFIX`](crate::error::diag::DRIVER_DIAG_PREFIX) + `text`
+/// resolved at compile time and [`post_diag`] can post it without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiagMsg {
     pub(crate) state: [u8; 5],
     pub(crate) text: &'static str,
+    full: &'static str,
+}
+
+macro_rules! diag_msgs {
+    ($($(#[$meta:meta])* $name:ident = ($state:expr, $text:literal $(,)?);)*) => {
+        $(
+            $(#[$meta])*
+            pub(crate) const $name: DiagMsg = DiagMsg {
+                state: $state,
+                text: $text,
+                full: concat!(crate::error::diag::driver_diag_prefix!(), $text),
+            };
+        )*
+
+        #[cfg(test)]
+        const ALL_DIAG_MSGS: &[(&str, DiagMsg)] = &[$((stringify!($name), $name)),*];
+    };
 }
 
 impl From<crate::conversion::error::ConvError> for DiagMsg {
@@ -97,34 +119,238 @@ impl From<crate::conversion::error::ConvError> for DiagMsg {
             ConvError::Restricted => ERR_RESTRICTED_DATA_TYPE,
             ConvError::InvalidCharacterValue => ERR_INVALID_CHARACTER_VALUE,
             ConvError::Internal => ERR_INTERNAL_CONVERSION,
-            ConvError::NotHandledHere => Self {
-                state: SQLSTATE_HYC00,
-                text: "Column type conversion not yet implemented",
-            },
+            ConvError::NotHandledHere => ERR_COLUMN_CONVERSION_NOT_IMPLEMENTED,
         }
     }
 }
 
-pub(crate) const ERR_INVALID_CURSOR_STATE: DiagMsg = DiagMsg {
-    state: SQLSTATE_24000,
-    text: "Invalid cursor state",
-};
-pub(crate) const ERR_OPERATION_CANCELED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY008,
-    text: "Operation canceled",
-};
-pub(crate) const ERR_CONNECTION_DOES_NOT_EXIST: DiagMsg = DiagMsg {
-    state: SQLSTATE_08003,
-    text: "Connection does not exist",
-};
-pub(crate) const ERR_NO_ACTIVE_TDS_CLIENT: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY000,
-    text: "No active TDS client",
-};
-pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY000,
-    text: "Connection is busy with results for another command",
-};
+diag_msgs! {
+    ERR_COLUMN_CONVERSION_NOT_IMPLEMENTED = (
+        SQLSTATE_HYC00,
+        "Column type conversion not yet implemented"
+    );
+    ERR_INVALID_CURSOR_STATE = (SQLSTATE_24000, "Invalid cursor state");
+    ERR_OPERATION_CANCELED = (SQLSTATE_HY008, "Operation canceled");
+    ERR_CONNECTION_DOES_NOT_EXIST = (SQLSTATE_08003, "Connection does not exist");
+    ERR_NO_ACTIVE_TDS_CLIENT = (SQLSTATE_HY000, "No active TDS client");
+    ERR_CONNECTION_BUSY = (SQLSTATE_HY000, "Connection is busy with results for another command");
+    ERR_STATEMENT_UNUSABLE = (
+        SQLSTATE_HY000,
+        "A statement on this connection is unusable and did not receive the attribute"
+    );
+    ERR_FUNCTION_SEQUENCE = (SQLSTATE_HY010, "Function sequence error");
+    /// msodbcsql's text for describing a statement positioned on no result set
+    /// (measured on 18.6.2.1).
+    ERR_NOT_CURSOR_SPECIFICATION = (
+        SQLSTATE_07005,
+        "Prepared statement is not a cursor-specification"
+    );
+    /// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
+    /// allocated a connection. Reached either by a caller that skipped the
+    /// attribute entirely, or by a 2.x application whose `SQL_OV_ODBC2` this
+    /// driver rejected (`HY024`) — the Driver Manager forwards that declaration
+    /// rather than mapping it, then allocates the connection regardless. ODBC
+    /// specifies `HY010` for allocating a connection before the version is set.
+    ///
+    /// Note the text below reaches only a caller that loads this driver directly.
+    /// It is posted on *this driver's* environment handle, which a Driver Manager
+    /// application never holds — the application's `henv` is the DM's own. On the
+    /// path this exists for, the DM substitutes its own diagnostic: unixODBC posts
+    /// `IM005` ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
+    /// `DriverManager/SQLConnect.c:1613-1616`), while the Windows DM propagates
+    /// the `HY024` from the rejected `SQLSetEnvAttr` instead. `post_diag` only
+    /// appends to `diag_records` and does not trace, so the refusal site in
+    /// `alloc_handle.rs` logs this `text` verbatim — that log is the only place
+    /// the reason survives for a Driver Manager user on either platform.
+    ERR_ODBC_VERSION_NOT_SET = (
+        SQLSTATE_HY010,
+        "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \
+         before allocating a connection; this driver does not support ODBC 2.x"
+    );
+    /// A fallible allocation failed. Used where the byte count comes from the
+    /// application rather than a bounded internal computation -- e.g. buffering
+    /// a data-at-execution value with no declared total (`SQL_DATA_AT_EXEC`) --
+    /// so it fails as a diagnostic the caller can act on instead of hitting
+    /// `Vec`'s default infallible allocation, which aborts the process this
+    /// driver is loaded into.
+    ERR_MEMORY_ALLOCATION = (SQLSTATE_HY001, "Memory allocation error");
+    ERR_PLP_TYPED_LIMIT = (
+        SQLSTATE_HYC00,
+        "PLP typed conversion exceeds the materialization limit"
+    );
+    ERR_FETCH_TYPE_OUT_OF_RANGE = (SQLSTATE_HY106, "Fetch type out of range");
+    ERR_INVALID_DESCRIPTOR_INDEX = (SQLSTATE_07009, "Invalid descriptor index");
+    ERR_INVALID_DESCRIPTOR_FIELD = (SQLSTATE_HY091, "Invalid descriptor field identifier");
+    /// Writing a record field (or any header field besides
+    /// `SQL_DESC_ROWS_PROCESSED_PTR` / `SQL_DESC_ARRAY_STATUS_PTR`) on an
+    /// implementation row descriptor. Matches msodbcsql's `IDS_HY_016`
+    /// (`sqlcdesc.cpp:1399-1405`) — IRD is populated by the driver, never by the
+    /// application.
+    ERR_CANNOT_MODIFY_IRD = (SQLSTATE_HY016, "Cannot modify an implementation row descriptor");
+    /// `SQLFreeHandle(SQL_HANDLE_DESC, ...)` on an implicitly-allocated
+    /// descriptor, or `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC, ...)`
+    /// given an implicitly-allocated descriptor other than the statement's own
+    /// ARD/APD (i.e. another statement's ARD/APD, or this statement's own
+    /// IRD/IPD). Matches the ODBC reference's HY017 entries for both functions —
+    /// implicit descriptors are owned by their statement and can never be freed
+    /// or reassigned as if they were explicit handles.
+    ERR_INVALID_USE_OF_AUTO_DESC = (
+        SQLSTATE_HY017,
+        "Invalid use of an automatically allocated descriptor handle"
+    );
+    /// `SQL_DESC_TYPE` set to the verbose `SQL_DATETIME` marker before a valid
+    /// `SQL_DESC_DATETIME_INTERVAL_CODE` identifies which date/time member is
+    /// meant. Matches msodbcsql's `IDS_HY_021` (`sqlcdesc.cpp:1676`).
+    ERR_INCONSISTENT_DESCRIPTOR_INFO = (SQLSTATE_HY021, "Inconsistent descriptor information");
+    /// `SQL_C_NUMERIC` precision/scale outside the valid range (precision
+    /// `1..=SQL_MAX_NUMERIC_LEN` digits, scale `<= precision`). Matches
+    /// msodbcsql's `IDS_S1_094` (`sqlcdesc.cpp:11384-11394`).
+    ERR_INVALID_PRECISION_OR_SCALE = (SQLSTATE_HY094, "Invalid precision or scale value");
+    /// `SQL_DESC_PARAMETER_TYPE` set to a value other than `SQL_PARAM_INPUT`,
+    /// `SQL_PARAM_INPUT_OUTPUT`, or `SQL_PARAM_OUTPUT`.
+    ERR_INVALID_PARAMETER_TYPE = (SQLSTATE_HY105, "Invalid parameter type");
+    ERR_NOT_VARIANT_COLUMN = (
+        SQLSTATE_HY113,
+        "Variant operation requested on column that is not sql_variant"
+    );
+    ERR_UNBOUND_PARAMETER = (SQLSTATE_07002, "COUNT field incorrect or syntax error");
+    ERR_INVALID_SQL_DATA_TYPE = (SQLSTATE_HY004, "Invalid SQL data type");
+    ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED = (SQLSTATE_HYC00, "Optional feature not implemented");
+    ERR_TNIR_NOT_SUPPORTED = (
+        SQLSTATE_HYC00,
+        "TransparentNetworkIPResolution is not supported; use MultiSubnetFailover instead"
+    );
+    ERR_INVALID_C_DATA_TYPE = (SQLSTATE_HY003, "Invalid application buffer type");
+    ERR_RESTRICTED_DATA_TYPE = (SQLSTATE_07006, "Restricted data type attribute violation");
+    ERR_INTERNAL_CONVERSION = (SQLSTATE_HY000, "Internal error converting value");
+    // `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which this
+    // driver does not support, so the state is terminal rather than "not yet"
+    // (msodbcsql `sqlccmd.cpp` -> IDS_07_S01 on a non-canonical call statement).
+    ERR_INVALID_USE_OF_DEFAULT_PARAM = (SQLSTATE_07S01, "Invalid use of default parameter");
+    ERR_DATA_AT_EXEC_NOT_STAGED = (
+        SQLSTATE_HY000,
+        "Data-at-execution parameter reached the materializing conversion path"
+    );
+    ERR_PARAM_C_TYPE_NOT_IMPLEMENTED = (SQLSTATE_HYC00, "Parameter C type not yet implemented");
+    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED = (SQLSTATE_HYC00, "Parameter SQL type not yet implemented");
+    ERR_PARAM_CONVERSION_NOT_IMPLEMENTED = (
+        SQLSTATE_HYC00,
+        "Parameter conversion not yet implemented"
+    );
+    // Covers both `ColumnSize` and `DecimalDigits`, as the ODBC 3.x `HY104` entry
+    // does. msodbcsql splits the text (IDS_S1_104 for precision, IDS_S1_094 for
+    // scale) but reports the one state either way
+    // (`Sql/Ntdbms/sqlncli/cli_common/src/clntcomn.cpp`). S1094 is ODBC 2.x and is not used here.
+    ERR_INVALID_PARAM_PRECISION_OR_SCALE = (SQLSTATE_HY104, "Invalid precision or scale value");
+    /// A bound column delivered NULL but the application supplied no indicator to
+    /// receive it, so the value cannot be reported at all.
+    ERR_INDICATOR_REQUIRED = (SQLSTATE_22002, "Indicator variable required but not supplied");
+    ERR_NUMERIC_OUT_OF_RANGE = (SQLSTATE_22003, "Numeric value out of range");
+    ERR_INVALID_CHARACTER_VALUE = (
+        SQLSTATE_22018,
+        "Invalid character value for cast specification"
+    );
+    /// Date/time fields that name no real instant - month 13, 31 February, a
+    /// year outside `0001`..`9999`, or an out-of-range time or UTC offset.
+    ERR_INVALID_DATETIME_FORMAT = (SQLSTATE_22007, "Invalid datetime format");
+    /// Temporal arithmetic overflow or a fraction dropped by the target's declared scale.
+    /// Retail 18.6.2.1
+    /// answers this state for `time`, `datetime2` and `datetimeoffset` alike.
+    ///
+    /// `ParamToSQLType` (`sqlcfunc.cpp:3350`) reads as a split - this state for the
+    /// timestamp family, `22001` otherwise - but that gate is the legacy datetime
+    /// arm and is not what these targets reach; see `convert_datetime_sql`. Do not
+    /// re-derive the split from source.
+    ERR_DATETIME_FIELD_OVERFLOW = (SQLSTATE_22008, "Datetime field overflow");
+    ERR_DAE_LENGTH_MISMATCH = (SQLSTATE_22026, "String data, length mismatch");
+    /// A `SQL_SS_UDT` parameter bound without `SQL_CA_SS_UDT_TYPE_NAME`. msodbcsql
+    /// rejects the same binding before execute, also as `HY000`
+    /// (`sqlccmd.cpp:9977`, `IDS_S1_000_95`). The SQLSTATE is the parity claim;
+    /// this text is this driver's own and is not derived from the reference.
+    ERR_MISSING_UDT_TYPE_NAME = (
+        SQLSTATE_HY000,
+        "A UDT parameter requires SQL_CA_SS_UDT_TYPE_NAME to be set"
+    );
+    ERR_MISSING_TVP_TYPE_NAME = (
+        SQLSTATE_HY000,
+        "A table-valued parameter requires SQL_CA_SS_TYPE_NAME to be set"
+    );
+    // A streamed parameter is either NULL or a sequence of value chunks; mixing the
+    // two in one `SQL_NEED_DATA` window has no representation on the wire
+    // (msodbcsql `sqlccmd.cpp` -> IDS_HY_020).
+    ERR_ATTEMPT_TO_CONCATENATE_NULL = (SQLSTATE_HY020, "Attempt to concatenate a null value");
+    WARN_FRACTIONAL_TRUNCATION = (SQLSTATE_01S07, "Fractional truncation");
+    /// Inbound truncation of a bound parameter. Distinct from
+    /// [`WARN_STRING_TRUNCATION`], which is the benign `01004` the fetch
+    /// direction posts when a caller's buffer is too small.
+    ERR_PARAM_STRING_TRUNCATION = (SQLSTATE_22001, "String data, right truncation");
+    WARN_STRING_TRUNCATION = (SQLSTATE_01004, "String data, right truncation");
+    ERR_INVALID_NULL_POINTER = (SQLSTATE_HY009, "Invalid use of null pointer");
+    ERR_INVALID_ATTRIBUTE_VALUE = (SQLSTATE_HY024, "Invalid attribute value");
+    ERR_INVALID_ATTRIBUTE_IDENTIFIER = (SQLSTATE_HY092, "Invalid attribute/option identifier");
+    /// `SQLEndTran` given a `CompletionType` other than `SQL_COMMIT` / `SQL_ROLLBACK`.
+    ERR_INVALID_TRANSACTION_OPERATION_CODE = (SQLSTATE_HY012, "Invalid transaction operation code");
+    /// `SQLDisconnect` while a manual-commit transaction holds uncommitted work
+    /// (msodbcsql `sqlcconn.cpp:1234`).
+    ERR_INVALID_TRANSACTION_STATE = (SQLSTATE_25000, "Invalid transaction state");
+    /// Posted when turning autocommit back on commits an open transaction
+    /// (msodbcsql `sqlcconn.cpp:3698`, `IDS_01_000_00`).
+    WARN_TRANSACTION_COMMITTED = (
+        SQLSTATE_01000,
+        "The open transaction was committed because autocommit mode was enabled"
+    );
+    /// Client-side conversion lost a character: to the server collation for input
+    /// parameters, or to the platform client code page for retrieved values.
+    /// Server-side conversion loss is not observable through this diagnostic.
+    ///
+    /// msodbcsql's `IDS_01_000_16` verbatim (`local.rc:29`, SQLSTATE `01000` via
+    /// `clntcomn.cpp:1183`). Posted only when the application opted in with
+    /// `SQL_COPT_SS_WARN_ON_CP_ERROR`; see
+    /// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error)
+    /// for why the substitution itself is not an error (AB#47598).
+    WARN_CODE_PAGE_CONVERSION_LOSS = (
+        SQLSTATE_01000,
+        "Warning: Code page translation caused loss of data"
+    );
+    /// `SQL_ATTR_TXN_ISOLATION` changed while a manual-commit transaction is open
+    /// (msodbcsql `sqlcmisc.cpp:360`).
+    ERR_ATTRIBUTE_CANNOT_BE_SET_NOW = (SQLSTATE_HY011, "Attribute cannot be set now");
+    ERR_INVALID_CONNECTION_STRING_ATTRIBUTE = (
+        SQLSTATE_01S00,
+        "Invalid connection string attribute"
+    );
+    WARN_CANCEL_TREATED_AS_CLOSE = (SQLSTATE_01S05, "Cancel treated as FreeStmt/Close");
+    ERR_INVALID_STRING_OR_BUFFER_LENGTH = (SQLSTATE_HY090, "Invalid string or buffer length");
+    ERR_INVALID_INFO_TYPE = (SQLSTATE_HY096, "Information type out of range");
+    /// Reported when a requested login timeout is larger than the driver accepts
+    /// and is clamped. Mirrors msodbcsql's `IDS_01_S02_05` (`dll/res/local.rc:45`),
+    /// which it posts from the same situation.
+    WARN_LOGIN_TIMEOUT_CHANGED = (SQLSTATE_01S02, "Login timeout changed");
+    /// The same clamp applied to `SQL_ATTR_CONNECTION_TIMEOUT`.
+    ///
+    /// A deliberate divergence: msodbcsql handles both timeouts in one arm and
+    /// posts `IDS_01_S02_05` — "Login timeout changed" — for either
+    /// (`sqlcmisc.cpp:1733-1741`), naming the wrong attribute when the application
+    /// set the connection timeout. The SQLSTATE is what applications branch on and
+    /// it is unchanged; only the human-readable text is corrected.
+    WARN_CONNECTION_TIMEOUT_CHANGED = (SQLSTATE_01S02, "Connection timeout changed");
+    /// `SQL_DESC_ARRAY_SIZE` clamped to `i32::MAX`. Matches msodbcsql's
+    /// `IDS_01_S02` for the same clamp (`sqlcdesc.cpp:4161-4167`).
+    WARN_ARRAY_SIZE_CHANGED = (SQLSTATE_01S02, "Array size changed");
+
+    /// The same clamp applied to `SQL_ATTR_QUERY_TIMEOUT`.
+    ///
+    /// msodbcsql posts the generic `IDS_01_S02` here rather than one of the
+    /// timeout-specific strings (`sqlcmisc.cpp:3993`), so the text matches it
+    /// verbatim.
+    WARN_OPTION_VALUE_CHANGED = (SQLSTATE_01S02, "Option value changed");
+
+    /// Posted when a requested `SQL_ATTR_PACKET_SIZE` falls outside the range
+    /// `mssql-tds` accepts and is clamped. Matches msodbcsql's `IDS_01_S02_02`
+    /// (`dll/res/local.rc:42`), which it posts from the same clamp
+    /// (`sqlcmisc.cpp:1909-1917`).
+    WARN_PACKET_SIZE_CHANGED = (SQLSTATE_01S02, "Packet size changed");
+}
 
 /// All contention maps to the busy error applications retry on.
 pub(crate) fn claim_error_diag(error: ClaimError) -> DiagMsg {
@@ -133,345 +359,6 @@ pub(crate) fn claim_error_diag(error: ClaimError) -> DiagMsg {
         ClaimError::NoClient => ERR_NO_ACTIVE_TDS_CLIENT,
     }
 }
-
-pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY000,
-    text: "A statement on this connection is unusable and did not receive the attribute",
-};
-pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY010,
-    text: "Function sequence error",
-};
-/// msodbcsql's text for describing a statement positioned on no result set
-/// (measured on 18.6.2.1).
-pub(crate) const ERR_NOT_CURSOR_SPECIFICATION: DiagMsg = DiagMsg {
-    state: SQLSTATE_07005,
-    text: "Prepared statement is not a cursor-specification",
-};
-/// No supported `SQL_ATTR_ODBC_VERSION` was recorded before the application
-/// allocated a connection. Reached either by a caller that skipped the
-/// attribute entirely, or by a 2.x application whose `SQL_OV_ODBC2` this
-/// driver rejected (`HY024`) — the Driver Manager forwards that declaration
-/// rather than mapping it, then allocates the connection regardless. ODBC
-/// specifies `HY010` for allocating a connection before the version is set.
-///
-/// Note the text below reaches only a caller that loads this driver directly.
-/// It is posted on *this driver's* environment handle, which a Driver Manager
-/// application never holds — the application's `henv` is the DM's own. On the
-/// path this exists for, the DM substitutes its own diagnostic: unixODBC posts
-/// `IM005` ("Driver's SQLAllocHandle on SQL_HANDLE_DBC failed",
-/// `DriverManager/SQLConnect.c:1613-1616`), while the Windows DM propagates
-/// the `HY024` from the rejected `SQLSetEnvAttr` instead. `post_diag` only
-/// appends to `diag_records` and does not trace, so the refusal site in
-/// `alloc_handle.rs` logs this `text` verbatim — that log is the only place
-/// the reason survives for a Driver Manager user on either platform.
-pub(crate) const ERR_ODBC_VERSION_NOT_SET: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY010,
-    text: "SQL_ATTR_ODBC_VERSION must be set to SQL_OV_ODBC3 or SQL_OV_ODBC3_80 \
-           before allocating a connection; this driver does not support ODBC 2.x",
-};
-/// A fallible allocation failed. Used where the byte count comes from the
-/// application rather than a bounded internal computation -- e.g. buffering
-/// a data-at-execution value with no declared total (`SQL_DATA_AT_EXEC`) --
-/// so it fails as a diagnostic the caller can act on instead of hitting
-/// `Vec`'s default infallible allocation, which aborts the process this
-/// driver is loaded into.
-pub(crate) const ERR_MEMORY_ALLOCATION: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY001,
-    text: "Memory allocation error",
-};
-pub(crate) const ERR_PLP_TYPED_LIMIT: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "PLP typed conversion exceeds the materialization limit",
-};
-pub(crate) const ERR_FETCH_TYPE_OUT_OF_RANGE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY106,
-    text: "Fetch type out of range",
-};
-pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
-    state: SQLSTATE_07009,
-    text: "Invalid descriptor index",
-};
-pub(crate) const ERR_INVALID_DESCRIPTOR_FIELD: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY091,
-    text: "Invalid descriptor field identifier",
-};
-/// Writing a record field (or any header field besides
-/// `SQL_DESC_ROWS_PROCESSED_PTR` / `SQL_DESC_ARRAY_STATUS_PTR`) on an
-/// implementation row descriptor. Matches msodbcsql's `IDS_HY_016`
-/// (`sqlcdesc.cpp:1399-1405`) — IRD is populated by the driver, never by the
-/// application.
-pub(crate) const ERR_CANNOT_MODIFY_IRD: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY016,
-    text: "Cannot modify an implementation row descriptor",
-};
-/// `SQLFreeHandle(SQL_HANDLE_DESC, ...)` on an implicitly-allocated
-/// descriptor, or `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC, ...)`
-/// given an implicitly-allocated descriptor other than the statement's own
-/// ARD/APD (i.e. another statement's ARD/APD, or this statement's own
-/// IRD/IPD). Matches the ODBC reference's HY017 entries for both functions —
-/// implicit descriptors are owned by their statement and can never be freed
-/// or reassigned as if they were explicit handles.
-pub(crate) const ERR_INVALID_USE_OF_AUTO_DESC: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY017,
-    text: "Invalid use of an automatically allocated descriptor handle",
-};
-/// `SQL_DESC_TYPE` set to the verbose `SQL_DATETIME` marker before a valid
-/// `SQL_DESC_DATETIME_INTERVAL_CODE` identifies which date/time member is
-/// meant. Matches msodbcsql's `IDS_HY_021` (`sqlcdesc.cpp:1676`).
-pub(crate) const ERR_INCONSISTENT_DESCRIPTOR_INFO: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY021,
-    text: "Inconsistent descriptor information",
-};
-/// `SQL_C_NUMERIC` precision/scale outside the valid range (precision
-/// `1..=SQL_MAX_NUMERIC_LEN` digits, scale `<= precision`). Matches
-/// msodbcsql's `IDS_S1_094` (`sqlcdesc.cpp:11384-11394`).
-pub(crate) const ERR_INVALID_PRECISION_OR_SCALE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY094,
-    text: "Invalid precision or scale value",
-};
-/// `SQL_DESC_PARAMETER_TYPE` set to a value other than `SQL_PARAM_INPUT`,
-/// `SQL_PARAM_INPUT_OUTPUT`, or `SQL_PARAM_OUTPUT`.
-pub(crate) const ERR_INVALID_PARAMETER_TYPE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY105,
-    text: "Invalid parameter type",
-};
-pub(crate) const ERR_NOT_VARIANT_COLUMN: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY113,
-    text: "Variant operation requested on column that is not sql_variant",
-};
-pub(crate) const ERR_UNBOUND_PARAMETER: DiagMsg = DiagMsg {
-    state: SQLSTATE_07002,
-    text: "COUNT field incorrect or syntax error",
-};
-pub(crate) const ERR_INVALID_SQL_DATA_TYPE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY004,
-    text: "Invalid SQL data type",
-};
-pub(crate) const ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "Optional feature not implemented",
-};
-pub(crate) const ERR_TNIR_NOT_SUPPORTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "TransparentNetworkIPResolution is not supported; use MultiSubnetFailover instead",
-};
-pub(crate) const ERR_INVALID_C_DATA_TYPE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY003,
-    text: "Invalid application buffer type",
-};
-pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
-    state: SQLSTATE_07006,
-    text: "Restricted data type attribute violation",
-};
-pub(crate) const ERR_INTERNAL_CONVERSION: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY000,
-    text: "Internal error converting value",
-};
-// `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which this
-// driver does not support, so the state is terminal rather than "not yet"
-// (msodbcsql `sqlccmd.cpp` -> IDS_07_S01 on a non-canonical call statement).
-pub(crate) const ERR_INVALID_USE_OF_DEFAULT_PARAM: DiagMsg = DiagMsg {
-    state: SQLSTATE_07S01,
-    text: "Invalid use of default parameter",
-};
-pub(crate) const ERR_DATA_AT_EXEC_NOT_STAGED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY000,
-    text: "Data-at-execution parameter reached the materializing conversion path",
-};
-pub(crate) const ERR_PARAM_C_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "Parameter C type not yet implemented",
-};
-pub(crate) const ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "Parameter SQL type not yet implemented",
-};
-pub(crate) const ERR_PARAM_CONVERSION_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "Parameter conversion not yet implemented",
-};
-// Covers both `ColumnSize` and `DecimalDigits`, as the ODBC 3.x `HY104` entry
-// does. msodbcsql splits the text (IDS_S1_104 for precision, IDS_S1_094 for
-// scale) but reports the one state either way
-// (`Sql/Ntdbms/sqlncli/cli_common/src/clntcomn.cpp`). S1094 is ODBC 2.x and is not used here.
-pub(crate) const ERR_INVALID_PARAM_PRECISION_OR_SCALE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY104,
-    text: "Invalid precision or scale value",
-};
-/// A bound column delivered NULL but the application supplied no indicator to
-/// receive it, so the value cannot be reported at all.
-pub(crate) const ERR_INDICATOR_REQUIRED: DiagMsg = DiagMsg {
-    state: SQLSTATE_22002,
-    text: "Indicator variable required but not supplied",
-};
-pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
-    state: SQLSTATE_22003,
-    text: "Numeric value out of range",
-};
-pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
-    state: SQLSTATE_22018,
-    text: "Invalid character value for cast specification",
-};
-/// Date/time fields that name no real instant - month 13, 31 February, a
-/// year outside `0001`..`9999`, or an out-of-range time or UTC offset.
-pub(crate) const ERR_INVALID_DATETIME_FORMAT: DiagMsg = DiagMsg {
-    state: SQLSTATE_22007,
-    text: "Invalid datetime format",
-};
-/// Temporal arithmetic overflow or a fraction dropped by the target's declared scale.
-/// Retail 18.6.2.1
-/// answers this state for `time`, `datetime2` and `datetimeoffset` alike.
-///
-/// `ParamToSQLType` (`sqlcfunc.cpp:3350`) reads as a split - this state for the
-/// timestamp family, `22001` otherwise - but that gate is the legacy datetime
-/// arm and is not what these targets reach; see `convert_datetime_sql`. Do not
-/// re-derive the split from source.
-pub(crate) const ERR_DATETIME_FIELD_OVERFLOW: DiagMsg = DiagMsg {
-    state: SQLSTATE_22008,
-    text: "Datetime field overflow",
-};
-pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
-    state: SQLSTATE_22026,
-    text: "String data, length mismatch",
-};
-/// A `SQL_SS_UDT` parameter bound without `SQL_CA_SS_UDT_TYPE_NAME`. msodbcsql
-/// rejects the same binding before execute, also as `HY000`
-/// (`sqlccmd.cpp:9977`, `IDS_S1_000_95`). The SQLSTATE is the parity claim;
-/// this text is this driver's own and is not derived from the reference.
-pub(crate) const ERR_MISSING_UDT_TYPE_NAME: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY000,
-    text: "A UDT parameter requires SQL_CA_SS_UDT_TYPE_NAME to be set",
-};
-// A streamed parameter is either NULL or a sequence of value chunks; mixing the
-// two in one `SQL_NEED_DATA` window has no representation on the wire
-// (msodbcsql `sqlccmd.cpp` -> IDS_HY_020).
-pub(crate) const ERR_ATTEMPT_TO_CONCATENATE_NULL: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY020,
-    text: "Attempt to concatenate a null value",
-};
-pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S07,
-    text: "Fractional truncation",
-};
-/// Inbound truncation of a bound parameter. Distinct from
-/// [`WARN_STRING_TRUNCATION`], which is the benign `01004` the fetch
-/// direction posts when a caller's buffer is too small.
-pub(crate) const ERR_PARAM_STRING_TRUNCATION: DiagMsg = DiagMsg {
-    state: SQLSTATE_22001,
-    text: "String data, right truncation",
-};
-pub(crate) const WARN_STRING_TRUNCATION: DiagMsg = DiagMsg {
-    state: SQLSTATE_01004,
-    text: "String data, right truncation",
-};
-pub(crate) const ERR_INVALID_NULL_POINTER: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY009,
-    text: "Invalid use of null pointer",
-};
-pub(crate) const ERR_INVALID_ATTRIBUTE_VALUE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY024,
-    text: "Invalid attribute value",
-};
-pub(crate) const ERR_INVALID_ATTRIBUTE_IDENTIFIER: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY092,
-    text: "Invalid attribute/option identifier",
-};
-/// `SQLEndTran` given a `CompletionType` other than `SQL_COMMIT` / `SQL_ROLLBACK`.
-pub(crate) const ERR_INVALID_TRANSACTION_OPERATION_CODE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY012,
-    text: "Invalid transaction operation code",
-};
-/// `SQLDisconnect` while a manual-commit transaction holds uncommitted work
-/// (msodbcsql `sqlcconn.cpp:1234`).
-pub(crate) const ERR_INVALID_TRANSACTION_STATE: DiagMsg = DiagMsg {
-    state: SQLSTATE_25000,
-    text: "Invalid transaction state",
-};
-/// Posted when turning autocommit back on commits an open transaction
-/// (msodbcsql `sqlcconn.cpp:3698`, `IDS_01_000_00`).
-pub(crate) const WARN_TRANSACTION_COMMITTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_01000,
-    text: "The open transaction was committed because autocommit mode was enabled",
-};
-/// Client-side conversion lost a character: to the server collation for input
-/// parameters, or to the platform client code page for retrieved values.
-/// Server-side conversion loss is not observable through this diagnostic.
-///
-/// msodbcsql's `IDS_01_000_16` verbatim (`local.rc:29`, SQLSTATE `01000` via
-/// `clntcomn.cpp:1183`). Posted only when the application opted in with
-/// `SQL_COPT_SS_WARN_ON_CP_ERROR`; see
-/// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error)
-/// for why the substitution itself is not an error (AB#47598).
-pub(crate) const WARN_CODE_PAGE_CONVERSION_LOSS: DiagMsg = DiagMsg {
-    state: SQLSTATE_01000,
-    text: "Warning: Code page translation caused loss of data",
-};
-/// `SQL_ATTR_TXN_ISOLATION` changed while a manual-commit transaction is open
-/// (msodbcsql `sqlcmisc.cpp:360`).
-pub(crate) const ERR_ATTRIBUTE_CANNOT_BE_SET_NOW: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY011,
-    text: "Attribute cannot be set now",
-};
-pub(crate) const ERR_INVALID_CONNECTION_STRING_ATTRIBUTE: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S00,
-    text: "Invalid connection string attribute",
-};
-pub(crate) const WARN_CANCEL_TREATED_AS_CLOSE: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S05,
-    text: "Cancel treated as FreeStmt/Close",
-};
-pub(crate) const ERR_INVALID_STRING_OR_BUFFER_LENGTH: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY090,
-    text: "Invalid string or buffer length",
-};
-pub(crate) const ERR_INVALID_INFO_TYPE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY096,
-    text: "Information type out of range",
-};
-/// Reported when a requested login timeout is larger than the driver accepts
-/// and is clamped. Mirrors msodbcsql's `IDS_01_S02_05` (`dll/res/local.rc:45`),
-/// which it posts from the same situation.
-pub(crate) const WARN_LOGIN_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S02,
-    text: "Login timeout changed",
-};
-/// The same clamp applied to `SQL_ATTR_CONNECTION_TIMEOUT`.
-///
-/// A deliberate divergence: msodbcsql handles both timeouts in one arm and
-/// posts `IDS_01_S02_05` — "Login timeout changed" — for either
-/// (`sqlcmisc.cpp:1733-1741`), naming the wrong attribute when the application
-/// set the connection timeout. The SQLSTATE is what applications branch on and
-/// it is unchanged; only the human-readable text is corrected.
-pub(crate) const WARN_CONNECTION_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S02,
-    text: "Connection timeout changed",
-};
-/// `SQL_DESC_ARRAY_SIZE` clamped to `i32::MAX`. Matches msodbcsql's
-/// `IDS_01_S02` for the same clamp (`sqlcdesc.cpp:4161-4167`).
-pub(crate) const WARN_ARRAY_SIZE_CHANGED: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S02,
-    text: "Array size changed",
-};
-
-/// The same clamp applied to `SQL_ATTR_QUERY_TIMEOUT`.
-///
-/// msodbcsql posts the generic `IDS_01_S02` here rather than one of the
-/// timeout-specific strings (`sqlcmisc.cpp:3993`), so the text matches it
-/// verbatim.
-pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S02,
-    text: "Option value changed",
-};
-
-/// Posted when a requested `SQL_ATTR_PACKET_SIZE` falls outside the range
-/// `mssql-tds` accepts and is clamped. Matches msodbcsql's `IDS_01_S02_02`
-/// (`dll/res/local.rc:42`), which it posts from the same clamp
-/// (`sqlcmisc.cpp:1909-1917`).
-pub(crate) const WARN_PACKET_SIZE_CHANGED: DiagMsg = DiagMsg {
-    state: SQLSTATE_01S02,
-    text: "Packet size changed",
-};
 
 /// Post a server-originated error under a caller-chosen SQLSTATE, keeping the
 /// native error number and the engine's message text.
@@ -502,12 +389,7 @@ pub(crate) fn post_tds_error_as(
     }
     for e in &diagnostics.errors {
         let native = i32::try_from(e.number).unwrap_or(i32::MAX);
-        post_sql_error(
-            state,
-            forced_state,
-            native,
-            format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
-        );
+        post_server_message(state, forced_state, native, &e.message);
     }
     post_tds_info_messages(state, &diagnostics.info_messages);
 }
@@ -515,14 +397,32 @@ pub(crate) fn post_tds_error_as(
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
 /// native error 0. For server-originated errors use [`post_tds_error`].
 pub(crate) fn post_diag(state: &mut impl HasDiagnostics, msg: DiagMsg) {
-    post_sql_error(state, msg.state, 0, msg.text);
+    state
+        .diag_records_mut()
+        .push(DiagRecord::new(msg.state, 0, msg.full));
+}
+
+/// Posts `[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]<message>`
+/// for a diagnostic the engine raised.
+fn post_server_message(
+    state: &mut impl HasDiagnostics,
+    sql_state: [u8; 5],
+    native_error: i32,
+    message: &str,
+) {
+    post_prefixed(
+        state,
+        sql_state,
+        native_error,
+        &[SERVER_DIAG_SUBSOURCE, message],
+    );
 }
 
 /// Sub-source tag msodbcsql inserts after the driver prefix for diagnostics
 /// that originate inside the SQL Server engine (errors and info/PRINT
 /// messages), yielding the full
 /// `[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]<message>`. The
-/// driver prefix itself is added by [`post_sql_error`].
+/// driver prefix itself is added by [`post_server_message`].
 const SERVER_DIAG_SUBSOURCE: &str = "[SQL Server]";
 
 /// SQL Server engine error number → ODBC 3.x SQLSTATE.
@@ -730,12 +630,7 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
                 let sqlstate = sqlstate_for_sql_error(e.number)
                     .unwrap_or_else(|| sqlstate_for_severity(e.class));
                 let native = i32::try_from(e.number).unwrap_or(i32::MAX);
-                post_sql_error(
-                    state,
-                    sqlstate,
-                    native,
-                    format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
-                );
+                post_server_message(state, sqlstate, native, &e.message);
             }
         }
         // Informational/warning records follow the primary error record(s).
@@ -751,7 +646,11 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     // elapsing is likewise independent of the caller's context: ODBC reserves
     // `HYT00` specifically so an application can distinguish "my deadline
     // passed" from a generic failure, matching msodbcsql.
-    let sqlstate = match err {
+    let mut cause = err;
+    while let TdsError::TvpCellSerialization { source, .. } = cause {
+        cause = source;
+    }
+    let sqlstate = match cause {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
         TdsError::TimeoutError(_) => SQLSTATE_HYT00,
         TdsError::EncodedValueTooLong { .. } => SQLSTATE_22001,
@@ -774,12 +673,7 @@ pub(crate) fn post_tds_info_messages(
         let sqlstate = sqlstate_for_sql_error(message.number)
             .unwrap_or_else(|| sqlstate_for_severity(message.class));
         let native = i32::try_from(message.number).unwrap_or(i32::MAX);
-        post_sql_error(
-            state,
-            sqlstate,
-            native,
-            format!("{SERVER_DIAG_SUBSOURCE}{}", message.message),
-        );
+        post_server_message(state, sqlstate, native, &message.message);
     }
 
     !messages.is_empty()
@@ -860,6 +754,29 @@ mod tests {
         fn diag_records_mut(&mut self) -> &mut Vec<crate::error::DiagRecord> {
             &mut self.records
         }
+    }
+
+    #[test]
+    fn post_tds_error_preserves_tvp_overflow_sqlstate_and_context() {
+        let mut state = FakeState::default();
+        let error = TdsError::TvpCellSerialization {
+            parameter: mssql_tds::error::TvpParameterRef::OdbcOrdinal(1),
+            row: 2,
+            column: 3,
+            source: Box::new(TdsError::EncodedValueTooLong {
+                actual: 6,
+                maximum: 2,
+            }),
+        };
+        post_tds_error(&mut state, &error, SQLSTATE_HY000);
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.records[0].sql_state, SQLSTATE_22001);
+        assert!(
+            state.records[0]
+                .message
+                .contains("ODBC ordinal 1, row 2, column 3")
+        );
+        assert!(state.records[0].message.ends_with(&error.to_string()));
     }
 
     #[test]
@@ -1225,5 +1142,67 @@ mod tests {
             s.records[0].message,
             "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Login failed for user 'x'."
         );
+    }
+
+    #[test]
+    fn forced_state_server_error_keeps_full_server_text() {
+        let err =
+            TdsError::from_sql_errors(vec![sql_error(911, "Database 'nope' does not exist.")]);
+        let records = post_as_on_dbc(&err, SQLSTATE_HY024);
+        assert_eq!(
+            records[0].message,
+            "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Database 'nope' does not exist."
+        );
+    }
+
+    #[test]
+    fn non_server_error_text_is_prefixed_display() {
+        let mut s = FakeState::default();
+        let err = TdsError::ProtocolError("bad packet".into());
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(
+            s.records[0].message,
+            format!("[Microsoft][ODBC Driver 18 for SQL Server]{err}")
+        );
+    }
+
+    #[test]
+    fn every_diag_msg_full_text_is_prefix_plus_text() {
+        use crate::conversion::error::ConvError;
+
+        assert!(
+            ALL_DIAG_MSGS
+                .iter()
+                .any(|(name, _)| *name == "ERR_COLUMN_CONVERSION_NOT_IMPLEMENTED")
+        );
+        let not_handled = DiagMsg::from(ConvError::NotHandledHere);
+        let all = ALL_DIAG_MSGS
+            .iter()
+            .copied()
+            .chain([("ConvError::NotHandledHere", not_handled)]);
+        for (name, msg) in all {
+            assert_eq!(
+                msg.full,
+                format!("[Microsoft][ODBC Driver 18 for SQL Server]{}", msg.text),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_diag_borrows_static_text() {
+        for &(name, msg) in ALL_DIAG_MSGS {
+            let mut s = FakeState::default();
+            post_diag(&mut s, msg);
+            let [record] = s.records.as_slice() else {
+                panic!("{name}: expected one record");
+            };
+            assert_eq!(record.sql_state, msg.state, "{name}");
+            assert_eq!(record.native_error, 0, "{name}");
+            let std::borrow::Cow::Borrowed(text) = record.message else {
+                panic!("{name}: message was allocated");
+            };
+            assert!(std::ptr::eq(text, msg.full), "{name}");
+        }
     }
 }

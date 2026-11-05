@@ -60,7 +60,6 @@ jobs:
     - job: Test_Matrix_alpine_arm64
       displayName: Linux arm64 (musl)
       variables:
-        SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
         SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
       # Intentionally no `dependsOn`: see sql-host-template.yml header.
       strategy:
@@ -75,15 +74,6 @@ jobs:
         demands:
           - ${{ parameters.poolImageOverride }}
       steps:
-        - bash: |
-            set -euo pipefail
-            bash .pipeline/scripts/sql-host/import-sql-password.sh
-          displayName: 'Import shared SQL credential'
-          workingDirectory: '$(Build.SourcesDirectory)'
-          env:
-            SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
-            SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
-
         - task: DockerInstaller@0
           inputs:
             dockerVersion: '29.0.0'
@@ -100,11 +90,12 @@ jobs:
         - bash: |
             set -euo pipefail
             bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
-          displayName: 'Wait for SQL host endpoint sentinel'
+          displayName: 'Wait for SQL host endpoint and credential'
           workingDirectory: '$(Build.SourcesDirectory)'
           env:
             # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
             ARTIFACT_NAME: 'sql-ready-shared_musl-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+            SENTINEL_ARTIFACT_NAME: '$(sentinelName)-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
             SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
             BUILD_BUILDID: $(Build.BuildId)
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
@@ -190,7 +181,6 @@ jobs:
       - job: Test_${{ target.name }}_alpine_arm64
         displayName: 'Linux arm64 (musl) ${{ target.name }}'
         variables:
-          SHARED_SQL_PASSWORD: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_PASSWORD'] ]
           SQL_CREDENTIAL_GENERATION: $[ stageDependencies.InitializeValidation.Initialize.outputs['GenerateSqlCredential.SQL_CREDENTIAL_GENERATION'] ]
         # Intentionally no `dependsOn`: see sql-host-template.yml header.
         pool:
@@ -198,15 +188,6 @@ jobs:
           demands:
             - ${{ parameters.poolImageOverride }}
         steps:
-          - bash: |
-              set -euo pipefail
-              bash .pipeline/scripts/sql-host/import-sql-password.sh
-            displayName: 'Import shared SQL credential'
-            workingDirectory: '$(Build.SourcesDirectory)'
-            env:
-              SHARED_SQL_PASSWORD: $(SHARED_SQL_PASSWORD)
-              SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
-
           - task: DockerInstaller@0
             inputs:
               dockerVersion: '29.0.0'
@@ -223,11 +204,12 @@ jobs:
           - bash: |
               set -euo pipefail
               bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
-            displayName: 'Wait for SQL host endpoint sentinel'
+            displayName: 'Wait for SQL host endpoint and credential'
             workingDirectory: '$(Build.SourcesDirectory)'
             env:
               # Stage-attempt suffix: rerun-safe namespacing (see sql-host-template.yml).
               ARTIFACT_NAME: 'sql-ready-${{ target.name }}_musl-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
+              SENTINEL_ARTIFACT_NAME: '${{ target.name }}_musl-$(SQL_CREDENTIAL_GENERATION)-$(System.StageAttempt)'
               SQL_CREDENTIAL_GENERATION: $(SQL_CREDENTIAL_GENERATION)
               BUILD_BUILDID: $(Build.BuildId)
               BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)

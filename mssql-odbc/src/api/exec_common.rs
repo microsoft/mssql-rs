@@ -9,7 +9,7 @@
 
 use tracing::{debug, error};
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::MutexGuard;
 use std::time::Duration;
 
@@ -37,8 +37,8 @@ use crate::error::{HasDiagnostics, post_sql_error};
 use crate::handles::dbc::{ConnectionState, DbcState};
 use crate::handles::desc::DescHeader;
 use crate::handles::stmt::{
-    DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
-    STMT_STATE_EXEC_STARTED, StatementOperation, StmtState,
+    BufferedTvpCell, DaeParam, DaeState, DaeTarget, PreparedPlan, STMT_STATE_CURSOR_OPEN,
+    STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StatementOperation, StmtState,
 };
 use crate::handles::wire::{ClaimError, ClaimPolicy, LeaseReturn, WireLease, WireOwner};
 use crate::handles::{
@@ -248,6 +248,7 @@ pub(super) fn park_dae_client(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
+    tvp_row_counts: std::collections::BTreeMap<usize, usize>,
     fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
@@ -263,7 +264,9 @@ pub(super) fn park_dae_client(
         error!("{op}: stmt mutex poisoned while parking DAE client");
         return SQL_ERROR;
     };
-    stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    stmt_state.dae = Some(
+        DaeState::new(client, prepared, orphaned, dae_params).with_tvp_row_counts(tvp_row_counts),
+    );
     if fractional_truncated {
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
     }
@@ -284,6 +287,7 @@ pub(super) fn park_deferred_dae(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     mut dae_params: Vec<DaeParam>,
+    tvp_row_counts: std::collections::BTreeMap<usize, usize>,
     prebuilt: Vec<RpcParameter>,
     sql: Option<String>,
     timeout_secs: u32,
@@ -296,7 +300,9 @@ pub(super) fn park_deferred_dae(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(
-        DaeState::new(client, prepared, orphaned, dae_params).deferred(prebuilt, sql, timeout_secs),
+        DaeState::new(client, prepared, orphaned, dae_params)
+            .with_tvp_row_counts(tvp_row_counts)
+            .deferred(prebuilt, sql, timeout_secs),
     );
     if fractional_truncated {
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
@@ -850,6 +856,8 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
+    /// Top-level maximum row counts for data-at-execution TVPs.
+    pub(super) tvp_row_counts: std::collections::BTreeMap<usize, usize>,
     /// Whether a parameter before the first DAE marker lost fractional digits.
     /// With no DAE marker, covers the full parameter list.
     pub(super) fractional_truncated: bool,
@@ -877,12 +885,42 @@ impl ParamRowBuildError {
         }
     }
 
+    fn tvp_cell_location(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Conversion {
+                source: ParamBuildError::TvpCellConversion { row, column, .. },
+                ..
+            } => Some((*row, *column)),
+            _ => None,
+        }
+    }
+
     pub(super) fn parameter(&self) -> usize {
         match self {
             Self::Unbound { parameter }
             | Self::Layout { parameter }
             | Self::Conversion { parameter, .. } => *parameter,
         }
+    }
+}
+
+pub(super) fn post_param_row_build_error(
+    stmt_state: &mut StmtState,
+    error: &ParamRowBuildError,
+    parameter_offset: usize,
+) {
+    let diagnostic = error.diag();
+    if let Some((row, column)) = error.tvp_cell_location() {
+        let message = format!(
+            "TVP parameter ODBC ordinal {}, row {}, column {}: {}",
+            error.parameter() + parameter_offset,
+            row + 1,
+            column + 1,
+            diagnostic.text
+        );
+        post_sql_error(stmt_state, diagnostic.state, 0, &message);
+    } else {
+        post_diag(stmt_state, diagnostic);
     }
 }
 
@@ -895,7 +933,7 @@ impl ParamRowBuildError {
 /// total the same as `NO_PARAM_LENGTH` (`sqlccmd.cpp:4160`). Folding it into
 /// `None` here keeps that behaviour instead of rejecting the first byte with
 /// `22026`.
-fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
+pub(super) fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
     if indicator == SQL_DATA_AT_EXEC {
         return None;
     }
@@ -952,16 +990,9 @@ pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Result<BoundParamSet, 
         (stmt_state.effective_apd(stmt), stmt.ipd)
     };
 
-    // `apd` can be an explicit descriptor resolved under the STMT lock,
-    // already dropped by now — re-check liveness right before dereferencing
-    // to narrow (not fully close) the race against a concurrent
-    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor. `ipd` is
-    // always `stmt.ipd`, freed only with the statement itself.
-    if crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc) {
-        error!("snapshotting parameters: apd freed concurrently");
-        return Err(SQL_ERROR);
-    }
-    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let apd_desc = stmt
+        .access_descriptor(crate::handles::stmt::StatementDescriptor::Apd, apd)
+        .map_err(|()| SQL_ERROR)?;
     let Ok(apd_state) = apd_desc.inner.lock() else {
         error!("snapshotting parameters: apd mutex poisoned");
         return Err(SQL_ERROR);
@@ -1069,6 +1100,9 @@ pub(super) unsafe fn build_positional_params(
     let built = unsafe {
         build_named_params_for_row(
             bound,
+            &stmt_state.tvp_column_bindings,
+            &stmt_state.tvp_column_layouts,
+            skip + 1,
             marker_count.saturating_sub(skip),
             bind_offset,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
@@ -1084,7 +1118,7 @@ pub(super) unsafe fn build_positional_params(
                 error.parameter() + skip,
                 error.diag().text
             );
-            post_diag(stmt_state, error.diag());
+            post_param_row_build_error(stmt_state, &error, skip);
             Err(SQL_ERROR)
         }
     }
@@ -1118,6 +1152,9 @@ pub(super) unsafe fn build_named_params(
     match unsafe {
         build_named_params_for_row(
             &stmt_state.bound_params,
+            &stmt_state.tvp_column_bindings,
+            &stmt_state.tvp_column_layouts,
+            1,
             marker_count,
             bind_offset,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
@@ -1132,7 +1169,7 @@ pub(super) unsafe fn build_named_params(
                 error.parameter(),
                 error.diag().text
             );
-            post_diag(stmt_state, error.diag());
+            post_param_row_build_error(stmt_state, &error, 0);
             Err(SQL_ERROR)
         }
     }
@@ -1143,8 +1180,12 @@ pub(super) unsafe fn build_named_params(
 /// # Safety
 /// Every pointer in `bound_params`, after applying `bind_offset` and the
 /// row-specific stride, must satisfy the original `SQLBindParameter` contract.
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn build_named_params_for_row(
     bound_params: &[Option<ParamSnapshot>],
+    tvp_columns: &std::collections::BTreeMap<usize, Vec<Option<crate::params::BoundParam>>>,
+    tvp_layouts: &std::collections::BTreeMap<usize, crate::handles::desc::DescHeader>,
+    first_ordinal: usize,
     marker_count: usize,
     bind_offset: isize,
     param_bind_type: crate::api::odbc_types::SqlULen,
@@ -1155,11 +1196,109 @@ pub(super) unsafe fn build_named_params_for_row(
 
     let mut params = Vec::with_capacity(marker_count + usize::from(!named));
     let mut dae_params = Vec::new();
+    let mut tvp_row_counts = std::collections::BTreeMap::new();
     let mut fractional_truncated = false;
     for i in 0..marker_count {
         let Some(Some(snapshot)) = bound_params.get(i) else {
             return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
         };
+        let name = named.then(|| parameter_name(i));
+
+        // A table-valued parameter is assembled from the columns captured
+        // while it was the parameter focus, not converted from a scalar
+        // buffer. Its row set is one logical value, so it is unaffected by the
+        // parameter-array row iteration (`row`).
+        if snapshot.param.sql_type == crate::api::odbc_types::SQL_SS_TABLE {
+            let ordinal = first_ordinal + i;
+            let columns = tvp_columns.get(&ordinal).map_or(&[][..], Vec::as_slice);
+            let layout = tvp_layouts.get(&ordinal).copied().unwrap_or_default();
+            let column_offset = if layout.bind_offset_ptr.is_null() {
+                0
+            } else {
+                unsafe { layout.bind_offset_ptr.cast::<SqlLen>().read_unaligned() }
+            };
+            let mut tvp_binding = snapshot
+                .param
+                .for_row(row, bind_offset, param_bind_type)
+                .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
+                    ParamRowBuildError::Layout { parameter: i + 1 }
+                })?;
+            if let Some(child_layout) = tvp_layouts.get(&ordinal) {
+                tvp_binding.column_size = child_layout.array_size;
+            }
+            if !tvp_binding.strlen_or_ind_ptr.is_null()
+                && unsafe { tvp_binding.strlen_or_ind_ptr.read_unaligned() }
+                    == crate::api::odbc_types::SQL_NULL_DATA
+            {
+                return Err(ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source: crate::conversion::param_convert::ParamBuildError::InvalidTvpRowCount,
+                });
+            }
+            let parent_dae =
+                unsafe { crate::conversion::param_convert::data_at_exec_indicator(&tvp_binding) }
+                    .is_some();
+            let fixed_dae_rows = if parent_dae {
+                None
+            } else {
+                unsafe { tvp_dae_cell_rows(&tvp_binding, columns, column_offset, layout.bind_type) }
+                    .map_err(|source| ParamRowBuildError::Conversion {
+                        parameter: i + 1,
+                        source,
+                    })?
+            };
+            if parent_dae || fixed_dae_rows.is_some() {
+                let staged = build_tvp_dae_params(
+                    i,
+                    &tvp_binding,
+                    snapshot.udt_names.clone(),
+                    columns,
+                    column_offset,
+                    layout.bind_type,
+                    snapshot.long_as_max,
+                    fixed_dae_rows,
+                )
+                .map_err(|source| ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
+                })?;
+                dae_params.extend(staged);
+                if let Some(count) = fixed_dae_rows {
+                    tvp_row_counts.insert(i, count);
+                }
+                let status = if crate::conversion::param_convert::is_output_direction(
+                    tvp_binding.input_output_type,
+                ) {
+                    StatusFlags::BY_REF_VALUE
+                } else {
+                    StatusFlags::NONE
+                };
+                params.push(
+                    RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax)
+                        .with_odbc_ordinal(ordinal),
+                );
+            } else {
+                let rpc = unsafe {
+                    // The parent binding already includes the outer bind offset.
+                    crate::conversion::param_convert::build_tvp_param(
+                        name,
+                        &tvp_binding,
+                        snapshot.udt_names.as_deref(),
+                        columns,
+                        0,
+                        column_offset,
+                        layout.bind_type,
+                    )
+                }
+                .map_err(|source| ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
+                })?;
+                params.push(rpc.with_odbc_ordinal(ordinal));
+            }
+            continue;
+        }
+
         let udt_names = snapshot.udt_names.as_deref();
         let bound_param = snapshot
             .param
@@ -1167,7 +1306,6 @@ pub(super) unsafe fn build_named_params_for_row(
             .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                 ParamRowBuildError::Layout { parameter: i + 1 }
             })?;
-        let name = named.then(|| parameter_name(i));
         let dae_indicator =
             unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
 
@@ -1281,8 +1419,142 @@ pub(super) unsafe fn build_named_params_for_row(
     Ok(ParamsWithDae {
         params,
         dae_params,
+        tvp_row_counts,
         fractional_truncated,
     })
+}
+
+pub(super) fn validate_parameter_focus(state: &mut StmtState, op: &str) -> Result<(), SqlReturn> {
+    if state
+        .vendor_attrs
+        .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+        .unwrap_or(0)
+        != 0
+    {
+        error!("{op}: SQL_SOPT_SS_PARAM_FOCUS must be zero at execution time");
+        post_sql_error(
+            state,
+            SQLSTATE_HY024,
+            0,
+            "Parameter focus (SQL_SOPT_SS_PARAM_FOCUS) must be zero at execution time",
+        );
+        return Err(SQL_ERROR);
+    }
+    Ok(())
+}
+
+/// # Safety
+/// Parent and child indicator buffers must remain readable for their positioned rows.
+pub(super) unsafe fn tvp_dae_cell_rows(
+    tvp: &BoundParam,
+    columns: &[Option<BoundParam>],
+    bind_offset: isize,
+    bind_type: SqlULen,
+) -> Result<Option<usize>, ParamBuildError> {
+    let rows = unsafe { crate::conversion::param_convert::tvp_row_count(tvp, 0) }?.unwrap_or(0);
+    if rows > tvp.column_size {
+        return Err(ParamBuildError::InvalidTvpRowCount);
+    }
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    for row in 0..rows {
+        for (index, column) in columns.iter().enumerate() {
+            let binding = column
+                .as_ref()
+                .ok_or(ParamBuildError::TvpColumnUnbound(index))?
+                .for_row(row, bind_offset, bind_type)
+                .map_err(|_| ParamBuildError::InvalidBufferLength)?;
+            if unsafe {
+                crate::conversion::param_convert::tvp_cell_data_at_exec_indicator(&binding)
+            }
+            .is_some()
+            {
+                return Ok(Some(rows));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_tvp_dae_params(
+    tvp_index: usize,
+    tvp: &BoundParam,
+    udt_names: Option<std::sync::Arc<crate::handles::desc::UdtNames>>,
+    columns: &[Option<BoundParam>],
+    bind_offset: isize,
+    bind_type: SqlULen,
+    long_as_max: bool,
+    fixed_rows: Option<usize>,
+) -> Result<Vec<DaeParam>, ParamBuildError> {
+    let row_capacity = fixed_rows.unwrap_or(tvp.column_size.min(1));
+    let controls = usize::from(fixed_rows.is_none());
+    let per_row = columns
+        .len()
+        .checked_add(controls)
+        .ok_or(ParamBuildError::MemoryAllocation)?;
+    let count = row_capacity
+        .checked_mul(per_row)
+        .and_then(|count| count.checked_add(controls))
+        .ok_or(ParamBuildError::MemoryAllocation)?;
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(count)
+        .map_err(|_| ParamBuildError::MemoryAllocation)?;
+
+    for row_index in 0..row_capacity {
+        if fixed_rows.is_none() {
+            staged.push(
+                DaeParam::new(
+                    tvp_index,
+                    None,
+                    true,
+                    None,
+                    *tvp,
+                    udt_names.clone(),
+                    long_as_max,
+                )
+                .with_target(DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index,
+                }),
+            );
+        }
+        for (column_index, column) in columns.iter().enumerate() {
+            let binding = column
+                .as_ref()
+                .ok_or(ParamBuildError::TvpColumnUnbound(column_index))?;
+            staged.push(
+                DaeParam::new(
+                    tvp_index,
+                    None,
+                    true,
+                    None,
+                    *binding,
+                    udt_names.clone(),
+                    long_as_max,
+                )
+                .with_target(DaeTarget::TvpCell {
+                    tvp_index,
+                    row_index,
+                    column_index,
+                })
+                .with_tvp_cell_binding(*binding, bind_offset, bind_type),
+            );
+        }
+    }
+    if fixed_rows.is_none() {
+        staged.push(
+            DaeParam::new(tvp_index, None, true, None, *tvp, udt_names, long_as_max).with_target(
+                DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index: row_capacity,
+                },
+            ),
+        );
+    }
+    Ok(staged)
 }
 
 fn parameter_name(index: usize) -> String {
@@ -1330,6 +1602,8 @@ pub(super) fn rebuild_deferred_params(
     prebuilt: Vec<RpcParameter>,
     collected: &[(usize, Vec<u8>, bool)],
     dae_params: &[DaeParam],
+    tvp_cells: &mut [BufferedTvpCell],
+    tvp_row_counts: &std::collections::BTreeMap<usize, usize>,
     op: &str,
 ) -> Result<(Vec<RpcParameter>, bool), SqlReturn> {
     let mut params = prebuilt;
@@ -1372,6 +1646,83 @@ pub(super) fn rebuild_deferred_params(
                     e.diag().text
                 );
                 post_diag(stmt_state, e.diag());
+                return Err(SQL_ERROR);
+            }
+        }
+    }
+
+    let mut rebuilt_tvps = BTreeSet::new();
+    for dae in dae_params {
+        let tvp_index = match dae.target {
+            DaeTarget::TvpRowControl { tvp_index, .. } | DaeTarget::TvpCell { tvp_index, .. } => {
+                tvp_index
+            }
+            DaeTarget::Parameter => continue,
+        };
+        if !rebuilt_tvps.insert(tvp_index) {
+            continue;
+        }
+
+        let column_count = dae_params
+            .iter()
+            .filter_map(|param| match param.target {
+                DaeTarget::TvpCell {
+                    tvp_index: target,
+                    column_index,
+                    ..
+                } if target == tvp_index => Some(column_index + 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let mut columns = Vec::new();
+        columns.try_reserve_exact(column_count).map_err(|_| {
+            post_diag(stmt_state, ERR_MEMORY_ALLOCATION);
+            SQL_ERROR
+        })?;
+        columns.resize_with(column_count, || None);
+        for param in dae_params {
+            if let DaeTarget::TvpCell {
+                tvp_index: target,
+                row_index: 0,
+                column_index,
+            } = param.target
+                && target == tvp_index
+            {
+                columns[column_index] = Some(param.binding);
+            }
+        }
+        let row_count = tvp_row_counts.get(&tvp_index).copied().unwrap_or(0);
+        let name = parameter_name(tvp_index);
+        let parameter_ordinal = params
+            .get(tvp_index)
+            .and_then(RpcParameter::odbc_ordinal)
+            .unwrap_or(tvp_index + 1);
+        let Some(slot) = params.get_mut(tvp_index) else {
+            error!("{op}: TVP parameter {} has no RPC slot", tvp_index + 1);
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+        match crate::conversion::param_convert::build_tvp_param_from_dae(
+            Some(name),
+            dae.udt_names.as_deref(),
+            &columns,
+            tvp_index,
+            row_count,
+            tvp_cells,
+        ) {
+            Ok(param) => *slot = param.with_odbc_ordinal(parameter_ordinal),
+            Err(error) => {
+                let row_error = ParamRowBuildError::Conversion {
+                    parameter: parameter_ordinal,
+                    source: error,
+                };
+                error!(
+                    "{op}: TVP parameter {} conversion failed: {}",
+                    parameter_ordinal,
+                    row_error.diag().text
+                );
+                post_param_row_build_error(stmt_state, &row_error, 0);
                 return Err(SQL_ERROR);
             }
         }
@@ -1627,6 +1978,7 @@ mod tests {
         ScriptedToken, col_metadata, col_metadata_empty, done_in_proc_more, done_more,
         done_no_more, done_proc_no_more, int_columns, sql_error, tds_client_from_tokens,
     };
+    use std::collections::BTreeMap;
     use std::ffi::c_void;
 
     // The success path of `try_claim_idle_client` needs a real `TdsClient`,
@@ -2378,6 +2730,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            std::collections::BTreeMap::new(),
             true,
             "SQLExecute",
         );
@@ -2936,6 +3289,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
@@ -2957,6 +3312,9 @@ mod tests {
         let Ok(streamed) = (unsafe {
             build_named_params_for_row(
                 &bound,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                1,
                 1,
                 0,
                 crate::api::odbc_types::SQL_BIND_BY_COLUMN,
@@ -2974,6 +3332,9 @@ mod tests {
         let Err(error) = (unsafe {
             build_named_params_for_row(
                 &bound,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                1,
                 1,
                 0,
                 crate::api::odbc_types::SQL_BIND_BY_COLUMN,
@@ -2992,18 +3353,8 @@ mod tests {
         ));
     }
 
-    /// The narrow race `snapshot_bound_params`'s liveness check guards
-    /// against: `effective_apd` resolves an explicit descriptor under the
-    /// STMT lock, which is dropped before the descriptor is actually locked
-    /// and read. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes
-    /// in that window, the stale pointer must fail cleanly (`Err`), not
-    /// dereference freed memory. Reassociating the APD and then freeing it
-    /// reproduces the state that window leaves behind — `active_apd` still
-    /// points at the freed handle, since only a *subsequent* `SQLBindCol`/
-    /// `SQLBindParameter`-family call re-resolves it via `free_desc`'s
-    /// association reset.
     #[test]
-    fn snapshot_bound_params_fails_cleanly_on_a_freed_apd() {
+    fn snapshot_bound_params_uses_implicit_apd_after_explicit_free() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit_apd = h.alloc_explicit_desc();
         unsafe {
@@ -3014,25 +3365,136 @@ mod tests {
                 0,
             )
         };
-        {
-            // Directly clears the tracked association without going through
-            // `free_desc`'s association-reset walk, so `active_apd` is left
-            // dangling exactly as it would be mid-race — `h.free_explicit_desc`
-            // goes through the real `SQLFreeHandle` path, which already resets
-            // the association and would defeat the point of this test.
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let mut ss = stmt.inner.lock().unwrap();
-            ss.active_apd = None;
-        }
-        unsafe {
-            crate::handles::free_handle::<DescHandle>(explicit_apd);
-        }
+        assert_eq!(h.free_explicit_desc(explicit_apd), SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        {
-            let mut ss = stmt.inner.lock().unwrap();
-            ss.active_apd = Some(explicit_apd);
+        assert!(snapshot_bound_params(stmt).unwrap().params.is_empty());
+    }
+
+    #[test]
+    fn explicit_descriptor_free_overlaps_live_statement_bindings_and_snapshots() {
+        use crate::api::odbc_types::{
+            SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_ROW_ARRAY_SIZE,
+            SQL_FETCH_NEXT, SQL_RESET_PARAMS, SQL_UNBIND, SqlPointer,
+        };
+        use std::sync::Barrier;
+
+        const ITERATIONS: usize = 64;
+        const OPERATIONS: usize = 8;
+        let mut h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let statements = [h.stmt.addr(), h.alloc_extra_stmt().addr()];
+        for address in statements {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(address as SqlHandle) };
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.result_set_exhausted = true;
         }
-        assert!(snapshot_bound_params(stmt).is_err());
+        let gate = Barrier::new(3);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = statements
+                .iter()
+                .map(|&address| {
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        let raw = address as SqlHandle;
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+                        let mut value = 7i32;
+                        let mut indicator = 4isize;
+                        let mut failures = Vec::new();
+                        // Keep both workers on the same API so a sibling fetch
+                        // does not intentionally reject a header write with HY010.
+                        for step in 0..ITERATIONS * OPERATIONS {
+                            let operation = step % OPERATIONS;
+                            gate.wait();
+                            // Only the live STMT is submitted; the descriptor may
+                            // disappear, but these application buffers remain live.
+                            let mut size = 0usize;
+                            let rc = match operation {
+                                0 => unsafe {
+                                    crate::api::SQLBindCol(
+                                        raw,
+                                        1,
+                                        SQL_C_LONG,
+                                        (&raw mut value).cast(),
+                                        4,
+                                        &mut indicator,
+                                    )
+                                },
+                                1 => unsafe {
+                                    crate::api::SQLBindParameter(
+                                        raw,
+                                        1,
+                                        SQL_PARAM_INPUT,
+                                        SQL_C_LONG,
+                                        SQL_INTEGER,
+                                        10,
+                                        0,
+                                        (&raw mut value).cast(),
+                                        4,
+                                        &mut indicator,
+                                    )
+                                },
+                                2 => snapshot_bound_params(stmt).map_or(SQL_ERROR, |_| SQL_SUCCESS),
+                                3 => unsafe {
+                                    crate::api::SQLSetStmtAttrW(
+                                        raw,
+                                        SQL_ATTR_ROW_ARRAY_SIZE,
+                                        1usize as SqlPointer,
+                                        0,
+                                    )
+                                },
+                                4 => unsafe {
+                                    crate::api::SQLGetStmtAttrW(
+                                        raw,
+                                        SQL_ATTR_ROW_ARRAY_SIZE,
+                                        (&raw mut size).cast(),
+                                        0,
+                                        std::ptr::null_mut(),
+                                    )
+                                },
+                                5 => unsafe { crate::api::SQLFetchScroll(raw, SQL_FETCH_NEXT, 0) },
+                                6 => unsafe { crate::api::SQLFreeStmt(raw, SQL_UNBIND) },
+                                _ => unsafe { crate::api::SQLFreeStmt(raw, SQL_RESET_PARAMS) },
+                            };
+                            let expected = if operation == 5 {
+                                SQL_NO_DATA
+                            } else {
+                                SQL_SUCCESS
+                            };
+                            if rc != expected {
+                                failures.push(format!(
+                                    "operation {operation} returned {rc}: {:?}",
+                                    stmt.inner.lock().unwrap().diag_records
+                                ));
+                            }
+                            gate.wait();
+                        }
+                        failures
+                    })
+                })
+                .collect();
+            for _ in 0..ITERATIONS * OPERATIONS {
+                let explicit = h.alloc_explicit_desc();
+                for address in statements {
+                    for attr in [SQL_ATTR_APP_ROW_DESC, SQL_ATTR_APP_PARAM_DESC] {
+                        assert_eq!(
+                            unsafe {
+                                crate::api::SQLSetStmtAttrW(address as SqlHandle, attr, explicit, 0)
+                            },
+                            SQL_SUCCESS
+                        );
+                    }
+                }
+                gate.wait();
+                let freed = h.free_explicit_desc(explicit);
+                gate.wait();
+                assert_eq!(freed, SQL_SUCCESS);
+            }
+            for worker in workers {
+                let failures = worker.join().unwrap();
+                assert!(failures.is_empty(), "{failures:?}");
+            }
+        });
     }
 
     /// A poisoned DBC must fail the snapshot rather than silently default the
@@ -3122,6 +3584,8 @@ mod tests {
                         built.params,
                         &[(0, b"42".to_vec(), false)],
                         &built.dae_params,
+                        &mut [],
+                        &BTreeMap::new(),
                         "test",
                     )
                     .unwrap();
@@ -3216,6 +3680,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3263,6 +3729,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3276,6 +3744,8 @@ mod tests {
             sql_type: SQL_DECIMAL,
             column_size: 5,
             decimal_digits: 1,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 38,
             app_scale: 2,
             parameter_value_ptr: (&mut numeric as *mut SqlNumericStruct).cast(),
@@ -3352,6 +3822,8 @@ mod tests {
             vec![deferred_slot()],
             &collected,
             &dae_params,
+            &mut [],
+            &BTreeMap::new(),
             "test",
         )
         .unwrap();
@@ -3372,6 +3844,8 @@ mod tests {
             vec![deferred_slot()],
             &[(0, Vec::new(), false)],
             &[],
+            &mut [],
+            &BTreeMap::new(),
             "test",
         );
         assert_eq!(missing_binding.unwrap_err(), SQL_ERROR);
@@ -3386,6 +3860,8 @@ mod tests {
             Vec::new(),
             &[(0, Vec::new(), false)],
             &[buffered_decimal_param(0)],
+            &mut [],
+            &BTreeMap::new(),
             "test",
         );
         assert_eq!(missing_slot.unwrap_err(), SQL_ERROR);
@@ -3406,6 +3882,8 @@ mod tests {
             vec![deferred_slot()],
             &[(0, b"not-a-number".to_vec(), false)],
             &[buffered_decimal_param(0)],
+            &mut [],
+            &BTreeMap::new(),
             "test",
         );
 
@@ -3429,6 +3907,8 @@ mod tests {
                 vec![deferred_slot()],
                 &[(0, bytes, is_null)],
                 &dae_params,
+                &mut [],
+                &BTreeMap::new(),
                 "test",
             );
             assert!(
@@ -3455,6 +3935,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -3467,6 +3949,423 @@ mod tests {
         assert_eq!(dae.dae_params.len(), 1);
         assert_eq!(dae.dae_params[0].bound_index, 0);
         assert_eq!(dae.dae_params[0].expected_len, Some(7));
+    }
+
+    #[test]
+    fn tvp_dae_staging_positions_each_cell_without_reading_its_indicator() {
+        let mut indicator = SQL_DATA_AT_EXEC;
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 2,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut indicator,
+        };
+        let mut values = [7i32, 9];
+        let mut indicators = [0, crate::api::odbc_types::SQL_NULL_DATA];
+        let mut dae_indicators = [
+            SQL_LEN_DATA_AT_EXEC_OFFSET - 5,
+            crate::api::odbc_types::SQL_NULL_DATA,
+        ];
+        let bound = BoundParam {
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: crate::api::odbc_types::SQL_INTEGER,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+            ..tvp
+        };
+        let dae = BoundParam {
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            strlen_or_ind_ptr: dae_indicators.as_mut_ptr(),
+            octet_length_ptr: dae_indicators.as_mut_ptr(),
+            ..tvp
+        };
+        let staged = build_tvp_dae_params(
+            0,
+            &tvp,
+            None,
+            &[Some(bound), Some(dae)],
+            0,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 4);
+        assert_eq!(
+            staged[1].binding.parameter_value_ptr,
+            values.as_mut_ptr().cast()
+        );
+        assert_eq!(staged[1].binding.strlen_or_ind_ptr, indicators.as_mut_ptr());
+        assert_eq!(staged[2].expected_len, None);
+        assert_eq!(
+            staged[2].binding.strlen_or_ind_ptr,
+            dae_indicators.as_mut_ptr()
+        );
+    }
+
+    #[test]
+    fn tvp_dae_cells_use_batch_relative_array_positions() {
+        let mut indicator = SQL_DATA_AT_EXEC;
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 2,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut indicator,
+        };
+        let mut values = [11i32, 999];
+        let mut indicators = [SQL_DATA_AT_EXEC, SQL_DATA_AT_EXEC];
+        let column = BoundParam {
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: SQL_INTEGER,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: std::mem::size_of::<i32>() as SqlLen,
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+            ..tvp
+        };
+        let staged = build_tvp_dae_params(
+            0,
+            &tvp,
+            None,
+            &[Some(column)],
+            0,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            false,
+            None,
+        )
+        .unwrap();
+        let mut dae = DaeState::for_test(staged, Some(0));
+        dae.stage_tvp_batch(0, 0, 2).unwrap();
+
+        dae.cursor = Some(1);
+        dae.tvp_batches.insert(0, (0, 2));
+        dae.position_current_tvp_cell().unwrap();
+        assert_eq!(
+            dae.current_param().unwrap().binding.parameter_value_ptr,
+            values.as_mut_ptr().cast()
+        );
+
+        dae.cursor = Some(3);
+        dae.position_current_tvp_cell().unwrap();
+        assert_eq!(
+            dae.current_param().unwrap().binding.parameter_value_ptr,
+            unsafe { values.as_mut_ptr().add(1) }.cast()
+        );
+
+        dae.tvp_batches.insert(0, (1, 2));
+        dae.position_current_tvp_cell().unwrap();
+        assert_eq!(
+            dae.current_param().unwrap().binding.parameter_value_ptr,
+            values.as_mut_ptr().cast()
+        );
+    }
+
+    #[test]
+    fn build_named_params_stages_tvp_row_and_cell_tokens_in_protocol_order() {
+        let mut table_indicator = SQL_DATA_AT_EXEC;
+        let mut cell_indicator = SQL_DATA_AT_EXEC;
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 6,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: 0x1000usize as *mut c_void,
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut table_indicator,
+            octet_length_ptr: &mut table_indicator,
+        };
+        let column = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 20,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: 0x2000usize as *mut c_void,
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut cell_indicator,
+            octet_length_ptr: &mut cell_indicator,
+        };
+        let bound = [snap(tvp)];
+        let tvp_columns = BTreeMap::from([(1, vec![Some(column)])]);
+        let layouts = BTreeMap::from([(
+            1,
+            crate::handles::desc::DescHeader {
+                array_size: 2,
+                ..Default::default()
+            },
+        )]);
+
+        let built = unsafe {
+            build_named_params_for_row(
+                &bound,
+                &tvp_columns,
+                &layouts,
+                1,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }
+        .unwrap_or_else(|_| panic!("TVP DAE staging failed"));
+
+        assert_eq!(built.dae_params.len(), 3);
+        assert!(matches!(
+            built.dae_params[0].target,
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0
+            }
+        ));
+        assert!(matches!(
+            built.dae_params[1].target,
+            DaeTarget::TvpCell {
+                tvp_index: 0,
+                row_index: 0,
+                column_index: 0
+            }
+        ));
+        assert!(matches!(
+            built.dae_params[2].target,
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 1
+            }
+        ));
+        assert_eq!(built.dae_params[1].value_ptr, 0x2000usize as *mut c_void);
+        assert_eq!(built.dae_params[0].binding.column_size, 2);
+        assert!(built.tvp_row_counts.is_empty());
+        assert_eq!(built.params.len(), 1);
+    }
+
+    #[test]
+    fn fixed_tvp_rows_detect_child_dae_and_honor_separate_null_indicators() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        let mut row_count = 3;
+        let mut values = [11i32, 22, 33];
+        let mut indicators = [0, SQL_DATA_AT_EXEC, crate::api::odbc_types::SQL_NULL_DATA];
+        let mut lengths = indicators;
+        let tvp = BoundParam {
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 3,
+            strlen_or_ind_ptr: &mut row_count,
+            octet_length_ptr: &mut row_count,
+            ..char_param(&mut [], &mut 0)
+        };
+        let column = BoundParam {
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: crate::api::odbc_types::SQL_INTEGER,
+            column_size: 10,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: size_of::<i32>() as SqlLen,
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: lengths.as_mut_ptr(),
+            ..tvp
+        };
+        let mut snapshot = snap(tvp).unwrap();
+        snapshot.udt_names = Some(std::sync::Arc::new(crate::handles::desc::UdtNames {
+            tvp_type_name: "test_table".into(),
+            ..Default::default()
+        }));
+        let bound = [Some(snapshot)];
+        let mut columns = BTreeMap::from([(1, vec![Some(column)])]);
+        let built = unsafe {
+            build_named_params_for_row(
+                &bound,
+                &columns,
+                &BTreeMap::new(),
+                1,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }
+        .unwrap_or_else(|_| panic!("fixed TVP staging failed"));
+        assert_eq!(built.tvp_row_counts, BTreeMap::from([(0, 3)]));
+        assert_eq!(built.dae_params.len(), 3);
+        for (row, param) in built.dae_params.iter().enumerate() {
+            assert!(matches!(param.target, DaeTarget::TvpCell {
+                tvp_index: 0, row_index, column_index: 0
+            } if row_index == row));
+        }
+        indicators.fill(crate::api::odbc_types::SQL_NULL_DATA);
+        lengths.fill(SQL_DATA_AT_EXEC);
+        columns.insert(1, vec![Some(column)]);
+        let built = unsafe {
+            build_named_params_for_row(
+                &bound,
+                &columns,
+                &BTreeMap::new(),
+                1,
+                1,
+                0,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }
+        .unwrap_or_else(|error| panic!("NULL TVP materialization failed: {}", error.diag().text));
+        assert!(built.dae_params.is_empty());
+        match mssql_tds::test_client_support::rpc_parameter_value(&built.params[0]).unwrap() {
+            SqlType::Table(_, Some(data)) => {
+                assert_eq!(data.rows, vec![vec![SqlType::Int(None)]; 3])
+            }
+            other => panic!("expected NULL table rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tvp_parameter_array_applies_bind_offset_once_to_parent_and_child() {
+        use crate::api::odbc_types::{SQL_C_BINARY, SQL_C_SLONG, SQL_SS_TABLE};
+        use crate::handles::desc::{DescHeader, UdtNames};
+        use mssql_tds::datatypes::sqltypes::SqlType;
+
+        let bind_offset = std::mem::size_of::<SqlLen>() as isize;
+        let mut row_counts: [SqlLen; 3] = [0, 1, 0];
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_BINARY,
+            sql_type: SQL_SS_TABLE,
+            column_size: 1,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: row_counts.as_mut_ptr(),
+            octet_length_ptr: row_counts.as_mut_ptr(),
+        };
+        let mut snapshot = snap(tvp).unwrap();
+        snapshot.udt_names = Some(std::sync::Arc::new(UdtNames {
+            tvp_type_name: "Rows".to_string(),
+            ..Default::default()
+        }));
+        let bound = [Some(snapshot)];
+
+        let mut values = [0i32, 0, 42];
+        let mut indicators: [SqlLen; 3] = [0, 0, 0];
+        let column = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_SLONG,
+            sql_type: SQL_INTEGER,
+            column_size: 4,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: std::mem::size_of::<i32>() as SqlLen,
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+        };
+        let mut child_bind_offset = bind_offset as SqlLen;
+        let layout = DescHeader {
+            array_size: 1,
+            bind_offset_ptr: (&mut child_bind_offset as *mut SqlLen).cast(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { layout.bind_offset_ptr.cast::<SqlLen>().read_unaligned() },
+            bind_offset as SqlLen
+        );
+        assert_eq!(
+            column
+                .with_bind_offset(child_bind_offset as isize)
+                .parameter_value_ptr,
+            unsafe { values.as_mut_ptr().add(2) }.cast()
+        );
+        let columns = BTreeMap::from([(1, vec![Some(column)])]);
+        let layouts = BTreeMap::from([(1, layout)]);
+
+        let built = unsafe {
+            build_named_params_for_row(
+                &bound,
+                &columns,
+                &layouts,
+                1,
+                1,
+                bind_offset,
+                crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                0,
+                true,
+            )
+        }
+        .unwrap_or_else(|_| panic!("TVP bind-offset conversion failed"));
+
+        match mssql_tds::test_client_support::rpc_parameter_value(&built.params[0]).unwrap() {
+            SqlType::Table(_, Some(data)) => {
+                assert_eq!(data.rows, vec![vec![SqlType::Int(Some(42))]]);
+            }
+            other => panic!("expected a materialized TVP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_named_params_rejects_null_tvp_indicator_before_dae_staging() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut indicator = crate::api::odbc_types::SQL_NULL_DATA;
+        let mut octet_length = SQL_DATA_AT_EXEC;
+        let tvp = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_SS_TABLE,
+            column_size: 2,
+            decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut octet_length,
+        };
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(snap(tvp));
+
+        let result = unsafe { build_named_params(&mut state, 1, 0, "test") };
+
+        assert!(matches!(result, Err(SQL_ERROR)));
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            crate::api::sqlstate::ERR_INVALID_ATTRIBUTE_VALUE.state
+        );
     }
 
     /// A streamed parameter is only declared at a narrowed length when the
@@ -3501,6 +4400,8 @@ mod tests {
                 sql_type,
                 column_size: 10,
                 decimal_digits: 0,
+                app_datetime_interval_code: None,
+                sql_datetime_interval_code: None,
                 app_precision: 0,
                 app_scale: 0,
                 parameter_value_ptr: std::ptr::null_mut(),
@@ -3572,6 +4473,8 @@ mod tests {
                     sql_type,
                     column_size: 8,
                     decimal_digits: 0,
+                    app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
                     app_precision: 0,
                     app_scale: 0,
                     parameter_value_ptr: std::ptr::null_mut(),
@@ -3601,6 +4504,8 @@ mod tests {
                     built.params,
                     &[(0, b"abc".to_vec(), false)],
                     &built.dae_params,
+                    &mut [],
+                    &std::collections::BTreeMap::new(),
                     "test",
                 )
                 .unwrap();
@@ -3630,6 +4535,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
@@ -3661,6 +4568,8 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
@@ -3708,6 +4617,8 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
@@ -3755,6 +4666,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value.as_mut_ptr().cast(),
@@ -3797,6 +4710,8 @@ mod tests {
             sql_type: SQL_DECIMAL,
             column_size: 10,
             decimal_digits: 2,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 38,
             app_scale: 0,
             parameter_value_ptr: values.as_mut_ptr().cast(),
@@ -3830,6 +4745,8 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
@@ -3889,7 +4806,16 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let lease = lease_for_test(dbc, h.stmt, tds_client_from_tokens(Vec::new()));
         assert_eq!(
-            park_dae_client(stmt, lease, None, None, Vec::new(), false, "test"),
+            park_dae_client(
+                stmt,
+                lease,
+                None,
+                None,
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                false,
+                "test",
+            ),
             SQL_NEED_DATA
         );
 
@@ -3943,6 +4869,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                std::collections::BTreeMap::new(),
                 false,
                 "test",
             ),

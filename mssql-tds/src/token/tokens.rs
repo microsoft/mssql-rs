@@ -410,6 +410,17 @@ impl SqlCollation {
         (self.info >> 28) as u8
     }
 
+    /// Returns the Windows code page this collation selects, as msodbcsql
+    /// derives it with `CodePageFromTDSCollation`: `65001` for a UTF-8
+    /// collation, else the SQL sort ID's code page, else the LCID's ANSI code
+    /// page. `None` when neither maps to a known code page.
+    ///
+    /// Unlike the encoding used to decode values, this has no Windows-1252
+    /// fallback, so callers can tell an exact code page from an unmapped one.
+    pub fn code_page(&self) -> Option<u16> {
+        crate::datatypes::sql_string::collation_code_page(*self)
+    }
+
     /// Returns `true` if the `fIgnoreCase` flag is set.
     pub fn ignore_case(&self) -> bool {
         (self.col_flags & 0x1) != 0

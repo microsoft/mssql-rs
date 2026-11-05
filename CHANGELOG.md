@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: `SecurityContextProvider` trait and
+  `ClientContext::security_context_provider` to replace the built-in
+  SSPI/GSSAPI context for integrated auth, e.g. NTLM on Linux/macOS (#707).
+
 - Shared MultiSubnetFailover (MSF) startup configuration: explicit connection
   setting > application default > `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT`
   (`true`/`false`) > built-in on. Rust, native Python, and Node.js expose
@@ -86,9 +90,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   an Enhanced Routing acknowledgement of 1 fails the login, matching msodbcsql
   (AB#49295).
 
+- `mssql-tds`: TLS 1.3 and the post-quantum `X25519MLKEM768` key exchange on
+  macOS for TDS 8.0 (Strict) connections. The default-enabled Network.framework
+  feature requires a macOS deployment target of 10.15 or later; lower targets
+  fail at build time. Strict TCP connections are opened
+  through Apple's Network.framework, with certificates still evaluated by
+  Security.framework, so keychain roots and trust settings apply. The connect
+  timeout covers the TLS handshake on this path. The post-quantum group needs
+  macOS 26 and a server that offers it; current SQL Server negotiates X25519.
+  TDS 7.x handshakes remain on Secure Transport (TLS 1.2 maximum). The
+  default-on `tls-network-framework-on-macos` feature controls this;
+  `default-features = false` restores native-tls throughout. Handshake failures
+  surface as `Error::TlsHandshakeError` on every engine.
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- `mssql-tds`: `Error::TlsHandshakeError` now covers failures from all TLS
+  engines. Its `source` is now boxed and the placeholder `cert_sans` field was
+  removed; this is a breaking public API change.
 
 - Eligible TCP connections now default to immediate parallel MSF attempts,
   without TNIR's first-address phase. Explicit non-TCP transports, failover
@@ -192,6 +213,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-odbc`: `SQLPrepareW` and `SQLExecDirectW` now take `TextLength` as
+  `SQLINTEGER`, as the ODBC headers and msodbcsql declare it. Before, only its
+  low 16 bits were kept on Windows x64: a length of 32768 or more ran empty or
+  truncated text, and 65533 was read as `SQL_NTS` (AB#50015).
+
+- `mssql-mock-tds`: a SQL batch spanning several packets is matched and
+  answered once, after its last packet. Before, each packet was answered as
+  its own batch (AB#50015).
 
 - `mssql-tds`: a parallel TCP connect now aborts its remaining attempts when it is cancelled
   or the login deadline expires. Before, those attempts kept their sockets

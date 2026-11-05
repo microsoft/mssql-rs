@@ -8,7 +8,8 @@ use crate::connection::dns_cache::{self, Resolution};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{
-    MAX_PARALLEL_IPS, ParallelConnectConfig, parallel_connect_resolving,
+    AttemptError, MAX_PARALLEL_IPS, ParallelConnectResult, connect_with_keepalive,
+    parallel_connect_resolving_with,
 };
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::{
@@ -36,7 +37,8 @@ use crate::io::token_stream::{
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
 use crate::message::messages::{PacketStatusFlags, PacketType, Request, ResetConnectionMode};
-use crate::token::data_classification::DataClassificationVersion;
+use crate::token::data_classification::{DataClassificationMetadata, DataClassificationVersion};
+use crate::token::parsers::DataClassificationTokenParser;
 use crate::token::tokens::{ColMetadataToken, DoneStatus, TokenType, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -413,6 +415,7 @@ fn tcp_stage(address: &SocketAddr) -> tracing::Span {
         os_error = tracing::field::Empty,
         io_kind = tracing::field::Empty,
         timed_out = tracing::field::Empty,
+        includes_tls = tracing::field::Empty,
         error = tracing::field::Empty,
         ok = tracing::field::Empty
     )
@@ -509,24 +512,15 @@ fn spawn_extra_connects(
     }
 }
 
-/// Creates a TCP stream using sequential connection mode.
-/// Tries each resolved IP address one at a time until one succeeds. A
-/// diagnostic connection then connects to the addresses after it too, without
-/// waiting for them.
-async fn create_base_stream_sequential(
+/// Resolves `host` for a sequential connect, recording the `dns` stage, and
+/// gives the addresses in the order to try them. A diagnostic connection that
+/// stops after resolution stops here.
+async fn resolve_sequential(
     ipaddress_preference: IPAddressPreference,
     host: &str,
     port: u16,
-    keep_alive_in_ms: u32,
-    keep_alive_interval_in_ms: u32,
-    connect_timeout_ms: u64,
     diagnosis: Option<&Diagnosis>,
-) -> TdsResult<(Box<dyn Stream>, Resolution)> {
-    info!(
-        "Connecting to TCP transport (sequential): {}:{}",
-        host, port
-    );
-
+) -> TdsResult<(Resolution, Vec<SocketAddr>)> {
     // This will cause the DNS resolution of the addresses. `lookup_host` (unlike
     // `std::net::ToSocketAddrs::to_socket_addrs`) awaits the resolution instead of
     // blocking the calling thread, so a slow or stuck resolver stays subject to the
@@ -575,6 +569,41 @@ async fn create_base_stream_sequential(
     {
         diagnosis.check_stop(DiagnosticStop::Resolution)?;
     }
+    Ok((resolution, socket_addresses))
+}
+
+/// The `tls` connect stage.
+fn tls_stage() -> tracing::Span {
+    tracing::info_span!(
+        target: connect_stage::TARGET,
+        connect_stage::TLS,
+        os_error = tracing::field::Empty,
+        io_kind = tracing::field::Empty,
+        error = tracing::field::Empty,
+        ok = tracing::field::Empty
+    )
+}
+
+/// Creates a TCP stream using sequential connection mode.
+/// Tries each resolved IP address one at a time until one succeeds. A
+/// diagnostic connection then connects to the addresses after it too, without
+/// waiting for them.
+async fn create_base_stream_sequential(
+    ipaddress_preference: IPAddressPreference,
+    host: &str,
+    port: u16,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+    connect_timeout_ms: u64,
+    diagnosis: Option<&Diagnosis>,
+) -> TdsResult<(Box<dyn Stream>, Resolution)> {
+    info!(
+        "Connecting to TCP transport (sequential): {}:{}",
+        host, port
+    );
+
+    let (resolution, socket_addresses) =
+        resolve_sequential(ipaddress_preference, host, port, diagnosis).await?;
 
     let stream = connect_in_order(
         socket_addresses,
@@ -589,7 +618,7 @@ async fn create_base_stream_sequential(
     Ok((stream, resolution))
 }
 
-/// Connects to each of `socket_addresses` in turn, each within
+/// Connects a TCP socket to each of `socket_addresses` in turn, each within
 /// `connect_timeout_ms`, until one accepts; for a diagnostic connection, then
 /// starts the connects to the addresses after it.
 async fn connect_in_order(
@@ -601,25 +630,75 @@ async fn connect_in_order(
     connect_timeout_ms: u64,
     diagnosis: Option<&Diagnosis>,
 ) -> TdsResult<Box<dyn Stream>> {
+    let stream = connect_in_order_with(
+        socket_addresses,
+        host,
+        port,
+        keep_alive_in_ms,
+        keep_alive_interval_in_ms,
+        connect_timeout_ms,
+        diagnosis,
+        false,
+        |address| {
+            let socket = new_tcp_socket(address, keep_alive_in_ms, keep_alive_interval_in_ms)?;
+            Ok(async move {
+                socket
+                    .connect(address)
+                    .await
+                    .map_err(AttemptError::Unreachable)
+            })
+        },
+    )
+    .await?;
+    Ok(Box::new(stream))
+}
+
+/// [`connect_in_order`] with the connect to each address supplied by the
+/// caller: `connect` gives it, or the error that keeps it from starting, which
+/// ends the connect. An address that rejects the connection ends it too, since
+/// no other address would fare differently. That address was reached, so its
+/// `tcp` stage records it as connected, and a `tls` stage records the
+/// rejection: only a connect that negotiates TLS too rejects one.
+#[allow(clippy::too_many_arguments)]
+async fn connect_in_order_with<S, C, F>(
+    socket_addresses: Vec<SocketAddr>,
+    host: &str,
+    port: u16,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+    connect_timeout_ms: u64,
+    diagnosis: Option<&Diagnosis>,
+    includes_tls: bool,
+    connect: C,
+) -> TdsResult<S>
+where
+    C: Fn(SocketAddr) -> std::io::Result<F>,
+    F: Future<Output = Result<S, AttemptError>>,
+{
     let mut last_error = None;
-    let mut tcp_stream = None;
+    let mut outcome = None;
 
     let mut remaining = socket_addresses.into_iter();
     for socket_address in remaining.by_ref() {
         let tcp_stage = tcp_stage(&socket_address);
-        let socket = new_tcp_socket(socket_address, keep_alive_in_ms, keep_alive_interval_in_ms)
+        tcp_stage.record(connect_stage::INCLUDES_TLS, includes_tls);
+        let attempt = connect(socket_address)
             .inspect_err(|e| connect_stage::record_io_error(&tcp_stage, e))?;
 
         // Apply connection timeout to each connection attempt
-        let connect_future = socket.connect(socket_address);
-        tcp_stream = match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await
-        {
+        outcome = match timeout(Duration::from_millis(connect_timeout_ms), attempt).await {
             Ok(Ok(stream)) => {
                 info!("Connected to TCP transport: {}:{}", host, port);
                 tcp_stage.record(connect_stage::OK, true);
-                Some(stream)
+                Some(Ok(stream))
             }
-            Ok(Err(e)) => {
+            Ok(Err(AttemptError::Rejected(e))) => {
+                tcp_stage.record(connect_stage::OK, true);
+                drop(tcp_stage);
+                connect_stage::record_error(&tls_stage(), &e);
+                Some(Err(e))
+            }
+            Ok(Err(AttemptError::Unreachable(e))) => {
                 connect_stage::record_io_error(&tcp_stage, &e);
                 last_error = Some(e);
                 None
@@ -638,13 +717,13 @@ async fn connect_in_order(
                 None
             }
         };
-        if tcp_stream.is_some() {
+        if outcome.is_some() {
             break;
         }
     }
 
-    // We don't have a valid TCP stream, so we need to return the last error.
-    if let Some(stream) = tcp_stream {
+    // No address was reached, so we need to return the last error.
+    if let Some(outcome) = outcome {
         if let Some(diagnosis) = diagnosis {
             spawn_extra_connects(
                 remaining,
@@ -654,7 +733,7 @@ async fn connect_in_order(
                 diagnosis,
             );
         }
-        Ok(Box::new(stream))
+        outcome
     } else {
         Err(crate::error::Error::from(last_error.unwrap_or_else(|| {
             std::io::Error::new(
@@ -663,39 +742,6 @@ async fn connect_in_order(
             )
         })))
     }
-}
-
-#[cfg(test)]
-async fn sequential_connect_with<C, F>(
-    addresses: &[SocketAddr],
-    connect_timeout_ms: u64,
-    connect: C,
-) -> std::io::Result<TcpStream>
-where
-    C: Fn(SocketAddr) -> std::io::Result<F>,
-    F: Future<Output = std::io::Result<TcpStream>>,
-{
-    let mut last_error = std::io::Error::new(
-        std::io::ErrorKind::NotConnected,
-        "No addresses provided for sequential connection",
-    );
-    for &address in addresses {
-        let connect_future = connect(address)?;
-        match timeout(Duration::from_millis(connect_timeout_ms), connect_future).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(error)) => last_error = error,
-            Err(_elapsed) => {
-                last_error = std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "Connection to {} timed out after {}ms",
-                        address, connect_timeout_ms
-                    ),
-                );
-            }
-        }
-    }
-    Err(last_error)
 }
 
 /// Creates a TCP stream using parallel connection mode (MultiSubnetFailover).
@@ -713,17 +759,46 @@ async fn create_base_stream_parallel(
         host, port
     );
 
-    let config = ParallelConnectConfig {
-        timeout_ms: connect_timeout_ms,
-        keep_alive_in_ms,
-        keep_alive_interval_in_ms,
-    };
+    let (result, resolution) =
+        race_to_connect(host, port, connect_timeout_ms, false, move |address| {
+            connect_with_keepalive(address, keep_alive_in_ms, keep_alive_interval_in_ms)
+        })
+        .await?;
 
+    info!(
+        "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
+        result.connected_address, result.total_addresses, result.failed_attempts
+    );
+
+    Ok((Box::new(result.stream), resolution))
+}
+
+/// Races `connect` to every address `host` resolves to, within
+/// `connect_timeout_ms` overall, recording one `tcp` stage over resolving and
+/// the race. An address that rejects the connection ends the race. That
+/// address was reached, so the `tcp` stage records it as the one connected
+/// to, and a `tls` stage records the rejection: only a connect that
+/// negotiates TLS too rejects one.
+async fn race_to_connect<S, C, F, E>(
+    host: &str,
+    port: u16,
+    connect_timeout_ms: u64,
+    includes_tls: bool,
+    connect: C,
+) -> TdsResult<(ParallelConnectResult<S>, Resolution)>
+where
+    S: Send + 'static,
+    C: Fn(SocketAddr) -> F,
+    F: Future<Output = Result<S, E>> + Send + 'static,
+    E: Into<AttemptError>,
+{
     let tcp_stage = tracing::info_span!(
         target: connect_stage::TARGET,
         connect_stage::TCP,
         address = tracing::field::Empty,
         port = port,
+        includes_tls = includes_tls,
+        timed_out = tracing::field::Empty,
         source = tracing::field::Empty,
         os_error = tracing::field::Empty,
         io_kind = tracing::field::Empty,
@@ -736,10 +811,11 @@ async fn create_base_stream_parallel(
     // Where the addresses came from is recorded once the host resolved, before
     // the race, so a race that fails keeps it.
     let fell_back = std::sync::atomic::AtomicBool::new(false);
-    let (result, resolution) = parallel_connect_resolving(
+    let mut rejected_by = None;
+    let raced = parallel_connect_resolving_with(
         host,
         port,
-        &config,
+        connect_timeout_ms,
         |e| {
             fell_back.store(true, std::sync::atomic::Ordering::Relaxed);
             connect_stage::record_resolver_fallback(&tcp_stage, e);
@@ -749,23 +825,38 @@ async fn create_base_stream_parallel(
                 tcp_stage.record(connect_stage::SOURCE, connect_stage::SOURCE_RESOLVER);
             }
         },
+        |address| rejected_by = Some(address),
+        connect,
     )
-    .await
-    .inspect_err(|e| connect_stage::record_error(&tcp_stage, e))?;
-    tcp_stage.record(
-        connect_stage::ADDRESS,
-        tracing::field::display(connect_stage::ScopedIp(&result.connected_address)),
-    );
-    tcp_stage.record(connect_stage::OK, true);
+    .await;
+    let reached = match &raced {
+        Ok((result, _)) => Some(result.connected_address),
+        Err(_) => rejected_by,
+    };
+    match reached {
+        Some(address) => {
+            tcp_stage.record(
+                connect_stage::ADDRESS,
+                tracing::field::display(connect_stage::ScopedIp(&address)),
+            );
+            tcp_stage.record(connect_stage::OK, true);
+        }
+        None => {
+            if let Err(e) = &raced {
+                if matches!(e, crate::error::Error::TimeoutError(_)) {
+                    tcp_stage.record(connect_stage::TIMED_OUT, true);
+                }
+                connect_stage::record_error(&tcp_stage, e);
+            }
+        }
+    }
     drop(tcp_stage);
-
-    info!(
-        "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
-        result.connected_address, result.total_addresses, result.failed_attempts
-    );
-
-    Ok((Box::new(result.stream), resolution))
+    if let (Err(e), Some(_)) = (&raced, rejected_by) {
+        connect_stage::record_error(&tls_stage(), e);
+    }
+    raced
 }
+
 /// Creates a NetworkTransport configured for the specified TDS version.
 /// This function applies TDS version-specific logic uniformly across all transport types.
 async fn create_transport_for_version(
@@ -798,14 +889,7 @@ async fn create_transport_for_version(
             // Enable TLS immediately for TDS 8.0 (before any TDS packets are exchanged)
             info!("Creating NetworkTransport for TDS 8.0 with immediate TLS");
 
-            let tls_stage = tracing::info_span!(
-                target: connect_stage::TARGET,
-                connect_stage::TLS,
-                os_error = tracing::field::Empty,
-                io_kind = tracing::field::Empty,
-                error = tracing::field::Empty,
-                ok = tracing::field::Empty
-            );
+            let tls_stage = tls_stage();
             let encrypted_stream = ssl_handler
                 .enable_ssl_async(stream, NegotiatedEncryptionSetting::Strict)
                 .await
@@ -855,6 +939,27 @@ pub(crate) async fn create_transport(
 ) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
     let encryption_mode = encryption_options.mode;
 
+    #[cfg(all(target_os = "macos", feature = "tls-network-framework"))]
+    {
+        if let (TdsVersion::V8_0, TransportContext::Tcp { host, port, .. }) =
+            (&tds_version, transport_context)
+        {
+            return create_network_framework_transport(
+                ipaddress_preference,
+                transport_context,
+                host,
+                *port,
+                encryption_options,
+                keep_alive_in_ms,
+                keep_alive_interval_in_ms,
+                multi_subnet_failover,
+                connect_timeout_ms,
+                diagnosis,
+            )
+            .await;
+        }
+    }
+
     // Step 1: Create the base stream (transport-specific)
     let (stream, resolution) = create_base_stream(
         ipaddress_preference,
@@ -879,6 +984,99 @@ pub(crate) async fn create_transport(
     Ok((transport, resolution))
 }
 
+/// Makes a Strict connection over TCP in Network.framework, which connects to
+/// each address and negotiates TLS on it in one step, walking the addresses as
+/// the socket transport does. See `tls::network_framework_engine` for why.
+#[cfg(all(target_os = "macos", feature = "tls-network-framework"))]
+#[allow(clippy::too_many_arguments)]
+async fn create_network_framework_transport(
+    ipaddress_preference: IPAddressPreference,
+    transport_context: &TransportContext,
+    host: &str,
+    port: u16,
+    encryption_options: EncryptionOptions,
+    keep_alive_in_ms: u32,
+    keep_alive_interval_in_ms: u32,
+    multi_subnet_failover: bool,
+    connect_timeout_ms: u64,
+    diagnosis: Option<&Diagnosis>,
+) -> TdsResult<(NetworkTransport, Option<Resolution>)> {
+    use crate::connection::transport::tls::network_framework_engine::Connector;
+
+    let encryption_mode = encryption_options.mode;
+    let ssl_handler = SslHandler {
+        server_host_name: transport_context.get_server_name().to_string(),
+        encryption_options,
+    };
+    // The socket path checks the TLS options once connected, in its `tls` stage,
+    // so a sequential diagnostic resolves, and can stop, before they are checked.
+    let connector = || {
+        ssl_handler
+            .tls_validation(NegotiatedEncryptionSetting::Strict)
+            .map(|(validation, host_name)| {
+                Connector::new(
+                    &ssl_handler.connect_params(&validation, host_name),
+                    keep_alive_in_ms,
+                    keep_alive_interval_in_ms,
+                )
+            })
+            .inspect_err(|e| connect_stage::record_error(&tls_stage(), e))
+    };
+
+    let (stream, resolution) = if multi_subnet_failover {
+        info!(
+            "Connecting to TCP transport with TLS (parallel/MultiSubnetFailover): {}:{}",
+            host, port
+        );
+        let connector = connector()?;
+        let (result, resolution) =
+            race_to_connect(host, port, connect_timeout_ms, true, |address| {
+                connector.connect(address)
+            })
+            .await?;
+        info!(
+            "Parallel connection succeeded to {} (tried {} addresses, {} failed)",
+            result.connected_address, result.total_addresses, result.failed_attempts
+        );
+        (result.stream, resolution)
+    } else {
+        info!(
+            "Connecting to TCP transport with TLS (sequential): {}:{}",
+            host, port
+        );
+        let (resolution, addresses) =
+            resolve_sequential(ipaddress_preference, host, port, diagnosis).await?;
+        let connector = connector()?;
+        let stream = connect_in_order_with(
+            addresses,
+            host,
+            port,
+            keep_alive_in_ms,
+            keep_alive_interval_in_ms,
+            connect_timeout_ms,
+            diagnosis,
+            true,
+            |address| connector.start(address),
+        )
+        .await?;
+        (stream, resolution)
+    };
+    // The handshake was part of the connect, so its `tcp` stage covers it.
+    tls_stage().record(connect_stage::OK, true);
+
+    info!("Creating NetworkTransport for TDS 8.0 with immediate TLS");
+    Ok((
+        NetworkTransport::new(
+            stream,
+            ssl_handler,
+            PRE_NEGOTIATED_PACKET_SIZE,
+            encryption_mode,
+            false,
+        ),
+        Some(resolution),
+    ))
+}
+
 /// SSL/TLS lifecycle callbacks for a transport.
 #[async_trait]
 pub trait TransportSslHandler {
@@ -894,6 +1092,9 @@ pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + Sync {
     fn tls_handshake_starting(&mut self);
     /// Called after TLS handshake completes.
     fn tls_handshake_completed(&mut self);
+    /// Stops protocol work before a hard drop, without flushing or TLS shutdown.
+    /// Socket-backed streams need no extra work beyond being dropped.
+    fn abort(&mut self) {}
     /// Check whether the underlying connection is dead via a non-blocking socket poll.
     /// Returns `true` if the connection is known to be dead, `false` if alive or unknown.
     fn is_connection_dead(&self) -> bool {
@@ -945,6 +1146,10 @@ impl Stream for TcpStream {
 }
 
 impl Stream for Box<dyn Stream> {
+    fn abort(&mut self) {
+        (**self).abort();
+    }
+
     fn tls_handshake_starting(&mut self) {
         (**self).tls_handshake_starting();
     }
@@ -1041,6 +1246,10 @@ impl AsyncWrite for SharedStream {
 }
 
 impl Stream for SharedStream {
+    fn abort(&mut self) {
+        self.lock().abort();
+    }
+
     /// Preserves the wrapped stream's TLS handshake transition.
     fn tls_handshake_starting(&mut self) {
         self.lock().tls_handshake_starting();
@@ -1157,6 +1366,29 @@ where
         None => None,
     };
     InterruptibleRead::Interrupted { error, boundary }
+}
+
+/// Peeks the next token type and parses it only when it is DATACLASSIFICATION.
+async fn receive_data_classification_internal(
+    transport: &mut NetworkTransport,
+    version: DataClassificationVersion,
+) -> TdsResult<Option<DataClassificationMetadata>> {
+    loop {
+        match transport.tds_read_buffer.get_buffered_slice().first() {
+            Some(&kind) if kind == TokenType::DataClassification as u8 => break,
+            Some(_) => return Ok(None),
+            None => transport.refill_for(1).await?,
+        }
+    }
+    log_received_token(
+        &TokenType::DataClassification,
+        TokenType::DataClassification as u8,
+    );
+    transport.tds_read_buffer.consume_bytes(1)?;
+    DataClassificationTokenParser
+        .parse_with_version(transport, version)
+        .await
+        .map(Some)
 }
 
 /// Mutable row-decoding state used while discarding a cancelled response.
@@ -1452,6 +1684,9 @@ impl NetworkTransport {
     }
 
     pub(crate) fn abort_transport(&mut self) {
+        if let Some(stream) = &mut self.stream {
+            stream.abort();
+        }
         self.stream = None;
         self.extractable_stream_handle = None;
         self.known_dead = true;
@@ -3096,6 +3331,82 @@ impl NetworkTransport {
         Err(*error)
     }
 
+    /// Reads a DATACLASSIFICATION token when it is the next token, leaving any
+    /// other token unread.
+    ///
+    /// SQL Server sends the token directly after the COLMETADATA it
+    /// classifies, before the first row; SqlClient's `TdsParser.TryRun`
+    /// likewise peeks for it right after COLMETADATA. `context` must carry
+    /// that metadata so an interrupted read can skip the result set's rows
+    /// while draining to DONE_ATTN. Nothing is read when the feature was not
+    /// negotiated, which leaves an unexpected token to the parser's rejection.
+    pub(crate) async fn receive_data_classification(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Option<DataClassificationMetadata>> {
+        let Some(version) = self.data_classification_version else {
+            return Ok(None);
+        };
+        self.attention_settlement = None;
+        if !cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled())
+            && self
+                .tds_read_buffer
+                .get_buffered_slice()
+                .first()
+                .is_some_and(|&kind| kind != TokenType::DataClassification as u8)
+        {
+            return Ok(None);
+        }
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let outcome = {
+            let mut read = std::pin::pin!(receive_data_classification_internal(self, version));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
+                cancel_handle,
+                attention_stream,
+                already_dead,
+            )
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
+
+        // Either way the reader stops on a token boundary: the classification
+        // is consumed whole or nothing was consumed. It is discarded with the
+        // rest of the cancelled response.
+        match completed {
+            Ok(_) => match self.wait_for_attention_ack(context, None, deadline).await {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted classification read"
+                    );
+                    self.known_dead = true;
+                }
+            },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted classification read"
+                );
+                self.known_dead = true;
+            }
+        }
+        Err(*error)
+    }
+
     pub(crate) async fn receive_row_into<W>(
         &mut self,
         context: &ParserContext,
@@ -3370,6 +3681,21 @@ impl TdsTokenStreamReader for NetworkTransport {
             .await
     }
 
+    async fn receive_data_classification(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Option<DataClassificationMetadata>> {
+        NetworkTransport::receive_data_classification(
+            self,
+            context,
+            remaining_request_timeout,
+            cancel_handle,
+        )
+        .await
+    }
+
     async fn receive_row_into(
         &mut self,
         context: &ParserContext,
@@ -3523,6 +3849,29 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Connects in order to `addresses`, as a normal connection, with
+    /// `connect`.
+    async fn connect_in_order_to<S, F>(
+        addresses: &[std::net::SocketAddr],
+        connect: impl Fn(std::net::SocketAddr) -> F,
+    ) -> crate::core::TdsResult<S>
+    where
+        F: std::future::Future<Output = Result<S, super::AttemptError>>,
+    {
+        super::connect_in_order_with(
+            addresses.to_vec(),
+            "test",
+            1433,
+            30_000,
+            1_000,
+            1_000,
+            None,
+            false,
+            |address| Ok(connect(address)),
+        )
+        .await
+    }
+
     #[tokio::test(start_paused = true)]
     async fn abort_transport_drops_the_stream_before_explicit_close() {
         use super::SharedStream;
@@ -3535,6 +3884,12 @@ pub(crate) mod tests {
         for with_extraction_handle in [false, true] {
             let (stream, mut peer) = duplex(16);
             let mut transport = build_duplex_transport(stream);
+            let events = Arc::new(Mutex::new([false; 5]));
+            let underlying = transport.stream.take().unwrap().into_inner().unwrap();
+            transport.stream = Some(SharedStream::new(Box::new(HookTrackingStream {
+                inner: underlying,
+                events: Arc::clone(&events),
+            })));
             if with_extraction_handle {
                 let underlying = transport.stream.take().unwrap().into_inner().unwrap();
                 let (handle, wrapper) = ExtractableStreamHandle::new(underlying);
@@ -3548,6 +3903,7 @@ pub(crate) mod tests {
             assert!(transport.stream.is_none());
             assert!(transport.known_dead);
             transport.close_transport().await.unwrap();
+            assert_eq!(*events.lock().unwrap(), [false, false, false, false, true]);
             let mut byte = [0];
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
@@ -3570,22 +3926,56 @@ pub(crate) mod tests {
                 .map(|port| SocketAddr::from(([192, 0, 2, 1], 1000 + port)))
                 .collect();
             let attempts = RefCell::new(Vec::new());
-            let error = super::sequential_connect_with(&addresses, 1000, |address| {
+            let error = connect_in_order_to(&addresses, |address| {
                 attempts.borrow_mut().push(address);
-                Ok(async { Err(std::io::ErrorKind::ConnectionRefused.into()) })
+                async {
+                    Err::<(), _>(super::AttemptError::Unreachable(
+                        std::io::ErrorKind::ConnectionRefused.into(),
+                    ))
+                }
             })
             .await
             .unwrap_err();
             assert_eq!(*attempts.borrow(), addresses);
-            assert_eq!(
-                error.kind(),
-                if count == 0 {
-                    std::io::ErrorKind::NotConnected
-                } else {
-                    std::io::ErrorKind::ConnectionRefused
-                }
-            );
+            let expected = if count == 0 {
+                std::io::ErrorKind::NotConnected
+            } else {
+                std::io::ErrorKind::ConnectionRefused
+            };
+            assert!(matches!(
+                error,
+                crate::error::Error::Io(error) if error.kind() == expected
+            ));
         }
+    }
+
+    #[tokio::test]
+    async fn sequential_connect_stops_at_an_address_that_rejects() {
+        use crate::error::Error;
+        use std::cell::RefCell;
+        use std::net::SocketAddr;
+
+        let addresses: Vec<_> = (0..3)
+            .map(|port| SocketAddr::from(([192, 0, 2, 1], 1000 + port)))
+            .collect();
+        let attempts = RefCell::new(Vec::new());
+        let error = connect_in_order_to(&addresses, |address| {
+            attempts.borrow_mut().push(address);
+            let first = address == addresses[0];
+            async move {
+                if first {
+                    Err::<(), _>(super::AttemptError::Unreachable(
+                        std::io::ErrorKind::ConnectionRefused.into(),
+                    ))
+                } else {
+                    Err(super::AttemptError::Rejected(Error::CertificateMismatch))
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(*attempts.borrow(), addresses[..2]);
+        assert!(matches!(error, Error::CertificateMismatch));
     }
 
     #[tokio::test]
@@ -3598,15 +3988,19 @@ pub(crate) mod tests {
         let mut addresses = vec![SocketAddr::from(([192, 0, 2, 1], 1433)); 64];
         addresses.push(live);
         let attempts = Cell::new(0);
-        let stream = super::sequential_connect_with(&addresses, 1000, |address| {
+        let stream = connect_in_order_to(&addresses, |address| {
             attempts.set(attempts.get() + 1);
-            Ok(async move {
+            async move {
                 if address == live {
-                    tokio::net::TcpStream::connect(address).await
+                    tokio::net::TcpStream::connect(address)
+                        .await
+                        .map_err(super::AttemptError::Unreachable)
                 } else {
-                    Err(std::io::ErrorKind::ConnectionRefused.into())
+                    Err(super::AttemptError::Unreachable(
+                        std::io::ErrorKind::ConnectionRefused.into(),
+                    ))
                 }
-            })
+            }
         })
         .await
         .unwrap();
@@ -3823,6 +4217,106 @@ pub(crate) mod tests {
             );
             assert_eq!(settlement.tokens.len(), 1, "only DONE_ATTN is retained");
         }
+
+        #[tokio::test]
+        async fn reads_the_classification_that_follows_colmetadata() {
+            let version = DataClassificationVersion::Version2;
+            let mut transport = transport_with(&classification_token(version));
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            let metadata = transport
+                .receive_data_classification(&int4_row_context(1), None, None)
+                .await
+                .unwrap()
+                .expect("the classification after COLMETADATA");
+            assert_eq!(metadata.version, version);
+            assert_eq!(metadata.rank, Some(SensitivityRank::NotDefined));
+
+            let next = transport
+                .receive_token(&ParserContext::None(()), None, None)
+                .await
+                .unwrap();
+            assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+        }
+
+        /// The first look refills an empty buffer; the second sees the
+        /// buffered DONE. Neither may consume it.
+        #[tokio::test]
+        async fn leaves_any_other_token_unread() {
+            let mut transport = transport_with(&[]);
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            for _ in 0..2 {
+                let classification = transport
+                    .receive_data_classification(&int4_row_context(1), None, None)
+                    .await
+                    .unwrap();
+                assert!(classification.is_none());
+            }
+            let next = transport
+                .receive_token(&ParserContext::None(()), None, None)
+                .await
+                .unwrap();
+            assert!(matches!(next, Tokens::Done(_)), "{next:?}");
+        }
+
+        /// Without the feature nothing is consumed, so the token reaches the
+        /// parser's rejection unchanged.
+        #[tokio::test]
+        async fn reads_nothing_unless_negotiated() {
+            let mut transport =
+                transport_with(&classification_token(DataClassificationVersion::Version2));
+
+            let classification = transport
+                .receive_data_classification(&int4_row_context(1), None, None)
+                .await
+                .unwrap();
+            assert!(classification.is_none());
+
+            let error = transport
+                .receive_token(&ParserContext::None(()), None, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not negotiated"), "{error}");
+        }
+
+        /// The interrupted read drains the result set's row, using the
+        /// metadata in `context`, and keeps nothing but DONE_ATTN.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancelled_classification_read_drains_to_done_attn() {
+            let version = DataClassificationVersion::Version2;
+            let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+                .continuation()
+                .append_bytes(&classification_token(version))
+                .append_bytes(&[TokenType::Row as u8, 7, 0, 0, 0])
+                .build();
+            stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, mut written) =
+                create_network_transport_with_live_peer_capturing_writes(&stream);
+            negotiate(&mut transport, &[0x02, 0x01]);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_data_classification(
+                    &int4_row_context(1),
+                    None,
+                    Some(&cancelled_handle()),
+                ),
+            )
+            .await
+            .expect("the attention drain hung");
+
+            assert!(
+                matches!(result, Err(OperationCancelledError(_))),
+                "{result:?}"
+            );
+            assert!(written.try_recv().is_ok(), "ATTENTION was not sent");
+            assert!(!is_known_dead(&transport));
+            let settlement = transport
+                .take_attention_settlement()
+                .expect("the acknowledgement must produce settlement state");
+            assert_eq!(settlement.tokens.len(), 1, "only DONE_ATTN is retained");
+        }
     }
 
     fn int4_row_context(column_count: usize) -> ParserContext {
@@ -3944,8 +4438,8 @@ pub(crate) mod tests {
     }
 
     struct HookTrackingStream {
-        inner: DuplexStream,
-        events: Arc<Mutex<[bool; 4]>>,
+        inner: Box<dyn Stream>,
+        events: Arc<Mutex<[bool; 5]>>,
     }
 
     impl AsyncRead for HookTrackingStream {
@@ -3981,6 +4475,11 @@ pub(crate) mod tests {
     }
 
     impl Stream for HookTrackingStream {
+        fn abort(&mut self) {
+            self.events.lock().unwrap()[4] = true;
+            self.inner.abort();
+        }
+
         fn tls_handshake_starting(&mut self) {
             self.events.lock().unwrap()[2] = true;
         }
@@ -3997,9 +4496,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shared_stream_forwards_hooks_and_requires_exclusive_extraction() {
         let (inner, mut peer) = duplex(MAX_BUFFER_SIZE);
-        let events = Arc::new(Mutex::new([false; 4]));
+        let events = Arc::new(Mutex::new([false; 5]));
         let mut stream = SharedStream::new(Box::new(HookTrackingStream {
-            inner,
+            inner: Box::new(inner),
             events: Arc::clone(&events),
         }));
 
@@ -4017,7 +4516,8 @@ pub(crate) mod tests {
         stream.tls_handshake_starting();
         stream.tls_handshake_completed();
         stream.shutdown().await.unwrap();
-        assert_eq!(*events.lock().unwrap(), [true; 4]);
+        stream.abort();
+        assert_eq!(*events.lock().unwrap(), [true; 5]);
 
         let outstanding = stream.clone();
         let error = stream
@@ -6963,6 +7463,36 @@ pub(crate) mod tests {
         assert!(!is_known_dead(&transport));
     }
 
+    /// The ATTENTION drain cannot step over a token it has no parser for: the
+    /// token's length is unknown, so it gives up and retires the connection
+    /// rather than look for DONE_ATTN in bytes whose boundaries it has lost.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_token_in_the_attention_drain_retires_the_connection() {
+        let mut done_more = vec![TokenType::Done as u8, DoneStatus::MORE.bits() as u8, 0];
+        done_more.extend_from_slice(&[0; 10]);
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_bytes(&done_more)
+            .append_bytes(&[0xA6, 0x02, 0x00, 0xAA, 0xBB])
+            .build();
+        stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&stream);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("the attention drain hung on an unknown token");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "{result:?}"
+        );
+        assert!(is_known_dead(&transport));
+    }
+
     /// The check must stay quiet on a healthy cancellation: a server that
     /// acknowledges keeps its connection usable. Without this, bounding the
     /// wait could just condemn every cancelled connection and still pass the
@@ -7489,6 +8019,107 @@ mod extra_connect_tests {
         assert_eq!(tcp.len(), 1 + MAX_PARALLEL_IPS, "{tcp:#?}");
         assert!(tcp.iter().all(|attempt| attempt.closed), "{tcp:#?}");
     }
+
+    /// An address that rejects the connection was reached: its `tcp` stage
+    /// succeeds, a `tls` stage records the rejection, and the addresses after
+    /// it are connected to as after one that accepts.
+    #[test]
+    fn a_rejecting_address_is_reached_and_starts_the_extra_connects() {
+        let (_extra, extra) = listener();
+        let rejecting = closed_port();
+        let log = StageLog::default();
+        let result = tracing::subscriber::with_default(log.clone(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let diagnosis = Diagnosis::new(None);
+                    let result = connect_in_order_with(
+                        vec![rejecting, extra],
+                        "test",
+                        0,
+                        30_000,
+                        1_000,
+                        5_000,
+                        Some(&diagnosis),
+                        true,
+                        |_| {
+                            Ok(async {
+                                Err::<(), _>(AttemptError::Rejected(
+                                    crate::error::Error::CertificateMismatch,
+                                ))
+                            })
+                        },
+                    )
+                    .await;
+                    diagnosis.finish_extra_connects(0).await;
+                    result
+                })
+        });
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::CertificateMismatch)
+        ));
+        let stages: Vec<_> = log.stages().iter().map(|stage| stage.name).collect();
+        assert_eq!(
+            stages,
+            [connect_stage::TCP, connect_stage::TLS, connect_stage::TCP]
+        );
+        let tcp = log.named(connect_stage::TCP);
+        assert_eq!(tcp[0].field(connect_stage::OK), Some("true"), "{tcp:#?}");
+        assert_eq!(tcp[0].field(connect_stage::ERROR), None, "{tcp:#?}");
+        assert_eq!(tcp[1].field(connect_stage::OK), Some("true"), "{tcp:#?}");
+        let tls = &log.named(connect_stage::TLS)[0];
+        assert_eq!(tls.field(connect_stage::OK), Some("false"));
+        assert!(tls.field(connect_stage::ERROR).is_some(), "{tls:#?}");
+    }
+
+    /// A connect that cannot be set up ends before the address is tried: its
+    /// `tcp` stage fails, and the addresses after it are not connected to.
+    #[test]
+    fn an_address_whose_connect_cannot_be_set_up_ends_the_connect_unreached() {
+        let (_extra, extra) = listener();
+        let log = StageLog::default();
+        let result = tracing::subscriber::with_default(log.clone(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let diagnosis = Diagnosis::new(None);
+                    let result = connect_in_order_with(
+                        vec![closed_port(), extra],
+                        "test",
+                        0,
+                        30_000,
+                        1_000,
+                        5_000,
+                        Some(&diagnosis),
+                        true,
+                        |_| {
+                            Err::<std::future::Ready<Result<(), AttemptError>>, _>(
+                                std::io::Error::other("no connection object"),
+                            )
+                        },
+                    )
+                    .await;
+                    diagnosis.finish_extra_connects(0).await;
+                    result
+                })
+        });
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::Io(e)) if e.kind() == std::io::ErrorKind::Other
+        ));
+        let tcp = log.named(connect_stage::TCP);
+        assert_eq!(tcp.len(), 1, "{tcp:#?}");
+        assert_eq!(tcp[0].field(connect_stage::OK), Some("false"), "{tcp:#?}");
+        assert!(tcp[0].field(connect_stage::ERROR).is_some(), "{tcp:#?}");
+        assert!(log.named(connect_stage::TLS).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -7702,5 +8333,360 @@ mod dns_stage_tests {
         let tcp = &log.named(connect_stage::TCP)[0];
         assert_eq!(tcp.field(connect_stage::OK), Some("false"));
         assert_eq!(tcp.field(connect_stage::SOURCE), None, "{tcp:#?}");
+    }
+
+    /// With MultiSubnetFailover, an address that rejects the connection was
+    /// reached: the `tcp` stage records it as the one connected to, and a
+    /// `tls` stage the rejection.
+    #[test]
+    fn combined_connect_deadlines_record_tls_inclusion_in_both_modes() {
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        for parallel in [false, true] {
+            let (result, log) = recording(async {
+                if parallel {
+                    race_to_connect("127.0.0.1", 1, 10, true, |_| {
+                        std::future::pending::<Result<(), AttemptError>>()
+                    })
+                    .await
+                    .map(|_| ())
+                } else {
+                    connect_in_order_with(
+                        vec![address],
+                        "127.0.0.1",
+                        1,
+                        30_000,
+                        1_000,
+                        10,
+                        None,
+                        true,
+                        |_| Ok(std::future::pending::<Result<(), AttemptError>>()),
+                    )
+                    .await
+                }
+            });
+            assert!(result.is_err());
+            let tcp = log.named(connect_stage::TCP);
+            assert_eq!(tcp.len(), 1);
+            assert_eq!(tcp[0].field(connect_stage::INCLUDES_TLS), Some("true"));
+            assert_eq!(tcp[0].field(connect_stage::TIMED_OUT), Some("true"));
+            assert_eq!(tcp[0].field(connect_stage::OK), Some("false"));
+        }
+    }
+
+    #[test]
+    fn a_rejection_in_the_race_is_recorded_on_the_tls_stage() {
+        let (result, log) = recording(race_to_connect("127.0.0.1", 1, 5_000, true, |_| async {
+            Err::<(), _>(AttemptError::Rejected(
+                crate::error::Error::CertificateMismatch,
+            ))
+        }));
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::CertificateMismatch)
+        ));
+        let stages: Vec<_> = log.stages().iter().map(|stage| stage.name).collect();
+        assert_eq!(stages, [connect_stage::TCP, connect_stage::TLS]);
+        let tcp = &log.named(connect_stage::TCP)[0];
+        assert_eq!(tcp.field(connect_stage::ADDRESS), Some("127.0.0.1"));
+        assert_eq!(
+            tcp.field(connect_stage::SOURCE),
+            Some(connect_stage::SOURCE_RESOLVER)
+        );
+        assert_eq!(tcp.field(connect_stage::OK), Some("true"));
+        assert_eq!(tcp.field(connect_stage::ERROR), None, "{tcp:#?}");
+        let tls = &log.named(connect_stage::TLS)[0];
+        assert_eq!(tls.field(connect_stage::OK), Some("false"));
+        assert!(tls.field(connect_stage::ERROR).is_some(), "{tls:#?}");
+    }
+}
+
+#[cfg(all(test, target_os = "macos", feature = "tls-network-framework"))]
+mod network_framework_stage_tests {
+    use super::*;
+    use crate::connection::connect_stage::tests::StageLog;
+    use crate::connection::transport::tls::network_framework_engine::tests::{
+        fixture, listen, refusing_address, serve, until_the_client_leaves,
+    };
+    use crate::error::Error;
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Opens a Strict transport to `address`, pinning the certificate file
+    /// `pin`, and gives the connect stages it recorded.
+    async fn connect(
+        address: SocketAddr,
+        pin: &str,
+        multi_subnet_failover: bool,
+        diagnosis: Option<&Diagnosis>,
+    ) -> (TdsResult<NetworkTransport>, StageLog) {
+        let options = EncryptionOptions {
+            server_certificate: Some(fixture(pin)),
+            ..EncryptionOptions::new()
+        };
+        connect_with(address, options, multi_subnet_failover, diagnosis).await
+    }
+
+    async fn connect_with(
+        address: SocketAddr,
+        options: EncryptionOptions,
+        multi_subnet_failover: bool,
+        diagnosis: Option<&Diagnosis>,
+    ) -> (TdsResult<NetworkTransport>, StageLog) {
+        let log = StageLog::default();
+        let _recording = tracing::subscriber::set_default(log.clone());
+        let context = TransportContext::Tcp {
+            host: address.ip().to_string(),
+            port: address.port(),
+            instance_name: None,
+        };
+        let connecting = create_transport(
+            IPAddressPreference::IPv4First,
+            TdsVersion::V8_0,
+            &context,
+            options,
+            30_000,
+            1_000,
+            multi_subnet_failover,
+            TIMEOUT.as_millis() as u64,
+            diagnosis,
+        );
+        let result = timeout(TIMEOUT, connecting)
+            .await
+            .expect("timed out")
+            .map(|(transport, _)| transport);
+        (result, log)
+    }
+
+    fn names(log: &StageLog) -> Vec<&'static str> {
+        log.stages().iter().map(|stage| stage.name).collect()
+    }
+
+    #[tokio::test]
+    async fn stalled_strict_handshakes_leave_tcp_acceptance_unconfirmed() {
+        for multi_subnet_failover in [false, true] {
+            for partial_record in [false, true] {
+                let (listener, address) = listen().await;
+                let server = tokio::spawn(async move {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    let mut hello = [0; 4096];
+                    assert!(peer.read(&mut hello).await.unwrap() > 0);
+                    if partial_record {
+                        peer.write_all(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x02])
+                            .await
+                            .unwrap();
+                    }
+                    let ended = timeout(Duration::from_secs(5), peer.read_to_end(&mut Vec::new()))
+                        .await
+                        .expect("timed-out attempt must release the connection");
+                    assert!(
+                        ended.is_ok()
+                            || ended.as_ref().is_err_and(|e| {
+                                matches!(
+                                    e.kind(),
+                                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                                )
+                            }),
+                        "{ended:?}"
+                    );
+                });
+                let log = StageLog::default();
+                let _recording = tracing::subscriber::set_default(log.clone());
+                let context = TransportContext::Tcp {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                    instance_name: None,
+                };
+                let diagnosis = Diagnosis::new(Some(DiagnosticStop::Transport));
+                let started = std::time::Instant::now();
+                let result = timeout(
+                    Duration::from_secs(5),
+                    create_transport(
+                        IPAddressPreference::IPv4First,
+                        TdsVersion::V8_0,
+                        &context,
+                        EncryptionOptions::new(),
+                        30_000,
+                        1_000,
+                        multi_subnet_failover,
+                        250,
+                        Some(&diagnosis),
+                    ),
+                )
+                .await
+                .expect("the connect deadline must bound the stalled handshake");
+                match result {
+                    Err(Error::TimeoutError(_)) => {}
+                    Err(Error::Io(error)) => assert_eq!(error.kind(), ErrorKind::TimedOut),
+                    Err(error) => panic!("expected the connect deadline, got {error:?}"),
+                    Ok(_) => panic!("a stalled handshake must not succeed"),
+                }
+                assert!(started.elapsed() >= Duration::from_millis(250));
+                let tcp = log.named(connect_stage::TCP);
+                assert_eq!(tcp.len(), 1);
+                assert_eq!(tcp[0].field(connect_stage::INCLUDES_TLS), Some("true"));
+                assert_eq!(tcp[0].field(connect_stage::OK), Some("false"));
+                assert!(log.named(connect_stage::TLS).is_empty());
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tls_stage_follows_the_tcp_stage_that_covered_the_handshake() {
+        for multi_subnet_failover in [false, true] {
+            let (listener, address) = listen().await;
+            let server = serve(listener, until_the_client_leaves);
+
+            let (result, log) =
+                connect(address, "valid_cert.pem", multi_subnet_failover, None).await;
+
+            drop(result.expect("connects"));
+            let expected = if multi_subnet_failover {
+                vec![connect_stage::TCP, connect_stage::TLS]
+            } else {
+                vec![connect_stage::DNS, connect_stage::TCP, connect_stage::TLS]
+            };
+            assert_eq!(names(&log), expected);
+            let tcp = &log.named(connect_stage::TCP)[0];
+            assert_eq!(tcp.field(connect_stage::ADDRESS), Some("127.0.0.1"));
+            assert_eq!(tcp.field(connect_stage::OK), Some("true"));
+            let tls = &log.named(connect_stage::TLS)[0];
+            assert_eq!(tls.field(connect_stage::OK), Some("true"));
+            assert!(log.stages().iter().all(|stage| stage.closed));
+            timeout(TIMEOUT, server).await.unwrap().unwrap();
+        }
+    }
+
+    /// A server that fails the handshake was reached, so its `tcp` stage
+    /// succeeds and the `tls` stage records the failure.
+    #[tokio::test]
+    async fn a_failed_handshake_is_recorded_on_the_tls_stage() {
+        for multi_subnet_failover in [false, true] {
+            let (listener, address) = listen().await;
+            let server = serve(listener, until_the_client_leaves);
+
+            let (result, log) = connect(
+                address,
+                "no_such_certificate.pem",
+                multi_subnet_failover,
+                None,
+            )
+            .await;
+
+            let Err(error) = result else {
+                panic!("the pin file is missing");
+            };
+            assert!(
+                matches!(error, Error::CertificateNotFound { .. }),
+                "{error:?}"
+            );
+            let tcp = log.named(connect_stage::TCP);
+            assert_eq!(tcp.len(), 1, "{tcp:#?}");
+            assert_eq!(tcp[0].field(connect_stage::ADDRESS), Some("127.0.0.1"));
+            assert_eq!(tcp[0].field(connect_stage::OK), Some("true"));
+            assert_eq!(tcp[0].field(connect_stage::ERROR), None);
+            let tls = log.named(connect_stage::TLS);
+            assert_eq!(tls.len(), 1, "{tls:#?}");
+            assert_eq!(tls[0].field(connect_stage::OK), Some("false"));
+            assert!(tls[0].field(connect_stage::ERROR).is_some(), "{tls:#?}");
+            timeout(TIMEOUT, server).await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_records_no_tls_stage() {
+        for multi_subnet_failover in [false, true] {
+            let address = refusing_address().await;
+
+            let (result, log) =
+                connect(address, "valid_cert.pem", multi_subnet_failover, None).await;
+
+            assert!(result.is_err(), "nothing listens on {address}");
+            let tcp = log.named(connect_stage::TCP);
+            assert_eq!(tcp.len(), 1, "{tcp:#?}");
+            assert_eq!(tcp[0].field(connect_stage::OK), Some("false"));
+            assert!(log.named(connect_stage::TLS).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_diagnostic_connect_stops_after_resolution_before_connecting() {
+        let diagnosis = Diagnosis::new(Some(DiagnosticStop::Resolution));
+
+        let (result, log) = connect(
+            refusing_address().await,
+            "valid_cert.pem",
+            false,
+            Some(&diagnosis),
+        )
+        .await;
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert_eq!(names(&log), [connect_stage::DNS]);
+        assert_eq!(
+            log.named(connect_stage::DNS)[0].field(connect_stage::OK),
+            Some("true")
+        );
+    }
+
+    /// Options the socket path rejects in its `tls` stage, once connected.
+    fn contradictory_tls_options() -> EncryptionOptions {
+        EncryptionOptions {
+            server_certificate: Some(fixture("valid_cert.pem")),
+            host_name_in_cert: Some("sql.example.com".to_string()),
+            ..EncryptionOptions::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_diagnostic_connect_stops_after_resolution_before_checking_the_tls_options() {
+        let diagnosis = Diagnosis::new(Some(DiagnosticStop::Resolution));
+
+        let (result, log) = connect_with(
+            refusing_address().await,
+            contradictory_tls_options(),
+            false,
+            Some(&diagnosis),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(names(&log), [connect_stage::DNS]);
+    }
+
+    #[tokio::test]
+    async fn contradictory_tls_options_fail_the_tls_stage_without_connecting() {
+        for multi_subnet_failover in [false, true] {
+            let (result, log) = connect_with(
+                refusing_address().await,
+                contradictory_tls_options(),
+                multi_subnet_failover,
+                None,
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(Error::UsageError(_))),
+                "{:?}",
+                result.as_ref().err()
+            );
+            let expected = if multi_subnet_failover {
+                vec![connect_stage::TLS]
+            } else {
+                vec![connect_stage::DNS, connect_stage::TLS]
+            };
+            assert_eq!(names(&log), expected);
+            let tls = &log.named(connect_stage::TLS)[0];
+            assert_eq!(tls.field(connect_stage::OK), Some("false"));
+            assert!(tls.field(connect_stage::ERROR).is_some(), "{tls:#?}");
+        }
     }
 }
