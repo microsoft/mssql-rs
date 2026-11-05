@@ -33,9 +33,11 @@ body:
         - mssql-js
         - mssql-py-core
         - mssql-tds-cli
+        - mssql-sqlcmd
         - mssql-mock-tds
         - mssql-mock-tds-py
         - mssql-tds-bench
+        - mssql-odbc-bench
         - Not applicable / Multiple
     validations:
       required: false

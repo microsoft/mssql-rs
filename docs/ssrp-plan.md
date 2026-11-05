@@ -1,5 +1,10 @@
 # Plan: SQL Browser Support in mssql-rs
 
+Historical implementation plan, not a current feature checklist. SQL Browser
+instance resolution is implemented; proposed milestones below do not establish
+which follow-ups shipped. See the [connection behavior guide](../mssql-tds/docs/connection-behavior.md)
+for current connection policy.
+
 ## TL;DR
 
 Implement SQL Server Browser (SSRP) support in `mssql-rs` so that connections using `server\instance` format resolve the TCP port via the SQL Browser service on UDP port 1434. The architecture in mssql-rs already has action chain plumbing (`QuerySsrp`, `CheckCache`, `UpdateCache`, `ConnectTcpFromSlot`) and stub functions in `ssrp.rs` — the work is to implement the UDP protocol with sender IP validation, wire it into the connection provider, add a process-lifetime instance cache, support configurable timeouts, and implement DAC port resolution.

@@ -3,6 +3,14 @@
 Detailed behavior for SDK and driver authors using
 [`mssql-tds`](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/README.md).
 
+## Encryption defaults
+
+`ClientContext::default()` selects `EncryptionSetting::Strict` (TDS 8.0).
+The server must support that protocol, and its certificate must be trusted and
+match the expected hostname. `TrustServerCertificate` does not bypass validation
+in Strict mode. For TDS 7.4 with encrypted query traffic, set
+`context.encryption_options.mode = EncryptionSetting::On` before connecting.
+
 ## Connection policy and migration
 
 Eligible TCP connections default to MultiSubnetFailover (MSF): attempt all
@@ -210,6 +218,20 @@ This keeps transport attempts, TLS/login, and client construction out of the
 caller's future, leaving room for the Driver Manager and native TLS on small
 application stacks. The connection is still polled on the calling thread with
 the same cancellation and login deadline; no worker-thread handoff is introduced.
+
+## Float16 vector conversion
+
+`SqlVector::try_from_f16` retains `f32` values until serialization narrows each
+element using `half::f16`. Reads widen binary16 values to `f32`. Conversion uses
+round-to-nearest, ties-to-even: magnitudes at or below `2^-25` become signed zero,
+and magnitudes of `65520.0` or more become infinity without an error. Values
+between `65504.0` and `65520.0`, such as `65505.0f32`, round to `65504.0`.
+Applications that require range checks must perform them before building the
+vector; these conversions do not imply that SQL Server accepts non-finite
+elements.
+
+Contributor test setup is in the
+[float16 integration test guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/tests/TRANSPORT_TESTS_README.md#float16-vector-integration-tests).
 
 ## SQL string decoding
 

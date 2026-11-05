@@ -168,9 +168,10 @@ pointer is non-NULL.
 
 ## Build from source
 
-Install the repository's pinned Rust toolchain. Linux and macOS builds also
-need unixODBC development headers; the C++ end-to-end tests additionally need
-CMake and a C++17 compiler.
+Install the repository's pinned Rust toolchain and a native linker. Linux
+builds need OpenSSL development libraries and `pkg-config` (for example,
+`libssl-dev` and `pkg-config` on Debian/Ubuntu). The C++ end-to-end tests also
+need unixODBC development headers on Linux/macOS, CMake, and a C++17 compiler.
 
 Default-feature macOS builds require macOS 10.15 or later (11.0 or later on
 Apple Silicon). Set `MACOSX_DEPLOYMENT_TARGET=10.15` or later for x86_64 builds

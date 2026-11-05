@@ -22,27 +22,38 @@
 //! | `gssapi` | via `integrated-auth` | Unix GSSAPI (Kerberos) via runtime `dlopen` |
 //! | `tls-schannel-direct-on-windows` | **yes** | Enables `tls-schannel-direct` |
 //! | `tls-schannel-direct` | via `tls-schannel-direct-on-windows` | Windows: TLS through the in-tree Schannel engine instead of `native-tls`. No effect on other targets. |
+//! | `tls-network-framework-on-macos` | **yes** | Enables `tls-network-framework` |
+//! | `tls-network-framework` | via `tls-network-framework-on-macos` | macOS: Network.framework for Strict TCP connections, including TLS 1.3. No effect on other targets. |
 //!
-//! Disable the defaults to drop platform-specific auth dependencies and use
+//! The Network.framework feature requires a macOS deployment target of 10.15 or
+//! later. For x86_64 macOS builds, set `MACOSX_DEPLOYMENT_TARGET=10.15` or later
+//! for the entire build. See the
+//! [connection behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#tls-on-macos).
+//!
+//! Disable the defaults to omit built-in integrated authentication and use
 //! `native-tls` on every platform:
 //!
 //! ```toml
-//! mssql-tds = { version = "0.3", default-features = false }
+//! mssql-tds = { version = "0.4", default-features = false }
 //! ```
 //!
 //! # Quick start
+//!
+//! Set `DB_USER` and `DB_PASSWORD`. The default Strict encryption mode requires
+//! a TDS-8-capable server and a trusted certificate matching the hostname.
+//! For TDS 7.4, set `context.encryption_options.mode` to
+//! [`core::EncryptionSetting::On`] before connecting.
 //!
 //! ```rust,no_run
 //! use mssql_tds::connection::client_context::ClientContext;
 //! use mssql_tds::connection::tds_client::ResultSet;
 //! use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
-//! use mssql_tds::core::TdsResult;
 //!
 //! #[tokio::main]
-//! async fn main() -> TdsResult<()> {
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let mut context = ClientContext::default();
-//!     context.user_name = std::env::var("DB_USER").unwrap_or("<user>".into());
-//!     context.password = std::env::var("DB_PASSWORD").unwrap_or("<password>".into());
+//!     context.user_name = std::env::var("DB_USER")?;
+//!     context.password = std::env::var("DB_PASSWORD")?;
 //!     context.database = "master".into();
 //!
 //!     let provider = TdsConnectionProvider {};

@@ -1,5 +1,11 @@
 # Flexible Query Execution Implementation
 
+Historical implementation snapshot, not a current API reference or release
+roadmap. The definitions and future-work list below describe the original
+change. For current types, examples, and limitations, see the
+[README](https://github.com/microsoft/mssql-rs/blob/main/mssql-mock-tds/README.md)
+and [API reference](https://docs.rs/mssql-mock-tds).
+
 ## Overview
 
 The mock TDS server has been refactored to support flexible query execution, allowing users to define custom queries with their expected column definitions and row data. This replaces the previous hardcoded approach where only `SELECT 1` was supported.

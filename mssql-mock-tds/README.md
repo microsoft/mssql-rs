@@ -71,7 +71,7 @@ Add these dependencies:
 
 ```toml
 [dependencies]
-mssql-mock-tds = "0.3"
+mssql-mock-tds = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -126,7 +126,7 @@ represents an empty value.
 
 ### Testing with TdsClient and controlled shutdown
 
-For this example, also add `mssql-tds = "0.3"` under `[dev-dependencies]` and
+For this example, also add `mssql-tds = "0.4"` under `[dev-dependencies]` and
 place the test in your project's `tests/` directory. It uses the default
 `SELECT 1` response and an unencrypted loopback connection:
 

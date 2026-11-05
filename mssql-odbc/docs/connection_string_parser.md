@@ -155,6 +155,7 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `Trusted_Connection` | integrated auth | `Yes` / `No` |
 | `Encrypt` | `EncryptionOptions::mode` | `Yes` / `Mandatory` / `No` / `Optional` / `Strict` |
 | `TrustServerCertificate` | `EncryptionOptions::trust_server_certificate` | `Yes` / `No` |
+| `LongAsMax` | parameter declaration policy | `Yes` selects MAX types for LONG bindings; other values select legacy types |
 | `HostnameInCertificate` | `EncryptionOptions::host_name_in_cert` | verbatim |
 | `ServerCertificate` | `EncryptionOptions::server_certificate` (path) | verbatim path |
 | `ServerSPN` | `ClientContext::server_spn` | verbatim |
@@ -168,7 +169,7 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer 1–60 seconds (rejected if out of range) |
 | `KeepAlive` | `ClientContext::keep_alive_in_ms` (×1000) | integer, seconds (saturating) |
 | `KeepAliveInterval` | `ClientContext::keep_alive_interval_in_ms` (×1000) | integer, seconds (saturating) |
-| `PacketSize` | `ClientContext::packet_size` (u16) | integer bytes, clamped to 512–32768 |
+| `PacketSize` | `ClientContext::packet_size` (u16) | nonzero bytes clamped to 512–32768; `0` leaves the protocol default |
 
 This mirrors the canonical keyword set that mssql-python normalizes to before it
 hands the string to the driver, so a mssql-python application can target mssql-odbc
@@ -192,9 +193,11 @@ Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
   `KeepAliveInterval`, `PacketSize`): a non-negative integer; a non-numeric or negative
   value is a hard error (`E_FAIL`). Range handling then differs per key, matching
   msodbcsql: `ConnectRetryCount` (0–255) and `ConnectRetryInterval` (1–60) are
-  **range-validated at parse time and rejected** when out of range, while `PacketSize`
-  is **clamped** to 512–32768 (the range mssql-tds accepts) when mapped onto the
-  `ClientContext` (`apply_connection_params` in `driver_connect.rs`).
+  **range-validated at parse time and rejected** when out of range, while nonzero
+  `PacketSize` is **clamped** to 512–32768 when mapped onto the `ClientContext`
+  (`apply_connection_params` in `driver_connect.rs`). `PacketSize=0` is the
+  unspecified sentinel: ODBC getters retain `0`, while the protocol client uses
+  its default.
   `KeepAlive`/`KeepAliveInterval` saturate on the ×1000 seconds→ms conversion.
 - **`Authentication`**: delegated to `is_recognized_keyword`
   (`odbc_supported_auth_keywords.rs`) so the accept/reject set never drifts from

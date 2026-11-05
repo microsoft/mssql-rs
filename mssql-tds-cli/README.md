@@ -1,54 +1,46 @@
 # mssql-tds-cli
 
-A command-line interface (CLI) tool for interacting with Microsoft SQL Server using the [mssql-tds](../mssql-tds) crate.
+An interactive development demo for the
+[`mssql-tds`](https://github.com/microsoft/mssql-rs/tree/main/mssql-tds)
+crate, not a replacement for sqlcmd. This crate is not published.
 
-## Overview
+## Prerequisites
 
-`mssql-tds-cli` is a demonstration CLI built on top of the `mssql-tds` Rust crate, which provides a native implementation of the Tabular Data Stream (TDS) protocol. This tool allows you to connect to SQL Server instances, execute queries, and interact with databases directly from your terminal.
+The demo's connection settings are fixed in `src/main.rs`:
 
-## Features
+- SQL Server at `tcp:localhost,1433`, with login `sa` and database `master`.
+- The password read from `/tmp/password`, with surrounding whitespace trimmed.
+  The file must exist before startup.
+- Encryption enabled, with server-certificate validation bypassed. Use only
+  against a local test server.
 
-- Connect to Microsoft SQL Server using the TDS protocol
-- Execute T-SQL queries and scripts
-- View query results in the terminal
-- Demonstrates the capabilities and usage of the `mssql-tds` library
+There are no command-line options for changing the server or credentials.
 
 ## Usage
 
-```
-cargo run --bin mssql-tds-cli -- --config-file-path <PATH_TO_CONFIG>
+From the repository root:
+
+```sh
+cargo run -p mssql-tds-cli
 ```
 
-Or, if installed:
-
-```
-mssql-tds-cli --config-file-path <PATH_TO_CONFIG>
-```
+Enter a complete T-SQL batch on one line. The demo prints results using Rust
+debug formatting. Type `exit`, send EOF, or press Ctrl+C to quit.
 
 ### Options
 
-- `--config-file-path <PATH>`: Path to a configuration file (required)
+| Option | Behavior |
+|---|---|
+| `--multi-subnet-failover <true\|false>` | Override the client's multi-subnet failover setting; `false` disables parallel TCP connection attempts. |
+| `-c, --config-file-path <PATH>` | Accepted but unused; no configuration file is read. |
+| `-h, --help` | Show help. |
+| `-V, --version` | Show version. |
 
-**Note:**
-Currently, all connection details (host, port, user, password, database, etc.) are hardcoded in the CLI source code. The only configurable option via the command line is the path to a configuration file. You may extend the CLI to support more options as needed.
+For example, to disable parallel TCP connection attempts:
 
-## Example
-
+```sh
+cargo run -p mssql-tds-cli -- --multi-subnet-failover false
 ```
-cargo run --bin mssql-tds-cli -- --config-file-path ./config.toml
-```
-
-## Why use this CLI?
-
-- To test and debug the `mssql-tds` protocol implementation
-- As a reference for building your own TDS-based tools in Rust
-- For quick, scriptable access to SQL Server from the command line (with future enhancements)
-
-## Project Structure
-
-- `src/`: CLI source code
-- `Cargo.toml`: Crate manifest
-- Depends on: [`mssql-tds`](../mssql-tds)
 
 ## License
 
