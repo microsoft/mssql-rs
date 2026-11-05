@@ -1602,7 +1602,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             let exec = || unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             };
             assert_eq!(SQL_SUCCESS, exec());
             assert_eq!(

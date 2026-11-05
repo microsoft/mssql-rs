@@ -130,6 +130,9 @@ pub struct ConnectionProcessor {
     query_registry: Arc<Mutex<QueryRegistry>>,
     /// Packet buffer for this connection
     buffer: BytesMut,
+    /// The first header and the bodies so far of a `SqlBatch` awaiting its
+    /// EOM packet
+    pending_batch: BytesMut,
     /// Optional redirection configuration
     redirection: Option<RedirectionConfig>,
     /// Shared store used to record connection state as soon as it is known
@@ -178,6 +181,7 @@ impl ConnectionProcessor {
             awaiting_fedauth_token: false,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
+            pending_batch: BytesMut::new(),
             redirection,
             connection_store,
             transaction_descriptor_headers: Vec::new(),
@@ -395,34 +399,67 @@ impl ConnectionProcessor {
     where
         S: AsyncRead + Unpin + Send,
     {
-        if self.buffer.len() < PACKET_HEADER_SIZE {
-            return Ok(None);
-        }
-
-        // Parse packet header
-        let header = {
-            let mut buf_clone = self.buffer.clone();
-            match PacketHeader::parse(&mut buf_clone) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!("Failed to parse packet header: {}", e);
-                    return Ok(None);
-                }
+        let (header, packet_data) = loop {
+            if self.buffer.len() < PACKET_HEADER_SIZE {
+                return Ok(None);
             }
+
+            let header = {
+                let mut buf_clone = self.buffer.clone();
+                match PacketHeader::parse(&mut buf_clone) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("Failed to parse packet header: {}", e);
+                        return Ok(None);
+                    }
+                }
+            };
+
+            if self.buffer.len() < header.length as usize {
+                debug!(
+                    "Incomplete packet: have {} bytes, need {}",
+                    self.buffer.len(),
+                    header.length
+                );
+                return Ok(None);
+            }
+
+            let packet_data = self.buffer.split_to(header.length as usize);
+
+            // A batch larger than the packet size spans several packets, and
+            // only the last carries EOM. Answer once, for the whole batch.
+            if header.packet_type == PacketType::SqlBatch {
+                if header.status.is_ignore() {
+                    // MS-TDS 2.2.1.7: the server discards a withdrawn batch
+                    // and answers with a single DONE carrying DONE_ERROR.
+                    self.pending_batch.clear();
+                    let done = crate::protocol::build_done_token_with_status(0x0002, 0); // DONE_ERROR
+                    let total_length = (PACKET_HEADER_SIZE + done.len()) as u16;
+                    let mut packet = BytesMut::with_capacity(total_length as usize);
+                    PacketHeader::new(PacketType::TabularResult, total_length, 1)
+                        .write(&mut packet);
+                    packet.extend_from_slice(&done);
+                    return Ok(Some(packet));
+                }
+                if !header.status.is_end_of_message() {
+                    if self.pending_batch.is_empty() {
+                        self.pending_batch.extend_from_slice(&packet_data);
+                    } else {
+                        self.pending_batch
+                            .extend_from_slice(&packet_data[PACKET_HEADER_SIZE..]);
+                    }
+                    continue;
+                }
+                if !self.pending_batch.is_empty() {
+                    let mut batch = std::mem::take(&mut self.pending_batch);
+                    batch.extend_from_slice(&packet_data[PACKET_HEADER_SIZE..]);
+                    break (header, batch);
+                }
+            } else {
+                self.pending_batch.clear();
+            }
+            break (header, packet_data);
         };
-
-        // Check if we have the full packet
-        if self.buffer.len() < header.length as usize {
-            debug!(
-                "Incomplete packet: have {} bytes, need {}",
-                self.buffer.len(),
-                header.length
-            );
-            return Ok(None);
-        }
-
-        // Extract the complete packet
-        let packet_data = self.buffer.split_to(header.length as usize);
 
         // Process the packet and build response
         let response = match header.packet_type {
@@ -1782,5 +1819,84 @@ mod tests {
             .expect("mock server should bind to an ephemeral localhost port");
         let addr = server.local_addr();
         assert!(addr.port() > 0);
+    }
+
+    fn packet(packet_type: PacketType, status: u8, body: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(PACKET_HEADER_SIZE + body.len()).unwrap();
+        let mut packet = vec![packet_type as u8, status];
+        packet.extend_from_slice(&length.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 1, 0]);
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    /// An ALL_HEADERS section with no headers, then `sql` as UTF-16LE.
+    fn batch_body(sql: &str) -> Vec<u8> {
+        let mut body = 4u32.to_le_bytes().to_vec();
+        body.extend(sql.encode_utf16().flat_map(u16::to_le_bytes));
+        body
+    }
+
+    /// The reply's first token type and, for a DONE, its status.
+    async fn first_token_of_reply(
+        processor: &mut ConnectionProcessor,
+        packets: &[Vec<u8>],
+    ) -> (u8, u16) {
+        for packet in packets {
+            processor.buffer_mut().extend_from_slice(packet);
+        }
+        let reply = processor
+            .process_packet(&mut tokio::io::empty())
+            .await
+            .unwrap()
+            .expect("a complete message is answered");
+        assert!(processor.pending_batch.is_empty());
+        let token = &reply[PACKET_HEADER_SIZE..];
+        (token[0], u16::from_le_bytes([token[1], token[2]]))
+    }
+
+    #[tokio::test]
+    async fn abandoned_partial_batch_does_not_prefix_the_next_batch() {
+        const COLMETADATA: u8 = 0x81;
+        const DONE: u8 = 0xFD;
+        const DONE_ERROR: u16 = 0x0002;
+        const DONE_ATTN: u16 = 0x0020;
+
+        let registry = Arc::new(Mutex::new(QueryRegistry::new()));
+        registry.lock().await.register(
+            "SELECT 1",
+            crate::query_response::QueryResponse::select_one(),
+        );
+        let mut processor =
+            ConnectionProcessor::new(0, "127.0.0.1:1".parse().unwrap(), registry, None);
+        processor.is_authenticated = true;
+        let select_one = packet(PacketType::SqlBatch, 0x01, &batch_body("SELECT 1"));
+
+        // EOM | IGNORE withdraws the message: the server discards it rather
+        // than running what was sent, and answers with DONE_ERROR (MS-TDS 2.2.1.7).
+        let withdrawn = packet(PacketType::SqlBatch, 0x00, &batch_body("SELECT 1"));
+        let ignore = packet(PacketType::SqlBatch, 0x03, &[]);
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[withdrawn, ignore]).await,
+            (DONE, DONE_ERROR)
+        );
+        assert_eq!(
+            first_token_of_reply(&mut processor, std::slice::from_ref(&select_one))
+                .await
+                .0,
+            COLMETADATA
+        );
+
+        // A different message type abandons the partial batch.
+        let partial = packet(PacketType::SqlBatch, 0x00, &batch_body("SELECT 2 /*"));
+        let attention = packet(PacketType::Attention, 0x01, &[]);
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[partial, attention]).await,
+            (DONE, DONE_ATTN)
+        );
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[select_one]).await.0,
+            COLMETADATA
+        );
     }
 }

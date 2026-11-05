@@ -78,8 +78,8 @@ use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::{DescHandle, DescHeader, DescKind};
 use crate::handles::stmt::{
-    InertStmtAttrs, STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
-    VendorStmtAttrs,
+    InertStmtAttrs, STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS,
+    StatementDescriptor as HeaderOwner, VendorStmtAttrs,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -303,6 +303,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             drop(state);
             let (rc, stored) = set_desc_header(
                 stmt,
+                HeaderOwner::Ard,
                 ard,
                 HeaderField::ArraySize,
                 value_ptr,
@@ -326,6 +327,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             drop(state);
             set_desc_header(
                 stmt,
+                HeaderOwner::Apd,
                 apd,
                 HeaderField::ArraySize,
                 value_ptr,
@@ -346,6 +348,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             drop(state);
             set_desc_header(
                 stmt,
+                HeaderOwner::Ard,
                 ard,
                 HeaderField::RowsetSize,
                 value_ptr,
@@ -375,7 +378,7 @@ unsafe fn sql_set_stmt_attr_w_safe(
             };
             let raw = owner.resolve(&state, stmt);
             drop(state);
-            set_desc_header(stmt, raw, field, value_ptr, ArraySizeClamp::None).0
+            set_desc_header(stmt, owner, raw, field, value_ptr, ArraySizeClamp::None).0
         }
         SQL_ATTR_CURSOR_TYPE => {
             // The driver is forward-only. Accept SQL_CURSOR_FORWARD_ONLY as-is;
@@ -764,29 +767,6 @@ enum ArraySizeClamp {
     None,
 }
 
-/// The statement's descriptor a header alias lives on: the effective ARD/APD,
-/// or the statement's own IRD/IPD.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeaderOwner {
-    Ard,
-    Apd,
-    Ird,
-    Ipd,
-}
-
-impl HeaderOwner {
-    /// Resolved under the caller's STMT lock, which must be dropped before the
-    /// handle is dereferenced (§7.1).
-    fn resolve(self, state: &StmtState, stmt: &StmtHandle) -> SqlHandle {
-        match self {
-            HeaderOwner::Ard => state.effective_ard(stmt),
-            HeaderOwner::Apd => state.effective_apd(stmt),
-            HeaderOwner::Ird => stmt.ird,
-            HeaderOwner::Ipd => stmt.ipd,
-        }
-    }
-}
-
 /// A `DescHeader` field reachable through a statement attribute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeaderField {
@@ -861,11 +841,12 @@ fn header_alias(attribute: SqlInteger) -> Option<(HeaderOwner, HeaderField)> {
 /// the clamp rule that belongs to the attribute spelling the caller used.
 ///
 /// `raw` is resolved under the STMT lock by the caller and that lock is dropped
-/// before this runs, so the handle is re-checked for liveness here.
+/// before this runs; explicit associations are re-resolved under their parent.
 /// Returns the status and the size actually stored (size fields only), so the
 /// caller can trace it without recomputing the clamp.
 fn set_desc_header(
     stmt: &StmtHandle,
+    owner: HeaderOwner,
     raw: SqlHandle,
     field: HeaderField,
     value_ptr: SqlPointer,
@@ -875,13 +856,12 @@ fn set_desc_header(
         ArraySizeClamp::ToI32Max => clamp_array_size(value_ptr as SqlULen),
         ArraySizeClamp::None => (value_ptr as SqlULen, false),
     };
-    if !stmt.owns_implicit_desc(raw) && crate::handles::live_type(raw) != Some(HandleType::Desc) {
+    let Ok(desc) = stmt.access_descriptor(owner, raw) else {
         return (
-            desc_header_error(stmt, "descriptor was freed concurrently"),
+            desc_header_error(stmt, "failed to access descriptor"),
             stored,
         );
-    }
-    let desc = unsafe { handle_from_raw::<DescHandle>(raw) };
+    };
     // `SQLSetDescFieldW` refuses this exact write while any statement on the
     // connection is fetching through this descriptor as its effective ARD or
     // executing through it as its effective APD
@@ -939,6 +919,7 @@ fn set_desc_header(
     // Released before the STMT lock below: the crate's locking rule forbids
     // nesting these in either order (`free_desc` already walks DBC->STMT).
     drop(desc_state);
+    drop(desc);
     if clamped {
         // Posted on the statement, not the descriptor: the application called
         // `SQLSetStmtAttrW`, so that is the handle it reads diagnostics from.
@@ -1122,7 +1103,7 @@ unsafe fn sql_get_stmt_attr_w_safe(
     if let Some((owner, field)) = header_alias(attribute) {
         let raw = owner.resolve(&state, stmt);
         drop(state);
-        return unsafe { get_desc_header(stmt, raw, field, value_ptr, string_length_ptr) };
+        return unsafe { get_desc_header(stmt, owner, raw, field, value_ptr, string_length_ptr) };
     }
 
     // Every attribute reported here is a pointer-sized integer or pointer,
@@ -1253,25 +1234,24 @@ unsafe fn sql_get_stmt_attr_w_safe(
 /// `value_ptr`, when non-null, must be writable for one `SqlULen`, and
 /// `string_length_ptr`, when non-null, for one `SqlInteger` — the same
 /// contract `SQLGetStmtAttrW` places on every integer-valued attribute.
-/// `raw` must be null or a descriptor handle resolved from `stmt`; it is
-/// re-checked for liveness before being dereferenced.
+/// `raw` is the descriptor resolved from `stmt` before releasing its lock.
 unsafe fn get_desc_header(
     stmt: &StmtHandle,
+    owner: HeaderOwner,
     raw: SqlHandle,
     field: HeaderField,
     value_ptr: SqlPointer,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    if !stmt.owns_implicit_desc(raw) && crate::handles::live_type(raw) != Some(HandleType::Desc) {
-        return desc_header_error(stmt, "descriptor was freed concurrently");
-    }
-    let desc = unsafe { handle_from_raw::<DescHandle>(raw) };
     // Copied out before the writes below: `write_if_some` dereferences
     // application-supplied pointers, which can fault a page in, and holding
     // the DESC guard across that would block every sibling statement sharing
     // an explicit descriptor for no benefit. Matches `set_desc_header`, which
     // drops its guard before touching anything else.
     let value = {
+        let Ok(desc) = stmt.access_descriptor(owner, raw) else {
+            return desc_header_error(stmt, "failed to access descriptor");
+        };
         let Ok(desc_state) = desc.inner.lock() else {
             return desc_header_error(stmt, "descriptor mutex poisoned");
         };

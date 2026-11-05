@@ -81,6 +81,11 @@ impl PacketStatus {
     pub fn is_end_of_message(&self) -> bool {
         self.0 & 0x01 != 0
     }
+
+    /// Set with EOM when a client withdraws a partly sent message.
+    pub fn is_ignore(&self) -> bool {
+        self.0 & 0x02 != 0
+    }
 }
 
 /// TDS Packet Header
@@ -760,7 +765,7 @@ pub fn build_login_ack() -> BytesMut {
 /// row count. The lower-level primitive behind [`build_done_token`] (which
 /// always passes `DONE_FINAL`) and [`build_attention_ack_packet`] (which needs
 /// `DONE_ATTN` instead).
-fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
+pub(crate) fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
     let mut token_data = BytesMut::new();
 
     // DONE token (0xFD)

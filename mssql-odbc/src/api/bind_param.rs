@@ -20,6 +20,7 @@ use crate::api::type_rules::{
     parameter_column_size_is_valid, resolve_default_c_type,
 };
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::StatementDescriptor;
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 use crate::params::BoundParam;
 use crate::params::conversion_matrix::is_supported_conversion;
@@ -641,16 +642,7 @@ fn bind_param_records(
     parameter_number: SqlUSmallInt,
     bound: BoundParam,
 ) -> Result<bool, ()> {
-    // `apd` can be an explicit descriptor `effective_apd` resolved under the
-    // STMT lock, already dropped by the time this runs — re-check liveness
-    // right before dereferencing to narrow (not fully close) the race against
-    // a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor.
-    // The statement's own implicit APD and IPD are freed only with the
-    // statement itself, so they need no equivalent check.
-    if !stmt.owns_implicit_desc(apd) && crate::handles::live_type(apd) != Some(HandleType::Desc) {
-        return Err(());
-    }
-    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let apd_desc = stmt.access_descriptor(StatementDescriptor::Apd, apd)?;
     let Ok(mut apd_state) = apd_desc.inner.lock() else {
         return Err(());
     };
@@ -718,8 +710,9 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
     // afterwards (`SQLSetDescField`/`SQLSetDescRec`, no matching IPD write)
     // would otherwise pick the old type, direction and size back up at the
     // next execute. `stmt.ipd` is never reassociated or independently freed
-    // (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so this needs no liveness
-    // recheck the way the APD's resolution does below.
+    // (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so its lifetime follows the
+    // statement. An explicit APD is instead protected by the scoped parent
+    // guard below.
     let apd = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFreeStmt(SQL_RESET_PARAMS): stmt mutex poisoned");
@@ -734,12 +727,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
         stmt_state.effective_apd(stmt)
     };
 
-    // `apd` can be an explicit descriptor resolved under the STMT lock,
-    // already dropped by now — re-check liveness right before dereferencing
-    // to narrow the race against a concurrent
-    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor.
-    if !stmt.owns_implicit_desc(apd) && crate::handles::live_type(apd) != Some(HandleType::Desc) {
-        error!("SQLFreeStmt(SQL_RESET_PARAMS): apd freed concurrently; reset failed");
+    let Ok(desc) = stmt.access_descriptor(StatementDescriptor::Apd, apd) else {
+        error!("SQLFreeStmt(SQL_RESET_PARAMS): failed to access apd");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
                 &mut stmt_state,
@@ -749,8 +738,7 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
             );
         }
         return SQL_ERROR;
-    }
-    let desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    };
     let Ok(mut desc_state) = desc.inner.lock() else {
         error!("SQLFreeStmt(SQL_RESET_PARAMS): apd mutex poisoned; reset failed");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -765,6 +753,7 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
     };
     desc_state.set_record_count(0, desc.kind);
     drop(desc_state);
+    drop(desc);
 
     // Best-effort beyond the spec-mandated APD reset above: log rather than
     // fail the whole call if the IPD mutex is poisoned, since the required
@@ -2360,15 +2349,8 @@ mod tests {
         assert_eq!(apd_record_count(&h), 1);
     }
 
-    /// The narrow race `bind_param_records`'s liveness check guards against:
-    /// `effective_apd` resolves an explicit descriptor under the STMT lock,
-    /// which is dropped before the descriptor is actually locked and
-    /// written. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes in
-    /// that window, the stale pointer must fail cleanly (`Err`), not
-    /// dereference freed memory. Calling the helper directly with an
-    /// already-freed handle reproduces the state that window leaves behind.
     #[test]
-    fn bind_param_records_fails_cleanly_on_a_freed_apd() {
+    fn bind_param_records_reresolves_after_explicit_descriptor_free() {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit_apd = h.alloc_explicit_desc();
         assert_eq!(h.free_explicit_desc(explicit_apd), SQL_SUCCESS);
@@ -2390,10 +2372,11 @@ mod tests {
             octet_length_ptr: std::ptr::null_mut(),
         };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert!(bind_param_records(stmt, explicit_apd, 1, bound).is_err());
+        assert!(bind_param_records(stmt, explicit_apd, 1, bound).is_ok());
+        assert_eq!(apd_record_count(&h), 1);
     }
 
-    /// `SQL_RESET_PARAMS` keeps the liveness check for an explicit APD: a
+    /// `SQL_RESET_PARAMS` validates access to an explicit APD: a
     /// dangling association fails cleanly instead of truncating freed memory.
     #[test]
     fn reset_params_fails_cleanly_on_a_freed_explicit_apd() {

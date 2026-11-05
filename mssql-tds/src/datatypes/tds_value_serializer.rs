@@ -24,8 +24,8 @@ use crate::io::packet_writer::{PacketWriter, TdsPacketWriter, TdsPacketWriterUnc
 use crate::token::tokens::SqlCollation;
 
 // NULL markers for different type classes
-const NULL_LENGTH: u8 = 0x00;
-const VARNULL: u16 = 0xFFFF;
+pub(crate) const NULL_LENGTH: u8 = 0x00;
+pub(crate) const VARNULL: u16 = 0xFFFF;
 
 /// PLP sentinel indicating a SQL NULL value.
 pub const PLP_NULL: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -234,6 +234,25 @@ impl TdsValueSerializer {
             encoded.bytes.truncate(fitted_len);
         }
         Ok(Some((Cow::Owned(encoded.bytes), encoded.had_loss)))
+    }
+
+    /// Shared by the async string serializer and the batched RPC fast path so
+    /// both emit the same event from the same target.
+    pub(crate) fn trace_variable_length_string(
+        is_unicode: bool,
+        tds_type: u8,
+        char_count: usize,
+        data_len: usize,
+    ) {
+        tracing::debug!(
+            "Writing variable-length string: is_unicode={}, tds_type=0x{:02X}, char_count={}, data_len={}, length_prefix={}, utf16_bytes.len()={}",
+            is_unicode,
+            tds_type,
+            char_count,
+            data_len,
+            data_len as u16,
+            data_len
+        );
     }
 
     /// Serialize a NULL value using the appropriate NULL marker for the type.
@@ -1665,15 +1684,7 @@ impl TdsValueSerializer {
             // where ADP.CharSize = 2 for Unicode
             let length_prefix = data_len as u16;
 
-            tracing::debug!(
-                "Writing variable-length string: is_unicode={}, tds_type=0x{:02X}, char_count={}, data_len={}, length_prefix={}, utf16_bytes.len()={}",
-                is_unicode,
-                ctx.tds_type,
-                char_count,
-                data_len,
-                length_prefix,
-                utf16_bytes.len()
-            );
+            Self::trace_variable_length_string(is_unicode, ctx.tds_type, char_count, data_len);
 
             writer.write_u16_async(length_prefix).await?;
 
