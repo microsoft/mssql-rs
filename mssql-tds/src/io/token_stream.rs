@@ -465,11 +465,7 @@ pub(crate) async fn dispatch_token<R: TdsPacketReader + Send + Sync>(
 ) -> TdsResult<Tokens> {
     let parser = match registry.get_parser(&token_type) {
         Some(parser) => parser,
-        None => {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "No parser implemented for token type: {token_type:?}. This token type is not supported yet."
-            )));
-        }
+        None => return Err(crate::token::tokens::no_parser_error(&token_type)),
     };
 
     debug!("Parsing token type: {:?}", &token_type);

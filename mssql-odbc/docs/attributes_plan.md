@@ -55,7 +55,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | Attribute | Set | Get | Note |
 |---|---|---|---|
 | `SQL_ATTR_LOGIN_TIMEOUT` | ✅ | ✅ | clamped to `0xFFFE`, `01S02` on clamp |
-| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-owned batches and transaction requests, including catalog/isolation changes, autocommit transitions, commit/rollback, and reset/disconnect rollback; also bounds internal `SQL_USER_NAME`, alias-type, and database-updateability lookups. Zero means no request deadline, with the separate 120-second cancellation default. Statement query timeout remains independent. Secondary logins and reads share the connection-timeout deadline (deviation 32). See `transactions_plan.md` for scope and source evidence. |
+| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-scoped requests, internal metadata lookups, and cancellation settlement; see the [timeout contract](driver-guide.md#connection-operation-timeouts) |
 | `SQL_ATTR_PACKET_SIZE` | ✅ | ✅ | pre-connect only |
 | `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | stored hint, not DML enforcement; an actually read-only database overrides the connected getter (see below) |
 | `SQL_ATTR_AUTOCOMMIT` | ✅ | ✅ | |
@@ -84,7 +84,7 @@ their measured not-implemented diagnostic; an unknown identifier returns `HY092`
 | `SQL_ATTR_ROWS_FETCHED_PTR` | ✅ | ✅ |
 | `SQL_ATTR_ROW_STATUS_PTR` / `ROW_BIND_TYPE` | ✅ | ✅ |
 | `SQL_ATTR_PARAMSET_SIZE` | ✅ | ✅ |
-| `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` | ✅ no-op | ✅ |
+| `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` | ✅ descriptor association | ✅ |
 | `SQL_ATTR_IMP_ROW_DESC` / `IMP_PARAM_DESC` | — | ✅ |
 | `SQL_ATTR_MAX_ROWS` | ✅ enforced | ✅ |
 | `SQL_ATTR_MAX_LENGTH`, `NOSCAN`, `RETRIEVE_DATA`, `USE_BOOKMARKS` | ✅ | ✅ |
@@ -626,8 +626,9 @@ three above — which the `CURRENT_CATALOG` contrast shows is not safe.
   `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`. `MULTISUBNET_FAILOVER`
   is routed (AB#49293); `TNIR` is deliberately omitted, with off accepted as a
   no-op and on returning `HYC00`.
-- **Read-only/diagnostic:** `SQL_COPT_SS_CLIENT_CONNECTION_ID`, `SQL_COPT_SS_SPID`,
-  `SQL_COPT_SS_USER_DATA`.
+- **Read-only/diagnostic:** `SQL_COPT_SS_SPID`, `SQL_COPT_SS_USER_DATA`.
+  `SQL_COPT_SS_CLIENT_CONNECTION_ID` is implemented as a read-only UTF-16 GUID
+  string; see the [tracing guide](driver-guide.md#tracing).
 - **Standard leftovers:** `SQL_ATTR_METADATA_ID = SQL_TRUE` (currently `HYC00`
   because catalog dispatch still forces pattern mode), `SQL_ATTR_ASYNC_ENABLE`,
   `SQL_ATTR_AUTO_IPD`, `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.

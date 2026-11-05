@@ -208,6 +208,13 @@ mod data_classification_tests {
         }
 
         async fn connect(&self, requested: Option<DataClassificationVersion>) -> TdsClient {
+            self.try_connect(requested).await.unwrap()
+        }
+
+        async fn try_connect(
+            &self,
+            requested: Option<DataClassificationVersion>,
+        ) -> Result<TdsClient, Error> {
             let mut context = ClientContext::default();
             context.user_name = "sa".to_string();
             context.password = generate_test_password();
@@ -222,7 +229,17 @@ mod data_classification_tests {
             TdsConnectionProvider {}
                 .create_client(context, &self.datasource, None)
                 .await
-                .unwrap()
+        }
+
+        /// What the most recent LOGIN7 carried: its FeatureExt ids and the
+        /// Data Classification version it requested.
+        async fn last_login(&self) -> (Vec<u8>, Option<u8>) {
+            let store = self.connections.lock().await;
+            let (&id, info) = store.all().iter().next_back().expect("a login");
+            let requested = store
+                .login_details(id)
+                .and_then(|details| details.data_classification_requested);
+            (info.requested_feature_ids.clone(), requested)
         }
 
         async fn stop(self) {
@@ -394,6 +411,254 @@ mod data_classification_tests {
         client.close_query().await.unwrap();
 
         client.close_connection().await.unwrap();
+        server.stop().await;
+    }
+
+    /// Disabled is the default: LOGIN7 carries no `0x09`, nothing is
+    /// negotiated, and queries run as before. The enabled login is checked
+    /// too, so the absence of `0x09` is not an artifact of the capture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabled_feature_is_not_advertised_and_queries_run_as_before() {
+        let server = Server::start(DataClassificationVersion::Version2).await;
+
+        let mut client = server.connect(None).await;
+        let (features, requested) = server.last_login().await;
+        assert!(!features.contains(&0x09), "{features:02X?}");
+        assert_eq!(requested, None);
+        assert_eq!(client.negotiated_data_classification_version(), None);
+        client.execute(UNCLASSIFIED.to_string(), ()).await.unwrap();
+        assert!(client.data_classification().is_none());
+        assert_eq!(
+            client.next_row().await.unwrap(),
+            Some(vec![ColumnValues::Int(1)])
+        );
+        client.close_query().await.unwrap();
+        client.close_connection().await.unwrap();
+
+        let mut client = server
+            .connect(Some(DataClassificationVersion::Version2))
+            .await;
+        let (features, requested) = server.last_login().await;
+        assert!(features.contains(&0x09), "{features:02X?}");
+        assert_eq!(requested, Some(2));
+        client.close_connection().await.unwrap();
+
+        server.stop().await;
+    }
+
+    /// A server may enable a lower version than requested at the first
+    /// login, not only on a reconnect; the token is then laid out for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_v2_request_acknowledged_as_v1_parses_the_v1_layout() {
+        let server = Server::start(DataClassificationVersion::Version1).await;
+        server
+            .registry
+            .lock()
+            .await
+            .set_data_classification_ack(DataClassificationAck::Version(1));
+        let mut client = server
+            .connect(Some(DataClassificationVersion::Version2))
+            .await;
+        assert_eq!(server.last_login().await.1, Some(2));
+        assert_eq!(
+            client.negotiated_data_classification_version(),
+            Some(DataClassificationVersion::Version1)
+        );
+
+        client.execute(CLASSIFIED.to_string(), ()).await.unwrap();
+        assert_classified_result(&mut client, DataClassificationVersion::Version1).await;
+        client.close_query().await.unwrap();
+
+        client.close_connection().await.unwrap();
+        server.stop().await;
+    }
+
+    /// A server that ignores the request leaves the feature off: the
+    /// connection works as if it had not been requested, and a classification
+    /// token sent anyway is rejected rather than parsed with a guessed layout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_acknowledgement_leaves_the_feature_off() {
+        let server = Server::start_recoverable(DataClassificationVersion::Version2).await;
+        server
+            .registry
+            .lock()
+            .await
+            .set_data_classification_ack(DataClassificationAck::Omitted);
+        let mut client = server
+            .connect(Some(DataClassificationVersion::Version2))
+            .await;
+        assert_eq!(server.last_login().await.1, Some(2));
+        assert_eq!(client.negotiated_data_classification_version(), None);
+
+        client.execute(UNCLASSIFIED.to_string(), ()).await.unwrap();
+        assert!(client.data_classification().is_none());
+        assert_eq!(
+            client.next_row().await.unwrap(),
+            Some(vec![ColumnValues::Int(1)])
+        );
+        client.close_query().await.unwrap();
+
+        let outcome = match client.execute(CLASSIFIED.to_string(), ()).await {
+            Ok(_) => client.next_row().await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        let error = outcome.unwrap_err();
+        assert!(error.to_string().contains("not negotiated"), "{error}");
+        assert!(client.is_connection_dead());
+        assert!(!client.is_session_recovery_enabled());
+
+        server.stop().await;
+    }
+
+    /// An acknowledgement naming a version the client does not know fails
+    /// the login with a protocol error; the next login is unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsupported_acknowledged_version_fails_the_login() {
+        let server = Server::start(DataClassificationVersion::Version2).await;
+        for version in [0, 3, 0xFF] {
+            server
+                .registry
+                .lock()
+                .await
+                .set_data_classification_ack(DataClassificationAck::Version(version));
+            let error = server
+                .try_connect(Some(DataClassificationVersion::Version2))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("version {version} was accepted"));
+            assert!(
+                matches!(&error, Error::ProtocolError(message)
+                    if message.contains(&format!("acknowledgement version {version}"))),
+                "version {version}: {error}"
+            );
+        }
+
+        server
+            .registry
+            .lock()
+            .await
+            .set_data_classification_ack(DataClassificationAck::Requested);
+        let mut client = server
+            .connect(Some(DataClassificationVersion::Version2))
+            .await;
+        assert_eq!(
+            client.negotiated_data_classification_version(),
+            Some(DataClassificationVersion::Version2)
+        );
+        client.close_connection().await.unwrap();
+        server.stop().await;
+    }
+
+    /// Classified and unclassified columns in one result set: the
+    /// unclassified one has an entry with no properties, and the row values
+    /// are those of an unclassified query.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_result_set_mixes_classified_and_unclassified_columns() {
+        const MIXED: &str = "SELECT SSN, NOTE FROM PEOPLE";
+        let version = DataClassificationVersion::Version2;
+        let server = Server::start(version).await;
+        server
+            .registry
+            .lock()
+            .await
+            .register_with_data_classification(
+                MIXED,
+                int_response(&["ssn", "note"], 5),
+                token(
+                    version,
+                    &[("Confidential", "L1")],
+                    &[("National ID", "I1")],
+                    30,
+                    &[&[(0, 0, 30)], &[]],
+                ),
+            );
+        let mut client = server.connect(Some(version)).await;
+
+        client.execute(MIXED.to_string(), ()).await.unwrap();
+        let metadata = client.data_classification().expect("classification");
+        let [ssn, note] = metadata.columns() else {
+            panic!("expected two columns, got {:?}", metadata.columns());
+        };
+        let [property] = ssn.properties() else {
+            panic!("expected one SSN property, got {ssn:?}");
+        };
+        assert_eq!(
+            metadata
+                .resolve_label(property.sensitivity_label())
+                .map(|label| label.name()),
+            Some("Confidential")
+        );
+        assert_eq!(
+            metadata
+                .resolve_information_type(property.information_type())
+                .map(|information_type| information_type.name()),
+            Some("National ID")
+        );
+        assert_eq!(property.rank(), Some(SensitivityRank::High));
+        assert!(!note.is_classified());
+        assert_eq!(
+            client.next_row().await.unwrap(),
+            Some(vec![ColumnValues::Int(5), ColumnValues::Int(5)])
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        client.close_query().await.unwrap();
+
+        client.close_connection().await.unwrap();
+        server.stop().await;
+    }
+
+    /// Dictionary references and ranks come from the server, so out-of-range
+    /// values are protocol errors, never panics or out-of-bounds reads. The
+    /// rest of the token is unread at that point, so the connection is
+    /// retired rather than recovered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_references_and_ranks_are_protocol_errors() {
+        let version = DataClassificationVersion::Version2;
+        let server = Server::start_recoverable(version).await;
+        let cases = [
+            (
+                "SELECT A FROM BAD_LABEL",
+                token(version, &[("L", "L")], &[], 30, &[&[(1, UNSPECIFIED, 30)]]),
+                "sensitivity-label index 1 is outside dictionary length 1",
+            ),
+            (
+                "SELECT A FROM BAD_TYPE",
+                token(version, &[], &[("T", "T")], 30, &[&[(UNSPECIFIED, 4, 30)]]),
+                "information-type index 4 is outside dictionary length 1",
+            ),
+            (
+                "SELECT A FROM BAD_RANK",
+                token(version, &[("L", "L")], &[], 30, &[&[(0, UNSPECIFIED, 7)]]),
+                "sensitivity rank: unknown value 7",
+            ),
+        ];
+        for (query, bytes, _) in &cases {
+            server
+                .registry
+                .lock()
+                .await
+                .register_with_data_classification(*query, int_response(&["a"], 1), bytes.clone());
+        }
+
+        for (query, _, expected) in cases {
+            let mut client = server.connect(Some(version)).await;
+            let error = client.execute(query.to_string(), ()).await.unwrap_err();
+            assert!(
+                matches!(&error, Error::ProtocolError(message) if message.contains(expected)),
+                "{query}: {error}"
+            );
+            assert!(client.is_connection_dead(), "{query}");
+            let error = client
+                .execute(UNCLASSIFIED.to_string(), ())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::ConnectionClosed(_)),
+                "{query}: {error}"
+            );
+            assert_eq!(client.connection_recovery_count(), 0, "{query}");
+        }
+
         server.stop().await;
     }
 

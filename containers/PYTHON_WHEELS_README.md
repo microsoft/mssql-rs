@@ -1,256 +1,98 @@
-# Python Wheel Building with Containers
+# Python wheel build containers
 
-This directory contains scripts and Dockerfiles for building Python wheels in a consistent, reproducible manner.
+Linux wheels are built in PyPA-based manylinux and musllinux containers for
+x64 and ARM64. Each build produces one `cp310-abi3` wheel, not one wheel per
+Python minor version. Windows x64/ARM64 and macOS universal2 wheels are built
+natively. See the [release guide](../docs/release-management.md#wheel-matrix-9-wheels)
+for the complete wheel matrix and platform requirements.
 
-## Overview
+## Images
 
-We build Python wheels inside **manylinux** and **musllinux** containers to:
-- ✅ Avoid GitHub API rate limits (no need to download Python from GitHub)
-- ✅ Ensure binary compatibility across Linux distributions
-- ✅ Use official PyPA (Python Packaging Authority) build environments
-- ✅ Build one `cp310-abi3` wheel for CPython 3.10 and later
-- ✅ Support both x64 and ARM64 architectures
+The shared wheel template defaults to `ghcr.io/microsoft/mssql-rs`; OneBranch
+callers select `tdslibrs.azurecr.io`. ACR access requires Azure authentication.
 
-## Container Images
+`build-python-images.sh` and `push-python-images.sh` build and publish these ACR
+images with Rust, maturin, OpenSSL development libraries, and `pkg-config`:
 
-All images are hosted in your Azure Container Registry (`tdslibrs.azurecr.io`) to avoid Docker Hub rate limits.
+| Target | Image under `tdslibrs.azurecr.io/python-build/` |
+|---|---|
+| Linux x64 | `manylinux_2_34_x86_64_rust:latest` |
+| Linux ARM64 | `manylinux_2_34_aarch64_rust:latest` |
+| Alpine x64 | `musllinux_1_2_x86_64_rust:latest` |
+| Alpine ARM64 | `musllinux_1_2_aarch64_rust:latest` |
 
-### 🚀 Pre-built Images with Rust (Recommended for CI/CD)
-These custom images extend official PyPA images with **Rust toolchain and maturin pre-installed** for faster builds.
+These manylinux images use glibc 2.34 and OpenSSL 3. The separate glibc 2.28
+release track uses the older compatibility build path; these images do not
+produce glibc 2.28 builds.
 
-#### Linux (glibc-based - Ubuntu, RHEL, Debian, etc.)
-- **x64**: `tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest`
-- **ARM64**: `tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64_rust:latest`
+`import-python-build-images.sh` mirrors stock manylinux 2.28 and musllinux 1.2
+images under `tdslibrs.azurecr.io/import/python-build/`. These are base images,
+not replacements for the `_rust` images: the wheel-build script requires Rust
+and maturin to be installed already. CI image synchronization also supplies the
+manylinux 2.34 bases used by the Dockerfiles.
 
-#### Alpine (musl-based)
-- **x64**: `tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest`
-- **ARM64**: `tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64_rust:latest`
+## Build and publish images
 
-**Pre-installed software:**
-- ✅ Rust toolchain (stable, via rustup)
-- ✅ maturin (Python-to-Rust build tool)
-- ✅ OpenSSL development libraries
-- ✅ pkg-config
-- ✅ All Python versions (3.10-3.14)
-- ✅ Build tools and compilers
-
-### Vanilla PyPA Images (Base images without Rust)
-Use these only if you need stock PyPA images without customization.
-
-#### Linux (glibc-based)
-- **x64**: `tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64:latest`
-- **ARM64**: `tdslibrs.azurecr.io/python-build/manylinux_2_28_aarch64:latest`
-
-#### Alpine (musl-based)
-- **x64**: `tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64:latest`
-- **ARM64**: `tdslibrs.azurecr.io/python-build/musllinux_1_2_aarch64:latest`
-
-### MacOS
-- Built natively on MacOS agents (no container)
-
-### Windows
-- ❌ **Not supported** - Windows wheel builds are disabled
-
-## Setup Instructions
-
-### Option 1: Build Custom Images with Rust (Recommended)
-
-Build the pre-configured images with Rust and maturin pre-installed for **faster CI/CD pipelines**:
+With Docker, Azure CLI, and permission to push to the ACR, run:
 
 ```bash
 cd containers
-
-# Build all 4 images (manylinux + musllinux, x64 + ARM64)
 ./build-python-images.sh
-
-# Push images to Azure Container Registry
 ./push-python-images.sh
 ```
 
-**What gets pre-installed:**
-- Rust toolchain (stable)
-- maturin (Python wheel builder)
-- OpenSSL development libraries
-- pkg-config
-- All system dependencies needed for building
+Rebuild when the toolchain, maturin, or base-image dependencies change.
 
-**Benefits:**
-- ⚡ **5-10x faster builds** - no runtime installation of Rust/maturin
-- 🔒 **More reliable** - no dependency on rustup.rs availability
-- 📦 **Better caching** - dependencies baked into image layers
+## Build wheels locally
 
-**When to rebuild:**
-- When you need to update Rust version
-- When new Python versions are added to base PyPA images (quarterly)
-- When you want to update maturin
-
-### Option 2: Import Vanilla PyPA Images (Base Images Only)
-
-Run this to pull official PyPA images without customization:
+Run from the **repository root**, using an image matching the host architecture:
 
 ```bash
-cd containers
-chmod +x import-python-build-images.sh
-./import-python-build-images.sh
-```
+az acr login --name tdslibrs
 
-This imports stock images from `quay.io/pypa` without pre-installed Rust/maturin. The build script will install these at runtime (slower).
-
-**Note**: Recommended to re-import monthly to get PyPA updates.
-
-### 2. Build Wheels Locally (Optional)
-
-To test wheel building locally using the pre-built Rust images:
-
-```bash
-# For x64 Linux (manylinux with Rust pre-installed)
+# Linux x64
 docker run --rm \
   -v "$(pwd):/workspace" \
-  -v "$(pwd)/target/wheels:/workspace/target/wheels" \
-  tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64_rust:latest \
+  tdslibrs.azurecr.io/python-build/manylinux_2_34_x86_64_rust:latest \
   bash /workspace/scripts/build-python-wheels-in-container.sh
 
-# For x64 Alpine (musllinux with Rust pre-installed)
+# Alpine x64
 docker run --rm \
   -v "$(pwd):/workspace" \
-  -v "$(pwd)/target/wheels:/workspace/target/wheels" \
   tdslibrs.azurecr.io/python-build/musllinux_1_2_x86_64_rust:latest \
-  sh /workspace/scripts/build-python-wheels-in-container.sh
+  bash /workspace/scripts/build-python-wheels-in-container.sh
 ```
 
-Wheels will be created in `target/wheels/`.
+Wheels are written to `target/wheels/`. This script builds the native extension;
+it does not perform the release pipeline's ODBC-driver injection, wheel repair,
+or clean-install checks. OpenSSL remains OS-provided rather than vendored.
 
-## Pipeline Integration
+## Pipeline integration
 
-The Azure DevOps pipeline automatically builds wheels in containers:
+The [shared template](../.pipeline/templates/build-python-wheels-template.yml)
+selects container builds for Linux/Alpine and native builds for Windows/macOS.
+For example, from a pipeline under `.pipeline/`:
 
-**Template**: `.pipeline/templates/build-python-wheels-template.yml`
-
-**Usage**:
 ```yaml
 - template: templates/build-python-wheels-template.yml
   parameters:
-    osType: Linux        # Linux, Alpine, or MacOS
+    osType: Linux        # Linux, Alpine, MacOS, or Windows
     architecture: x64    # x64 or ARM64
 ```
 
-**What it does**:
-1. Logs into ACR
-2. Pulls the appropriate container image
-3. Mounts source code into the container
-4. Runs `build-python-wheels-in-container.sh`
-5. Builds one `cp310-abi3` wheel for the target platform
-6. Publishes wheels as build artifacts
+Authenticate to the selected registry before pulling private images. The template
+builds the wheel and optionally publishes artifacts; its callers own registry
+login and the remaining release steps.
 
-## About manylinux and musllinux
+## Stable ABI floor
 
-**manylinux** and **musllinux** are standardized Docker images maintained by the Python Packaging Authority (PyPA):
-
-- **Purpose**: Build portable binary wheels that work across many Linux distributions
-- **Standards**: 
-  - `manylinux_2_28`: Compatible with glibc 2.28+ (Ubuntu 20.04+, RHEL 8+, Debian 10+)
-  - `musllinux_1_2`: Compatible with musl 1.2+ (Alpine 3.13+)
-- **Pre-installed**: Multiple Python versions (3.8-3.14), compilers, build tools
-- **Official**: Maintained by PyPA at https://github.com/pypa/manylinux
-
-**Benefits**:
-- ✅ Binary compatibility guaranteed
-- ✅ No need to install Python versions manually
-- ✅ Audited with `auditwheel` to verify portability
-- ✅ Used by major Python packages (numpy, pandas, cryptography, etc.)
-
-## Maintenance
-
-### Update Custom Build Images
-
-When you need to refresh the Rust toolchain, maturin, or base PyPA images:
-
-```bash
-cd containers
-
-# Rebuild all custom images with latest base images and tools
-./build-python-images.sh
-
-# Push updated images to ACR
-./push-python-images.sh
-```
-
-**When to update:**
-- Quarterly - to get latest Python versions from PyPA base images
-- When new Rust version is needed
-- When maturin needs updating
-- After security patches in base images
-
-### Update Vanilla PyPA Images
-
-Re-import stock PyPA images monthly or when new Python versions are released:
-
-```bash
-cd containers
-./import-python-build-images.sh
-```
-
-### Image Architecture
-
-```
-Custom Images (_rust suffix):
-  ├── Base: quay.io/pypa/manylinux_2_28_x86_64:latest
-  └── Adds:
-      ├── Rust toolchain (stable)
-      ├── maturin
-      ├── OpenSSL dev libraries
-      └── pkg-config
-
-Vanilla Images (no suffix):
-  └── Direct import from quay.io/pypa
-      └── No customization
-```
-
-### Modify the Stable ABI Floor
-
-The wheel uses the CPython 3.10 stable ABI. To change that floor, update the
-PyO3 `abi3-py310` feature and all `cp310-abi3` wheel selection and validation
-logic together.
-
-## Troubleshooting
-
-### Container image not found
-
-**For custom Rust images:**
-```bash
-# Build the custom images locally
-cd containers
-./build-python-images.sh
-./push-python-images.sh
-```
-
-**For vanilla PyPA images:**
-```bash
-# Re-import base images
-cd containers
-./import-python-build-images.sh
-```
-
-### Rust installation is slow in CI
-Switch to using the custom `_rust` images which have Rust pre-installed:
-- Use: `manylinux_2_28_x86_64_rust:latest` 
-- Instead of: `manylinux_2_28_x86_64:latest`
-
-### Python version not building
-Check the container has that Python version:
-```bash
-docker run --rm tdslibrs.azurecr.io/python-build/manylinux_2_28_x86_64:latest \
-  ls -la /opt/python
-```
-
-### ACR authentication fails
-```bash
-az acr login -n tdslibrs
-```
+To change the CPython 3.10 stable ABI floor, update PyO3's `abi3-py310` feature
+and all `cp310-abi3` wheel selection and validation logic together. `abi3` does
+not support free-threaded CPython.
 
 ## References
 
 - [PyPA manylinux](https://github.com/pypa/manylinux)
-- [PEP 600 - manylinux_2_28](https://peps.python.org/pep-0600/)
-- [PEP 656 - musllinux](https://peps.python.org/pep-0656/)
+- [PEP 600: manylinux](https://peps.python.org/pep-0600/)
+- [PEP 656: musllinux](https://peps.python.org/pep-0656/)
 - [Maturin documentation](https://www.maturin.rs/)

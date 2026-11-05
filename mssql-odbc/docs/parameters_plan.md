@@ -104,34 +104,34 @@ transparent reconnects.
   `CHAR`, `WCHAR` and `BINARY` accumulate and convert at close.
   A C-type/SQL-type wideness mismatch
   within the character family (e.g. `SQL_C_WCHAR` against a narrow SQL type)
-  is buffered and transcoded once at `SQLParamData` close via the
-  connection's collation rather than rejected - msodbcsql accepts the same
-  pairing. A msodbcsql parity run for the narrow-to-wide direction measured a
-  UTF-8 character split across two `SQLPutData` calls coming back as 5
+  is transcoded incrementally by `DaeTranscode`, retaining incomplete encoded
+  units between chunks. Mixed sequences can still buffer an earlier streamable
+  parameter until a later buffered parameter is available, preserving
+  `SQLParamData` bind order. A msodbcsql parity run for the narrow-to-wide
+  direction measured a UTF-8 character split across two `SQLPutData` calls coming back as 5
   UTF-16 units instead of 4
   (`NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter`,
   skipped for msodbcsql parity because of it), but this is very likely
   msodbcsql reading `SQL_C_CHAR` bytes in the client code page rather than
   UTF-8 (AB#47565) -- a mismatch that would reproduce for a single-chunk
   value too -- not evidence about whether msodbcsql carries a residual
-  across `SQLPutData` calls; not confirmed at the code-point level. Either
-  way, whole-value buffering here is a documented deviation from msodbcsql's
-  incremental approach, not a gap. The same-wideness narrow path
+  across `SQLPutData` calls; not confirmed at the code-point level.
+  The same-wideness narrow path
   (`SQL_C_CHAR` against a narrow SQL type) still reads the *application
   buffer* as UTF-8 rather than the client code page (AB#47565); the wire side
   has read the connection's collation since `DaeTranscode` landed
-  (`DaeTarget::Narrow(collation)` encodes through `encode_narrow`), and only
-  the wideness-mismatch half of AB#47590 has closed. Under a UTF8-flagged
-  database collation the streamed and inline paths now agree:
+  (`DaeTarget::Narrow(collation)` encodes through `encode_narrow`). Under a
+  UTF8-flagged database collation the streamed and inline paths now agree:
   `encode_narrow` checks `collation.utf8()` like `get_encoding_type` does,
   and since AB#48437 the serializer's `VARCHAR | CHAR | TEXT` arm resolves
   through the same helper rather than the LCID alone, so the same value
   reaches the wire as the same bytes whichever route it took. Before that
   fix the streamed side was correct and the inline side encoded through the
   single-byte LCID codepage regardless of the flag.
-  `SQLPutData`'s `try_reserve` guard against an unbounded `SQL_DATA_AT_EXEC`
-  value only bounds accumulation: the transform `SQLParamData` runs at close
-  (`decode_utf16le`, `String::from_utf8_lossy`, `encode_narrow`) still
+  On buffered paths, `SQLPutData`'s `try_reserve` guard against an unbounded
+  `SQL_DATA_AT_EXEC` value only bounds accumulation: the transform
+  `SQLParamData` runs at close (`decode_utf16le`, `String::from_utf8_lossy`,
+  `encode_narrow`) still
   allocates its output infallibly, and can be several times the buffered
   size (NCR substitution alone is up to 10 bytes per unmappable character,
   measured for U+10FFFF), so a value that just fit under the guard can still
