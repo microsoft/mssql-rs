@@ -8,6 +8,7 @@ use crate::datatypes::row_writer::{DiscardRowWriter, RowWriter, write_column_val
 use crate::io::packet_reader::TdsPacketReader;
 use crate::query::metadata::ColumnMetadata;
 use crate::security::cell_decryptor::CellDecryptor;
+use crate::token::data_classification::DataClassificationMetadata;
 use crate::token::parsers::TokenParser;
 use crate::token::parsers::done_parser::{DONE_PAYLOAD_LEN, buffered_done_token, read_done_token};
 use crate::token::parsers::returnstatus_parser::{RETURN_STATUS_PAYLOAD_LEN, read_return_status};
@@ -237,6 +238,20 @@ pub(crate) trait TdsTokenStreamReader {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens>;
 
+    /// Reads a DATACLASSIFICATION token when it is the next token, leaving any
+    /// other token unread. Called directly after the COLMETADATA it
+    /// classifies, so `context` carries that metadata. Transports that cannot
+    /// look ahead leave the token to the next read.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
+    async fn receive_data_classification(
+        &mut self,
+        _context: &ParserContext,
+        _remaining_request_timeout: Option<Duration>,
+        _cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Option<DataClassificationMetadata>> {
+        Ok(None)
+    }
+
     // Object-safe fallbacks for cfg-gated dynamic transports. Production calls
     // the native inherent methods on its concrete transport representation.
     #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
@@ -320,6 +335,17 @@ pub trait TdsTokenStreamReader {
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens>;
+
+    /// Reads a DATACLASSIFICATION token when it is the next token, leaving any
+    /// other token unread.
+    async fn receive_data_classification(
+        &mut self,
+        _context: &ParserContext,
+        _remaining_request_timeout: Option<Duration>,
+        _cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<Option<DataClassificationMetadata>> {
+        Ok(None)
+    }
 
     async fn receive_row_into(
         &mut self,
@@ -2386,5 +2412,61 @@ mod tests {
             "{token:?}"
         );
         assert_eq!(reader.remaining(), 1, "the next token must be left unread");
+    }
+
+    /// A token with no parser ends the read. Its class bits cannot be trusted
+    /// for a length (MS-TDS 2.2.4.2 lists exceptions, DATACLASSIFICATION among
+    /// them), so only the type byte is consumed and nothing after it skipped.
+    #[tokio::test]
+    async fn tokens_without_a_parser_are_fatal_on_every_read_path() {
+        use crate::token::parsers::common::test_utils::MockReader;
+
+        let registry = GenericTokenParserRegistry::default();
+        let row_context = ParserContext::ColumnMetadata(two_int4_metadata(), None);
+        let payload = [0x02, 0x00, 0xAA, 0xBB];
+        let cases = [
+            (0xA6, "Unknown token type: 0xA6"),
+            (0x88, "No parser implemented for token type: AltMetadata"),
+            (0xD3, "No parser implemented for token type: AltRow"),
+            (0x78, "No parser implemented for token type: Offset"),
+        ];
+        for (byte, expected) in cases {
+            let bytes = || [&[byte][..], &payload].concat();
+            let check = |error: crate::error::Error, reader: &MockReader, path: &str| {
+                assert!(
+                    matches!(&error, crate::error::Error::ProtocolError(message)
+                        if message.contains(expected)),
+                    "{path} 0x{byte:02X}: {error}"
+                );
+                assert_eq!(reader.remaining(), payload.len(), "{path} 0x{byte:02X}");
+            };
+
+            let mut reader = MockReader::new(bytes());
+            let error = receive_token_internal(&mut reader, &registry, &ParserContext::default())
+                .await
+                .unwrap_err();
+            check(error, &reader, "token");
+
+            let mut reader = MockReader::new(bytes());
+            let error = receive_row_into_internal(
+                &mut reader,
+                &registry,
+                &row_context,
+                ColumnPolicy::SkipAll,
+                &mut DiscardRowWriter,
+                &mut None,
+            )
+            .await
+            .unwrap_err();
+            check(error, &reader, "row");
+
+            let mut reader = MockReader::new(bytes());
+            let Err(error) =
+                receive_row_header_internal(&mut reader, &registry, &row_context, &mut None).await
+            else {
+                panic!("row header 0x{byte:02X}: read succeeded");
+            };
+            check(error, &reader, "row header");
+        }
     }
 }

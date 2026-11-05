@@ -62,6 +62,17 @@ the next fetch. The connection retains one heap-allocated protocol client to
 avoid large client copies during result retrieval; cancellation and connection
 ownership behavior are unchanged.
 
+### Descriptors
+
+Binding and descriptor APIs share the same records. Freeing an explicit
+descriptor restores associated statements' implicit descriptors. Application
+buffers must remain valid until outstanding operations finish.
+
+IPD SQL-definition changes take effect on the next prepared execution, including
+edits overlapping a synchronous execution. Equivalent definitions and
+application-buffer-only changes retain cached plans. During Need Data, complete
+or cancel the data-at-execution sequence before changing bindings.
+
 ### Connection defaults
 
 Eligible TCP connections use MultiSubnetFailover (MSF) by default. Set
@@ -132,6 +143,13 @@ LONG bindings in either mode; use the ordinary variable-length SQL types with
 An already-executed prepared statement retains its server-side declaration
 when the option changes; prepare it again to select a new declaration. DAE
 parameters remain chunked in both modes.
+
+### Integer connection-attribute getters
+
+Supported integer getters accept NULL value and length pointers independently.
+Successful getters report a four-byte value length when requested, except
+`SQL_COPT_SS_WARN_ON_CP_ERROR`, which writes the length only when the value
+pointer is non-NULL.
 
 ## Platform artifacts
 
@@ -267,6 +285,11 @@ Use `SQL_C_WCHAR` for lossless Unicode retrieval; it remains UTF-16LE.
 `SQL_C_BINARY` continues to return unconverted wire bytes. mssql-python's
 default wide-character fetching is unchanged; an explicitly selected narrow
 decoder must match the platform client encoding.
+
+On Windows, a streamed `varchar(max)` value whose collation code page is 1252
+is delivered to `SQL_C_CHAR` under ANSI code page 1252 without decoding and
+re-encoding, as msodbcsql does when the code pages match. The bytes are the
+same as converting them, and the copy may read ahead up to 64 KiB of the value.
 
 **Migration note:** narrow results were previously always UTF-8. Applications
 that assumed UTF-8 on a non-UTF-8 system should use wide retrieval or decode

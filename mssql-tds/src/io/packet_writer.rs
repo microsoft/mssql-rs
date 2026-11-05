@@ -404,6 +404,15 @@ impl<'a> PacketWriter<'a> {
         (self.payload_cursor.position() - Self::PACKET_HEADER_SIZE as u64) as i32
     }
 
+    /// Appends bytes the caller has proven end strictly before the packet
+    /// boundary (`has_space(len + 1)` for the whole run). Under that bound
+    /// every async writer would also have skipped its flush, so not awaiting
+    /// here cannot drop a send, cancellation check or EOM transition.
+    pub(crate) fn write_bytes_within_packet(&mut self, bytes: &[u8]) {
+        debug_assert!(self.has_space(bytes.len() + 1));
+        let _ = std::io::Write::write_all(&mut self.payload_cursor, bytes);
+    }
+
     pub(crate) async fn write_fixed_bytes<const N: usize>(
         &mut self,
         bytes: &[u8; N],

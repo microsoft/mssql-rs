@@ -184,18 +184,18 @@ transparent reconnects.
   [ADO 46631](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46631).
   Enable `StaleHandleAfterReconnectIsInvalidatedAndReprepared` afterward under
   [ADO 47099](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47099).
-- **Concurrent IPD mutation during synchronous `SQLExecute`.** The plan
-  comparison in `DescRecord::parameter_definition` covers sequential mutations
-  between completed calls. An IPD edit made after execution takes its binding
-  snapshot can miss the staged plan, which execution later restores with its
-  old declaration, so applications must serialize parameter edits with
-  execution. Closing this requires coordinating the descriptor snapshot, plan
-  staging, and restoration together; a flag set only while the plan is absent
-  would leave the earlier snapshot-to-staging window uncovered. This is
-  distinct from the data-at-execution Need Data restriction (section 7.3 of
-  the [ODBC engineering instructions](../../.github/instructions/mssql-odbc.instructions.md#73-prepared-parameter-definitions)),
-  and is not a
-  claim that synchronous cross-thread calls are inherently invalid.
+- **Concurrent IPD mutation during synchronous `SQLExecute`: resolved.**
+  `DescRecord::parameter_definition` identifies SQL-definition changes, and
+  the statement retains the earliest changed ordinal across snapshot, staging,
+  and restoration, even while the prepared plan is temporarily absent.
+  Before the next execution snapshots bindings, it invalidates a restored plan
+  if a used marker changed. Equivalent definitions, APD-only edits, and changes
+  beyond the SQL's markers preserve plan reuse. The in-flight execution can
+  finish with its original snapshot; restoring its plan does not clear pending
+  invalidation. The separate Need Data restriction remains: complete or cancel
+  the data-at-execution sequence before changing bindings or live definitions
+  (section 7.3 of the
+  [ODBC engineering instructions](../../.github/instructions/mssql-odbc.instructions.md#73-prepared-parameter-definitions)).
 
 ## Conversion milestone: integers and strings
 

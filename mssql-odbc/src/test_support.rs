@@ -15,7 +15,7 @@ use crate::api::alloc_handle::sql_alloc_handle;
 use crate::api::free_handle::sql_free_handle;
 use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
-    SQL_NULL_HANDLE, SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlReturn,
+    SQL_NULL_HANDLE, SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlReturn, SqlWChar,
 };
 use crate::api::set_env_attr::sql_set_env_attr;
 use crate::api::sqlstate::DiagMsg;
@@ -470,6 +470,22 @@ impl Drop for MockServer {
             });
         }
     }
+}
+
+/// A `SELECT 1` padded with a comment to exactly `len` UTF-16 units, and a
+/// buffer holding it followed by a different statement and a terminator. A
+/// driver that reads anything other than exactly `len` units sees different
+/// text; the terminator keeps a mistaken `SQL_NTS` scan in bounds.
+pub(crate) fn padded_statement_text(len: usize) -> (String, Vec<SqlWChar>) {
+    const PREFIX: &str = "SELECT 1 /*";
+    const SUFFIX: &str = "*/";
+    let fill = len - PREFIX.len() - SUFFIX.len();
+    let text = format!("{PREFIX}{}{SUFFIX}", "x".repeat(fill));
+    let buffer = text
+        .encode_utf16()
+        .chain(" SELECT 2\0".encode_utf16())
+        .collect();
+    (text, buffer)
 }
 
 /// Starts a mock TDS server registered to answer `query` with `response`,
