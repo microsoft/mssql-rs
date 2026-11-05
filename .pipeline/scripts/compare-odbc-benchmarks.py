@@ -39,6 +39,12 @@ BAR_MAX_SQUARES = 20
 DEFAULT_REGRESSION_RATIO = 1.05
 DEFAULT_IMPROVEMENT_MAX = 3
 GEOMEAN_ENTRY = "OVERALL_GEOMEAN"
+PAIRED_FORMAT = "mssql-odbc-bench-paired/1"
+PAIRED_MIN_ROUNDS = 10
+PAIRED_ROLES = ("candidate", "baseline", "reference")
+# One-sided sign-test level a paired direction must reach before it counts.
+PAIRED_SIGN_ALPHA = 0.01
+PAIRED_CI_LEVEL = 0.95
 
 
 def read_samples(path):
@@ -419,6 +425,263 @@ def confirmation_plan(results, improvement_max):
     return plan, len(improvements) - len(kept)
 
 
+def binomial_upper_tail(count, successes):
+    """P(X >= successes) for X ~ Binomial(count, 1/2)."""
+    if successes <= 0:
+        return 1.0
+    total = sum(math.comb(count, value) for value in range(successes, count + 1))
+    return total / 2**count
+
+
+def sign_rounds_required(count, alpha=PAIRED_SIGN_ALPHA):
+    """Fewest same-direction rounds that a one-sided sign test accepts at alpha."""
+    for successes in range(count // 2 + 1, count + 1):
+        if binomial_upper_tail(count, successes) <= alpha:
+            return successes
+    return None
+
+
+def median_confidence_interval(sorted_values, level=PAIRED_CI_LEVEL):
+    """Distribution-free order-statistic interval for a median.
+
+    Uses the largest k with P(X <= k - 1) <= (1 - level) / 2, X ~ Bin(n, 1/2),
+    and returns the k-th smallest and k-th largest values.
+    """
+    count = len(sorted_values)
+    tail = (1.0 - level) / 2.0
+    rank = 0
+    for candidate in range(1, count // 2 + 1):
+        if 1.0 - binomial_upper_tail(count, candidate) <= tail:
+            rank = candidate
+        else:
+            break
+    if rank == 0:
+        return sorted_values[0], sorted_values[-1]
+    return sorted_values[rank - 1], sorted_values[count - rank]
+
+
+def load_paired(path, unpaired_names):
+    """Read and validate the paired harness document; any doubt is an error."""
+    with path.open(encoding="utf-8-sig") as stream:
+        document = json.load(stream)
+    if document.get("format") != PAIRED_FORMAT:
+        raise ValueError(f"{path}: expected format '{PAIRED_FORMAT}'")
+    rounds = document.get("rounds")
+    if not isinstance(rounds, int) or rounds < PAIRED_MIN_ROUNDS:
+        raise ValueError(f"{path}: paired runs need at least {PAIRED_MIN_ROUNDS} rounds")
+    delay = document.get("candidate_delay_ns")
+    if not isinstance(delay, int) or delay < 0:
+        raise ValueError(f"{path}: candidate_delay_ns must be a non-negative integer")
+    roles = [leg.get("role") for leg in document.get("legs") or []]
+    if len(set(roles)) != len(roles) or not set(roles) <= set(PAIRED_ROLES):
+        raise ValueError(f"{path}: leg roles must be distinct values of {PAIRED_ROLES}")
+    if "candidate" not in roles or "baseline" not in roles:
+        raise ValueError(f"{path}: paired runs need candidate and baseline legs")
+    benchmarks = document.get("benchmarks") or []
+    if not benchmarks:
+        raise ValueError(f"{path}: no paired benchmarks found")
+    names = set()
+    for entry in benchmarks:
+        name = entry.get("name")
+        if not isinstance(name, str) or not name or name in names:
+            raise ValueError(f"{path}: paired benchmark names must be unique strings")
+        if name in unpaired_names:
+            raise ValueError(f"{path}: paired benchmark '{name}' collides with a sample id")
+        names.add(name)
+        calls = entry.get("calls_per_batch")
+        if not isinstance(calls, int) or calls < 1:
+            raise ValueError(f"{path}: '{name}' needs a positive calls_per_batch")
+        seconds = entry.get("seconds") or {}
+        if set(seconds) != set(roles):
+            raise ValueError(f"{path}: '{name}' must carry times for exactly {roles}")
+        for role, values in seconds.items():
+            if (
+                not isinstance(values, list)
+                or len(values) != rounds
+                or not all(
+                    isinstance(value, (int, float))
+                    and math.isfinite(value)
+                    and value > 0
+                    for value in values
+                )
+            ):
+                raise ValueError(
+                    f"{path}: '{name}' {role} needs {rounds} positive batch times"
+                )
+    return document
+
+
+def paired_results(document, threshold, improvement_ratio):
+    """Turn per-round batch times into the paired verdicts.
+
+    Each round's candidate/baseline ratio is one paired observation. The gate
+    needs both a material effect (median ratio at or above the regression ratio)
+    and a consistent one (the candidate slower in enough rounds for a one-sided
+    sign test at PAIRED_SIGN_ALPHA), so neither one bad round nor a tiny but
+    consistent shift can fail the run.
+    """
+    rounds = document["rounds"]
+    results = []
+    for entry in document["benchmarks"]:
+        seconds = entry["seconds"]
+        calls = entry["calls_per_batch"]
+        ratios = [
+            candidate / baseline
+            for candidate, baseline in zip(seconds["candidate"], seconds["baseline"])
+        ]
+        ordered = sorted(ratios)
+        ratio = statistics.median(ordered)
+        quartiles = statistics.quantiles(ordered, n=4, method="inclusive")
+        ci_low, ci_high = median_confidence_interval(ordered)
+        faster = sum(1 for value in ratios if value < 1.0)
+        slower = sum(1 for value in ratios if value > 1.0)
+        decided = faster + slower
+        required = sign_rounds_required(decided)
+        significant_faster = required is not None and faster >= required
+        significant_slower = required is not None and slower >= required
+        if significant_faster:
+            direction = "faster"
+        elif significant_slower:
+            direction = "slower"
+        else:
+            direction = "no significant difference"
+        baseline_seconds = statistics.median(seconds["baseline"])
+        candidate_seconds = statistics.median(seconds["candidate"])
+        result = {
+            "name": entry["name"],
+            "mode": "paired",
+            "rounds": rounds,
+            "calls_per_batch": calls,
+            "baseline_median_seconds": baseline_seconds,
+            "candidate_median_seconds": candidate_seconds,
+            "baseline_us_per_call": baseline_seconds * 1e6 / calls,
+            "candidate_us_per_call": candidate_seconds * 1e6 / calls,
+            "candidate_ratio": ratio,
+            "change_percent": (ratio - 1.0) * 100.0,
+            "ratio_q1": quartiles[0],
+            "ratio_q3": quartiles[2],
+            "ratio_iqr": quartiles[2] - quartiles[0],
+            "ratio_ci95_low": ci_low,
+            "ratio_ci95_high": ci_high,
+            "candidate_faster_rounds": faster,
+            "candidate_slower_rounds": slower,
+            "sign_rounds_required": required,
+            "sign_test_p_two_sided": min(
+                1.0, 2.0 * binomial_upper_tail(decided, max(faster, slower))
+            ),
+            "direction": direction,
+            "regression": ratio >= threshold and significant_slower,
+            "verified_improvement": ratio <= 1.0 / improvement_ratio
+            and significant_faster,
+        }
+        if "reference" in seconds:
+            reference_seconds = statistics.median(seconds["reference"])
+            reference_ratio = statistics.median(
+                candidate / reference
+                for candidate, reference in zip(
+                    seconds["candidate"], seconds["reference"]
+                )
+            )
+            result.update(
+                {
+                    "reference_median_seconds": reference_seconds,
+                    "reference_us_per_call": reference_seconds * 1e6 / calls,
+                    "candidate_vs_reference_ratio": reference_ratio,
+                    "candidate_vs_reference_change_percent": (reference_ratio - 1.0)
+                    * 100.0,
+                }
+            )
+        results.append(result)
+    return results
+
+
+def paired_text(paired):
+    """Plain-text lines for the paired entries in comparison.txt."""
+    lines = [
+        "",
+        "Paired interleaved latency (median per-round candidate/baseline ratio)",
+        "",
+        f"{'benchmark':48} {'base us':>9} {'cand us':>9} {'ratio':>8} "
+        f"{'95% CI':>15} {'faster/slower':>14}",
+    ]
+    for result in paired:
+        lines.append(
+            f"{result['name'][:48]:48} "
+            f"{result['baseline_us_per_call']:9.2f} "
+            f"{result['candidate_us_per_call']:9.2f} "
+            f"{result['candidate_ratio']:8.4f} "
+            f"{result['ratio_ci95_low']:7.4f}-{result['ratio_ci95_high']:<7.4f} "
+            f"{result['candidate_faster_rounds']:>6}/{result['candidate_slower_rounds']:<7}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def paired_section(paired, threshold, reference_label, candidate_delay_ns):
+    """Markdown for the paired entries, including the rule they gate on."""
+    rounds = paired[0]["rounds"]
+    required = paired[0]["sign_rounds_required"]
+    lines = ["", "### Paired interleaved latency (candidate vs pinned baseline)", ""]
+    if candidate_delay_ns:
+        lines.extend(
+            [
+                f"> ⚠️ **Harness self-test run:** the candidate leg was slowed by "
+                f"{candidate_delay_ns} ns per call. These numbers do not describe "
+                "a driver.",
+                "",
+            ]
+        )
+    lines.append(
+        "One process holds a connection through every driver and alternates "
+        "short batches of calls between them, swapping the candidate and "
+        "baseline order every round, so the drivers share server state, machine "
+        "load, and clock regime within a fraction of a second. Each round gives "
+        "one candidate/baseline ratio; the "
+        f"headline is the median of **{rounds} rounds**, with a distribution-free "
+        "95% interval for that median."
+    )
+    lines.append("")
+    lines.append(
+        f"These entries gate on their own rule and are not re-measured: a "
+        f"regression needs a median ratio of at least **{threshold:.2f}** *and* "
+        f"the candidate slower in at least **{required} of {rounds}** rounds "
+        f"(one-sided sign test, p ≤ {PAIRED_SIGN_ALPHA}). A direction is reported "
+        "as faster or slower whenever the sign test alone passes, whatever its "
+        "size."
+    )
+    has_reference = all("candidate_vs_reference_ratio" in result for result in paired)
+    header = (
+        "| Benchmark | Rounds × calls | Baseline µs/call | Candidate µs/call | "
+        "Median ratio (95% CI) | IQR | Faster / slower rounds | Result |"
+    )
+    divider = "|---|--:|--:|--:|--:|--:|:--:|---|"
+    if has_reference:
+        header += f" Candidate / {reference_label} |"
+        divider += "--:|"
+    lines.extend(["", header, divider])
+    for result in paired:
+        if result["regression"]:
+            verdict = "❌ regression"
+        elif result["verified_improvement"]:
+            verdict = "✅ verified improvement"
+        else:
+            verdict = result["direction"]
+        verdict += f" (p={result['sign_test_p_two_sided']:.2g})"
+        row = (
+            f"| `{result['name']}` | {result['rounds']} × {result['calls_per_batch']} | "
+            f"{result['baseline_us_per_call']:.2f} | "
+            f"{result['candidate_us_per_call']:.2f} | "
+            f"{result['candidate_ratio']:.4f} "
+            f"({result['ratio_ci95_low']:.4f}–{result['ratio_ci95_high']:.4f}) | "
+            f"{result['ratio_iqr']:.4f} | "
+            f"{result['candidate_faster_rounds']} / {result['candidate_slower_rounds']} | "
+            f"{verdict} |"
+        )
+        if has_reference:
+            row += f" {result['candidate_vs_reference_ratio']:.4f} |"
+        lines.append(row)
+    return lines
+
+
 def comparison_text(results, reference_label=None):
     """Produce a compact plain-text artifact suited to step logs and downloads."""
     if reference_label is not None:
@@ -620,9 +883,13 @@ def summary_markdown(
     confirm_quorum=None,
     improvements_skipped=0,
     official_compare=False,
+    paired=None,
+    paired_path=None,
+    paired_delay_ns=0,
 ):
     """Build the single rich report uploaded by the shared PerfTest template."""
-    regressions = [result for result in results if result["regression"]]
+    paired = paired or []
+    regressions = [result for result in results + paired if result["regression"]]
     gated = "confirmed " if confirm_runs is not None else ""
     if regressions:
         verdict = (
@@ -791,6 +1058,10 @@ def summary_markdown(
             improvements_skipped,
         )
     )
+    if paired:
+        lines.extend(
+            paired_section(paired, threshold, reference_label, paired_delay_ns)
+        )
     if repetitions is None:
         sample_counts = {result["candidate_samples"] for result in results}
         repetitions = sample_counts.pop() if len(sample_counts) == 1 else None
@@ -841,6 +1112,8 @@ def summary_markdown(
                 f"- Microsoft samples: {describe_inputs(reference_paths)}",
             ]
         )
+    if paired_path is not None:
+        lines.append(f"- Paired latency rounds: {describe_inputs([paired_path])}")
     lines.append("")
     if reference_paths:
         lines.append(
@@ -853,6 +1126,12 @@ def summary_markdown(
         lines.append(
             "The gate is based on median complete-result wall time. Throughput "
             "counters come from the candidate samples."
+        )
+    if paired:
+        lines.append("")
+        lines.append(
+            "Paired latency entries are the exception: they gate on the paired "
+            "rule stated in their section, without confirmation rounds."
         )
     return "\n".join(add_section_spacing(lines)) + "\n"
 
@@ -874,6 +1153,9 @@ def parse_args():
     parser.add_argument("--improvement-ratio", type=float)
     parser.add_argument("--improvement-max", type=int, default=DEFAULT_IMPROVEMENT_MAX)
     parser.add_argument("--gbench-compare", type=Path)
+    # Raw rounds from mssql_odbc_bench_paired. Its entries carry their own verdict,
+    # so the runners pass it only to the final, gating invocation.
+    parser.add_argument("--paired", type=Path)
     parser.add_argument("--plan-out", type=Path)
     parser.add_argument("--ratios-out", type=Path)
     # The perf template attaches Markdown from the results tree, so the screening
@@ -1030,16 +1312,25 @@ def main():
         args.confirm_quorum,
     )
     plan, improvements_skipped = confirmation_plan(results, args.improvement_max)
+    improvement_ratio = args.improvement_ratio or args.regression_ratio
+    paired = []
+    paired_delay_ns = 0
+    if args.paired is not None:
+        paired_document = load_paired(args.paired, set(baseline))
+        paired = paired_results(paired_document, args.regression_ratio, improvement_ratio)
+        paired_delay_ns = paired_document["candidate_delay_ns"]
 
     reference_label = args.reference_label.strip() if reference else None
     text = comparison_text(results, reference_label)
+    if paired:
+        text += paired_text(paired)
     (args.output_dir / "comparison.txt").write_text(text, encoding="utf-8")
     if not args.no_summary:
         (args.output_dir / "summary.md").write_text(
             summary_markdown(
                 results,
                 args.regression_ratio,
-                args.improvement_ratio or args.regression_ratio,
+                improvement_ratio,
                 args.baseline,
                 args.candidate,
                 args.reference,
@@ -1051,15 +1342,20 @@ def main():
                 args.confirm_quorum,
                 improvements_skipped,
                 args.gbench_compare is not None,
+                paired,
+                args.paired,
+                paired_delay_ns,
             ),
             encoding="utf-8",
         )
     output = {
         "regression_ratio": args.regression_ratio,
-        "improvement_ratio": args.improvement_ratio or args.regression_ratio,
+        "improvement_ratio": improvement_ratio,
         "improvements_skipped": improvements_skipped,
-        "benchmarks": results,
+        "benchmarks": results + paired,
     }
+    if paired:
+        output["paired_candidate_delay_ns"] = paired_delay_ns
     if reference_label is not None:
         output["reference_label"] = reference_label
     if args.baseline_commit is not None:
@@ -1093,7 +1389,7 @@ def main():
     sys.stdout.write(text)
 
     gate_enabled = not args.no_fail_on_regression
-    if gate_enabled and any(result["regression"] for result in results):
+    if gate_enabled and any(result["regression"] for result in results + paired):
         return 2
     return 0
 

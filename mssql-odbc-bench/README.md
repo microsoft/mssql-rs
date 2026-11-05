@@ -29,6 +29,19 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_WRITE_MODE` | `parameter_array` | Use one parameter-array execute, or `sequential` for a driver without array support |
 | `ODBC_BENCH_LATENCY_CALLS` | catalog size | Override calls per `latency` sample (1-1000000) for short local runs; the perf lab leaves it unset |
 
+`mssql_odbc_bench_paired` reads the same variables (`ODBC_BENCH_DRIVER` is its
+candidate leg; `ODBC_BENCH_SCENARIO` and `ODBC_BENCH_LATENCY_CALLS` are ignored)
+plus:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ODBC_BENCH_PAIRED_BASELINE_DRIVER` | required | Registered driver name of the baseline leg |
+| `ODBC_BENCH_PAIRED_REFERENCE_DRIVER` | unset | Optional third leg (Microsoft ODBC in the lab), informational only |
+| `ODBC_BENCH_PAIRED_REFERENCE_PACKET_SIZE_KEYWORD` | `ODBC_BENCH_PACKET_SIZE_KEYWORD` | Packet-size spelling for the reference leg |
+| `ODBC_BENCH_PAIRED_ROUNDS` | `100` | Interleaved rounds (10-1000) |
+| `ODBC_BENCH_PAIRED_CALLS` | paired catalog size | Calls per leg per round (1-1000000) |
+| `ODBC_BENCH_PAIRED_CANDIDATE_DELAY_NS` | `0` | **Self-test only.** Busy-waits this long after every candidate call to check the method against a known slowdown; the report flags any run that sets it |
+
 Missing required values, connection errors, absent/invalid tables, ODBC
 warnings during retrieval, and correctness failures make the process fail.
 There is no disconnected or skipped workload mode. An unknown scenario is
@@ -108,7 +121,8 @@ After both legs:
 ## Workloads
 
 Seventeen measurements, all of them C++ calls into the driver: fourteen over nine
-tables, and three `latency` ones that need no table.
+tables, and three `latency` ones that need no table. The three `latency`
+workloads also run in a separate paired mode as `latency_paired/*`.
 Every id encodes the data shape, the row and column counts, and the access shape,
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
@@ -252,7 +266,51 @@ runs 500 untimed, validated warm-up calls.
 
 These are microsecond-scale on a shared lab VM, and the regression gate covers
 every benchmark. Measure their run-to-run noise on `main` before relying on them
-to gate.
+to gate. Their paired form below is the one built to resolve small changes.
+
+### `latency_paired` — the same calls, interleaved in one process
+
+Separate driver legs run minutes apart, so a 3-5% driver change is lost in
+machine and server drift: on identical driver code the lab's single-run
+candidate/baseline ratio for `latency/*` has moved by up to ±8%.
+`mssql_odbc_bench_paired` removes most of that drift by measuring the drivers
+side by side:
+
+- One process opens one connection per leg — candidate, pinned baseline, and
+  optionally Microsoft ODBC as a reference — through the Driver Manager, and
+  holds them all for the run.
+- For each latency workload, every leg runs the same preflight as `latency/*`,
+  then **100 rounds** (`ODBC_BENCH_PAIRED_ROUNDS`). In a round each leg runs an
+  untimed warm-up of a tenth of a batch (at least 20 calls) and then one timed
+  batch: 250 calls for `exec_direct_select1` and `prepared_select_param`, 100
+  for `exec_direct_16k_text`. Short batches keep the legs of a round within a
+  fraction of a second of each other, which matters more on a busy machine than
+  long batches do.
+- Candidate and baseline swap places every round (candidate, baseline /
+  baseline, candidate: ABBA), so they have the same mean position and linear
+  drift cancels in their ratio. A reference leg always runs last, after both:
+  it separates rounds, so no leg's batch directly follows its own and inherits
+  warm caches the others do not get. In local A/A runs, an earlier order that
+  let the candidate follow itself biased the ratio by about 1% in its favour.
+- The output is raw per-round batch seconds per leg
+  (`results/odbc-paired-latency.json`, format `mssql-odbc-bench-paired/1`). The
+  comparator turns each round into one candidate/baseline ratio.
+
+Two builds of mssql-odbc coexist in one process because the Driver Manager loads
+each by path. Windows `odbc32` loads two copies of `mssqlodbc.dll` from
+different directories as two modules with separate statics, thread-locals, and
+Tokio runtimes. unixODBC loads drivers through libltdl's `lt_dlopen`, which
+calls `dlopen` without `RTLD_GLOBAL`, and the Rust cdylib exports only the ODBC
+entry points, so neither build's symbols can bind to the other. The lab runs
+candidate and baseline from different target directories, which keeps them two
+distinct objects even though both carry the `mssqlodbc.so` SONAME. A leg pointed
+at the very same file shares one loaded instance, which is harmless for an A/A
+check.
+
+`ODBC_BENCH_PAIRED_CANDIDATE_DELAY_NS` exists only to validate the method: it
+busy-waits after every candidate call so the expected ratio is known in advance.
+It is in the harness, never in a driver, and the report marks any run that sets
+it.
 
 ## Measurement boundaries
 
@@ -270,6 +328,7 @@ access shape:
 | `getdata/*` | `SQLExecDirect`, the initial describe, then per row: `SQLFetch`, and per column a `SQLDescribeCol` plus its `SQLGetData` calls (including LOB continuations and the variant probe/`SQLColAttribute` pair) |
 | `write/*` | one parameter-array `SQLExecute`, or 2,000 sequential `SQLExecute` calls on the pinned Rust baseline |
 | `latency/*` | the whole batch: per call `SQLExecDirectW` or `SQLExecute`, `SQLFetch`, the value check, and `SQLCloseCursor`; no per-phase timestamps |
+| `latency_paired/*` | the same per batch; the warm-up calls before each batch are outside it |
 
 The per-cell `SQLDescribeCol` in the row-at-a-time shape is not an accident: it
 mirrors `SQLGetData_wrap`, which re-describes every column on every row, so it is
@@ -352,6 +411,32 @@ Confirmation raw JSON, ratios, and per-round comparisons are kept under
 `results/confirm/round<N>/`; the pre-confirmation comparison is kept under
 `results/initial/`. Only the final report is written as `summary.md`.
 
+### Paired latency gate
+
+`latency_paired/*` entries never enter screening or confirmation; the runner
+measures them once, after the initial pass, and passes them only to the final
+comparison. Each of the R rounds gives one ratio, candidate batch time / baseline
+batch time. The comparator reports:
+
+- the **median ratio** (the headline and `candidate_ratio` in
+  `comparison.json`), its distribution-free 95% interval from order statistics
+  (sorted rounds 40 and 61 of 100), and the interquartile range;
+- the rounds in which the candidate was faster and slower, and a two-sided
+  sign-test p-value;
+- a **direction**: `faster` or `slower` when that many rounds would pass a
+  one-sided sign test at p ≤ 0.01 (at least **63 of 100** rounds), otherwise
+  `no significant difference`. This is how a 3-5% change becomes visible: it
+  needs consistency, not size.
+
+A paired entry is a **regression**, and fails the run like a confirmed one, when
+its median ratio is at least the regression ratio (`1.05`) **and** the candidate
+was slower in enough rounds to pass that sign test. Size alone (a few slow
+rounds) or consistency alone (a steady 2% shift) does not gate. A median at or
+below 1 / improvement ratio with a significant `faster` direction is a verified
+improvement. The candidate/reference median ratio is reported but never gates.
+The harness rejects fewer than 10 rounds, below which the sign test is only met
+unanimously.
+
 ### Comparison engine
 
 Pairwise comparison is done by Google Benchmark's own `tools/compare.py` and
@@ -423,4 +508,5 @@ log.
 | `ODBC_BENCH_IMPROVEMENT_VERIFY_MAX` | `3` | Cap on re-measured improvements |
 | `ODBC_BENCH_CONFIRM_RUNS` | `4` | Confirmation rounds |
 | `ODBC_BENCH_CONFIRM_QUORUM` | majority (`3`) | Rounds required to confirm |
+| `ODBC_BENCH_PAIRED_ROUNDS` | `100` | Rounds of the paired latency run |
 | `ODBC_BENCH_FAIL_ON_REGRESSION` | `1` | Set `0` to publish the report without gating |

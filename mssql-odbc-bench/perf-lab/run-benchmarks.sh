@@ -177,6 +177,8 @@ read_positive_int() {
 }
 
 REPETITIONS="$(read_positive_int ODBC_BENCH_REPETITIONS "${ODBC_BENCH_REPETITIONS:-5}" 1)"
+# Rounds of the paired interleaved latency mode; the harness rejects fewer than 10.
+PAIRED_ROUNDS="$(read_positive_int ODBC_BENCH_PAIRED_ROUNDS "${ODBC_BENCH_PAIRED_ROUNDS:-100}" 10)"
 # Confirmation defaults match the fixed-baseline mssql-tds runner: four targeted
 # re-runs, reproduction required in a majority (3 of 4).
 CONFIRM_RUNS="$(read_positive_int ODBC_BENCH_CONFIRM_RUNS "${ODBC_BENCH_CONFIRM_RUNS:-4}" 1)"
@@ -392,9 +394,10 @@ CANDIDATE_DRIVER="$(driver_artifact "$REPO_ROOT" "$CANDIDATE_TARGET_DIR")"
 BASELINE_DRIVER="$(driver_artifact "$BASELINE_TREE" "$BASELINE_TARGET_DIR")"
 BENCH_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench"
 ADMIN_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench_admin"
+PAIRED_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench_paired"
 for required_file in \
     "$CANDIDATE_DRIVER" "$BASELINE_DRIVER" "$MICROSOFT_DRIVER" \
-    "$BENCH_EXE" "$ADMIN_EXE"; do
+    "$BENCH_EXE" "$ADMIN_EXE" "$PAIRED_EXE"; do
     if [ ! -f "$required_file" ]; then
         echo "ERROR: expected build output not found: $required_file" >&2
         exit 1
@@ -443,6 +446,7 @@ fi
     echo "write_baseline_mode=sequential"
     echo "write_reference_mode=parameter_array"
     echo "repetitions=$REPETITIONS"
+    echo "paired_rounds=$PAIRED_ROUNDS"
     echo "regression_ratio=$REGRESSION_RATIO"
     echo "confirm_runs=$CONFIRM_RUNS"
     echo "confirm_quorum=$CONFIRM_QUORUM"
@@ -519,6 +523,23 @@ for index in "${!SCENARIOS[@]}"; do
     fi
 done
 cpu_sample "initial-end"
+
+# One process, one connection per driver, batches interleaved per round. unixODBC
+# loads each driver through libltdl without RTLD_GLOBAL, so the two Rust builds
+# keep separate symbols and statics. Paired entries carry their own verdict, so
+# they skip the screening and confirmation flow and reach only the final
+# comparison.
+PAIRED_FILE="$RESULTS_DIR/odbc-paired-latency.json"
+cpu_sample "paired-start"
+echo ">>> Running paired interleaved latency ($PAIRED_ROUNDS rounds)..."
+ODBC_BENCH_DRIVER="$CANDIDATE_DRIVER_NAME" \
+    ODBC_BENCH_SCENARIO="" \
+    ODBC_BENCH_PACKET_SIZE_KEYWORD="PacketSize" \
+    ODBC_BENCH_PAIRED_BASELINE_DRIVER="$BASELINE_DRIVER_NAME" \
+    ODBC_BENCH_PAIRED_REFERENCE_DRIVER="$MICROSOFT_DRIVER_NAME" \
+    ODBC_BENCH_PAIRED_ROUNDS="$PAIRED_ROUNDS" \
+    "${BENCH_PREFIX[@]}" "$PAIRED_EXE" "--out=$PAIRED_FILE"
+cpu_sample "paired-end"
 
 three_way_args=()
 for index in "${!SCENARIOS[@]}"; do
@@ -675,6 +696,7 @@ fi
 final_args=(
     "${three_way_args[@]}"
     --output-dir "$RESULTS_DIR"
+    --paired "$PAIRED_FILE"
     --confirm-runs "$CONFIRM_RUNS"
     --confirm-quorum "$CONFIRM_QUORUM"
     "${CONFIRMATION_ARGS[@]}"
