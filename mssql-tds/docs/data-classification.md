@@ -128,7 +128,7 @@ token was read whole, so the connection is unaffected.
 | Out-of-range index, unknown rank, budget exceeded | Protocol error | Retired; session recovery disarmed |
 | `0xA3` on a connection that did not negotiate it | Protocol error | Retired; session recovery disarmed |
 | Transport error or truncation inside the token | The reader error | Retired; recovery kept armed for a lost transport |
-| Request timeout or `CancelHandle` during the read | Timeout or cancellation error | Settled through ATTENTION; usable afterwards |
+| Request timeout or `CancelHandle` during the read | Timeout or cancellation error | Settled through ATTENTION and usable if settlement succeeds; otherwise retired with the same error, so check `is_connection_dead()` |
 | Caller drops the future during the read | None | Not settled; must not be reused |
 | Fewer classified columns than result columns | Accepted | Unaffected |
 | More classified columns than result columns | Classification dropped, warning logged | Unaffected |
@@ -143,7 +143,8 @@ Dropping a read future, for example with `tokio::select!` or an outer
 `tokio::time::timeout`, skips the ATTENTION settlement. As with a row, column
 metadata or PLP value split across packets, the reader can be left inside the
 token, so drop the client rather than reuse it. Use the request timeout or a
-`CancelHandle` to interrupt a read and keep the connection.
+`CancelHandle` to interrupt a read: the connection is then kept when the
+interrupted token and the ATTENTION acknowledgement both complete in time.
 
 ### Session recovery
 
