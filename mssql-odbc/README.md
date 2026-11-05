@@ -97,6 +97,15 @@ character encoding, migration notes, and tracing. See the
 [parity registry](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/parity-deviations.md)
 for deliberate differences from Microsoft ODBC Driver for SQL Server.
 
+## Tracing
+
+Tracing is off by default. Set `MSSQL_TDS_TRACE=true` before the first ODBC
+call to enable it; use `MSSQL_TDS_TRACE_LEVEL=warn,mssqlodbc=debug` for command
+diagnostics. Output goes to stderr unless `MSSQL_TDS_TRACE_DIR` is set.
+Traces can contain SQL text and parameter values; protect captured logs.
+See the [tracing guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/driver-guide.md#tracing)
+for configuration, correlation IDs, and file rollover.
+
 ## Test
 
 Run the Rust unit tests from the repository root:

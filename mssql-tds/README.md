@@ -58,54 +58,18 @@ before connecting; certificate validation remains enabled.
 cancellation, and other per-command settings. Use `advance()` for subsequent
 results in a batch. See the [API reference](https://docs.rs/mssql-tds).
 
-SQL-batch timeout accounting includes both sending the batch and reading its
-response.
-
-Use `begin_transaction_with_options`, `commit_transaction_with_options`, and
-`rollback_transaction_with_options` to bound transaction requests with the same
-options. The timeout covers both sending the request and consuming its response.
-Their original counterparts remain unbounded. Commit and rollback never reconnect
-onto a different session.
-
-## Vectors
-
-Connections request `VectorVersion::V2` by default, supporting float32 and float16
-vectors when the server negotiates the corresponding feature version. Set
-`ClientContext::vector_version` to `VectorVersion::V1` before connecting to opt out
-of float16 support while retaining float32 support. A float16 RPC parameter,
-including a typed NULL, requires negotiated V2; requesting V2 alone does not
-guarantee server support.
-
-`SqlVector::try_from_f32` creates float32 vectors (up to 1998 dimensions).
-`SqlVector::try_from_f16` accepts `Vec<f32>` and tags it for float16 wire storage
-(up to 3996 dimensions). Both types are held in memory as `f32` and exposed through
-`as_f32()`; constructing a float16 vector does not immediately round its values.
-Serialization narrows each element to IEEE 754 binary16; reads widen it back to
-`f32`. Conversion is lossy and can produce zero or infinity without an error.
-Validate inputs if your application must reject that loss. See
-[float16 conversion semantics](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#float16-vector-conversion)
-for rounding and range boundaries.
-
-## Connection policy and migration
-
-See the [connection behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
-for connection defaults, MultiSubnetFailover settings, transport limitations,
-migration, timeouts, and DNS caching.
-
 ## Feature flags
 
 | Feature | Default | Purpose |
 |---|---|---|
 | `integrated-auth` | On | Enables `sspi` (Windows) and `gssapi` (Unix Kerberos). |
-| `tls-schannel-direct-on-windows` | On | Enables `tls-schannel-direct`: the in-tree Windows Schannel TLS engine. |
-| `tls-network-framework-on-macos` | On | Enables `tls-network-framework`: on macOS, TDS 8.0 (Strict) TCP connections are opened through Apple's Network.framework, adding TLS 1.3 and the `X25519MLKEM768` post-quantum key exchange. |
+| `tls-schannel-direct-on-windows` | On | Enables `tls-schannel-direct` for Windows Schannel TLS. |
+| `tls-network-framework-on-macos` | On | Enables `tls-network-framework` for macOS Strict TCP connections. |
 
 Set `default-features = false` to omit integrated authentication and use
 `native-tls` on all platforms. Individual auth and TLS features can be enabled
 separately. Linux builds require OpenSSL development libraries; Unix integrated
-authentication loads GSSAPI at runtime. On macOS, TDS 7.x handshakes always use
-Secure Transport (TLS 1.2 maximum); see
-[TLS on macOS](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#tls-on-macos).
+authentication loads GSSAPI at runtime.
 
 The default Network.framework feature requires a macOS deployment target of
 10.15 or later. For x86_64 macOS builds, set `MACOSX_DEPLOYMENT_TARGET=10.15`
@@ -113,41 +77,13 @@ The default Network.framework feature requires a macOS deployment target of
 Apple Silicon's default deployment target already meets this requirement.
 Disabling `tls-network-framework` removes this added minimum.
 
-## Response lifecycle
+## Documentation
 
-Drain a response with `close_query()` before reuse, or call
-`cancel_query(timeout_secs)` to abandon it and wait for cancellation
-acknowledgement. `abandon_query(timeout_secs)` abandons it the way an ODBC
-statement close does: unread messages and statement errors are discarded, and
-ATTENTION is skipped when the response has already fully arrived. Zero uses the
-transport default; failed cancellation settlement retires the connection.
-Discarding rows during cancellation does not decode values or resolve Always
-Encrypted keys.
-
-Write deadlines apply to SQL batches, RPCs (including streamed parameters), and
-bulk copy. If a timeout interrupts an in-flight packet, the connection is retired
-without TLS shutdown or automatic session recovery, including during later explicit
-closure. There is no packet-completion grace period, and cancellation cannot extend
-the request's write deadline. Transport failures remain eligible for negotiated
-recovery; at a clean packet boundary, normal withdrawal or cancellation recovery
-remains available.
-
-## Runtime behavior
-
-Healthy commands do not allocate a session-recovery future; recovery boxes it
-only when needed. Connection setup boxes its action chain once per connection
-to reduce caller stack use without a thread handoff.
-
-String decoding follows column metadata, not BOM-shaped prefixes in values.
-The [behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
-documents encoding and stack-use details.
-
-## Legacy LOB parameters
-
-`SqlType::Text`, `SqlType::NText`, and `SqlType::Image` RPC parameters accept
-materialized, empty, and NULL values. A streamed value can keep its legacy
-declaration through `RpcParameter::with_streamed_declaration` while sending a
-MAX/PLP payload, without buffering the whole value.
+- [API reference](https://docs.rs/mssql-tds) for public types and methods.
+- [Client guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/client-guide.md)
+  for request timeouts, response cleanup, vectors, and LOB parameters.
+- [Connection and decoding behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md)
+  for connection policy, TLS, DNS caching, encoding, and runtime details.
 
 ## License
 
