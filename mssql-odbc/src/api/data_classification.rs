@@ -692,6 +692,39 @@ mod tests {
         assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
     }
 
+    /// A cancellation that lands after the last read turns the call into a
+    /// failure (`HY008`), so even a prepared statement drops its classification.
+    #[test]
+    fn a_late_cancellation_drops_the_classification() {
+        use std::time::{Duration, Instant};
+
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let raw = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(classification(ird(raw)), (SQL_SUCCESS, payload));
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(raw) };
+        let operation = stmt.begin_operation().unwrap();
+        let address = raw as usize;
+        let rc = std::thread::scope(|scope| {
+            let cancel =
+                scope.spawn(move || unsafe { crate::api::SQLCancel(address as SqlHandle) });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !stmt.cancellation_state_for_test().1 {
+                assert!(Instant::now() < deadline, "cancel did not signal");
+                std::thread::yield_now();
+            }
+            let rc = super::super::exec_common::finish_operation(operation, stmt, raw, SQL_SUCCESS);
+            assert_eq!(cancel.join().unwrap(), SQL_SUCCESS);
+            rc
+        });
+
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(classification(ird(raw)).0, SQL_ERROR);
+        assert_last_diag(&desc_diags(ird(raw)), ERR_INVALID_DESCRIPTOR_FIELD);
+    }
+
     /// A failed execution reports no classification, not the one its
     /// statement had before.
     #[test]

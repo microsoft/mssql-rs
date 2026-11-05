@@ -220,6 +220,8 @@ fn settle_late_cancellation(
             return SQL_ERROR;
         }
     }
+    // The call now fails, so its classification goes with it, prepared or not.
+    super::ird::clear_ird_classification(stmt);
     let drained = !matches!(
         super::close_cursor::abandon_and_release(stmt, statement_handle),
         super::close_cursor::DrainOutcome::Failed
