@@ -34,17 +34,17 @@ COMPARATOR = REPO_ROOT / ".pipeline" / "scripts" / "compare-odbc-benchmarks.py"
 # mirrored.
 BENCHMARKS = (
     "fetch/narrow_2m_c15_fixed/bound_rowset_1000",
-    "fetch/wide_10k_c600_fixed/bound_rowset_1000",
-    "fetch/rowset_100k_c15_fixed/bound_rowset_1",
-    "fetch/rowset_100k_c15_fixed/bound_rowset_64",
-    "fetch/rowset_100k_c15_fixed/bound_rowset_1000",
-    "fetch/rowset_100k_c15_fixed/bind_cycle_rowset_64",
-    "fetch/rowset_20k_c15_fixed/bind_cycle_rowset_1",
+    "fetch/wide_40k_c600_fixed/bound_rowset_1000",
+    "fetch/rowset_1m_c15_fixed/bound_rowset_1",
+    "fetch/rowset_1m_c15_fixed/bound_rowset_64",
+    "fetch/rowset_1m_c15_fixed/bound_rowset_1000",
+    "fetch/rowset_1m_c15_fixed/bind_cycle_rowset_64",
+    "fetch/rowset_200k_c15_fixed/bind_cycle_rowset_1",
     "fetch/varwidth_100k_c7_nullable/bound_rowset_1000",
     "fetch/varwidth_100k_c7_nullable/bound_rowset_64",
-    "getdata/rowwise_20k_c15_fixed/inline_values",
-    "getdata/rowwise_1k_c3_lob_max/chunked_8192",
-    "getdata/rowwise_20k_c16_mixed_lob/whole_result_rowwise",
+    "getdata/rowwise_200k_c15_fixed/inline_values",
+    "getdata/rowwise_10k_c3_lob_max/chunked_8192",
+    "getdata/rowwise_200k_c16_mixed_lob/whole_result_rowwise",
     "getdata/rowwise_20k_c4_variant/probe_colattribute",
 )
 

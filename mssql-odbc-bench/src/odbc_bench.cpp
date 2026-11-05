@@ -770,19 +770,20 @@ std::uint64_t TableSpec::logical_bytes_total() const {
 
 // The catalog the admin executable creates and every measurement reads.
 //
-// Row counts are chosen per access shape so one full retrieval stays in the
-// hundreds of milliseconds on all three drivers: a rowset-1 workload issues one
+// Row counts are chosen per access shape so one full retrieval takes roughly a
+// second on mssql-odbc: same-commit runs showed 100-300 ms samples drifting
+// 5-13% between runs, wider than the 5% gate. A rowset-1 workload issues one
 // driver round trip per row, so it cannot use the same row count as a
 // rowset-1000 one and still finish in comparable time.
 const std::array<TableSpec, kTableCount>& tables() {
     static const std::array<TableSpec, kTableCount> catalog = {{
         {"mssql_odbc_bench_fixed_2m_c15", TableShape::fixed_pattern, 2'000'000, 1},
-        {"mssql_odbc_bench_fixed_10k_c600", TableShape::fixed_pattern, 10'000, 40},
-        {"mssql_odbc_bench_fixed_100k_c15", TableShape::fixed_pattern, 100'000, 1},
-        {"mssql_odbc_bench_fixed_20k_c15", TableShape::fixed_pattern, 20'000, 1},
+        {"mssql_odbc_bench_fixed_40k_c600", TableShape::fixed_pattern, 40'000, 40},
+        {"mssql_odbc_bench_fixed_1m_c15", TableShape::fixed_pattern, 1'000'000, 1},
+        {"mssql_odbc_bench_fixed_200k_c15", TableShape::fixed_pattern, 200'000, 1},
         {"mssql_odbc_bench_varwidth_100k_c7", TableShape::variable_width, 100'000, 0},
-        {"mssql_odbc_bench_lobmax_1k_c3", TableShape::lob_max, 1'000, 0},
-        {"mssql_odbc_bench_mixedlob_20k_c16", TableShape::mixed_lob, 20'000, 1},
+        {"mssql_odbc_bench_lobmax_10k_c3", TableShape::lob_max, 10'000, 0},
+        {"mssql_odbc_bench_mixedlob_200k_c16", TableShape::mixed_lob, 200'000, 1},
         {"mssql_odbc_bench_variant_20k_c4", TableShape::sql_variant, 20'000, 0},
     }};
     return catalog;
@@ -809,27 +810,27 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
          &table_by_name("mssql_odbc_bench_fixed_2m_c15"), AccessMode::bound_drain,
          kFetchAllRowset},
         // Per-row conversion and binding breadth, still below the 8060-byte row limit.
-        {"fetch/wide_10k_c600_fixed/bound_rowset_1000", "wide",
-         &table_by_name("mssql_odbc_bench_fixed_10k_c600"), AccessMode::bound_drain,
+        {"fetch/wide_40k_c600_fixed/bound_rowset_1000", "wide",
+         &table_by_name("mssql_odbc_bench_fixed_40k_c600"), AccessMode::bound_drain,
          kFetchAllRowset},
         // The three rowset sizes over identical data, so only the cadence differs.
-        {"fetch/rowset_100k_c15_fixed/bound_rowset_1", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_drain,
+        {"fetch/rowset_1m_c15_fixed/bound_rowset_1", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_drain,
          kFetchManyDefaultRowset},
-        {"fetch/rowset_100k_c15_fixed/bound_rowset_64", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_drain,
+        {"fetch/rowset_1m_c15_fixed/bound_rowset_64", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_drain,
          kFetchManyCadenceRowset},
-        {"fetch/rowset_100k_c15_fixed/bound_rowset_1000", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_drain,
+        {"fetch/rowset_1m_c15_fixed/bound_rowset_1000", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_drain,
          kFetchAllRowset},
         // Same data and cadence as bound_rowset_64, plus the per-call describe,
         // rebind, and unbind that fetchmany() repeats. The pair isolates that cost.
-        {"fetch/rowset_100k_c15_fixed/bind_cycle_rowset_64", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_bind_cycle,
+        {"fetch/rowset_1m_c15_fixed/bind_cycle_rowset_64", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_bind_cycle,
          kFetchManyCadenceRowset},
         // The default arraysize: one bind/fetch/unbind lifecycle per row.
-        {"fetch/rowset_20k_c15_fixed/bind_cycle_rowset_1", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_20k_c15"), AccessMode::bound_bind_cycle,
+        {"fetch/rowset_200k_c15_fixed/bind_cycle_rowset_1", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_200k_c15"), AccessMode::bound_bind_cycle,
          kFetchManyDefaultRowset},
         // Nullable inline variable width, kept separate from the MAX/PLP path.
         {"fetch/varwidth_100k_c7_nullable/bound_rowset_1000", "varwidth",
@@ -840,16 +841,16 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
          kFetchManyCadenceRowset},
         // Row-at-a-time SQLGetData over ordinary inline values: the same columns
         // as bound_rowset_1, so the pair separates the call shape from the cadence.
-        {"getdata/rowwise_20k_c15_fixed/inline_values", "getdata",
-         &table_by_name("mssql_odbc_bench_fixed_20k_c15"), AccessMode::row_wise_get_data,
+        {"getdata/rowwise_200k_c15_fixed/inline_values", "getdata",
+         &table_by_name("mssql_odbc_bench_fixed_200k_c15"), AccessMode::row_wise_get_data,
          kFetchManyDefaultRowset},
         // MAX text past one chunk, so every value needs repeated 8192-byte calls.
-        {"getdata/rowwise_1k_c3_lob_max/chunked_8192", "getdata",
-         &table_by_name("mssql_odbc_bench_lobmax_1k_c3"), AccessMode::row_wise_get_data,
+        {"getdata/rowwise_10k_c3_lob_max/chunked_8192", "getdata",
+         &table_by_name("mssql_odbc_bench_lobmax_10k_c3"), AccessMode::row_wise_get_data,
          kFetchManyDefaultRowset},
         // One small MAX column forcing all 16 columns onto the row-at-a-time path.
-        {"getdata/rowwise_20k_c16_mixed_lob/whole_result_rowwise", "getdata",
-         &table_by_name("mssql_odbc_bench_mixedlob_20k_c16"), AccessMode::row_wise_get_data,
+        {"getdata/rowwise_200k_c16_mixed_lob/whole_result_rowwise", "getdata",
+         &table_by_name("mssql_odbc_bench_mixedlob_200k_c16"), AccessMode::row_wise_get_data,
          kFetchManyDefaultRowset},
         // The sql_variant sequence: zero-length SQL_C_BINARY probe, then
         // SQLColAttribute(SQL_CA_SS_VARIANT_TYPE), then the typed read.
