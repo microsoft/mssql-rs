@@ -1762,7 +1762,7 @@ pub(super) fn finish_execute(
     op: &str,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
-    let data_classification = super::data_classification::capture(dbc, &client);
+    let data_classification = super::data_classification::capture(&client);
     let has_result_set = !metadata.is_empty();
 
     if !has_result_set && client.has_open_batch() {

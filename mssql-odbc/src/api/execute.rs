@@ -232,6 +232,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         Ok(s) => s,
         Err(rc) => return rc,
     };
+    super::ird::clear_ird_classification(stmt);
 
     #[cfg(test)]
     tests::after_execution_staging();
@@ -671,7 +672,7 @@ fn finish_parameter_array(
     mut batch: BatchClientResults,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
-    let data_classification = super::data_classification::capture(dbc, &client);
+    let data_classification = super::data_classification::capture(&client);
     // Like a scalar execute, wait for the first row or the end of an empty
     // first set. msodbcsql's SQLExecute reads an empty set through its DONE
     // (OnDone), reporting that set's status and any error now (measured on

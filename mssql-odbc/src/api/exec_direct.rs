@@ -377,6 +377,7 @@ fn sql_exec_direct_w_operation(
             return rc;
         }
     };
+    super::ird::clear_ird_classification(stmt);
 
     let ParamsWithDae {
         params,

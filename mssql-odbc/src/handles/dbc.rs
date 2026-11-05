@@ -531,11 +531,28 @@ impl DbcHandle {
             error!(owner = ?lease.owner(), "dbc mutex poisoned returning a wire lease");
             return None;
         };
-        if !state.wire.restore(lease, how) {
+        if !self.restore_lease(&mut state, lease, how) {
             return None;
         }
         after_restore();
         Some(publish(&mut state))
+    }
+
+    /// Returns `lease` to the wire. Every hand-back goes through here so the
+    /// Data Classification version the IRD reports follows a session that
+    /// recovery replaced while the lease was out.
+    pub(crate) fn restore_lease(
+        &self,
+        state: &mut DbcState,
+        lease: WireLease,
+        how: LeaseReturn,
+    ) -> bool {
+        let version = lease.negotiated_data_classification_version();
+        if !state.wire.restore(lease, how) {
+            return false;
+        }
+        self.publish_data_classification_version(version);
+        true
     }
 }
 

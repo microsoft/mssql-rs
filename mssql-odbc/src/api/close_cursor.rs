@@ -16,7 +16,9 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, StmtState};
+use crate::handles::stmt::{
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_PREPARED, StmtState,
+};
 use crate::handles::wire::{ClaimError, ClaimPolicy, LeaseReturn, WireOwner};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
@@ -92,8 +94,12 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     // longer discover it there — take it now and surface it below instead
     // of silently closing as if the batch had never errored.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
+    let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
+    if !prepared {
+        super::ird::clear_ird_classification(stmt);
+    }
 
     let outcome = abandon_and_release(stmt, statement_handle);
     if let Some(e) = pending_fetch_error {
@@ -160,8 +166,12 @@ pub(super) fn free_stmt_close_locked(
     let needs_drain = !stmt_state.batch_exhausted;
     // See the identical comment in sql_close_cursor_safe.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
+    let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
+    if !prepared {
+        super::ird::clear_ird_classification(stmt);
+    }
 
     let outcome = if needs_drain {
         abandon_and_release_inner(stmt, statement_handle, process_is_shutting_down())
@@ -218,7 +228,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
-    let pending_fetch_error = {
+    let (pending_fetch_error, prepared) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
@@ -228,9 +238,13 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
             return SQL_SUCCESS;
         }
         let pending_fetch_error = stmt_state.pending_fetch_error.take();
+        let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
         reset_cursor_state(&mut stmt_state);
-        pending_fetch_error
+        (pending_fetch_error, prepared)
     };
+    if !prepared {
+        super::ird::clear_ird_classification(stmt);
+    }
 
     let outcome = abandon_and_release(stmt, handle);
     if let Some(e) = pending_fetch_error

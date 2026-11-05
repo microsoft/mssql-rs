@@ -177,10 +177,17 @@ protected:
         ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc_), SQL_HANDLE_ENV, env_);
     }
 
+    // Drops the table on a fresh statement: stmt_ may still carry a bound
+    // parameter array that would turn the DROP into an array execution.
     void TearDown() override {
         if (!table_.empty() && stmt_ != SQL_NULL_HSTMT) {
             SQLFreeStmt(stmt_, SQL_CLOSE);
-            ExecDirectIgnoreError("DROP TABLE IF EXISTS dbo." + table_);
+            SQLHSTMT cleanup = SQL_NULL_HSTMT;
+            if (SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &cleanup))) {
+                auto drop = ODBCTestUtils::ToSqlTStr("DROP TABLE IF EXISTS dbo." + table_);
+                SQLExecDirect(cleanup, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS);
+                SQLFreeHandle(SQL_HANDLE_STMT, cleanup);
+            }
         }
         ODBCTest::TearDown();
     }
@@ -312,8 +319,10 @@ protected:
 };
 
 // Every attribute call below runs while connected: before connecting, the
-// Windows Driver Manager caches SQLSetConnectAttr and answers SQLGetConnectAttr
-// itself (08003, or the cached value), so neither reaches the driver.
+// Driver Manager caches SQLSetConnectAttr and the Windows one answers
+// SQLGetConnectAttr itself (08003, or the cached value). The IRD is read only
+// while the statement has a result or is prepared, since unixODBC rejects an
+// IRD read in state S1 with HY007.
 
 TEST_F(DataClassificationTest, DefaultConnectionNegotiatesVersion1) {
     ConnectDbc();
@@ -321,8 +330,8 @@ TEST_F(DataClassificationTest, DefaultConnectionNegotiatesVersion1) {
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
     if (IsSkipped()) return;
 
-    EXPECT_EQ(1, IrdVersion());
     ExecDirect(ClassifiedSelect());
+    EXPECT_EQ(1, IrdVersion());
     ExpectClassifiedPayload(false);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     SQLWCHAR ssn[16] = {};
@@ -339,13 +348,14 @@ TEST_F(DataClassificationTest, Version2AddsRanks) {
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
     if (IsSkipped()) return;
 
-    EXPECT_EQ(2, IrdVersion());
     ExecDirect(ClassifiedSelect());
+    EXPECT_EQ(2, IrdVersion());
     ExpectClassifiedPayload(true);
 }
 
-// The Driver Manager replays a cached attribute at connect; the driver rejects
-// it, so the connection succeeds with IM006 and keeps the default.
+// The Driver Manager replays a cached attribute at connect and the driver
+// rejects it, so the connection keeps the default. The Windows Driver Manager
+// reports the rejection as IM006; unixODBC ignores it (SQLConnect.c).
 TEST_F(DataClassificationTest, InvalidPreConnectVersionKeepsTheDefault) {
     ASSERT_SQL_OK(SetRequestedVersion(0), SQL_HANDLE_DBC, dbc_);
     SqlTString connstr = ODBCTestUtils::BuildConnectionString();
@@ -353,9 +363,12 @@ TEST_F(DataClassificationTest, InvalidPreConnectVersionKeepsTheDefault) {
                                     static_cast<SQLSMALLINT>(connstr.size()), nullptr, 0,
                                     nullptr, SQL_DRIVER_NOPROMPT);
     ASSERT_TRUE(SQL_SUCCEEDED(rc)) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc_);
+#ifdef _WIN32
     EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, dbc_, "IM006"));
+#endif
     ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt_), SQL_HANDLE_DBC, dbc_);
     EXPECT_EQ(1u, RequestedVersion());
+    ExecDirect("SELECT 1 AS x");
     EXPECT_EQ(1, IrdVersion());
 }
 
@@ -372,9 +385,66 @@ TEST_F(DataClassificationTest, VersionSetWhileConnectedAppliesAtTheNextLogin) {
     ConnectDbc();
     EXPECT_EQ(SQL_SUCCESS, SetRequestedVersion(2));
     EXPECT_EQ(2u, RequestedVersion());
+    ExecDirect("SELECT 1 AS x");
     EXPECT_EQ(1, IrdVersion());
     Reconnect();
+    ExecDirect("SELECT 1 AS x");
     EXPECT_EQ(2, IrdVersion());
+}
+
+// A prepared statement keeps its classification across a cursor close; the
+// end of the batch and a failed execution drop it (measured on msodbcsql
+// 18.07.0001). A prepared statement's IRD stays readable under unixODBC.
+TEST_F(DataClassificationTest, PreparedStatementClassificationLifecycle) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+
+    auto sql = ODBCTestUtils::ToSqlTStr(ClassifiedSelect());
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_FALSE(IrdPayload().has_value());
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    while (SQLFetch(stmt_) == SQL_SUCCESS) {
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_FALSE(IrdPayload().has_value());
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLHSTMT other = AllocStmt();
+    auto drop = ODBCTestUtils::ToSqlTStr("DROP TABLE dbo." + table_);
+    ASSERT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(drop.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_FALSE(IrdPayload().has_value());
+}
+
+TEST_F(DataClassificationTest, ParameterArrayReportsEachSetsClassification) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+
+    auto sql = ODBCTestUtils::ToSqlTStr(ClassifiedSelect() + " WHERE id = ?");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER ids[2] = {1, 2};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   ids, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
 }
 
 TEST_F(DataClassificationTest, UnclassifiedResultHasNoPayload) {

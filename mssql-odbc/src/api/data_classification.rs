@@ -19,18 +19,12 @@ use mssql_tds::token::data_classification::{
 };
 use tracing::error;
 
-use crate::handles::DbcHandle;
-
 /// The wire index of an unspecified label or information type.
 const UNSPECIFIED_INDEX: u16 = 0xFFFF;
 
 /// Captures the classification of the result set `client` is positioned on,
 /// as the payload the IRD reports.
-///
-/// Also republishes the session's negotiated version, which session recovery
-/// can change after login.
-pub(super) fn capture(dbc: &DbcHandle, client: &TdsClient) -> Option<Box<[u8]>> {
-    dbc.publish_data_classification_version(client.negotiated_data_classification_version());
+pub(super) fn capture(client: &TdsClient) -> Option<Box<[u8]>> {
     let metadata = client.data_classification()?;
     let payload = payload(metadata);
     if payload.is_none() {
@@ -136,7 +130,7 @@ mod tests {
 
     use mssql_mock_tds::{
         ColumnDefinition, ColumnValue, ConnectionStore, DataClassificationAck, MockTdsServer,
-        QueryRegistry, QueryResponse, ResultSetResponse, Row, SqlDataType,
+        QueryRegistry, QueryResponse, ResultSetResponse, Row, SqlDataType, TerminalError,
     };
     use tokio::sync::Mutex;
 
@@ -145,15 +139,17 @@ mod tests {
     use crate::api::disconnect::sql_disconnect;
     use crate::api::driver_connect::sql_driver_connect_w;
     use crate::api::exec_direct::sql_exec_direct_w;
+    use crate::api::execute::sql_execute;
     use crate::api::get_connect_attr::sql_get_connect_attr_w;
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::more_results::sql_more_results;
     use crate::api::odbc_types::{
         SQL_CA_SS_DATA_CLASSIFICATION, SQL_CA_SS_DATA_CLASSIFICATION_VERSION,
-        SQL_COPT_SS_DATACLASSIFICATION_VERSION, SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_NTS,
-        SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+        SQL_COPT_SS_DATACLASSIFICATION_VERSION, SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_NO_DATA,
+        SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
         SqlSmallInt, SqlWChar,
     };
+    use crate::api::prepare::sql_prepare_w;
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
     use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::api::sqlstate::{
@@ -289,6 +285,12 @@ mod tests {
         fn set_ack(&self, ack: DataClassificationAck) {
             self.runtime.block_on(async {
                 self.registry.lock().await.set_data_classification_ack(ack);
+            });
+        }
+
+        fn register(&self, query: &str, response: QueryResponse) {
+            self.runtime.block_on(async {
+                self.registry.lock().await.register(query, response);
             });
         }
 
@@ -596,6 +598,118 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(length, full);
+
+        let mut exact = vec![0u8; payload.len()];
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                ird(stmt),
+                0,
+                DATA_CLASSIFICATION,
+                exact.as_mut_ptr().cast(),
+                full,
+                &mut length,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS, "an exact fit is not truncated");
+        assert_eq!(exact, payload);
+        assert!(desc_diags(ird(stmt)).is_empty());
+    }
+
+    /// Prepares and executes `sql` on a new statement of the connected `dbc`.
+    fn prepare_and_execute(h: &mut TestHandles, sql: &str) -> SqlHandle {
+        let stmt = h.alloc_extra_stmt();
+        let text: Vec<SqlWChar> = sql.encode_utf16().collect();
+        let len = SqlInteger::try_from(text.len()).unwrap();
+        assert_eq!(
+            unsafe { sql_prepare_w(stmt, text.as_ptr(), len) },
+            SQL_SUCCESS
+        );
+        let ret = unsafe { sql_execute(stmt) };
+        assert!(
+            matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+            "execute {sql}: {ret}"
+        );
+        stmt
+    }
+
+    fn classified_server() -> (Server, Vec<u8>) {
+        let wire = classified_token(false);
+        let registered = wire.clone();
+        let server = Server::start(DataClassificationAck::Requested, |registry| {
+            registry.register_with_data_classification(
+                CLASSIFIED,
+                int_response(&["ssn", "phone", "id"]),
+                registered,
+            );
+            registry.register(UNCLASSIFIED, int_response(&["id"]));
+        });
+        (server, wire[1..].to_vec())
+    }
+
+    /// msodbcsql's `SQLGetDescField` reads the session's version, so it
+    /// answers before any result set (`sqlcdesc.cpp:5220`).
+    #[test]
+    fn the_version_is_the_acknowledged_one_before_any_result_set() {
+        for (ack, expected) in [
+            (DataClassificationAck::Requested, 2),
+            (DataClassificationAck::Version(1), 1),
+            (DataClassificationAck::Omitted, 0),
+        ] {
+            let server = Server::start(ack, |_| {});
+            let mut h = TestHandles::with_env_dbc();
+            assert_eq!(set_requested_version(h.dbc, 2), SQL_SUCCESS);
+            server.connect(h.dbc);
+            let stmt = h.alloc_extra_stmt();
+            assert_eq!(classification_version(ird(stmt)), expected, "{ack:?}");
+        }
+    }
+
+    /// Measured on msodbcsql 18.07.0001: closing a cursor drops the
+    /// classification unless the statement is prepared.
+    #[test]
+    fn closing_drops_the_classification_unless_the_statement_is_prepared() {
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        let direct = execute(&server, &mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(direct) }, SQL_SUCCESS);
+        assert_eq!(classification(ird(direct)).0, SQL_ERROR);
+        assert_last_diag(&desc_diags(ird(direct)), ERR_INVALID_DESCRIPTOR_FIELD);
+
+        let prepared = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(prepared) }, SQL_SUCCESS);
+        assert_eq!(classification(ird(prepared)), (SQL_SUCCESS, payload));
+    }
+
+    /// msodbcsql clears it at batch end even for a prepared statement.
+    #[test]
+    fn the_end_of_the_batch_drops_the_classification() {
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+        assert_eq!(unsafe { sql_more_results(stmt) }, SQL_NO_DATA);
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+    }
+
+    /// A failed execution reports no classification, not the one its
+    /// statement had before.
+    #[test]
+    fn a_failed_execution_does_not_report_the_previous_classification() {
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+
+        server.register(
+            CLASSIFIED,
+            QueryResponse::error_only(TerminalError::new(208, 16, "Invalid object name.")),
+        );
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_ERROR);
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+        assert_last_diag(&desc_diags(ird(stmt)), ERR_INVALID_DESCRIPTOR_FIELD);
     }
 
     #[test]
@@ -613,18 +727,15 @@ mod tests {
 
         let mut value = [0u8; 64];
         let mut length: SqlInteger = 0;
-        let ret = unsafe {
-            sql_get_desc_field_w(
-                stmt_handle.ard,
-                0,
-                DATA_CLASSIFICATION,
-                value.as_mut_ptr().cast(),
-                64,
-                &mut length,
-            )
-        };
-        assert_eq!(ret, SQL_ERROR);
-        assert_last_diag(&desc_diags(stmt_handle.ard), ERR_INVALID_DESCRIPTOR_FIELD);
+        for desc in [stmt_handle.ard, stmt_handle.apd, stmt_handle.ipd] {
+            for field in [DATA_CLASSIFICATION, DATA_CLASSIFICATION_VERSION] {
+                let ret = unsafe {
+                    sql_get_desc_field_w(desc, 0, field, value.as_mut_ptr().cast(), 64, &mut length)
+                };
+                assert_eq!(ret, SQL_ERROR, "field {field}");
+                assert_last_diag(&desc_diags(desc), ERR_INVALID_DESCRIPTOR_FIELD);
+            }
+        }
 
         for field in [
             SQL_CA_SS_DATA_CLASSIFICATION,

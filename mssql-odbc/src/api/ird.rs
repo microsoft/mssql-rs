@@ -70,6 +70,19 @@ pub(super) fn populate_ird(
     Ok(())
 }
 
+/// Drops the IRD's `SQL_CA_SS_DATA_CLASSIFICATION` once its result set is gone:
+/// when an execution starts, at batch end, and when a statement that is not
+/// prepared closes its cursor. Matches where msodbcsql clears it
+/// (`ClearColinfo`, `sqlcfunc.cpp:641`), measured on 18.07.0001. Call without
+/// the STMT lock held. A poisoned IRD is left alone: `SQLGetDescField` already
+/// fails on it.
+pub(super) fn clear_ird_classification(stmt: &StmtHandle) {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+    if let Ok(mut desc_state) = desc.inner.lock() {
+        desc_state.data_classification = None;
+    }
+}
+
 fn ird_record_from_metadata(meta: &ColumnMetadata) -> DescRecord {
     let concise_type = odbc_sql_type(meta);
     DescRecord {

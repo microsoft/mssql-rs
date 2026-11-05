@@ -16,7 +16,7 @@ use crate::api::output_params::write_back_output_params;
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
 use super::close_cursor::reset_cursor_state;
-use super::ird::populate_ird;
+use super::ird::{clear_ird_classification, populate_ird};
 use crate::api::exec_common::post_claim_error;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
@@ -114,6 +114,8 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             // call's own success return.
             reset_cursor_state(&mut stmt_state);
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            drop(stmt_state);
+            clear_ird_classification(stmt);
             return SQL_ERROR;
         }
         if stmt_state.batch_exhausted && stmt_state.pending_row_counts.is_empty() {
@@ -145,6 +147,8 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             };
             reset_cursor_state(&mut stmt_state);
+            drop(stmt_state);
+            clear_ird_classification(stmt);
             debug!("SQLMoreResults: batch already known exhausted; returning SQL_NO_DATA");
             return if output_rc == SQL_SUCCESS {
                 SQL_NO_DATA
@@ -212,7 +216,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         let mut settled = None;
         if matches!(result, StatementResult::Rows) {
             metadata = Some(client.get_metadata().clone());
-            data_classification = super::data_classification::capture(dbc, &client);
+            data_classification = super::data_classification::capture(&client);
             // msodbcsql's navigation reads an empty parameter set through its
             // DONE (OnDone), reporting that set's status and any error now
             // rather than on the next fetch (measured on 18.6.2.1).
@@ -376,6 +380,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 )
             };
             drop(stmt_state);
+            clear_ird_classification(stmt);
             debug!("SQLMoreResults: no more result sets");
             if array_rc == SQL_ERROR || output_rc == SQL_ERROR {
                 SQL_ERROR
@@ -403,6 +408,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 post_tds_info_messages(&mut stmt_state, &info_messages);
             }
+            clear_ird_classification(stmt);
             SQL_ERROR
         }
     }

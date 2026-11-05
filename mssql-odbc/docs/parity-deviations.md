@@ -1368,7 +1368,9 @@ msodbcsql build is measured.
     index or an undefined rank still reaches the application. mssql-tds
     validates the token before the IRD sees it: such a payload is a protocol
     error that retires the connection, and an unpaired UTF-16 surrogate in a
-    name is returned as U+FFFD. The IRD payload is rebuilt from the
+    name is returned as U+FFFD. A token that classifies more columns than the
+    result set has is dropped with a warning, so the IRD reports `HY091`
+    where msodbcsql returns the bytes. The IRD payload is rebuilt from the
     validated metadata in the [MS-TDS] 2.2.7.5 layout, so for every token
     SQL Server sends it is byte-identical to msodbcsql's; measured at
     versions 1 and 2 on msodbcsql 18.07.0001 and SQL Server 2022. Only a
