@@ -11,11 +11,13 @@
 #include <sqlext.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <vector>
 
 namespace mssql::odbc::bench {
 
@@ -38,6 +40,9 @@ inline constexpr std::size_t kMaxRowsetSize = kFetchAllRowset;
 /// (`DAE_CHUNK_SIZE`). Matching it is what makes the chunked workload measure
 /// the same number of driver round trips the consumer would cause.
 inline constexpr std::size_t kLobChunkBytes = 8192;
+
+/// Read an environment variable; empty when it is unset.
+std::string environment_value(const char* name);
 
 /// Connection and workload selection shared by the admin and timed executables.
 ///
@@ -172,6 +177,10 @@ struct LatencySpec {
     /// pads `SELECT 1` with a trailing block comment to exactly this length.
     std::size_t text_chars;
     std::size_t calls_per_sample;
+    /// Id of the same workload in the paired, interleaved mode.
+    const char* paired_name;
+    /// Calls per driver leg in one paired round.
+    std::size_t paired_calls_per_batch;
 };
 
 inline constexpr std::size_t kLatencyWorkloadCount = 3;
@@ -332,9 +341,46 @@ public:
     /// compare against a round trip.
     RetrievalMetrics execute();
 
+    /// Run `calls` untimed, validated calls.
+    void warm_up(std::size_t calls);
+
+    std::size_t calls_per_sample() const;
+
+    /// Harness self-test only: busy-wait this long after every call, so a known
+    /// slowdown can be injected without touching a driver.
+    void set_per_call_delay(std::chrono::nanoseconds delay);
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+/// One connection in the paired latency mode.
+struct PairedLeg {
+    /// `candidate`, `baseline`, or `reference`.
+    std::string role;
+    Config config;
+};
+
+/// Settings for `mssql_odbc_bench_paired`.
+///
+/// The candidate leg is `Config::from_environment()`; the baseline and the
+/// optional reference leg differ only in driver name and, for the reference, the
+/// packet-size keyword spelling.
+struct PairedConfig {
+    std::vector<PairedLeg> legs;
+    std::size_t rounds = 0;
+    /// Calls per leg per round; 0 keeps each workload's paired catalog size.
+    std::size_t calls_override = 0;
+    /// Self-test slowdown applied to the candidate leg only; zero in the lab.
+    std::chrono::nanoseconds candidate_delay{0};
+
+    static PairedConfig from_environment();
+};
+
+/// Run every latency workload as interleaved candidate/baseline(/reference)
+/// batches on connections held open in this one process, and return the raw
+/// per-round batch times as JSON for the comparator.
+std::string run_paired_latency(const PairedConfig& config);
 
 }  // namespace mssql::odbc::bench

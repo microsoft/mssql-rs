@@ -400,6 +400,33 @@ function Invoke-BenchmarkLeg {
     Invoke-Native { & $script:BenchExe @arguments }
 }
 
+function Invoke-PairedLatency {
+    # One process, one connection per driver, batches interleaved per round. The
+    # paired-only variables are cleared afterwards so no later leg inherits them.
+    param([Parameter(Mandatory)][string]$Output)
+
+    $env:ODBC_BENCH_DRIVER = $script:CandidateDriverName
+    $env:ODBC_BENCH_SCENARIO = ''
+    $env:ODBC_BENCH_PACKET_SIZE_KEYWORD = 'PacketSize'
+    $env:ODBC_BENCH_PAIRED_BASELINE_DRIVER = $script:BaselineDriverName
+    $env:ODBC_BENCH_PAIRED_REFERENCE_DRIVER = $script:MicrosoftDriverName
+    $env:ODBC_BENCH_PAIRED_REFERENCE_PACKET_SIZE_KEYWORD = 'Packet Size'
+    $env:ODBC_BENCH_PAIRED_ROUNDS = [string]$script:PairedRounds
+    Write-Host ">>> Running paired interleaved latency ($script:PairedRounds rounds)..."
+    try {
+        Invoke-Native { & $script:PairedExe "--out=$Output" }
+    } finally {
+        foreach ($name in @(
+                'ODBC_BENCH_PAIRED_BASELINE_DRIVER',
+                'ODBC_BENCH_PAIRED_REFERENCE_DRIVER',
+                'ODBC_BENCH_PAIRED_REFERENCE_PACKET_SIZE_KEYWORD',
+                'ODBC_BENCH_PAIRED_ROUNDS'
+            )) {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Invoke-Comparator {
     # Exit 2 means the report was written and the gate tripped, so it has to reach
     # the caller instead of becoming a terminating error. The comparator's own
@@ -497,6 +524,7 @@ $HarnessBuildDir = Join-Path $RepoRoot 'target\odbc-bench'
 $CandidateTargetDir = Join-Path $RepoRoot 'target\odbc-candidate'
 $BaselineTargetDir = Join-Path $RepoRoot 'target\odbc-baseline'
 $CandidateDriverName = 'MSSQL Rust ODBC Perf Candidate'
+$script:CandidateDriverName = $CandidateDriverName
 $script:BaselineDriverName = 'MSSQL Rust ODBC Perf Baseline'
 $script:MicrosoftDriverName = 'ODBC Driver 18 for SQL Server'
 $script:NumpyVersion = '2.2.6'
@@ -509,6 +537,8 @@ $Scenarios = @('narrow', 'wide', 'rowset', 'varwidth', 'getdata', 'write', 'late
 $script:OdbcInstRoot = 'HKLM:\Software\ODBC\ODBCINST.INI'
 $script:DriversRegKey = "$script:OdbcInstRoot\ODBC Drivers"
 $script:Repetitions = Get-PositiveIntEnv -Name 'ODBC_BENCH_REPETITIONS' -Default 5
+# Rounds of the paired interleaved latency mode; the harness rejects fewer than 10.
+$script:PairedRounds = Get-PositiveIntEnv -Name 'ODBC_BENCH_PAIRED_ROUNDS' -Default 100
 # Confirmation defaults match the fixed-baseline mssql-tds runner: four targeted
 # re-runs, reproduction required in a majority (3 of 4).
 $ConfirmRuns = Get-PositiveIntEnv -Name 'ODBC_BENCH_CONFIRM_RUNS' -Default 4
@@ -704,12 +734,14 @@ try {
     $BaselineDriver = Get-DriverArtifact -SourceRoot $BaselineTree -TargetDir $BaselineTargetDir
     $script:BenchExe = Join-Path $HarnessRuntimeDir 'mssql_odbc_bench.exe'
     $AdminExe = Join-Path $HarnessRuntimeDir 'mssql_odbc_bench_admin.exe'
+    $script:PairedExe = Join-Path $HarnessRuntimeDir 'mssql_odbc_bench_paired.exe'
     foreach ($requiredFile in @(
             $CandidateDriver,
             $BaselineDriver,
             $MicrosoftDriver,
             $script:BenchExe,
-            $AdminExe
+            $AdminExe,
+            $script:PairedExe
         )) {
         if (-not (Test-Path -LiteralPath $requiredFile)) {
             throw "Expected build output not found: $requiredFile"
@@ -740,6 +772,7 @@ try {
         "write_baseline_mode=sequential",
         "write_reference_mode=parameter_array",
         "repetitions=$script:Repetitions",
+        "paired_rounds=$script:PairedRounds",
         "regression_ratio=$(Format-Invariant $RegressionRatio 'F4')",
         "confirm_runs=$ConfirmRuns",
         "confirm_quorum=$ConfirmQuorum",
@@ -828,6 +861,13 @@ try {
         }
     }
     Write-CpuSample 'initial-end'
+
+    # Paired entries carry their own verdict, so they skip the screening and
+    # confirmation flow and reach only the final comparison.
+    $PairedFile = Join-Path $ResultsDir 'odbc-paired-latency.json'
+    Write-CpuSample 'paired-start'
+    Invoke-PairedLatency -Output $PairedFile
+    Write-CpuSample 'paired-end'
 
     $threeWayArguments = @()
     foreach ($scenario in $Scenarios) { $threeWayArguments += @('--baseline', $baselineFiles[$scenario]) }
@@ -957,6 +997,7 @@ try {
 
     $finalArguments = $threeWayArguments + @(
         '--output-dir', $ResultsDir,
+        '--paired', $PairedFile,
         '--confirm-runs', [string]$ConfirmRuns,
         '--confirm-quorum', [string]$ConfirmQuorum
     ) + $confirmationArguments

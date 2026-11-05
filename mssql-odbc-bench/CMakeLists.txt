@@ -33,6 +33,7 @@ endif()
 
 add_library(mssql_odbc_bench_common STATIC
     src/odbc_bench.cpp
+    src/paired_latency.cpp
 )
 target_include_directories(mssql_odbc_bench_common
     PUBLIC
@@ -64,3 +65,8 @@ add_executable(mssql_odbc_bench_admin
     src/admin_main.cpp
 )
 target_link_libraries(mssql_odbc_bench_admin PRIVATE mssql_odbc_bench_common)
+
+add_executable(mssql_odbc_bench_paired
+    src/paired_main.cpp
+)
+target_link_libraries(mssql_odbc_bench_paired PRIVATE mssql_odbc_bench_common)

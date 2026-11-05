@@ -155,6 +155,8 @@ struct ColumnSpec {
     std::uint64_t null_phase = 0;
 };
 
+}  // namespace
+
 // Read environment values without platform-specific ownership leaking to callers.
 std::string environment_value(const char* name) {
 #ifdef _WIN32
@@ -171,6 +173,8 @@ std::string environment_value(const char* name) {
     return value == nullptr ? std::string{} : std::string(value);
 #endif
 }
+
+namespace {
 
 // Apply defaults only when the variable is absent or empty.
 std::string environment_value_or(const char* name, const char* fallback) {
@@ -863,16 +867,21 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
 // Small calls where per-call driver overhead, not payload, decides latency. Batch
 // sizes put one sample at roughly 0.8-2 s locally on both msodbcsql18 and
 // mssql-odbc: long enough to average scheduler jitter, short enough that the
-// scenario adds about a minute to an initial pass.
+// scenario adds about a minute to an initial pass. A paired batch is a twentieth
+// of a sample: short batches keep the legs of a round close enough in time to
+// see the same machine, and 100 rounds cost each leg about five samples.
 const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads() {
     static const std::array<LatencySpec, kLatencyWorkloadCount> specs = {{
         // The shortest non-prepared round trip.
-        {"latency/exec_direct_select1", LatencyCall::exec_direct, 0, 5'000},
+        {"latency/exec_direct_select1", LatencyCall::exec_direct, 0, 5'000,
+         "latency_paired/exec_direct_select1", 250},
         // The ORM shape: prepare once, then execute with a new parameter each call.
-        {"latency/prepared_select_param", LatencyCall::prepared_param, 0, 5'000},
+        {"latency/prepared_select_param", LatencyCall::prepared_param, 0, 5'000,
+         "latency_paired/prepared_select_param", 250},
         // Statement text large enough that client-side scanning and UTF-16
         // handling dominate; the trailing comment keeps server work trivial.
-        {"latency/exec_direct_16k_text", LatencyCall::exec_direct, 16'384, 2'000},
+        {"latency/exec_direct_16k_text", LatencyCall::exec_direct, 16'384, 2'000,
+         "latency_paired/exec_direct_16k_text", 100},
     }};
     return specs;
 }
@@ -2691,6 +2700,18 @@ public:
         return run(calls_);
     }
 
+    void warm_up(std::size_t calls) {
+        run(calls);
+    }
+
+    std::size_t calls_per_sample() const {
+        return calls_;
+    }
+
+    void set_per_call_delay(std::chrono::nanoseconds delay) {
+        delay_ = delay;
+    }
+
 private:
     // Enough to fault in driver code, settle the server plan cache, and warm the
     // socket path before the first timed sample; capped at one sample.
@@ -2794,6 +2815,12 @@ private:
             for (std::size_t call = 0; call < calls; ++call) {
                 fetch_row(submit());
                 close_cursor();
+                if (delay_.count() != 0) {
+                    // Sleep granularity is far coarser than a call, so spin.
+                    const auto until = std::chrono::steady_clock::now() + delay_;
+                    while (std::chrono::steady_clock::now() < until) {
+                    }
+                }
             }
             total_seconds = seconds_between(start, std::chrono::steady_clock::now());
         } catch (...) {
@@ -2819,6 +2846,7 @@ private:
     SQLINTEGER parameter_ = 0;
     SQLLEN parameter_indicator_ = sizeof(SQLINTEGER);
     SQLINTEGER next_parameter_ = 1;
+    std::chrono::nanoseconds delay_{0};
 };
 
 // Allocate descriptors once per catalog workload; each iteration still rebinds.
@@ -2876,6 +2904,18 @@ void LatencyRunner::preflight() {
 
 RetrievalMetrics LatencyRunner::execute() {
     return impl_->execute();
+}
+
+void LatencyRunner::warm_up(std::size_t calls) {
+    impl_->warm_up(calls);
+}
+
+std::size_t LatencyRunner::calls_per_sample() const {
+    return impl_->calls_per_sample();
+}
+
+void LatencyRunner::set_per_call_delay(std::chrono::nanoseconds delay) {
+    impl_->set_per_call_delay(delay);
 }
 
 }  // namespace mssql::odbc::bench

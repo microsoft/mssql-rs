@@ -526,5 +526,163 @@ class OfficialComparatorTests(ComparatorTestCase):
         self.assertTrue((out / "gbench-reference-vs-candidate.txt").is_file())
 
 
+PAIRED_BENCHMARKS = (
+    "latency_paired/exec_direct_select1",
+    "latency_paired/prepared_select_param",
+    "latency_paired/exec_direct_16k_text",
+)
+
+
+def make_paired_document(ratios, rounds=30, delay_ns=0, reference=True):
+    """Build the paired harness document with exact per-round ratios.
+
+    ``ratios`` maps a paired id to a list of per-round candidate/baseline ratios,
+    or is one list applied to every id. Baseline batches take 0.2 s.
+    """
+    legs = [
+        {"role": "candidate", "driver": "MSSQL Rust ODBC Perf Candidate"},
+        {"role": "baseline", "driver": "MSSQL Rust ODBC Perf Baseline"},
+    ]
+    if reference:
+        legs.append({"role": "reference", "driver": "ODBC Driver 18 for SQL Server"})
+    benchmarks = []
+    for name in PAIRED_BENCHMARKS:
+        values = ratios[name] if isinstance(ratios, dict) else ratios
+        seconds = {
+            "candidate": [0.2 * value for value in values],
+            "baseline": [0.2] * rounds,
+        }
+        if reference:
+            seconds["reference"] = [0.1] * rounds
+        benchmarks.append(
+            {
+                "name": name,
+                "calls_per_batch": 1000,
+                "warm_up_calls_per_batch": 50,
+                "seconds": seconds,
+            }
+        )
+    return {
+        "format": "mssql-odbc-bench-paired/1",
+        "rounds": rounds,
+        "candidate_delay_ns": delay_ns,
+        "legs": legs,
+        "benchmarks": benchmarks,
+    }
+
+
+class PairedTests(ComparatorTestCase):
+    """Paired entries carry their own verdict: material and consistent, or not."""
+
+    def paired(self, ratios, **kwargs):
+        path = self.write("paired.json", make_paired_document(ratios, **kwargs))
+        return self.three_way(100.0, 100.0, 40.0) + ["--paired", str(path)]
+
+    def paired_rows(self, out):
+        report = json.loads((out / "comparison.json").read_text(encoding="utf-8"))
+        return {
+            row["name"]: row
+            for row in report["benchmarks"]
+            if row.get("mode") == "paired"
+        }
+
+    def test_noise_around_one_passes_and_is_reported(self):
+        ratios = [0.99, 1.01] * 15
+        code, output, out = self.compare(self.paired(ratios))
+        self.assertEqual(code, 0, output)
+        rows = self.paired_rows(out)
+        self.assertEqual(sorted(rows), sorted(PAIRED_BENCHMARKS))
+        row = rows[PAIRED_BENCHMARKS[0]]
+        self.assertAlmostEqual(row["candidate_ratio"], 1.0, places=6)
+        self.assertEqual(row["direction"], "no significant difference")
+        self.assertEqual(row["sign_rounds_required"], 22)
+        self.assertAlmostEqual(row["candidate_vs_reference_ratio"], 2.0, places=6)
+        self.assertAlmostEqual(row["baseline_us_per_call"], 200.0, places=6)
+        summary = (out / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("Paired interleaved latency", summary)
+        self.assertIn(f"`{PAIRED_BENCHMARKS[2]}`", summary)
+        self.assertIn("✅", summary)
+
+    def test_consistent_regression_fails_the_run(self):
+        ratios = [1.07, 1.09] * 15
+        code, _, out = self.compare(self.paired(ratios))
+        self.assertEqual(code, 2)
+        row = self.paired_rows(out)[PAIRED_BENCHMARKS[1]]
+        self.assertTrue(row["regression"])
+        self.assertEqual(row["candidate_slower_rounds"], 30)
+        self.assertIn("❌ regression", (out / "summary.md").read_text(encoding="utf-8"))
+
+    def test_large_but_inconsistent_ratio_does_not_gate(self):
+        ratios = [1.20] * 15 + [0.99] * 15
+        code, output, out = self.compare(self.paired(ratios))
+        self.assertEqual(code, 0, output)
+        row = self.paired_rows(out)[PAIRED_BENCHMARKS[0]]
+        self.assertGreater(row["candidate_ratio"], 1.05)
+        self.assertFalse(row["regression"])
+
+    def test_small_consistent_regression_is_slower_but_does_not_gate(self):
+        ratios = [1.02, 1.03] * 15
+        code, output, out = self.compare(self.paired(ratios))
+        self.assertEqual(code, 0, output)
+        row = self.paired_rows(out)[PAIRED_BENCHMARKS[0]]
+        self.assertEqual(row["direction"], "slower")
+        self.assertFalse(row["regression"])
+
+    def test_consistent_small_improvement_is_measured(self):
+        ratios = [0.96, 0.97, 1.001] + [0.965] * 27
+        code, output, out = self.compare(self.paired(ratios))
+        self.assertEqual(code, 0, output)
+        row = self.paired_rows(out)[PAIRED_BENCHMARKS[2]]
+        self.assertEqual(row["direction"], "faster")
+        self.assertEqual(row["candidate_faster_rounds"], 29)
+        self.assertFalse(row["verified_improvement"])
+        self.assertAlmostEqual(row["candidate_ratio"], 0.965, places=6)
+        self.assertLessEqual(row["ratio_ci95_low"], 0.965)
+        self.assertGreaterEqual(row["ratio_ci95_high"], 0.965)
+
+    def test_paired_entries_never_enter_the_plan_or_round_ratios(self):
+        ratios_path = self.root / "ratios.txt"
+        plan_path = self.root / "plan.txt"
+        code, _, _ = self.compare(
+            self.paired([1.5] * 30)
+            + [
+                "--ratios-out",
+                str(ratios_path),
+                "--plan-out",
+                str(plan_path),
+                "--no-fail-on-regression",
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("latency_paired/", ratios_path.read_text(encoding="utf-8"))
+        self.assertNotIn("latency_paired/", plan_path.read_text(encoding="utf-8"))
+
+    def test_self_test_delay_is_flagged(self):
+        code, _, out = self.compare(self.paired([1.1] * 30, delay_ns=10000))
+        self.assertEqual(code, 2)
+        self.assertIn("Harness self-test run", (out / "summary.md").read_text(encoding="utf-8"))
+
+    def test_two_leg_document_needs_no_reference(self):
+        code, output, out = self.compare(self.paired([1.0] * 30, reference=False))
+        self.assertEqual(code, 0, output)
+        row = self.paired_rows(out)[PAIRED_BENCHMARKS[0]]
+        self.assertNotIn("candidate_vs_reference_ratio", row)
+
+    def test_too_few_rounds_are_rejected(self):
+        code, output, _ = self.compare(self.paired([1.0] * 9, rounds=9))
+        self.assertEqual(code, 1)
+        self.assertIn("at least 10 rounds", output)
+
+    def test_missing_round_is_rejected(self):
+        document = make_paired_document([1.0] * 30)
+        document["benchmarks"][0]["seconds"]["baseline"].pop()
+        path = self.write("paired.json", document)
+        code, output, _ = self.compare(
+            self.three_way(100.0, 100.0, 40.0) + ["--paired", str(path)]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("positive batch times", output)
+
+
 if __name__ == "__main__":
     unittest.main()
