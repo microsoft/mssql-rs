@@ -12,7 +12,7 @@
 //! - [`diagnostics`] checks a connection stage by stage for
 //!   `sqlcmd diagnose`, and reports it as text or JSON. It connects with
 //!   `mssql-tds`, which is 64-bit only, so 32-bit builds leave it out.
-//! - [`telemetry`] defines privacy-safe, exporter-independent product metrics.
+//! - [`telemetry`] defines privacy-safe, exporter-independent product events.
 
 #[cfg(target_pointer_width = "64")]
 pub mod diagnostics;
