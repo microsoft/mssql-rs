@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -14,7 +14,7 @@ use mssql_tds::core::CancelHandle;
 use mssql_tds::error::Error as TdsError;
 
 use super::dbc::DbcState;
-use super::desc::{DescHandle, DescKind, DescRecord, DescState};
+use super::desc::{DescHandle, DescHeader, DescKind, DescRecord, DescState};
 use super::wire::WireLease;
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_from_raw, handle_to_raw};
 use crate::api::odbc_types::{
@@ -460,6 +460,8 @@ pub(crate) struct StmtHandle {
     /// Independent of `inner` so SQLCancel never waits for the executing call.
     /// Replaced under the execution claim; retained for the whole batch lifetime.
     cancel: Mutex<StatementCancellation>,
+    /// Serializes PARAM_FOCUS changes with parameter routing and descriptor writes.
+    pub(crate) param_focus_gate: Mutex<()>,
     // Zero admits an untraced call without locking; NOTIFY reserves the slow path.
     operation_state: AtomicU8,
     operation_finished: Condvar,
@@ -568,6 +570,18 @@ pub(crate) struct StmtState {
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<ParamSnapshot>>,
+    /// Constituent columns of each table-valued parameter, captured while that
+    /// parameter was the active `SQL_SOPT_SS_PARAM_FOCUS`. Keyed by the TVP's
+    /// 1-based ordinal; each value holds the TVP's columns indexed by
+    /// `(column ordinal - 1)`. `SQLBindParameter` under focus writes here
+    /// instead of the top-level APD/IPD, mirroring msodbcsql routing a bind to
+    /// the TVP's child descriptor. Read at execute to assemble the table's rows,
+    /// and cleared whenever the parameter bindings are reset.
+    pub(crate) tvp_column_bindings: BTreeMap<usize, Vec<Option<BoundParam>>>,
+    /// Independent APD length and IPD octet-length overrides for focused TVP columns,
+    /// keyed by the TVP ordinal and then zero-based column ordinal.
+    pub(crate) tvp_column_overrides: BTreeMap<usize, Vec<Option<super::desc::TvpColumnOverrides>>>,
+    pub(crate) tvp_column_layouts: BTreeMap<usize, DescHeader>,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
     /// The drop is deferred to the next point that already holds the TDS client
@@ -856,6 +870,8 @@ pub(crate) struct DaeParam {
     /// 0-based index into [`StmtState::bound_params`], and equally the
     /// parameter's position in the RPC list, which is built in the same order.
     pub(crate) bound_index: usize,
+    /// The role this token plays in the DAE protocol.
+    pub(crate) target: DaeTarget,
     /// `ParameterValuePtr` with the execution's bind offset already applied.
     pub(crate) value_ptr: SqlPointer,
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
@@ -877,6 +893,16 @@ pub(crate) struct DaeParam {
     /// How a streamed chunk is re-encoded on its way to the wire. Filled in
     /// when the sequence is parked, where the connection's collation is known.
     pub(crate) transcode: Option<DaeTranscode>,
+    /// Original TVP cell binding and child-array layout, positioned only after
+    /// the application declares the current row batch.
+    pub(crate) tvp_cell_binding: Option<TvpCellBinding>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TvpCellBinding {
+    pub(crate) binding: BoundParam,
+    pub(crate) bind_offset: isize,
+    pub(crate) bind_type: SqlULen,
 }
 
 impl DaeParam {
@@ -894,6 +920,7 @@ impl DaeParam {
     ) -> Self {
         Self {
             bound_index,
+            target: DaeTarget::Parameter,
             value_ptr: binding.parameter_value_ptr,
             expected_len,
             buffered,
@@ -902,7 +929,27 @@ impl DaeParam {
             long_as_max,
             udt_names,
             transcode: None,
+            tvp_cell_binding: None,
         }
+    }
+
+    pub(crate) fn with_tvp_cell_binding(
+        mut self,
+        binding: BoundParam,
+        bind_offset: isize,
+        bind_type: SqlULen,
+    ) -> Self {
+        self.tvp_cell_binding = Some(TvpCellBinding {
+            binding,
+            bind_offset,
+            bind_type,
+        });
+        self
+    }
+
+    pub(crate) fn with_target(mut self, target: DaeTarget) -> Self {
+        self.target = target;
+        self
     }
 
     /// A streamed parameter with no `ColumnSize` bound, for the tests that only
@@ -919,6 +966,8 @@ impl DaeParam {
             sql_type: crate::api::odbc_types::SQL_VARBINARY,
             column_size: 0,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value_ptr,
@@ -957,6 +1006,30 @@ impl DaeParam {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaeTarget {
+    Parameter,
+    TvpRowControl {
+        tvp_index: usize,
+        row_index: usize,
+    },
+    TvpCell {
+        tvp_index: usize,
+        row_index: usize,
+        column_index: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BufferedTvpCell {
+    pub(crate) tvp_index: usize,
+    pub(crate) row_index: usize,
+    pub(crate) column_index: usize,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) is_null: bool,
+    pub(crate) value: Option<mssql_tds::datatypes::sqltypes::SqlType>,
+}
+
 /// How much of the open data-at-execution parameter the application has
 /// supplied. Reset as a unit whenever the cursor advances.
 #[derive(Debug, Default)]
@@ -981,6 +1054,8 @@ pub(crate) struct DaeProgress {
     /// The parameter was supplied as SQL NULL, so the declared-length check is
     /// skipped, as in msodbcsql.
     pub(crate) is_null: bool,
+    /// Row count supplied for the current TVP batch; zero ends the table.
+    pub(crate) tvp_row_batch_count: Option<usize>,
     /// Chunks collected for a [`DaePlan::Buffer`] parameter, converted when it
     /// closes. Empty for a streamed one.
     pub(crate) buffer: Vec<u8>,
@@ -1031,6 +1106,16 @@ pub(crate) struct DaeState {
     /// Collected values for buffered parameters as `(bound index, bytes,
     /// is_null)`, in close order.
     pub(crate) buffered: Vec<(usize, Vec<u8>, bool)>,
+    /// Buffered TVP cell payloads, kept separate from top-level parameter
+    /// buffers because several cells contribute to one RPC parameter.
+    pub(crate) tvp_cells: Vec<BufferedTvpCell>,
+    /// Number of rows accepted from all input batches, by TVP parameter.
+    pub(crate) tvp_row_counts: BTreeMap<usize, usize>,
+    /// `(first output row, exclusive end)` for the current input batch.
+    pub(crate) tvp_batches: BTreeMap<usize, (usize, usize)>,
+    /// Cached token boundary, row extent, and row-zero cell templates for TVPs
+    /// whose DAE row-control stream has been staged.
+    tvp_staging: BTreeMap<usize, TvpStagingState>,
     /// The RPC parameters as `build_named_params` materialized them at execute
     /// time, data-at-execution slots included as placeholders. The deferred
     /// execute replaces only those slots and keeps the rest verbatim.
@@ -1050,6 +1135,21 @@ pub(crate) struct DaeState {
     pub(crate) fractional_truncated: bool,
 }
 
+#[derive(Debug)]
+struct TvpStagingState {
+    segment_end: usize,
+    staged_end: usize,
+    cell_templates: Vec<(usize, DaeParam)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TvpBatchStageError {
+    CapacityExceeded,
+    InvalidState,
+    MemoryAllocation,
+    Overflow,
+}
+
 impl DaeState {
     pub(crate) fn new(
         client: WireLease,
@@ -1067,6 +1167,10 @@ impl DaeState {
             progress: DaeProgress::default(),
             deferred: false,
             buffered: Vec::new(),
+            tvp_cells: Vec::new(),
+            tvp_row_counts: BTreeMap::new(),
+            tvp_batches: BTreeMap::new(),
+            tvp_staging: BTreeMap::new(),
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
@@ -1137,6 +1241,10 @@ impl DaeState {
         &self.params
     }
 
+    pub(crate) fn current_param_mut(&mut self) -> Option<&mut DaeParam> {
+        self.params.get_mut(self.cursor?)
+    }
+
     /// Takes the prepared plan back out when the deferred execute runs.
     pub(crate) fn take_prepared(&mut self) -> Option<PreparedPlan> {
         self.prepared.take()
@@ -1194,10 +1302,272 @@ impl DaeState {
         self.params.get(self.cursor?)
     }
 
+    pub(crate) fn with_tvp_row_counts(mut self, row_counts: BTreeMap<usize, usize>) -> Self {
+        self.tvp_batches.extend(
+            row_counts
+                .iter()
+                .map(|(&index, &count)| (index, (0, count))),
+        );
+        self.tvp_row_counts = row_counts;
+        self
+    }
+
+    pub(crate) fn stage_tvp_batch(
+        &mut self,
+        tvp_index: usize,
+        row_index: usize,
+        batch_count: usize,
+    ) -> Result<(), TvpBatchStageError> {
+        let current_index = self.cursor.ok_or(TvpBatchStageError::InvalidState)?;
+        let capacity = self
+            .params
+            .get(current_index)
+            .filter(|param| {
+                matches!(
+                    param.target,
+                    DaeTarget::TvpRowControl {
+                        tvp_index: target,
+                        row_index: target_row,
+                    } if target == tvp_index && target_row == row_index
+                )
+            })
+            .map(|param| param.binding.column_size)
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        let batch_end = row_index
+            .checked_add(batch_count)
+            .ok_or(TvpBatchStageError::Overflow)?;
+        if batch_end > capacity {
+            return Err(TvpBatchStageError::CapacityExceeded);
+        }
+        if batch_count == 0 {
+            return Ok(());
+        }
+
+        self.cache_tvp_staging_state(tvp_index)?;
+        let staging = self
+            .tvp_staging
+            .get(&tvp_index)
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        let segment_end = staging.segment_end;
+        let staged_end = staging.staged_end;
+        if batch_end <= staged_end {
+            return Ok(());
+        }
+
+        let current_control = self
+            .params
+            .get(current_index)
+            .cloned()
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        let additional_rows = batch_end - staged_end;
+        let token_count = additional_rows
+            .checked_mul(
+                staging
+                    .cell_templates
+                    .len()
+                    .checked_add(1)
+                    .ok_or(TvpBatchStageError::Overflow)?,
+            )
+            .ok_or(TvpBatchStageError::Overflow)?;
+        let buffered_cell_count = additional_rows
+            .checked_mul(staging.cell_templates.len())
+            .ok_or(TvpBatchStageError::Overflow)?;
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(token_count)
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+
+        for row in staged_end..batch_end {
+            if row != staged_end {
+                let mut row_control = current_control.clone();
+                row_control.target = DaeTarget::TvpRowControl {
+                    tvp_index,
+                    row_index: row,
+                };
+                staged.push(row_control);
+            }
+            for (column_index, template) in &staging.cell_templates {
+                let Some(layout) = template.tvp_cell_binding else {
+                    return Err(TvpBatchStageError::InvalidState);
+                };
+                let mut cell = template.clone();
+                cell.target = DaeTarget::TvpCell {
+                    tvp_index,
+                    row_index: row,
+                    column_index: *column_index,
+                };
+                cell.binding = layout.binding;
+                cell.value_ptr = layout.binding.parameter_value_ptr;
+                cell.expected_len = None;
+                staged.push(cell);
+            }
+        }
+        let mut terminal = current_control;
+        terminal.target = DaeTarget::TvpRowControl {
+            tvp_index,
+            row_index: batch_end,
+        };
+        staged.push(terminal);
+
+        let staged_len = staged.len();
+        self.params
+            .try_reserve(staged_len)
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        self.tvp_cells
+            .try_reserve(buffered_cell_count)
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        self.params.splice(segment_end + 1..segment_end + 1, staged);
+        for (&cached_tvp, state) in &mut self.tvp_staging {
+            if cached_tvp == tvp_index {
+                state.segment_end += staged_len;
+                state.staged_end = batch_end;
+            } else if state.segment_end > segment_end {
+                state.segment_end += staged_len;
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_tvp_staging_state(&mut self, tvp_index: usize) -> Result<(), TvpBatchStageError> {
+        if self.tvp_staging.contains_key(&tvp_index) {
+            return Ok(());
+        }
+
+        let segment_end = self
+            .params
+            .iter()
+            .rposition(|param| {
+                matches!(
+                    param.target,
+                    DaeTarget::TvpRowControl { tvp_index: target, .. }
+                        | DaeTarget::TvpCell { tvp_index: target, .. }
+                        if target == tvp_index
+                )
+            })
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        let params = &self.params[..=segment_end];
+        let staged_end = params
+            .iter()
+            .filter_map(|param| match param.target {
+                DaeTarget::TvpRowControl {
+                    tvp_index: target,
+                    row_index,
+                } if target == tvp_index => Some(row_index),
+                _ => None,
+            })
+            .max()
+            .ok_or(TvpBatchStageError::InvalidState)?;
+        let template_count = params
+            .iter()
+            .filter(|param| {
+                matches!(
+                    param.target,
+                    DaeTarget::TvpCell {
+                        tvp_index: target,
+                        row_index: 0,
+                        ..
+                    } if target == tvp_index
+                )
+            })
+            .count();
+        let mut cell_templates = Vec::new();
+        cell_templates
+            .try_reserve_exact(template_count)
+            .map_err(|_| TvpBatchStageError::MemoryAllocation)?;
+        for param in params {
+            if let DaeTarget::TvpCell {
+                tvp_index: target,
+                row_index: 0,
+                column_index,
+            } = param.target
+                && target == tvp_index
+            {
+                cell_templates.push((column_index, param.clone()));
+            }
+        }
+        cell_templates.sort_unstable_by_key(|(column_index, _)| *column_index);
+        if cell_templates
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+        {
+            return Err(TvpBatchStageError::InvalidState);
+        }
+
+        self.tvp_staging.insert(
+            tvp_index,
+            TvpStagingState {
+                segment_end,
+                staged_end,
+                cell_templates,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn position_current_tvp_cell(&mut self) -> Result<(), ()> {
+        let Some(DaeTarget::TvpCell {
+            tvp_index,
+            row_index,
+            ..
+        }) = self.current_param().map(|param| param.target)
+        else {
+            return Ok(());
+        };
+        let Some(&(batch_start, batch_end)) = self.tvp_batches.get(&tvp_index) else {
+            return Err(());
+        };
+        if row_index < batch_start || row_index >= batch_end {
+            return Err(());
+        }
+        let Some(param) = self.current_param_mut() else {
+            return Err(());
+        };
+        let Some(layout) = param.tvp_cell_binding else {
+            return Ok(());
+        };
+        param.binding = layout
+            .binding
+            .for_row(
+                row_index - batch_start,
+                layout.bind_offset,
+                layout.bind_type,
+            )
+            .map_err(|_| ())?;
+        param.value_ptr = param.binding.parameter_value_ptr;
+        Ok(())
+    }
+
     /// Opens the next parameter, discarding the closed one's progress. Called
     /// by every `SQLParamData`, including the first, which opens parameter 0.
     pub(crate) fn advance(&mut self) {
         self.cursor = Some(self.cursor.map_or(0, |current| current + 1));
+        self.progress = DaeProgress::default();
+    }
+
+    /// A false TVP row-control marker terminates that table. Its remaining
+    /// pre-staged cell and row tokens must not be presented to the application.
+    pub(crate) fn advance_past_tvp(&mut self, tvp_index: usize) {
+        let next = self.cursor.map_or(0, |current| current + 1);
+        let end = self
+            .params
+            .get(next..)
+            .and_then(|rest| {
+                rest.iter().position(|param| {
+                    !matches!(
+                        param.target,
+                        DaeTarget::TvpRowControl {
+                            tvp_index: target,
+                            ..
+                        } | DaeTarget::TvpCell {
+                            tvp_index: target,
+                            ..
+                        } if target == tvp_index
+                    )
+                })
+            })
+            .map_or(self.params.len(), |offset| next + offset);
+        self.cursor = Some(end);
         self.progress = DaeProgress::default();
     }
 
@@ -1215,6 +1585,10 @@ impl DaeState {
             progress: DaeProgress::default(),
             deferred: false,
             buffered: Vec::new(),
+            tvp_cells: Vec::new(),
+            tvp_row_counts: BTreeMap::new(),
+            tvp_batches: BTreeMap::new(),
+            tvp_staging: BTreeMap::new(),
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
@@ -1362,6 +1736,17 @@ impl VendorStmtAttrs {
     /// statement attribute.
     pub(crate) fn get(&self, attribute: SqlInteger) -> Option<SqlULen> {
         Self::index_of(attribute).map(|i| self.0[i])
+    }
+
+    /// Stores `SQL_SOPT_SS_PARAM_FOCUS` directly, bypassing the static value
+    /// rule. Its validity depends on the statement's bound parameters (a valid
+    /// table-valued-parameter ordinal, or 0 to restore top-level binding)
+    /// rather than a fixed range, so the caller validates against the IPD and
+    /// this writes the slot. The value still reads back through [`Self::get`].
+    pub(crate) fn store_param_focus(&mut self, value: SqlULen) {
+        if let Some(i) = Self::index_of(odbc_types::SQL_SOPT_SS_PARAM_FOCUS) {
+            self.0[i] = value;
+        }
     }
 
     /// Validates `value` against the attribute's measured rule, storing it and
@@ -2052,6 +2437,7 @@ impl StmtHandle {
                 parent_dbc,
             ))),
             cancel: Mutex::new(StatementCancellation::default()),
+            param_focus_gate: Mutex::new(()),
             operation_state: AtomicU8::new(0),
             operation_finished: Condvar::new(),
             inner: Mutex::new(StmtState {
@@ -2072,6 +2458,9 @@ impl StmtHandle {
                 parameter_metadata: Vec::new(),
                 parameter_udt_names: Vec::new(),
                 bound_params: Vec::new(),
+                tvp_column_bindings: BTreeMap::new(),
+                tvp_column_overrides: BTreeMap::new(),
+                tvp_column_layouts: BTreeMap::new(),
                 pending_unprepare: None,
                 parameter_array: None,
                 deferred_array_update: None,
@@ -2729,6 +3118,89 @@ mod tests {
         assert!(dae.buffered_phase_complete());
         dae.cursor = Some(2);
         assert!(!dae.buffered_phase_complete());
+    }
+
+    #[test]
+    fn false_tvp_row_marker_skips_the_rest_of_its_tokens() {
+        let mut row_control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        row_control.set_buffered(true);
+        let mut cell =
+            DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(DaeTarget::TvpCell {
+                tvp_index: 0,
+                row_index: 0,
+                column_index: 0,
+            });
+        cell.set_buffered(true);
+        let next_param = DaeParam::unbounded(1, std::ptr::null_mut(), None);
+        let mut dae = DaeState::for_test(
+            vec![
+                row_control.clone(),
+                cell,
+                row_control.clone().with_target(DaeTarget::TvpRowControl {
+                    tvp_index: 0,
+                    row_index: 1,
+                }),
+                row_control.with_target(DaeTarget::TvpCell {
+                    tvp_index: 0,
+                    row_index: 1,
+                    column_index: 0,
+                }),
+                DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+                    DaeTarget::TvpRowControl {
+                        tvp_index: 0,
+                        row_index: 2,
+                    },
+                ),
+                next_param,
+            ],
+            Some(0),
+        );
+
+        dae.advance_past_tvp(0);
+
+        assert_eq!(dae.cursor, Some(5));
+        assert_eq!(dae.current_param().unwrap().bound_index, 1);
+    }
+
+    #[test]
+    fn tvp_batches_cannot_exceed_the_declared_total_row_capacity() {
+        let mut row_control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 2,
+            },
+        );
+        row_control.binding.column_size = 2;
+        let mut dae = DaeState::for_test(vec![row_control], Some(0));
+
+        assert_eq!(
+            dae.stage_tvp_batch(0, 2, 1),
+            Err(TvpBatchStageError::CapacityExceeded)
+        );
+        assert!(dae.tvp_staging.is_empty());
+    }
+
+    #[test]
+    fn tvp_batches_cannot_exceed_the_focused_array_capacity() {
+        let mut row_control = DaeParam::unbounded(0, std::ptr::null_mut(), None).with_target(
+            DaeTarget::TvpRowControl {
+                tvp_index: 0,
+                row_index: 0,
+            },
+        );
+        row_control.binding.column_size = 2;
+        let mut dae = DaeState::for_test(vec![row_control], Some(0));
+
+        assert_eq!(
+            dae.stage_tvp_batch(0, 0, 3),
+            Err(TvpBatchStageError::CapacityExceeded)
+        );
+        assert!(dae.tvp_staging.is_empty());
     }
 
     #[test]

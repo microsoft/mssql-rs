@@ -829,6 +829,8 @@ impl SqlType {
         // RPC LOBs carry lengths, not the textptr/timestamp used by bulk ROWs.
         // Resolve encoding once so MaxLen, ActualLen, and the payload agree.
         if matches!(self, Self::Text(_) | Self::NText(_) | Self::Image(_)) {
+            let narrow_string_byte_limit =
+                self.effective_narrow_string_byte_limit(narrow_string_byte_limit);
             let (encoded, had_loss) = self.legacy_lob_wire_bytes(db_collation)?;
             let fitted = encoded
                 .as_deref()
@@ -1246,6 +1248,10 @@ impl SqlType {
         db_collation: &SqlCollation,
         narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()> {
+        let narrow_string_byte_limit =
+            self.effective_narrow_string_byte_limit(narrow_string_byte_limit);
+        let has_narrow_string_byte_limit = narrow_string_byte_limit.is_some();
+
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
             SqlType::NText(Some(value)) => {
@@ -1257,15 +1263,15 @@ impl SqlType {
             }
             SqlType::Variant(inner) => {
                 Self::validate_variant_inner(inner)?;
-                inner.validate_for_send(db_collation, None)
+                inner.validate_for_send(db_collation, narrow_string_byte_limit)
             }
             SqlType::Varchar(_, length)
-                if narrow_string_byte_limit.is_none() && *length > VAR_TDS_MAX_LENGTH =>
+                if !has_narrow_string_byte_limit && *length > VAR_TDS_MAX_LENGTH =>
             {
                 Ok(())
             }
-            SqlType::VarcharMax(_) if narrow_string_byte_limit.is_none() => Ok(()),
-            SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
+            SqlType::VarcharMax(_) if !has_narrow_string_byte_limit => Ok(()),
+            SqlType::Text(_) if !has_narrow_string_byte_limit => {
                 self.validate_legacy_lob_length(db_collation, None)
             }
             SqlType::Vector(vector, dimensions, base_type) => {
@@ -1284,6 +1290,21 @@ impl SqlType {
                 self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
             }
             _ => Ok(()),
+        }
+    }
+
+    fn effective_narrow_string_byte_limit(&self, column_limit: Option<usize>) -> Option<usize> {
+        let value_limit = match self {
+            Self::Char(Some(value), _)
+            | Self::Varchar(Some(value), _)
+            | Self::VarcharMax(Some(value))
+            | Self::Text(Some(value)) => value.narrow_string_byte_limit(),
+            _ => None,
+        };
+        match (value_limit, column_limit) {
+            (Some(value_limit), Some(column_limit)) => Some(value_limit.min(column_limit)),
+            (Some(value_limit), None) => Some(value_limit),
+            (None, column_limit) => column_limit,
         }
     }
 
@@ -1696,6 +1717,48 @@ mod legacy_lob_tests {
                     assert!(writer.get_payload().into_inner().is_empty());
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_rpc_applies_value_level_narrow_byte_limit() {
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        for (text, value_limit, parameter_limit) in
+            [(b"a ".as_slice(), 1, None), (b"a  ".as_slice(), 2, Some(1))]
+        {
+            let mut text = SqlString::new(text.to_vec(), EncodingType::Utf8);
+            text.set_narrow_string_byte_limit(value_limit);
+            let value = SqlType::Text(Some(text));
+            value
+                .validate_for_send(&collation, parameter_limit)
+                .unwrap();
+
+            let mut mock = MockNetworkWriter::new(64);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            value
+                .serialize_with_narrow_string_byte_limit(
+                    &mut writer,
+                    &collation,
+                    None,
+                    parameter_limit,
+                )
+                .await
+                .unwrap();
+
+            let mut expected = vec![0x23];
+            expected.extend_from_slice(&1u32.to_le_bytes());
+            expected.extend_from_slice(&[0; 5]);
+            expected.extend_from_slice(&1u32.to_le_bytes());
+            expected.push(b'a');
+            assert_eq!(
+                &writer.get_payload().into_inner()[PacketWriter::PACKET_HEADER_SIZE..],
+                expected
+            );
         }
     }
 

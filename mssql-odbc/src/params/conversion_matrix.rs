@@ -381,8 +381,9 @@ mod tests {
     }
 
     /// The rows still deferred: `vector` is P9g (AB#48326) and TVP is a feature
-    /// of its own. Pinned so adding one is a deliberate edit here rather than a
-    /// side effect of widening something else.
+    /// of its own (its top-level bind is validated in `bind_param`, not through
+    /// this scalar matrix). Pinned so adding one is a deliberate edit here
+    /// rather than a side effect of widening something else.
     #[test]
     fn the_deferred_sql_types_are_reached_by_nothing() {
         let c_types = [

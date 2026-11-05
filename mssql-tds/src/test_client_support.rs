@@ -56,6 +56,13 @@ pub fn rpc_parameter_declaration(
     parameter.sql_declaration()
 }
 
+/// Returns the materialized value of an RPC parameter for downstream tests.
+pub fn rpc_parameter_value(
+    parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
+) -> TdsResult<&crate::datatypes::sqltypes::SqlType> {
+    parameter.value()
+}
+
 /// The per-value serialization context [`serialized_value_wire_bytes`] needs.
 ///
 /// Re-exported rather than made public on `datatypes`: the module itself stays

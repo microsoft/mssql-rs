@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use crate::{
+    core::TdsResult,
+    error::Error,
     query::metadata::ColumnMetadata,
     token::tokens::{CODE_PAGE_FROM_SORT_ID, SqlCollation},
 };
@@ -38,6 +40,22 @@ pub struct SqlString {
     /// Raw encoded bytes.
     pub bytes: Vec<u8>,
     encoding_type: EncodingType,
+    narrow_string_byte_limit: Option<usize>,
+}
+
+/// Applies a narrow-string byte limit, allowing only trailing ASCII spaces
+/// beyond the limit to be discarded.
+pub fn fit_narrow_byte_limit(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
+    if bytes.len() <= maximum {
+        return Ok(bytes);
+    }
+    if bytes[maximum..].iter().all(|byte| *byte == b' ') {
+        return Ok(&bytes[..maximum]);
+    }
+    Err(Error::EncodedValueTooLong {
+        actual: bytes.len(),
+        maximum,
+    })
 }
 
 /// Resolves `collation` to its narrow encoding, or `None` when neither the
@@ -311,7 +329,18 @@ impl SqlString {
         SqlString {
             bytes,
             encoding_type,
+            narrow_string_byte_limit: None,
         }
+    }
+
+    /// Sets a byte limit to enforce after encoding this value for a narrow SQL
+    /// string column.
+    pub fn set_narrow_string_byte_limit(&mut self, maximum: usize) {
+        self.narrow_string_byte_limit = Some(maximum);
+    }
+
+    pub(crate) fn narrow_string_byte_limit(&self) -> Option<usize> {
+        self.narrow_string_byte_limit
     }
 
     /// Splits into the raw encoded bytes and their encoding.
