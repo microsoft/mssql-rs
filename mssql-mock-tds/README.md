@@ -67,6 +67,11 @@ overrides the verbosity flags.
 
 ## Library
 
+These examples target version 0.4 of both the mock and TDS client. If that version
+is not yet available on crates.io,
+[use a source checkout](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/client-guide.md#using-a-source-checkout)
+instead of registry dependencies.
+
 Add these dependencies:
 
 ```toml

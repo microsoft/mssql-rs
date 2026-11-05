@@ -38,6 +38,8 @@ component links above.
 - A platform C/C++ toolchain and linker. On Linux, also install OpenSSL development
   libraries and `pkg-config` (for example, `build-essential libssl-dev pkg-config`
   on Debian/Ubuntu).
+- macOS workspace builds also require OpenSSL development libraries for
+  `mssql-mock-tds`, even though the TDS client uses platform TLS by default.
 - On x86_64 macOS, set `MACOSX_DEPLOYMENT_TARGET=10.15` or later for the default
   TLS features; see [TLS on macOS](mssql-tds/docs/connection-behavior.md#tls-on-macos).
 - [cargo-nextest](https://nexte.st/) and

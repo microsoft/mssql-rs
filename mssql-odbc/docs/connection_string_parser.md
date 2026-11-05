@@ -169,7 +169,7 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `ConnectRetryInterval` | `ClientContext::connect_retry_interval` | integer 1–60 seconds (rejected if out of range) |
 | `KeepAlive` | `ClientContext::keep_alive_in_ms` (×1000) | integer, seconds (saturating) |
 | `KeepAliveInterval` | `ClientContext::keep_alive_interval_in_ms` (×1000) | integer, seconds (saturating) |
-| `PacketSize` | `ClientContext::packet_size` (u16) | nonzero bytes clamped to 512–32768; `0` leaves the protocol default |
+| `PacketSize` | `ClientContext::packet_size` (u16) | nonzero bytes clamped to 512–32768; `0` preserves the pre-connect attribute seed, or the protocol default if no nonzero seed exists |
 
 This mirrors the canonical keyword set that mssql-python normalizes to before it
 hands the string to the driver, so a mssql-python application can target mssql-odbc
@@ -196,8 +196,12 @@ Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
   **range-validated at parse time and rejected** when out of range, while nonzero
   `PacketSize` is **clamped** to 512–32768 when mapped onto the `ClientContext`
   (`apply_connection_params` in `driver_connect.rs`). `PacketSize=0` is the
-  unspecified sentinel: ODBC getters retain `0`, while the protocol client uses
-  its default.
+  unspecified sentinel: it leaves any nonzero pre-connect
+  `SQL_ATTR_PACKET_SIZE` seed unchanged; without one, the protocol client uses
+  its default. While connected, the getter reports the resolved size requested
+  at login, not the server's ENVCHANGE-negotiated size. After disconnect, it
+  reports the application-set attribute or default again, including `0`; a
+  connection-string override does not persist onto the next connection.
   `KeepAlive`/`KeepAliveInterval` saturate on the ×1000 seconds→ms conversion.
 - **`Authentication`**: delegated to `is_recognized_keyword`
   (`odbc_supported_auth_keywords.rs`) so the accept/reject set never drifts from

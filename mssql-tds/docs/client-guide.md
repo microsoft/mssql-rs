@@ -6,6 +6,29 @@ for public types and methods, and the
 [connection behavior guide](connection-behavior.md) for connection policy,
 TLS, encoding, and runtime details.
 
+## Using a source checkout
+
+Examples follow this repository's source APIs, which can be ahead of crates.io.
+For an unpublished version, clone the repository and use local path dependencies.
+Follow the [repository prerequisites](../../README.md#prerequisites) before
+building.
+
+With your application and the cloned `mssql-rs` in sibling directories, replace
+the corresponding registry dependencies in your application's `Cargo.toml`:
+
+```toml
+[dependencies]
+mssql-tds = { path = "../mssql-rs/mssql-tds" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+mssql-mock-tds = { path = "../mssql-rs/mssql-mock-tds" }
+```
+
+Paths are relative to that manifest; adjust them to your checkout location.
+The mock dependency is only needed for tests. Keep both crates on the same
+checkout so the examples use matching APIs.
+
 ## Request timeouts
 
 `execute` accepts `()` for defaults or `ExecuteOptions` for timeout,

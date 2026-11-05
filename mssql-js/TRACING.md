@@ -72,8 +72,8 @@ This document describes how to configure and use tracing in the `mssql-js` libra
 
 - **File Creation Failure:**
   - If the log file cannot be created (e.g., due to permissions), an error is printed to stderr and file logging is disabled.
-  - If `console` was requested, logs continue on stdout. Otherwise, a failed file-only configuration falls back to stderr, including when `MSSQLJS_TRACE_DIR` is missing or its directory cannot be created.
-  - Protect stderr captures as well as file logs: a failed file destination does not disable tracing.
+  - Trace events fall back to stdout, even for a file-only configuration, including when `MSSQLJS_TRACE_DIR` is missing or its directory cannot be created. Setup errors are printed to stderr.
+  - Protect stdout captures as well as file logs: a failed file destination does not disable tracing.
 
 - **Security Warnings:**
   - File logging to temporary directories (`/tmp`, `/var/tmp`, Windows temp) generates a **warning**.

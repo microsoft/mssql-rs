@@ -13,6 +13,13 @@ compiler/linker (MSVC Build Tools on Windows). The package pins Yarn 4.9.2;
 CI currently builds with Node.js 20. Linux also needs OpenSSL development
 libraries and `pkg-config`.
 
+On x86_64 macOS, set `MACOSX_DEPLOYMENT_TARGET=10.15` or later before
+`yarn build` to meet the default TDS Network.framework requirement:
+
+```sh
+export MACOSX_DEPLOYMENT_TARGET=10.15
+```
+
 From `mssql-js`:
 
 ```sh

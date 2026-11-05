@@ -30,6 +30,9 @@
 //! for the entire build. See the
 //! [connection behavior guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/connection-behavior.md#tls-on-macos).
 //!
+//! These examples target version 0.4. If it is not yet available on crates.io,
+//! [use a source checkout](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/client-guide.md#using-a-source-checkout).
+//!
 //! Disable the defaults to omit built-in integrated authentication and use
 //! `native-tls` on every platform:
 //!

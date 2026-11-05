@@ -12,6 +12,10 @@ TLS, and integrated authentication.
 
 ## Quick start
 
+These examples target version 0.4. If that version is not yet available on
+crates.io, [use a source checkout](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/client-guide.md#using-a-source-checkout)
+instead of the registry dependency below.
+
 ```toml
 [dependencies]
 mssql-tds = "0.4"

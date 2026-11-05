@@ -190,6 +190,11 @@ Reading a `sql_variant` column takes three things, not one, and mssql-python nee
 2. `SQLGetData(col, SQL_C_BINARY, NULL, 0, &indicator)` must succeed. This is a length/NULL probe, separate from the binary delivery implemented by AB#47239.
 3. `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` returns the C type of the value just probed. Under `SQL_OV_ODBC3`, variant `time` and `datetimeoffset` values report `SQL_C_BINARY` because their SQL Server-specific C types require ODBC 3.8; under `SQL_OV_ODBC3_80` they report `SQL_C_SS_TIME2` / `SQL_C_SS_TIMESTAMPOFFSET`.
 
+The ODBC 3.0 mapping does not imply that temporal binary retrieval is implemented:
+non-NULL `time` and `datetimeoffset` values still fail with `HYC00` when read
+into a real `SQL_C_BINARY` buffer. A zero-length probe is not a data read.
+Binary-column and PLP delivery do not close this temporal conversion gap.
+
 Variant `date` and datetime-family values deliberately report the legacy C type codes `SQL_C_DATE` / `SQL_C_TIMESTAMP` (9/11), matching msodbcsql at every declared ODBC version. This is the *C* type of the value, not the column's SQL type: the variant column itself still describes as `SQL_SS_VARIANT` (`-150`) through both `SQLDescribeCol` and `SQL_DESC_CONCISE_TYPE`, which is what item 1 above depends on. A plain, non-variant `date` / `datetime` column is the one that describes as `SQL_TYPE_DATE` / `SQL_TYPE_TIMESTAMP` (91/93), and this change does not touch it.
 
 The underlying type is a property of the **value**, not the column — a variant column can hold a different type in every row — so it is carried up from the decoder rather than derived from metadata: `RowWriter` gained a defaulted `write_variant_base_type`, `CursorColumn::Value` carries the base type alongside the value, and `StmtState` clears it with the rest of the row-stream state. `ColumnValues` is deliberately untouched, which is what keeps this change out of the Python and Node bindings.
