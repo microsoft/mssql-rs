@@ -1361,17 +1361,22 @@ msodbcsql build is measured.
     driver's state. Chosen by the change author; maintainer sign-off is
     pending review.
 
-41. **Malformed DATACLASSIFICATION data is rejected rather than passed
-    through.** msodbcsql copies the token payload without checking it
-    (`Parse.cpp` `ProcessDataClassification`, `sqlctokn.cpp`
-    `OnDataClassification`), so a payload with an out-of-range dictionary
-    index or an undefined rank still reaches the application. mssql-tds
-    validates the token before the IRD sees it: such a payload is a protocol
-    error that retires the connection, and an unpaired UTF-16 surrogate in a
-    name is returned as U+FFFD. A token that classifies more columns than the
-    result set has is dropped with a warning, so the IRD reports `HY091`
-    where msodbcsql returns the bytes. The IRD payload is rebuilt from the
-    validated metadata in the [MS-TDS] 2.2.7.5 layout, so for every token
-    SQL Server sends it is byte-identical to msodbcsql's; measured at
-    versions 1 and 2 on msodbcsql 18.07.0001 and SQL Server 2022. Only a
-    non-compliant server can observe the difference.
+41. **DATACLASSIFICATION data is validated rather than passed through.**
+    msodbcsql copies the token payload without checking it (`Parse.cpp`
+    `ProcessDataClassification`, `sqlctokn.cpp` `OnDataClassification`).
+    mssql-tds validates the token before the IRD sees it, and the IRD payload
+    is rebuilt from that metadata in the [MS-TDS] 2.2.7.5 layout. Three cases
+    differ from msodbcsql:
+    - An out-of-range dictionary index or an undefined rank is a protocol
+      error that retires the connection; only a non-compliant server sends
+      either.
+    - A token that classifies more columns than the result set has is
+      dropped with a warning, so the IRD reports `HY091` where msodbcsql
+      returns the bytes.
+    - An unpaired UTF-16 surrogate in a label or information-type name is
+      returned as U+FFFD where msodbcsql returns the original code unit.
+      SQL Server stores these names as `nvarchar`, so a compliant server can
+      send one.
+
+    For well-formed names the payload is byte-identical to msodbcsql's;
+    measured at versions 1 and 2 on msodbcsql 18.07.0001 and SQL Server 2022.

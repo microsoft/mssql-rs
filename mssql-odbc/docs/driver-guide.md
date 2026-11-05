@@ -112,7 +112,9 @@ A result set's classification is read from its IRD header (`RecNumber` 0):
 - `SQL_CA_SS_DATA_CLASSIFICATION_VERSION` (1238) is the version the server
   acknowledged for the session, or `0` when it did not enable the feature.
 - `SQL_CA_SS_DATA_CLASSIFICATION` (1237) is the DATACLASSIFICATION token
-  payload in the [MS-TDS] layout, byte-identical to msodbcsql's. A short
+  payload in the [MS-TDS] layout, byte-identical to msodbcsql's for
+  well-formed names; an unpaired UTF-16 surrogate is returned as U+FFFD (see
+  [parity deviation 41](parity-deviations.md)). A short
   buffer receives a prefix with `01004` (msodbcsql reports `HY004`; see
   [parity deviation 40](parity-deviations.md)), and a result set
   without classification returns `HY091`.
