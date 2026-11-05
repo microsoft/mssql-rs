@@ -1141,7 +1141,7 @@ impl Stream for TcpStream {
 }
 
 /// Bypasses tokio/mio on Windows: a WouldBlock through `try_read` makes mio
-/// cancel and re-arm the socket's AFD poll on the calling thread, which put
+/// cancel and re-arm the socket's AFD poll on the calling thread, which puts
 /// that cost ahead of every send. The next real read pays it instead, while
 /// the server is working. Tokio and mio readiness state is not touched.
 #[cfg(windows)]
