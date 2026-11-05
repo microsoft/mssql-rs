@@ -157,7 +157,9 @@ Every connection requests SQL Server Data Classification version 1, as
 msodbcsql does. Set `SQL_COPT_SS_DATACLASSIFICATION_VERSION` (1400) to `2` to
 also receive sensitivity ranks; values outside `1..=2` return `HY024`. The
 attribute can be set while connected, and the new value is requested at the
-next login.
+next login. unixODBC frees the driver's connection at `SQLDisconnect` and
+replays only attributes set before connecting, so there set it before
+`SQLDriverConnect`.
 
 A result set's classification is read from its IRD header (`RecNumber` 0):
 

@@ -389,7 +389,15 @@ TEST_F(DataClassificationTest, VersionSetWhileConnectedAppliesAtTheNextLogin) {
     EXPECT_EQ(1, IrdVersion());
     Reconnect();
     ExecDirect("SELECT 1 AS x");
+#ifdef _WIN32
     EXPECT_EQ(2, IrdVersion());
+#else
+    // unixODBC frees the driver's connection on SQLDisconnect (SQLConnect.c,
+    // __disconnect_part_three) and replays only
+    // attributes set before connecting, so the value set while connected is
+    // gone; the login still requests what the attribute now reports.
+    EXPECT_EQ(static_cast<SQLINTEGER>(RequestedVersion()), IrdVersion());
+#endif
 }
 
 // A prepared statement keeps its classification across a cursor close; the
