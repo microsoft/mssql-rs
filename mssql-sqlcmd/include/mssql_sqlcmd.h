@@ -25,6 +25,7 @@ extern "C" {
 #define MSSQL_SQLCMD_INTERNAL_ERROR 3
 #define MSSQL_SQLCMD_INVALID_ARGUMENT 4
 #define MSSQL_SQLCMD_UNSUPPORTED 5 /* not in this build: diagnostics when 32-bit */
+#define MSSQL_SQLCMD_TELEMETRY_TIMEOUT 6
 
 /* How the run ended: the end argument of mssql_sqlcmd_json_render. With the
    exit code it decides executionStatus and operationOutcome. */
@@ -46,16 +47,20 @@ typedef struct MssqlSqlcmdText {
     size_t len; /* in UTF-16 code units, not bytes */
 } MssqlSqlcmdText;
 
-/* Privacy-safe, exporter-independent product telemetry. These calls capture
-   discrete typed invocation and completion records for an approved provider.
-   With no provider they are no-ops. sqlcmd_version is included only when it is
-   a bounded version-like value. Failures are ignored and never affect sqlcmd. */
-void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_invocation(
+/* Privacy-safe, exporter-independent product telemetry. Captures one discrete
+   typed usage record for an approved provider. With no provider this is a
+   no-op. sqlcmd_version is included only when it is a bounded version-like
+   value. Panics are caught and failures never affect sqlcmd. Thread-safe. */
+void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
     MssqlSqlcmdText sqlcmd_version);
-void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_completion(
-    MssqlSqlcmdText sqlcmd_version,
-    int32_t exit_code,
-    int32_t end);
+
+/* Stops new telemetry capture and flushes the installed provider once.
+   timeout_ms is clamped to 1000 milliseconds. Thread-safe and idempotent:
+   with no provider or after another shutdown call it returns MSSQL_SQLCMD_OK
+   immediately. Returns MSSQL_SQLCMD_TELEMETRY_TIMEOUT when the bounded wait
+   expires, or MSSQL_SQLCMD_INTERNAL_ERROR on a provider failure or panic.
+   Callers must treat every result as fail-open and preserve sqlcmd behavior. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_shutdown(uint32_t timeout_ms);
 
 /* A result-set column, as the driver describes it. Only the name is always
    given; a negative number or a NULL or empty type name means the driver did

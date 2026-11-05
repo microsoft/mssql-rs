@@ -62,9 +62,10 @@ for the depths, the report, the exit codes and what is shown or labelled.
 
 ## Telemetry
 
-The library captures privacy-safe, discrete invocation and completion records
-behind an exporter-independent sink. With no approved provider installed,
-capture is a no-op and sends nothing. See the [telemetry architecture](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
+The library captures one privacy-safe, discrete usage record behind an
+exporter-independent sink and exposes a bounded shutdown flush. With no
+approved provider installed, capture and shutdown are no-ops and send nothing.
+See the [telemetry architecture](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
 for the native and Rust flows, stable schema, privacy rules, and unresolved
 Application Insights and DataX onboarding.
 

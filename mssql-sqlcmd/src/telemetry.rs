@@ -4,14 +4,15 @@
 //! Privacy-safe, exporter-independent product telemetry for native sqlcmd.
 //!
 //! OpenTelemetry has no first-class custom-event signal. This module preserves
-//! discrete typed event records behind a sink boundary so an approved provider
-//! can map them to Application Insights `AppEvents` without changing capture.
+//! one discrete typed usage record behind a sink boundary so an approved
+//! provider can map it to Application Insights `AppEvents`.
 
-use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, mpsc};
+use std::time::{Duration, SystemTime};
 
-pub const INVOCATION_EVENT_NAME: &str = "sqlcmdcli_invocation";
-pub const COMPLETION_EVENT_NAME: &str = "sqlcmdcli_completion";
+pub const USAGE_EVENT_NAME: &str = "sqlcmdcli_usage";
+pub const MAX_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 const SCHEMA_VERSION: &str = "1";
 const IMPLEMENTATION: &str = "mssql-sqlcmd-rust";
@@ -19,31 +20,25 @@ const RUNTIME: &str = "native";
 const MAX_VERSION_LEN: usize = 64;
 
 static EVENT_SINK: OnceLock<Box<dyn EventSink>> = OnceLock::new();
+static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// A discrete product event ready for an approved provider to export.
+/// One discrete product usage event ready for an approved provider to export.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TelemetryEvent {
-    Invocation(InvocationEvent),
-    Completion(CompletionEvent),
+pub struct UsageEvent {
+    common: CommonProperties,
 }
 
-impl TelemetryEvent {
+impl UsageEvent {
     pub fn name(&self) -> &'static str {
-        match self {
-            Self::Invocation(_) => INVOCATION_EVENT_NAME,
-            Self::Completion(_) => COMPLETION_EVENT_NAME,
-        }
+        USAGE_EVENT_NAME
     }
 
     pub fn common(&self) -> &CommonProperties {
-        match self {
-            Self::Invocation(event) => &event.common,
-            Self::Completion(event) => &event.common,
-        }
+        &self.common
     }
 }
 
-/// Common bounded properties shared by every sqlcmd product event.
+/// Common bounded properties for the sqlcmd usage event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommonProperties {
     timestamp: SystemTime,
@@ -85,57 +80,30 @@ impl CommonProperties {
     }
 }
 
-/// One native sqlcmd process invocation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InvocationEvent {
-    common: CommonProperties,
-}
-
-/// One completed native sqlcmd process invocation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompletionEvent {
-    common: CommonProperties,
-    outcome: CompletionOutcome,
-}
-
-impl CompletionEvent {
-    pub fn outcome(&self) -> CompletionOutcome {
-        self.outcome
-    }
-}
-
-/// Bounded outcome categories for a completed sqlcmd invocation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CompletionOutcome {
-    Succeeded,
-    Failed,
-    Canceled,
-    InvalidInvocation,
-    Unknown,
-}
-
-impl CompletionOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Canceled => "canceled",
-            Self::InvalidInvocation => "invalid_invocation",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 /// Provider boundary implemented by a future approved Application Insights
 /// exporter. Implementations must handle their own failures without panicking.
 pub trait EventSink: Send + Sync {
-    fn record(&self, event: &TelemetryEvent);
+    fn record(&self, event: &UsageEvent);
+
+    fn flush(&self, _timeout: Duration) -> Result<(), FlushError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventSinkAlreadyInstalled;
 
-/// Installs the process-wide event sink before native sqlcmd records events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlushError;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlushOutcome {
+    Completed,
+    Failed,
+    TimedOut,
+}
+
+/// Installs the process-wide event sink before native sqlcmd records usage.
 ///
 /// The first provider wins so event routing cannot change during a process.
 pub fn install_event_sink(sink: impl EventSink + 'static) -> Result<(), EventSinkAlreadyInstalled> {
@@ -144,43 +112,65 @@ pub fn install_event_sink(sink: impl EventSink + 'static) -> Result<(), EventSin
         .map_err(|_| EventSinkAlreadyInstalled)
 }
 
-/// Captures one process invocation. With no installed provider this is a no-op.
-pub fn record_invocation(sqlcmd_version: Option<&str>) {
-    record_invocation_at(sqlcmd_version, SystemTime::now(), installed_sink());
+/// Captures one sqlcmd usage event. With no installed provider this is a no-op.
+pub fn record_usage(sqlcmd_version: Option<&str>) {
+    record_usage_at(sqlcmd_version, SystemTime::now(), installed_sink());
 }
 
-/// Captures one process completion. With no installed provider this is a no-op.
-pub fn record_completion(sqlcmd_version: Option<&str>, outcome: CompletionOutcome) {
-    record_completion_at(sqlcmd_version, outcome, SystemTime::now(), installed_sink());
+/// Stops new capture and flushes the installed provider once.
+///
+/// The timeout is clamped to [`MAX_FLUSH_TIMEOUT`]. With no provider, or after
+/// another shutdown call has started, this returns [`FlushOutcome::Completed`].
+pub fn shutdown(timeout: Duration) -> FlushOutcome {
+    if SHUTDOWN_STARTED.swap(true, Ordering::AcqRel) {
+        return FlushOutcome::Completed;
+    }
+    let Some(sink) = installed_sink() else {
+        return FlushOutcome::Completed;
+    };
+    let timeout = clamp_flush_timeout(timeout);
+    flush_with_timeout(sink, timeout)
+}
+
+fn clamp_flush_timeout(timeout: Duration) -> Duration {
+    timeout.min(MAX_FLUSH_TIMEOUT)
+}
+
+fn flush_with_timeout(sink: &'static dyn EventSink, timeout: Duration) -> FlushOutcome {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.flush(timeout))).map_or(
+                FlushOutcome::Failed,
+                |result| match result {
+                    Ok(()) => FlushOutcome::Completed,
+                    Err(_) => FlushOutcome::Failed,
+                },
+            );
+        let _ = sender.send(outcome);
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        Err(mpsc::RecvTimeoutError::Timeout) => FlushOutcome::TimedOut,
+        Err(mpsc::RecvTimeoutError::Disconnected) => FlushOutcome::Failed,
+    }
 }
 
 fn installed_sink() -> Option<&'static dyn EventSink> {
     EVENT_SINK.get().map(Box::as_ref)
 }
 
-fn record_invocation_at(
+fn record_usage_at(
     sqlcmd_version: Option<&str>,
     timestamp: SystemTime,
     sink: Option<&dyn EventSink>,
 ) {
-    if let Some(sink) = sink {
-        sink.record(&TelemetryEvent::Invocation(InvocationEvent {
+    if !SHUTDOWN_STARTED.load(Ordering::Acquire)
+        && let Some(sink) = sink
+    {
+        sink.record(&UsageEvent {
             common: common_properties(sqlcmd_version, timestamp),
-        }));
-    }
-}
-
-fn record_completion_at(
-    sqlcmd_version: Option<&str>,
-    outcome: CompletionOutcome,
-    timestamp: SystemTime,
-    sink: Option<&dyn EventSink>,
-) {
-    if let Some(sink) = sink {
-        sink.record(&TelemetryEvent::Completion(CompletionEvent {
-            common: common_properties(sqlcmd_version, timestamp),
-            outcome,
-        }));
+        });
     }
 }
 
@@ -209,16 +199,16 @@ fn version_is_safe(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[derive(Default)]
     struct InMemorySink {
-        events: Mutex<Vec<TelemetryEvent>>,
+        events: Mutex<Vec<UsageEvent>>,
     }
 
     impl EventSink for InMemorySink {
-        fn record(&self, event: &TelemetryEvent) {
+        fn record(&self, event: &UsageEvent) {
             self.events
                 .lock()
                 .expect("in-memory telemetry lock")
@@ -226,43 +216,16 @@ mod tests {
         }
     }
 
-    impl EventSink for Arc<InMemorySink> {
-        fn record(&self, event: &TelemetryEvent) {
-            self.as_ref().record(event);
-        }
-    }
-
     #[test]
-    fn installed_sink_observes_public_capture_flow() {
-        let sink = Arc::new(InMemorySink::default());
-        install_event_sink(Arc::clone(&sink)).expect("install in-memory telemetry sink");
-
-        record_invocation(Some("18.4.1"));
-        record_completion(Some("18.4.1"), CompletionOutcome::Succeeded);
-
-        let events = sink.events.lock().expect("in-memory telemetry lock");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].name(), INVOCATION_EVENT_NAME);
-        assert_eq!(events[1].name(), COMPLETION_EVENT_NAME);
-        assert_eq!(
-            events[1],
-            TelemetryEvent::Completion(CompletionEvent {
-                common: events[1].common().clone(),
-                outcome: CompletionOutcome::Succeeded,
-            })
-        );
-    }
-
-    #[test]
-    fn invocation_is_captured_as_an_exact_discrete_record() {
+    fn usage_is_captured_as_an_exact_discrete_record() {
         let timestamp = UNIX_EPOCH + Duration::from_secs(1_730_736_000);
         let sink = InMemorySink::default();
 
-        record_invocation_at(Some("18.4.1-preview.2"), timestamp, Some(&sink));
+        record_usage_at(Some("18.4.1-preview.2"), timestamp, Some(&sink));
 
         assert_eq!(
             *sink.events.lock().expect("in-memory telemetry lock"),
-            vec![TelemetryEvent::Invocation(InvocationEvent {
+            vec![UsageEvent {
                 common: CommonProperties {
                     timestamp,
                     schema_version: "1",
@@ -272,40 +235,7 @@ mod tests {
                     implementation: "mssql-sqlcmd-rust",
                     runtime: "native",
                 },
-            })]
-        );
-    }
-
-    #[test]
-    fn completion_is_captured_as_an_exact_discrete_record() {
-        let timestamp = UNIX_EPOCH + Duration::from_secs(1_730_736_001);
-        let sink = InMemorySink::default();
-
-        record_completion_at(
-            Some("18.4.1"),
-            CompletionOutcome::Canceled,
-            timestamp,
-            Some(&sink),
-        );
-
-        let events = sink.events.lock().expect("in-memory telemetry lock");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].name(), COMPLETION_EVENT_NAME);
-        assert_eq!(events[0].common().timestamp, timestamp);
-        assert_eq!(
-            events[0],
-            TelemetryEvent::Completion(CompletionEvent {
-                common: CommonProperties {
-                    timestamp,
-                    schema_version: "1",
-                    sqlcmd_version: Some("18.4.1".to_owned()),
-                    os: std::env::consts::OS,
-                    architecture: std::env::consts::ARCH,
-                    implementation: "mssql-sqlcmd-rust",
-                    runtime: "native",
-                },
-                outcome: CompletionOutcome::Canceled,
-            })
+            }]
         );
     }
 
@@ -325,28 +255,61 @@ mod tests {
 
     #[test]
     fn no_provider_is_a_no_op() {
-        record_invocation_at(Some("18.4.1"), UNIX_EPOCH, None);
-        record_completion_at(
-            Some("18.4.1"),
-            CompletionOutcome::Succeeded,
-            UNIX_EPOCH,
-            None,
+        record_usage_at(Some("18.4.1"), UNIX_EPOCH, None);
+    }
+
+    #[test]
+    fn event_name_is_stable() {
+        let usage = UsageEvent {
+            common: common_properties(None, UNIX_EPOCH),
+        };
+        assert_eq!(usage.name(), USAGE_EVENT_NAME);
+    }
+
+    struct SlowSink;
+
+    impl EventSink for SlowSink {
+        fn record(&self, _event: &UsageEvent) {}
+
+        fn flush(&self, _timeout: Duration) -> Result<(), FlushError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn flush_wait_is_bounded_independently_of_the_provider() {
+        static SINK: SlowSink = SlowSink;
+        assert_eq!(
+            flush_with_timeout(&SINK, Duration::from_millis(1)),
+            FlushOutcome::TimedOut
         );
     }
 
     #[test]
-    fn event_names_and_outcomes_are_bounded() {
-        let invocation = TelemetryEvent::Invocation(InvocationEvent {
-            common: common_properties(None, UNIX_EPOCH),
-        });
-        assert_eq!(invocation.name(), INVOCATION_EVENT_NAME);
-        assert_eq!(CompletionOutcome::Succeeded.as_str(), "succeeded");
-        assert_eq!(CompletionOutcome::Failed.as_str(), "failed");
-        assert_eq!(CompletionOutcome::Canceled.as_str(), "canceled");
+    fn flush_timeout_is_clamped_to_one_second() {
         assert_eq!(
-            CompletionOutcome::InvalidInvocation.as_str(),
-            "invalid_invocation"
+            clamp_flush_timeout(Duration::from_secs(30)),
+            MAX_FLUSH_TIMEOUT
         );
-        assert_eq!(CompletionOutcome::Unknown.as_str(), "unknown");
+    }
+
+    struct PanickingSink;
+
+    impl EventSink for PanickingSink {
+        fn record(&self, _event: &UsageEvent) {}
+
+        fn flush(&self, _timeout: Duration) -> Result<(), FlushError> {
+            panic!("provider panic")
+        }
+    }
+
+    #[test]
+    fn provider_panic_is_contained() {
+        static SINK: PanickingSink = PanickingSink;
+        assert_eq!(
+            flush_with_timeout(&SINK, Duration::from_secs(1)),
+            FlushOutcome::Failed
+        );
     }
 }

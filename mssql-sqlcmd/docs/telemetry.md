@@ -2,9 +2,9 @@
 
 ## Status
 
-`mssql-sqlcmd` captures privacy-safe, discrete invocation and completion event
-records behind an exporter-independent sink boundary. Native sqlcmd can call
-the stable C ABI now; when no approved sink is installed, capture is a no-op.
+`mssql-sqlcmd` captures one privacy-safe, discrete usage event behind an
+exporter-independent sink. Native sqlcmd can call the stable C ABI now; when no
+approved sink is installed, capture and shutdown are no-ops.
 
 The production destination is:
 
@@ -13,15 +13,14 @@ sqlcmd -> Application Insights -> DataX AllProducts -> Kusto
 ```
 
 The approved Application Insights exporter and its authentication, batching,
-retry, and shutdown behavior are not yet defined. This implementation does not
-add OTLP, Geneva, ETW, Linux `user_events`, or a community Application Insights
-exporter, and does not claim that any of those routes reaches DataX.
+retry, and shutdown implementation are not yet defined. This implementation
+does not add OTLP, Geneva, ETW, Linux `user_events`, or a community Application
+Insights exporter, and does not claim that any of those routes reaches DataX.
 
-AllProducts does not process Application Insights `AppMetrics`, so invocation
-and completion are preserved as discrete events rather than primary metric
-counters. OpenTelemetry has no first-class custom-event signal. The future
-approved provider owns the explicit conversion from these typed records to
-Application Insights `AppEvents`.
+AllProducts does not process Application Insights `AppMetrics`, so usage is
+preserved as a discrete event rather than a metric counter. OpenTelemetry has no
+first-class custom-event signal. The future approved provider owns the explicit
+conversion from the typed record to an Application Insights `AppEvent`.
 
 ## Architecture
 
@@ -29,7 +28,7 @@ Application Insights `AppEvents`.
 flowchart LR
     Native[Native sqlcmd lifecycle]
     ABI[mssql-sqlcmd C ABI]
-    Capture[Typed event capture]
+    Capture[Typed usage capture]
     Sink{Approved sink installed?}
     Noop[No-op]
     Provider[Approved Application Insights provider]
@@ -42,10 +41,10 @@ flowchart LR
     Sink -- Yes --> Provider --> AI --> DataX --> Kusto
 ```
 
-The capture layer knows only stable event names, typed properties, and bounded
-outcomes. It does not know connection details, queries, exporter configuration,
-or DataX credentials. The provider layer must map each record to one `AppEvent`
-with the documented `sqlcmdcli_` keys.
+The capture layer knows only the stable event name and typed common properties.
+It does not know connection details, queries, exporter configuration, or DataX
+credentials. The provider maps the record to one `AppEvent` with the documented
+`sqlcmdcli_` keys.
 
 ## Native and Rust flow
 
@@ -57,29 +56,24 @@ sequenceDiagram
     participant Sink as EventSink
     participant AI as Application Insights
 
-    Main->>ABI: record_invocation(version)
+    Main->>ABI: record_usage(version)
     ABI->>Capture: validate version and timestamp
     alt approved sink installed
-        Capture->>Sink: InvocationEvent
+        Capture->>Sink: UsageEvent
         Sink-->>AI: future AppEvent mapping
     else no sink installed
         Capture-->>Capture: no-op
     end
 
     Main->>Main: execute normal command
-    Main->>ABI: record_completion(version, exit_code, end)
-    ABI->>Capture: map bounded outcome and timestamp
-    alt approved sink installed
-        Capture->>Sink: CompletionEvent
-        Sink-->>AI: future AppEvent mapping
-    else no sink installed
-        Capture-->>Capture: no-op
-    end
+    Main->>ABI: shutdown(timeout_ms)
+    ABI->>Sink: flush(clamped timeout)
+    ABI-->>Main: status after bounded wait
 ```
 
-Capture never changes command output, execution, or exit status. The C boundary
-catches Rust panics. The approved provider must also contain its own failures
-and must not materially delay normal shutdown.
+Capture and shutdown never change command output, execution, or exit status.
+Both C entry points catch Rust panics. Native sqlcmd treats every telemetry
+status as fail-open.
 
 ## Components
 
@@ -92,14 +86,13 @@ classDiagram
     }
 
     class TelemetryCAbi {
-      +record_invocation(version) void
-      +record_completion(version, exit_code, end) void
+      +record_usage(version) void
+      +shutdown(timeout_ms) int32
     }
 
-    class TelemetryEvent {
-      <<enumeration>>
-      Invocation
-      Completion
+    class UsageEvent {
+      +name sqlcmdcli_usage
+      +common CommonProperties
     }
 
     class CommonProperties {
@@ -112,50 +105,31 @@ classDiagram
       +runtime string
     }
 
-    class CompletionEvent {
-      +outcome CompletionOutcome
-    }
-
     class EventSink {
       <<interface>>
       +record(event)
+      +flush(timeout)
     }
 
     class ApprovedApplicationInsightsProvider {
       +map_to_app_event(event)
       +export()
+      +flush(timeout)
     }
 
     NativeSqlcmd --> TelemetryCAbi
-    TelemetryCAbi --> TelemetryEvent
-    TelemetryEvent *-- CommonProperties
-    TelemetryEvent *-- CompletionEvent
-    TelemetryEvent --> EventSink
+    TelemetryCAbi --> UsageEvent
+    UsageEvent *-- CommonProperties
+    UsageEvent --> EventSink
     ApprovedApplicationInsightsProvider ..|> EventSink
 ```
 
 ## Event schema
 
-Event names and property keys use the downstream `sqlcmdcli_` prefix.
+### `sqlcmdcli_usage`
 
-### `sqlcmdcli_invocation`
-
-One record when native sqlcmd starts an invocation.
-
-### `sqlcmdcli_completion`
-
-One record when native sqlcmd has a final process outcome. It adds
-`sqlcmdcli_outcome`, one of:
-
-- `succeeded`
-- `failed`
-- `canceled`
-- `invalid_invocation`
-- `unknown`
-
-The raw exit code is not exported.
-
-### Common properties
+One record per native sqlcmd process usage. Event and property names use the
+downstream `sqlcmdcli_` prefix.
 
 | AppEvents property | Typed capture value |
 |---|---|
@@ -166,7 +140,7 @@ The raw exit code is not exported.
 | `sqlcmdcli_implementation` | `mssql-sqlcmd-rust` |
 | `sqlcmdcli_runtime` | `native` |
 
-Each record also has a capture timestamp. The approved provider determines the
+The record also has a capture timestamp. The approved provider determines the
 exact Application Insights timestamp field and serialization.
 
 The version is omitted unless it is 1-64 ASCII bytes containing only letters,
@@ -184,6 +158,7 @@ collects or exports:
 - server, host, IP, database, or user names
 - filesystem paths
 - raw error messages
+- exit codes or outcome categories
 - arbitrary free-form strings
 
 No device identifier is captured. `devdeviceid` remains blocked until an
@@ -192,34 +167,44 @@ approved implementation or exact algorithm is available.
 ## C ABI
 
 ```c
-void mssql_sqlcmd_telemetry_record_invocation(
+void mssql_sqlcmd_telemetry_record_usage(
     MssqlSqlcmdText sqlcmd_version);
 
-void mssql_sqlcmd_telemetry_record_completion(
-    MssqlSqlcmdText sqlcmd_version,
-    int32_t exit_code,
-    int32_t end);
+int32_t mssql_sqlcmd_telemetry_shutdown(
+    uint32_t timeout_ms);
 ```
 
-`sqlcmd_version.data` may be null; a null or empty value is omitted. Completion
-uses the existing run-end constants:
+`sqlcmd_version.data` may be null; a null or empty value is omitted.
 
-- `MSSQL_SQLCMD_RUN_FINISHED`
-- `MSSQL_SQLCMD_RUN_CANCELED`
-- `MSSQL_SQLCMD_RUN_INVALID_INVOCATION`
+`mssql_sqlcmd_telemetry_record_usage` is thread-safe, catches panics, returns no
+status, and is a no-op after shutdown starts.
 
-No provider configuration crosses this ABI yet. The future approved provider
-can be added behind the Rust sink boundary without changing native lifecycle
-calls.
+`mssql_sqlcmd_telemetry_shutdown` is thread-safe and idempotent. Only the first
+call starts a flush; concurrent or later calls return `MSSQL_SQLCMD_OK`
+immediately. `timeout_ms` is milliseconds and is clamped to 1000. The function
+returns:
+
+- `MSSQL_SQLCMD_OK` when the flush completed, no provider is installed, or
+  another shutdown call already started
+- `MSSQL_SQLCMD_TELEMETRY_TIMEOUT` when the bounded wait expires
+- `MSSQL_SQLCMD_INTERNAL_ERROR` when the provider fails or panics
+
+The bounded wait is enforced outside the provider. A timed-out provider may
+continue on its detached worker thread, but native sqlcmd does not wait longer
+than the clamped timeout. Callers ignore the status for command behavior.
+
+No provider configuration crosses this ABI. The future approved provider can be
+added behind the Rust sink boundary without changing native lifecycle calls.
 
 ## What works now
 
-- native invocation and completion lifecycle calls
-- exact typed capture with event timestamps
-- stable event names, common properties, and bounded outcomes
+- one native usage lifecycle call
+- exact typed capture with an event timestamp
+- stable event name and common properties
 - privacy validation for the only caller-provided property
-- in-memory sink tests observing exact discrete records
+- in-memory sink tests observing the exact discrete record
 - fail-open, no-op behavior when no provider is installed
+- bounded, idempotent shutdown and flush boundary
 
 ## Remaining production onboarding
 
@@ -228,8 +213,8 @@ implement:
 
 1. the approved Rust-compatible Application Insights provider
 2. authentication and the target Application Insights resource
-3. exact mapping of `TelemetryEvent` to `AppEvents`
-4. batching, retry, timeout, and bounded shutdown behavior
+3. exact mapping of `UsageEvent` to `AppEvents`
+4. batching, retry, timeout, and bounded provider shutdown behavior
 5. DataX AllProducts onboarding and schema registration
 6. Kusto database/table names, retention, access, and validated queries
 7. the approved `devdeviceid` algorithm, if that property is required
