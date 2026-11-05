@@ -36,6 +36,7 @@
 //! the attempt ended. The password is used to log in and is never part of the
 //! report.
 
+pub mod driver_text;
 pub mod redact;
 pub mod report;
 pub mod stages;
@@ -630,6 +631,9 @@ pub struct ErrorRecord {
     /// A stable symbolic identifier, e.g. `refused` or `invalidPort`.
     pub code: Option<String>,
     pub message: String,
+    /// What a normal sqlcmd run prints for the same event, in the ODBC
+    /// driver's wording (see [`driver_text`]); `None` when it has no equivalent.
+    pub text: Option<String>,
     /// From a transport sqlcmd then moved past, without a protocol prefix
     /// (TCP before named pipes): kept as evidence, but a normal run, which
     /// reports only the last transport's errors, would not print it.
@@ -649,6 +653,7 @@ impl ErrorRecord {
             os_error: None,
             code: None,
             message: message.into(),
+            text: None,
             superseded: false,
             from_message_text: false,
         }
@@ -1061,6 +1066,11 @@ struct Diagnosis {
     /// The SPN the client requested with integrated authentication, as it
     /// recorded it.
     spn: Option<String>,
+    /// The transport the run ended on, for wording its errors: the last one
+    /// the connection attempt used (a pipe the protocol order reached without
+    /// a prefix, or TCP after a routing redirect), or the pipe that did not
+    /// open below that depth. `None` follows the target's own protocol.
+    transport: Option<Protocol>,
     limitations: Vec<String>,
     status: ExecutionStatus,
 }
@@ -1221,6 +1231,7 @@ impl Diagnosis {
             authentication: None,
             server: None,
             spn: None,
+            transport: None,
             limitations: Vec::new(),
             status: ExecutionStatus::Completed,
         }
@@ -2321,6 +2332,8 @@ impl Diagnosis {
         let blocks = Some(Skip::BlockedBy(CheckId::TcpConnect));
         if tcp_acceptance_unknown {
             check.coverage = Coverage::Inconclusive;
+            // Read by the error wording: no failed-open summary for it.
+            check.fields.push(Field::plain("tcpAcceptance", "unknown"));
             check.domain = Some(Domain::undetermined(&[
                 "connectivity.network",
                 "target.sqlServer",
@@ -2523,6 +2536,9 @@ impl Diagnosis {
             return Some(Skip::Canceled);
         }
         let protocol = transport.protocol();
+        // The pipe ends the run here: its errors are worded as this
+        // transport's, as the connection attempt words its own.
+        self.transport = Some(protocol);
         // No answer in time: the attempt's limit abandoned the open, or the
         // open ended on the pipe's own time limit for a free instance, which
         // the client records as `TimedOut` (as it does Windows' semaphore
@@ -2918,6 +2934,11 @@ impl Diagnosis {
                     .push(Field::identifier("pipe", pipe, Category::Pipe));
             }
         }
+        // The errors are worded as the transport the attempt ended on, whatever
+        // the target's protocol: a routing redirect reconnects over TCP.
+        if let Some(last) = last {
+            self.transport = Some(last.protocol());
+        }
         self.spn = all
             .iter()
             .rev()
@@ -2977,7 +2998,23 @@ impl Diagnosis {
                     CheckId::ConnectionAttempt,
                     classified.finding,
                 );
-                self.errors.extend(classified.errors);
+                let mut errors = classified.errors;
+                // A pipe open the time limit abandoned, before any phase: the
+                // timeout is the pipe's own, recorded as reachability records
+                // it, so it is worded and summarized the same way.
+                if failed_phase.is_none() && last.and_then(|t| t.pipe).is_some_and(Step::abandoned)
+                {
+                    for record in &mut errors {
+                        if record.source == "client" && record.code.as_deref() == Some("timedOut") {
+                            record.source = "os";
+                            record.message = format!(
+                                "no answer within the {} s time limit",
+                                self.request.timeout().as_secs()
+                            );
+                        }
+                    }
+                }
+                self.errors.extend(errors);
                 if classified.from_message_text {
                     self.limitation(
                         "The TLS failure was classified from the error text; no stable error \
@@ -3203,6 +3240,17 @@ impl Diagnosis {
                 .position(|id| *id == c.id)
                 .unwrap_or(usize::MAX)
         });
+        driver_text::apply(
+            &mut self.errors,
+            &self.checks,
+            self.transport
+                .or_else(|| self.target.as_ref().map(|t| t.protocol)),
+            &self.request.server,
+            driver_text::Encryption {
+                encrypt: self.request.encrypt,
+                trust_server_certificate: self.request.trust_server_certificate,
+            },
+        );
         let domain = self
             .checks
             .iter()
@@ -3533,6 +3581,18 @@ fn error_records(error: &Error, check: CheckId) -> Vec<ErrorRecord> {
             vec![record]
         }
         _ if is_tls_error(error) => vec![ErrorRecord::new("tls", check, error.to_string())],
+        // The server closed the connection: a read that found its end.
+        Error::ConnectionClosed(_) => {
+            let mut record = ErrorRecord::new("client", check, error.to_string());
+            record.code = Some("connectionClosed".to_string());
+            vec![record]
+        }
+        // A time limit that ran out, as the session check marks its own.
+        Error::TimeoutError(_) => {
+            let mut record = ErrorRecord::new("client", check, error.to_string());
+            record.code = Some("timedOut".to_string());
+            vec![record]
+        }
         _ => vec![ErrorRecord::new("client", check, error.to_string())],
     }
 }
@@ -4819,6 +4879,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// Port 1 on the loopback address refuses at once: name resolution
+    /// passes, TCP is diagnosed, and the connection attempt is skipped.
+    #[test]
+    fn a_refused_port_reads_as_a_normal_sqlcmd_run() {
+        let report = run(request("tcp:127.0.0.1,1", Depth::NetworkReachability));
+        let codes: Vec<Option<&str>> = report.errors.iter().map(|e| e.code.as_deref()).collect();
+        let tcp_text = if cfg!(windows) {
+            "TCP Provider: No connection could be made because the target machine actively \
+             refused it"
+        } else {
+            "TCP Provider: Error code 0x274D"
+        };
+        // Refused at once: no time limit ran out, so no timeout summary.
+        let expected = vec![Some("refused"), Some("networkRelatedError")];
+        assert_eq!(codes, expected, "{:#?}", report.errors);
+        let refused = report.errors.iter().find(|e| e.source == "os").unwrap();
+        assert_eq!(refused.text.as_deref(), Some(tcp_text));
+        let network = report.errors.last().unwrap();
+        assert!(
+            network
+                .text
+                .as_deref()
+                .is_some_and(|t| t.contains("connection to tcp:127.0.0.1,1. Server is not found")),
+            "{network:#?}"
+        );
+    }
+
     #[test]
     fn a_refused_port_is_diagnosed_without_a_server() {
         let report = run(request("tcp:127.0.0.1,1", Depth::SessionValidation));
@@ -4877,8 +4964,8 @@ pub(crate) mod tests {
     /// `..._PASSWORD` of the live test): passes through session validation
     /// with and without the `tcp:` prefix.
     /// Without a prefix, on Windows, a name that does not resolve is tried
-    /// over named pipes next, as the client does: name resolution's error is
-    /// kept, marked superseded.
+    /// over named pipes next, as the client does: the report ends with the
+    /// errors a normal run prints for it.
     #[cfg(windows)]
     #[test]
     fn without_a_prefix_a_failed_tcp_path_falls_back_to_named_pipes() {
@@ -4899,7 +4986,24 @@ pub(crate) mod tests {
             .iter()
             .find(|e| e.check == CheckId::NameResolution)
             .unwrap();
-        assert!(resolution.superseded, "{resolution:#?}");
+        assert!(
+            resolution.superseded && resolution.text.is_none(),
+            "{resolution:#?}"
+        );
+        let printed: Vec<&str> = report
+            .errors
+            .iter()
+            .filter(|e| !e.superseded)
+            .filter_map(|e| e.text.as_deref())
+            .collect();
+        // The pipe was not found: no time limit ran out, so no timeout line.
+        assert_eq!(printed.len(), 2, "{:#?}", report.errors);
+        assert!(
+            printed[0]
+                .starts_with("Named Pipes Provider: Could not open a connection to SQL Server ["),
+            "{printed:#?}"
+        );
+        assert!(printed[1].starts_with("A network-related"), "{printed:#?}");
         let order: Vec<CheckId> = report.checks.iter().map(|c| c.id).collect();
         assert_eq!(order, CheckId::ORDER, "checks stay in their order");
     }
@@ -5333,6 +5437,51 @@ pub(crate) mod tests {
         assert_eq!(attempt.skip, None, "{report:#?}");
         assert_ne!(attempt.coverage, Coverage::Passed, "{report:#?}");
         assert!(!report.errors.is_empty());
+        // No pipe was reached: the driver's network summary closes the errors.
+        assert_eq!(
+            report.errors.last().and_then(|e| e.code.as_deref()),
+            Some("networkRelatedError"),
+            "{:#?}",
+            report.errors
+        );
+    }
+
+    /// `lpc:` with a named instance opens that instance's shared memory
+    /// directly, as the driver does: no SQL Server Browser lookup and no TCP.
+    /// An instance that does not exist is the driver's shared-memory error.
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_memory_named_instance_is_opened_without_sql_server_browser() {
+        let report = run(request(
+            "lpc:(local)\\NoSuchDiagnoseInstance",
+            Depth::ConnectionAttempt,
+        ));
+        let check = |id| report.checks.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            check(CheckId::InstanceResolution).skip,
+            Some(Skip::NotApplicable(NOT_TCP)),
+            "{report:#?}"
+        );
+        assert_ne!(
+            check(CheckId::ConnectionAttempt).coverage,
+            Coverage::Passed,
+            "{report:#?}"
+        );
+        let texts: Vec<_> = report
+            .errors
+            .iter()
+            .filter_map(|e| e.text.as_deref())
+            .collect();
+        assert_eq!(
+            texts.first().copied(),
+            Some("Shared Memory Provider: Could not open a connection to SQL Server [2]. "),
+            "{:#?}",
+            report.errors
+        );
+        assert_eq!(
+            report.errors.last().and_then(|e| e.code.as_deref()),
+            Some("networkRelatedError")
+        );
     }
 
     /// A cancel counts only for the run in progress: one with no run is not
@@ -5832,6 +5981,60 @@ pub(crate) mod tests {
         );
         assert!(check.duration_ms.unwrap() < 1600);
         assert_eq!(check.coverage, Coverage::Inconclusive);
+        // It timed out, so a normal run's timeout line is there.
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.code.as_deref() == Some("loginTimeoutExpired")),
+            "{:#?}",
+            report.errors
+        );
+    }
+
+    /// A login the time limit ended after the transport opened, before the
+    /// client had an operating-system error to report, still gets the
+    /// driver's timeout line, as a normal sqlcmd run prints it.
+    #[test]
+    fn a_login_that_runs_out_of_time_reads_as_a_login_timeout() {
+        let stages = Stages::new()
+            .add(
+                Stage::Dns,
+                Some(true),
+                0,
+                1,
+                &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(true),
+                1,
+                2,
+                &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+            )
+            .add(Stage::Prelogin, None, 2, 900, &[]);
+        let report = observed(
+            request("tcp:db01,1433", Depth::ConnectionAttempt),
+            stages,
+            timed_out(),
+        );
+        let codes: Vec<Option<&str>> = report.errors.iter().map(|e| e.code.as_deref()).collect();
+        assert_eq!(
+            codes,
+            [Some("timedOut"), Some("loginTimeoutExpired")],
+            "{:#?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|e| e.check == CheckId::ConnectionAttempt)
+        );
+        assert_eq!(
+            report.errors[1].text.as_deref(),
+            Some("Login timeout expired")
+        );
     }
 
     /// An address connected, and the client checked no more than its most
@@ -6117,6 +6320,25 @@ pub(crate) mod tests {
             let check = checked(&report, CheckId::TcpConnect);
             assert_eq!(check.coverage, Coverage::Inconclusive);
             assert_eq!(check.attempts[0].result, TcpResult::TimedOut);
+            assert_eq!(check.field("tcpAcceptance"), Some("unknown"));
+            // The time limit ran out, so the timeout line; but TCP may have
+            // been accepted, so no failed-open summary.
+            let summaries: Vec<&str> = report
+                .errors
+                .iter()
+                .filter(|e| e.source == "client")
+                .filter_map(|e| e.code.as_deref())
+                .collect();
+            assert!(
+                summaries.contains(&"loginTimeoutExpired"),
+                "{ok:?}: {:#?}",
+                report.errors
+            );
+            assert!(
+                !summaries.contains(&"networkRelatedError"),
+                "{ok:?}: {:#?}",
+                report.errors
+            );
             assert!(report.findings.iter().any(|f| {
                 f.check == CheckId::TcpConnect
                     && f.certainty == Certainty::Informational
@@ -6368,6 +6590,132 @@ pub(crate) mod tests {
         );
     }
 
+    /// The server closing the connection in pre-login or in login: the error
+    /// keeps the client's `connectionClosed` code and gets the driver's
+    /// summary for the read that failed in that phase.
+    #[test]
+    fn a_connection_the_server_closed_gets_the_read_summary_for_its_phase() {
+        for (failed, expected) in [
+            (Stage::Prelogin, "preloginFailure"),
+            (Stage::Login, "communicationLinkFailure"),
+        ] {
+            let mut stages = Stages::new()
+                .add(
+                    Stage::Dns,
+                    Some(true),
+                    0,
+                    1,
+                    &[(cs::HOST, "db01"), (cs::ADDRESSES, "10.0.0.1")],
+                )
+                .add(
+                    Stage::Tcp,
+                    Some(true),
+                    1,
+                    2,
+                    &[(cs::ADDRESS, "10.0.0.1"), (cs::PORT, "1433")],
+                );
+            stages = if failed == Stage::Login {
+                stages.add(Stage::Prelogin, Some(true), 2, 3, &[]).add(
+                    Stage::Login,
+                    Some(false),
+                    3,
+                    4,
+                    &[],
+                )
+            } else {
+                stages.add(Stage::Prelogin, Some(false), 2, 3, &[])
+            };
+            let report = observed(
+                request("tcp:db01,1433", Depth::ConnectionAttempt),
+                stages,
+                Ended::Failed(Error::ConnectionClosed("closed by the server".to_string())),
+            );
+            let codes: Vec<&str> = report
+                .errors
+                .iter()
+                .filter(|e| e.check == CheckId::ConnectionAttempt)
+                .filter_map(|e| e.code.as_deref())
+                .collect();
+            assert_eq!(
+                codes,
+                ["connectionClosed", expected],
+                "{failed:?}: {:#?}",
+                report.errors
+            );
+        }
+    }
+
+    /// A routing redirect reconnects over TCP whatever the target's protocol:
+    /// a refused connect where a named pipe login was sent is worded as TCP's,
+    /// not as a pipe that did not open.
+    #[test]
+    fn a_pipe_login_redirected_to_a_refused_tcp_port_reads_as_tcp() {
+        let refused = if cfg!(windows) {
+            10061
+        } else if cfg!(target_os = "macos") {
+            61
+        } else {
+            111
+        };
+        let stages = Stages::new()
+            .add(
+                Stage::Pipe,
+                Some(true),
+                0,
+                1,
+                &[
+                    (cs::KIND, cs::KIND_NAMED_PIPE),
+                    (cs::PIPE_PATH, r"\\db01\pipe\sql\query"),
+                ],
+            )
+            .add(Stage::Prelogin, Some(true), 1, 2, &[])
+            .add(Stage::Login, None, 2, 4, &[(cs::REDIRECTED, "true")])
+            .add(
+                Stage::Dns,
+                Some(true),
+                5,
+                6,
+                &[(cs::HOST, "node7"), (cs::ADDRESSES, "10.0.0.9")],
+            )
+            .add(
+                Stage::Tcp,
+                Some(false),
+                6,
+                7,
+                &[
+                    (cs::ADDRESS, "10.0.0.9"),
+                    (cs::PORT, "11000"),
+                    (cs::OS_ERROR, &refused.to_string()),
+                    (cs::ERROR, "Connection refused"),
+                ],
+            );
+        let report = observed(
+            request(r"np:\\db01\pipe\sql\query", Depth::ConnectionAttempt),
+            stages,
+            Ended::Failed(Error::Io(std::io::Error::from_raw_os_error(refused))),
+        );
+        let worded: Vec<&str> = report
+            .errors
+            .iter()
+            .filter(|e| !e.superseded && e.source == "os")
+            .filter_map(|e| e.text.as_deref())
+            .collect();
+        assert!(
+            worded.iter().any(|t| t.starts_with("TCP Provider: ")),
+            "{:#?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .filter_map(|e| e.text.as_deref())
+                .all(|t| !t.starts_with("Named Pipes Provider: ")),
+            "{:#?}",
+            report.errors
+        );
+    }
+
     /// Without a prefix the client's protocol order moves on: the transports
     /// it moved past are evidence, marked superseded, and the attempt is the
     /// last transport's. A TCP path the pipe that opened replaced does not
@@ -6477,7 +6825,7 @@ pub(crate) mod tests {
             .iter()
             .find(|e| e.os_error == Some(2))
             .unwrap();
-        assert!(set_aside.superseded);
+        assert!(set_aside.superseded && set_aside.text.is_none());
         assert_eq!(
             checked(&report, CheckId::TcpConnect).coverage,
             Coverage::Passed
@@ -6703,6 +7051,23 @@ pub(crate) mod tests {
             checked(&report, CheckId::TcpConnect).skip,
             Some(Skip::BlockedBy(CheckId::NameResolution))
         );
+        // Worded as the driver prints it: SNI resolves the name inside its
+        // SQL Server Browser lookup and reports error 26, not the TCP
+        // provider; the network-related summary follows.
+        let text = report::text(&report);
+        let errors: Vec<&str> = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Sqlcmd: Error:"))
+            .collect();
+        assert!(
+            errors[0].contains(
+                "SQL Server Network Interfaces: Error Locating Server/Instance Specified \
+                 [xFFFFFFFF]."
+            ),
+            "{text}"
+        );
+        assert!(errors[1].contains("A network-related"), "{text}");
+        assert!(!text.contains("TCP Provider"), "{text}");
     }
 
     /// SQL Server Browser answered for `db01\SQL2022` with no TCP port.
@@ -7842,6 +8207,56 @@ pub(crate) mod tests {
         }
     }
 
+    /// Without a prefix, shared memory to this computer that ends the run at
+    /// `networkReachability` is worded as the shared-memory provider's, the
+    /// transport its check names, not as TCP: abandoned by the time limit,
+    /// and refused by the operating system.
+    #[test]
+    fn a_shared_memory_open_that_ends_the_run_is_worded_as_shared_memory() {
+        let pipe = r"\\.\pipe\SQLLocal\MSSQLSERVER";
+        for (ok, details, ended, code) in [
+            (None, vec![], timed_out(), 121),
+            (
+                Some(false),
+                vec![
+                    (cs::OS_ERROR, "2"),
+                    (
+                        cs::ERROR,
+                        "The system cannot find the file specified. (os error 2)",
+                    ),
+                ],
+                Ended::Failed(Error::Io(std::io::Error::from_raw_os_error(2))),
+                2,
+            ),
+        ] {
+            let mut fields = vec![(cs::KIND, cs::KIND_SHARED_MEMORY), (cs::PIPE_PATH, pipe)];
+            fields.extend(details);
+            let report = observed(
+                request("localhost", Depth::NetworkReachability),
+                Stages::new().add(Stage::Pipe, ok, 0, 900, &fields),
+                ended,
+            );
+            let check = checked(&report, CheckId::TcpConnect);
+            assert_eq!(check.field("transport"), Some("sharedMemory"), "{check:#?}");
+            let error = report
+                .errors
+                .iter()
+                .find(|e| !e.superseded && e.source == "os")
+                .unwrap();
+            assert_eq!(
+                error.text.as_deref(),
+                Some(
+                    format!("Shared Memory Provider: Could not open a connection to SQL Server [{code}]. ")
+                        .as_str()
+                ),
+                "{:#?}",
+                report.errors
+            );
+            let text = report::text(&report);
+            assert!(!text.contains("TCP Provider"), "{text}");
+        }
+    }
+
     /// An explicit pipe that does not open at `networkReachability` is a
     /// failed reachability check on that transport, with its error: not a
     /// clean run, and not a TCP attempt.
@@ -7874,11 +8289,21 @@ pub(crate) mod tests {
         assert!(check.attempts.is_empty());
         assert_eq!(report.outcome, DiagnosticOutcome::IssueDetected);
         assert_eq!(report.exit_code(), 1);
-        let errors: Vec<&ErrorRecord> = report.errors.iter().filter(|e| !e.superseded).collect();
+        let errors: Vec<&ErrorRecord> = report
+            .errors
+            .iter()
+            .filter(|e| !e.superseded && e.source == "os")
+            .collect();
         assert_eq!(errors.len(), 1, "{:#?}", report.errors);
         assert_eq!(errors[0].check, CheckId::TcpConnect);
         assert_eq!(errors[0].os_error, Some(2));
+        // Worded as the driver words a pipe that does not open, not as TCP.
+        assert_eq!(
+            errors[0].text.as_deref(),
+            Some("Named Pipes Provider: Could not open a connection to SQL Server [2]. ")
+        );
         let text = report::text(&report);
+        assert!(!text.contains("TCP Provider"), "{text}");
         assert!(
             text.contains(r"namedPipe \\db01\pipe\sql\query: failed"),
             "{text}"
@@ -7911,6 +8336,52 @@ pub(crate) mod tests {
         assert_eq!(check.coverage, Coverage::Inconclusive, "{report:#?}");
         assert_eq!(check.field("result"), Some("timedOut"));
         assert_eq!(report.exit_code(), 2);
+        // Deeper, the connection attempt reports it as reachability does:
+        // the pipe's own timeout, worded as SNI words a pipe that did not
+        // open in time, then `Login timeout expired` and the network summary.
+        for depth in [Depth::ConnectionAttempt, Depth::SessionValidation] {
+            let report = observed(
+                request(r"np:\\db01\pipe\sql\query", depth),
+                unanswered(),
+                timed_out(),
+            );
+            let pipe: Vec<&ErrorRecord> = report
+                .errors
+                .iter()
+                .filter(|e| !e.superseded && e.source == "os")
+                .collect();
+            assert_eq!(pipe.len(), 1, "{depth:?}: {:#?}", report.errors);
+            assert_eq!(pipe[0].check, CheckId::ConnectionAttempt, "{depth:?}");
+            assert_eq!(pipe[0].code.as_deref(), Some("timedOut"), "{depth:?}");
+            assert_eq!(
+                pipe[0].text.as_deref(),
+                Some("Named Pipes Provider: Could not open a connection to SQL Server [121]. "),
+                "{depth:?}"
+            );
+            let codes: Vec<&str> = report
+                .errors
+                .iter()
+                .filter(|e| e.source == "client")
+                .filter_map(|e| e.code.as_deref())
+                .collect();
+            assert_eq!(
+                codes,
+                ["loginTimeoutExpired", "networkRelatedError"],
+                "{depth:?}: {:#?}",
+                report.errors
+            );
+        }
+        // Timed out before any pipe stage: the timeout alone, no pipe line.
+        let report = observed(
+            request(r"np:\\db01\pipe\sql\query", Depth::SessionValidation),
+            Stages::new(),
+            timed_out(),
+        );
+        assert!(
+            report.errors.iter().all(|e| e.source != "os"),
+            "{:#?}",
+            report.errors
+        );
         let report = observed(
             request(r"np:\\db01\pipe\sql\query", Depth::SessionValidation),
             unanswered(),
@@ -8014,12 +8485,44 @@ pub(crate) mod tests {
                     Coverage::Inconclusive,
                     "{server}: {report:#?}"
                 );
-                let errors: Vec<&ErrorRecord> =
-                    report.errors.iter().filter(|e| !e.superseded).collect();
+                let errors: Vec<&ErrorRecord> = report
+                    .errors
+                    .iter()
+                    .filter(|e| !e.superseded && e.source == "os")
+                    .collect();
                 assert_eq!(errors.len(), 1, "{server}: {:#?}", report.errors);
                 assert_eq!(errors[0].check, id, "{server}");
                 assert_eq!(errors[0].code.as_deref(), Some("timedOut"), "{server}");
                 assert_eq!(errors[0].message, error, "{server}");
+                // Worded as the driver words a pipe that did not open in
+                // time, as for the abandoned pipe: SNI's error 40 with
+                // `WaitNamedPipe`'s 121, `Login timeout expired` and the
+                // network summary.
+                let provider = if kind == cs::KIND_SHARED_MEMORY {
+                    "Shared Memory Provider: "
+                } else {
+                    "Named Pipes Provider: "
+                };
+                assert_eq!(
+                    errors[0].text.as_deref(),
+                    Some(
+                        format!("{provider}Could not open a connection to SQL Server [121]. ")
+                            .as_str()
+                    ),
+                    "{server}"
+                );
+                let codes: Vec<&str> = report
+                    .errors
+                    .iter()
+                    .filter(|e| !e.superseded && e.source == "client")
+                    .filter_map(|e| e.code.as_deref())
+                    .collect();
+                assert_eq!(
+                    codes,
+                    ["loginTimeoutExpired", "networkRelatedError"],
+                    "{server}: {:#?}",
+                    report.errors
+                );
                 assert!(
                     report.findings.iter().any(|f| f.text.contains(error)),
                     "{server}: {:#?}",
@@ -8089,6 +8592,34 @@ pub(crate) mod tests {
         );
     }
 
+    /// A time limit that ran out after SQL Server Browser answered, before
+    /// the transport its answer pointed to, reads as the driver's login
+    /// timeout: the line follows the time-limit error, on the TCP connect,
+    /// with no network-related summary, as no provider message precedes it.
+    fn assert_login_timeout_line(report: &Report, text: &str, server: &str) {
+        let codes: Vec<Option<&str>> = report
+            .errors
+            .iter()
+            .filter(|e| e.check == CheckId::TcpConnect && !e.superseded)
+            .map(|e| e.code.as_deref())
+            .collect();
+        assert_eq!(
+            codes,
+            [Some("timedOut"), Some("loginTimeoutExpired")],
+            "{server}: {:#?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|e| e.code.as_deref() != Some("networkRelatedError")),
+            "{server}: {:#?}",
+            report.errors
+        );
+        assert!(text.contains("Login timeout expired"), "{server}: {text}");
+    }
+
     /// The login time limit spent on SQL Server Browser before any TCP
     /// connect: TCP was needed, so the check is not attempted, with the
     /// time-limit error, not not applicable. A pipe instance keeps its skip.
@@ -8136,6 +8667,7 @@ pub(crate) mod tests {
             );
             let text = report::text(&report);
             assert!(text.contains("port 50001: notAttempted"), "{text}");
+            assert_login_timeout_line(&report, &text, server);
 
             // A client that reports the limit's end as nothing having
             // worked: the attempt took the time limit, so the limit ran out.
@@ -8280,6 +8812,7 @@ pub(crate) mod tests {
                 text.contains(&format!("namedPipe {listed}: notAttempted")),
                 "{text}"
             );
+            assert_login_timeout_line(&report, &text, server);
 
             let report = canceled_with(request(server, Depth::NetworkReachability), answered(pipe));
             assert_eq!(
@@ -8516,11 +9049,20 @@ pub(crate) mod tests {
             assert_eq!(tcp[0].coverage, Coverage::Diagnosed, "{:#?}", tcp[0]);
             assert_eq!(tcp[0].field("transport"), Some("namedPipe"));
             assert_eq!(tcp[0].field("pipe"), Some(pipe));
-            let current: Vec<&ErrorRecord> =
-                report.errors.iter().filter(|e| !e.superseded).collect();
+            // The summaries the driver adds follow; the event is the os one.
+            let current: Vec<&ErrorRecord> = report
+                .errors
+                .iter()
+                .filter(|e| !e.superseded && e.source == "os")
+                .collect();
             assert_eq!(current.len(), 1, "{:#?}", report.errors);
             assert_eq!(current[0].check, CheckId::TcpConnect);
             assert_eq!(current[0].os_error, Some(53));
+            // Worded by the transport that ended the run, not as TCP.
+            assert_eq!(
+                current[0].text.as_deref(),
+                Some("Named Pipes Provider: Could not open a connection to SQL Server [53]. ")
+            );
             assert!(
                 report
                     .errors
@@ -8983,7 +9525,7 @@ pub(crate) mod tests {
         let record = report
             .errors
             .iter()
-            .find(|e| e.check == CheckId::NameResolution)
+            .find(|e| e.check == CheckId::NameResolution && e.source != "client")
             .unwrap();
         assert_eq!(record.message, "no answer within 2000 ms");
         let text = report::text(&report);
@@ -9084,7 +9626,7 @@ pub(crate) mod tests {
         assert!(finding.quotes_message, "{finding:#?}");
         assert_eq!(
             review(&report),
-            serde_json::json!(["errors[].message", "findings[].text"])
+            serde_json::json!(["errors[].message", "errors[].text", "findings[].text"])
         );
 
         let report = failed(None);
@@ -9094,7 +9636,10 @@ pub(crate) mod tests {
             .find(|f| f.check == CheckId::SessionValidation)
             .unwrap();
         assert!(!finding.quotes_message, "{finding:#?}");
-        assert_eq!(review(&report), serde_json::json!(["errors[].message"]));
+        assert_eq!(
+            review(&report),
+            serde_json::json!(["errors[].message", "errors[].text"])
+        );
     }
 
     /// The session query's row, read without a server: the clock from days

@@ -18,10 +18,10 @@ use super::exec_common::{
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use super::util::read_utf16;
+use super::util::read_utf16_long;
 use crate::api::odbc_types::{
-    SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn,
-    SqlSmallInt, SqlWChar,
+    SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SQL_NTS, SqlHandle,
+    SqlInteger, SqlReturn, SqlWChar,
 };
 use crate::conversion::param_convert::{data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
@@ -50,7 +50,7 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 pub(crate) unsafe fn sql_exec_direct_w(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     crate::ffi_entry!(
         "SQLExecDirectW",
@@ -79,7 +79,7 @@ pub(crate) unsafe fn sql_exec_direct_w(
 unsafe fn sql_exec_direct_w_impl(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLExecDirectW: statement_handle is null");
@@ -99,7 +99,12 @@ unsafe fn sql_exec_direct_w_impl(
         "SQLExecDirectW: statement_text is null — DM should have rejected this"
     );
 
-    let sql = unsafe { read_utf16(statement_text, text_length) };
+    debug_assert!(
+        text_length == SqlInteger::from(SQL_NTS) || text_length >= 0,
+        "SQLExecDirectW: invalid text_length ({text_length}) — DM should have rejected this"
+    );
+
+    let sql = unsafe { read_utf16_long(statement_text, text_length) };
     sql_exec_direct_w_safe(statement_handle, stmt, sql)
 }
 
@@ -538,7 +543,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(SQL_NULL_HANDLE, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(SQL_NULL_HANDLE, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
     }
 
@@ -546,7 +551,7 @@ mod tests {
     fn null_statement_text_returns_error() {
         let h = TestHandles::with_env_dbc_stmt();
 
-        let ret = unsafe { sql_exec_direct_w(h.stmt, std::ptr::null(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, std::ptr::null(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_ERROR);
     }
 
@@ -558,7 +563,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
     }
@@ -582,7 +587,7 @@ mod tests {
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
 
@@ -608,7 +613,7 @@ mod tests {
         // Fails (not connected), but the stale row-count state must be cleared
         // at execute start so a later SQLMoreResults can't surface it.
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
 
@@ -644,7 +649,7 @@ mod tests {
             .collect();
         // Fails (not connected), but the prepared plan must already be reset.
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
 
@@ -715,7 +720,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let _ = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let _ = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         helper.join().unwrap();
 
         assert_eq!(
@@ -749,7 +754,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
@@ -797,7 +802,7 @@ mod tests {
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -848,7 +853,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_ERROR);
 
         let state = stmt.inner.lock().unwrap();
@@ -898,7 +903,7 @@ mod tests {
                 let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
                 for _ in 0..3 {
                     assert_eq!(
-                        unsafe { SQLExecDirectW(stmt, sql.as_ptr(), SQL_NTS) },
+                        unsafe { SQLExecDirectW(stmt, sql.as_ptr(), SQL_NTS.into()) },
                         SQL_SUCCESS
                     );
                     assert_eq!(unsafe { SQLFetch(stmt) }, SQL_SUCCESS);
@@ -926,6 +931,89 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// `TextLength` is a `SQLINTEGER`. Read as 16 bits, 40000 and 65536 became
+    /// empty text, 70000 a 4464-unit prefix, and 65533 `SQL_NTS`. Only the
+    /// exact text matches the mock's registered row-returning response.
+    #[test]
+    fn exec_direct_reads_text_length_beyond_i16() {
+        use crate::api::exports::{SQLExecDirectW, SQLFetch, SQLFreeStmt, SQLGetData};
+        use crate::api::odbc_types::{SQL_C_LONG, SQL_CLOSE, SQL_SUCCESS, SqlLen};
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+
+        for len in [32_767, 32_768, 40_000, 65_533, 65_536, 70_000] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let (text, buffer) = crate::test_support::padded_statement_text(len);
+            let _server =
+                crate::test_support::connect_mock_server(dbc, &text, QueryResponse::select_one());
+
+            let text_length = SqlInteger::try_from(len).unwrap();
+            assert_eq!(
+                unsafe { SQLExecDirectW(h.stmt, buffer.as_ptr(), text_length) },
+                SQL_SUCCESS,
+                "TextLength {len}"
+            );
+            assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_SUCCESS, "TextLength {len}");
+            let mut value = 0i32;
+            let mut indicator: SqlLen = 0;
+            assert_eq!(
+                unsafe {
+                    SQLGetData(
+                        h.stmt,
+                        1,
+                        SQL_C_LONG,
+                        std::ptr::from_mut(&mut value).cast(),
+                        SqlLen::try_from(size_of::<i32>()).unwrap(),
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 1, "TextLength {len}");
+            assert_eq!(unsafe { SQLFreeStmt(h.stmt, SQL_CLOSE) }, SQL_SUCCESS);
+        }
+    }
+
+    /// The DM rejects these with HY090 before the driver sees them, so the
+    /// driver only asserts the contract, as msodbcsql relies on it too. The
+    /// mock answers any batch, so only the assert keeps this an error.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn negative_text_length_other_than_nts_violates_dm_contract() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+
+        for text_length in [-1, -2, -4, -32_768, SqlInteger::MIN] {
+            assert_eq!(
+                unsafe { crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), text_length) },
+                SQL_ERROR,
+                "TextLength {text_length}"
+            );
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.diag_records.is_empty(), "TextLength {text_length}");
+            assert!(!state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN));
+            drop(state);
+            assert!(dbc.inner.lock().unwrap().wire.owner().is_none());
+        }
+
+        assert_eq!(
+            unsafe { crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), 8) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { crate::api::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_CLOSE) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
     }
 
     /// A plain batch whose first statement is a no-row result (DML row count)

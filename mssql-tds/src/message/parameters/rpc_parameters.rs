@@ -11,7 +11,7 @@ use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sql_udt::UdtTypeName;
 use crate::datatypes::sqldatatypes::VectorBaseType;
-use crate::datatypes::sqltypes::SqlType;
+use crate::datatypes::sqltypes::{RpcInlineValue, SqlType};
 use crate::datatypes::tds_value_serializer::TdsValueSerializer;
 use crate::{
     core::TdsResult,
@@ -656,6 +656,33 @@ impl RpcParameter {
             Self::validate_name_length(name)?;
         }
         self.validate_before_send(db_collation)
+    }
+
+    /// Encoded length of this parameter in positional form when the batched
+    /// `sp_execute` fast path can write it; see [`SqlType::rpc_inline`].
+    pub(crate) fn positional_inline_len(&self) -> Option<usize> {
+        self.inline_value().map(|value| 2 + value.encoded_len())
+    }
+
+    /// Synchronous twin of [`Self::serialize`] for a positional parameter
+    /// whose [`Self::positional_inline_len`] the caller has already reserved
+    /// within the current packet. Writes nothing for an ineligible parameter.
+    pub(crate) fn write_positional_inline(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+    ) {
+        if let Some(value) = self.inline_value() {
+            packet_writer.write_bytes_within_packet(&[0, self.options.bits()]);
+            value.write(packet_writer, db_collation);
+        }
+    }
+
+    fn inline_value(&self) -> Option<RpcInlineValue<'_>> {
+        match &self.value {
+            RpcValue::Materialized(value) if self.encrypted.is_none() => value.rpc_inline(),
+            _ => None,
+        }
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.

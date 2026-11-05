@@ -75,6 +75,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use super::dbc::DbcState;
 use super::stmt::{STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS};
 use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
 use crate::api::odbc_types::{
@@ -787,6 +788,18 @@ impl DescHandle {
             error!("checking descriptor reader state: dbc mutex poisoned");
             return Err(());
         };
+        self.readers_through_locked(&dbc_state, want_fetch, want_exec)
+    }
+
+    pub(crate) fn readers_through_locked(
+        &self,
+        dbc_state: &DbcState,
+        want_fetch: bool,
+        want_exec: bool,
+    ) -> Result<(bool, bool), ()> {
+        if !want_fetch && !want_exec {
+            return Ok((false, false));
+        }
         // An *implicit* descriptor has exactly one possible reader: the
         // statement it belongs to. `SQL_ATTR_APP_ROW_DESC` /
         // `SQL_ATTR_APP_PARAM_DESC` reject another statement's implicit

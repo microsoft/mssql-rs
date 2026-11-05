@@ -48,6 +48,7 @@ use mssql_tds::datatypes::sql_string::{
     EncodingType, ResolvedDecoder, ResolvedEncoding, SqlString,
 };
 use mssql_tds::query::metadata::PlpEncoding;
+use mssql_tds::token::tokens::SqlCollation;
 
 /// Maximum speculative PLP read-ahead retained by one `SQLGetData` stream.
 ///
@@ -265,12 +266,13 @@ fn sql_get_data_operation(
         .as_ref()
         .filter(|stream| stream.column == col_index)
     {
-        let prepared_stream = (
-            active_plp.encoding,
-            active_plp.pending_units.len(),
-            active_plp.pending_bytes.len(),
-            active_plp.narrow_encoding,
-        );
+        let prepared_stream = PreparedPlpStream {
+            encoding: active_plp.encoding,
+            widen_carry_len: active_plp.pending_units.len(),
+            utf8_carry_len: active_plp.pending_bytes.len(),
+            narrow_encoding: active_plp.narrow_encoding,
+            narrow_verbatim: active_plp.narrow_verbatim,
+        };
         return stream_active_plp_chunk(
             stmt,
             statement_handle,
@@ -1872,6 +1874,40 @@ fn apply_cursor_result(
     }
 }
 
+/// Continuation state of an open stream, read under the statement lock.
+struct PreparedPlpStream {
+    encoding: PlpEncoding,
+    /// Pending UTF-16 units from a wide conversion.
+    widen_carry_len: usize,
+    /// Pending converted bytes.
+    utf8_carry_len: usize,
+    narrow_encoding: Option<ResolvedEncoding>,
+    /// Narrow `SQL_C_CHAR` delivery copies wire bytes unconverted.
+    narrow_verbatim: bool,
+}
+
+/// Whether a narrow PLP column's wire bytes can be delivered to `SQL_C_CHAR`
+/// unconverted. msodbcsql skips CHAR->CHAR conversion when the column's
+/// collation code page is the client's (`FIsConversionNeeded`,
+/// `sqlcdata.cpp`), comparing code pages rather than decoders: an unmapped
+/// collation does not qualify even though values decode as Windows-1252.
+///
+/// Limited to cp1252 on Windows, where Windows-1252 decoding followed by
+/// `WideCharToMultiByte` is already the identity for every byte. Elsewhere
+/// verbatim output differs from today's conversion (iconv's CP1252 has no
+/// 0x81, 0x8D, 0x8F, 0x90 or 0x9D; DBCS pages differ in unmapped and
+/// vendor-extension sequences), so those stay converted until that change is
+/// taken as a parity fix (AB#49624).
+fn narrow_plp_copies_verbatim(collation: Option<SqlCollation>, client: ClientEncoding) -> bool {
+    #[cfg(test)]
+    if tests::FORCE_NARROW_TRANSCODE.with(std::cell::Cell::get) {
+        return false;
+    }
+    cfg!(windows)
+        && client.code_page() == 1252
+        && collation.and_then(|collation| collation.code_page()) == Some(1252)
+}
+
 #[derive(Default)]
 struct PlpReadProgress {
     written: usize,
@@ -1902,7 +1938,7 @@ fn stream_active_plp_chunk<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     mut starting_new_stream: bool,
-    mut prepared_stream: Option<(PlpEncoding, usize, usize, Option<ResolvedEncoding>)>,
+    mut prepared_stream: Option<PreparedPlpStream>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
     let mut progress = PlpReadProgress::default();
@@ -1937,7 +1973,7 @@ fn stream_active_plp_chunk_once<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
-    prepared_stream: Option<(PlpEncoding, usize, usize, Option<ResolvedEncoding>)>,
+    prepared_stream: Option<PreparedPlpStream>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
     progress: &mut PlpReadProgress,
 ) -> SqlReturn {
@@ -1992,8 +2028,14 @@ fn stream_active_plp_chunk_once<'a>(
         return SQL_ERROR;
     }
 
-    let (plp_encoding, widen_carry_len, utf8_carry_len, narrow_encoding) =
-        if let Some((encoding, widen_carry_len, utf8_carry_len, narrow_encoding)) = prepared_stream
+    let (plp_encoding, widen_carry_len, utf8_carry_len, narrow_encoding, narrow_verbatim) =
+        if let Some(PreparedPlpStream {
+            encoding,
+            widen_carry_len,
+            utf8_carry_len,
+            narrow_encoding,
+            narrow_verbatim,
+        }) = prepared_stream
         {
             let decoder_ready = narrow_encoding.is_some();
             let compatible = match (target_type, encoding) {
@@ -2036,6 +2078,7 @@ fn stream_active_plp_chunk_once<'a>(
                 widen_carry_len,
                 utf8_carry_len,
                 narrow_encoding,
+                narrow_verbatim,
             )
         } else {
             let mut stmt_state = match retained_stmt_state.take() {
@@ -2074,11 +2117,17 @@ fn stream_active_plp_chunk_once<'a>(
                         }),
                     _ => None,
                 };
+                let narrow_verbatim = encoding == PlpEncoding::SingleByteText
+                    && narrow_plp_copies_verbatim(
+                        column_meta.and_then(|m| m.get_collation()),
+                        text_output.encoding,
+                    );
                 // The TDS cursor is already paused inside this value. Preserve
                 // that position even if conversion is rejected, so a retry does
                 // not resume the row cursor and drain the unread value.
-                stmt_state.active_plp =
-                    Some(ActivePlpStream::new(col_index, encoding, narrow_encoding));
+                let mut stream = ActivePlpStream::new(col_index, encoding, narrow_encoding);
+                stream.narrow_verbatim = narrow_verbatim;
+                stmt_state.active_plp = Some(stream);
                 stmt_state.current_row_last_col = col_index;
             }
 
@@ -2153,6 +2202,7 @@ fn stream_active_plp_chunk_once<'a>(
                 stream.map_or(0, |s| s.pending_units.len()),
                 stream.map_or(0, |s| s.pending_bytes.len()),
                 narrow_encoding,
+                stream.is_some_and(|s| s.narrow_verbatim),
             );
             retained_stmt_state = Some(stmt_state);
             stream_state
@@ -2162,8 +2212,10 @@ fn stream_active_plp_chunk_once<'a>(
     // encodes complete text into the client code page.
     let transcode_utf16_to_utf8 = target_type == SQL_C_CHAR && is_unicode_plp;
     // UTF-8 wire text (including json) is verbatim only for a UTF-8 client.
-    // Other narrow sources still decode through their own collation (AB#47566).
+    // Other narrow sources still decode through their own collation (AB#47566)
+    // unless their code page is the client's.
     let transcode_narrow_to_utf8 = target_type == SQL_C_CHAR
+        && !narrow_verbatim
         && matches!(
             plp_encoding,
             Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
@@ -2419,8 +2471,13 @@ fn stream_active_plp_chunk_once<'a>(
             )
             | (SQL_C_BINARY, Some(_))
     ) && !transcode_narrow_to_utf8;
-    let direct_wire_output =
+    let read_ahead =
         max_read > 0 && !target_value_ptr.is_null() && !staged_binary_read && wire_shaped_output;
+    // A direct read zeroes its whole window first, so a final short read would
+    // leave zeros after the terminator. msodbcsql's same-code-page copy leaves
+    // those bytes untouched, so verbatim narrow text is staged and copied with
+    // its terminator only. It keeps read-ahead: its bytes are still the output.
+    let direct_wire_output = read_ahead && !(narrow_verbatim && target_type == SQL_C_CHAR);
     let mut inline_payload = [0_u8; 256];
     let mut heap_payload = if typed_target {
         std::mem::take(&mut progress.typed_scratch)
@@ -2509,12 +2566,7 @@ fn stream_active_plp_chunk_once<'a>(
         // Read-ahead that ran dry short of the budget is topped up from the wire,
         // as an unbuffered read would have been.
         let buffered = prefetched_read.map_or(0, |(read, ..)| read);
-        match read_plp_wire(
-            stmt,
-            statement_handle,
-            &mut payload[buffered..],
-            direct_wire_output,
-        ) {
+        match read_plp_wire(stmt, statement_handle, &mut payload[buffered..], read_ahead) {
             Ok(Ok(chunk)) => Ok(PlpChunk {
                 read: buffered + chunk.read,
                 ..chunk
@@ -2943,13 +2995,14 @@ fn stream_active_plp_chunk_once<'a>(
         }
     } else {
         // SQL_C_CHAR delivery of a text PLP column whose wire bytes are already
-        // UTF-8, copied verbatim. `SingleByteText` reaches here only when its
-        // collation is UTF-8 (or did not resolve, where there is nothing to
-        // decode through); anything else took the transcode branch above. The
-        // two arms are kept separate so the distinction stays recorded: `json`
-        // (`Utf8Text`) carries no collation at all and must never be folded into
-        // the conversion logic: it has no collation, but still needs transcoding
-        // when the client encoding is not UTF-8.
+        // in the client encoding, copied verbatim. `SingleByteText` reaches here
+        // only when its collation is UTF-8, its code page is the client's
+        // (`narrow_plp_copies_verbatim`), or it did not resolve, where there is
+        // nothing to decode through; anything else took the transcode branch
+        // above. The two arms are kept separate so the distinction stays
+        // recorded: `json` (`Utf8Text`) carries no collation at all and must
+        // never be folded into the conversion logic: it has no collation, but
+        // still needs transcoding when the client encoding is not UTF-8.
         let copy_verbatim = || unsafe {
             if direct_wire_output {
                 target_value_ptr.cast::<u8>().add(read).write_unaligned(0);
@@ -2963,8 +3016,8 @@ fn stream_active_plp_chunk_once<'a>(
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         };
         match plp_encoding {
-            // varchar(max)/char/text under a UTF-8 collation — already UTF-8 on
-            // the wire, so verbatim is the conversion.
+            // varchar(max)/char/text under a UTF-8 collation, or one whose code
+            // page is the client's -- already in the client encoding.
             Some(PlpEncoding::SingleByteText) => copy_verbatim(),
             // json — UTF-8 on the wire with no collation; this branch is reached
             // only when the client encoding also permits verbatim delivery.
@@ -3183,7 +3236,7 @@ fn read_plp_wire(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
     payload: &mut [u8],
-    direct_wire_output: bool,
+    read_ahead: bool,
 ) -> Result<TdsResult<PlpChunk>, SqlReturn> {
     #[cfg(test)]
     tests::PLP_WIRE_READS.with(|reads| reads.set(reads.get() + 1));
@@ -3239,7 +3292,7 @@ fn read_plp_wire(
                     .and_then(|total| total.checked_sub(chunk.total_read as u64))
                     .and_then(|bytes| usize::try_from(bytes).ok());
                 let prefetch_len = remaining.filter(|remaining| {
-                    direct_wire_output
+                    read_ahead
                         && *remaining > 0
                         && *remaining <= MAX_PLP_PREFETCH_BYTES
                         && !chunk.reached_end
@@ -6404,7 +6457,9 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT plp_info\0".encode_utf16().collect();
         assert_eq!(
-            unsafe { crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe {
+                crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into())
+            },
             SQL_SUCCESS
         );
         assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);
@@ -10708,7 +10763,11 @@ mod tests {
         let query: Vec<u16> = "SELECT carry\0".encode_utf16().collect();
         assert_eq!(
             unsafe {
-                crate::api::exec_direct::sql_exec_direct_w(handles.stmt, query.as_ptr(), SQL_NTS)
+                crate::api::exec_direct::sql_exec_direct_w(
+                    handles.stmt,
+                    query.as_ptr(),
+                    SQL_NTS.into(),
+                )
             },
             SQL_SUCCESS
         );
@@ -10963,7 +11022,7 @@ mod tests {
                     crate::api::exec_direct::sql_exec_direct_w(
                         handles.stmt,
                         query.as_ptr(),
-                        SQL_NTS,
+                        SQL_NTS.into(),
                     )
                 },
                 SQL_SUCCESS
@@ -11080,7 +11139,11 @@ mod tests {
             let next_stmt = handles.alloc_extra_stmt();
             assert_eq!(
                 unsafe {
-                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        next_stmt,
+                        query.as_ptr(),
+                        SQL_NTS.into(),
+                    )
                 },
                 SQL_SUCCESS
             );
@@ -11146,7 +11209,7 @@ mod tests {
                     crate::api::exec_direct::sql_exec_direct_w(
                         handles.stmt,
                         query.as_ptr(),
-                        SQL_NTS,
+                        SQL_NTS.into(),
                     )
                 },
                 SQL_SUCCESS
@@ -11226,7 +11289,11 @@ mod tests {
             let next_stmt = handles.alloc_extra_stmt();
             assert_eq!(
                 unsafe {
-                    crate::api::exec_direct::sql_exec_direct_w(next_stmt, query.as_ptr(), SQL_NTS)
+                    crate::api::exec_direct::sql_exec_direct_w(
+                        next_stmt,
+                        query.as_ptr(),
+                        SQL_NTS.into(),
+                    )
                 },
                 SQL_SUCCESS
             );
@@ -12434,7 +12501,7 @@ mod tests {
             let sql: Vec<u16> = "SELECT null_plp\0".encode_utf16().collect();
             assert_eq!(
                 unsafe {
-                    crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS)
+                    crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into())
                 },
                 SQL_SUCCESS
             );
@@ -12549,7 +12616,9 @@ mod tests {
         let server = crate::test_support::connect_mock_server(dbc, "SELECT plp_switch", response);
         let sql: Vec<u16> = "SELECT plp_switch\0".encode_utf16().collect();
         assert_eq!(
-            unsafe { crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe {
+                crate::api::exec_direct::sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into())
+            },
             SQL_SUCCESS
         );
         assert_eq!(unsafe { crate::api::fetch::sql_fetch(h.stmt) }, SQL_SUCCESS);
@@ -12613,6 +12682,10 @@ mod tests {
 
     thread_local! {
         pub(super) static PLP_WIRE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Opens narrow PLP streams on the conversion path even when the
+        /// column's code page is the client's, for old-versus-new comparisons.
+        pub(super) static FORCE_NARROW_TRANSCODE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
     }
 
     fn open_mock_cp1252_plp(
@@ -12697,6 +12770,398 @@ mod tests {
             (SQL_SUCCESS, (source.len() - consumed) as SqlLen)
         );
         assert_eq!(&binary[..source.len() - consumed], &source[consumed..]);
+    }
+
+    /// One `SQLGetData` call: return code, indicator, the output buffer (only
+    /// through the terminator for the final chunk), and the posted SQLSTATEs.
+    type PlpTraceCall = (
+        SqlReturn,
+        SqlLen,
+        Vec<u8>,
+        Vec<crate::error::diag::SqlState>,
+    );
+
+    /// Every byte value, repeated `repeats` times and split across uneven PLP
+    /// chunks. The mock server sends one 4 KB packet, so its values stay below
+    /// that.
+    fn every_byte_plp_chunks(repeats: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(256 * repeats).collect();
+        let chunks = vec![
+            bytes[..1].to_vec(),
+            bytes[1..256].to_vec(),
+            bytes[256..1801].to_vec(),
+            bytes[1801..].to_vec(),
+        ];
+        (bytes, chunks)
+    }
+
+    /// Reads a PLP column through `steps`, repeating the last step until
+    /// `SQL_NO_DATA` or `max_calls`. `wide_carry` is placed in the stream after
+    /// the first call, as a `SQL_C_WCHAR` overflow would leave it. Calls whose
+    /// index is in `null_calls` pass a NULL `TargetValuePtr`. Returns the
+    /// trace and whether the stream opened verbatim.
+    fn trace_narrow_plp(
+        h: &TestHandles,
+        steps: &[(SqlSmallInt, usize)],
+        wide_carry: &[u16],
+        null_calls: &[usize],
+        max_calls: usize,
+    ) -> (Vec<PlpTraceCall>, Option<bool>) {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut trace = Vec::new();
+        let mut verbatim = None;
+        for call in 0..max_calls {
+            let (target, size) = steps[call.min(steps.len() - 1)];
+            let mut output = vec![0xcc; size + 1];
+            let target_value = if null_calls.contains(&call) {
+                std::ptr::null_mut()
+            } else {
+                output.as_mut_ptr().cast()
+            };
+            let mut indicator = -999;
+            let rc = unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    target,
+                    target_value,
+                    SqlLen::try_from(size).unwrap(),
+                    &mut indicator,
+                )
+            };
+            let mut state = stmt.inner.lock().unwrap();
+            let states = state.diag_records.iter().map(|d| d.sql_state).collect();
+            if call == 0
+                && let Some(stream) = state.active_plp.as_mut()
+            {
+                verbatim = Some(stream.narrow_verbatim);
+                stream.pending_units.extend_from_slice(wide_carry);
+            }
+            drop(state);
+            if rc == SQL_SUCCESS && target != SQL_C_CHAR {
+                // Direct wide and binary reads zero their window, so bytes past
+                // the final terminator differ by path there. Narrow text keeps
+                // them untouched, as msodbcsql does.
+                let terminator = match target {
+                    SQL_C_WCHAR => 2,
+                    _ => 0,
+                };
+                output.truncate(usize::try_from(indicator).unwrap() + terminator);
+            }
+            if target_value.is_null() {
+                assert!(output.iter().all(|&byte| byte == 0xcc));
+            }
+            trace.push((rc, indicator, output, states));
+            if rc == SQL_NO_DATA || rc == SQL_ERROR {
+                break;
+            }
+        }
+        (trace, verbatim)
+    }
+
+    /// Traces a cp1252 `varchar(max)` under a cp1252 client, on the conversion
+    /// path when `transcode` is set and on the default path otherwise.
+    fn trace_cp1252_plp(
+        chunks: Vec<Vec<u8>>,
+        steps: &[(SqlSmallInt, usize)],
+        wide_carry: &[u16],
+        null_calls: &[usize],
+        max_calls: usize,
+        transcode: bool,
+    ) -> (Vec<PlpTraceCall>, Option<bool>) {
+        let (h, _server) = open_mock_cp1252_plp(chunks);
+        client_code_page(&h, 1252, true);
+        FORCE_NARROW_TRANSCODE.with(|force| force.set(transcode));
+        let result = trace_narrow_plp(&h, steps, wide_carry, null_calls, max_calls);
+        FORCE_NARROW_TRANSCODE.with(|force| force.set(false));
+        result
+    }
+
+    #[test]
+    fn plp_cp1252_verbatim_matches_conversion_for_every_byte() {
+        let (bytes, chunks) = every_byte_plp_chunks(14);
+        for size in [1, 2, 3, 1024, 8192] {
+            // A terminator-only buffer is a length probe that never advances.
+            let max_calls = if size == 1 { 3 } else { bytes.len() + 2 };
+            let steps = [(SQL_C_CHAR, size)];
+            let (converted, converted_path) =
+                trace_cp1252_plp(chunks.clone(), &steps, &[], &[], max_calls, true);
+            let (verbatim, verbatim_path) =
+                trace_cp1252_plp(chunks.clone(), &steps, &[], &[], max_calls, false);
+            assert_eq!(converted_path, Some(false).filter(|_| size <= bytes.len()));
+            assert_eq!(
+                verbatim_path,
+                Some(cfg!(windows)).filter(|_| size <= bytes.len())
+            );
+            assert_eq!(verbatim, converted, "buffer size {size}");
+            assert_eq!(verbatim[0].1, bytes.len() as SqlLen);
+            if size == 1 {
+                continue;
+            }
+            assert_eq!(verbatim.last().unwrap().0, SQL_NO_DATA);
+            let mut delivered = Vec::new();
+            for (rc, indicator, output, _) in &verbatim[..verbatim.len() - 1] {
+                let len = if *rc == SQL_SUCCESS {
+                    usize::try_from(*indicator).unwrap()
+                } else {
+                    assert_eq!(*rc, SQL_SUCCESS_WITH_INFO);
+                    assert_eq!(output[size], 0xcc);
+                    size - 1
+                };
+                assert_eq!(output[len], 0);
+                delivered.extend_from_slice(&output[..len]);
+            }
+            if cfg!(windows) {
+                assert_eq!(delivered, bytes, "buffer size {size}");
+            }
+        }
+    }
+
+    #[test]
+    fn plp_cp1252_verbatim_matches_conversion_for_probes_and_null_buffers() {
+        let (_, chunks) = every_byte_plp_chunks(14);
+        for (steps, null_calls) in [
+            (
+                &[(SQL_C_CHAR, 0), (SQL_C_CHAR, 0), (SQL_C_CHAR, 8192)][..],
+                &[][..],
+            ),
+            (
+                &[(SQL_C_CHAR, 0), (SQL_C_CHAR, 5), (SQL_C_CHAR, 8192)][..],
+                &[0, 1][..],
+            ),
+            (
+                &[(SQL_C_CHAR, 3), (SQL_C_CHAR, 1024), (SQL_C_CHAR, 8192)][..],
+                &[1][..],
+            ),
+            (&[(SQL_C_CHAR, 8192)][..], &[0][..]),
+        ] {
+            let case = format!("steps {steps:?}, NULL calls {null_calls:?}");
+            let (converted, converted_path) =
+                trace_cp1252_plp(chunks.clone(), steps, &[], null_calls, 100, true);
+            let (verbatim, verbatim_path) =
+                trace_cp1252_plp(chunks.clone(), steps, &[], null_calls, 100, false);
+            assert!(!converted_path.unwrap_or(false), "{case}");
+            assert_eq!(
+                verbatim_path,
+                converted_path.map(|_| cfg!(windows)),
+                "{case}"
+            );
+            assert_eq!(verbatim.last().unwrap().0, SQL_NO_DATA, "{case}");
+            assert_eq!(verbatim, converted, "{case}");
+        }
+    }
+
+    #[test]
+    fn plp_cp1252_verbatim_matches_conversion_across_target_switches() {
+        let (_, chunks) = every_byte_plp_chunks(14);
+        for steps in [
+            &[
+                (SQL_C_WCHAR, 6),
+                (SQL_C_CHAR, 5),
+                (SQL_C_WCHAR, 7),
+                (SQL_C_BINARY, 3),
+                (SQL_C_CHAR, 4),
+                (SQL_C_WCHAR, 8192),
+            ][..],
+            &[(SQL_C_CHAR, 3), (SQL_C_WCHAR, 4), (SQL_C_CHAR, 8192)][..],
+            &[
+                (SQL_C_CHAR, 8192),
+                (SQL_C_WCHAR, 10),
+                (SQL_C_CHAR, 2),
+                (SQL_C_CHAR, 8192),
+            ][..],
+        ] {
+            let (converted, _) = trace_cp1252_plp(chunks.clone(), steps, &[], &[], 100, true);
+            let (verbatim, _) = trace_cp1252_plp(chunks.clone(), steps, &[], &[], 100, false);
+            assert_eq!(verbatim.last().unwrap().0, SQL_NO_DATA, "steps {steps:?}");
+            assert_eq!(verbatim, converted, "steps {steps:?}");
+        }
+    }
+
+    #[test]
+    fn plp_cp1252_verbatim_counts_text_carry_in_the_indicator() {
+        let (bytes, chunks) = every_byte_plp_chunks(14);
+        let carry = [0x00e9, 0x20ac, 0x0041];
+        for steps in [
+            &[
+                (SQL_C_CHAR, 4),
+                (SQL_C_CHAR, 3),
+                (SQL_C_CHAR, 2),
+                (SQL_C_CHAR, 8192),
+            ][..],
+            &[(SQL_C_CHAR, 4), (SQL_C_CHAR, 8192)][..],
+            &[(SQL_C_CHAR, 4), (SQL_C_WCHAR, 4), (SQL_C_CHAR, 8192)][..],
+        ] {
+            let (converted, _) = trace_cp1252_plp(chunks.clone(), steps, &carry, &[], 100, true);
+            let (verbatim, verbatim_path) =
+                trace_cp1252_plp(chunks.clone(), steps, &carry, &[], 100, false);
+            assert_eq!(verbatim_path, Some(cfg!(windows)));
+            assert_eq!(verbatim.last().unwrap().0, SQL_NO_DATA, "steps {steps:?}");
+            assert_eq!(verbatim, converted, "steps {steps:?}");
+            // Three wire bytes delivered; six carried bytes precede the rest.
+            if steps[1].0 == SQL_C_CHAR {
+                assert_eq!(
+                    verbatim[1].1,
+                    (bytes.len() - 3 + 2 * carry.len()) as SqlLen,
+                    "steps {steps:?}"
+                );
+            }
+        }
+    }
+
+    /// Covers values beyond the mock server's packet, so an 8 KB buffer
+    /// truncates, with the stream's verbatim flag set directly.
+    #[cfg(windows)]
+    #[test]
+    fn plp_cp1252_verbatim_matches_conversion_for_long_and_unknown_lengths() {
+        let (bytes, _) = every_byte_plp_chunks(40);
+        for known in [false, true] {
+            for size in [1, 2, 3, 8192] {
+                let max_calls = if size == 1 { 3 } else { bytes.len() + 2 };
+                let traces: Vec<_> = [false, true]
+                    .into_iter()
+                    .map(|verbatim| {
+                        let h = TestHandles::with_env_dbc_stmt();
+                        client_code_page(&h, 1252, true);
+                        prefetched_text_stream(
+                            &h,
+                            PlpEncoding::SingleByteText,
+                            Some(encoding_rs::WINDOWS_1252.into()),
+                            bytes.clone(),
+                            known.then_some(bytes.len() as u64),
+                        );
+                        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                        stmt.inner
+                            .lock()
+                            .unwrap()
+                            .active_plp
+                            .as_mut()
+                            .unwrap()
+                            .narrow_verbatim = verbatim;
+                        trace_narrow_plp(&h, &[(SQL_C_CHAR, size)], &[], &[], max_calls).0
+                    })
+                    .collect();
+                let first_indicator = if known {
+                    bytes.len() as SqlLen
+                } else {
+                    SQL_NO_TOTAL
+                };
+                assert_eq!(traces[0][0].1, first_indicator);
+                if size > 1 {
+                    assert_eq!(traces[0].last().unwrap().0, SQL_NO_DATA);
+                }
+                assert_eq!(traces[1], traces[0], "known {known}, buffer size {size}");
+            }
+        }
+    }
+
+    /// Output is identical on both paths by design, so this observes the branch
+    /// itself: the verbatim stream never builds a decoder or converted carry.
+    #[test]
+    fn plp_cp1252_verbatim_bypasses_the_narrow_decoder() {
+        let (_, chunks) = every_byte_plp_chunks(14);
+        for transcode in [true, false] {
+            let (h, _server) = open_mock_cp1252_plp(chunks.clone());
+            client_code_page(&h, 1252, false);
+            FORCE_NARROW_TRANSCODE.with(|force| force.set(transcode));
+            let mut output = [0xcc; 5];
+            let (rc, _) = read_plp_test_chunk(&h, SQL_C_CHAR, &mut output);
+            FORCE_NARROW_TRANSCODE.with(|force| force.set(false));
+            assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            let stream = state.active_plp.as_ref().unwrap();
+            let verbatim = cfg!(windows) && !transcode;
+            assert_eq!(stream.narrow_verbatim, verbatim, "transcode {transcode}");
+            assert_eq!(
+                stream.narrow_decoder.is_some(),
+                !verbatim,
+                "transcode {transcode}"
+            );
+        }
+    }
+
+    /// msodbcsql leaves the caller's buffer past the terminator untouched; pinned
+    /// by the `Issue627CharGetDataIndicatorIncludesExpansion` e2e parity test.
+    #[test]
+    fn plp_cp1252_verbatim_leaves_bytes_after_the_terminator() {
+        for capacity in [2, 3, 4, 8192] {
+            let (h, _server) = open_mock_cp1252_plp(vec![vec![0x80]]);
+            client_code_page(&h, 1252, false);
+            let (trace, _) = trace_narrow_plp(&h, &[(SQL_C_CHAR, capacity)], &[], &[], 1);
+            let mut expected = vec![0xcc; capacity + 1];
+            expected[..2].copy_from_slice(&[0x80, 0]);
+            let (rc, indicator, output, _) = &trace[0];
+            if cfg!(windows) {
+                assert_eq!((*rc, *indicator), (SQL_SUCCESS, 1), "capacity {capacity}");
+                assert_eq!(output, &expected, "capacity {capacity}");
+            } else {
+                assert_eq!(output[capacity], 0xcc, "capacity {capacity}");
+            }
+        }
+    }
+
+    #[test]
+    fn plp_narrow_verbatim_requires_the_client_code_page() {
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, SqlDataType};
+
+        for (collation, client, expected) in [
+            ([0x09, 0x04, 0, 0, 0], 1252, cfg!(windows)), // en-US
+            ([0x09, 0x04, 0xd0, 0, 0x34], 1252, cfg!(windows)), // SQL_Latin1_General_CP1_CI_AS
+            ([0x09, 0x04, 0, 0, 0], 65001, false),
+            ([0x09, 0x04, 0, 0, 0], 932, false),
+            ([0x09, 0x04, 0, 0x04, 0], 1252, false), // UTF-8 collation
+            ([0x01, 0, 0, 0, 0], 1252, false),       // unmapped LCID, decoded as 1252
+            ([0x04, 0x08, 0, 0, 0], 936, false),
+            ([0x11, 0x04, 0, 0, 0], 932, false),
+            ([0x08, 0x04, 0, 0, 0], 1253, false),
+            ([0x05, 0x04, 0, 0, 0], 1250, false),
+        ] {
+            let mut column = ColumnDefinition::new("value", SqlDataType::VarCharMax);
+            column.collation = collation;
+            let (h, _server) =
+                open_mock_plp_column(column, ColumnValue::VarCharMax(vec![b"ABC".to_vec()]));
+            client_code_page(&h, client, false);
+            let (trace, verbatim) = trace_narrow_plp(&h, &[(SQL_C_CHAR, 2)], &[], &[], 1);
+            assert_eq!(trace[0].0, SQL_SUCCESS_WITH_INFO);
+            assert_eq!(trace[0].2, b"A\0\xcc");
+            assert_eq!(
+                verbatim,
+                Some(expected),
+                "collation {collation:x?}, client {client}"
+            );
+        }
+    }
+
+    /// The verbatim gate compares code pages; this pins that every collation
+    /// whose code page is 1252 is also decoded as Windows-1252 today, so
+    /// copying it verbatim cannot change its output.
+    #[test]
+    fn cp1252_collations_are_decoded_as_windows_1252() {
+        let lcids = (0..=0x000F_FFFF_u32).map(|lcid| SqlCollation {
+            info: lcid,
+            ..SqlCollation::default()
+        });
+        let sort_ids = (0..=u8::MAX).map(|sort_id| SqlCollation {
+            info: 0x0411,
+            sort_id,
+            ..SqlCollation::default()
+        });
+        let mut cp1252 = 0;
+        for collation in lcids
+            .chain(sort_ids)
+            .filter(|collation| collation.code_page() == Some(1252))
+        {
+            cp1252 += 1;
+            assert_eq!(
+                EncodingType::LcidBased(collation).resolved_encoding(),
+                Some(encoding_rs::WINDOWS_1252.into()),
+                "collation {:#x}/{}",
+                collation.info,
+                collation.sort_id
+            );
+        }
+        assert!(cp1252 > 20);
     }
 
     #[test]
