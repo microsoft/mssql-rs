@@ -1553,6 +1553,8 @@ fn fill_rowset(
         // SQLSTATE and native error rather than flattening them into HY000.
         post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
         post_tds_info_messages(&mut stmt_state, &info_messages);
+        drop(stmt_state);
+        super::ird::clear_ird_classification(stmt);
         return SQL_ERROR;
     }
 

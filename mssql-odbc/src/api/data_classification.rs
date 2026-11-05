@@ -50,7 +50,7 @@ pub(super) fn payload(metadata: &DataClassificationMetadata) -> Option<Box<[u8]>
     // The parser reads a rank exactly when the negotiated version is 2, so its
     // presence reproduces the version-dependent layout.
     if let Some(rank) = metadata.rank() {
-        out.extend_from_slice(&rank_value(rank)?.to_le_bytes());
+        out.extend_from_slice(&rank_value(rank).to_le_bytes());
     }
     write_count(&mut out, metadata.columns().len())?;
     for column in metadata.columns() {
@@ -67,7 +67,7 @@ pub(super) fn payload(metadata: &DataClassificationMetadata) -> Option<Box<[u8]>
             out.extend_from_slice(&label.to_le_bytes());
             out.extend_from_slice(&information_type.to_le_bytes());
             if let Some(rank) = property.rank() {
-                out.extend_from_slice(&rank_value(rank)?.to_le_bytes());
+                out.extend_from_slice(&rank_value(rank).to_le_bytes());
             }
         }
     }
@@ -110,17 +110,10 @@ fn write_b_varchar(out: &mut Vec<u8>, value: &str) -> Option<()> {
     Some(())
 }
 
-fn rank_value(rank: SensitivityRank) -> Option<i32> {
-    // `SensitivityRank` is non-exhaustive, so a cast is not available here.
-    match rank {
-        SensitivityRank::NotDefined => Some(-1),
-        SensitivityRank::None => Some(0),
-        SensitivityRank::Low => Some(10),
-        SensitivityRank::Medium => Some(20),
-        SensitivityRank::High => Some(30),
-        SensitivityRank::Critical => Some(40),
-        _ => None,
-    }
+/// The wire value: `SensitivityRank` is `#[repr(i32)]` with the [MS-TDS]
+/// values as its discriminants, so a rank mssql-tds adds later keeps its own.
+fn rank_value(rank: SensitivityRank) -> i32 {
+    rank as i32
 }
 
 #[cfg(test)]

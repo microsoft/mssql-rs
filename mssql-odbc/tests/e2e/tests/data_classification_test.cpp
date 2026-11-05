@@ -259,6 +259,12 @@ protected:
                    " INSERT INTO dbo." + table_ +
                    " VALUES (1, N'123-45-6789', N'ann@contoso.com', N'first');" +
                    classify("ssn", kSsn) + classify("email", kEmail));
+        // Read every statement's result, so closing cannot cancel a pending
+        // classification or hide its error.
+        SQLRETURN rc;
+        while (SQL_SUCCEEDED(rc = SQLMoreResults(stmt_))) {
+        }
+        ASSERT_EQ(SQL_NO_DATA, rc) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
         SQLFreeStmt(stmt_, SQL_CLOSE);
     }
 

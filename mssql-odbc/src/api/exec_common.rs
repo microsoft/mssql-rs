@@ -676,6 +676,9 @@ pub(super) fn release_busy_if_row_exhausted(
             stmt_state.batch_exhausted = true;
         }
     }
+    if cancelled {
+        super::ird::clear_ird_classification(stmt);
+    }
     // msodbcsql's OnDone writes a set's status when its RPC DONE is read, so a
     // later close or cancel cannot discard it. Published after the STMT lock is
     // released: the IPD is read first and must not nest beneath it. An
@@ -722,6 +725,8 @@ pub(super) fn finish_cancelled_cursor(
     };
     super::close_cursor::reset_cursor_state(&mut state);
     post_tds_error(&mut state, err, SQLSTATE_HY000);
+    drop(state);
+    super::ird::clear_ird_classification(stmt);
     SQL_ERROR
 }
 
