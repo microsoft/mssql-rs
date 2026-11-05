@@ -1087,10 +1087,10 @@ impl<'a> BulkCopy<'a> {
         // second batch's verdict would overwrite the first's, and a bulk copy
         // whose only substitution happened early would report none (AB#47598).
         //
-        // Mirror this after each batch and internal transaction request.
-        // Transactions reach `finish_send` and replace the flag with their own
-        // verdict, so restoring only at the epilogue would lose earlier batches'
-        // substitutions on a transaction failure or an inter-batch timeout.
+        // Mirror after each batch and BEGIN, which overwrite the flag.
+        // Commit and rollback preserve it themselves. Restoring only at the
+        // epilogue would lose earlier batches' substitutions on a BEGIN failure
+        // or an inter-batch timeout.
         let mut accumulated_cp_loss = false;
 
         loop {

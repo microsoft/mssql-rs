@@ -96,10 +96,8 @@ time against the remaining response budget. Packet sends reject an expired
 deadline before polling the transport; a pending send does not receive a fresh
 timeout per packet.
 
-If a timeout interrupts a packet send, the client retires that transport without
-further writes, including graceful TLS shutdown during recovery or close.
-The no-write abort releases the socket immediately, even if the client is retained.
-Recovery, when permitted by the session state, uses a fresh transport.
+For interrupted-send retirement and transport-failure recovery, see
+[Response lifecycle](../README.md#response-lifecycle).
 
 ## DNS fallback caching
 

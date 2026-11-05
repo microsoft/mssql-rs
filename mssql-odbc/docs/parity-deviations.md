@@ -1351,12 +1351,13 @@ msodbcsql build is measured.
     budget, so this is not an exact whole-API-call deadline.
 
     The scope is wider than connection-owned requests: the same writer
-    bounds statement and bulk-copy packets, and unparameterized
-    `SQLExecDirect` uses the language-batch accounting. The `sp_executesql`
-    path currently bounds its send but does not subtract send time from its
-    response budget. Parameterized and unparameterized statements therefore
-    need not have identical total elapsed limits for `SQL_ATTR_QUERY_TIMEOUT`.
-    No cross-RPC accounting change is implied by this decision.
+    bounds statement and bulk-copy packets. Language batches, transaction
+    requests, and array-bound prepared batches subtract send time; other RPC
+    requests (`sp_executesql`, single-row `sp_execute`, stored-procedure and
+    catalog calls) bound their send but do not subtract it from the response
+    budget. These paths therefore need not have identical total elapsed limits
+    for `SQL_ATTR_QUERY_TIMEOUT`. No cross-RPC accounting change is implied by
+    this decision.
 
     **Evidence limit:** the reference comparison is source-only, not measured
     retail parity. Mock regressions cover expiry before sending, stalled
