@@ -74,10 +74,29 @@ impl TryFrom<u8> for TokenType {
             0xED => Ok(TokenType::SSPI),
             0xA4 => Ok(TokenType::TabName),
             _ => Err(crate::error::Error::ProtocolError(format!(
-                "Unknown token type: {value:#X}"
+                "{UNKNOWN_TOKEN_PREFIX}{value:#X}"
             ))),
         }
     }
+}
+
+const UNKNOWN_TOKEN_PREFIX: &str = "Unknown token type: ";
+const NO_PARSER_PREFIX: &str = "No parser implemented for token type: ";
+
+/// The error for a known token type this client has no parser for.
+pub(crate) fn no_parser_error(token_type: &TokenType) -> crate::error::Error {
+    crate::error::Error::ProtocolError(format!(
+        "{NO_PARSER_PREFIX}{token_type:?}. This token type is not supported yet."
+    ))
+}
+
+/// Whether `error` reports a token the client could not read past: an
+/// unknown token type, or a known one without a parser. Its payload is left
+/// unread, and [MS-TDS] gives no reliable way to find where it ends, so those
+/// bytes can pass for other tokens, a final DONE among them.
+pub(crate) fn is_unreadable_token_error(error: &crate::error::Error) -> bool {
+    matches!(error, crate::error::Error::ProtocolError(message)
+        if message.starts_with(UNKNOWN_TOKEN_PREFIX) || message.starts_with(NO_PARSER_PREFIX))
 }
 
 /// A parsed TDS token.

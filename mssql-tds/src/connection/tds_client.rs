@@ -29,6 +29,7 @@ use crate::message::transaction_management::{
 use crate::query::result::ReturnValue;
 use crate::token::data_classification::{DataClassificationMetadata, DataClassificationVersion};
 use crate::token::parsers::data_classification_parser::is_classification_error;
+use crate::token::tokens::is_unreadable_token_error;
 use crate::token::tokens::{SessionStateToken, SqlCollation};
 use crate::{
     connection::execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
@@ -5429,9 +5430,9 @@ impl TdsClient {
                 Err(error) => {
                     self.settle_interrupted_read(&error);
                     // See `fail_read`: the stream cannot be trusted after a
-                    // rejected DATACLASSIFICATION token, and the prepared-batch
-                    // drain does not retire on its own.
-                    if is_classification_error(&error) {
+                    // token the client could not read past, and the
+                    // prepared-batch drain does not retire on its own.
+                    if Self::leaves_a_token_unread(&error) {
                         return Err(self.abandon_failed_statement(error));
                     }
                     return Err(error);
@@ -5501,6 +5502,11 @@ impl TdsClient {
             Tokens::ReturnStatus(return_status) => {
                 self.last_return_status = ReturnStatus::Received(return_status.value);
                 info!(?return_status);
+            }
+            // Belongs to a result set the drain discards. Only the token is
+            // named: its labels and information types describe the data.
+            Tokens::DataClassification(_) => {
+                debug!("Skipping DATACLASSIFICATION while draining");
             }
             other => {
                 info!(?other);
@@ -8785,17 +8791,25 @@ impl TdsClient {
         error
     }
 
+    /// Whether a read failed inside a token whose end cannot be found, leaving
+    /// the reader at an unknown offset; see [`fail_read`](Self::fail_read).
+    fn leaves_a_token_unread(error: &crate::error::Error) -> bool {
+        is_classification_error(error) || is_unreadable_token_error(error)
+    }
+
     /// Settles a read that failed while consuming the response and returns the
     /// error to report, closing a [`BatchErrorMode::Continue`] walk the failure
     /// leaves unreadable (see [`end_walk_on_read_error`](Self::end_walk_on_read_error)).
     ///
-    /// A rejected DATACLASSIFICATION token ends the walk in either mode. It
-    /// has no length prefix, so its unread bytes can pass for other tokens,
-    /// a final DONE among them, and a later drain would report success over a
-    /// desynchronized stream.
+    /// A token the client could not read past ends the walk in either mode:
+    /// an unknown token type, a known one without a parser, or a rejected
+    /// DATACLASSIFICATION. None has a length prefix to skip by, so its unread
+    /// bytes can pass for other tokens, a final DONE among them, and a later
+    /// drain would report success over a desynchronized stream. msodbcsql and
+    /// SqlClient break the connection here too.
     fn fail_read(&mut self, error: crate::error::Error) -> crate::error::Error {
         self.settle_interrupted_read(&error);
-        if is_classification_error(&error) {
+        if Self::leaves_a_token_unread(&error) {
             return self.abandon_failed_statement(error);
         }
         self.end_walk_on_read_error(error)
@@ -11887,28 +11901,98 @@ mod tests {
 
     /// The prepared-batch drain reads rows itself rather than through
     /// `fail_read`, and its caller only closes the batch, so it needs the same
-    /// rule for a rejected DATACLASSIFICATION token.
+    /// rule for a token it could not read past.
     #[tokio::test]
-    async fn a_rejected_classification_in_the_prepared_batch_drain_retires_the_connection() {
-        let mut transport = TestTransport::with_tokens(vec![empty_col_metadata()]);
-        transport.row_read_error = Some(
+    async fn an_unreadable_token_in_the_prepared_batch_drain_retires_the_connection() {
+        use crate::token::tokens::{TokenType, no_parser_error};
+        for error in [
             crate::token::parsers::data_classification_parser::classification_error(
                 "token received but the feature was not negotiated",
             ),
-        );
-        let mut client = create_test_client_with_transport(transport);
-        client.recovery_context.session_recovery_negotiated = true;
+            TokenType::try_from(0xA6).unwrap_err(),
+            no_parser_error(&TokenType::AltMetadata),
+        ] {
+            let mut transport = TestTransport::with_tokens(vec![empty_col_metadata()]);
+            transport.row_read_error = Some(error);
+            let mut client = create_test_client_with_transport(transport);
+            client.recovery_context.session_recovery_negotiated = true;
+            let statement_id = client.register_prepared_handle_for_test(42);
+            let mut statement =
+                PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
+
+            let error = client
+                .execute_prepared_batch(&mut statement, vec![Ok((0, Vec::new()))], &mut None, ())
+                .await
+                .unwrap_err();
+            assert!(TdsClient::leaves_a_token_unread(&error), "{error}");
+            assert!(client.is_connection_dead(), "{error}");
+            assert!(!client.is_session_recovery_enabled(), "{error}");
+            assert!(!client.has_open_batch(), "{error}");
+        }
+    }
+
+    /// A drain discards classification without logging what it says: its
+    /// labels and information types describe the data, so only the token is
+    /// named. The capture is checked to have seen the drain.
+    #[tokio::test]
+    async fn draining_a_classification_logs_no_labels_or_information_types() {
+        use crate::token::data_classification::{
+            ColumnSensitivity, DataClassificationMetadata, DataClassificationVersion,
+            InformationType, SensitivityLabel,
+        };
+        use tracing::instrument::WithSubscriber;
+
+        let classification = Tokens::DataClassification(DataClassificationMetadata {
+            version: DataClassificationVersion::Version1,
+            sensitivity_labels: vec![SensitivityLabel {
+                name: "LabelNameMarker".to_string(),
+                id: "LabelIdMarker".to_string(),
+            }],
+            information_types: vec![InformationType {
+                name: "TypeNameMarker".to_string(),
+                id: "TypeIdMarker".to_string(),
+            }],
+            rank: None,
+            columns: vec![ColumnSensitivity {
+                properties: Vec::new(),
+            }],
+        });
+        let (mut client, _) = create_capturing_client(vec![
+            int_col_metadata(1),
+            classification,
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ]);
         let statement_id = client.register_prepared_handle_for_test(42);
         let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", statement_id);
 
-        let error = client
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("off,mssql_tds=trace")
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        client
             .execute_prepared_batch(&mut statement, vec![Ok((0, Vec::new()))], &mut None, ())
+            .with_subscriber(subscriber)
             .await
-            .unwrap_err();
-        assert!(is_classification_error(&error), "{error}");
-        assert!(client.is_connection_dead());
-        assert!(!client.is_session_recovery_enabled());
-        assert!(!client.has_open_batch());
+            .unwrap();
+
+        let logs = std::fs::read_to_string(logs.path()).unwrap();
+        assert!(
+            logs.contains("Skipping DATACLASSIFICATION while draining"),
+            "{logs}"
+        );
+        for marker in [
+            "LabelNameMarker",
+            "LabelIdMarker",
+            "TypeNameMarker",
+            "TypeIdMarker",
+        ] {
+            assert!(!logs.contains(marker), "{marker} logged:\n{logs}");
+        }
+        assert!(!client.is_connection_dead());
     }
 
     /// Under `Continue` one error can be reflected by both the failing
