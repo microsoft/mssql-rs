@@ -174,9 +174,7 @@ A result set's classification is read from its IRD header (`RecNumber` 0):
 `SQLColAttribute` does not answer either field. Each result set reports only
 its own classification: as in msodbcsql, it is dropped when an execution
 starts or fails, at the end of the batch, and when the cursor of a statement
-that is not prepared is closed. mssql-python can set the attribute through
-`attrs_before`, but it does not call `SQLGetDescField`, so it cannot read the
-metadata yet.
+that is not prepared is closed.
 
 ### Integer connection-attribute getters
 
