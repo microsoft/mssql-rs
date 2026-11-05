@@ -55,7 +55,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | Attribute | Set | Get | Note |
 |---|---|---|---|
 | `SQL_ATTR_LOGIN_TIMEOUT` | ✅ | ✅ | clamped to `0xFFFE`, `01S02` on clamp |
-| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-scoped requests, internal metadata lookups, and cancellation settlement; see the [timeout contract](../README.md#connection-operation-timeouts) |
+| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-scoped requests, internal metadata lookups, and cancellation settlement; see the [timeout contract](driver-guide.md#connection-operation-timeouts) |
 | `SQL_ATTR_PACKET_SIZE` | ✅ | ✅ | pre-connect only |
 | `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | stored hint, not DML enforcement; an actually read-only database overrides the connected getter (see below) |
 | `SQL_ATTR_AUTOCOMMIT` | ✅ | ✅ | |
@@ -628,7 +628,7 @@ three above — which the `CURRENT_CATALOG` contrast shows is not safe.
   no-op and on returning `HYC00`.
 - **Read-only/diagnostic:** `SQL_COPT_SS_SPID`, `SQL_COPT_SS_USER_DATA`.
   `SQL_COPT_SS_CLIENT_CONNECTION_ID` is implemented as a read-only UTF-16 GUID
-  string; see the [tracing guide](../README.md#tracing).
+  string; see the [tracing guide](driver-guide.md#tracing).
 - **Standard leftovers:** `SQL_ATTR_METADATA_ID = SQL_TRUE` (currently `HYC00`
   because catalog dispatch still forces pattern mode), `SQL_ATTR_ASYNC_ENABLE`,
   `SQL_ATTR_AUTO_IPD`, `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.

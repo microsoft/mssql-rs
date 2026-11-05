@@ -9,18 +9,23 @@ bindings, command-line tools, and test infrastructure.
 
 Start with the component documentation for installation, usage, and limitations:
 
-| Component | Intended use |
+| Component | Purpose |
 |---|---|
-| [mssql-tds](mssql-tds/README.md) | Low-level async Rust API for SQL Server and Azure SQL Database |
-| [mssql-odbc](mssql-odbc/README.md) | ODBC 3.x driver; see its implementation status and compatibility limitations |
-| [mssql-python-rs](mssql-py-core/README.md) | Native Python runtime used by [mssql-python](https://github.com/microsoft/mssql-python), not a standalone DB-API client |
-| [mssql-js](mssql-js/README.md) | Experimental Node.js bindings |
-| [mssql-sqlcmd](mssql-sqlcmd/README.md) | SQLCMD-compatible command-line tool |
+| [mssql-tds](mssql-tds/README.md) | Async Rust TDS protocol client for SQL Server and Azure SQL Database |
+| [mssql-odbc](mssql-odbc/README.md) | Alpha ODBC 3.x driver exposing the native ODBC C API over `mssql-tds` |
+| [mssql-py-core](mssql-py-core/README.md) | PyO3 extension providing Rust TDS operations for [mssql-python](https://github.com/microsoft/mssql-python); not a standalone DB-API client |
+| [mssql-js](mssql-js/README.md) | Experimental Node.js bindings to `mssql-tds`, with a TypeScript wrapper |
+| [mssql-sqlcmd](mssql-sqlcmd/README.md) | Rust static library exposing a C ABI for native sqlcmd integration; not a standalone executable |
 
-For testing and development, see the [Rust mock server](mssql-mock-tds/README.md),
-[Python mock bindings](mssql-mock-tds-py/README.md),
-[interactive demo](mssql-tds-cli/README.md), and
-[TDS](mssql-tds-bench/README.md) / [ODBC](mssql-odbc-bench/README.md) benchmark harnesses.
+For testing and development:
+
+| Component | Purpose |
+|---|---|
+| [mssql-mock-tds](mssql-mock-tds/README.md) | Mock TDS server returning configured responses to test clients without SQL Server |
+| [mssql-mock-tds-py](mssql-mock-tds-py/README.md) | Python bindings to the mock TDS server |
+| [mssql-tds-cli](mssql-tds-cli/README.md) | Interactive T-SQL development demo using `mssql-tds` |
+| [mssql-tds-bench](mssql-tds-bench/README.md) | Criterion harness comparing `mssql-tds` revisions against fixed workloads |
+| [mssql-odbc-bench](mssql-odbc-bench/README.md) | C++ harness comparing ODBC drivers through the platform Driver Manager |
 
 ## Getting Started
 

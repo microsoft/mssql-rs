@@ -1,8 +1,8 @@
 # mssql-tds-cli
 
-An interactive development demo for the
+An interactive T-SQL client for exercising
 [`mssql-tds`](https://github.com/microsoft/mssql-rs/tree/main/mssql-tds)
-crate, not a replacement for sqlcmd. This crate is not published.
+during development, not a replacement for sqlcmd. This crate is not published.
 
 ## Prerequisites
 

@@ -6,10 +6,10 @@ absolute. The docs.rs API reference is generated from Rust source separately.
 
 # mssql-mock-tds
 
-A library and CLI for testing SQL Server clients without a SQL Server instance.
-Returns configured TDS responses; it does not execute SQL or validate database
-semantics. Use only in test environments, not as a database or authentication
-service.
+A mock TDS server, available as a Rust library and CLI, for testing SQL Server
+clients without a SQL Server instance. Returns configured TDS responses; it does
+not execute SQL or validate database semantics. Use only in test environments,
+not as a database or authentication service.
 
 ## Features
 

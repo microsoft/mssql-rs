@@ -1,8 +1,8 @@
 # mssql-js
 
 Experimental Node.js bindings for the
-[mssql-tds](https://github.com/microsoft/mssql-rs/tree/main/mssql-tds) SQL Server
-protocol library, using NAPI-RS and a TypeScript wrapper. The API and packaging
+[mssql-tds](https://github.com/microsoft/mssql-rs/tree/main/mssql-tds) TDS protocol
+client, using NAPI-RS and a TypeScript wrapper. The API and packaging
 are under development; the instructions below use a local checkout, not a
 supported npm release.
 
