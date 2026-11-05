@@ -7,8 +7,6 @@ version 2) ranks that `ADD SENSITIVITY CLASSIFICATION` assigns to columns.
 Work items: feature [AB#42847](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/42847),
 tasks [AB#49357](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49357) and
 [AB#49358](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49358).
-The ODBC surface (`SQL_CA_SS_DATA_CLASSIFICATION`) is tracked separately under
-Feature 42845; see [Follow-up for the ODBC layer](#follow-up-for-the-odbc-layer).
 
 ## Using it
 
@@ -43,25 +41,15 @@ if let Some(classification) = client.data_classification() {
 - `TdsClient::negotiated_data_classification_version()` reports the version in
   effect for the connection, or `None` when the server did not enable it.
 - `ResultSet::data_classification()` is available as soon as a result set is
-  positioned, before any row is read, and until the client moves to the next
-  result set, starts another request, cancels, or reconnects.
+  positioned, before any row is read. Its lifetime and clearing rules are
+  described under [Result sets](#result-sets).
 - `columns()` covers the result set's leading columns. It is empty when the
-  server sent no per-column data, and one entry short for a server cursor (see
-  [Result sets](#result-sets)). Look entries up with `columns().get(i)` and treat a
-  missing entry as unclassified.
+  server sent no per-column data. Look entries up with `columns().get(i)` and
+  treat a missing entry as unclassified.
 - A dictionary reference of `0xFFFF` is `Unspecified` and resolves to `None`.
 - Ranks are `None` unless version 2 is in effect.
 
 ## Protocol flow
-
-```text
-LOGIN7 FeatureExt 0x09 (requested version)
-  -> FEATUREEXTACK 0x09 (version, IsEnabled)
-  -> version in effect for the connection
-  -> COLMETADATA
-  -> DATACLASSIFICATION 0xA3 (dictionaries, rank, per-column properties)
-  -> attached to that result set
-```
 
 ### Negotiation
 
@@ -78,11 +66,14 @@ The acknowledgement is `version | IsEnabled | version-specific data`:
 | `IsEnabled = 0` | Feature off. |
 | Version 1 or 2, enabled | On. The layout is the lower of the requested and acknowledged versions. |
 
-The token carries no version of its own. [MS-TDS] 2.2.7.5 sends
-`SensitivityRank` only when both the request and the acknowledgement are
-version 2, so the layout is `min(requested, acknowledged)`. A higher
-acknowledgement is accepted, as msodbcsql, SqlClient and JDBC do, but does not
-change the layout.
+The token carries no version of its own. Under [MS-TDS] 2.2.7.5,
+`SensitivityRank` is present only when both versions are 2. A higher
+acknowledgement is accepted, as in msodbcsql, SqlClient and JDBC, without
+changing the layout.
+
+Session recovery requests the feature again from the client context and uses
+the new acknowledgement, honoring a downgrade or disabled feature rather than
+reusing the dead session's version.
 
 ### Token parsing
 
@@ -98,10 +89,10 @@ The token has no length prefix, so it is parsed field by field
 - The token may not exceed 16 MiB. When each column references one classified
   source, the worst case SQL Server produces is 4,251,658 bytes: 4,096
   columns, each with its own label and information type, all four strings at
-  the 128-character `sysname` maximum. Live, 252 such columns produce 261,586
-  bytes, matching the formula. Derived columns add 8 bytes per extra source,
-  plus up to 514 bytes for each label or information type no other column
-  uses (see [Limitations](#limitations-and-assumptions)).
+  the 128-character `sysname` maximum. Derived columns add 8 bytes per extra
+  source, plus up to 514 bytes for each label or information type no other column
+  uses; their source count has no documented upper bound, so the 16 MiB limit
+  can reject a sufficiently large derived-column classification.
 - An unpaired UTF-16 surrogate in a name or id is replaced with U+FFFD. SQL
   Server stores such strings as given.
 
@@ -116,12 +107,12 @@ result set and is skipped.
 
 The per-column list may cover fewer columns than the result set. For a STATIC
 or FAST_FORWARD server cursor, SQL Server classifies the selected columns but
-not the trailing ROWSTAT column it adds (live: 4 metadata columns, 3
-classified). Those trailing columns are unclassified. A list longer than the
-result set cannot be mapped, so it is dropped with a warning. In both cases the
-token was read whole, so the connection is unaffected.
+not the trailing ROWSTAT column it adds. Those trailing columns are
+unclassified. A list longer than the result set cannot be mapped, so it is
+dropped with a warning. In both cases the token was read whole, so the
+connection is unaffected.
 
-### Errors and connection safety
+## Connection safety
 
 | Situation | Result | Connection |
 |---|---|---|
@@ -130,88 +121,25 @@ token was read whole, so the connection is unaffected.
 | Transport error or truncation inside the token | The reader error | Retired; recovery kept armed for a lost transport |
 | Request timeout or `CancelHandle` during the read | Timeout or cancellation error | Settled through ATTENTION and usable if settlement succeeds; otherwise retired with the same error, so check `is_connection_dead()` |
 | Caller drops the future during the read | None | Not settled; must not be reused |
-| Fewer classified columns than result columns | Accepted | Unaffected |
-| More classified columns than result columns | Classification dropped, warning logged | Unaffected |
-| Unpaired surrogate in a string | Replaced with U+FFFD | Unaffected |
+| Unknown token type or known type without a parser | Protocol error | Retired at the read; session recovery disarmed |
 
-A rejected token leaves the rest of it unread, and those bytes can pass for
-other tokens, a final DONE among them. The connection is therefore retired in
-both batch error modes, so a later `close_query` cannot report success over a
-desynchronized stream.
+A rejected or unreadable token leaves bytes that could pass for other tokens,
+including a final DONE. Retirement happens at the failing read in both
+`BatchErrorMode::Abort` and `Continue`, including prepared-batch and ATTENTION
+drains, so a later `close_query()` cannot succeed over a desynchronized stream.
 
 Dropping a read future, for example with `tokio::select!` or an outer
 `tokio::time::timeout`, skips the ATTENTION settlement. As with a row, column
 metadata or PLP value split across packets, the reader can be left inside the
-token, so drop the client rather than reuse it. Use the request timeout or a
-`CancelHandle` to interrupt a read: the connection is then kept when the
-interrupted token and the ATTENTION acknowledgement both complete in time.
+token, so drop the client rather than reuse it. With the request timeout or a
+`CancelHandle`, reuse is safe only when the interrupted token and ATTENTION
+acknowledgement both complete in time.
 
-### Session recovery
-
-The reconnect LOGIN7 requests the feature again from the client context. The
-recovered session parses with its own acknowledgement, so a server that
-downgrades or drops the feature on reconnect is honored, and the version the
-dead session negotiated is never reused.
-
-## Unknown tokens
-
-An unrecognized token type is a hard protocol error, and the read that meets
-it retires the connection. Data Classification does not rely on skipping:
-`0xA3` is a known token type with its own parser.
-
-[MS-TDS] 2.2.4.2.1 assigns each token a framing class by bits 5–4 of its type
-byte: zero length (`01`), fixed length (`11`, 1/2/4/8 bytes), variable length
-(`10`, followed by a length) and variable count (`00`). A generic skip would
-have to trust that class for a token it does not know. The known tokens show it
-cannot:
-
-| Token | Class from the type byte | Actual framing |
-|---|---|---|
-| ROW `0xD1`, NBCROW `0xD2`, ALTROW `0xD3` | Zero length | Column data follows |
-| DONE `0xFD`, DONEPROC `0xFE`, DONEINPROC `0xFF` | Fixed, 8 bytes | 12 bytes |
-| DATACLASSIFICATION `0xA3`, RETURNVALUE `0xAC`, FEATUREEXTACK `0xAE` | Variable length | No length prefix |
-| SESSIONSTATE `0xE4`, FEDAUTHINFO `0xEE` | Variable length | 4-byte length, not 2 |
-| COLMETADATA `0x81`, ALTMETADATA `0x88` | Variable count | Needs type parsing |
-
-Only 10 of the 23 known token types could be skipped from the class alone. The
-spec itself notes that `0xA3` "does not start with a length specification"
-(2.2.4.2.1.3). Skipping an unknown token risks reading its payload as tokens,
-which is worse than failing.
-
-Blast radius of keeping the error: an unknown token can appear only if the
-server sends a token this client never asked for, since servers introduce new
-tokens behind a LOGIN7 feature or TDS version. The query that meets it fails
-with `Unknown token type: 0x..` (or `No parser implemented` for a known type
-without a parser). The connection is retired at that read, in either batch
-error mode, with session recovery disarmed, so `close_query` has nothing to
-drain and a pool discards the connection.
-
-Retiring at the read matters under the default `BatchErrorMode::Abort`.
-Otherwise `close_query` would drain the token's unread bytes, and a payload
-that reads as a final DONE (`FD 00 00 C1 00 …`) would let that drain succeed
-over a desynchronized stream. A rejected `0xA3` is retired the same way.
-
-The reference drivers also break the connection at the token:
-
-- msodbcsql: `default: // Unknown token, out of sync!` raises a protocol error
-  and sets a parse error state (`Parse.cpp:2002`).
-- SqlClient: `IsValidTdsToken` (`TdsParser.cs:2447`) fails, the connection is
-  broken and `InvalidTdsTokenReceived` is thrown.
-- JDBC: `throwUnexpectedTokenException` (`tdsparser.java:141`) terminates the
-  connection.
-
-Regression coverage:
-
-- `a_token_without_a_parser_fails_closed` (`tests/test_unknown_token.rs`):
-  an unknown and an unparsed token, each with an ordinary payload and with one
-  that reads as a final DONE, in both batch error modes, with and without
-  session recovery.
-- `an_unreadable_token_in_the_prepared_batch_drain_retires_the_connection`
-  (`connection/tds_client.rs`): the prepared-batch row drain.
-- `tokens_without_a_parser_are_fatal_on_every_read_path`
-  (`io/token_stream.rs`) and
-  `an_unknown_token_in_the_attention_drain_retires_the_connection`
-  (`connection/transport/network_transport.rs`).
+Unknown tokens are not skipped: the framing class in the type byte is not
+sufficient to determine their length ([MS-TDS] 2.2.4.2.1). `0xA3` is a known
+token parsed without a length prefix. msodbcsql (`Parse.cpp:2002`), SqlClient
+(`TdsParser.cs:2447`) and JDBC (`tdsparser.java:141`) likewise break the
+connection on an unknown token.
 
 ## Differences from the reference drivers
 
@@ -231,90 +159,9 @@ Regression coverage:
 mssql-tds is the only one of these clients that does not request the feature
 on every login (msodbcsql `sqlcfunc.cpp:3487`, SqlClient
 `SqlConnectionInternal.cs:3423`, JDBC `SQLServerConnection.java:7809`). It
-stays opt-in so existing callers keep their LOGIN7 and token stream unchanged,
-and so a server's classification cannot fail a query or retire a connection for
-a caller that never reads it. The ODBC layer is expected to request it by
-default to match msodbcsql (see [Follow-up](#follow-up-for-the-odbc-layer)).
-
-## Validation
-
-### Mock server
-
-`tests/test_data_classification.rs` runs the client against `mssql-mock-tds`.
-Parser, negotiation and transport behaviour is also covered by unit tests next
-to the code.
-
-| Criterion | Tests |
-|---|---|
-| Feature disabled; LOGIN7 omits `0x09` | `disabled_feature_is_not_advertised_and_queries_run_as_before`; `data_classification_is_not_requested_by_default` |
-| V1 negotiation and parsing | `v1_classification_is_attached_to_its_result_set` |
-| V2 negotiation and ranks | `v2_classification_carries_ranks`, `decodes_every_rank_from_signed_little_endian_wire_bytes` |
-| V2 request, V1 acknowledgement | `a_v2_request_acknowledged_as_v1_parses_the_v1_layout`, `recovered_session_parses_with_the_version_it_negotiated`, `mixed_versions_parse_the_v1_layout` |
-| Missing acknowledgement | `a_missing_acknowledgement_leaves_the_feature_off`, `recovered_session_without_the_feature_rejects_classification` |
-| Classified and unclassified columns | `a_result_set_mixes_classified_and_unclassified_columns`, `unclassified_result_has_no_classification` |
-| Multiple result sets, both orders | `each_result_set_carries_only_its_own_classification`, `consecutive_queries_do_not_share_classification`, `rpc_result_sets_carry_their_classification` |
-| Cleanup on close and cancel | `closing_a_classified_result_early_leaves_no_classification`, `cancelled_classified_results_leave_no_classification` |
-| Column count | `classification_covers_at_most_the_result_columns` |
-| Malformed `0xA3` | `malformed_classification_on_the_first_result_set_retires_the_connection`, `invalid_references_and_ranks_are_protocol_errors`, `an_unrequested_classification_token_retires_the_connection` |
-| Invalid references, counts, lengths, ranks | `rejects_invalid_label_index`, `rejects_invalid_information_type_index`, `rejects_unknown_result_set_rank`, `rejects_unknown_property_rank`, `rejects_counts_that_exceed_parser_budget_before_allocating`, `string_content_counts_toward_the_parser_budget`, `every_truncated_prefix_passes_the_reader_error_through` |
-| Invalid acknowledgement | `an_unsupported_acknowledged_version_fails_the_login`, `rejects_short_acknowledgement`, `rejects_invalid_acknowledged_version` |
-| Session recovery | `session_recovery_renegotiates_data_classification` |
-
-Each test added for this work was mutation-checked: the guarded code was broken
-and the test confirmed to fail.
-
-### Live SQL Server
-
-`tests/test_data_classification_live.rs` runs against a real server. Each test
-creates its own table in tempdb (`dc_live_<random>`), applies
-`ADD SENSITIVITY CLASSIFICATION`, and drops the table even when the test or
-its setup fails.
-The login needs permission to create tables in tempdb, add classifications,
-and (for the recovery test) `KILL` its own session.
-
-```powershell
-$env:DB_HOST = 'localhost'; $env:DB_PORT = '1433'
-$env:DB_USERNAME = '<login>'; $env:SQL_PASSWORD = '<password>'
-$env:TRUST_SERVER_CERTIFICATE = 'true'
-cargo nextest run -p mssql-tds --test test_data_classification_live
-```
-
-| Test | Checks |
-|---|---|
-| `live_v1_classification_matches_the_server`, `live_v2_…` | Negotiation; label, information type and ids; rank at V2; unclassified `id` and `note`; row values; a following unclassified result set has none |
-| `live_v1_partial_shared_and_derived_classifications_match_the_server`, `live_v2_…` | Label-only and type-only columns; a shared label sent once; derived columns with one property per source |
-| `live_v1_static_cursor_classification_skips_rowstat`, `live_v2_…` | STATIC cursor open and fetch; classification maps to the data columns |
-| `live_unrequested_connection_receives_no_classification` | No `0xA3` when not requested |
-| `live_session_recovery_keeps_classification_working` | Real `KILL`; reconnect renegotiates |
-
-Result on 2026-11-04 against SQL Server 2022 16.0.1210.3 (Developer Edition,
-Windows): 8 of 8 passed, and no `dc_live_` tables were left in tempdb. The PR
-validation pipeline runs the same tests against SQL Server 2025 on Linux,
-Linux ARM, Windows and macOS.
-
-### Fuzzing
-
-`fuzz/fuzz_targets/fuzz_data_classification.rs` feeds arbitrary bytes to the
-parser at both versions. The scheduled fuzz job runs it for 300 seconds.
-
-A 300-second run on 2026-11-04 with the CI options (`-timeout=10 -fork=1
--ignore_crashes=1`, nightly 1.101) executed 3,678,521 inputs and reached 758
-coverage points, with no crashes, timeouts or out-of-memory errors.
-
-## Limitations and assumptions
-
-- Only versions 1 and 2 exist; any other acknowledgement fails the login.
-- The token is validated strictly. A malformed or unexpected token retires the
-  connection where msodbcsql would pass it through.
-- The per-column count is not required to match COLMETADATA, because SQL
-  Server does not match it for server cursors.
-- Tokens above 16 MiB are rejected. SQL Server's single-classification worst
-  case is about a quarter of that. A derived column with many classified
-  sources adds 8 bytes per source, plus up to 514 bytes for each label or
-  information type no other column uses, and has no documented upper bound.
-- Unpaired surrogates are replaced, so the strings may differ from the bytes
-  the server sent.
-- Unknown token types stay fatal.
+stays opt-in so existing callers keep their LOGIN7 and expected token stream
+unchanged. Classification validation applies whenever a token arrives,
+including an unrequested one.
 
 ## Follow-up for the ODBC layer
 
