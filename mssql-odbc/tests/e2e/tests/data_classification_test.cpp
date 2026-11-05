@@ -440,6 +440,35 @@ TEST_F(DataClassificationTest, PreparedStatementClassificationLifecycle) {
     EXPECT_FALSE(IrdPayload().has_value());
 }
 
+// A server error that a fetch reports after rows were delivered leaves the
+// classification readable, direct or prepared (measured on msodbcsql
+// 18.07.0001), so SQL_ERROR alone does not clear it.
+TEST_F(DataClassificationTest, ServerErrorAfterRowsKeepsTheClassification) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+
+    ExecDirect("INSERT INTO dbo." + table_ +
+               " VALUES (2, N'987-65-4321', N'bob@contoso.com', N'second')");
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+    auto sql = ODBCTestUtils::ToSqlTStr("SELECT ssn, 1/(id-2) AS q FROM dbo." + table_ +
+                                        " OPTION (MAXDOP 1)");
+    for (bool prepared : {false, true}) {
+        if (prepared) {
+            ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        } else {
+            ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_)) << (prepared ? "prepared" : "direct");
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+        EXPECT_TRUE(IrdPayload().has_value()) << (prepared ? "prepared" : "direct");
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+    }
+}
 TEST_F(DataClassificationTest, ParameterArrayReportsEachSetsClassification) {
     ConnectDbc();
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());

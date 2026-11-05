@@ -1546,6 +1546,9 @@ fn fill_rowset(
     }
     if let Some(e) = fetch_error {
         error!(%e, "SQLFetchScroll: row fetch failed");
+        // A cancelled read drops the classification with the cursor. A server
+        // error keeps it readable, as msodbcsql does.
+        let cancelled_read = matches!(e, TdsError::OperationCancelledError(_));
         // The cursor cannot be resumed after a protocol failure, so tear the
         // row stream down rather than leaving it addressable.
         super::close_cursor::reset_cursor_state(&mut stmt_state);
@@ -1554,7 +1557,9 @@ fn fill_rowset(
         post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
         post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
-        super::ird::clear_ird_classification(stmt);
+        if cancelled_read {
+            super::ird::clear_ird_classification(stmt);
+        }
         return SQL_ERROR;
     }
 
