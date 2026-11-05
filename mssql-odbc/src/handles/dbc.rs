@@ -3,15 +3,19 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use mssql_tds::token::data_classification::DataClassificationVersion;
 use tracing::error;
 
 use super::env::SharedRuntime;
 use super::wire::{ConnectionWire, LeaseReturn, WireLease};
 use super::{EnvHandle, HandleType, HasObjectType};
-use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
+use crate::api::odbc_types::{
+    DATACLASSIFICATION_VERSION_DEFAULT, DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE,
+    SQL_TXN_READ_COMMITTED,
+};
 use crate::conversion::client_encoding::ClientEncoding;
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -48,6 +52,11 @@ pub(crate) struct DbcHandle {
     /// Native: GetNetIOTimeOut/GetCancelTimeoutValue (sqlcprot.h:1605,1625);
     /// broader connection-scoped timeout enforcement remains follow-up work.
     connection_timeout: AtomicU32,
+    /// Data Classification version the server acknowledged for the current
+    /// session, `0` when none. Atomic so an IRD read can answer
+    /// `SQL_CA_SS_DATA_CLASSIFICATION_VERSION` while holding only its DESC
+    /// lock; taking `inner` there would invert DBC-before-DESC ordering.
+    data_classification_version: AtomicU8,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -156,6 +165,10 @@ pub(crate) struct DbcState {
     /// retrieval (`sqlcdata.h:1297,1310`); retaining our input-parameter warning
     /// is the remaining deviation in parity-deviations entry 23 (AB#47598).
     pub(crate) warn_on_cp_error: bool,
+    /// `SQL_COPT_SS_DATACLASSIFICATION_VERSION`: the version requested at the
+    /// next login, `1..=2`. Defaults to 1, so every connection negotiates
+    /// Data Classification as msodbcsql's does (`sqlcfunc.cpp:3487`).
+    pub(crate) data_classification_version: u8,
     /// `SQL_ATTR_PACKET_SIZE` in bytes: the app-set attribute (or default),
     /// surviving `SQLDisconnect` so the next connect attempt on this handle
     /// starts from it again. Never overwritten with a resolved or negotiated
@@ -416,6 +429,25 @@ impl DbcHandle {
         }
     }
 
+    /// The acknowledged Data Classification version, `0` when the session did
+    /// not negotiate it, as msodbcsql's `GetDataClassificationVersion` reports.
+    pub(crate) fn negotiated_data_classification_version(&self) -> u8 {
+        self.data_classification_version.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn publish_data_classification_version(
+        &self,
+        version: Option<DataClassificationVersion>,
+    ) {
+        let value = match version {
+            Some(DataClassificationVersion::Version1) => 1,
+            Some(DataClassificationVersion::Version2) => 2,
+            _ => 0,
+        };
+        self.data_classification_version
+            .store(value, Ordering::Relaxed);
+    }
+
     pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
             trace: Arc::default(),
@@ -423,6 +455,7 @@ impl DbcHandle {
             parent_env,
             runtime,
             connection_timeout: AtomicU32::new(0),
+            data_classification_version: AtomicU8::new(0),
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
                 client_encoding: ClientEncoding::system_default(),
@@ -436,6 +469,7 @@ impl DbcHandle {
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
                 warn_on_cp_error: false,
+                data_classification_version: DATACLASSIFICATION_VERSION_DEFAULT,
                 packet_size: DEFAULT_PACKET_SIZE,
                 effective_packet_size: None,
                 autocommit: true,

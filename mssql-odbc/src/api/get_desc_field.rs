@@ -15,14 +15,15 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME,
-    SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME,
-    SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
-    SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
-    SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH,
-    SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR,
-    SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE,
-    SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS,
+    SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_DATA_CLASSIFICATION, SQL_CA_SS_DATA_CLASSIFICATION_VERSION,
+    SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME,
+    SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME,
+    SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
+    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
+    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
+    SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
+    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
+    SQL_DESC_UNNAMED, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
     SqlULen, SqlUSmallInt, SqlWChar,
 };
@@ -32,8 +33,8 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::post_sql_error;
 use crate::error::{HasDiagnostics, free_errors};
-use crate::handles::desc::{DescHeader, DescRecord, FieldScope, classify_field};
-use crate::handles::{DescHandle, HandleType, handle_from_raw};
+use crate::handles::desc::{DescHeader, DescRecord, DescState, FieldScope, classify_field};
+use crate::handles::{DbcHandle, DescHandle, HandleType, handle_from_raw};
 
 /// Implementation of [`SQLGetDescFieldW`](super::exports::SQLGetDescFieldW).
 ///
@@ -241,6 +242,21 @@ fn sql_get_desc_field_w_safe(
                 SqlSmallInt::try_from(state.records.len()).unwrap_or(SqlSmallInt::MAX),
             )
         }
+        FieldScope::Header if field == SQL_CA_SS_DATA_CLASSIFICATION_VERSION => {
+            // The session's acknowledged version, as `GetIRDHeaderField` reads
+            // `hConn->GetDataClassificationVersion()`, so it answers before
+            // any result set.
+            // SAFETY: the DM frees every descriptor before its connection.
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(desc.parent_dbc) };
+            FieldValue::Integer(SqlInteger::from(
+                dbc.negotiated_data_classification_version(),
+            ))
+        }
+        FieldScope::Header if field == SQL_CA_SS_DATA_CLASSIFICATION => {
+            return unsafe {
+                write_data_classification(&mut state, value_ptr, buffer_length, string_length_ptr)
+            };
+        }
         FieldScope::Header => match header_field_value(&state.header, field) {
             Some(v) => v,
             None => {
@@ -370,6 +386,50 @@ fn get_focused_tvp_header_field(
         return Some(SQL_ERROR);
     };
     Some(value.write(value_ptr, buffer_length, string_length_ptr, &mut *state))
+}
+
+/// Copies the current result set's DATACLASSIFICATION payload, as msodbcsql's
+/// `SQLGetDescFieldW` does (`sqlcdesc.cpp:5220-5260`): `StringLengthPtr`
+/// receives the full length, a short buffer gets the prefix and `01004`, and a
+/// result set without classification is `HY091`.
+///
+/// # Safety
+/// `value_ptr`, when non-null, must be writable for `buffer_length` bytes;
+/// `string_length_ptr`, when non-null, must be writable for one `SqlInteger`.
+unsafe fn write_data_classification(
+    state: &mut DescState,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    let Some(payload) = state.data_classification.as_deref() else {
+        post_diag(state, ERR_INVALID_DESCRIPTOR_FIELD);
+        return SQL_ERROR;
+    };
+    let length = payload.len();
+    let truncated = if value_ptr.is_null() {
+        false
+    } else {
+        let capacity = usize::try_from(buffer_length).unwrap_or(0);
+        let copied = capacity.min(length);
+        // SAFETY: the caller guarantees `value_ptr` is writable for
+        // `buffer_length` bytes, and `copied` does not exceed that or the
+        // payload. A byte copy has no alignment requirement.
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), value_ptr.cast::<u8>(), copied) };
+        capacity < length
+    };
+    unsafe {
+        write_if_some(
+            string_length_ptr,
+            SqlInteger::try_from(length).unwrap_or(SqlInteger::MAX),
+        );
+    }
+    if truncated {
+        post_diag(state, WARN_STRING_TRUNCATION);
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
+    }
 }
 
 /// Maps a header field to its stored value. `SQL_DESC_COUNT` is handled by

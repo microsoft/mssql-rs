@@ -1762,6 +1762,7 @@ pub(super) fn finish_execute(
     op: &str,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
+    let data_classification = super::data_classification::capture(dbc, &client);
     let has_result_set = !metadata.is_empty();
 
     if !has_result_set && client.has_open_batch() {
@@ -1777,7 +1778,7 @@ pub(super) fn finish_execute(
         if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
             return SQL_ERROR;
         }
-        let ird_ok = populate_ird(stmt, &metadata).is_ok();
+        let ird_ok = populate_ird(stmt, &metadata, None).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned on no-row result");
             return SQL_ERROR;
@@ -1832,7 +1833,7 @@ pub(super) fn finish_execute(
         if !dbc.return_lease(client, LeaseReturn::Release) {
             return SQL_ERROR;
         }
-        let ird_ok = populate_ird(stmt, &metadata).is_ok();
+        let ird_ok = populate_ird(stmt, &metadata, None).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
             return SQL_ERROR;
@@ -1928,7 +1929,7 @@ pub(super) fn finish_execute(
     if !dbc.return_lease(client, lease_return) {
         return SQL_ERROR;
     }
-    let ird_ok = populate_ird(stmt, &metadata).is_ok();
+    let ird_ok = populate_ird(stmt, &metadata, data_classification).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
         return SQL_ERROR;

@@ -76,6 +76,14 @@ pub const SQL_COPT_SS_CLIENT_CONNECTION_ID: SqlInteger = 1233;
 /// [`DbcState::warn_on_cp_error`](crate::handles::dbc::DbcState::warn_on_cp_error).
 pub const SQL_COPT_SS_WARN_ON_CP_ERROR: SqlInteger = 1243;
 
+/// `SQL_COPT_SS_DATACLASSIFICATION_VERSION` (`SQL_COPT_SS_BASE_ADD + 0`): the
+/// Data Classification version requested in LOGIN7.
+pub const SQL_COPT_SS_DATACLASSIFICATION_VERSION: SqlInteger = 1400;
+/// msodbcsql `DATACLASSIFICATION_VERSION_DEFAULT` (`tds/FeatureExtension.h`).
+pub const DATACLASSIFICATION_VERSION_DEFAULT: u8 = 1;
+/// msodbcsql `DATACLASSIFICATION_VERSION_MAX`: version 2 adds sensitivity rank.
+pub const DATACLASSIFICATION_VERSION_MAX: u8 = 2;
+
 pub const SQL_COPT_SS_LONGASMAX: SqlInteger = 1403;
 pub const SQL_XL_OFF: usize = 0;
 pub const SQL_XL_ON: usize = 1;
@@ -749,6 +757,9 @@ pub const SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME: SqlUSmallInt = 1221;
 pub const SQL_CA_SS_CATALOG_NAME: SqlUSmallInt = 1225;
 pub const SQL_CA_SS_SCHEMA_NAME: SqlUSmallInt = 1226;
 pub const SQL_CA_SS_TYPE_NAME: SqlUSmallInt = 1227;
+// IRD header fields (`RecNumber = 0`), not SQLColAttribute fields.
+pub const SQL_CA_SS_DATA_CLASSIFICATION: SqlUSmallInt = 1237;
+pub const SQL_CA_SS_DATA_CLASSIFICATION_VERSION: SqlUSmallInt = 1238;
 
 // ---- SQLColAttribute field identifiers --------------------------------------
 // The low-numbered ids are the ODBC 3.x descriptor fields that double as the

@@ -671,6 +671,7 @@ fn finish_parameter_array(
     mut batch: BatchClientResults,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
+    let data_classification = super::data_classification::capture(dbc, &client);
     // Like a scalar execute, wait for the first row or the end of an empty
     // first set. msodbcsql's SQLExecute reads an empty set through its DONE
     // (OnDone), reporting that set's status and any error now (measured on
@@ -724,7 +725,7 @@ fn finish_parameter_array(
     if !dbc.return_lease(client, lease_return) {
         return SQL_ERROR;
     }
-    let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
+    let ird_ok = super::ird::populate_ird(stmt, &metadata, data_classification).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         return SQL_ERROR;
     };
@@ -777,7 +778,7 @@ fn finish_parameter_array(
         rc = SQL_ERROR;
     }
     drop(stmt_state);
-    if error_result && super::ird::populate_ird(stmt, &[]).is_err() {
+    if error_result && super::ird::populate_ird(stmt, &[], None).is_err() {
         return SQL_ERROR;
     }
     rc

@@ -1349,3 +1349,27 @@ msodbcsql build is measured.
     leg, keeping the reference behavior measured. No existing call sequence is
     changed. The runtime evidence was collected with the C++ test against the
     local SQL Server and ODBC Driver 18.07.0001. Tracked in AB#49353.
+
+40. **A truncated `SQL_CA_SS_DATA_CLASSIFICATION` read reports `01004`.**
+    msodbcsql's `SQLGetDescFieldW` copies the prefix, reports the full length,
+    and returns `SQL_SUCCESS_WITH_INFO`, but posts `IDS_S1_004`
+    (`sqlcdesc.cpp:5240-5256`), which surfaces as `HY004` "Invalid SQL data
+    type". This driver returns the same prefix, length and return code with
+    `01004`, the state ODBC defines for truncated output, so an application
+    that tests for truncation finds it. Measured on Windows msodbcsql
+    18.07.0001 against SQL Server 2022; `ShortBufferSqlState` asserts each
+    driver's state. Chosen by the change author; maintainer sign-off is
+    pending review.
+
+41. **Malformed DATACLASSIFICATION data is rejected rather than passed
+    through.** msodbcsql copies the token payload without checking it
+    (`Parse.cpp` `ProcessDataClassification`, `sqlctokn.cpp`
+    `OnDataClassification`), so a payload with an out-of-range dictionary
+    index or an undefined rank still reaches the application. mssql-tds
+    validates the token before the IRD sees it: such a payload is a protocol
+    error that retires the connection, and an unpaired UTF-16 surrogate in a
+    name is returned as U+FFFD. The IRD payload is rebuilt from the
+    validated metadata in the [MS-TDS] 2.2.7.5 layout, so for every token
+    SQL Server sends it is byte-identical to msodbcsql's; measured at
+    versions 1 and 2 on msodbcsql 18.07.0001 and SQL Server 2022. Only a
+    non-compliant server can observe the difference.

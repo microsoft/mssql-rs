@@ -79,16 +79,17 @@ use super::dbc::DbcState;
 use super::stmt::{STMT_STATE_EXEC_STARTED, STMT_STATE_FETCH_IN_PROGRESS};
 use super::{DbcHandle, HandleType, HasObjectType, StmtHandle, handle_from_raw};
 use crate::api::odbc_types::{
-    SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME,
-    SQL_CA_SS_TYPE_NAME, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME,
-    SQL_CA_SS_UDT_SCHEMA_NAME, SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE,
-    SQL_DESC_ALLOC_USER, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR,
-    SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR,
-    SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME,
-    SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE,
-    SQL_DESC_PRECISION, SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE,
-    SQL_DESC_UNNAMED, SQL_ERROR, SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT,
-    SQL_SUCCESS, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_DATA_CLASSIFICATION,
+    SQL_CA_SS_DATA_CLASSIFICATION_VERSION, SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME,
+    SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME,
+    SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER,
+    SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
+    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
+    SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
+    SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
+    SQL_NULLABLE, SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT, SQL_SUCCESS, SqlInteger, SqlLen,
+    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, SQLSTATE_HY000, post_diag};
 use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
@@ -576,6 +577,11 @@ pub(crate) struct DescState {
     pub(crate) header: DescHeader,
     /// 1-based descriptor records: `records[0]` is record number 1.
     pub(crate) records: Vec<DescRecord>,
+    /// IRD only: the current result set's `SQL_CA_SS_DATA_CLASSIFICATION`
+    /// payload. Replaced with the records, so a result set never reports an
+    /// earlier one's classification, as msodbcsql's `ReleaseColinfo` clears
+    /// it with the column metadata.
+    pub(crate) data_classification: Option<Box<[u8]>>,
 }
 
 impl DescState {
@@ -1357,6 +1363,7 @@ impl DescHandle {
                     ..DescHeader::default()
                 },
                 records: Vec::new(),
+                data_classification: None,
             }),
         }
     }
@@ -1463,6 +1470,11 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         SQL_DESC_BIND_OFFSET_PTR if is_ad => (Header, true),
         SQL_DESC_BIND_TYPE if is_ad => (Header, true),
         SQL_DESC_ROWS_PROCESSED_PTR if is_ird || is_ipd => (Header, true),
+        // msodbcsql's `IsDescriptorHeaderField` (`sqlcdesc.cpp:3395-3410`)
+        // makes both header fields, answered only by `GetIRDHeaderField`.
+        SQL_CA_SS_DATA_CLASSIFICATION | SQL_CA_SS_DATA_CLASSIFICATION_VERSION if is_ird => {
+            (Header, false)
+        }
 
         // ---- Record fields common to every kind -------------------------
         SQL_DESC_TYPE
@@ -2315,6 +2327,7 @@ mod tests {
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
+            data_classification: None,
         };
         state.set_record_count(3, DescKind::AppParam);
         assert_eq!(state.records.len(), 3);
@@ -2329,6 +2342,7 @@ mod tests {
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
+            data_classification: None,
         };
         ipd_state.set_record_count(1, DescKind::ImpParam);
         assert_eq!(ipd_state.records.len(), 1);
@@ -2342,6 +2356,7 @@ mod tests {
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
+            data_classification: None,
         };
         state.set_record_count(3, DescKind::AppRow);
         if let Some(r) = state.record_mut(1) {
@@ -2359,6 +2374,7 @@ mod tests {
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
+            data_classification: None,
         };
         state.set_record_count(1, DescKind::AppRow);
         assert!(state.record(0).is_none());

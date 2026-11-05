@@ -151,6 +151,29 @@ An already-executed prepared statement retains its server-side declaration
 when the option changes; prepare it again to select a new declaration. DAE
 parameters remain chunked in both modes.
 
+### Data Classification
+
+Every connection requests SQL Server Data Classification version 1, as
+msodbcsql does. Set `SQL_COPT_SS_DATACLASSIFICATION_VERSION` (1400) to `2` to
+also receive sensitivity ranks; values outside `1..=2` return `HY024`. The
+attribute can be set while connected, and the new value is requested at the
+next login.
+
+A result set's classification is read from its IRD header (`RecNumber` 0):
+
+- `SQL_CA_SS_DATA_CLASSIFICATION_VERSION` (1238) is the version the server
+  acknowledged for the session, or `0` when it did not enable the feature.
+- `SQL_CA_SS_DATA_CLASSIFICATION` (1237) is the DATACLASSIFICATION token
+  payload in the [MS-TDS] layout, byte-identical to msodbcsql's. A short
+  buffer receives a prefix with `01004` (msodbcsql reports `HY004`; see
+  [parity deviation 40](docs/parity-deviations.md)), and a result set
+  without classification returns `HY091`.
+
+`SQLColAttribute` does not answer either field. Each result set reports only
+its own classification. mssql-python can set the attribute through
+`attrs_before`, but it does not call `SQLGetDescField`, so it cannot read the
+metadata yet.
+
 ### Integer connection-attribute getters
 
 Supported integer getters accept NULL value and length pointers independently.
