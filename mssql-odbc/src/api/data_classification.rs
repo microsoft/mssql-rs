@@ -718,6 +718,95 @@ mod tests {
         assert_last_diag(&desc_diags(ird(raw)), ERR_INVALID_DESCRIPTOR_FIELD);
     }
 
+    /// A fetch error closes the cursor but keeps the classification; closing
+    /// afterwards still drops it unless the statement is prepared (measured on
+    /// msodbcsql 18.07.0001 for all three close functions).
+    #[test]
+    fn closing_after_a_fetch_error_drops_the_classification_unless_prepared() {
+        for close in ["SQLFreeStmt", "SQLCancel", "SQLCloseCursor"] {
+            for prepared in [false, true] {
+                let (server, payload) = classified_server();
+                let mut h = TestHandles::with_env_dbc();
+                server.connect(h.dbc);
+                let stmt = if prepared {
+                    prepare_and_execute(&mut h, CLASSIFIED)
+                } else {
+                    let stmt = h.alloc_extra_stmt();
+                    exec(stmt, CLASSIFIED);
+                    stmt
+                };
+                while unsafe { crate::api::SQLFetch(stmt) } == SQL_SUCCESS {}
+                // What a server error on a later fetch leaves behind.
+                super::super::close_cursor::reset_cursor_state(
+                    &mut unsafe { handle_from_raw::<StmtHandle>(stmt) }
+                        .inner
+                        .lock()
+                        .unwrap(),
+                );
+                assert_eq!(classification(ird(stmt)).0, SQL_SUCCESS, "{close}");
+
+                unsafe {
+                    match close {
+                        "SQLFreeStmt" => {
+                            crate::api::SQLFreeStmt(stmt, crate::api::odbc_types::SQL_CLOSE)
+                        }
+                        "SQLCancel" => crate::api::SQLCancel(stmt),
+                        _ => sql_close_cursor(stmt),
+                    }
+                };
+                if prepared {
+                    assert_eq!(
+                        classification(ird(stmt)),
+                        (SQL_SUCCESS, payload),
+                        "{close} prepared"
+                    );
+                } else {
+                    assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{close} direct");
+                }
+            }
+        }
+    }
+
+    /// msodbcsql's commit sweep strips `KEEP_COLUMN_INFO`, so a prepared
+    /// statement whose cursor is already closed loses its classification; an
+    /// open one keeps it, and with no transaction started there is no sweep
+    /// (measured on msodbcsql 18.07.0001).
+    #[test]
+    fn ending_a_transaction_drops_a_closed_prepared_statements_classification() {
+        for started in [false, true] {
+            let (server, payload) = classified_server();
+            let mut h = TestHandles::with_env_dbc();
+            server.connect(h.dbc);
+            let closed = prepare_and_execute(&mut h, CLASSIFIED);
+            assert_eq!(unsafe { sql_close_cursor(closed) }, SQL_SUCCESS);
+            let open = prepare_and_execute(&mut h, CLASSIFIED);
+            unsafe { handle_from_raw::<crate::handles::dbc::DbcHandle>(h.dbc) }
+                .inner
+                .lock()
+                .unwrap()
+                .local_tran_started = started;
+
+            let rc = unsafe {
+                crate::api::SQLEndTran(
+                    crate::api::odbc_types::SQL_HANDLE_DBC,
+                    h.dbc,
+                    crate::api::odbc_types::SQL_COMMIT,
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "started: {started}");
+            if started {
+                assert_eq!(classification(ird(closed)).0, SQL_ERROR);
+            } else {
+                assert_eq!(classification(ird(closed)), (SQL_SUCCESS, payload.clone()));
+            }
+            assert_eq!(
+                classification(ird(open)),
+                (SQL_SUCCESS, payload),
+                "started: {started}"
+            );
+        }
+    }
+
     /// A failed execution reports no classification, not the one its
     /// statement had before.
     #[test]

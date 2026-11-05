@@ -441,8 +441,9 @@ TEST_F(DataClassificationTest, PreparedStatementClassificationLifecycle) {
 }
 
 // A server error that a fetch reports after rows were delivered leaves the
-// classification readable, direct or prepared (measured on msodbcsql
-// 18.07.0001), so SQL_ERROR alone does not clear it.
+// classification readable, direct or prepared; closing afterwards drops it
+// unless the statement is prepared (measured on msodbcsql 18.07.0001), so
+// SQL_ERROR alone does not clear it.
 TEST_F(DataClassificationTest, ServerErrorAfterRowsKeepsTheClassification) {
     ConnectDbc();
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
@@ -466,8 +467,46 @@ TEST_F(DataClassificationTest, ServerErrorAfterRowsKeepsTheClassification) {
         EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_)) << (prepared ? "prepared" : "direct");
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
         EXPECT_TRUE(IrdPayload().has_value()) << (prepared ? "prepared" : "direct");
-        SQLFreeStmt(stmt_, SQL_CLOSE);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        if (prepared) {
+            EXPECT_TRUE(IrdPayload().has_value());
+        } else {
+#ifdef _WIN32
+            // unixODBC rejects an IRD read in state S1 with HY007.
+            EXPECT_FALSE(IrdPayload().has_value());
+#endif
+        }
     }
+}
+
+// msodbcsql's commit sweep strips KEEP_COLUMN_INFO before closing
+// (sqlctran.cpp:302-323), so a prepared statement whose cursor is already
+// closed loses its classification; one with an open cursor keeps it (measured
+// on msodbcsql 18.07.0001).
+TEST_F(DataClassificationTest, EndTranDropsAClosedPreparedStatementsClassification) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+
+    ASSERT_SQL_OK(SQLSetConnectAttrW(dbc_, SQL_ATTR_AUTOCOMMIT,
+                                     reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0),
+                  SQL_HANDLE_DBC, dbc_);
+    auto sql = ODBCTestUtils::ToSqlTStr(ClassifiedSelect());
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT), SQL_HANDLE_DBC, dbc_);
+    EXPECT_FALSE(IrdPayload().has_value());
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT), SQL_HANDLE_DBC, dbc_);
+    ExpectClassifiedPayload(false);
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+    ASSERT_SQL_OK(SQLSetConnectAttrW(dbc_, SQL_ATTR_AUTOCOMMIT,
+                                     reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0),
+                  SQL_HANDLE_DBC, dbc_);
 }
 TEST_F(DataClassificationTest, ParameterArrayReportsEachSetsClassification) {
     ConnectDbc();

@@ -226,6 +226,11 @@ pub(super) fn exec_batch(
 /// would fail with a usage error.
 #[must_use]
 pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
+    sweep_cursors(dbc, false)
+}
+
+/// `ending_transaction`: see [`close_cursor_for_connection_op`].
+fn sweep_cursors(dbc: &DbcHandle, ending_transaction: bool) -> SqlReturn {
     let statements = match dbc.inner.lock() {
         Ok(state) => state.statements.clone(),
         Err(_) => {
@@ -242,7 +247,7 @@ pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
         // `SQLDisconnect` documents (see the TODO in `disconnect.rs`), which
         // refcounted handles will close for the whole driver at once.
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
-        if close_cursor_for_connection_op(stmt, stmt_ptr) == SQL_ERROR {
+        if close_cursor_for_connection_op(stmt, stmt_ptr, ending_transaction) == SQL_ERROR {
             error!(?stmt_ptr, "close_all_cursors: could not close cursor");
             worst = SQL_ERROR;
         }
@@ -284,7 +289,7 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     // `SQL_CB_PRESERVE`, so the DM never closes cursors on its behalf. Both
     // drivers are internally consistent; they just report different truths about
     // themselves.
-    if close_all_cursors(dbc) == SQL_ERROR {
+    if sweep_cursors(dbc, started) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
 
