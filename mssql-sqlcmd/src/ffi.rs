@@ -70,32 +70,33 @@ pub extern "C" fn mssql_sqlcmd_version() -> *const std::ffi::c_char {
     VERSION.as_ptr().cast()
 }
 
-/// Captures one discrete sqlcmd usage event for the installed telemetry sink.
+/// Captures the single usage event for one sqlcmd run.
 ///
 /// The version is included only when it is a bounded version-like value.
-/// With no installed sink this is a no-op. Telemetry is best effort: a panic is
-/// caught and never crosses the ABI.
+/// With no valid Application Insights configuration this is a no-op. Telemetry
+/// is best effort: a panic is caught and never crosses the ABI.
 ///
 /// # Safety
 /// `sqlcmd_version` must satisfy [`read_text`]'s pointer and length requirements.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mssql_sqlcmd_telemetry_record_usage(sqlcmd_version: MssqlSqlcmdText) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: forwarded from the caller's guarantees.
-        let version = unsafe { read_text(sqlcmd_version) };
+        let version = if sqlcmd_version.len <= 64 {
+            // SAFETY: forwarded from the caller's guarantees.
+            unsafe { read_text(sqlcmd_version) }
+        } else {
+            None
+        };
         telemetry::record_usage(version.as_deref());
     }));
 }
 
-/// Stops new telemetry capture and flushes the installed sink once.
-///
-/// `timeout_ms` is clamped to 1000 milliseconds. This call is thread-safe and
-/// idempotent; with no sink or after another shutdown call it succeeds
-/// immediately. Sink failures and panics are reported without crossing the ABI.
+/// Flushes and shuts down telemetry within `timeout_ms`, capped at one second.
 #[unsafe(no_mangle)]
 pub extern "C" fn mssql_sqlcmd_telemetry_shutdown(timeout_ms: u32) -> i32 {
-    match catch_unwind(|| telemetry::shutdown(std::time::Duration::from_millis(timeout_ms.into())))
-    {
+    match catch_unwind(AssertUnwindSafe(|| {
+        telemetry::shutdown(std::time::Duration::from_millis(u64::from(timeout_ms)))
+    })) {
         Ok(FlushOutcome::Completed) => MSSQL_SQLCMD_OK,
         Ok(FlushOutcome::TimedOut) => MSSQL_SQLCMD_TELEMETRY_TIMEOUT,
         Ok(FlushOutcome::Failed) | Err(_) => MSSQL_SQLCMD_INTERNAL_ERROR,

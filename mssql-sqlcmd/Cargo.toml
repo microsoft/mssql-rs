@@ -11,8 +11,18 @@ description = "sqlcmd components in Rust, linked into native sqlcmd through a C 
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+async-trait = "0.1"
+bytes = "1"
+flate2 = "1"
+http = "1"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-application-insights = { version = "0.46", default-features = false, features = ["trace"] }
+opentelemetry-http = { version = "0.33", default-features = false, features = ["reqwest-blocking"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tracing = "0.1.43"
 
 [lints]
 workspace = true
@@ -23,7 +33,6 @@ workspace = true
 [target.'cfg(target_pointer_width = "64")'.dependencies]
 mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1.48.0", features = ["rt", "time", "macros", "sync"] }
-tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", default-features = false, features = ["registry", "std"] }
 
 # diagnostics: the client's operating-system version and, off Windows, the

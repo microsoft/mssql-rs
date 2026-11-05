@@ -47,19 +47,18 @@ typedef struct MssqlSqlcmdText {
     size_t len; /* in UTF-16 code units, not bytes */
 } MssqlSqlcmdText;
 
-/* Privacy-safe, exporter-independent product telemetry. Captures one discrete
-   typed usage record for an approved provider. With no provider this is a
-   no-op. sqlcmd_version is included only when it is a bounded version-like
-   value. Panics are caught and failures never affect sqlcmd. Thread-safe. */
+/* Privacy-safe product telemetry. The usage call lazily configures the direct
+   Application Insights exporter from APPLICATIONINSIGHTS_CONNECTION_STRING.
+   Missing or invalid configuration is a no-op. sqlcmd_version is included only
+   when it is a bounded version-like value. Failures are ignored and never
+   affect sqlcmd. */
 void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
     MssqlSqlcmdText sqlcmd_version);
 
-/* Stops new telemetry capture and flushes the installed provider once.
-   timeout_ms is clamped to 1000 milliseconds. Thread-safe and idempotent:
-   with no provider or after another shutdown call it returns MSSQL_SQLCMD_OK
-   immediately. Returns MSSQL_SQLCMD_TELEMETRY_TIMEOUT when the bounded wait
-   expires, or MSSQL_SQLCMD_INTERNAL_ERROR on a provider failure or panic.
-   Callers must treat every result as fail-open and preserve sqlcmd behavior. */
+/* Stops new telemetry capture and flushes once. timeout_ms is capped at 1000.
+   Returns 0 when completed, unconfigured, or already started; 6 on timeout;
+   or 3 on provider failure or panic. Callers must treat every result as
+   fail-open and preserve sqlcmd behavior. */
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_shutdown(uint32_t timeout_ms);
 
 /* A result-set column, as the driver describes it. Only the name is always
