@@ -1,10 +1,5 @@
 # Plan: `sql_variant` RPC parameter support in `mssql-tds`
 
-Historical implementation plan. `SqlType::Variant` is implemented; the
-"current state" and implementation steps below describe the pre-change code.
-Use the [API reference](https://docs.rs/mssql-tds/latest/mssql_tds/datatypes/sqltypes/enum.SqlType.html)
-for current usage.
-
 ## Goal
 
 Allow callers to pass a `sql_variant` value as an RPC / `sp_executesql` parameter.

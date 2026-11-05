@@ -1,4 +1,4 @@
-# Contributing to mssql-rs
+# Contributing to mssql-tds
 
 Thank you for your interest in this project!
 
@@ -12,7 +12,7 @@ While we are not accepting code contributions at this time, we welcome:
 
 - **Bug reports** — File an issue using the [bug report template](https://github.com/microsoft/mssql-rs/issues/new?template=bug_report.yml).
 - **Feature requests** — Suggest improvements using the [feature request template](https://github.com/microsoft/mssql-rs/issues/new?template=feature_request.yml).
-- **Feedback** — Share your experience using the components in GitHub Issues.
+- **Feedback** — Share your experience using the library in GitHub Issues.
 
 ## Security
 

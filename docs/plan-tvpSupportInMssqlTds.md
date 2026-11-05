@@ -1,10 +1,5 @@
 ## Plan: TVP Support in mssql-tds
 
-Historical implementation plan. TVPs, including `sql_variant` columns, are now
-implemented; the exclusions and future-driver discussion below describe the
-original scope. See the [TVP API reference](https://docs.rs/mssql-tds/latest/mssql_tds/datatypes/sql_tvp/index.html)
-for current types.
-
 Add Table-Valued Parameter (TVP) support to the mssql-tds Rust crate so that stored procedures accepting TVPs can be called. TVPs are input-only parameters (TDS type `0xF3`) that send tabular data as a single RPC parameter. The design serves two consumers: (1) mssql-python for direct Python→TDS usage, and (2) a future ODBC driver built on mssql-tds.
 
 ### Design Approach

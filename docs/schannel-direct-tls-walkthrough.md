@@ -1,9 +1,5 @@
 # Schannel-Direct TLS Engine — Branch Walkthrough
 
-Historical cutover walkthrough, not a current TLS configuration reference.
-See the [connection behavior guide](../mssql-tds/docs/connection-behavior.md)
-for current behavior.
-
 > Branch: `dev/saurabh/winschan-08-cutover` compared against `origin/development`
 > Scope: **17 files, +2922 / −169** — the final cutover of an 8-PR stack that adds a
 > Windows-only, in-tree **Schannel-direct TLS engine** to replace the

@@ -22,11 +22,12 @@ workspace = true
 # The library under test. This dependency line always points at ../mssql-tds.
 # The perf-lab testScript holds the harness constant and swaps only the SOURCE
 # at ../mssql-tds in place between runs — candidate = the working tree, baseline =
-# a checkout of the commit pinned in perf-lab/baseline-commit.txt.
+# a checkout of the commit pinned in perf-lab/baseline-commit.txt — so mssql-tds
+# is the only variable.
 #
 # The harness code, Criterion version, and toolchain stay byte-for-byte identical
-# across both runs. Host and server conditions can still affect measurements;
-# see perf-lab/MONITORING.md for confirmation requirements.
+# across both runs, so any statistically significant delta is attributable to
+# mssql-tds itself.
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
 
 async-trait = "0.1.89"
