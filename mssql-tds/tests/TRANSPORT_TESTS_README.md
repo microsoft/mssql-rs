@@ -12,7 +12,7 @@ This directory contains integration tests for different SQL Server transport pro
 - Standard network protocol
 - Works on all platforms (Windows, Linux, macOS)
 - Default protocol for remote connections
-- Format: `host:port` (e.g., `localhost:1433`)
+- Datasource format: `tcp:host,port` (e.g., `tcp:localhost,1433`)
 
 ### Named Pipes (Windows only)
 - Windows inter-process communication mechanism
@@ -22,12 +22,8 @@ This directory contains integration tests for different SQL Server transport pro
   - Named instance: `\\server\pipe\MSSQL$INSTANCE\sql\query` or `\\.\pipe\MSSQL$INSTANCE\sql\query` (local)
 
 ### Shared Memory (Windows only, local only)
-- Fastest protocol for local connections
-- Uses Named Pipes internally with special path
-- Formats:
-  - Default instance: Empty instance name or "MSSQLSERVER"
-  - Named instance: Instance name (e.g., "SQLEXPRESS")
-- Internally uses pipe format: `\\.\pipe\sql\query` or `\\.\pipe\MSSQL$INSTANCE\sql\query`
+- Datasource format: `lpc:.` for the default local instance
+- The current implementation uses local Named Pipes internally
 
 ## Environment Variables
 
@@ -48,11 +44,8 @@ DB_DATABASE=UserDb         # Only read by the float16 helper; other tests always
 DB_HOST=localhost           # Server hostname or IP
 DB_PORT=1433               # Server port (optional, defaults to 1433)
 
-# Named Pipe and Shared Memory tests (Windows only)
-DB_INSTANCE=SQLEXPRESS     # Instance name (optional, defaults to default instance)
-
 # Encryption settings
-TRUST_SERVER_CERTIFICATE=true
+TRUST_SERVER_CERTIFICATE=false
 CERT_HOST_NAME=localhost   # Optional: hostname in certificate
 
 # Debugging
@@ -81,7 +74,6 @@ Requirements:
    the explicit port; setting `DB_INSTANCE` alone does not select a named instance for TCP.
 - Optionally set `VECTOR16_EXPECTED_INSTANCE` to verify the instance name on each float16
    connection. This safeguard accepts any configured instance name.
-- Set `DB_INSTANCE` for any Named Pipe/Shared Memory tests in the same run.
 - Have an administrator preprovision preview support in the target database on a server
    build that supports float16 vectors and Vector feature V2. Tests never enable preview
    features, change database configuration, set global flags, or issue `USE` statements.
@@ -102,51 +94,27 @@ and the configured endpoint. Negotiation/wire unit tests do not need a live serv
 
 ## Running Tests
 
-### All Tests (Linux/macOS - TCP only)
+From the repository root, after configuring the environment:
+
 ```bash
-cargo test --package mssql-tds --test test_transport_protocols
+cargo nextest run -p mssql-tds --test test_transport_protocols
 ```
 
-### All Tests (Windows - TCP, Named Pipe, Shared Memory)
+Named Pipe and Shared Memory cases are Windows-only. Filter the same test binary
+by protocol or test name:
+
 ```bash
-cargo test --package mssql-tds --test test_transport_protocols
+cargo nextest run -p mssql-tds --test test_transport_protocols -E 'test(test_tcp)'
+cargo nextest run -p mssql-tds --test test_transport_protocols -E 'test(named_pipe)'
+cargo nextest run -p mssql-tds --test test_transport_protocols -E 'test(shared_memory)'
 ```
 
-### Specific Protocol Tests
-
-#### TCP Tests (all platforms)
-```bash
-cargo test --package mssql-tds --test test_transport_protocols test_tcp_connection
-```
-
-#### Named Pipe Tests (Windows only)
-```bash
-# All Named Pipe tests
-cargo test --package mssql-tds --test test_transport_protocols test_named_pipe
-
-# Specific tests
-cargo test --package mssql-tds --test test_transport_protocols test_named_pipe_default_instance
-cargo test --package mssql-tds --test test_transport_protocols test_named_pipe_named_instance
-cargo test --package mssql-tds --test test_transport_protocols test_named_pipe_local_default_instance
-cargo test --package mssql-tds --test test_transport_protocols test_named_pipe_local_named_instance
-```
-
-#### Shared Memory Tests (Windows only)
-```bash
-# All Shared Memory tests
-cargo test --package mssql-tds --test test_transport_protocols test_shared_memory
-
-# Specific tests
-cargo test --package mssql-tds --test test_transport_protocols test_shared_memory_default_instance
-cargo test --package mssql-tds --test test_transport_protocols test_shared_memory_named_instance
-cargo test --package mssql-tds --test test_transport_protocols test_shared_memory_mssqlserver_instance
-```
-
-#### Unit Tests
-```bash
-# Test TransportContext helper methods
-cargo test --package mssql-tds --test test_transport_protocols test_transport_context
-```
+Tests using Strict encryption return early when
+`TRUST_SERVER_CERTIFICATE=true`; that flag cannot bypass Strict validation.
+To exercise those cases, trust the server certificate and leave the flag false.
+Named Pipe and Shared Memory cases in this binary target the default instance;
+`DB_INSTANCE` does not redirect them. LocalDB cases target `MSSQLLocalDB` and
+use Windows integrated authentication.
 
 ## Setting Up SQL Server for Testing
 
@@ -169,11 +137,9 @@ cargo test --package mssql-tds --test test_transport_protocols test_transport_co
 
 3. **Restart SQL Server** service after enabling protocols
 
-4. **Create test user** (if needed):
+4. **Create a test login** as an administrator (if needed):
    ```sql
    CREATE LOGIN testuser WITH PASSWORD = 'YourPassword123!';
-   GO
-   GRANT VIEW SERVER STATE TO testuser;
    GO
    ```
 
@@ -182,20 +148,15 @@ cargo test --package mssql-tds --test test_transport_protocols test_transport_co
    DB_HOST=localhost
    DB_USERNAME=testuser
    SQL_PASSWORD=YourPassword123!
-   DB_INSTANCE=SQLEXPRESS           # Or empty for default instance
-   TRUST_SERVER_CERTIFICATE=true
+   TRUST_SERVER_CERTIFICATE=false
    ```
 
 ### Verifying Protocol Availability
 
-You can check which protocols are enabled by running:
+Check the transport used by the current connection:
 
 ```sql
--- Check network protocols
-SELECT * FROM sys.dm_exec_connections WHERE session_id = @@SPID;
-
--- Check server properties
-SELECT * FROM sys.configurations WHERE name LIKE '%protocol%';
+SELECT CONNECTIONPROPERTY('net_transport') AS net_transport;
 ```
 
 ## Troubleshooting
@@ -218,7 +179,7 @@ SELECT * FROM sys.configurations WHERE name LIKE '%protocol%';
 - Ensure Shared Memory protocol is enabled
 - Shared Memory only works for local connections
 - Verify instance name is correct
-- For default instance, use empty string or "MSSQLSERVER"
+- For the default instance, use `lpc:.`
 
 ### General
 
@@ -227,33 +188,19 @@ SELECT * FROM sys.configurations WHERE name LIKE '%protocol%';
 - Alternatively, export environment variables before running tests
 
 **Connection timeout**
-- Increase timeout in connection string (not yet implemented in these tests)
+- These tests construct `ClientContext` directly; connection-string timeout
+  settings do not configure them.
 - Check if SQL Server is running: `services.msc` → SQL Server (INSTANCE)
 
 **TLS/Certificate errors**
-- Set `TRUST_SERVER_CERTIFICATE=true` for local testing
-- For production, configure proper certificates
+- Trust the server certificate and check `CERT_HOST_NAME`.
+- `TRUST_SERVER_CERTIFICATE=true` permits local TDS 7.4 `Encryption=On` tests
+  with an untrusted certificate, but skips the Strict cases.
 
 ## Test Coverage
 
-The test suite covers:
-
-- ✅ TCP connections (default protocol)
-- ✅ Named Pipe connections (remote server)
-- ✅ Named Pipe connections (named instance)
-- ✅ Named Pipe connections (local default instance)
-- ✅ Named Pipe connections (local named instance)
-- ✅ Shared Memory connections (default instance)
-- ✅ Shared Memory connections (named instance)
-- ✅ Shared Memory connections (explicit MSSQLSERVER)
-- ✅ TransportContext helper methods (get_server_name, is_local, get_protocol)
-
-## Future Enhancements
-
-- [ ] Add connection string parsing tests
-- [ ] Add protocol fallback tests (try protocols in order)
-- [ ] Add SQL Browser (SSRP) integration tests
-- [ ] Add performance comparison between protocols
-- [ ] Add error handling tests for invalid pipe paths
-- [ ] Add timeout tests
-- [ ] Add concurrent connection tests
+The binary covers TCP, remote/local default-instance Named Pipes, the local
+Shared Memory path, and LocalDB. It includes Strict and TDS 7.4 encrypted
+connections plus ten concurrent connections for each local Named Pipe and
+Shared Memory path. It does not test named-instance selection, protocol fallback,
+or `TransportContext` helper methods.

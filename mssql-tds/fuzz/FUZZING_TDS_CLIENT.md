@@ -12,9 +12,9 @@ Tests the TdsClient with simulated SQL Server responses without requiring an act
 
 **What it tests:**
 - Query execution (`execute()`)
-- Result set fetching (`get_next_row()`)
-- Metadata parsing (`move_to_column_metadata()`)
-- Stream draining (`drain_stream()`)
+- Query execution followed by response draining (`close_query()`)
+- Parameterized execution (`execute_sp_executesql()`)
+- Stored-procedure execution (`execute_stored_procedure()`)
 - State management across operations
 - Error handling with malformed tokens
 
@@ -22,9 +22,9 @@ Tests the TdsClient with simulated SQL Server responses without requiring an act
 ```
 Byte 0: Scenario selector (0-3)
   0 = execute() with token response
-  1 = execute() + get_next_row() flow
-  2 = move_to_column_metadata() directly
-  3 = drain_stream()
+  1 = execute() followed by close_query()
+  2 = execute_sp_executesql()
+  3 = execute_stored_procedure()
   
 Bytes 1+: Token stream data (TDS protocol tokens)
 ```
@@ -42,6 +42,8 @@ rustup install nightly
 ```
 
 ### Run fuzzing
+
+Run from `mssql-tds/fuzz`:
 
 ```bash
 # Fuzz TdsClient (recommended - tests client logic)
@@ -148,7 +150,7 @@ Common TDS token types:
 
 1. **Start small:** Use small corpus files (< 1KB)
 2. **Run continuously:** Let fuzzer run overnight for best results
-3. **Monitor memory:** Fuzzer caps allocations at 1MB to prevent OOM
+3. **Monitor memory:** Inputs over 2048 bytes are rejected; this is not a bound on total process memory
 4. **Triage promptly:** Investigate crashes as soon as they're found
 5. **Minimize corpus:** Run `cmin` periodically to keep corpus efficient
 
@@ -171,7 +173,7 @@ Common TDS token types:
 
 ### "Out of memory"
 - Reduce corpus size
-- Check for allocation bugs (shouldn't exceed 1MB per input)
+- Check for allocation bugs; input size alone does not bound allocations
 
 ### "Timeout"
 - Limit input size (max 2048 bytes in fuzzer)

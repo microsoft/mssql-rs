@@ -3,6 +3,14 @@
 Detailed behavior for SDK and driver authors using
 [`mssql-tds`](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/README.md).
 
+## Encryption defaults
+
+`ClientContext::default()` selects `EncryptionSetting::Strict` (TDS 8.0).
+The server must support that protocol, and its certificate must be trusted and
+match the expected hostname. `TrustServerCertificate` does not bypass validation
+in Strict mode. For TDS 7.4 with encrypted query traffic, set
+`context.encryption_options.mode = EncryptionSetting::On` before connecting.
+
 ## Connection policy and migration
 
 Eligible TCP connections default to MultiSubnetFailover (MSF): attempt all
@@ -84,6 +92,20 @@ on/`Enabled` is unsupported, and invalid values fail validation. **Disabling
 TNIR does not disable MSF.** See the
 [parity decisions](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/parity-deviations.md) for the intentional
 differences from msodbcsql and outstanding approval/evidence.
+
+## Request deadlines and interrupted sends
+
+`begin_transaction_with_options`, `commit_transaction_with_options`, and
+`rollback_transaction_with_options` accept the same timeout and cancellation
+options as `execute`. These options expire when the transaction request returns,
+including on error; later savepoint or DTC requests do not inherit them.
+Language batches and transaction requests charge serialization and packet-send
+time against the remaining response budget. Packet sends reject an expired
+deadline before polling the transport; a pending send does not receive a fresh
+timeout per packet.
+
+For interrupted-send retirement and transport-failure recovery, see
+[Response lifecycle](client-guide.md#response-lifecycle).
 
 ## DNS fallback caching
 

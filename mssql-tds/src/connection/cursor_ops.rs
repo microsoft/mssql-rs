@@ -286,7 +286,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -365,7 +365,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -451,7 +451,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -550,7 +550,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -619,7 +619,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -715,7 +715,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -781,7 +781,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -895,7 +895,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -964,7 +964,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;
@@ -1060,7 +1060,7 @@ impl CursorClient for TdsClient {
 
         self.remaining_request_timeout = request_timeout;
         self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-        self.return_values.clear();
+        self.clear_return_values();
         self.transport.reset_reader();
 
         let db_collation = self.negotiated_settings.database_collation;

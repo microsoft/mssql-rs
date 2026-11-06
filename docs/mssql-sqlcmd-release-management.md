@@ -64,7 +64,9 @@ The pack step fails if any runtime is missing.
   `buildMssqlSqlcmd: true` it builds and publishes the sqlcmd package.
   PR builds build but never publish.
 - The Official build and the release pipeline are sqlcmd's own.
-- All three build the same jobs, from `.pipeline/OneBranch/mssql-sqlcmd-jobs.yml`.
+- Both build pipelines use `.pipeline/OneBranch/mssql-sqlcmd-jobs.yml`.
+  The release pipeline validates and publishes the selected Official build's
+  package without rebuilding it.
 
 ## Versions
 
