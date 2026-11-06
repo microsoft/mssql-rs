@@ -272,6 +272,9 @@ pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -
             );
         }
         let units = chunk.get(..count).unwrap_or_default();
+        // ORing every unit together leaves a bit at or above 0x80 set iff some
+        // unit is non-ASCII. Unlike `all(|u| u < 0x80)` it never exits early,
+        // so the compiler can vectorize it.
         if units.iter().fold(0, |any, &unit| any | unit) < 0x80 {
             for (byte, &unit) in ascii.iter_mut().zip(units) {
                 [*byte, _] = unit.to_le_bytes();
