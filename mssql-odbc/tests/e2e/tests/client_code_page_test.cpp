@@ -218,23 +218,30 @@ ODBC_TEST_F(ClientCodePageTest, NarrowChunksEndAtClientCharacterBoundaries) {
                                    std::vector<size_t>{1, 1, 1};
     const SQLLEN buffer_length =
         client_code_page_ == 65001 ? 5 : client_code_page_ == 932 ? 4 : 2;
+    // Parity deviation 8: msodbcsql copies same-code-page UTF-8 verbatim, so
+    // only the shared truncation contract is asserted on that leg.
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool whole_character_chunks =
+        client_code_page_ != 65001 || target == nullptr || std::string(target) != "msodbcsql";
     ASSERT_EQ(SQL_SUCCESS, Execute(sql));
     ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
 
     size_t consumed = 0;
     size_t chunk_index = 0;
     while (consumed < encoded.size()) {
-        ASSERT_LT(chunk_index, chunk_sizes.size());
         SQLCHAR output[5];
         std::fill(std::begin(output), std::end(output), 0xCC);
         SQLLEN indicator = -1;
         const SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, output, buffer_length, &indicator);
-        ASSERT_LE(chunk_sizes[chunk_index],
-                  static_cast<size_t>(buffer_length - 1));
         const size_t written = static_cast<size_t>(
             std::find(std::begin(output), std::begin(output) + buffer_length, 0) -
             std::begin(output));
-        ASSERT_EQ(chunk_sizes[chunk_index], written);
+        ASSERT_GT(written, 0u) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        ASSERT_LE(written, static_cast<size_t>(buffer_length - 1));
+        if (whole_character_chunks) {
+            ASSERT_LT(chunk_index, chunk_sizes.size());
+            ASSERT_EQ(chunk_sizes[chunk_index], written);
+        }
         EXPECT_EQ(encoded.substr(consumed, written),
                   std::string(reinterpret_cast<const char*>(output), written));
         const size_t remaining = encoded.size() - consumed;
@@ -251,7 +258,9 @@ ODBC_TEST_F(ClientCodePageTest, NarrowChunksEndAtClientCharacterBoundaries) {
         consumed += written;
         ++chunk_index;
     }
-    EXPECT_EQ(chunk_sizes.size(), chunk_index);
+    if (whole_character_chunks) {
+        EXPECT_EQ(chunk_sizes.size(), chunk_index);
+    }
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 

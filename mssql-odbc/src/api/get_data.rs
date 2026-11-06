@@ -2478,6 +2478,7 @@ fn stream_active_plp_chunk_once<'a>(
     // those bytes untouched, so verbatim narrow text is staged and copied with
     // its terminator only. It keeps read-ahead: its bytes are still the output.
     let direct_wire_output = read_ahead && !(narrow_verbatim && target_type == SQL_C_CHAR);
+    // Parity deviation 8: UTF-8 chunks end on whole characters.
     let direct_utf8_output = direct_wire_output
         && target_type == SQL_C_CHAR
         && text_output.encoding.is_utf8()
