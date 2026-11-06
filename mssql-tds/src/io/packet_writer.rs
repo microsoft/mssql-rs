@@ -738,8 +738,8 @@ impl TdsPacketWriter for PacketWriter<'_> {
     }
 
     async fn write_string_unicode_async(&mut self, value: &str) -> TdsResult<()> {
-        // Encodes straight into the packet buffer; a packet boundary may split
-        // a surrogate pair, or a code unit at an odd boundary.
+        // A packet boundary may split a surrogate pair, or a code unit at an
+        // odd boundary.
         let mut units = Utf16Units::new(value);
 
         loop {
@@ -883,15 +883,10 @@ impl<'s> Utf16Units<'s> {
         }
         let ch = self.rest.chars().next()?;
         self.rest = &self.rest[ch.len_utf8()..];
-        let mut units = [0; 2];
-        match *ch.encode_utf16(&mut units) {
-            [high, low] => {
-                self.pending_low = Some(low);
-                Some(high)
-            }
-            [unit] => Some(unit),
-            _ => None,
-        }
+        let mut buf = [0; 2];
+        let units = ch.encode_utf16(&mut buf);
+        self.pending_low = units.get(1).copied();
+        units.first().copied()
     }
 
     /// Writes up to `max_units` UTF-16LE units at the cursor and returns how

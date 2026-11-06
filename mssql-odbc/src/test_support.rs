@@ -41,6 +41,24 @@ pub(crate) fn assert_last_diag(records: &[DiagRecord], expected: DiagMsg) {
 #[repr(align(8))]
 pub(crate) struct AlignedBuffer<T, const N: usize>(pub(crate) [T; N]);
 
+/// Deterministic generator for differential tests: reproducible from a seed,
+/// no dependency.
+pub(crate) struct SplitMix64(pub(crate) u64);
+
+impl SplitMix64 {
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
 /// Rebuild an ODBC connection string from a template, expanding the credential
 /// placeholders `<PW>` → `PWD` and `<PASS>` → `PASSWORD`.
 ///
