@@ -5,6 +5,7 @@
 timeout, lifecycle state (closed/is_connected), async context manager, repr."""
 
 import asyncio
+import socket
 import subprocess
 import sys
 import textwrap
@@ -118,12 +119,72 @@ def test_failed_connect_logs_while_awaitable_is_polled():
         }
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
-            with pytest.raises(Exception, match="Failed to connect to SQL Server"):
+            with pytest.raises(
+                mssql_py_core.OperationalError, match="Failed to connect to SQL Server"
+            ):
                 await mssql_py_core.PyAsyncConnection.connect(invalid_context, logger)
         assert any(
             "PyAsyncConnection::connect: failed" in message
             for message in logger.messages
         )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "authentication",
+    [
+        "SqlPassword",
+        "AccessToken",
+        "token_provider",
+        "ActiveDirectoryDefault",
+        "ActiveDirectoryMSI",
+        "ActiveDirectoryServicePrincipal",
+    ],
+)
+@pytest.mark.parametrize("failure", ["connection-refused", "untrusted-tls"])
+def test_connect_transport_errors_use_dbapi_mapping_for_all_auth_modes(
+    mock_client_context, authentication, failure
+):
+    if authentication.startswith("ActiveDirectory"):
+        pytest.importorskip("azure.identity.aio")
+        pytest.importorskip("aiohttp")
+
+    async def run():
+        context = {
+            key: value
+            for key, value in mock_client_context.items()
+            if key != "access_token"
+        }
+        context.update(connect_timeout=2, connect_retry_count=0)
+        options = {}
+        if authentication == "AccessToken":
+            context["access_token"] = "unused-transport-test-token"
+        elif authentication == "token_provider":
+            class Credential:
+                async def get_token(self, scope):
+                    pytest.fail("Transport failure must precede token acquisition")
+
+            options["token_provider"] = Credential()
+        else:
+            context["authentication"] = authentication
+            if authentication in ("SqlPassword", "ActiveDirectoryServicePrincipal"):
+                context.update(user_name="test-client", password="test-secret")
+
+        with socket.socket() as blocked_port:
+            blocked_port.bind(("127.0.0.1", 0))
+            if failure == "connection-refused":
+                context["server"] = f"127.0.0.1,{blocked_port.getsockname()[1]}"
+            else:
+                context.update(encryption="Mandatory", trust_server_certificate=False)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)
+                with pytest.raises(
+                    mssql_py_core.OperationalError, match="Failed to connect to SQL Server"
+                ):
+                    await asyncio.wait_for(
+                        mssql_py_core.PyAsyncConnection.connect(context, **options), 5
+                    )
 
     asyncio.run(run())
 
