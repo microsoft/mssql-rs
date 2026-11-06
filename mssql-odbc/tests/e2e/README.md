@@ -563,7 +563,7 @@ profile runs it.
 
 ```bash
 ctest --test-dir build -L mt                            # every concurrent variant, 2 x 1
-./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt, gdb stacks
+./run_e2e.sh --mt-profile=weekly                        # 16 x 25, only <name>_mt, gdb stacks
 ```
 
 ```powershell
@@ -632,7 +632,7 @@ Compilation and execution have separate job budgets.
 ```powershell
 pwsh -File .\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\odbc-e2e
 # Download/copy the drop's build\ directory into the consumer's tests\e2e\.
-.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile nightly -CompareWithMsodbcsql
+.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile weekly -CompareWithMsodbcsql
 ```
 
 `-BuildOnly` requires PowerShell 7 or later (`pwsh`) and rejects Windows

@@ -248,8 +248,7 @@ endfunction()
 # Helper function: a multithreaded-only test (tests/multithreaded_tests/) that
 # reads the MSSQL_ODBC_MT_* settings itself rather than through ODBC_TEST_F.
 # It has no single-threaded form, so it registers only <name>_mt, labelled "mt"
-# and "mt_weekly": only the weekly profile runs it (PR and nightly exclude
-# mt_weekly). It is built only with ODBC_E2E_CONCURRENT.
+# and "mt_weekly": only the weekly profile runs it (PR excludes mt_weekly). It is built only with ODBC_E2E_CONCURRENT.
 # Usage:  add_odbc_mt_only_test(name sources...)
 # ---------------------------------------------------------------------------
 function(add_odbc_mt_only_test TEST_NAME)

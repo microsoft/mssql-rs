@@ -559,7 +559,7 @@ on; these guarantees were verified against msodbcsql's behavior.
   `-DODBC_E2E_CONCURRENT=ON`) when CMake configures.
   - Before review, run the `<name>_mt` entry of a test you add or convert in
     every mode (`MSSQL_ODBC_MT_SKIP_MODES=none`, plus `ODBC_E2E_CONCURRENT=ON`
-    on Unix, or `--mt-profile=nightly` / `-MtProfile nightly`):
+    on Unix, or `--mt-profile=weekly` / `-MtProfile weekly`):
     PR validation does not cover a test that keeps out of `/SharedDbc`, nor
     any concurrent variant on unixODBC.
   - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests

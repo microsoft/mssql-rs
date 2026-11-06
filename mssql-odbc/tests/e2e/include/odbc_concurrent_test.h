@@ -50,7 +50,7 @@
 // exception from a fixture phase on any thread fails the test as gtest would
 // on its own thread (see RunPhase).
 //
-// Env (defaults are the PR smoke size; nightly sets the stress size):
+// Env (defaults are the PR smoke size; the weekly profile sets the stress size):
 //   MSSQL_ODBC_MT_THREADS          Threads running at once: SharedEnv and
 //                                  SharedDbc workers, or the SharedStmt owner
 //                                  plus observers, so 1 runs the owner alone
