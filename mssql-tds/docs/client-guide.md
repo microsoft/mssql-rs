@@ -38,8 +38,8 @@ includes both sending the batch and reading its response.
 Use `begin_transaction_with_options`, `commit_transaction_with_options`, and
 `rollback_transaction_with_options` to bound transaction requests with the same
 options. The timeout covers both sending the request and consuming its response.
-Their original counterparts remain unbounded. Commit and rollback never reconnect
-onto a different session.
+Options do not leak into later requests. Their original counterparts remain
+unbounded. Commit and rollback never reconnect onto a different session.
 
 ## Response lifecycle
 
