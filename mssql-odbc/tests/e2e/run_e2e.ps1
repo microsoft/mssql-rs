@@ -845,9 +845,13 @@ try {
         Push-Location $OdbcCrateDir
         try {
             if ($Release) {
-                Invoke-Checked "cargo build --release" { cargo build --release }
+                Invoke-Checked "cargo build --release --features e2e-test-client-code-page" {
+                    cargo build --release --features e2e-test-client-code-page
+                }
             } else {
-                Invoke-Checked "cargo build" { cargo build }
+                Invoke-Checked "cargo build --features e2e-test-client-code-page" {
+                    cargo build --features e2e-test-client-code-page
+                }
             }
         } finally {
             Pop-Location

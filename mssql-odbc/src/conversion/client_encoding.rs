@@ -207,9 +207,30 @@ impl ClientEncoding {
 
     /// Match `InitDbcCodePages` / `SystemLocale::AnsiCP`, not a server code page.
     pub(crate) fn system_default() -> Self {
+        #[cfg(feature = "e2e-test-client-code-page")]
+        if let Some(encoding) = Self::e2e_test_override() {
+            return encoding;
+        }
+
         // Native SystemLocale::Singleton captures the locale on its first use.
         static DEFAULT: std::sync::OnceLock<ClientEncoding> = std::sync::OnceLock::new();
         *DEFAULT.get_or_init(platform::system_default)
+    }
+
+    #[cfg(feature = "e2e-test-client-code-page")]
+    fn e2e_test_override() -> Option<Self> {
+        const ENV: &str = "MSSQL_ODBC_TEST_CLIENT_CODE_PAGE";
+        let value = std::env::var_os(ENV)?;
+        let value = value
+            .to_str()
+            .unwrap_or_else(|| panic!("{ENV} must contain a numeric code page"));
+        let code_page = value
+            .parse::<u32>()
+            .unwrap_or_else(|_| panic!("{ENV} must contain a numeric code page"));
+        Some(
+            Self::for_code_page(code_page)
+                .unwrap_or_else(|| panic!("{ENV} contains unsupported code page {code_page}")),
+        )
     }
 
     pub(crate) fn is_utf8(self) -> bool {
@@ -295,7 +316,7 @@ impl ClientEncoding {
         platform::prefix_len(self, bytes, capacity)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
     pub(crate) fn for_code_page(code_page: u32) -> Option<Self> {
         platform::for_code_page(code_page)
     }
@@ -693,7 +714,7 @@ mod platform {
         Ok(consumed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
     pub(super) fn for_code_page(code_page: u32) -> Option<ClientEncoding> {
         let encoding = ClientEncoding(code_page);
         charset(encoding, false).ok()?;
@@ -1083,7 +1104,7 @@ mod platform {
         Ok(end)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
     pub(super) fn for_code_page(code_page: u32) -> Option<ClientEncoding> {
         if code_page == 65001 {
             return Some(ClientEncoding::UTF8);

@@ -181,6 +181,18 @@ msodbcsql build is measured.
    splits per-leg on `ODBC_TEST_TARGET` rather than skipping, so the shared part
    — both truncate, report `01004`, and deliver a prefix — stays measured.
 
+   `SQLGetData` chunks of that column follow the same rule. A chunk stops before
+   a character that does not fit, the next call starts with that character, and
+   a buffer with no room for it returns `HY090`. A truncated sequence at the end
+   of the value cannot complete, so it is delivered as-is. msodbcsql's chunked
+   output on this path is not separately measured. Its verbatim copy is the one
+   measured above, so it is expected to end chunks at byte capacity. At client
+   code page 65001, `NarrowChunksEndAtClientCharacterBoundaries` asserts
+   whole-character chunks only on this driver; on msodbcsql it asserts the
+   shared part, where each chunk fits, the chunks rebuild the value, and
+   truncation reports `01004`.
+   Approved by David Engel on 2026-11-06. Tracked in AB#49106.
+
    AB#47564 extends this driver's whole-character policy to native client
    encodings for bound `SQL_C_CHAR` output from `nvarchar(max)` and JSON.
    `ABoundNvarcharMaxTruncatesOnACharacterBoundary` and

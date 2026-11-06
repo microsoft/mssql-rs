@@ -321,3 +321,65 @@ std::string ODBCTestUtils::Utf8ToNativeClient(const std::string& utf8,
     return ConvertNativeTestText(validated, encoding, true, usedDefault);
 #endif
 }
+
+std::string ODBCTestUtils::Utf8ToCodePage(const std::string& utf8, unsigned codePage,
+                                          bool* usedDefault) {
+    if (usedDefault != nullptr) {
+        *usedDefault = false;
+    }
+#ifdef _WIN32
+    if (utf8.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+        throw std::length_error("UTF-8 test value exceeds Windows conversion limit");
+    }
+    const int inputSize = static_cast<int>(utf8.size());
+    const int wideSize = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), inputSize, nullptr, 0);
+    if (wideSize == 0 && !utf8.empty()) {
+        throw std::runtime_error("MultiByteToWideChar sizing failed: " +
+                                 std::to_string(GetLastError()));
+    }
+    std::wstring wide(wideSize, L'\0');
+    if (wideSize != 0 &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), inputSize,
+                            wide.data(), wideSize) != wideSize) {
+        throw std::runtime_error("MultiByteToWideChar conversion failed: " +
+                                 std::to_string(GetLastError()));
+    }
+    if (codePage == CP_UTF8) {
+        return utf8;
+    }
+    BOOL substituted = FALSE;
+    const int byteSize = WideCharToMultiByte(
+        codePage, 0, wide.data(), wideSize, nullptr, 0, nullptr, &substituted);
+    if (byteSize == 0 && wideSize != 0) {
+        throw std::runtime_error("WideCharToMultiByte sizing failed: " +
+                                 std::to_string(GetLastError()));
+    }
+    std::string result(byteSize, '\0');
+    if (byteSize != 0 &&
+        WideCharToMultiByte(codePage, 0, wide.data(), wideSize, result.data(),
+                            byteSize, nullptr, &substituted) != byteSize) {
+        throw std::runtime_error("WideCharToMultiByte conversion failed: " +
+                                 std::to_string(GetLastError()));
+    }
+    if (usedDefault != nullptr) {
+        *usedDefault = substituted != FALSE;
+    }
+    return result;
+#else
+    const auto validated = ConvertNativeTestText(utf8, "UTF-8", false, nullptr);
+    if (codePage == 65001) {
+        return validated;
+    }
+
+    if (codePage != 1252 && codePage != 1251 && codePage != 932) {
+        throw std::invalid_argument("unsupported test code page " +
+                                    std::to_string(codePage));
+    }
+    std::string encoding = "CP" + std::to_string(codePage);
+#if defined(__GLIBC__) || defined(__APPLE__)
+    encoding += "//TRANSLIT";
+#endif
+    return ConvertNativeTestText(validated, encoding, true, usedDefault);
+#endif
+}
