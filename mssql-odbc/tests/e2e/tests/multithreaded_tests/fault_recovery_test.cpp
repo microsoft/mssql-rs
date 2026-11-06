@@ -279,10 +279,36 @@ TEST_F(FaultRecoveryTest, KilledConnectionDoesNotDisturbOthers) {
     });
 }
 
+constexpr size_t kStallChunk = 4096;
+
+// Reads the next SQL_C_CHAR chunk of a REPLICATE('p') value into |chunk|,
+// which is first filled with 'x' so bytes the driver did not write cannot pass
+// as payload. Returns how many 'p' bytes the chunk holds (a truncated chunk
+// fills the buffer less its terminator; the last holds its indicator's
+// length), or -1 if the chunk is short, unterminated, or holds anything else.
+long long ReadPayloadChunk(SQLHSTMT stmt, char (&chunk)[kStallChunk], SQLRETURN& rc) {
+    std::fill(std::begin(chunk), std::end(chunk), 'x');
+    SQLLEN indicator = 0;
+    rc = SQLGetData(stmt, 1, SQL_C_CHAR, chunk, sizeof(chunk), &indicator);
+    size_t bytes;
+    if (rc == SQL_SUCCESS_WITH_INFO) {
+        bytes = sizeof(chunk) - 1;
+    } else if (rc == SQL_SUCCESS && indicator >= 0 &&
+               static_cast<size_t>(indicator) < sizeof(chunk)) {
+        bytes = static_cast<size_t>(indicator);
+    } else {
+        return -1;
+    }
+    if (chunk[bytes] != '\0' || !std::all_of(chunk, chunk + bytes, [](char c) { return c == 'p'; })) {
+        return -1;
+    }
+    return static_cast<long long>(bytes);
+}
+
 struct StalledRead {
     SQLRETURN rc = SQL_ERROR;
-    long long truncated_chunks = 0;
-    SQLLEN last_length = 0;
+    long long received = 0;
+    bool corrupt = false;
 };
 
 // A victim on the shared ENV reads an 8 MB value through a proxy that stops
@@ -305,8 +331,7 @@ bool FaultRecoveryTest::StallVictimMidResult(std::string& error) {
         return false;
     }
     const SQLHSTMT stmt = victim.stmt();
-    char buffer[4096];
-    SQLLEN length = 0;
+    char buffer[kStallChunk];
     SQLRETURN rc = lifecycle::ExecDirect(
         stmt, "SELECT REPLICATE(CAST('p' AS varchar(max)), " + std::to_string(kValueBytes) + ")");
     if (!SQL_SUCCEEDED(rc)) {
@@ -317,19 +342,24 @@ bool FaultRecoveryTest::StallVictimMidResult(std::string& error) {
         error = Describe("SQLFetch", rc, SQL_HANDLE_STMT, stmt);
         return false;
     }
-    if ((rc = SQLGetData(stmt, 1, SQL_C_CHAR, buffer, sizeof(buffer), &length)) !=
-        SQL_SUCCESS_WITH_INFO) {
-        error = Describe("first SQLGetData", rc, SQL_HANDLE_STMT, stmt);
+    const long long first = ReadPayloadChunk(stmt, buffer, rc);
+    if (rc != SQL_SUCCESS_WITH_INFO || first < 0) {
+        error = "first SQLGetData: unexpected chunk; " +
+                Describe("SQLGetData", rc, SQL_HANDLE_STMT, stmt);
         return false;
     }
 
     proxy->PauseResponses();
     auto reading = std::async(std::launch::async, [stmt] {
         StalledRead read;
-        char chunk[4096];
+        char chunk[kStallChunk];
         do {
-            read.rc = SQLGetData(stmt, 1, SQL_C_CHAR, chunk, sizeof(chunk), &read.last_length);
-            read.truncated_chunks += read.rc == SQL_SUCCESS_WITH_INFO ? 1 : 0;
+            const long long bytes = ReadPayloadChunk(stmt, chunk, read.rc);
+            if (bytes < 0) {
+                read.corrupt = SQL_SUCCEEDED(read.rc);
+                break;
+            }
+            read.received += bytes;
         } while (read.rc == SQL_SUCCESS_WITH_INFO);
         return read;
     });
@@ -338,12 +368,12 @@ bool FaultRecoveryTest::StallVictimMidResult(std::string& error) {
     proxy->Resume();
     const StalledRead read = reading.get();
 
-    // Each truncated SQL_C_CHAR chunk holds sizeof(buffer) - 1 bytes.
-    const long long received =
-        (1 + read.truncated_chunks) * static_cast<long long>(sizeof(buffer) - 1) +
-        (read.rc == SQL_SUCCESS ? read.last_length : 0);
+    const long long received = first + read.received;
     if (!blocked) {
         error = "the victim's read was not blocked by the stalled response";
+    } else if (read.corrupt) {
+        error = "a chunk after the stall was short, unterminated, or not the payload, after " +
+                std::to_string(received) + " bytes";
     } else if (read.rc != SQL_SUCCESS) {
         error = Describe("SQLGetData after the stall", read.rc, SQL_HANDLE_STMT, stmt);
     } else if (received != kValueBytes) {

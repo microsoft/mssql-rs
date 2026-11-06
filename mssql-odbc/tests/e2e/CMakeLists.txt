@@ -249,7 +249,8 @@ endfunction()
 # reads the MSSQL_ODBC_MT_* settings itself rather than through ODBC_TEST_F.
 # It has no single-threaded form, so it registers only <name>_mt, labelled "mt"
 # and "mt_weekly": only the weekly profile runs it (PR excludes mt_weekly).
-# It is built only with ODBC_E2E_CONCURRENT.
+# It is built only with ODBC_E2E_CONCURRENT. The explicit --gtest_filter keeps an
+# inherited GTEST_FILTER from selecting none of its tests, which would pass.
 # Usage:  add_odbc_mt_only_test(name sources...)
 # ---------------------------------------------------------------------------
 function(add_odbc_mt_only_test TEST_NAME)
@@ -260,9 +261,10 @@ function(add_odbc_mt_only_test TEST_NAME)
     target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib)
     if(UNIX)
         add_test(NAME ${TEST_NAME}_mt
-                 COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/run_mt_test.sh" $<TARGET_FILE:${TEST_NAME}>)
+                 COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/run_mt_test.sh" $<TARGET_FILE:${TEST_NAME}>
+                         "--gtest_filter=*")
     else()
-        add_test(NAME ${TEST_NAME}_mt COMMAND ${TEST_NAME})
+        add_test(NAME ${TEST_NAME}_mt COMMAND ${TEST_NAME} "--gtest_filter=*")
     endif()
     set_tests_properties(${TEST_NAME}_mt PROPERTIES SKIP_RETURN_CODE 77 LABELS "mt;mt_weekly")
 endfunction()

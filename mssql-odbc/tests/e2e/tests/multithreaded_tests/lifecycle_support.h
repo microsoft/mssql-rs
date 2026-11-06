@@ -117,11 +117,12 @@ inline std::string Lower(std::string text) {
 }
 
 inline std::string Trim(const std::string& text) {
-    const auto first = text.find_first_not_of(" \t");
+    static const char* const kSpace = " \t\n\v\f\r";
+    const auto first = text.find_first_not_of(kSpace);
     if (first == std::string::npos) {
         return "";
     }
-    return text.substr(first, text.find_last_not_of(" \t") - first + 1);
+    return text.substr(first, text.find_last_not_of(kSpace) - first + 1);
 }
 
 // Keywords that name the same attribute, so an override replaces all of them.
