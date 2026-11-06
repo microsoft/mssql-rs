@@ -3061,7 +3061,7 @@ ODBC_TEST_F_MODES(ParamArrayTest, RunUniqueParameterSetsAnswerInOrder,
 //
 // Benefits-from-mock-tds: would assert the sp_prepexec @params order and that
 // the array reused the handle instead of re-preparing; pinned meanwhile by
-// streamed_prepexec_declares_the_plan_a_parameter_array_reuses_in_order.
+// streamed_prepexec_plan_binds_later_scalar_and_array_values_in_order.
 // -------------------------------------------------------------------
 ODBC_TEST_F(ParamArrayTest, ArrayAfterDataAtExecutionKeepsParameterOrder) {
     ExecDirect("CREATE TABLE #pa_dae_order (s varchar(50), n int)");
