@@ -82,7 +82,7 @@ leg reads the same tables:
 
 - `dbo.mssql_odbc_bench_fixed_2m_c15`
 - `dbo.mssql_odbc_bench_fixed_40k_c600`
-- `dbo.mssql_odbc_bench_fixed_1m_c15`
+- `dbo.mssql_odbc_bench_fixed_100k_c15`
 - `dbo.mssql_odbc_bench_fixed_200k_c15`
 - `dbo.mssql_odbc_bench_varwidth_100k_c7`
 - `dbo.mssql_odbc_bench_lobmax_10k_c3`
@@ -136,17 +136,20 @@ an unconfigured `fetchmany()` binds a one-row rowset; applications that raise it
 land in the tens; and `fetchall()` caps its computed batch at **1000**
 (`FetchAll_wrap` in `ddbc_bindings.cpp`).
 
-- `fetch/rowset_1m_c15_fixed/bound_rowset_1`
-- `fetch/rowset_1m_c15_fixed/bound_rowset_64`
-- `fetch/rowset_1m_c15_fixed/bound_rowset_1000`
+- `fetch/rowset_100k_c15_fixed/bound_rowset_1`
+- `fetch/rowset_100k_c15_fixed/bound_rowset_64`
+- `fetch/rowset_100k_c15_fixed/bound_rowset_1000`
 
-The same 1,000,000 rows in all three, so only the cadence differs.
+The same 100,000 rows in all three, so only the cadence differs. Increasing the
+shared table to 1,000,000 rows did not materially improve confirmation
+variability and added about four minutes to each run, so the smaller table is
+retained.
 
 `fetchmany()` does not bind once and drain: every call re-describes the columns,
 rebinds them, sets the row-array size, fetches one rowset, resets the size to 1,
 and unbinds. Two workloads model that complete lifecycle:
 
-- `fetch/rowset_1m_c15_fixed/bind_cycle_rowset_64` — same table and cadence as
+- `fetch/rowset_100k_c15_fixed/bind_cycle_rowset_64` — same table and cadence as
   `bound_rowset_64`, so the pair isolates the per-call bind/unbind cost.
 - `fetch/rowset_200k_c15_fixed/bind_cycle_rowset_1` — the default `arraysize`, one
   full lifecycle per row. A smaller table because this shape issues dozens of

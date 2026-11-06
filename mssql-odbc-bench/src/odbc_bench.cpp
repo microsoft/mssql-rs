@@ -770,16 +770,17 @@ std::uint64_t TableSpec::logical_bytes_total() const {
 
 // The catalog the admin executable creates and every measurement reads.
 //
-// Row counts are chosen per access shape so one full retrieval takes roughly a
-// second on mssql-odbc: same-commit runs showed 100-300 ms samples drifting
-// 5-13% between runs, wider than the 5% gate. A rowset-1 workload issues one
-// driver round trip per row, so it cannot use the same row count as a
-// rowset-1000 one and still finish in comparable time.
+// Most row counts are chosen per access shape so one full retrieval takes
+// roughly a second on mssql-odbc. The shared rowset-cadence table stays at
+// 100,000 rows: increasing it to 1,000,000 did not materially improve
+// confirmation stability and added about four minutes per run. A rowset-1
+// workload issues one driver round trip per row, so it cannot use the same row
+// count as a rowset-1000 one and still finish in comparable time.
 const std::array<TableSpec, kTableCount>& tables() {
     static const std::array<TableSpec, kTableCount> catalog = {{
         {"mssql_odbc_bench_fixed_2m_c15", TableShape::fixed_pattern, 2'000'000, 1},
         {"mssql_odbc_bench_fixed_40k_c600", TableShape::fixed_pattern, 40'000, 40},
-        {"mssql_odbc_bench_fixed_1m_c15", TableShape::fixed_pattern, 1'000'000, 1},
+        {"mssql_odbc_bench_fixed_100k_c15", TableShape::fixed_pattern, 100'000, 1},
         {"mssql_odbc_bench_fixed_200k_c15", TableShape::fixed_pattern, 200'000, 1},
         {"mssql_odbc_bench_varwidth_100k_c7", TableShape::variable_width, 100'000, 0},
         {"mssql_odbc_bench_lobmax_10k_c3", TableShape::lob_max, 10'000, 0},
@@ -814,19 +815,19 @@ const std::array<WorkloadSpec, kWorkloadCount>& workloads() {
          &table_by_name("mssql_odbc_bench_fixed_40k_c600"), AccessMode::bound_drain,
          kFetchAllRowset},
         // The three rowset sizes over identical data, so only the cadence differs.
-        {"fetch/rowset_1m_c15_fixed/bound_rowset_1", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_drain,
+        {"fetch/rowset_100k_c15_fixed/bound_rowset_1", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_drain,
          kFetchManyDefaultRowset},
-        {"fetch/rowset_1m_c15_fixed/bound_rowset_64", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_drain,
+        {"fetch/rowset_100k_c15_fixed/bound_rowset_64", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_drain,
          kFetchManyCadenceRowset},
-        {"fetch/rowset_1m_c15_fixed/bound_rowset_1000", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_drain,
+        {"fetch/rowset_100k_c15_fixed/bound_rowset_1000", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_drain,
          kFetchAllRowset},
         // Same data and cadence as bound_rowset_64, plus the per-call describe,
         // rebind, and unbind that fetchmany() repeats. The pair isolates that cost.
-        {"fetch/rowset_1m_c15_fixed/bind_cycle_rowset_64", "rowset",
-         &table_by_name("mssql_odbc_bench_fixed_1m_c15"), AccessMode::bound_bind_cycle,
+        {"fetch/rowset_100k_c15_fixed/bind_cycle_rowset_64", "rowset",
+         &table_by_name("mssql_odbc_bench_fixed_100k_c15"), AccessMode::bound_bind_cycle,
          kFetchManyCadenceRowset},
         // The default arraysize: one bind/fetch/unbind lifecycle per row.
         {"fetch/rowset_200k_c15_fixed/bind_cycle_rowset_1", "rowset",
