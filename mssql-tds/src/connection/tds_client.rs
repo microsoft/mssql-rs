@@ -25014,27 +25014,39 @@ mod tests {
             assert!(client.output_names_by_ordinal.is_empty());
         }
 
+        /// `sp_prepexec` puts three parameters before the values and `sp_execute`
+        /// one, so a re-execute reports the same output at a lower ordinal.
         #[tokio::test]
-        async fn prepexec_output_is_reported_past_its_three_leading_parameters() {
-            let (mut client, _sent) =
-                create_capturing_client(vec![handle_token(55), output_token(4, 8), done_no_more()]);
+        async fn prepared_output_is_reported_under_its_name_on_prepexec_and_execute() {
+            let (mut client, _sent) = create_capturing_client(vec![
+                handle_token(55),
+                output_token(4, 8),
+                done_no_more(),
+                output_token(2, 9),
+                done_no_more(),
+            ]);
             let mut statement = PreparedStatement::new("SET @P2 = @P1 + 1");
-            client
-                .execute_prepared(
-                    &mut statement,
-                    vec![
-                        int_param("@P1", Some(7), StatusFlags::NONE),
-                        int_param("@P2", None, StatusFlags::BY_REF_VALUE),
-                    ],
-                    &mut None,
-                    (),
-                )
-                .await
-                .unwrap();
-            client.close_query().await.unwrap();
-            let values = client.get_return_values();
-            assert_eq!(values.len(), 1);
-            assert_eq!(values[0].param_name, "@P2");
+            let mut orphan = None;
+            for (proc_id, value) in [(13u8, 8), (12, 9)] {
+                client
+                    .execute_prepared(
+                        &mut statement,
+                        vec![
+                            int_param("@P1", Some(value - 1), StatusFlags::NONE),
+                            int_param("@P2", None, StatusFlags::BY_REF_VALUE),
+                        ],
+                        &mut orphan,
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                client.close_query().await.unwrap();
+                let values = client.get_return_values();
+                assert_eq!(values.len(), 1, "proc {proc_id}");
+                assert_eq!(values[0].param_name, "@P2", "proc {proc_id}");
+                assert_eq!(values[0].column_metadata.column_name, "@P2");
+                assert_eq!(values[0].value, ColumnValues::Int(value));
+            }
         }
 
         /// Streamed values extend the ordinal map past the materialized ones.
