@@ -1065,7 +1065,7 @@ impl TdsClient {
         self.current_metadata = None;
         self.current_data_classification = None;
         self.count_map.clear();
-        self.return_values.clear();
+        self.clear_return_values();
         self.info_messages.clear();
         self.info_messages.extend(info_messages);
         // Prepared-statement handles belong to the dead session and do not
@@ -5576,8 +5576,7 @@ impl TdsClient {
         self.count_map.clear();
         self.last_rows_affected = -1;
         self.dml_result_counts.clear();
-        self.return_values.clear();
-        self.output_names_by_ordinal.clear();
+        self.clear_return_values();
         self.output_param_ceks.clear();
         self.last_return_status = ReturnStatus::NotReceived;
         self.abort_pending_prepare_capture();
@@ -6599,7 +6598,9 @@ impl TdsClient {
                 .iter()
                 .find(|(ordinal, _)| *ordinal == token.param_ordinal)
         {
+            // The parser copies the wire name into both fields.
             token.param_name.clone_from(name);
+            token.column_metadata.column_name.clone_from(name);
         }
         // Only decrypt when the encrypted value carries crypto metadata and
         // result decryption is enabled for this command. Otherwise pass the value
@@ -9110,6 +9111,14 @@ impl TdsClient {
         }
     }
 
+    /// Drops the previous request's output values together with the output
+    /// names it sent unnamed, so a later RPC's RETURNVALUEs (for example a
+    /// cursor RPC's) are never renamed with them.
+    pub(in crate::connection) fn clear_return_values(&mut self) {
+        self.return_values.clear();
+        self.output_names_by_ordinal.clear();
+    }
+
     /// Resets the informational-message buffer at the start of a new command so
     /// [`info_messages()`](Self::info_messages) reflects only that command.
     ///
@@ -9129,8 +9138,7 @@ impl TdsClient {
         // Clear output parameters / return values from the previous command so a
         // fully-navigated prior RPC does not leave `get_return_values()` /
         // `retrieve_output_params()` reporting stale values for this new command.
-        self.return_values.clear();
-        self.output_names_by_ordinal.clear();
+        self.clear_return_values();
         // Every execution RPC path (plain batch, sp_executesql, sp_execute,
         // sp_prepexec, stored proc) funnels through here, so reset the
         // affected-row count for the new command. A prior DML count must not
@@ -9309,8 +9317,7 @@ impl TdsClient {
         // (see push_return_value) and survives this clear.
         self.current_metadata = None;
         self.current_result_ended_with_done_in_proc = false;
-        self.return_values.clear();
-        self.output_names_by_ordinal.clear();
+        self.clear_return_values();
         self.abort_pending_prepare_capture();
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
@@ -24999,6 +25006,7 @@ mod tests {
             let values = client.get_return_values();
             assert_eq!(values.len(), 1);
             assert_eq!(values[0].param_name, "@P2");
+            assert_eq!(values[0].column_metadata.column_name, "@P2");
             assert_eq!(values[0].param_ordinal, 3);
             assert_eq!(values[0].value, ColumnValues::Int(8));
 
@@ -25076,6 +25084,7 @@ mod tests {
             let value = client.finalize_return_value(token).unwrap();
 
             assert_eq!(value.param_name, "@P2");
+            assert_eq!(value.column_metadata.column_name, "@P2");
             assert_eq!(value.value, ColumnValues::Int(987_654));
         }
 
@@ -25096,6 +25105,35 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, UsageError(_)), "{error}");
             assert!(sent.lock().unwrap().is_empty());
+        }
+
+        /// Cursor RPCs skip `begin_command`, so the reset that drops their
+        /// predecessor's output values must also drop its output names.
+        #[tokio::test]
+        async fn cursor_rpc_after_an_unnamed_output_keeps_its_own_names() {
+            use crate::connection::cursor_ops::CursorClient;
+
+            let (mut client, _sent) =
+                create_capturing_client(vec![done_no_more(), output_token(3, 9), done_no_more()]);
+            client
+                .execute_sp_executesql(
+                    "SET @P2 = @P1".to_string(),
+                    vec![
+                        int_param("@P1", Some(7), StatusFlags::NONE),
+                        int_param("@P2", None, StatusFlags::BY_REF_VALUE),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.output_names_by_ordinal, [(3, "@P2".to_string())]);
+
+            client.cursor_close(1, None, None).await.unwrap();
+
+            let values = client.get_return_values();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].param_name, "");
+            assert_eq!(values[0].column_metadata.column_name, "");
         }
 
         #[tokio::test]
