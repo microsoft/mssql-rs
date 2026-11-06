@@ -309,10 +309,6 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // `query_timeout` (already deducted above) bounds the whole call,
             // including any reconnect charged above; `0` means unlimited, matching
             // the ODBC default.
-            //
-            // Values go unnamed, bound by ordinal, as msodbcsql sends them
-            // (`AddRPCUserParameters`); the server matches named values
-            // against `@params` in quadratic time.
             let exec_result = dbc.runtime.block_on(
                 client.execute_prepared(
                     &mut prepared.stmt,
@@ -320,8 +316,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     &mut orphaned,
                     ExecuteOptions::new()
                         .timeout_secs(query_timeout)
-                        .cancel(&cancel_handle)
-                        .positional_parameter_values(true),
+                        .cancel(&cancel_handle),
                 ),
             );
 
