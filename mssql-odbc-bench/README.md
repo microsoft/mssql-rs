@@ -111,9 +111,10 @@ Every id encodes the data shape, the row and column counts, and the access shape
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
 
-Row counts are sized so one sample takes roughly a second on mssql-odbc.
-Same-commit runs with 100-300 ms samples drifted 5-13% between runs, wider than
-the 5% regression gate.
+The `fixed_40k_c600`, `fixed_200k_c15`, `lobmax_10k_c3`, and `mixedlob_200k_c16`
+tables are sized so one sample takes roughly a second on mssql-odbc. Same-commit
+runs with 100-300 ms samples drifted 5-13% between runs, wider than the 5%
+regression gate.
 
 ### `narrow` and `wide` — bound fetch at the fetchall cadence
 
@@ -152,8 +153,8 @@ and unbinds. Two workloads model that complete lifecycle:
 - `fetch/rowset_100k_c15_fixed/bind_cycle_rowset_64` — same table and cadence as
   `bound_rowset_64`, so the pair isolates the per-call bind/unbind cost.
 - `fetch/rowset_200k_c15_fixed/bind_cycle_rowset_1` — the default `arraysize`, one
-  full lifecycle per row. A smaller table because this shape issues dozens of
-  ODBC calls per row.
+  full lifecycle per row. It reads a separate 200,000-row table, sized for this
+  shape's dozens of ODBC calls per row.
 
 ### `varwidth` — nullable inline variable width
 
