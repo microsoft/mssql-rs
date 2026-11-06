@@ -541,6 +541,9 @@ fn sql_exec_direct_w_operation(
             )
             .map(|_| ())
     } else if marker_count > 0 {
+        // Unnamed values, bound by ordinal, as msodbcsql sends them
+        // (`AddRPCUserParameters`); the server matches named values against
+        // `@params` in quadratic time.
         dbc.runtime
             .block_on(
                 client.execute_sp_executesql(
@@ -548,7 +551,8 @@ fn sql_exec_direct_w_operation(
                     params,
                     ExecuteOptions::new()
                         .timeout_secs(query_timeout)
-                        .cancel(&cancel_handle),
+                        .cancel(&cancel_handle)
+                        .positional_parameter_values(true),
                 ),
             )
             .map(|_| ())
@@ -1547,5 +1551,176 @@ mod tests {
             "must not fast-path this new query's SQLMoreResults to SQL_NO_DATA"
         );
         assert!(ss.pending_fetch_error.is_none());
+    }
+
+    mod positional_parameter_values {
+        use super::*;
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::odbc_types::{
+            SQL_C_BINARY, SQL_C_SLONG, SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NEED_DATA, SQL_NO_DATA,
+            SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_SUCCESS, SQL_VARBINARY, SqlLen, SqlSmallInt,
+        };
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{
+            ScriptedToken, done_no_more, int_columns, return_value,
+            tds_client_from_tokens_capturing,
+        };
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+        use std::sync::{Arc, Mutex};
+
+        const NAMED_P1_INT_7: [u8; 15] = [
+            0x03, b'@', 0, b'P', 0, b'1', 0, 0x00, 0x26, 0x04, 0x04, 7, 0, 0, 0,
+        ];
+        /// Zero-length name, status NONE, INTN(4).
+        const UNNAMED_INT_7: [u8; 9] = [0x00, 0x00, 0x26, 0x04, 0x04, 7, 0, 0, 0];
+        const UNNAMED_INT_8: [u8; 9] = [0x00, 0x00, 0x26, 0x04, 0x04, 8, 0, 0, 0];
+        /// Length byte of a B_VARCHAR `@P` name, then `@P` in UTF-16LE.
+        const NAMED_P: [u8; 5] = [0x03, b'@', 0, b'P', 0];
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        fn bind_int(
+            stmt: SqlHandle,
+            ordinal: u16,
+            io_type: SqlSmallInt,
+            value: &mut i32,
+            length: &mut SqlLen,
+        ) {
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        stmt,
+                        ordinal,
+                        io_type,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        std::ptr::from_mut(value).cast(),
+                        4,
+                        length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+
+        fn connect(h: &TestHandles, tokens: Vec<ScriptedToken>) -> Arc<Mutex<Vec<u8>>> {
+            h.mark_dbc_connected();
+            let (client, sent) = tds_client_from_tokens_capturing(tokens);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().wire.put_client_for_test(client);
+            sent
+        }
+
+        /// msodbcsql sends `sp_executesql` user values unnamed
+        /// (`AddRPCUserParameters`); the declaration keeps `@P1..@Pn`.
+        #[test]
+        fn exec_direct_sends_parameter_values_unnamed() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let sent = connect(&h, vec![done_no_more()]);
+            let (mut first, mut second) = (7, 8);
+            let (mut first_length, mut second_length) = (4, 4);
+            bind_int(h.stmt, 1, SQL_PARAM_INPUT, &mut first, &mut first_length);
+            bind_int(h.stmt, 2, SQL_PARAM_INPUT, &mut second, &mut second_length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT ?, ?".to_string());
+
+            assert_eq!(ret, SQL_SUCCESS);
+            let bytes = sent.lock().unwrap();
+            assert!(contains(&bytes, &[0xFF, 0xFF, 10, 0]), "sp_executesql");
+            assert!(contains(&bytes, &UNNAMED_INT_7));
+            assert!(contains(&bytes, &UNNAMED_INT_8));
+            assert!(!contains(&bytes, &NAMED_P));
+        }
+
+        /// SQL Server returns an unnamed output with an empty name and its RPC
+        /// ordinal (`@stmt` and `@params` are 0 and 1). It must still reach the
+        /// application's buffer.
+        #[test]
+        fn exec_direct_binds_an_unnamed_output_value() {
+            let h = TestHandles::with_env_dbc_stmt();
+            connect(
+                &h,
+                vec![
+                    return_value(ReturnValue {
+                        param_ordinal: 2,
+                        param_name: String::new(),
+                        value: ColumnValues::Int(73),
+                        column_metadata: Box::new(int_columns(1).remove(0)),
+                        status: ReturnValueStatus::OutputParam,
+                    }),
+                    done_no_more(),
+                ],
+            );
+            let (mut output, mut input) = (-1, 7);
+            let (mut output_length, mut input_length) = (-1, 4);
+            bind_int(h.stmt, 1, SQL_PARAM_OUTPUT, &mut output, &mut output_length);
+            bind_int(h.stmt, 2, SQL_PARAM_INPUT, &mut input, &mut input_length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SET ? = ? + 66".to_string());
+
+            assert_eq!(ret, SQL_SUCCESS);
+            while unsafe { crate::api::more_results::sql_more_results(h.stmt) } != SQL_NO_DATA {}
+            assert_eq!(output, 73);
+            assert_eq!(output_length, 4);
+        }
+
+        /// Materialized values precede streamed ones on the wire, so a
+        /// data-at-execution call keeps every value named.
+        #[test]
+        fn exec_direct_with_data_at_execution_keeps_values_named() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let sent = connect(&h, vec![done_no_more()]);
+            let mut first = 7;
+            let mut first_length = 4;
+            bind_int(h.stmt, 1, SQL_PARAM_INPUT, &mut first, &mut first_length);
+            let mut token = 2_i32;
+            let mut streamed_length = SQL_DATA_AT_EXEC;
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        2,
+                        SQL_PARAM_INPUT,
+                        SQL_C_BINARY,
+                        SQL_VARBINARY,
+                        0,
+                        0,
+                        std::ptr::from_mut(&mut token).cast(),
+                        0,
+                        &mut streamed_length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT ?, ?".to_string());
+            assert_eq!(ret, SQL_NEED_DATA);
+            let mut value_ptr = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { crate::api::param_data::sql_param_data(h.stmt, &mut value_ptr) },
+                SQL_NEED_DATA
+            );
+            let mut chunk = [1u8, 2];
+            assert_eq!(
+                unsafe { crate::api::put_data::sql_put_data(h.stmt, chunk.as_mut_ptr().cast(), 2) },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::param_data::sql_param_data(h.stmt, &mut value_ptr) },
+                SQL_SUCCESS
+            );
+
+            let bytes = sent.lock().unwrap();
+            assert!(contains(&bytes, &NAMED_P1_INT_7));
+        }
     }
 }

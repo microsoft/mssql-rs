@@ -914,6 +914,12 @@ impl RpcParameter {
         self.options.contains(StatusFlags::BY_REF_VALUE)
     }
 
+    /// An encrypted output parameter's returned ciphertext is decrypted with a
+    /// CEK looked up by parameter name, so it must be sent named.
+    pub(crate) fn is_encrypted_output(&self) -> bool {
+        self.encrypted.is_some() && self.is_output()
+    }
+
     /// Serializes the parameter's value in its encrypted form: the ENCRYPTED
     /// status flag, a BIGVARBINARY TYPE_INFO carrying the ciphertext, the
     /// plaintext base TYPE_INFO, and the trailing CryptoMetaData block.

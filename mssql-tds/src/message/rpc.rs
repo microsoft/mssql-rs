@@ -68,7 +68,38 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            named_parameters_positional: false,
         }
+    }
+
+    /// Sends the `named_parameters` values with zero-length names, after the
+    /// positional ones, so the server binds them by ordinal. Their names stay
+    /// on the [`RpcParameter`]s for the `@params` declaration and Always
+    /// Encrypted matching; only the wire form changes. msodbcsql sends the
+    /// user values of `sp_executesql`, `sp_prepexec` and `sp_execute` this way
+    /// (`AddRPCUserParameters` → `SetIgnoreParamName`).
+    pub(crate) fn with_named_parameters_positional(mut self, positional: bool) -> Self {
+        self.named_parameters_positional = positional;
+        self
+    }
+
+    /// RPC ordinal and name of every output parameter sent unnamed, so their
+    /// unnamed RETURNVALUEs can be mapped back to the declared names.
+    pub(crate) fn unnamed_output_names(&self) -> Vec<(u16, String)> {
+        if !self.named_parameters_positional {
+            return Vec::new();
+        }
+        let offset = self.positional_parameters.as_ref().map_or(0, Vec::len);
+        self.named_parameters
+            .iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, parameter)| parameter.is_output())
+            .filter_map(|(index, parameter)| {
+                let ordinal = u16::try_from(offset + index).ok()?;
+                Some((ordinal, parameter.name.clone()?))
+            })
+            .collect()
     }
 
     pub(crate) fn new_batch_command(
@@ -91,6 +122,7 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            named_parameters_positional: false,
         }
     }
 
@@ -117,7 +149,11 @@ impl<'a> SqlRpc<'a> {
             parameter.validate_before_send(self.db_collation)?;
         }
         for parameter in self.named_parameters.iter().flatten() {
-            parameter.validate_named_before_send(self.db_collation)?;
+            if self.named_parameters_positional {
+                parameter.validate_before_send(self.db_collation)?;
+            } else {
+                parameter.validate_named_before_send(self.db_collation)?;
+            }
         }
         Ok(())
     }
@@ -153,7 +189,12 @@ impl<'a> SqlRpc<'a> {
             let encoder = GenericEncoder::new();
             for parameter in parameters {
                 if let Err(error) = parameter
-                    .serialize(packet_writer, self.db_collation, false, &encoder)
+                    .serialize(
+                        packet_writer,
+                        self.db_collation,
+                        self.named_parameters_positional,
+                        &encoder,
+                    )
                     .await
                 {
                     return Err(
@@ -339,6 +380,7 @@ pub(crate) struct SqlRpc<'param> {
     pub named_parameters: Option<Vec<RpcParameter>>,
     pub db_collation: &'param SqlCollation,
     pub proc_options: ProcOptions,
+    named_parameters_positional: bool,
 }
 
 #[async_trait]
@@ -617,6 +659,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unnamed_output_names_follow_the_leading_positional_parameters() {
+        let collation = SqlCollation::default();
+        let named = |name: &str, flags| {
+            RpcParameter::new(Some(name.to_string()), flags, SqlType::Int(None))
+        };
+        let build = || {
+            SqlRpc::new(
+                RpcType::ProcId(RpcProcs::Execute),
+                Some(vec![param(SqlType::Int(Some(55)))]),
+                Some(vec![
+                    named("@P1", StatusFlags::NONE),
+                    named("@P2", StatusFlags::BY_REF_VALUE),
+                ]),
+                &collation,
+                &ExecutionContext::new(),
+            )
+        };
+        assert!(build().unnamed_output_names().is_empty());
+        assert_eq!(
+            build()
+                .with_named_parameters_positional(true)
+                .unnamed_output_names(),
+            vec![(2, "@P2".to_string())]
+        );
     }
 
     #[test]

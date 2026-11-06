@@ -309,6 +309,10 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // `query_timeout` (already deducted above) bounds the whole call,
             // including any reconnect charged above; `0` means unlimited, matching
             // the ODBC default.
+            //
+            // Values go unnamed, bound by ordinal, as msodbcsql sends them
+            // (`AddRPCUserParameters`); the server matches named values
+            // against `@params` in quadratic time.
             let exec_result = dbc.runtime.block_on(
                 client.execute_prepared(
                     &mut prepared.stmt,
@@ -316,7 +320,8 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     &mut orphaned,
                     ExecuteOptions::new()
                         .timeout_secs(query_timeout)
-                        .cancel(&cancel_handle),
+                        .cancel(&cancel_handle)
+                        .positional_parameter_values(true),
                 ),
             );
 
@@ -4445,6 +4450,57 @@ mod tests {
             ExecutionStaging::Ready(_) | ExecutionStaging::Batch(_) => {
                 panic!("expected NeedData staging for DAE param")
             }
+        }
+    }
+
+    /// msodbcsql sends `sp_prepexec` and `sp_execute` user values unnamed
+    /// (`AddRPCUserParameters`); the declaration keeps `@P1`.
+    #[test]
+    fn execute_sends_prepexec_and_execute_values_unnamed() {
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{
+            done_no_more, int_columns, return_value, tds_client_from_tokens_capturing,
+        };
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+
+        const UNNAMED_INT_7: [u8; 9] = [0x00, 0x00, 0x26, 0x04, 0x04, 7, 0, 0, 0];
+        const NAMED_P: [u8; 5] = [0x03, b'@', 0, b'P', 0];
+        let contains =
+            |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let (client, sent) = tds_client_from_tokens_capturing(vec![
+            return_value(ReturnValue {
+                param_ordinal: 0,
+                param_name: String::new(),
+                value: ColumnValues::Int(55),
+                column_metadata: Box::new(int_columns(1).remove(0)),
+                status: ReturnValueStatus::OutputParam,
+            }),
+            done_no_more(),
+            done_no_more(),
+        ]);
+        let dbc = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }.parent_dbc();
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
+        set_prepared(h.stmt, "SELECT ?");
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+
+        for proc_id in [13u8, 12] {
+            assert_eq!(
+                unsafe { sql_execute(h.stmt) },
+                SQL_SUCCESS,
+                "proc {proc_id}"
+            );
+            let bytes = std::mem::take(&mut *sent.lock().unwrap());
+            assert!(
+                contains(&bytes, &[0xFF, 0xFF, proc_id, 0]),
+                "proc {proc_id}"
+            );
+            assert!(contains(&bytes, &UNNAMED_INT_7), "proc {proc_id}");
+            assert!(!contains(&bytes, &NAMED_P), "proc {proc_id}");
         }
     }
 }
