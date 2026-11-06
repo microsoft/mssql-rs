@@ -153,7 +153,7 @@ the extra unless their implementation uses its dependencies.
   suppresses it may continue running after the caller stops waiting.
 
 Provider cancellation during session recovery remains a known limitation: it may
-be retried or surface as `OperationalError`. The example disables recovery withcovering the azure-async extra, supported built-in modes, custom token_provider contract, credential ownership, cleanup requirements, and Azure Public Cloud restriction.
+be retried or surface as `OperationalError`. The example disables recovery with
 `connect_retry_count=0`; preserving recovery-time cancellation requires a separate
 TDS and py-core change.
 
