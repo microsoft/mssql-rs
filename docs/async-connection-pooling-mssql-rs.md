@@ -1106,6 +1106,109 @@ eager carrier and return-cleanup cost, cancellation recovery and high-contention
 tail latency; no relative performance or delivery-time estimate is established
 by this design review.
 
+### 10.1 A1 executable experiment
+
+`mssql-py-core/src/pool/fit.rs` is a test-only, Python-free experiment against
+Deadpool 0.13.1. It is not a production pool, does not expose a Python API,
+and does not change direct AQE connections. Deadpool is a pinned development
+dependency only.
+
+The adapter serializes admission, every slot-get poll, cancellation and slot
+return. With fixed capacity and infallible, immediately-ready slot hooks,
+live queued demand is `max(0, registered demand - max_size)`. Registered demand
+includes checked-out leases and assigned-but-unpolled requests, not just
+unfinished `get()` calls. Returning a slot removes its previous demand before
+another admission can inspect the count. Deadpool remains the only FIFO
+capacity scheduler and idle-slot store.
+
+A registration map owns pending get futures and grants held behind maintenance
+so disable and lazy deadline expiration can reclaim them without waiting for
+their callers to resume.
+It does not select grants or maintain another FIFO. Semaphore wakeups are
+deferred until outside the admission lock. Idle maintenance retains slots,
+extracts clients through interior mutability, and blocks lease publication
+pool-wide until off-lock client destruction finishes. Admission and Deadpool
+FIFO assignment continue during that barrier, preserving exact queue limits
+and order even if callers resume in reverse order.
+
+The tests cover exact queue boundaries, FIFO/retry admission, cancellation,
+deadline expiry, generation retention, idle age, maintenance, shutdown and
+client-before-slot destruction, using instrumented fake clients. These lifecycle
+experiments test feasibility only; they do not complete A2's production manager,
+configuration, sweep, eviction or concurrency validation. The pool-wide barrier
+is a deliberate prototype simplification, not a measured performance choice.
+A two-worker Tokio test checks physical-cap observations under contention. These tests are
+not evidence of TDS reset, rollback, actual transport-task settlement, Python
+delivery or live SQL behavior. Those remain later-slice gates. The accounting
+argument does not apply to asynchronous/fallible slot hooks, live resize or
+uncontrolled raw Object access.
+
+Run the pool contract tests and experiment from the repository root:
+
+```powershell
+cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --lib -E 'test(pool::)' --no-fail-fast
+cargo fmt --manifest-path .\mssql-py-core\Cargo.toml -- --check
+cargo clippy --manifest-path .\mssql-py-core\Cargo.toml --frozen --all-features --all-targets -- -D warnings
+```
+
+Measure coverage explicitly for this workspace-excluded crate:
+
+```powershell
+cargo llvm-cov nextest --manifest-path .\mssql-py-core\Cargo.toml --frozen --lib --no-fail-fast --show-missing-lines
+```
+
+Inspect the `pool/` files in the report rather than treating a filtered unit run
+as repository-wide coverage. Their file totals include test code: deliberately
+noncompleting futures and test-helper panic guards can remain uncovered.
+Ownership-transfer tests use the existing `mssql-tds` `test-util` feature as a
+development dependency only. Scripted token transports are not mock TCP or live
+SQL evidence.
+
+### 10.2 Compiled foundation and developer boundaries
+
+The private `mssql-py-core/src/pool.rs` module is compiled in normal builds.
+Its contracts are not connected to AQE or exposed to Python:
+
+| Module | Implemented contract |
+|---|---|
+| `pool/config.rs` | Validated immutable settings, typed positive limits and explicit acquisition/cleanup/shutdown budgets; inherited defaults only for size, idle timeout and token margin |
+| `pool/error.rs` | Pool-owned typed errors with acquisition stage and preserved TDS/provider causes; routine Display/Debug excludes source messages |
+| `pool/control.rs` | One absolute Tokio deadline and explicit cancellation, including a final check before result delivery |
+| `pool/connection.rs` | Opaque key/auth fingerprints, distinct token-expiry cases, immutable effective context and object-safe physical factory returning a uniquely owned `TdsClient` |
+| `pool/fit.rs` | A1's test-only scheduler/slot experiment, now using the shared configuration contract |
+
+`PoolConfig::new` requires all three timeout budgets. Owned `with_*` methods
+construct a new configuration value; they do not reconfigure a running manager.
+Capacity values exceeding Tokio's `Semaphore::MAX_PERMITS` are rejected before
+constructing the selected slot scheduler; this is not a second semaphore.
+Rust inputs are typed durations/integers. The later Python boundary must still
+reject booleans, negative/non-finite values and conversion overflow.
+
+`PoolKey` and `AuthBinding` accept opaque fingerprints only. This foundation
+does not canonicalize connection strings, select a fingerprint algorithm,
+verify a real login principal or implement token refresh. Doc 2 remains the
+key authority; authentication adapters must supply verified login metadata.
+`ConnectSpec` receives already-validated effective options, including the
+pooled recovery restriction. No concrete physical factory is enabled yet.
+
+`AcquireControl::run` drops its caller-owned future on cancellation/timeout.
+It does not cancel a TDS `CancelHandle`, supervise detached transport work, or
+join Python tasks. Those still require their owning operation guards. Its
+final cancellation/deadline check is not the manager's generation/publication
+lock or the AQE close barrier.
+
+The module has a non-test `dead_code` expectation while these internal
+contracts have no AQE consumers. Test builds do not suppress that lint.
+Remove the expectation when production integration supplies the consumers.
+Deadpool remains a development dependency, confined to the A1 experiment.
+
+The core developer can build A2's manager and lifecycle behind these contracts.
+The AQE developer can work on B2/B3's logical ownership and close coordination
+on the existing direct path. There is deliberately no placeholder
+`AsyncPoolManager`, `PoolLease`, `ConnHandle` or Python `AsyncPool`: their safe
+implementations, full reset/return protocol, real SQL validation and platform
+matrix remain subsequent approved slices.
+
 ### Upstream contracts reviewed
 
 - [Deadpool 0.13.1 manager hooks](https://docs.rs/deadpool/0.13.1/deadpool/managed/trait.Manager.html)
