@@ -3039,7 +3039,7 @@ impl TdsClient {
     /// Withdraws with `EOM | IGNORE`. A configured cancellation budget covers
     /// the write and drain together; otherwise the historical TDS limits apply.
     async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> Withdrawal {
-        // Cached read, not `is_connection_dead`: that one `try_read`s a byte,
+        // Cached read, not `is_connection_dead`: that one consumes a byte,
         // which here could swallow the server's answer to the half-written
         // request. msodbcsql's `FIsConnectionDead` is likewise a cached flag.
         if self.transport.connection_known_dead() {
