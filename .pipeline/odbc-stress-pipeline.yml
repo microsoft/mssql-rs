@@ -70,8 +70,10 @@ variables:
   # Linux builds compile the <name>_mt entries only when asked (CMakeLists.txt);
   # the build templates forward this into their containers.
   ODBC_E2E_CONCURRENT: 'ON'
-  # Read during template expansion by the job timeouts.
-  odbcMtJobTimeoutInMinutes: 240
+  # Read during template expansion by the job timeouts. Each ctest entry has 180
+  # minutes (run_e2e.ps1 / run_e2e.sh), so one slow suite still leaves room for
+  # the rest of its group as more suites gain <name>_mt entries.
+  odbcMtJobTimeoutInMinutes: 360
   # Suite groups, run as parallel jobs on every leg (ctest -R / -E regexes over
   # the <name>_mt entries). Other is the complement of the named groups, so a
   # newly converted suite is still covered. Weekly 16 x 50 run serially on one

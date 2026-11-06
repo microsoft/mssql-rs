@@ -330,7 +330,10 @@ one driver race found so far, AB#49225, came from `SharedDbc`. Order of effort:
   [prebuilt runner commands](../tests/e2e/README.md#windows-stress-jobs). The
   groups' regexes are shared by all three legs (`odbc-stress-pipeline.yml`),
   and the remaining-suites group is their complement, so a newly converted
-  suite is still run. Jobs allow 240 minutes; each ctest entry has 60. Run
+  suite is still run. Jobs allow 360 minutes and each ctest entry 180, with room
+  for the suites still to be converted to `ODBC_TEST_F` (build 189166's slowest
+  entry took 37 minutes and its slowest job 80); the watchdog still ends a hung
+  phase after 5 minutes. Run
   serially at 16 x 50, the Linux weekly needed about 280 minutes (build 188696,
   cancelled at 240); split at 16 x 25, every job finished within 80 minutes
   (build 189166).

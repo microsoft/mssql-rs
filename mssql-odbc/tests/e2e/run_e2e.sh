@@ -233,7 +233,7 @@ apply_mt_profile() {
             fi
             # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
             # this only bounds an entry whose many phases all progress slowly.
-            CTEST_ARGS+=(-L mt --timeout 3600)
+            CTEST_ARGS+=(-L mt --timeout 10800)
             if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
                 echo "--mt-profile=$MT_PROFILE ignores --retries=$RETRIES: an intermittent failure is the signal."
                 RETRIES=0

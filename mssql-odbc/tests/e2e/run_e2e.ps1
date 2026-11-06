@@ -449,7 +449,7 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         if ($script:MtStress) {
             # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
             # this only bounds an entry whose many phases all progress slowly.
-            $ctestArgs += @('-L', 'mt', '--timeout', '3600')
+            $ctestArgs += @('-L', 'mt', '--timeout', '10800')
             # Set-MtProfile created it, but a dump directory inside build\ is gone
             # if Remove-IncompatibleCMakeBuildTree deleted the tree since.
             New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
