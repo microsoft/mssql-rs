@@ -15,7 +15,7 @@
 # Requires: Administrator privileges (writes to HKLM).
 # Usage: .\run_e2e.ps1 [-Release] [-Retries N] [-Coverage] [-CoverageOutput PATH]
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
-#                      [-FilterTests REGEX] [-MtProfile pr|nightly|weekly]
+#                      [-FilterTests REGEX] [-MtProfile pr|weekly]
 #                      [-MtDumpDir PATH]
 #                      [-BuildJobs N] [-BuildOnly -OutDir PATH | -SkipBuild]
 #
@@ -31,14 +31,12 @@
 #            concurrent variants in /SharedDbc only, at the harness default of
 #            2 threads x 1 iteration. The other modes cost more PR time than
 #            they catch at that size.
-#   nightly  only the <name>_mt entries, 8 x 20, every mode, except entries
-#            labelled mt_weekly.
 #   weekly   only the <name>_mt entries, 16 x 25, every mode; the only profile
 #            that runs mt_weekly entries.
-# nightly and weekly ignore -Retries (an intermittent failure is what they look
-# for) and leave evidence in -MtDumpDir (default build\mt-dumps): a minidump from
+# weekly ignores -Retries (an intermittent failure is what it looks for) and
+# leaves evidence in -MtDumpDir (default build\mt-dumps): a minidump from
 # the watchdog for a hang, and from the test process itself for a crash or
-# abort(). Crashes end the process there because these profiles set
+# abort(). Crashes end the process there because the profile sets
 # GTEST_CATCH_EXCEPTIONS=0. With
 # -CompareWithMsodbcsql the msodbcsql leg runs at 2 x 1: it checks that the tests
 # suit the modes, not msodbcsql's thread safety. Unlike on unixODBC, /SharedStmt
@@ -92,7 +90,7 @@ param(
     # driver gaps tracked in AB#46973 (get_type_info_test, driver_connect_test) are
     # fixed, so the full suite runs on Windows. Pass -ExcludeTests '<regex>' to skip.
     [string]$ExcludeTests = '',
-    [ValidateSet('pr', 'nightly', 'weekly')]
+    [ValidateSet('pr', 'weekly')]
     [string]$MtProfile = 'pr',
     [string]$MtDumpDir = '',
     [ValidateRange(1, 64)]
@@ -369,9 +367,8 @@ function Set-MtProfile {
         $env:MSSQL_ODBC_MT_SKIP_MODES = 'CrossThread,SharedEnv,SharedStmt'
     }
     if ($script:MtStress) {
-        $threads, $iters = if ($MtProfile -eq 'nightly') { 8, 20 } else { 16, 25 }
-        if (-not $env:MSSQL_ODBC_MT_THREADS) { $env:MSSQL_ODBC_MT_THREADS = "$threads" }
-        if (-not $env:MSSQL_ODBC_MT_ITERS) { $env:MSSQL_ODBC_MT_ITERS = "$iters" }
+        if (-not $env:MSSQL_ODBC_MT_THREADS) { $env:MSSQL_ODBC_MT_THREADS = '16' }
+        if (-not $env:MSSQL_ODBC_MT_ITERS) { $env:MSSQL_ODBC_MT_ITERS = '25' }
         if (-not $script:MtDumpDir) { $script:MtDumpDir = Join-Path $ScriptDir 'build\mt-dumps' }
         New-Item -ItemType Directory -Force -Path $script:MtDumpDir | Out-Null
         $script:MtDumpDir = (Resolve-Path $script:MtDumpDir).Path

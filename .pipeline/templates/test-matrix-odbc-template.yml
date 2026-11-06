@@ -17,7 +17,7 @@ parameters:
   nameSuffix: ''
   poolName: 'RUST-X64-WUS3'
   poolImageOverride: 'imageOverride -equals RUST-AZL3'
-  # run_e2e.sh --mt-profile (pr, nightly, weekly). A runtime macro such as
+  # run_e2e.sh --mt-profile (pr or weekly). A runtime macro such as
   # $(odbcMtProfile) works: it is only expanded into the container's environment.
   mtProfile: 'pr'
   # ctest until-pass retries; the stress profiles ignore it.

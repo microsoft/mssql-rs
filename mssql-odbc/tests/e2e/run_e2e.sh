@@ -13,7 +13,7 @@
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
 #                [--skip-build] [--driver=PATH]
 #                [--filter=REGEX] [--exclude=REGEX]
-#                [--mt-profile=pr|nightly|weekly]
+#                [--mt-profile=pr|weekly]
 #
 # Default: runs the e2e suite against mssql-odbc only.
 #
@@ -27,13 +27,11 @@
 #            mode except /SharedStmt, at the harness default of 2 threads x 1
 #            iteration. Linux and macOS build no <name>_mt entries unless
 #            ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
-#   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt,
-#            and not the entries labelled mt_weekly.
-#   weekly   only the <name>_mt entries, 16 x 25, the same modes as nightly;
-#            the only profile that runs mt_weekly entries. Nightly and weekly
-#            build with ODBC_E2E_CONCURRENT=ON.
-# nightly and weekly ignore --retries (an intermittent failure is what they
-# look for) and run each entry under gdb through run_mt_test.sh when gdb is
+#   weekly   only the <name>_mt entries, 16 x 25, every mode except /SharedStmt;
+#            the only profile that runs mt_weekly entries. It builds with
+#            ODBC_E2E_CONCURRENT=ON.
+# weekly ignores --retries (an intermittent failure is what it looks for) and
+# runs each entry under gdb through run_mt_test.sh when gdb is
 # installed, so a crash or a watchdog abort prints every thread's stack. With
 # --compare-with-msodbcsql the msodbcsql leg runs at 2 x 1: it checks that the
 # tests suit the modes, not msodbcsql's thread safety. /SharedStmt is left out
@@ -217,17 +215,15 @@ parse_args() {
 # header). Settings already in the environment win over the profile.
 # ----------------------------------------------------------------------------
 apply_mt_profile() {
-    local threads iters
     # AB#49575: restore SharedStmt after CI adopts the diagnostic-list fix.
     export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
     case "$MT_PROFILE" in
         pr)
             ;;
-        nightly|weekly)
+        weekly)
             export ODBC_E2E_CONCURRENT=ON
-            if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=25; fi
-            export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
-            export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"
+            export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-16}"
+            export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-25}"
             # run_mt_test.sh runs each <name>_mt entry under gdb; the watchdog must
             # still end a hang inside the traced process.
             export MSSQL_ODBC_MT_GDB="${MSSQL_ODBC_MT_GDB:-1}"
@@ -245,7 +241,7 @@ apply_mt_profile() {
             MS_LEG_ENV=(MSSQL_ODBC_MT_THREADS=2 MSSQL_ODBC_MT_ITERS=1)
             ;;
         *)
-            echo "Unknown --mt-profile '$MT_PROFILE' (expected pr, nightly, or weekly)" >&2
+            echo "Unknown --mt-profile '$MT_PROFILE' (expected pr or weekly)" >&2
             exit 2
             ;;
     esac

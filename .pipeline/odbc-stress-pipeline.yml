@@ -1,13 +1,12 @@
-# Scheduled multithreaded stress runs of the mssql-odbc C++ e2e suite (AB#49263).
+# Weekly multithreaded stress run of the mssql-odbc C++ e2e suite (AB#49263).
 #
 # PR validation runs the ODBC_TEST_F concurrent variants once at 2 threads x 1
 # iteration, in /SharedDbc only and only on Windows, which catches tests unfit
 # for concurrency but rarely a race. This pipeline reruns only those variants
-# (the <name>_mt ctest entries) in every mode at stress size, without retries,
-# so an intermittent failure is reported rather than retried away:
-#
-#   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
-#   weekly  16 x 25, the same modes
+# (the <name>_mt ctest entries) and the multithreaded-only (mt_weekly) entries
+# at 16 threads x 25 iterations, in every mode (Windows) / every mode but
+# /SharedStmt (unixODBC), without retries, so an intermittent failure is
+# reported rather than retried away. A manual run uses the same profile.
 #
 # Legs: Windows x64 (one shared build, debug driver, Windows Driver Manager,
 # msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21 (musl),
@@ -36,16 +35,6 @@ trigger: none
 pr: none
 
 schedules:
-# Temporary: the nightly run is there to flush out the obvious races while the
-# converted suites settle. Remove this entry once the bugs it finds are fixed
-# (planned for two to three weeks after it starts); the weekly run and PR
-# validation remain.
-- cron: '0 2 * * 1-6'
-  displayName: Nightly ODBC stress
-  branches:
-    include:
-    - main
-  always: true
 - cron: '0 2 * * 0'
   displayName: Weekly ODBC stress
   branches:
@@ -54,15 +43,6 @@ schedules:
   always: true
 
 parameters:
-- name: profile
-  displayName: Stress profile (auto takes it from the schedule; a manual run gets nightly)
-  type: string
-  values:
-  - auto
-  - nightly
-  - weekly
-  default: auto
-
 - name: linuxImage
   displayName: Agent image for x64 Linux jobs
   type: string
@@ -84,16 +64,14 @@ parameters:
 variables:
   # Same pinned reference driver as validation-pipeline.yml.
   msodbcsqlVersion: '18.6.2.1'
-  # Resolved when the run starts: the schedule that fired it, or the manual choice.
-  odbcMtProfile: $[ iif(eq('${{ parameters.profile }}', 'auto'), iif(eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'), 'weekly', 'nightly'), '${{ parameters.profile }}') ]
+  # Scheduled and manual runs both use the weekly profile; PR validation runs
+  # the PR profile.
+  odbcMtProfile: weekly
   # Linux builds compile the <name>_mt entries only when asked (CMakeLists.txt);
   # the build templates forward this into their containers.
   ODBC_E2E_CONCURRENT: 'ON'
-  # Job timeouts must be resolved during template expansion.
-  ${{ if or(eq(parameters.profile, 'weekly'), and(eq(parameters.profile, 'auto'), eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'))) }}:
-    odbcMtJobTimeoutInMinutes: 240
-  ${{ else }}:
-    odbcMtJobTimeoutInMinutes: 120
+  # Read during template expansion by the job timeouts.
+  odbcMtJobTimeoutInMinutes: 240
   # Suite groups, run as parallel jobs on every leg (ctest -R / -E regexes over
   # the <name>_mt entries). Other is the complement of the named groups, so a
   # newly converted suite is still covered. Weekly 16 x 50 run serially on one
