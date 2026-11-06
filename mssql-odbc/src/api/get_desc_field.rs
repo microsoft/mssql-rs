@@ -15,6 +15,7 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
+    SQL_CA_SS_CATALOG_NAME, SQL_CA_SS_SCHEMA_NAME, SQL_CA_SS_TYPE_NAME,
     SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME, SQL_CA_SS_UDT_CATALOG_NAME, SQL_CA_SS_UDT_SCHEMA_NAME,
     SQL_CA_SS_UDT_TYPE_NAME, SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR,
     SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT,
@@ -29,6 +30,7 @@ use crate::api::sqlstate::{
     ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
+use crate::error::post_sql_error;
 use crate::error::{HasDiagnostics, free_errors};
 use crate::handles::desc::{DescHeader, DescRecord, FieldScope, classify_field};
 use crate::handles::{DescHandle, HandleType, handle_from_raw};
@@ -121,6 +123,82 @@ fn sql_get_desc_field_w_safe(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
+    if let Some(result) = get_focused_tvp_header_field(
+        desc,
+        record_number,
+        field_identifier,
+        value_ptr,
+        buffer_length,
+        string_length_ptr,
+    ) {
+        return result;
+    }
+
+    if let Ok(field) = SqlUSmallInt::try_from(field_identifier)
+        && record_number >= 1
+        && matches!(
+            desc.kind,
+            crate::handles::desc::DescKind::AppParam
+                | crate::handles::desc::DescKind::Ad
+                | crate::handles::desc::DescKind::ImpParam
+        )
+        && matches!(
+            field,
+            SQL_DESC_DATA_PTR
+                | SQL_DESC_INDICATOR_PTR
+                | SQL_DESC_OCTET_LENGTH_PTR
+                | SQL_DESC_OCTET_LENGTH
+                | SQL_DESC_LENGTH
+                | SQL_DESC_NULLABLE
+                | SQL_DESC_CONCISE_TYPE
+                | SQL_DESC_DATETIME_INTERVAL_CODE
+                | SQL_DESC_PRECISION
+                | SQL_DESC_SCALE
+                | SQL_DESC_TYPE
+                | SQL_DESC_NAME
+                | SQL_DESC_UNNAMED
+                | SQL_DESC_PARAMETER_TYPE
+        )
+        && classify_field(desc.kind, field).is_some_and(|access| access.scope == FieldScope::Record)
+    {
+        match super::get_desc_rec::focused_tvp_record_for_desc(desc, record_number) {
+            Ok(Some(super::get_desc_rec::FocusedTvpRecord::PastCount)) => {
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLGetDescFieldW: desc mutex poisoned");
+                    return SQL_ERROR;
+                };
+                free_errors(&mut state);
+                return SQL_NO_DATA;
+            }
+            Ok(Some(super::get_desc_rec::FocusedTvpRecord::Record(record))) => {
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLGetDescFieldW: desc mutex poisoned");
+                    return SQL_ERROR;
+                };
+                free_errors(&mut state);
+                let Some(value) = record_field_value(&record, field) else {
+                    post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+                    return SQL_ERROR;
+                };
+                return value.write(value_ptr, buffer_length, string_length_ptr, &mut *state);
+            }
+            Ok(None) => {}
+            Err(()) => {
+                error!("SQLGetDescFieldW: failed reading focused TVP descriptor records");
+                if let Ok(mut state) = desc.inner.lock() {
+                    free_errors(&mut state);
+                    post_sql_error(
+                        &mut state,
+                        crate::api::sqlstate::SQLSTATE_HY000,
+                        0,
+                        "Internal error reading focused table-valued parameter descriptor",
+                    );
+                }
+                return SQL_ERROR;
+            }
+        }
+    }
+
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLGetDescFieldW: desc mutex poisoned");
         return SQL_ERROR;
@@ -197,6 +275,103 @@ fn sql_get_desc_field_w_safe(
     value.write(value_ptr, buffer_length, string_length_ptr, &mut state)
 }
 
+fn get_focused_tvp_header_field(
+    desc: &DescHandle,
+    _record_number: SqlSmallInt,
+    field_identifier: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
+) -> Option<SqlReturn> {
+    let field = SqlUSmallInt::try_from(field_identifier).ok()?;
+    let is_count = field == SQL_DESC_COUNT;
+    if if is_count {
+        !matches!(
+            desc.kind,
+            crate::handles::desc::DescKind::AppParam
+                | crate::handles::desc::DescKind::Ad
+                | crate::handles::desc::DescKind::ImpParam
+        )
+    } else {
+        !matches!(
+            desc.kind,
+            crate::handles::desc::DescKind::AppParam | crate::handles::desc::DescKind::Ad
+        )
+    } {
+        return None;
+    }
+    if !matches!(
+        field,
+        SQL_DESC_COUNT | SQL_DESC_ARRAY_SIZE | SQL_DESC_BIND_OFFSET_PTR | SQL_DESC_BIND_TYPE
+    ) || !classify_field(desc.kind, field)
+        .is_some_and(|access| access.scope == FieldScope::Header)
+    {
+        return None;
+    }
+    if is_count {
+        let count = match desc.focused_tvp_record_count() {
+            Ok(Some(count)) => count,
+            Ok(None) => return None,
+            Err(()) => {
+                error!("SQLGetDescFieldW: failed reading focused TVP descriptor count");
+                let Ok(mut state) = desc.inner.lock() else {
+                    error!("SQLGetDescFieldW: desc mutex poisoned posting child-count error");
+                    return Some(SQL_ERROR);
+                };
+                free_errors(&mut state);
+                post_sql_error(
+                    &mut state,
+                    crate::api::sqlstate::SQLSTATE_HY000,
+                    0,
+                    "Internal error reading focused table-valued parameter descriptor count",
+                );
+                return Some(SQL_ERROR);
+            }
+        };
+        let Ok(mut state) = desc.inner.lock() else {
+            error!("SQLGetDescFieldW: desc mutex poisoned reading child count");
+            return Some(SQL_ERROR);
+        };
+        free_errors(&mut state);
+        let count = SqlSmallInt::try_from(count).unwrap_or(SqlSmallInt::MAX);
+        return Some(FieldValue::SmallInt(count).write(
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+            &mut state,
+        ));
+    }
+    let header = match desc.focused_tvp_layout_header() {
+        Ok(Some(header)) => header,
+        Ok(None) => return None,
+        Err(()) => {
+            error!("SQLGetDescFieldW: failed reading focused TVP descriptor headers");
+            let Ok(mut state) = desc.inner.lock() else {
+                error!("SQLGetDescFieldW: desc mutex poisoned posting child-header error");
+                return Some(SQL_ERROR);
+            };
+            free_errors(&mut state);
+            post_sql_error(
+                &mut state,
+                crate::api::sqlstate::SQLSTATE_HY000,
+                0,
+                "Internal error reading focused table-valued parameter descriptor header",
+            );
+            return Some(SQL_ERROR);
+        }
+    };
+    let Ok(mut state) = desc.inner.lock() else {
+        error!("SQLGetDescFieldW: desc mutex poisoned reading child header");
+        return Some(SQL_ERROR);
+    };
+    free_errors(&mut state);
+    let Some(value) = header_field_value(&header, field) else {
+        post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
+        return Some(SQL_ERROR);
+    };
+    Some(value.write(value_ptr, buffer_length, string_length_ptr, &mut *state))
+}
+
 /// Maps a header field to its stored value. `SQL_DESC_COUNT` is handled by
 /// the caller (it is derived from the record list, not stored on the
 /// header). Returns `None` only if out of sync with [`classify_field`].
@@ -232,16 +407,21 @@ fn record_field_value(record: &DescRecord, field: SqlUSmallInt) -> Option<FieldV
         SQL_DESC_DATA_PTR => FieldValue::Pointer(record.data_ptr),
         SQL_DESC_INDICATOR_PTR => FieldValue::Pointer(record.indicator_ptr),
         SQL_DESC_OCTET_LENGTH_PTR => FieldValue::Pointer(record.octet_length_ptr),
-        // A UDT name part that was never set reads back empty, the same answer
-        // a record with no UDT identity at all gives.
+        // A type-name part that was never set reads back empty, the same answer
+        // a record with no server type identity at all gives. Catalog/schema
+        // aliases share storage, while UDT and TVP type names are distinct.
         SQL_CA_SS_UDT_CATALOG_NAME
         | SQL_CA_SS_UDT_SCHEMA_NAME
         | SQL_CA_SS_UDT_TYPE_NAME
-        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME => {
+        | SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+        | SQL_CA_SS_CATALOG_NAME
+        | SQL_CA_SS_SCHEMA_NAME
+        | SQL_CA_SS_TYPE_NAME => {
             let part = record.udt_names.as_deref().map(|n| match field {
-                SQL_CA_SS_UDT_CATALOG_NAME => &n.catalog,
-                SQL_CA_SS_UDT_SCHEMA_NAME => &n.schema,
+                SQL_CA_SS_UDT_CATALOG_NAME | SQL_CA_SS_CATALOG_NAME => &n.catalog,
+                SQL_CA_SS_UDT_SCHEMA_NAME | SQL_CA_SS_SCHEMA_NAME => &n.schema,
                 SQL_CA_SS_UDT_TYPE_NAME => &n.type_name,
+                SQL_CA_SS_TYPE_NAME => &n.tvp_type_name,
                 _ => &n.assembly_type_name,
             });
             FieldValue::Text(part.cloned().unwrap_or_default())
@@ -343,12 +523,12 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_NUMERIC, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_PARAM_INPUT,
-        SQL_UNNAMED,
+        SQL_C_NUMERIC, SQL_DECIMAL, SQL_DESC_ALLOC_AUTO, SQL_INVALID_HANDLE, SQL_NULL_HANDLE,
+        SQL_NULLABLE, SQL_PARAM_INPUT, SQL_UNNAMED,
     };
     use crate::api::set_desc_field::sql_set_desc_field_w;
     use crate::error::diag::DiagRecord;
-    use crate::handles::{DescHandle, handle_from_raw};
+    use crate::handles::{DescHandle, StmtHandle, handle_from_raw};
     use crate::test_support::TestHandles;
     use crate::test_support::assert_last_diag;
 
@@ -368,6 +548,10 @@ mod tests {
         crate::api::odbc_types::SQL_DESC_PARAMETER_TYPE as SqlSmallInt;
     const SQL_DESC_UNNAMED: SqlSmallInt = crate::api::odbc_types::SQL_DESC_UNNAMED as SqlSmallInt;
     const SQL_DESC_NAME: SqlSmallInt = crate::api::odbc_types::SQL_DESC_NAME as SqlSmallInt;
+    const SQL_DESC_PRECISION: SqlSmallInt =
+        crate::api::odbc_types::SQL_DESC_PRECISION as SqlSmallInt;
+    const SQL_DESC_SCALE: SqlSmallInt = crate::api::odbc_types::SQL_DESC_SCALE as SqlSmallInt;
+    const SQL_DESC_NULLABLE: SqlSmallInt = crate::api::odbc_types::SQL_DESC_NULLABLE as SqlSmallInt;
 
     fn desc_diags(handle: SqlHandle) -> Vec<DiagRecord> {
         let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
@@ -497,6 +681,217 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn focused_record_uses_child_defaults_and_returns_no_data_past_count() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_CONCISE_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert!(
+            unsafe { handle_from_raw::<DescHandle>(h.apd()) }
+                .inner
+                .lock()
+                .unwrap()
+                .records
+                .is_empty(),
+            "focused write must not create an outer APD record"
+        );
+
+        let mut concise: SqlSmallInt = -1;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_CONCISE_TYPE,
+                &mut concise as *mut SqlSmallInt as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(concise, SQL_C_NUMERIC);
+
+        let mut length: SqlULen = 0;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.apd(),
+                1,
+                crate::api::odbc_types::SQL_DESC_LENGTH as SqlSmallInt,
+                &mut length as *mut SqlULen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(length, 38);
+
+        stmt.inner
+            .lock()
+            .unwrap()
+            .tvp_column_bindings
+            .insert(1, Vec::new());
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_CONCISE_TYPE,
+                &mut concise as *mut SqlSmallInt as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn focused_ipd_fields_read_sql_metadata_from_the_child_binding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        {
+            let mut state = ipd.inner.lock().unwrap();
+            state.set_record_count(1, ipd.kind);
+            let outer = state.record_mut(1).unwrap();
+            outer.name = "outer parameter".to_string();
+            outer.parameter_type = crate::api::odbc_types::SQL_PARAM_OUTPUT;
+        }
+        stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(1);
+        stmt.inner.lock().unwrap().tvp_column_bindings.insert(
+            1,
+            vec![
+                Some(crate::params::BoundParam {
+                    input_output_type: SQL_PARAM_INPUT,
+                    c_type: crate::api::odbc_types::SQL_C_SLONG,
+                    sql_type: SQL_DECIMAL,
+                    column_size: 10,
+                    decimal_digits: 2,
+                    app_datetime_interval_code: None,
+                    sql_datetime_interval_code: None,
+                    app_precision: 0,
+                    app_scale: 0,
+                    parameter_value_ptr: ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: ptr::null_mut(),
+                    octet_length_ptr: ptr::null_mut(),
+                }),
+                None,
+            ],
+        );
+
+        let mut concise: SqlSmallInt = -1;
+        let mut precision: SqlSmallInt = -1;
+        let mut scale: SqlSmallInt = -1;
+        for (field, value) in [
+            (SQL_DESC_CONCISE_TYPE, &mut concise),
+            (SQL_DESC_PRECISION, &mut precision),
+            (SQL_DESC_SCALE, &mut scale),
+        ] {
+            assert_eq!(
+                unsafe {
+                    sql_get_desc_field_w(
+                        h.ipd(),
+                        1,
+                        field,
+                        value as *mut SqlSmallInt as SqlPointer,
+                        0,
+                        ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+
+        assert_eq!(concise, SQL_DECIMAL);
+        assert_eq!(precision, 10);
+        assert_eq!(scale, 2);
+
+        let mut name = [0u16; 32];
+        let mut name_length = -1;
+        assert_eq!(
+            unsafe {
+                sql_get_desc_field_w(
+                    h.ipd(),
+                    1,
+                    SQL_DESC_NAME,
+                    name.as_mut_ptr().cast(),
+                    (name.len() * size_of::<u16>()) as SqlInteger,
+                    &mut name_length,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(name_length, 0);
+        assert_eq!(name[0], 0, "the focused child name is empty");
+        let get_small_int = |record_number, field_identifier| {
+            let mut value: SqlSmallInt = 0;
+            assert_eq!(
+                unsafe {
+                    sql_get_desc_field_w(
+                        h.ipd(),
+                        record_number,
+                        field_identifier,
+                        (&mut value as *mut SqlSmallInt).cast(),
+                        0,
+                        ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS
+            );
+            value
+        };
+        assert_eq!(
+            get_small_int(1, SQL_DESC_UNNAMED),
+            SQL_UNNAMED as SqlSmallInt,
+            "an overlapping outer IPD name must not leak into the focused child"
+        );
+        assert_eq!(
+            get_small_int(1, SQL_DESC_PARAMETER_TYPE),
+            SQL_PARAM_INPUT,
+            "an overlapping outer parameter type must not leak into the child"
+        );
+        assert_eq!(
+            get_small_int(2, SQL_DESC_PARAMETER_TYPE),
+            SQL_PARAM_INPUT,
+            "a focused child past the outer IPD count still has a default record"
+        );
+    }
+
+    #[test]
+    fn focused_ipd_nullable_reads_from_the_child_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.tvp_column_bindings.insert(1, vec![None, None]);
+        }
+
+        let mut nullable: SqlSmallInt = -1;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                h.ipd(),
+                2,
+                SQL_DESC_NULLABLE,
+                (&mut nullable as *mut SqlSmallInt).cast(),
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(nullable, SQL_NULLABLE);
     }
 
     #[test]

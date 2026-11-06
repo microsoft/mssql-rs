@@ -3368,7 +3368,7 @@ mod tests {
         // "SELECT 1" is a default registration on the mock server and carries
         // no INFO of its own, so anything reported here leaked from the lookup.
         let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
-        let rc = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let rc = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
 
         let stmt = unsafe { handle_from_raw::<crate::handles::StmtHandle>(h.stmt) };
         let leaked: Vec<String> = stmt
@@ -3417,7 +3417,7 @@ mod tests {
         // state that lets the lookup run and `SQLCloseCursor` follow it.
         let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_SUCCESS
         );
         while unsafe { crate::api::fetch::sql_fetch(h.stmt) } == SQL_SUCCESS {}

@@ -24,8 +24,8 @@ use crate::io::packet_writer::{PacketWriter, TdsPacketWriter, TdsPacketWriterUnc
 use crate::token::tokens::SqlCollation;
 
 // NULL markers for different type classes
-const NULL_LENGTH: u8 = 0x00;
-const VARNULL: u16 = 0xFFFF;
+pub(crate) const NULL_LENGTH: u8 = 0x00;
+pub(crate) const VARNULL: u16 = 0xFFFF;
 
 /// PLP sentinel indicating a SQL NULL value.
 pub const PLP_NULL: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -113,6 +113,17 @@ impl TdsTypeContext {
 pub struct TdsValueSerializer;
 
 impl TdsValueSerializer {
+    fn effective_narrow_string_byte_limit(
+        value: &SqlString,
+        column_limit: Option<usize>,
+    ) -> Option<usize> {
+        match (value.narrow_string_byte_limit(), column_limit) {
+            (Some(value_limit), Some(column_limit)) => Some(value_limit.min(column_limit)),
+            (Some(value_limit), None) => Some(value_limit),
+            (None, column_limit) => column_limit,
+        }
+    }
+
     fn narrow_string_maximum(
         ctx: &TdsTypeContext,
         narrow_string_byte_limit: Option<usize>,
@@ -145,7 +156,7 @@ impl TdsValueSerializer {
         'b: 'a,
     {
         if ctx.tds_type == SQL_VARIANT {
-            return Self::serialize_as_variant(writer, value, ctx, false).await;
+            return Self::serialize_as_variant(writer, value, ctx, None, false).await;
         }
 
         Self::serialize_value_inner(writer, value, ctx, None, false).await
@@ -164,7 +175,8 @@ impl TdsValueSerializer {
         // Check if target column is sql_variant (TDS type SQL_VARIANT)
         // If so, wrap the value with variant wire format
         if ctx.tds_type == SQL_VARIANT {
-            return Self::serialize_as_variant(writer, value, ctx, true).await;
+            return Self::serialize_as_variant(writer, value, ctx, narrow_string_byte_limit, true)
+                .await;
         }
 
         Self::serialize_value_inner(writer, value, ctx, narrow_string_byte_limit, true).await
@@ -179,6 +191,12 @@ impl TdsValueSerializer {
             return Ok(());
         }
 
+        let narrow_string_byte_limit = match value {
+            ColumnValues::String(value) => {
+                Self::effective_narrow_string_byte_limit(value, narrow_string_byte_limit)
+            }
+            _ => narrow_string_byte_limit,
+        };
         let Some(maximum) = Self::narrow_string_maximum(ctx, narrow_string_byte_limit) else {
             return Ok(());
         };
@@ -198,6 +216,8 @@ impl TdsValueSerializer {
             return Ok(None);
         }
 
+        let narrow_string_byte_limit =
+            Self::effective_narrow_string_byte_limit(value, narrow_string_byte_limit);
         let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit);
         if let Some(bytes) = value.as_raw_wire_bytes() {
             let bytes = match maximum {
@@ -214,6 +234,25 @@ impl TdsValueSerializer {
             encoded.bytes.truncate(fitted_len);
         }
         Ok(Some((Cow::Owned(encoded.bytes), encoded.had_loss)))
+    }
+
+    /// Shared by the async string serializer and the batched RPC fast path so
+    /// both emit the same event from the same target.
+    pub(crate) fn trace_variable_length_string(
+        is_unicode: bool,
+        tds_type: u8,
+        char_count: usize,
+        data_len: usize,
+    ) {
+        tracing::debug!(
+            "Writing variable-length string: is_unicode={}, tds_type=0x{:02X}, char_count={}, data_len={}, length_prefix={}, utf16_bytes.len()={}",
+            is_unicode,
+            tds_type,
+            char_count,
+            data_len,
+            data_len as u16,
+            data_len
+        );
     }
 
     /// Serialize a NULL value using the appropriate NULL marker for the type.
@@ -1458,6 +1497,9 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
+        let narrow_string_byte_limit =
+            Self::effective_narrow_string_byte_limit(value, narrow_string_byte_limit);
+
         // For NVARCHAR/NCHAR types, we need UTF-16LE encoding
         // The SqlString might already be UTF-16 encoded, so check first to avoid re-encoding
         let (utf16_bytes, is_unicode) = match ctx.tds_type {
@@ -1642,15 +1684,7 @@ impl TdsValueSerializer {
             // where ADP.CharSize = 2 for Unicode
             let length_prefix = data_len as u16;
 
-            tracing::debug!(
-                "Writing variable-length string: is_unicode={}, tds_type=0x{:02X}, char_count={}, data_len={}, length_prefix={}, utf16_bytes.len()={}",
-                is_unicode,
-                ctx.tds_type,
-                char_count,
-                data_len,
-                length_prefix,
-                utf16_bytes.len()
-            );
+            Self::trace_variable_length_string(is_unicode, ctx.tds_type, char_count, data_len);
 
             writer.write_u16_async(length_prefix).await?;
 
@@ -1963,20 +1997,8 @@ impl TdsValueSerializer {
         Ok(())
     }
 
-    /// Helper to serialize a single-byte string for CHAR/VARCHAR types.
-    ///
-    /// Takes single-byte encoded data and serializes it according to the TDS type context.
     pub(crate) fn fit_narrow_bytes(bytes: &[u8], maximum: usize) -> TdsResult<&[u8]> {
-        if bytes.len() <= maximum {
-            return Ok(bytes);
-        }
-        if bytes[maximum..].iter().all(|byte| *byte == b' ') {
-            return Ok(&bytes[..maximum]);
-        }
-        Err(Error::EncodedValueTooLong {
-            actual: bytes.len(),
-            maximum,
-        })
+        crate::datatypes::sql_string::fit_narrow_byte_limit(bytes, maximum)
     }
 
     async fn serialize_char_varchar_direct<'a, 'b>(
@@ -2082,6 +2104,7 @@ impl TdsValueSerializer {
         writer: &'a mut PacketWriter<'b>,
         value: &ColumnValues,
         ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
         fit_narrow_overflow: bool,
     ) -> TdsResult<()>
     where
@@ -2129,8 +2152,12 @@ impl TdsValueSerializer {
             {
                 let (bytes, had_loss) = Self::resolve_narrow_wire_bytes(s, ctx.collation);
                 narrow_had_loss = had_loss;
+                let narrow_string_byte_limit =
+                    Self::effective_narrow_string_byte_limit(s, narrow_string_byte_limit);
+                let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit)
+                    .unwrap_or(ctx.max_size);
                 if fit_narrow_overflow {
-                    let fitted_len = Self::fit_narrow_bytes(&bytes, ctx.max_size)?.len();
+                    let fitted_len = Self::fit_narrow_bytes(&bytes, maximum)?.len();
                     Some(match bytes {
                         Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..fitted_len]),
                         Cow::Owned(mut bytes) => {
@@ -2139,10 +2166,10 @@ impl TdsValueSerializer {
                         }
                     })
                 } else {
-                    if bytes.len() > ctx.max_size {
+                    if bytes.len() > maximum {
                         return Err(Error::EncodedValueTooLong {
                             actual: bytes.len(),
-                            maximum: ctx.max_size,
+                            maximum,
                         });
                     }
                     Some(bytes)
@@ -4410,6 +4437,43 @@ mod serializer_tests {
         assert_eq!(bytes[4], 0xA7);
         assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 1);
         assert_eq!(&bytes[13..], b"a");
+    }
+
+    #[test]
+    fn variant_varchar_applies_value_level_narrow_byte_limit() {
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 10;
+        ctx.collation = Some(crate::token::tokens::SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        });
+        for (text, value_limit, parameter_limit) in
+            [(b"a ".as_slice(), 1, None), (b"a  ".as_slice(), 2, Some(1))]
+        {
+            let mut mock = MockNetworkWriter::new(128);
+            let mut writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+            let mut value = crate::datatypes::sql_string::SqlString::new(
+                text.to_vec(),
+                crate::datatypes::sql_string::EncodingType::Utf8,
+            );
+            value.set_narrow_string_byte_limit(value_limit);
+            block_on(
+                TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                    &mut writer,
+                    &ColumnValues::String(value),
+                    &ctx,
+                    parameter_limit,
+                ),
+            )
+            .unwrap();
+
+            let bytes = payload(&writer);
+            assert_eq!(&bytes[0..4], &10u32.to_le_bytes());
+            assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 1);
+            assert_eq!(&bytes[13..], b"a");
+        }
     }
 
     /// The collation defaulted when none is known must be the same one used
