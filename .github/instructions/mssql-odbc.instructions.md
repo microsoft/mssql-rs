@@ -559,7 +559,9 @@ on; these guarantees were verified against msodbcsql's behavior.
   `-DODBC_E2E_CONCURRENT=ON`) when CMake configures.
   - Before review, run the `<name>_mt` entry of a test you add or convert in
     every mode (`MSSQL_ODBC_MT_SKIP_MODES=none`, plus `ODBC_E2E_CONCURRENT=ON`
-    on Unix, or `--mt-profile=nightly` / `-MtProfile nightly`):
+    on Unix, or the weekly profile filtered to that entry, e.g.
+    `--mt-profile=weekly --filter='^<name>_mt$'` /
+    `-MtProfile weekly -FilterTests '^<name>_mt$'`):
     PR validation does not cover a test that keeps out of `/SharedDbc`, nor
     any concurrent variant on unixODBC.
   - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests
@@ -582,7 +584,10 @@ on; these guarantees were verified against msodbcsql's behavior.
     `stmt_` must stream that statement's diagnostic, so a busy connection is
     retried rather than failed. PR and stress runs execute the mode.
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
-    connect races) go under `tests/e2e/tests/multithreaded_tests/`.
+    faults under load) go under `tests/e2e/tests/multithreaded_tests/`. Size
+    them with the harness's `LoadConfig()` and register them with
+    `add_odbc_mt_only_test`, which labels them `mt_weekly`: only the weekly
+    stress profile runs them.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
     than loosen the assertion or the mode.
   - For idle `SQLCancel`, use `CancelIdleStatement()` so `SharedStmt` diagnostic
