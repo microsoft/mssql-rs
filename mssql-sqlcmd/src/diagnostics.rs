@@ -119,6 +119,8 @@ impl Encrypt {
 pub enum SettingSource {
     CommandLine,
     Environment,
+    /// The ODBC data source (DSN) that `-D` makes `-S` name (Linux and macOS).
+    Dsn,
     Default,
 }
 
@@ -127,6 +129,7 @@ impl SettingSource {
         match self {
             SettingSource::CommandLine => "commandLine",
             SettingSource::Environment => "environment",
+            SettingSource::Dsn => "dsn",
             SettingSource::Default => "default",
         }
     }
@@ -161,6 +164,14 @@ impl SettingOrigin {
         }
     }
 
+    /// A setting the data source `name` (`-D`) supplied.
+    pub fn dsn(name: impl Into<String>) -> Self {
+        Self {
+            source: SettingSource::Dsn,
+            name: Some(name.into()),
+        }
+    }
+
     pub fn text_name(&self) -> &str {
         self.name.as_deref().unwrap_or("default")
     }
@@ -181,6 +192,18 @@ pub struct SettingSources {
 }
 
 impl SettingSources {
+    /// The data source (`-D`) that supplied the setting `field` picks, when one
+    /// did.
+    pub fn dsn_name(&self, field: impl Fn(&Self) -> &Option<SettingOrigin>) -> Option<String> {
+        match field(self) {
+            Some(SettingOrigin {
+                source: SettingSource::Dsn,
+                name: Some(name),
+            }) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.server.is_none()
             && self.database.is_none()
@@ -191,6 +214,29 @@ impl SettingSources {
             && self.host_name_in_certificate.is_none()
             && self.login_timeout.is_none()
     }
+}
+
+/// The ODBC data source (DSN) that `-D` makes `-S` name, as native sqlcmd
+/// resolved it from the user and system `odbc.ini` (Linux and macOS; sqlcmd on
+/// Windows treats `-D` as obsolete).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dsn {
+    /// The data source name given to `-S`.
+    pub name: String,
+    pub status: DsnStatus,
+}
+
+/// What native sqlcmd found for the data source given with `-D`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DsnStatus {
+    /// Found: the settings it supplied carry [`SettingSource::Dsn`].
+    Found,
+    /// No data source of that name, with a driver, in the user or system
+    /// `odbc.ini`: the driver manager cannot load a driver for it.
+    NotFound,
+    /// Found, but it names no server: as the driver does then, the data
+    /// source name is the server (the request's `server`, from the default).
+    NoServer,
 }
 
 /// How far the diagnosis goes. Each depth includes the ones before it.
@@ -261,6 +307,9 @@ pub struct Request {
     pub invalid: Option<String>,
     /// Where resolved non-secret connection settings came from.
     pub sources: SettingSources,
+    /// The data source `-D` names, when it was given. When it was found,
+    /// `server` is the server it names; otherwise `server` is empty.
+    pub dsn: Option<Dsn>,
 }
 
 impl Request {
@@ -286,7 +335,7 @@ impl Request {
 /// The version of the diagnostic coverage matrix this implementation follows
 /// (`docs/diagnose-coverage.md`): which phases are checked, with which signals,
 /// and which coverage states each can report.
-pub const COVERAGE_MATRIX_VERSION: &str = "1.2";
+pub const COVERAGE_MATRIX_VERSION: &str = "1.3";
 
 /// The Microsoft Learn page on driver tracing for `sqlcmd diagnose`, given when
 /// the client's own evidence cannot explain a failure.
@@ -3328,9 +3377,33 @@ impl Diagnosis {
     }
     fn connection_input(&mut self) -> Option<Target> {
         let started = Instant::now();
+        if let Some(dsn) = self.request.dsn.clone() {
+            match dsn.status {
+                DsnStatus::Found => {}
+                DsnStatus::NotFound => {
+                    self.dsn_not_found(&dsn, started);
+                    return None;
+                }
+                DsnStatus::NoServer => self.finding(
+                    Certainty::Informational,
+                    CheckId::ConnectionInput,
+                    LocalizedText::new(
+                        "diagnose.finding.dsn_no_server",
+                        format!(
+                            "The DSN {} given with -D names no server, so sqlcmd uses the DSN name as the server.",
+                            dsn.name
+                        ),
+                        vec![("dsn", dsn.name.clone())],
+                    ),
+                ),
+            }
+        }
         let parsed = target::parse_for(&self.request.server, self.windows);
         let mut check = Check::new(CheckId::ConnectionInput, Coverage::Passed);
         check.duration_ms = Some(millis(started));
+        if let Some(dsn) = &self.request.dsn {
+            check.fields.push(Field::plain("dsn", dsn.name.clone()));
+        }
         match parsed {
             Ok(target) => {
                 check
@@ -3373,15 +3446,25 @@ impl Diagnosis {
                 }
                 if self.request.trust_server_certificate && self.request.encrypt == Encrypt::Strict
                 {
-                    self.finding(
-                        Certainty::Informational,
-                        CheckId::ConnectionInput,
-                        LocalizedText::new(
+                    let text = match self
+                        .request
+                        .sources
+                        .dsn_name(|s| &s.trust_server_certificate)
+                    {
+                        Some(dsn) => LocalizedText::new(
+                            "diagnose.finding.dsn_trust_ignored_with_strict_encryption",
+                            format!(
+                                "The DSN {dsn} sets TrustServerCertificate=yes, which is ignored with strict encryption (-Ns): the server certificate is validated."
+                            ),
+                            vec![("dsn", dsn)],
+                        ),
+                        None => LocalizedText::new(
                             "diagnose.finding.trust_ignored_with_strict_encryption",
                             "-C is ignored with strict encryption (-Ns): the server certificate is validated.",
                             vec![],
                         ),
-                    );
+                    };
+                    self.finding(Certainty::Informational, CheckId::ConnectionInput, text);
                 } else if self.request.trust_server_certificate
                     && self
                         .request
@@ -3389,16 +3472,27 @@ impl Diagnosis {
                         .as_deref()
                         .is_some_and(|name| !name.is_empty())
                 {
-                    self.finding(
-                        Certainty::Informational,
-                        CheckId::ConnectionInput,
-                        LocalizedText::new(
+                    let sources = &self.request.sources;
+                    let text = match sources
+                        .dsn_name(|s| &s.trust_server_certificate)
+                        .or_else(|| sources.dsn_name(|s| &s.host_name_in_certificate))
+                    {
+                        Some(dsn) => LocalizedText::new(
+                            "diagnose.finding.dsn_certificate_name_not_validated_when_trusted",
+                            format!(
+                                "The certificate host name is not validated when the server certificate is trusted (DSN {dsn})."
+                            ),
+                            vec![("dsn", dsn)],
+                        ),
+                        None => LocalizedText::new(
                             "diagnose.finding.certificate_name_not_validated_when_trusted",
                             "The certificate host name from -F is not validated when -C trusts the server certificate.",
                             vec![],
                         ),
-                    );
+                    };
+                    self.finding(Certainty::Informational, CheckId::ConnectionInput, text);
                 }
+                self.trusted_connection_from_dsn_finding();
                 Some(target)
             }
             Err(error) => {
@@ -3408,33 +3502,58 @@ impl Diagnosis {
                 self.checks.push(check);
                 let error_text = LocalizedText::from(&error);
                 let error_english = error_text.render("en-US");
+                let error_arg = LocalizedArg::message_with_args(
+                    "error",
+                    error.message_id(),
+                    error_english.clone(),
+                    error_text.args.clone(),
+                );
                 // The client's own messages end with their period: the
                 // finding adds none of its own after them.
-                let (id, english) = if error_english.ends_with('.') {
-                    (
-                        "diagnose.finding.server_parse_failed_sentence",
-                        format!("The server given to -S could not be parsed: {error_english}"),
-                    )
-                } else {
-                    (
-                        "diagnose.finding.server_parse_failed",
-                        format!("The server given to -S could not be parsed: {error_english}."),
-                    )
+                let sentence = error_english.ends_with('.');
+                let finding = match self.request.dsn.as_ref().map(|dsn| dsn.name.clone()) {
+                    Some(dsn) => {
+                        let (id, english) = if sentence {
+                            (
+                                "diagnose.finding.dsn_server_parse_failed_sentence",
+                                format!(
+                                    "The server in DSN {dsn} could not be parsed: {error_english}"
+                                ),
+                            )
+                        } else {
+                            (
+                                "diagnose.finding.dsn_server_parse_failed",
+                                format!(
+                                    "The server in DSN {dsn} could not be parsed: {error_english}."
+                                ),
+                            )
+                        };
+                        LocalizedText::new_with_args(
+                            id,
+                            english,
+                            vec![LocalizedArg::text("dsn", dsn), error_arg],
+                        )
+                    }
+                    None => {
+                        let (id, english) = if sentence {
+                            (
+                                "diagnose.finding.server_parse_failed_sentence",
+                                format!(
+                                    "The server given to -S could not be parsed: {error_english}"
+                                ),
+                            )
+                        } else {
+                            (
+                                "diagnose.finding.server_parse_failed",
+                                format!(
+                                    "The server given to -S could not be parsed: {error_english}."
+                                ),
+                            )
+                        };
+                        LocalizedText::new_with_args(id, english, vec![error_arg])
+                    }
                 };
-                self.finding(
-                    Certainty::Confirmed,
-                    CheckId::ConnectionInput,
-                    LocalizedText::new_with_args(
-                        id,
-                        english,
-                        vec![LocalizedArg::message_with_args(
-                            "error",
-                            error.message_id(),
-                            error_english,
-                            error_text.args.clone(),
-                        )],
-                    ),
-                );
+                self.finding(Certainty::Confirmed, CheckId::ConnectionInput, finding);
                 let mut record = ErrorRecord::new("sqlcmd", CheckId::ConnectionInput, "");
                 record.message = error_text;
                 record.code = Some(error.code().to_string());
@@ -3446,6 +3565,72 @@ impl Diagnosis {
                 None
             }
         }
+    }
+
+    /// Connection input for a data source (`-D`) that was not found: there is
+    /// no server for the later checks, which are skipped.
+    fn dsn_not_found(&mut self, dsn: &Dsn, started: Instant) {
+        const CODE: &str = "dsnNotFound";
+        let mut check = Check::new(CheckId::ConnectionInput, Coverage::Diagnosed);
+        check.duration_ms = Some(millis(started));
+        check.fields.push(Field::plain("dsn", dsn.name.clone()));
+        check.fields.push(Field::plain("error", CODE));
+        check.domain = Some(Domain::specific("client.inputConfiguration"));
+        self.checks.push(check);
+        let name = dsn.name.clone();
+        let text = LocalizedText::new(
+            "diagnose.finding.dsn_not_found",
+            format!(
+                "The DSN {name} given with -D was not found in the user or system odbc.ini, or it names no driver."
+            ),
+            vec![("dsn", name)],
+        );
+        self.finding(Certainty::Confirmed, CheckId::ConnectionInput, text.clone());
+        let mut record = ErrorRecord::new("sqlcmd", CheckId::ConnectionInput, "");
+        record.message = text;
+        record.code = Some(CODE.to_string());
+        self.errors.push(record);
+        self.skip_rest(
+            CheckId::ConnectionInput,
+            &Skip::BlockedBy(CheckId::ConnectionInput),
+        );
+    }
+
+    /// A login given with `-U` (or `SQLCMDUSER`) is not used when the data
+    /// source sets `Trusted_Connection=yes`: the driver then logs in with
+    /// integrated authentication, as native sqlcmd resolved it.
+    fn trusted_connection_from_dsn_finding(&mut self) {
+        let sources = &self.request.sources;
+        let Some(SettingOrigin {
+            source: SettingSource::Dsn,
+            name: Some(dsn),
+        }) = &sources.authentication
+        else {
+            return;
+        };
+        let Some(user) = sources.user.as_ref().filter(|user| {
+            matches!(
+                user.source,
+                SettingSource::CommandLine | SettingSource::Environment
+            )
+        }) else {
+            return;
+        };
+        if self.request.authentication != Authentication::Integrated {
+            return;
+        }
+        let (dsn, login) = (dsn.clone(), user.text_name().to_string());
+        self.finding(
+            Certainty::Informational,
+            CheckId::ConnectionInput,
+            LocalizedText::new(
+                "diagnose.finding.dsn_trusted_connection_ignores_login",
+                format!(
+                    "The DSN {dsn} sets Trusted_Connection=yes, so sqlcmd logs in with integrated authentication and does not use the login from {login}."
+                ),
+                vec![("dsn", dsn), ("source", login)],
+            ),
+        );
     }
 
     fn client_context(&self) -> ClientContext {
@@ -4755,6 +4940,7 @@ pub(crate) mod tests {
             local_detail: false,
             invalid: None,
             sources: SettingSources::default(),
+            dsn: None,
         }
     }
 
@@ -5298,6 +5484,258 @@ pub(crate) mod tests {
                 "{locale}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn a_dsn_and_the_settings_it_supplied_are_reported() {
+        let mut from_dsn = request("tcp:db01,1433", Depth::ConnectionInput);
+        from_dsn.database = Some("sales".to_string());
+        from_dsn.authentication = Authentication::Integrated;
+        from_dsn.dsn = Some(Dsn {
+            name: "SalesDsn".to_string(),
+            status: DsnStatus::Found,
+        });
+        from_dsn.sources = SettingSources {
+            server: Some(SettingOrigin::dsn("SalesDsn")),
+            database: Some(SettingOrigin::dsn("SalesDsn")),
+            authentication: Some(SettingOrigin::dsn("SalesDsn")),
+            encrypt: Some(SettingOrigin::default_source()),
+            login_timeout: Some(SettingOrigin::command_line("-l")),
+            ..SettingSources::default()
+        };
+
+        let report = run(from_dsn);
+        assert_eq!(report.checks[0].coverage, Coverage::Passed);
+        assert_eq!(report.checks[0].field("dsn"), Some("SalesDsn"));
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        let text = report::text(&report);
+        assert!(text.contains("sqlcmd diagnose: tcp:db01,1433\n"), "{text}");
+        assert!(
+            text.contains("server from DSN SalesDsn, authentication from DSN SalesDsn, database from DSN SalesDsn, encrypt default, time limit from -l\n"),
+            "{text}"
+        );
+        let json = report::json(&report, "18.7.0001.1").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let input = &value["checks"][0];
+        assert_eq!(input["dsn"], "SalesDsn", "{json}");
+        for setting in ["server", "database", "authentication"] {
+            assert_eq!(
+                input["sources"][setting],
+                serde_json::json!({ "source": "dsn", "name": "SalesDsn" }),
+                "{setting}: {json}"
+            );
+        }
+        assert_eq!(value["target"]["authentication"], "Integrated", "{json}");
+    }
+
+    /// A data source that was not found leaves no server: connection input is
+    /// diagnosed and every later check is skipped.
+    #[test]
+    fn a_dsn_that_is_not_found_is_a_connection_input_issue() {
+        let code = "dsnNotFound";
+        let mut missing = request("", Depth::SessionValidation);
+        missing.dsn = Some(Dsn {
+            name: "SalesDsn".to_string(),
+            status: DsnStatus::NotFound,
+        });
+        let report = run(missing);
+        assert_eq!(report.checks[0].id, CheckId::ConnectionInput);
+        assert_eq!(report.checks[0].coverage, Coverage::Diagnosed);
+        assert_eq!(report.checks[0].field("error"), Some(code));
+        assert_eq!(report.checks[0].field("dsn"), Some("SalesDsn"));
+        assert!(report.checks.len() > 1);
+        assert!(
+            report.checks[1..]
+                .iter()
+                .all(|c| c.skip == Some(Skip::BlockedBy(CheckId::ConnectionInput))),
+            "{:#?}",
+            report.checks
+        );
+        assert_eq!(report.errors.len(), 1, "{:#?}", report.errors);
+        assert_eq!(report.errors[0].code.as_deref(), Some(code));
+        let findings: Vec<String> = report
+            .findings
+            .iter()
+            .map(|f| f.text.render("en-US"))
+            .collect();
+        assert_eq!(
+            findings,
+            [
+                "The DSN SalesDsn given with -D was not found in the user or system odbc.ini, or it names no driver."
+            ]
+        );
+        assert_eq!(report.outcome, DiagnosticOutcome::IssueDetected);
+        assert_eq!(report.exit_code(), 1);
+        let text = report::text(&report);
+        assert!(text.contains("sqlcmd diagnose: DSN SalesDsn\n"), "{text}");
+        let json = report::json(&report, "18.7.0001.1").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["checks"][0]["error"], code, "{json}");
+        assert_eq!(value["checks"][0]["dsn"], "SalesDsn", "{json}");
+    }
+
+    /// The driver connects to the data source name when the data source names
+    /// no server: connection input says so, and the checks go on with it.
+    #[test]
+    fn a_dsn_that_names_no_server_is_its_own_server() {
+        let mut no_server = request("SalesDsn", Depth::ConnectionInput);
+        no_server.dsn = Some(Dsn {
+            name: "SalesDsn".to_string(),
+            status: DsnStatus::NoServer,
+        });
+        no_server.sources.server = Some(SettingOrigin::default_source());
+        let report = run(no_server);
+        assert_eq!(report.checks[0].id, CheckId::ConnectionInput);
+        assert_eq!(report.checks[0].coverage, Coverage::Passed);
+        assert_eq!(report.checks[0].field("dsn"), Some("SalesDsn"));
+        assert_eq!(report.checks[0].field("host"), Some("SalesDsn"));
+        assert!(report.errors.is_empty(), "{:#?}", report.errors);
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        assert_eq!(report.findings[0].certainty, Certainty::Informational);
+        assert_eq!(
+            report.findings[0].text.render("en-US"),
+            "The DSN SalesDsn given with -D names no server, so sqlcmd uses the DSN name as the server."
+        );
+        assert_eq!(report.outcome, DiagnosticOutcome::Passed);
+    }
+
+    #[test]
+    fn a_dsn_server_that_cannot_be_parsed_names_the_dsn() {
+        let mut bad = request("tcp:127.0.0.1, 50001 \\SQL2022", Depth::ConnectionInput);
+        bad.dsn = Some(Dsn {
+            name: "SalesDsn".to_string(),
+            status: DsnStatus::Found,
+        });
+        let report = run(bad);
+        assert_eq!(report.checks[0].coverage, Coverage::Diagnosed);
+        assert_eq!(report.errors[0].code.as_deref(), Some("invalidPort"));
+        let finding = report.findings[0].text.render("en-US");
+        assert!(
+            finding.starts_with("The server in DSN SalesDsn could not be parsed: "),
+            "{finding}"
+        );
+        assert!(!finding.contains("-S"), "{finding}");
+    }
+
+    /// The driver logs in with integrated authentication when the data source
+    /// sets `Trusted_Connection=yes`, and does not use a login given with `-U`
+    /// or `SQLCMDUSER`.
+    #[test]
+    fn a_dsn_trusted_connection_is_reported_over_the_login() {
+        let findings = |user: Option<SettingOrigin>, authentication: SettingOrigin| {
+            let mut trusted = request("tcp:db01,1433", Depth::ConnectionInput);
+            trusted.authentication = Authentication::Integrated;
+            trusted.dsn = Some(Dsn {
+                name: "SalesDsn".to_string(),
+                status: DsnStatus::Found,
+            });
+            trusted.sources.user = user;
+            trusted.sources.authentication = Some(authentication);
+            run(trusted)
+                .findings
+                .iter()
+                .map(|f| f.text.render("en-US"))
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            findings(
+                Some(SettingOrigin::command_line("-U")),
+                SettingOrigin::dsn("SalesDsn")
+            ),
+            [
+                "The DSN SalesDsn sets Trusted_Connection=yes, so sqlcmd logs in with integrated authentication and does not use the login from -U."
+            ]
+        );
+        assert_eq!(
+            findings(
+                Some(SettingOrigin::environment("SQLCMDUSER")),
+                SettingOrigin::dsn("SalesDsn")
+            ),
+            [
+                "The DSN SalesDsn sets Trusted_Connection=yes, so sqlcmd logs in with integrated authentication and does not use the login from SQLCMDUSER."
+            ]
+        );
+        // -E chose it, or no login was given: nothing goes unused.
+        assert!(
+            findings(
+                Some(SettingOrigin::command_line("-U")),
+                SettingOrigin::command_line("-E")
+            )
+            .is_empty()
+        );
+        assert!(findings(None, SettingOrigin::dsn("SalesDsn")).is_empty());
+    }
+
+    /// With -D and neither -U nor -E, the driver logs in as a SQL login with
+    /// no name: the depth line shows no name for it.
+    #[test]
+    fn a_login_with_no_name_is_shown_without_one() {
+        let mut nameless = request("tcp:db01,1433", Depth::ConnectionInput);
+        nameless.authentication = Authentication::SqlPassword {
+            user: String::new(),
+            password: String::new(),
+        };
+        let text = report::text(&run(nameless));
+        assert!(
+            text.contains("; SqlPassword login; encrypt mandatory"),
+            "{text}"
+        );
+    }
+
+    /// Certificate settings a data source supplied name it, not -C or -F, in
+    /// the depth line and in the findings about them.
+    #[test]
+    fn dsn_certificate_settings_name_the_dsn() {
+        let report_for = |encrypt: Encrypt| {
+            let mut from_dsn = request("tcp:db01,1433", Depth::ConnectionInput);
+            from_dsn.encrypt = encrypt;
+            from_dsn.host_name_in_certificate = Some("db01.contoso.com".to_string());
+            from_dsn.dsn = Some(Dsn {
+                name: "SalesDsn".to_string(),
+                status: DsnStatus::Found,
+            });
+            from_dsn.sources = SettingSources {
+                trust_server_certificate: Some(SettingOrigin::dsn("SalesDsn")),
+                host_name_in_certificate: Some(SettingOrigin::dsn("SalesDsn")),
+                ..SettingSources::default()
+            };
+            let report = run(from_dsn);
+            let findings: Vec<String> = report
+                .findings
+                .iter()
+                .map(|f| f.text.render("en-US"))
+                .collect();
+            (report::text(&report), findings)
+        };
+
+        let (text, findings) = report_for(Encrypt::Mandatory);
+        assert!(
+            text.contains(
+                "; server certificate trusted (DSN SalesDsn); certificate name db01.contoso.com (DSN SalesDsn)\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            findings,
+            [
+                "The certificate host name is not validated when the server certificate is trusted (DSN SalesDsn)."
+            ]
+        );
+
+        let (text, findings) = report_for(Encrypt::Strict);
+        assert!(
+            text.contains(
+                "; TrustServerCertificate from DSN SalesDsn ignored (strict encryption validates the certificate)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("-C"), "{text}");
+        assert_eq!(
+            findings,
+            [
+                "The DSN SalesDsn sets TrustServerCertificate=yes, which is ignored with strict encryption (-Ns): the server certificate is validated."
+            ]
+        );
     }
 
     #[test]
