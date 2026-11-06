@@ -1121,6 +1121,10 @@ unfinished `get()` calls. Returning a slot removes its previous demand before
 another admission can inspect the count. Deadpool remains the only FIFO
 capacity scheduler and idle-slot store.
 
+Only the bounded, non-I/O slot-get future bypasses Tokio's cooperative budget,
+so an exhausted caller cannot defer slot acquisition or FIFO registration.
+Physical opening, reset and cleanup must not inherit that exemption.
+
 A registration map owns pending get futures and grants held behind maintenance
 so disable and lazy deadline expiration can reclaim them without waiting for
 their callers to resume.
@@ -1131,7 +1135,8 @@ pool-wide until off-lock client destruction finishes. Admission and Deadpool
 FIFO assignment continue during that barrier, preserving exact queue limits
 and order even if callers resume in reverse order.
 
-The tests cover exact queue boundaries, FIFO/retry admission, cancellation,
+The tests cover exact queue boundaries, exhausted-budget acquisition and FIFO
+admission, retry admission, cancellation,
 deadline expiry, generation retention, idle age, maintenance, shutdown and
 client-before-slot destruction, using instrumented fake clients. These lifecycle
 experiments test feasibility only; they do not complete A2's production manager,

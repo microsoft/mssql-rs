@@ -384,7 +384,9 @@ impl Future for Acquire {
             state.pending.insert(
                 id,
                 PendingGet {
-                    get: Some(Box::pin(async move { slots.get().await })),
+                    get: Some(Box::pin(tokio::task::unconstrained(async move {
+                        slots.get().await
+                    }))),
                     assigned: None,
                     deadline: this.deadline.deadline(),
                     waker: cx.waker().clone(),
@@ -565,6 +567,53 @@ fn ready(request: &mut Acquire) -> Lease {
 
 fn request(pool: &Arc<Prototype>) -> Acquire {
     pool.acquire(Instant::now() + std::time::Duration::from_secs(30))
+}
+
+#[tokio::test]
+async fn exhausted_cooperative_budget_acquires_free_and_recycled_slots_promptly() {
+    let pool = Prototype::new(1, None);
+    let observations = Arc::default();
+    while tokio::task::coop::has_budget_remaining() {
+        tokio::task::consume_budget().await;
+    }
+
+    let lease = ready(&mut request(&pool));
+    lease.install(Client::new(1, &observations));
+    lease.release_clean();
+    assert!(!tokio::task::coop::has_budget_remaining());
+    let lease = ready(&mut request(&pool));
+    assert_eq!(lease.client_id(), Some(1));
+    drop(lease);
+    assert_eq!(observations.lock().unwrap().destroyed, [1]);
+    assert_eq!(pool.state.lock().unwrap().demand, 0);
+}
+
+#[tokio::test]
+async fn exhausted_cooperative_budget_admits_waiters_before_newcomers() {
+    let pool = Prototype::new(1, Some(1));
+    let lease = ready(&mut request(&pool));
+    while tokio::task::coop::has_budget_remaining() {
+        tokio::task::consume_budget().await;
+    }
+
+    let mut older = request(&pool);
+    assert!(poll(&mut older).is_pending());
+    drop(lease);
+    let mut newer = request(&pool);
+    assert!(
+        tokio::task::unconstrained(async { poll(&mut newer) })
+            .await
+            .is_pending()
+    );
+    assert!(matches!(
+        poll(&mut request(&pool)),
+        Poll::Ready(Err(Error::WaitQueueFull))
+    ));
+    let older = ready(&mut older);
+    assert!(poll(&mut newer).is_pending());
+    drop(older);
+    drop(ready(&mut newer));
+    assert_eq!(pool.state.lock().unwrap().demand, 0);
 }
 
 #[tokio::test]
