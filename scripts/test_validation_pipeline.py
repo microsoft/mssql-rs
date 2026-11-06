@@ -458,7 +458,8 @@ def test_windows_stress_ctest_groups_are_exhaustive_and_disjoint(tmp_path, windo
         encoding="utf-8"
     )
     # Model every suite as converted, including ones not converted yet.
-    suites = set(re.findall(r"^add_odbc_(?:direct_load_)?test\((\w+)", cmake, re.M))
+    suites = set(re.findall(r"^add_odbc_(?:direct_load_|mt_only_)?test\((\w+)", cmake, re.M))
+    assert {"handle_lifecycle_test", "fault_recovery_test"} <= suites
     suites.add("future_suite_test")
     entries = {f"{suite}_mt" for suite in suites}
     testfile = tmp_path / "CTestTestfile.cmake"
