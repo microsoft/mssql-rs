@@ -16,6 +16,8 @@ pub const MAX_PACKET_SIZE: usize = 4096;
 
 const PLP_TYPE_LENGTH_MARKER: u16 = 0xFFFF;
 const MAX_BOUNDED_STRING_BYTES: u16 = 8000;
+/// DONE status flag: more result sets follow in this response.
+const DONE_MORE: u16 = 0x0001;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -78,6 +80,11 @@ impl PacketStatus {
 
     pub fn is_end_of_message(&self) -> bool {
         self.0 & 0x01 != 0
+    }
+
+    /// Set with EOM when a client withdraws a partly sent message.
+    pub fn is_ignore(&self) -> bool {
+        self.0 & 0x02 != 0
     }
 }
 
@@ -164,6 +171,8 @@ pub enum TokenType {
     FeatureExtAck = 0xAE,
 }
 
+/// Session recovery feature extension ID
+pub const FEATURE_EXT_SESSION_RECOVERY: u8 = 0x01;
 /// FedAuth feature extension ID
 pub const FEATURE_EXT_FEDAUTH: u8 = 0x02;
 /// Data Classification feature extension ID
@@ -215,7 +224,15 @@ fn read_login7_string(data: &[u8], entry: usize) -> Option<String> {
 
 /// Parse Login7 packet to extract FedAuth feature extension with access token
 pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
+    parse_login7(packet_data).0
+}
+
+/// [`parse_login7_auth`], plus whether the session-recovery feature carried
+/// session state, which only a reconnect does. Kept out of [`Login7AuthInfo`]
+/// so that published struct keeps its shape.
+pub(crate) fn parse_login7(packet_data: &[u8]) -> (Login7AuthInfo, bool) {
     let mut auth_info = Login7AuthInfo::default();
+    let mut carries_session_state = false;
 
     // Login7 packet structure (offsets from start of Login7 body after TDS header):
     // - 4 bytes: Length (offset 0)
@@ -240,7 +257,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
 
     if data.len() < 56 {
         debug!("Login7 packet too short for server name parsing");
-        return auth_info;
+        return (auth_info, false);
     }
 
     // Parse ServerName from offset table
@@ -276,7 +293,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
 
     if !has_feature_ext {
         debug!("Login7 does not have feature extension");
-        return auth_info;
+        return (auth_info, false);
     }
 
     // The FeatureExt entry in the Login7 offset table is at bytes 56-59
@@ -285,7 +302,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
     // That DWORD is the actual offset to the feature extension list.
     if data.len() < 60 {
         debug!("Login7 packet too short for FeatureExt offset table entry");
-        return auth_info;
+        return (auth_info, false);
     }
 
     let feat_ext_ptr_offset = u16::from_le_bytes([data[56], data[57]]) as usize;
@@ -297,7 +314,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             feat_ext_ptr_offset,
             data.len()
         );
-        return auth_info;
+        return (auth_info, false);
     }
 
     let feature_ext_offset = u32::from_le_bytes([
@@ -318,7 +335,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             feature_ext_offset,
             data.len()
         );
-        return auth_info;
+        return (auth_info, false);
     }
 
     // Parse feature extension entries starting at feature_ext_offset
@@ -371,6 +388,8 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
             }
         } else if feature_id == FEATURE_EXT_DATA_CLASSIFICATION && feat_len >= 1 {
             auth_info.data_classification_version = data.get(i + 5).copied();
+        } else if feature_id == FEATURE_EXT_SESSION_RECOVERY {
+            carries_session_state = feat_len > 0;
         } else if feature_id == FEATURE_EXT_USER_AGENT && i + 5 + feat_len <= data.len() {
             let feat_data = &data[i + 5..i + 5 + feat_len];
             if feat_data.len().is_multiple_of(2) {
@@ -394,7 +413,7 @@ pub fn parse_login7_auth(packet_data: &[u8]) -> Login7AuthInfo {
         i += 5 + feat_len;
     }
 
-    auth_info
+    (auth_info, carries_session_state)
 }
 
 /// Build a PreLogin response packet
@@ -527,12 +546,18 @@ pub fn build_feature_ext_ack_fedauth() -> BytesMut {
 
 /// Build a FeatureExtAck token enabling Data Classification at `version`.
 pub fn build_feature_ext_ack_data_classification(version: u8) -> BytesMut {
+    build_feature_ext_ack(&[(FEATURE_EXT_DATA_CLASSIFICATION, vec![version, 1])])
+}
+
+/// Build one FeatureExtAck token acknowledging each `(feature id, data)` pair.
+pub fn build_feature_ext_ack(features: &[(u8, Vec<u8>)]) -> BytesMut {
     let mut token_data = BytesMut::new();
     token_data.put_u8(TokenType::FeatureExtAck as u8);
-    token_data.put_u8(FEATURE_EXT_DATA_CLASSIFICATION);
-    token_data.put_u32_le(2);
-    token_data.put_u8(version);
-    token_data.put_u8(1); // IsEnabled
+    for (feature_id, data) in features {
+        token_data.put_u8(*feature_id);
+        token_data.put_u32_le(data.len() as u32);
+        token_data.put_slice(data);
+    }
     token_data.put_u8(FEATURE_EXT_TERMINATOR);
     token_data
 }
@@ -740,7 +765,7 @@ pub fn build_login_ack() -> BytesMut {
 /// row count. The lower-level primitive behind [`build_done_token`] (which
 /// always passes `DONE_FINAL`) and [`build_attention_ack_packet`] (which needs
 /// `DONE_ATTN` instead).
-fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
+pub(crate) fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
     let mut token_data = BytesMut::new();
 
     // DONE token (0xFD)
@@ -996,6 +1021,21 @@ pub fn build_query_result_with_extras(
     data_classification: &[u8],
     trailing_info: &[crate::query_response::InfoMessage],
 ) -> BytesMut {
+    build_query_results(response, data_classification, &[], trailing_info)
+}
+
+/// Build a response of one or more result sets. `response` and its
+/// `data_classification` bytes form the first set; each of `following` comes
+/// after it, every DONE but the last carrying `DONE_MORE`. `trailing_info`
+/// follows the last set's rows.
+///
+/// Only the first set's `leading_error` and `terminal_error` are honoured.
+pub fn build_query_results(
+    response: &crate::query_response::QueryResponse,
+    data_classification: &[u8],
+    following: &[crate::query_response::ResultSetResponse],
+    trailing_info: &[crate::query_response::InfoMessage],
+) -> BytesMut {
     let mut result = BytesMut::new();
 
     // A terminal error replaces the result set entirely: no ColMetadata, no
@@ -1011,7 +1051,34 @@ pub fn build_query_result_with_extras(
         result.extend_from_slice(&build_leading_error_tokens(leading_error));
     }
 
-    // ColMetadata token (0x81)
+    let sets = std::iter::once((response, data_classification)).chain(
+        following
+            .iter()
+            .map(|set| (&set.response, set.data_classification.as_slice())),
+    );
+    let last = following.len();
+    for (index, (set, data_classification)) in sets.enumerate() {
+        let is_last = index == last;
+        append_result_set(
+            &mut result,
+            set,
+            data_classification,
+            if is_last { trailing_info } else { &[] },
+            !is_last,
+        );
+    }
+    wrap_in_packet(PacketType::TabularResult, result)
+}
+
+/// Appends ColMetadata, an optional DATACLASSIFICATION token, rows,
+/// `trailing_info`, and the DONE closing the set.
+fn append_result_set(
+    result: &mut BytesMut,
+    response: &crate::query_response::QueryResponse,
+    data_classification: &[u8],
+    trailing_info: &[crate::query_response::InfoMessage],
+    more: bool,
+) {
     result.put_u8(TokenType::ColMetadata as u8);
     result.put_u16_le(response.columns.len() as u16); // Column count
 
@@ -1066,7 +1133,7 @@ pub fn build_query_result_with_extras(
     for row in &response.rows {
         result.put_u8(TokenType::Row as u8);
         for value in &row.values {
-            value.write_to_buffer(&mut result);
+            value.write_to_buffer(result);
         }
     }
 
@@ -1076,9 +1143,11 @@ pub fn build_query_result_with_extras(
         result.extend_from_slice(&build_info_token(info));
     }
 
-    // DONE token
-    result.extend_from_slice(&build_done_token(response.rows.len() as u64));
-    wrap_in_packet(PacketType::TabularResult, result)
+    let status = if more { DONE_MORE } else { 0x0000 };
+    result.extend_from_slice(&build_done_token_with_status(
+        status,
+        response.rows.len() as u64,
+    ));
 }
 
 /// Build an error response
@@ -1621,6 +1690,33 @@ mod tests {
             build_feature_ext_ack_data_classification(2).as_ref(),
             [0xAE, 0x09, 2, 0, 0, 0, 2, 1, 0xFF]
         );
+    }
+
+    /// Each set gets its own classification bytes, and every DONE but the
+    /// last carries DONE_MORE so the client keeps reading.
+    #[test]
+    fn build_query_results_chains_result_sets_with_done_more() {
+        let empty = crate::query_response::QueryResponse::new(Vec::new(), Vec::new());
+        let packet = build_query_results(
+            &empty,
+            &[0xA3, 0xAA],
+            &[crate::query_response::ResultSetResponse::new(
+                empty.clone(),
+                Vec::new(),
+            )],
+            &[],
+        );
+
+        let done = |status: u8| {
+            let mut token = vec![TokenType::Done as u8, status, 0, 0xC1, 0];
+            token.extend_from_slice(&[0; 8]);
+            token
+        };
+        let mut expected = vec![TokenType::ColMetadata as u8, 0, 0, 0xA3, 0xAA];
+        expected.extend(done(0x01));
+        expected.extend([TokenType::ColMetadata as u8, 0, 0]);
+        expected.extend(done(0x00));
+        assert_eq!(&packet[PACKET_HEADER_SIZE..], expected.as_slice());
     }
 
     #[test]

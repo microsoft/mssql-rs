@@ -4,18 +4,18 @@
 //! Mock TDS Server implementation
 
 use crate::protocol::{
-    FEATURE_EXT_ENHANCED_ROUTING, PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError,
-    TM_BEGIN_XACT, TM_COMMIT_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
-    build_error_response, build_feature_ext_ack_data_classification, build_feature_ext_ack_fedauth,
-    build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
-    build_prelogin_response_with_fedauth, build_query_result_with_extras,
-    build_routing_login_response, build_transaction_manager_response, parse_fedauth_token,
-    parse_login7_auth, parse_sql_batch, parse_transaction_descriptor_header,
-    parse_transaction_manager_request,
+    FEATURE_EXT_DATA_CLASSIFICATION, FEATURE_EXT_ENHANCED_ROUTING, FEATURE_EXT_SESSION_RECOVERY,
+    PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT, TM_COMMIT_XACT,
+    TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token, build_error_response,
+    build_feature_ext_ack, build_feature_ext_ack_fedauth, build_fedauth_challenge_response,
+    build_login_ack, build_prelogin_response, build_prelogin_response_with_fedauth,
+    build_query_results, build_routing_login_response, build_transaction_manager_response,
+    parse_fedauth_token, parse_login7, parse_login7_auth, parse_sql_batch,
+    parse_transaction_descriptor_header, parse_transaction_manager_request,
 };
 use crate::query_response::{
-    ATTENTION_DELAY_KEY, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY,
-    TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
+    ATTENTION_DELAY_KEY, DataClassificationAck, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY,
+    TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
 };
 use bytes::BytesMut;
 use native_tls::Identity;
@@ -130,6 +130,9 @@ pub struct ConnectionProcessor {
     query_registry: Arc<Mutex<QueryRegistry>>,
     /// Packet buffer for this connection
     buffer: BytesMut,
+    /// The first header and the bodies so far of a `SqlBatch` awaiting its
+    /// EOM packet
+    pending_batch: BytesMut,
     /// Optional redirection configuration
     redirection: Option<RedirectionConfig>,
     /// Shared store used to record connection state as soon as it is known
@@ -139,6 +142,11 @@ pub struct ConnectionProcessor {
     /// this connection has sent, in order. See
     /// [`ConnectionInfo::transaction_descriptor_headers`].
     transaction_descriptor_headers: Vec<(u64, u32)>,
+    login_details: LoginDetails,
+    /// Set after answering a query registered with
+    /// [`QueryRegistry::close_connection_after`]; the connection loop then
+    /// closes the socket.
+    close_after_response: bool,
 }
 
 impl ConnectionProcessor {
@@ -173,15 +181,23 @@ impl ConnectionProcessor {
             awaiting_fedauth_token: false,
             query_registry,
             buffer: BytesMut::with_capacity(4096),
+            pending_batch: BytesMut::new(),
             redirection,
             connection_store,
             transaction_descriptor_headers: Vec::new(),
+            login_details: LoginDetails::default(),
+            close_after_response: false,
         }
     }
 
     /// Get the unique connection id
     pub(crate) fn conn_id(&self) -> u64 {
         self.conn_id
+    }
+
+    /// Whether the connection should close now that its closing query was answered.
+    pub fn close_requested(&self) -> bool {
+        self.close_after_response
     }
 
     /// Get the client address
@@ -254,6 +270,53 @@ impl ConnectionProcessor {
         if let Some(store) = &self.connection_store {
             store.lock().await.store(self);
         }
+    }
+
+    /// The TabularResult packet that completes a login: LOGINACK, the
+    /// acknowledgements for the features Login7 requested, and DONE. A login
+    /// finished after a FedAuth challenge uses it too, so it acknowledges the
+    /// same features as a direct one.
+    async fn login_response_packet(&self, fedauth: bool) -> BytesMut {
+        let mut response = build_login_ack();
+        if fedauth {
+            debug!("Including FeatureExtAck for FedAuth");
+            response.extend_from_slice(&build_feature_ext_ack_fedauth());
+        }
+
+        // Session recovery and Data Classification share one FEATUREEXTACK
+        // token, as SQL Server sends them.
+        let mut acknowledged: Vec<(u8, Vec<u8>)> = Vec::new();
+        {
+            let registry = self.query_registry.lock().await;
+            if self
+                .requested_feature_ids
+                .contains(&FEATURE_EXT_SESSION_RECOVERY)
+                && registry.session_recovery()
+            {
+                acknowledged.push((FEATURE_EXT_SESSION_RECOVERY, Vec::new()));
+            }
+            if let Some(requested) = self.login_details.data_classification_requested {
+                let version = match registry.data_classification_ack() {
+                    DataClassificationAck::Requested => Some(requested),
+                    DataClassificationAck::Version(version) => Some(version),
+                    DataClassificationAck::Omitted => None,
+                };
+                if let Some(version) = version {
+                    debug!("Acknowledging Data Classification v{version}");
+                    acknowledged.push((FEATURE_EXT_DATA_CLASSIFICATION, vec![version, 1]));
+                }
+            }
+        }
+        if !acknowledged.is_empty() {
+            response.extend_from_slice(&build_feature_ext_ack(&acknowledged));
+        }
+        response.extend_from_slice(&build_done_token(0));
+
+        let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
+        let mut packet = BytesMut::with_capacity(total_length as usize);
+        PacketHeader::new(PacketType::TabularResult, total_length, 1).write(&mut packet);
+        packet.extend_from_slice(&response);
+        packet
     }
 
     /// Waits out `delay` (if any) before a registered response is sent,
@@ -336,34 +399,67 @@ impl ConnectionProcessor {
     where
         S: AsyncRead + Unpin + Send,
     {
-        if self.buffer.len() < PACKET_HEADER_SIZE {
-            return Ok(None);
-        }
-
-        // Parse packet header
-        let header = {
-            let mut buf_clone = self.buffer.clone();
-            match PacketHeader::parse(&mut buf_clone) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!("Failed to parse packet header: {}", e);
-                    return Ok(None);
-                }
+        let (header, packet_data) = loop {
+            if self.buffer.len() < PACKET_HEADER_SIZE {
+                return Ok(None);
             }
+
+            let header = {
+                let mut buf_clone = self.buffer.clone();
+                match PacketHeader::parse(&mut buf_clone) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("Failed to parse packet header: {}", e);
+                        return Ok(None);
+                    }
+                }
+            };
+
+            if self.buffer.len() < header.length as usize {
+                debug!(
+                    "Incomplete packet: have {} bytes, need {}",
+                    self.buffer.len(),
+                    header.length
+                );
+                return Ok(None);
+            }
+
+            let packet_data = self.buffer.split_to(header.length as usize);
+
+            // A batch larger than the packet size spans several packets, and
+            // only the last carries EOM. Answer once, for the whole batch.
+            if header.packet_type == PacketType::SqlBatch {
+                if header.status.is_ignore() {
+                    // MS-TDS 2.2.1.7: the server discards a withdrawn batch
+                    // and answers with a single DONE carrying DONE_ERROR.
+                    self.pending_batch.clear();
+                    let done = crate::protocol::build_done_token_with_status(0x0002, 0); // DONE_ERROR
+                    let total_length = (PACKET_HEADER_SIZE + done.len()) as u16;
+                    let mut packet = BytesMut::with_capacity(total_length as usize);
+                    PacketHeader::new(PacketType::TabularResult, total_length, 1)
+                        .write(&mut packet);
+                    packet.extend_from_slice(&done);
+                    return Ok(Some(packet));
+                }
+                if !header.status.is_end_of_message() {
+                    if self.pending_batch.is_empty() {
+                        self.pending_batch.extend_from_slice(&packet_data);
+                    } else {
+                        self.pending_batch
+                            .extend_from_slice(&packet_data[PACKET_HEADER_SIZE..]);
+                    }
+                    continue;
+                }
+                if !self.pending_batch.is_empty() {
+                    let mut batch = std::mem::take(&mut self.pending_batch);
+                    batch.extend_from_slice(&packet_data[PACKET_HEADER_SIZE..]);
+                    break (header, batch);
+                }
+            } else {
+                self.pending_batch.clear();
+            }
+            break (header, packet_data);
         };
-
-        // Check if we have the full packet
-        if self.buffer.len() < header.length as usize {
-            debug!(
-                "Incomplete packet: have {} bytes, need {}",
-                self.buffer.len(),
-                header.length
-            );
-            return Ok(None);
-        }
-
-        // Extract the complete packet
-        let packet_data = self.buffer.split_to(header.length as usize);
 
         // Process the packet and build response
         let response = match header.packet_type {
@@ -384,7 +480,7 @@ impl ConnectionProcessor {
 
                 // Parse Login7 packet body (skip header) for authentication info
                 let packet_body = &packet_data[PACKET_HEADER_SIZE..];
-                let auth_info = parse_login7_auth(packet_body);
+                let (auth_info, carries_session_state) = parse_login7(packet_body);
                 self.user_agent = auth_info.user_agent.clone();
 
                 // Log the server name sent by client (important for verifying redirection behavior)
@@ -402,6 +498,10 @@ impl ConnectionProcessor {
                 self.received_database = auth_info.database.clone();
                 self.requested_feature_ids = auth_info.feature_ids.clone();
                 self.fedauth_workflow = auth_info.fedauth_workflow;
+                self.login_details = LoginDetails {
+                    data_classification_requested: auth_info.data_classification_version,
+                    recovery_login: carries_session_state,
+                };
 
                 // Check if redirection is configured
                 if let Some(ref redir) = self.redirection {
@@ -471,31 +571,8 @@ impl ConnectionProcessor {
                     }
 
                     // Build response with LoginAck + optional FeatureExtAck + Done
-                    let mut response = build_login_ack();
-
-                    // If client sent FedAuth, respond with FeatureExtAck
-                    if auth_info.has_fedauth {
-                        debug!("Including FeatureExtAck for FedAuth");
-                        response.extend_from_slice(&build_feature_ext_ack_fedauth());
-                    }
-
-                    if let Some(version) = auth_info.data_classification_version {
-                        debug!("Including FeatureExtAck for Data Classification v{version}");
-                        response
-                            .extend_from_slice(&build_feature_ext_ack_data_classification(version));
-                    }
-
-                    response.extend_from_slice(&build_done_token(0));
-
-                    // Wrap in packet
-                    let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
-                    let mut packet = BytesMut::with_capacity(total_length as usize);
-                    let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
-                    resp_header.write(&mut packet);
-                    packet.extend_from_slice(&response);
-
                     self.record_to_store().await;
-                    Some(packet)
+                    Some(self.login_response_packet(auth_info.has_fedauth).await)
                 }
             }
 
@@ -521,18 +598,8 @@ impl ConnectionProcessor {
                             self.awaiting_fedauth_token = false;
                             self.is_authenticated = true;
 
-                            let mut response = build_login_ack();
-                            response.extend_from_slice(&build_done_token(0));
-
-                            let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
-                            let mut packet = BytesMut::with_capacity(total_length as usize);
-                            let resp_header =
-                                PacketHeader::new(PacketType::TabularResult, total_length, 1);
-                            resp_header.write(&mut packet);
-                            packet.extend_from_slice(&response);
-
                             self.record_to_store().await;
-                            Some(packet)
+                            Some(self.login_response_packet(true).await)
                         }
                         Err(e) => {
                             warn!("Failed to parse FedAuthToken from {}: {}", self.addr, e);
@@ -571,12 +638,17 @@ impl ConnectionProcessor {
                                     (
                                         r,
                                         registry.data_classification(&sql).to_vec(),
+                                        registry.following_result_sets(&sql).to_vec(),
                                         registry.trailing_info(&sql).to_vec(),
                                     )
                                 })
                             };
-                            if let Some((response_data, data_classification, trailing_info)) =
-                                registered
+                            if let Some((
+                                response_data,
+                                data_classification,
+                                following_result_sets,
+                                trailing_info,
+                            )) = registered
                             {
                                 info!("Found registered response for query");
                                 match self
@@ -587,12 +659,18 @@ impl ConnectionProcessor {
                                     DelayOutcome::Closed => return Ok(None),
                                     DelayOutcome::Elapsed => {}
                                 }
-                                // build_query_result already wraps in a packet, so return directly
-                                let packet = build_query_result_with_extras(
+                                // build_query_results already wraps in a packet, so return directly
+                                let packet = build_query_results(
                                     &response_data,
                                     &data_classification,
+                                    &following_result_sets,
                                     &trailing_info,
                                 );
+                                self.close_after_response = self
+                                    .query_registry
+                                    .lock()
+                                    .await
+                                    .closes_connection_after(&sql);
                                 Some(packet)
                             } else {
                                 info!("No registered response, returning empty result");
@@ -638,16 +716,25 @@ impl ConnectionProcessor {
                     let registered = {
                         let registry = self.query_registry.lock().await;
                         registry
-                            .get_by_contained_utf16_text_with_extras(packet_body)
-                            .map(|(response, data_classification, trailing)| {
-                                (
-                                    response.clone(),
-                                    data_classification.to_vec(),
-                                    trailing.to_vec(),
-                                )
+                            .find_by_contained_utf16_text(packet_body)
+                            .and_then(|query| {
+                                registry.get(query).map(|response| {
+                                    (
+                                        response.clone(),
+                                        registry.data_classification(query).to_vec(),
+                                        registry.following_result_sets(query).to_vec(),
+                                        registry.trailing_info(query).to_vec(),
+                                    )
+                                })
                             })
                     };
-                    if let Some((response_data, data_classification, trailing_info)) = registered {
+                    if let Some((
+                        response_data,
+                        data_classification,
+                        following_result_sets,
+                        trailing_info,
+                    )) = registered
+                    {
                         info!("Found registered response for RPC request");
                         match self
                             .wait_out_delay_or_attention(socket, response_data.delay)
@@ -657,9 +744,10 @@ impl ConnectionProcessor {
                             DelayOutcome::Closed => return Ok(None),
                             DelayOutcome::Elapsed => {}
                         }
-                        Some(build_query_result_with_extras(
+                        Some(build_query_results(
                             &response_data,
                             &data_classification,
+                            &following_result_sets,
                             &trailing_info,
                         ))
                     } else {
@@ -790,6 +878,20 @@ pub struct ConnectionStore {
     /// Connection info keyed by unique connection id, ordered so that
     /// iteration and `.values().last()` yield the most recent connection.
     connections: BTreeMap<u64, ConnectionInfo>,
+    /// Login7 details beyond [`ConnectionInfo`], under the same ids. Held
+    /// apart so the published `ConnectionInfo` keeps its shape.
+    login_details: BTreeMap<u64, LoginDetails>,
+}
+
+/// Login7 details captured for a connection, read with
+/// [`ConnectionStore::login_details`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LoginDetails {
+    /// Data Classification version the client requested in Login7, if any.
+    pub data_classification_requested: Option<u8>,
+    /// Whether Login7 carried session-recovery state, i.e. was a reconnect.
+    pub recovery_login: bool,
 }
 
 /// Captured information from a completed connection
@@ -843,9 +945,7 @@ impl ConnectionInfo {
 
 impl ConnectionStore {
     pub fn new() -> Self {
-        Self {
-            connections: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Upsert connection info keyed by the connection's unique id.
@@ -864,11 +964,18 @@ impl ConnectionStore {
             transaction_descriptor_headers: processor.transaction_descriptor_headers().to_vec(),
         };
         self.connections.insert(processor.conn_id(), info);
+        self.login_details
+            .insert(processor.conn_id(), processor.login_details.clone());
     }
 
     /// Get connection info by connection id
     pub fn get(&self, conn_id: u64) -> Option<&ConnectionInfo> {
         self.connections.get(&conn_id)
+    }
+
+    /// Login7 details for a connection id
+    pub fn login_details(&self, conn_id: u64) -> Option<&LoginDetails> {
+        self.login_details.get(&conn_id)
     }
 
     /// Get all connection infos
@@ -884,6 +991,7 @@ impl ConnectionStore {
     /// Clear all stored connections
     pub fn clear(&mut self) {
         self.connections.clear();
+        self.login_details.clear();
     }
 }
 
@@ -1350,6 +1458,10 @@ async fn handle_strict_encrypted_connection(
             );
             socket.write_all(&response).await?;
         }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
+        }
     }
 
     // Store connection info for test verification
@@ -1391,6 +1503,10 @@ async fn handle_encrypted_connection(
         while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!("Sending {} encrypted bytes response", response.len());
             socket.write_all(&response).await?;
+        }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
         }
     }
 
@@ -1441,6 +1557,10 @@ async fn handle_encrypted_tds_wrapped_connection(
             debug!("Sending {} encrypted bytes response", response.len());
             socket.write_all(&response).await?;
         }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
+        }
     }
 
     // Store connection info for test verification
@@ -1484,6 +1604,10 @@ async fn handle_unencrypted_connection(
         while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!("Sending {} bytes response", response.len());
             socket.write_all(&response).await?;
+        }
+        if processor.close_requested() {
+            debug!("Closing connection {} after its closing query", addr);
+            break;
         }
     }
 
@@ -1587,9 +1711,10 @@ async fn handle_connection(
                                 // Look up query in registry
                                 let registry = query_registry.lock().await;
                                 if let Some(response) = registry.get(&sql) {
-                                    Some(build_query_result_with_extras(
+                                    Some(build_query_results(
                                         response,
                                         registry.data_classification(&sql),
+                                        registry.following_result_sets(&sql),
                                         registry.trailing_info(&sql),
                                     ))
                                 } else if sql.to_uppercase().starts_with("SELECT") {
@@ -1694,5 +1819,84 @@ mod tests {
             .expect("mock server should bind to an ephemeral localhost port");
         let addr = server.local_addr();
         assert!(addr.port() > 0);
+    }
+
+    fn packet(packet_type: PacketType, status: u8, body: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(PACKET_HEADER_SIZE + body.len()).unwrap();
+        let mut packet = vec![packet_type as u8, status];
+        packet.extend_from_slice(&length.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 1, 0]);
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    /// An ALL_HEADERS section with no headers, then `sql` as UTF-16LE.
+    fn batch_body(sql: &str) -> Vec<u8> {
+        let mut body = 4u32.to_le_bytes().to_vec();
+        body.extend(sql.encode_utf16().flat_map(u16::to_le_bytes));
+        body
+    }
+
+    /// The reply's first token type and, for a DONE, its status.
+    async fn first_token_of_reply(
+        processor: &mut ConnectionProcessor,
+        packets: &[Vec<u8>],
+    ) -> (u8, u16) {
+        for packet in packets {
+            processor.buffer_mut().extend_from_slice(packet);
+        }
+        let reply = processor
+            .process_packet(&mut tokio::io::empty())
+            .await
+            .unwrap()
+            .expect("a complete message is answered");
+        assert!(processor.pending_batch.is_empty());
+        let token = &reply[PACKET_HEADER_SIZE..];
+        (token[0], u16::from_le_bytes([token[1], token[2]]))
+    }
+
+    #[tokio::test]
+    async fn abandoned_partial_batch_does_not_prefix_the_next_batch() {
+        const COLMETADATA: u8 = 0x81;
+        const DONE: u8 = 0xFD;
+        const DONE_ERROR: u16 = 0x0002;
+        const DONE_ATTN: u16 = 0x0020;
+
+        let registry = Arc::new(Mutex::new(QueryRegistry::new()));
+        registry.lock().await.register(
+            "SELECT 1",
+            crate::query_response::QueryResponse::select_one(),
+        );
+        let mut processor =
+            ConnectionProcessor::new(0, "127.0.0.1:1".parse().unwrap(), registry, None);
+        processor.is_authenticated = true;
+        let select_one = packet(PacketType::SqlBatch, 0x01, &batch_body("SELECT 1"));
+
+        // EOM | IGNORE withdraws the message: the server discards it rather
+        // than running what was sent, and answers with DONE_ERROR (MS-TDS 2.2.1.7).
+        let withdrawn = packet(PacketType::SqlBatch, 0x00, &batch_body("SELECT 1"));
+        let ignore = packet(PacketType::SqlBatch, 0x03, &[]);
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[withdrawn, ignore]).await,
+            (DONE, DONE_ERROR)
+        );
+        assert_eq!(
+            first_token_of_reply(&mut processor, std::slice::from_ref(&select_one))
+                .await
+                .0,
+            COLMETADATA
+        );
+
+        // A different message type abandons the partial batch.
+        let partial = packet(PacketType::SqlBatch, 0x00, &batch_body("SELECT 2 /*"));
+        let attention = packet(PacketType::Attention, 0x01, &[]);
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[partial, attention]).await,
+            (DONE, DONE_ATTN)
+        );
+        assert_eq!(
+            first_token_of_reply(&mut processor, &[select_one]).await.0,
+            COLMETADATA
+        );
     }
 }

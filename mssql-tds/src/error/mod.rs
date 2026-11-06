@@ -148,6 +148,30 @@ pub enum TimeoutErrorType {
     String(String),
 }
 
+/// Identifies a TVP parameter in a serialization diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TvpParameterRef {
+    /// One-based parameter ordinal in the ODBC statement.
+    OdbcOrdinal(usize),
+    /// One-based position in the TDS RPC request.
+    RpcPosition(usize),
+    /// Name of a named TDS RPC parameter.
+    Name(String),
+    /// No parameter identity was available at the serialization layer.
+    Unknown,
+}
+
+impl std::fmt::Display for TvpParameterRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OdbcOrdinal(ordinal) => write!(f, "ODBC ordinal {ordinal}"),
+            Self::RpcPosition(position) => write!(f, "RPC position {position}"),
+            Self::Name(name) => write!(f, "name {name}"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
 /// All errors produced by the TDS client.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -238,6 +262,20 @@ pub enum Error {
         actual: usize,
         /// Maximum encoded byte length accepted by the caller.
         maximum: usize,
+    },
+
+    /// A TVP cell failed while being serialized.
+    #[error("TVP parameter {parameter}, row {row}, column {column} serialization failed: {source}")]
+    TvpCellSerialization {
+        /// Parameter identity.
+        parameter: TvpParameterRef,
+        /// One-based row containing the cell.
+        row: usize,
+        /// One-based column containing the cell.
+        column: usize,
+        /// The underlying cell serialization error.
+        #[source]
+        source: Box<Error>,
     },
 
     /// Connection was closed by server or transport.
@@ -334,6 +372,43 @@ pub enum Error {
         "The connection reset was not acknowledged by the server, so the session was not returned to its login defaults"
     )]
     ConnectionResetNotAcknowledged,
+}
+
+impl Error {
+    pub(crate) fn with_tvp_cell_context(self, row: usize, column: usize) -> Self {
+        if !matches!(
+            &self,
+            Self::UsageError(_)
+                | Self::TypeConversionError(_)
+                | Self::EncodedValueTooLong { .. }
+                | Self::UnsupportedEncoding { .. }
+        ) {
+            return self;
+        }
+        Self::TvpCellSerialization {
+            parameter: TvpParameterRef::Unknown,
+            row: row + 1,
+            column: column + 1,
+            source: Box::new(self),
+        }
+    }
+
+    pub(crate) fn with_tvp_parameter_context(self, parameter: TvpParameterRef) -> Self {
+        match self {
+            Self::TvpCellSerialization {
+                row,
+                column,
+                source,
+                ..
+            } => Self::TvpCellSerialization {
+                parameter,
+                row,
+                column,
+                source,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Helper for `SqlServerError` display formatting.

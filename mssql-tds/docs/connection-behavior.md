@@ -3,6 +3,14 @@
 Detailed behavior for SDK and driver authors using
 [`mssql-tds`](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/README.md).
 
+## Encryption defaults
+
+`ClientContext::default()` selects `EncryptionSetting::Strict` (TDS 8.0).
+The server must support that protocol, and its certificate must be trusted and
+match the expected hostname. `TrustServerCertificate` does not bypass validation
+in Strict mode. For TDS 7.4 with encrypted query traffic, set
+`context.encryption_options.mode = EncryptionSetting::On` before connecting.
+
 ## Connection policy and migration
 
 Eligible TCP connections default to MultiSubnetFailover (MSF): attempt all

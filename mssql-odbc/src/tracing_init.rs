@@ -11,7 +11,7 @@
 //! matter most. Rotation therefore bounds only the size of an individual file,
 //! so each one stays openable, searchable and attachable to a bug report.
 //! Total output is bounded by the operator, who owns reclaiming the space; see
-//! the tracing section of `mssql-odbc/README.md` (AB#48091).
+//! the tracing section of `mssql-odbc/docs/driver-guide.md` (AB#48091).
 
 use chrono::Utc;
 use std::ffi::OsString;
@@ -1408,7 +1408,7 @@ mod tests {
                 let worker = scope.spawn(move || {
                     tracing::dispatcher::with_default(&dispatch, || {
                         let sql: Vec<u16> = "SELECT 1".encode_utf16().chain([0]).collect();
-                        unsafe { SQLExecDirectW(raw as SqlHandle, sql.as_ptr(), SQL_NTS) }
+                        unsafe { SQLExecDirectW(raw as SqlHandle, sql.as_ptr(), SQL_NTS.into()) }
                     })
                 });
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -1592,7 +1592,7 @@ mod tests {
             let mut responses = Vec::new();
             if prepared {
                 assert_eq!(
-                    unsafe { SQLPrepareW(h.stmt, sql.as_ptr(), SQL_NTS) },
+                    unsafe { SQLPrepareW(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
                     SQL_SUCCESS
                 );
                 responses.push(return_value(ReturnValue {
@@ -1619,7 +1619,7 @@ mod tests {
                         if prepared {
                             SQLExecute(h.stmt)
                         } else {
-                            SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS)
+                            SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS.into())
                         }
                     },
                     SQL_SUCCESS
@@ -1642,7 +1642,7 @@ mod tests {
 
             let invalid: Vec<u16> = "{call}".encode_utf16().chain([0]).collect();
             assert_eq!(
-                unsafe { SQLPrepareW(h.stmt, invalid.as_ptr(), SQL_NTS) },
+                unsafe { SQLPrepareW(h.stmt, invalid.as_ptr(), SQL_NTS.into()) },
                 SQL_ERROR
             );
             let mut columns = -1;
@@ -1658,7 +1658,7 @@ mod tests {
 
             let next: Vec<u16> = "SELECT ?".encode_utf16().chain([0]).collect();
             assert_eq!(
-                unsafe { SQLPrepareW(h.stmt, next.as_ptr(), SQL_NTS) },
+                unsafe { SQLPrepareW(h.stmt, next.as_ptr(), SQL_NTS.into()) },
                 SQL_SUCCESS
             );
             for api in ["SQLNumResultCols", "SQLDescribeColW", "SQLColAttributeW"] {
