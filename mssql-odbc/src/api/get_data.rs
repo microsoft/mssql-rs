@@ -2421,6 +2421,10 @@ fn stream_active_plp_chunk_once<'a>(
     ) && !transcode_narrow_to_utf8;
     let direct_wire_output =
         max_read > 0 && !target_value_ptr.is_null() && !staged_binary_read && wire_shaped_output;
+    let direct_utf8_output = direct_wire_output
+        && target_type == SQL_C_CHAR
+        && text_output.encoding.is_utf8()
+        && narrow_encoding == Some(encoding_rs::UTF_8.into());
     let mut inline_payload = [0_u8; 256];
     let mut heap_payload = if typed_target {
         std::mem::take(&mut progress.typed_scratch)
@@ -2546,6 +2550,60 @@ fn stream_active_plp_chunk_once<'a>(
             return SQL_ERROR;
         }
     };
+
+    if direct_utf8_output
+        && read > 0
+        && let Some(prefix_len) = utf8_complete_prefix_len(&payload[..read])
+        && prefix_len < read
+    {
+        let tail = &payload[prefix_len..read];
+        if let Some(state) = retained_stmt_state.as_mut() {
+            let Some(stream) = state.active_plp.as_mut() else {
+                post_diag(&mut **state, ERR_INTERNAL_CONVERSION);
+                return SQL_ERROR;
+            };
+            stream.restore_source_prefix(tail, total_read, known_total, reached_end);
+            if prefix_len == 0 {
+                unsafe {
+                    target_value_ptr.cast::<u8>().write_unaligned(0);
+                }
+                post_sql_error(
+                    &mut **state,
+                    SQLSTATE_HY090,
+                    0,
+                    "Buffer length too small to hold a single character and null terminator",
+                );
+                return SQL_ERROR;
+            }
+        } else {
+            let Ok(mut state) = stmt.inner.lock() else {
+                error!(
+                    "SQLGetData: stmt mutex poisoned while restoring an incomplete UTF-8 character"
+                );
+                return SQL_ERROR;
+            };
+            let Some(stream) = state.active_plp.as_mut() else {
+                post_diag(&mut state, ERR_INTERNAL_CONVERSION);
+                return SQL_ERROR;
+            };
+            stream.restore_source_prefix(tail, total_read, known_total, reached_end);
+            if prefix_len == 0 {
+                unsafe {
+                    target_value_ptr.cast::<u8>().write_unaligned(0);
+                }
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY090,
+                    0,
+                    "Buffer length too small to hold a single character and null terminator",
+                );
+                return SQL_ERROR;
+            }
+        }
+        total_read = total_read.saturating_sub(read - prefix_len);
+        read = prefix_len;
+        reached_end = false;
+    }
 
     if typed_target {
         let mut state = match retained_stmt_state.take() {
@@ -3644,6 +3702,14 @@ fn narrow_source_fit(source: &[u8], room: usize, held_partial: bool) -> usize {
     };
     let fit = ascii + narrow_max_read(room - ascii, 0);
     fit.max(1).min(source.len())
+}
+
+fn utf8_complete_prefix_len(bytes: &[u8]) -> Option<usize> {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Some(bytes.len()),
+        Err(error) if error.error_len().is_none() => Some(error.valid_up_to()),
+        Err(_) => None,
+    }
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-8 for `SQL_C_CHAR`
@@ -5652,6 +5718,19 @@ mod tests {
                 "narrow_max_read({capacity}, {carry})"
             );
         }
+    }
+
+    #[test]
+    fn utf8_complete_prefix_excludes_only_a_trailing_partial_character() {
+        let value = "A😀B".as_bytes();
+        for (length, expected) in [(0, 0), (1, 1), (2, 1), (4, 1), (5, 5), (6, 6)] {
+            assert_eq!(
+                utf8_complete_prefix_len(&value[..length]),
+                Some(expected),
+                "length={length}"
+            );
+        }
+        assert_eq!(utf8_complete_prefix_len(b"A\xff"), None);
     }
 
     /// Option-returning shim so these tests read the same as before the

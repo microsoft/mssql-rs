@@ -311,9 +311,9 @@ build_rust_driver() {
         (
             cd "$ODBC_CRATE_DIR"
             if [ "$BUILD_TYPE" = "release" ]; then
-                cargo build --release
+                cargo build --release --features e2e-test-client-code-page
             else
-                cargo build
+                cargo build --features e2e-test-client-code-page
             fi
         )
         RUST_DRIVER_PATH="$(bash "$ODBC_CRATE_DIR/scripts/finalize-artifact.sh" "$BUILD_TYPE")"

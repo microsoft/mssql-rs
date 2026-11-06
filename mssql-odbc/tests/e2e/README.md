@@ -157,6 +157,16 @@ The DBCS text-to-binary continuation regression requires an ASCII-compatible
 client encoding: its binary continuation returns wire bytes, not UTF-32LE
 converted carry.
 
+`client_code_page_test` adds four isolated client-code-page runs (1252, 65001,
+932, and 1251) for collation transcoding, narrow character boundaries, UTF-16
+surrogate streaming, and PLP/bound-column lengths. The e2e runners build the
+driver with the private `e2e-test-client-code-page` feature; CTest sets
+`MSSQL_ODBC_TEST_CLIENT_CODE_PAGE` before each process starts. The override is
+validated by the driver and does not change the default system-locale path when
+the variable is absent. On the msodbcsql comparison leg, which has no override,
+a run executes only on Windows when its code page matches `GetACP()`; the other
+runs skip.
+
 ### Intentional divergence: `SKIP_IF_COMPARING_MSODBCSQL()`
 
 Some tests assert behavior that is deliberately stricter in the Rust driver than
