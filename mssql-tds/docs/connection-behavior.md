@@ -93,6 +93,20 @@ TNIR does not disable MSF.** See the
 [parity decisions](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/parity-deviations.md) for the intentional
 differences from msodbcsql and outstanding approval/evidence.
 
+## Request deadlines and interrupted sends
+
+`begin_transaction_with_options`, `commit_transaction_with_options`, and
+`rollback_transaction_with_options` accept the same timeout and cancellation
+options as `execute`. These options expire when the transaction request returns,
+including on error; later savepoint or DTC requests do not inherit them.
+Language batches and transaction requests charge serialization and packet-send
+time against the remaining response budget. Packet sends reject an expired
+deadline before polling the transport; a pending send does not receive a fresh
+timeout per packet.
+
+For interrupted-send retirement and transport-failure recovery, see
+[Response lifecycle](client-guide.md#response-lifecycle).
+
 ## DNS fallback caching
 
 LOGIN7 advertises DNS caching (`0x0B`). Each TCP connection keeps its resolved

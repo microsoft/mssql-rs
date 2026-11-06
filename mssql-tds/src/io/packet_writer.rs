@@ -509,6 +509,12 @@ impl<'a> PacketWriter<'a> {
         let deadline = self
             .max_timeout_sec
             .map(|seconds| self.start_time + Duration::from_secs(u64::from(seconds)));
+        // The timer driver may not have observed expiry during synchronous work.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(TimeoutError(TimeoutErrorType::String(
+                "Timeout expired".to_string(),
+            )));
+        }
         let elapsed = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -527,6 +533,13 @@ impl<'a> PacketWriter<'a> {
             tokio::pin!(send_data_fut);
             tokio::select! {
                 biased;
+                () = elapsed => {
+                    // The write may have stopped inside a packet or TLS record.
+                    // Keep send_incomplete set so the caller retires the stream.
+                    return Err(TimeoutError(TimeoutErrorType::String(
+                        "Timeout expired".to_string(),
+                    )));
+                }
                 result = &mut send_data_fut => result?,
                 () = handle.cancel_token.cancelled() => {
                     cancelled = true;
@@ -543,21 +556,14 @@ impl<'a> PacketWriter<'a> {
                         "Cancellation timed out completing the current packet".to_string(),
                     ))??;
                 }
-                () = elapsed => {
-                    // The write may have stopped inside a packet or TLS record.
-                    // Keep send_incomplete set so the caller retires the stream.
-                    return Err(TimeoutError(TimeoutErrorType::String(
-                        "Timeout expired".to_string(),
-                    )));
-                }
             }
         } else if deadline.is_some() {
             tokio::select! {
                 biased;
-                result = CancelHandle::run_until_cancelled(handle, send_data_fut) => result?,
                 () = elapsed => return Err(TimeoutError(TimeoutErrorType::String(
                     "Timeout expired".to_string(),
                 ))),
+                result = CancelHandle::run_until_cancelled(handle, send_data_fut) => result?,
             }
         } else {
             CancelHandle::run_until_cancelled(handle, send_data_fut).await?;
@@ -891,6 +897,7 @@ pub(crate) mod tests {
         pub(crate) data: Vec<u8>,
         pub(crate) reset_mode: ResetConnectionMode,
         pub(crate) reset_dispatched: bool,
+        blocking_send: Option<Duration>,
     }
 
     impl MockNetworkWriter {
@@ -900,6 +907,7 @@ pub(crate) mod tests {
                 data: vec![],
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
+                blocking_send: None,
             }
         }
     }
@@ -908,7 +916,9 @@ pub(crate) mod tests {
     impl NetworkWriter for MockNetworkWriter {
         #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
         async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
-            // No op
+            if let Some(duration) = self.blocking_send {
+                std::thread::sleep(duration);
+            }
             self.data.extend_from_slice(_data);
             Ok(())
         }
@@ -1931,56 +1941,108 @@ pub(crate) mod tests {
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
     }
 
-    /// A ready send can finish before expiry is observed, leaving `finalize`'s
-    /// terminating packet on the wire. Such a message needs cancelling, not
-    /// withdrawing: a second `EOM | IGNORE` would leave the server owing two
-    /// responses and the extra DONE for the next command.
-    #[test]
-    fn a_finalized_message_that_times_out_is_still_complete() {
-        let mut mock = MockNetworkWriter::new(16);
-        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
-        block_on(writer.write_async(&[0xABu8; 4])).unwrap();
-        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+    #[tokio::test]
+    async fn expired_deadline_after_synchronous_work_does_not_send() {
+        for with_settlement in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            writer.write_async(&[0xAB; 4]).await.unwrap();
+            // Keep the runtime's timer driver from observing expiry first.
+            std::thread::sleep(Duration::from_millis(1100));
 
-        let result = block_on(writer.finalize());
-        let message = writer.suspend();
-
-        assert!(result.is_err(), "the overrun budget must surface an error");
-        assert!(
-            mock.data[1] & (PacketStatusFlags::Eom as u8) != 0,
-            "the terminating packet reached the wire"
-        );
-        assert!(
-            message.message_complete(),
-            "a terminated message must not be withdrawn as if it were partial"
-        );
+            let result = writer.finalize().await;
+            let message = writer.suspend();
+            assert!(matches!(result, Err(TimeoutError(_))), "{result:?}");
+            assert!(message.nothing_sent());
+            assert!(!message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.message_complete());
+            assert!(mock.data.is_empty());
+        }
     }
 
-    /// A ready write can finish before expiry is observed, so this error path
-    /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
-    /// the flushed flag can tell the caller the server is mid-message, and
-    /// getting it wrong means the request is dropped instead of withdrawn.
-    #[test]
-    fn a_packet_that_lands_then_times_out_is_not_nothing_sent() {
+    #[tokio::test]
+    async fn completed_send_overrun_preserves_message_accounting() {
+        for (final_packet, with_settlement) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.blocking_send = Some(Duration::from_millis(1100));
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            let result = if final_packet {
+                writer.write_async(&[0xAB; 4]).await.unwrap();
+                writer.finalize().await
+            } else {
+                writer.write_async(&[0xAB; 9]).await
+            };
+            let message = writer.suspend();
+            assert!(matches!(result, Err(TimeoutError(_))), "{result:?}");
+            assert!(message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.nothing_sent());
+            assert_eq!(message.message_complete(), final_packet);
+            assert!(!mock.data.is_empty());
+            assert_eq!(
+                mock.data[1] & PacketStatusFlags::Eom as u8 != 0,
+                final_packet
+            );
+        }
+    }
+
+    /// An expired deadline must win before the final packet is sent, leaving no
+    /// partial message to withdraw.
+    #[tokio::test]
+    async fn an_expired_deadline_does_not_send_the_final_packet() {
         let mut mock = MockNetworkWriter::new(16);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        writer.write_async(&[0xABu8; 4]).await.unwrap();
         writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
 
-        let result = block_on(writer.write_async(&[0xABu8; 64]));
+        let result = writer.finalize().await;
         let message = writer.suspend();
 
         assert!(result.is_err(), "the overrun budget must surface an error");
         assert!(
-            !mock.data.is_empty(),
-            "the packet reached the wire before the budget was checked"
+            mock.data.is_empty(),
+            "the expired deadline must precede send"
+        );
+        assert!(!message.message_complete());
+        assert!(message.nothing_sent());
+    }
+
+    /// A ready write must not be polled after its deadline has expired.
+    #[tokio::test]
+    async fn an_expired_deadline_is_checked_before_polling_the_transport() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+
+        let result = writer.write_async(&[0xABu8; 64]).await;
+        let message = writer.suspend();
+
+        assert!(result.is_err(), "the overrun budget must surface an error");
+        assert!(
+            mock.data.is_empty(),
+            "the expired deadline must precede send"
         );
         assert!(
             message.is_first_packet,
             "the first-packet flag is still set on this path"
         );
-        assert!(
-            !message.nothing_sent(),
-            "a request the server has part of must be withdrawn, not discarded"
-        );
+        assert!(message.nothing_sent());
     }
 }
