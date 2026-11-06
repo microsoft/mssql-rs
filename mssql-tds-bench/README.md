@@ -2,7 +2,7 @@
 
 A **fixed Criterion harness** for benchmarking [`mssql-tds`](../mssql-tds) with a
 **swappable dependency**, so a stable baseline build and a candidate build can be
-compared on the same host with `mssql-tds` as the only variable.
+compared on the same host with only the `mssql-tds` source swapped.
 
 See [`../docs/perf-testing-plan.md`](../docs/perf-testing-plan.md)
 for the full design and rationale.
@@ -19,8 +19,10 @@ runs rather than building a different harness:
   pinned in [`perf-lab/baseline-commit.txt`](perf-lab/baseline-commit.txt) (see
   [`perf-lab/run-benchmarks.sh`](perf-lab/run-benchmarks.sh)).
 
-Any statistically significant delta is therefore attributable to `mssql-tds`
-itself. The baseline is pinned by a **commit SHA committed to
+This controls the build inputs, not server or host conditions. A significant
+delta still needs confirmation across runs; see the
+[monitoring runbook](perf-lab/MONITORING.md#what-the-quorum-does-not-cover).
+The baseline is pinned by a **commit SHA committed to
 `perf-lab/baseline-commit.txt`**; advancing it requires a pull request that edits
 that file, so every move is reviewed and recorded in git history.
 
@@ -42,8 +44,15 @@ closes.
 
 ## Running locally
 
+Run from the repository root with the connection environment below configured.
+The full suite requires SQL Server 2022 or later and database compatibility
+level 160 or later for `GENERATE_SERIES`.
+
 ```sh
-# Run everything (real SQL Server required)
+# Require a server rather than silently skipping benchmarks (POSIX shell)
+export BENCH_REQUIRE_SERVER=1
+
+# Run everything
 cargo bench -p mssql-tds-bench
 
 # A single bench file
@@ -56,12 +65,14 @@ cargo bench -p mssql-tds-bench -- --save-baseline candidate
 critcmp base candidate
 ```
 
-When no server is reachable, each benchmark probes the connection once and skips
-gracefully (this is what lets the bench binaries run as tests in CI without a DB).
+`BENCH_REQUIRE_SERVER=1` makes missing connection settings or an unreachable
+server fatal; use it for validation and baseline comparisons, as the perf-lab
+runners do. In PowerShell, set `$env:BENCH_REQUIRE_SERVER = '1'`. Without it,
+benchmarks skip gracefully, allowing CI to run the bench binaries without a DB.
 
 ## Environment contract
 
-Shared with `mssql-tds/benches/perf.rs`:
+Connection settings shared with `mssql-tds/benches/perf.rs`:
 
 | Variable | Purpose |
 |----------|---------|

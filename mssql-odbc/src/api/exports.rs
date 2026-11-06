@@ -519,7 +519,7 @@ pub unsafe extern "C" fn SQLBindParameter(
 pub unsafe extern "C" fn SQLPrepareW(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     unsafe { super::prepare::sql_prepare_w(statement_handle, statement_text, text_length) }
 }
@@ -568,7 +568,7 @@ pub unsafe extern "C" fn SQLDescribeParam(
 pub unsafe extern "C" fn SQLExecDirectW(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     unsafe { super::exec_direct::sql_exec_direct_w(statement_handle, statement_text, text_length) }
 }

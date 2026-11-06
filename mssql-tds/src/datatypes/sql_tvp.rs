@@ -386,38 +386,40 @@ impl TvpTableData {
             }
 
             for (col_idx, (column, cell)) in self.columns.iter().zip(row.iter()).enumerate() {
-                if std::mem::discriminant(cell) != std::mem::discriminant(&column.column_type) {
-                    return Err(Error::UsageError(format!(
-                        "TVP row {row_idx} column {col_idx} type mismatch: cell is {cell:?} \
-                         but the column is declared as {:?}",
-                        column.column_type
-                    )));
-                }
+                let cell_result = (|| -> TdsResult<()> {
+                    if std::mem::discriminant(cell) != std::mem::discriminant(&column.column_type) {
+                        return Err(Error::UsageError(format!(
+                            "TVP row {row_idx} column {col_idx} type mismatch: cell is {cell:?} \
+                             but the column is declared as {:?}",
+                            column.column_type
+                        )));
+                    }
 
-                let temporal_value = match cell {
-                    SqlType::Time(Some(value)) => Some(value),
-                    SqlType::DateTime2(Some(value)) => Some(&value.time),
-                    SqlType::DateTimeOffset(Some(value)) => Some(&value.datetime2.time),
-                    _ => None,
-                };
-                if let (Some(scale), Some(value)) = (column.temporal_scale(), temporal_value)
-                    && !temporal_value_fits_scale(value, scale)
-                {
-                    return Err(Error::UsageError(format!(
-                        "TVP row {row_idx} column {col_idx} value cannot be represented at \
-                         temporal scale {scale}"
-                    )));
-                }
+                    let temporal_value = match cell {
+                        SqlType::Time(Some(value)) => Some(value),
+                        SqlType::DateTime2(Some(value)) => Some(&value.time),
+                        SqlType::DateTimeOffset(Some(value)) => Some(&value.datetime2.time),
+                        _ => None,
+                    };
+                    if let (Some(scale), Some(value)) = (column.temporal_scale(), temporal_value)
+                        && !temporal_value_fits_scale(value, scale)
+                    {
+                        return Err(Error::UsageError(format!(
+                            "TVP row {row_idx} column {col_idx} value cannot be represented at \
+                             temporal scale {scale}"
+                        )));
+                    }
 
-                if let Some((precision, scale)) = column.decimal_metadata()
-                    && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
-                {
-                    // Rescale a copy and discard it: this only pre-flights the
-                    // conversion that `write_tvp_rows` performs for real, so a
-                    // rejectable value fails before any bytes reach the wire.
-                    let mut value = *value;
-                    apply_decimal_metadata(&mut value, precision, scale)?;
-                }
+                    if let Some((precision, scale)) = column.decimal_metadata()
+                        && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
+                    {
+                        // Preflight the same rescale that row serialization performs.
+                        let mut value = *value;
+                        apply_decimal_metadata(&mut value, precision, scale)?;
+                    }
+                    Ok(())
+                })();
+                cell_result.map_err(|error| error.with_tvp_cell_context(row_idx, col_idx))?;
             }
         }
 
@@ -563,7 +565,7 @@ pub(crate) async fn write_tvp_rows(
     rows: &[Vec<SqlType>],
     db_collation: &SqlCollation,
 ) -> TdsResult<()> {
-    for row in rows {
+    for (row_index, row) in rows.iter().enumerate() {
         if row.len() != columns.len() {
             return Err(Error::UsageError(format!(
                 "TVP row has {} values but the table type has {} columns",
@@ -574,7 +576,7 @@ pub(crate) async fn write_tvp_rows(
 
         packet_writer.write_byte_async(TVP_ROW_TOKEN).await?;
 
-        for (column, cell) in columns.iter().zip(row.iter()) {
+        for (column_index, (column, cell)) in columns.iter().zip(row.iter()).enumerate() {
             let (mut value, cell_ctx) = cell.to_column_value_and_context(db_collation);
             let ctx = if matches!(column.column_type, SqlType::Variant(_)) {
                 cell_ctx
@@ -590,8 +592,18 @@ pub(crate) async fn write_tvp_rows(
             // Callers must have run `TvpTableData::validate` first: this can
             // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
             // buffered, which would leave a half-written TVP on the wire.
-            apply_column_metadata(column, &mut value)?;
-            TdsValueSerializer::serialize_value(packet_writer, &value, &ctx).await?;
+            let result = async {
+                apply_column_metadata(column, &mut value)?;
+                TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                    packet_writer,
+                    &value,
+                    &ctx,
+                    None,
+                )
+                .await
+            }
+            .await;
+            result.map_err(|source| source.with_tvp_cell_context(row_index, column_index))?;
         }
     }
 
@@ -642,14 +654,179 @@ mod tests {
         mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
     }
 
-    async fn row_bytes(columns: &[TvpColumnDef], rows: &[Vec<SqlType>]) -> Vec<u8> {
+    #[tokio::test]
+    async fn utf8_varchar_cell_fits_only_trailing_blanks_to_declared_byte_length() {
+        let column = TvpColumnDef::new(SqlType::Varchar(None, 3));
+        let row = vec![SqlType::Varchar(
+            Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                "€ ".to_string(),
+            )),
+            3,
+        )];
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
         let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        write_tvp_rows(&mut writer, columns, rows, &default_collation())
+        write_tvp_rows(&mut writer, &[column], &[row], &collation)
             .await
             .unwrap();
         writer.finalize().await.unwrap();
-        mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec()
+
+        assert_eq!(
+            &mock.data[PacketWriter::PACKET_HEADER_SIZE..],
+            &[TVP_ROW_TOKEN, 3, 0, 0xE2, 0x82, 0xAC, TVP_END_TOKEN]
+        );
+    }
+
+    #[tokio::test]
+    async fn tvp_cell_serialization_error_includes_zero_based_coordinates() {
+        let columns = [
+            TvpColumnDef::new(SqlType::Int(None)),
+            TvpColumnDef::new(SqlType::Varchar(None, 2)),
+        ];
+        let rows = [
+            vec![
+                SqlType::Int(Some(1)),
+                SqlType::Varchar(
+                    Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                        "ok".to_string(),
+                    )),
+                    2,
+                ),
+            ],
+            vec![
+                SqlType::Int(Some(2)),
+                SqlType::Varchar(
+                    Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                        "too long".to_string(),
+                    )),
+                    2,
+                ),
+            ],
+        ];
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+
+        let error = write_tvp_rows(&mut writer, &columns, &rows, &default_collation())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::TvpCellSerialization {
+                row: 2,
+                column: 2,
+                source,
+                ..
+            } if matches!(*source, Error::EncodedValueTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn narrow_string_limit_discards_only_trailing_ascii_spaces() {
+        assert_eq!(
+            crate::datatypes::sql_string::fit_narrow_byte_limit("€ ".as_bytes(), 3).unwrap(),
+            "€".as_bytes()
+        );
+        assert!(crate::datatypes::sql_string::fit_narrow_byte_limit("€a".as_bytes(), 3).is_err());
+    }
+
+    async fn row_bytes_with_collation(
+        columns: &[TvpColumnDef],
+        rows: &[Vec<SqlType>],
+        collation: &SqlCollation,
+    ) -> TdsResult<Vec<u8>> {
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        write_tvp_rows(&mut writer, columns, rows, collation).await?;
+        writer.finalize().await.unwrap();
+        Ok(mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec())
+    }
+
+    async fn row_bytes(columns: &[TvpColumnDef], rows: &[Vec<SqlType>]) -> Vec<u8> {
+        row_bytes_with_collation(columns, rows, &default_collation())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tvp_narrow_limit_is_applied_after_collation_encoding() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let mut string = crate::datatypes::sql_string::SqlString::new(
+            "éé".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        );
+        string.set_narrow_string_byte_limit(2);
+        let columns = [TvpColumnDef::new(SqlType::VarcharMax(None))];
+        let rows = [vec![SqlType::VarcharMax(Some(string))]];
+
+        let bytes = row_bytes_with_collation(&columns, &rows, &collation)
+            .await
+            .unwrap();
+        assert!(bytes.windows(2).any(|window| window == [0xE9, 0xE9]));
+    }
+
+    #[tokio::test]
+    async fn tvp_narrow_limit_preserves_padding_that_fits_after_encoding() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        let mut string = crate::datatypes::sql_string::SqlString::new(
+            "€ ".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        );
+        string.set_narrow_string_byte_limit(3);
+        let columns = [TvpColumnDef::new(SqlType::VarcharMax(None))];
+        let rows = [vec![SqlType::VarcharMax(Some(string))]];
+
+        let bytes = row_bytes_with_collation(&columns, &rows, &collation)
+            .await
+            .unwrap();
+        assert!(bytes.windows(2).any(|window| window == [0x80, b' ']));
+    }
+
+    #[tokio::test]
+    async fn tvp_narrow_limit_rejects_encoded_overflow() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let mut string = crate::datatypes::sql_string::SqlString::new(
+            "é".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        );
+        string.set_narrow_string_byte_limit(1);
+        let columns = [TvpColumnDef::new(SqlType::VarcharMax(None))];
+        let rows = [vec![SqlType::VarcharMax(Some(string))]];
+
+        assert!(matches!(
+            row_bytes_with_collation(&columns, &rows, &collation).await,
+            Err(Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                source,
+                ..
+            }) if matches!(
+                *source,
+                Error::EncodedValueTooLong {
+                    actual: 2,
+                    maximum: 1
+                }
+            )
+        ));
     }
 
     #[tokio::test]
@@ -776,10 +953,19 @@ mod tests {
 
         assert!(matches!(
             error,
-            Error::EncodedValueTooLong {
-                actual: 5,
-                maximum: 4
+            Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                source,
+                ..
             }
+                if matches!(
+                    *source,
+                    Error::EncodedValueTooLong {
+                        actual: 5,
+                        maximum: 4
+                    }
+                )
         ));
     }
 
@@ -923,7 +1109,14 @@ mod tests {
             vec![TvpColumnDef::new(SqlType::Int(None))],
             vec![vec![SqlType::BigInt(Some(1))]],
         );
-        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        assert!(matches!(
+            data.validate(),
+            Err(Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -998,7 +1191,14 @@ mod tests {
             column.scale = Some(3);
             let data = TvpTableData::new(vec![column], vec![vec![value]]);
 
-            assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+            assert!(matches!(
+                data.validate(),
+                Err(Error::TvpCellSerialization {
+                    row: 1,
+                    column: 1,
+                    ..
+                })
+            ));
         }
     }
 
@@ -1013,7 +1213,14 @@ mod tests {
                 true, 9, 3, 123_456,
             )))]],
         );
-        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        assert!(matches!(
+            data.validate(),
+            Err(Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                ..
+            })
+        ));
 
         let mut column = TvpColumnDef::new(SqlType::Numeric(None));
         column.precision = Some(3);
@@ -1024,7 +1231,14 @@ mod tests {
                 true, 5, 2, 12_345,
             )))]],
         );
-        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        assert!(matches!(
+            data.validate(),
+            Err(Error::TvpCellSerialization {
+                row: 1,
+                column: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

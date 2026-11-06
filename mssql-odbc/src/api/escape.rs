@@ -22,8 +22,9 @@
 //! a separate phase ([`super::util::rewrite_param_markers`]) which only the
 //! execution path runs, because `SQLNativeSql` must return the markers intact —
 //! msodbcsql answers `{? = call sp_who(?)}` with ` EXEC ?=sp_who ?  `. Both
-//! phases walk the same lexer ([`CodeScan`]) so they cannot disagree about what
-//! counts as a comment or a literal.
+//! phases classify comments and literals identically: translation walks
+//! [`CodeScan`], and the marker rewrite runs a byte-level equivalent that the
+//! tests check against it.
 //!
 //! See `mssql-odbc/docs/odbc-escape-sequences-plan.md` for the measured
 //! msodbcsql behaviour this file reproduces.
@@ -144,8 +145,8 @@ pub(crate) struct Translated {
 /// Walks SQL text and reports which characters are *code*, i.e. outside string
 /// literals, quoted and bracketed identifiers, and comments.
 ///
-/// This is the lexer `rewrite_param_markers` has always used, lifted out so
-/// escape translation and marker rewriting share one definition of "inside a
+/// Escape translation walks this lexer, and `rewrite_param_markers` is
+/// differential-tested against it, so both phases agree on what is "inside a
 /// comment". It keeps msodbcsql's two deliberate quirks:
 ///
 /// - **Block comments do not nest** — the first `*/` closes.
@@ -550,13 +551,29 @@ pub(crate) fn translate_for_execution(
     noscan: bool,
     outputs: &[bool],
 ) -> Result<(String, usize, Option<CallSite>), EscapeError> {
-    if noscan {
+    // Without a `{` there is no escape to translate and no nesting to reject,
+    // so translation is the identity and yields no call site.
+    if noscan || !sql.as_bytes().contains(&b'{') {
         let (rewritten, count) = super::util::rewrite_param_markers(sql);
         return Ok((rewritten, count, None));
     }
     validate_nesting(sql)?;
     let translated = translate_escapes_inner(sql, false, outputs, &mut 0)?;
     let (rewritten, count) = super::util::rewrite_param_markers(&translated.sql);
+    Ok((rewritten, count, translated.call))
+}
+
+/// [`translate_for_execution`] with escape scanning on, without its `{`
+/// shortcut, and with the [`CodeScan`] marker rewrite: the differential oracle
+/// for both.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn translate_for_execution_reference(
+    sql: &str,
+    outputs: &[bool],
+) -> Result<(String, usize, Option<CallSite>), EscapeError> {
+    validate_nesting(sql)?;
+    let translated = translate_escapes_inner(sql, false, outputs, &mut 0)?;
+    let (rewritten, count) = super::util::rewrite_param_markers_reference(&translated.sql);
     Ok((rewritten, count, translated.call))
 }
 
@@ -944,7 +961,7 @@ fn is_identifier_part(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '#' || c == '@' || c == '$'
 }
 
-fn is_regular_identifier(name: &str) -> bool {
+pub(super) fn is_regular_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if is_identifier_start(c)) && chars.all(is_identifier_part)
 }
@@ -1993,6 +2010,131 @@ mod tests {
         let t = translate_escapes("").unwrap();
         assert_eq!(t.sql, "");
         assert!(t.call.is_none());
+    }
+
+    // -- byte-level rewrite and `{` shortcut vs the CodeScan oracle ----------
+
+    use crate::test_support::SplitMix64;
+
+    const LEXER_ALPHABET: &[&str] = &[
+        "'", "\"", "[", "]", "-", "/", "*", "?", "{", "}", "(", ")", "\r", "\n", "N", ";", " ",
+        "é", "東", "😀",
+    ];
+
+    /// Delimiter pairs and quirk triggers that single characters rarely form.
+    const LEXER_PIECES: &[&str] = &[
+        "*)--",
+        "--(*",
+        "/*",
+        "*/",
+        "--",
+        "''",
+        "\"\"",
+        "]]",
+        ")--",
+        "*)",
+        "{fn ",
+        "{call p(",
+        "{? = call p(",
+        "{d '2020-01-02'}",
+        "{interval '1' DAY}",
+        "{escape '\\'}",
+    ];
+
+    fn lexer_input(rng: &mut SplitMix64, pieces: usize, filler_percent: usize) -> String {
+        let mut sql = String::new();
+        for _ in 0..pieces {
+            let roll = rng.below(100);
+            if roll < filler_percent {
+                sql.push_str(["x", "SELECT ", "1 ", "東京"][rng.below(4)]);
+            } else if roll.is_multiple_of(2) {
+                sql.push_str(LEXER_PIECES[rng.below(LEXER_PIECES.len())]);
+            } else {
+                sql.push_str(LEXER_ALPHABET[rng.below(LEXER_ALPHABET.len())]);
+            }
+        }
+        sql
+    }
+
+    fn assert_matches_code_scan(sql: &str, rng: &mut SplitMix64) {
+        assert_eq!(
+            super::super::util::rewrite_param_markers(sql),
+            super::super::util::rewrite_param_markers_reference(sql),
+            "{sql:?}"
+        );
+        let outputs: Vec<bool> = (0..rng.below(4)).map(|_| rng.next() & 1 == 1).collect();
+        assert_eq!(
+            translate_for_execution(sql, false, &outputs),
+            translate_for_execution_reference(sql, &outputs),
+            "{sql:?} {outputs:?}"
+        );
+    }
+
+    /// One of eight 125k-input shards, so the 1M inputs stay inside nextest's
+    /// per-test timeout under coverage instrumentation.
+    fn short_text_shard(shard: u64) {
+        let mut rng = SplitMix64(0x6D73_7371_6C2D_7273 ^ shard);
+        for i in 0..125_000usize {
+            let sql = if i.is_multiple_of(2) {
+                (0..rng.below(65))
+                    .map(|_| LEXER_ALPHABET[rng.below(LEXER_ALPHABET.len())])
+                    .collect()
+            } else {
+                let pieces = rng.below(33);
+                lexer_input(&mut rng, pieces, 20)
+            };
+            assert_matches_code_scan(&sql, &mut rng);
+        }
+    }
+
+    macro_rules! short_text_shards {
+        ($($name:ident = $shard:literal),* $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    short_text_shard($shard);
+                }
+            )*
+        };
+    }
+
+    short_text_shards! {
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_0 = 0,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_1 = 1,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_2 = 2,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_3 = 3,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_4 = 4,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_5 = 5,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_6 = 6,
+        byte_rewrite_and_brace_shortcut_match_code_scan_on_short_text_7 = 7,
+    }
+
+    #[test]
+    fn byte_rewrite_and_brace_shortcut_match_code_scan_on_16_kib_text() {
+        let mut rng = SplitMix64(0x0016_4B1B_7E57);
+        for i in 0..64usize {
+            let mut sql = String::new();
+            while sql.len() < 16 * 1024 {
+                sql.push_str(&lexer_input(&mut rng, 64, 90));
+            }
+            if i.is_multiple_of(4) {
+                sql.retain(|c| c != '{');
+            }
+            assert_matches_code_scan(&sql, &mut rng);
+        }
+    }
+
+    /// Unclosed braces never form an escape, but they must still reach the
+    /// nesting check: the shortcut keys on `{` alone.
+    #[test]
+    fn brace_shortcut_still_rejects_unclosed_nesting() {
+        let unclosed = format!("{}?", "{".repeat(65));
+        assert_eq!(
+            translate_for_execution(&unclosed, false, &[])
+                .unwrap_err()
+                .state(),
+            SQLSTATE_42000
+        );
     }
 
     #[test]

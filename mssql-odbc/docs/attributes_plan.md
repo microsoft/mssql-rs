@@ -55,7 +55,7 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | Attribute | Set | Get | Note |
 |---|---|---|---|
 | `SQL_ATTR_LOGIN_TIMEOUT` | ✅ | ✅ | clamped to `0xFFFE`, `01S02` on clamp |
-| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds the internal `SQL_USER_NAME`, alias-type, and database-updateability lookups, as msodbcsql's `GetNetIOTimeOut` does on the session; secondary logins and reads share that deadline (deviation 32) |
+| `SQL_ATTR_CONNECTION_TIMEOUT` | ✅ | ✅ | bounds connection-scoped requests, internal metadata lookups, and cancellation settlement; see the [timeout contract](driver-guide.md#connection-operation-timeouts) |
 | `SQL_ATTR_PACKET_SIZE` | ✅ | ✅ | pre-connect only |
 | `SQL_ATTR_ACCESS_MODE` | ✅ | ✅ | stored hint, not DML enforcement; an actually read-only database overrides the connected getter (see below) |
 | `SQL_ATTR_AUTOCOMMIT` | ✅ | ✅ | |
@@ -84,7 +84,7 @@ their measured not-implemented diagnostic; an unknown identifier returns `HY092`
 | `SQL_ATTR_ROWS_FETCHED_PTR` | ✅ | ✅ |
 | `SQL_ATTR_ROW_STATUS_PTR` / `ROW_BIND_TYPE` | ✅ | ✅ |
 | `SQL_ATTR_PARAMSET_SIZE` | ✅ | ✅ |
-| `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` | ✅ no-op | ✅ |
+| `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` | ✅ descriptor association | ✅ |
 | `SQL_ATTR_IMP_ROW_DESC` / `IMP_PARAM_DESC` | — | ✅ |
 | `SQL_ATTR_MAX_ROWS` | ✅ enforced | ✅ |
 | `SQL_ATTR_MAX_LENGTH`, `NOSCAN`, `RETRIEVE_DATA`, `USE_BOOKMARKS` | ✅ | ✅ |
@@ -626,8 +626,9 @@ three above — which the `CURRENT_CATALOG` contrast shows is not safe.
   `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`. `MULTISUBNET_FAILOVER`
   is routed (AB#49293); `TNIR` is deliberately omitted, with off accepted as a
   no-op and on returning `HYC00`.
-- **Read-only/diagnostic:** `SQL_COPT_SS_CLIENT_CONNECTION_ID`, `SQL_COPT_SS_SPID`,
-  `SQL_COPT_SS_USER_DATA`.
+- **Read-only/diagnostic:** `SQL_COPT_SS_SPID`, `SQL_COPT_SS_USER_DATA`.
+  `SQL_COPT_SS_CLIENT_CONNECTION_ID` is implemented as a read-only UTF-16 GUID
+  string; see the [tracing guide](driver-guide.md#tracing).
 - **Standard leftovers:** `SQL_ATTR_METADATA_ID = SQL_TRUE` (currently `HYC00`
   because catalog dispatch still forces pattern mode), `SQL_ATTR_ASYNC_ENABLE`,
   `SQL_ATTR_AUTO_IPD`, `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.
@@ -677,12 +678,12 @@ suites; none of it came from `msodbcsql.h`.
 | 1233 | `QUERYNOTIFICATION_TIMEOUT` | int | **432000** | `1..=i32::MAX` — **0 is rejected** |
 | 1234 | `QUERYNOTIFICATION_MSGTEXT` | **string** | `""` | any string; `StringLength` ≥ 0 or `SQL_NTS` |
 | 1235 | `QUERYNOTIFICATION_OPTIONS` | **string** | `""` | any string; `StringLength` ≥ 0 or `SQL_NTS` |
-| 1236 | `PARAM_FOCUS` | int | 0 | **always `HY024`** |
+| 1236 | `PARAM_FOCUS` | int | 0 | 0 restores top-level binding; a bound TVP ordinal selects its columns; other values are `HY024` |
 | 1237 | `NAME_SCOPE` | int | 0 | range `0..=3` |
 | 1238 | `COLUMN_ENCRYPTION` | int | 0 | **always `HY024`** |
 
-A rejected set leaves the previous value in place. `PARAM_FOCUS` and
-`COLUMN_ENCRYPTION` reject *every* value including 0 — `COLUMN_ENCRYPTION` does
+A rejected set leaves the previous value in place.
+`COLUMN_ENCRYPTION` rejects *every* value including 0 — it does
 so even on a connection opened with `ColumnEncryption=Enabled`, so the rejection
 is unconditional rather than a licence check. The QN timeout ceiling is
 `i32::MAX`, not the full `SQLULEN` width the pointer slot can carry on a 64-bit
@@ -777,9 +778,9 @@ driver refuses. Variation 29 is therefore inverted from "this one is not
 implemented" into a completeness sweep asserting that all 41 comparable
 identifiers answer with neither `HY092` nor `HYC00`.
 
-**Cross-story notes:** `PARAM_FOCUS` rejects every value today, which matches
-msodbcsql; if AB#46374 (Descriptors) later implements it, the rejection is the
-single line to revisit.
+**Cross-story notes:** AB#49353 implements `PARAM_FOCUS` for TVP column binding.
+Its binding and execution coverage lives in `tvp_test`; the unsupported-feature
+attribute test now covers only `COLUMN_ENCRYPTION`.
 
 **Size:** M. **Depends on:** S1, S3 (string I/O), S4 (`begin_batch` call sites).
 

@@ -1,0 +1,1549 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+//
+// End-to-end coverage for table-valued parameters: describe identity, a
+// populated round-trip, and an empty table. Mirrors the ODBC sequence a
+// consumer (mssql-python) issues: prepare, describe, bind the SQL_SS_TABLE
+// parameter, focus on it, bind its columns as arrays, restore focus, execute.
+
+#include "odbc_test_fixture.h"
+
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <random>
+#include <string>
+#include <vector>
+
+#ifndef SQL_SS_TABLE
+#define SQL_SS_TABLE (-153)
+#endif
+#ifndef SQL_SOPT_SS_PARAM_FOCUS
+#define SQL_SOPT_SS_PARAM_FOCUS 1236
+#endif
+#ifndef SQL_CA_SS_SCHEMA_NAME
+#define SQL_CA_SS_SCHEMA_NAME 1226
+#endif
+#ifndef SQL_CA_SS_TYPE_NAME
+#define SQL_CA_SS_TYPE_NAME 1227
+#endif
+
+namespace {
+
+const std::string& UniqueSuffix() {
+    static const std::string suffix = [] {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dist;
+        char buf[17] = {};
+        std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(dist(gen)));
+        return std::string(buf);
+    }();
+    return suffix;
+}
+
+std::vector<SQLWCHAR> ToSqlW(const std::string& text) {
+    std::vector<SQLWCHAR> result;
+    result.reserve(text.size() + 1);
+    for (unsigned char ch : text) result.push_back(static_cast<SQLWCHAR>(ch));
+    result.push_back(0);
+    return result;
+}
+
+std::string SqlWToAscii(const SQLWCHAR* text, size_t count) {
+    std::string result;
+    for (size_t i = 0; i < count && text[i] != 0; ++i) {
+        result.push_back(static_cast<char>(text[i]));
+    }
+    return result;
+}
+
+} // namespace
+
+class TvpTest : public ODBCTest {
+protected:
+    // TEST_F is intentional: each test creates permanent dbo objects with the
+    // same process-wide suffix, so parallel fixtures would collide.
+    void SetUp() override {
+        ODBCTest::SetUp();
+        ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection());
+        Connect();
+        suffix_ = UniqueSuffix();
+        type_name_ = "pytvp_type_" + suffix_;
+        proc_name_ = "pytvp_proc_" + suffix_;
+        Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc_name_ + "]");
+        Direct("DROP TYPE IF EXISTS dbo.[" + type_name_ + "]");
+        ASSERT_SQL_OK(
+            DirectRc("CREATE TYPE dbo.[" + type_name_ +
+                     "] AS TABLE (id INT, label NVARCHAR(50))"),
+            SQL_HANDLE_STMT, stmt_);
+        // The proc returns the rows it received, so a fetch verifies what the
+        // server actually materialized from the TVP on the wire.
+        ASSERT_SQL_OK(
+            DirectRc("CREATE PROCEDURE dbo.[" + proc_name_ +
+                     "] @t dbo.[" + type_name_ +
+                     "] READONLY AS SELECT id, label FROM @t ORDER BY id"),
+            SQL_HANDLE_STMT, stmt_);
+    }
+
+    void TearDown() override {
+        if (stmt_ != SQL_NULL_HSTMT) {
+            RestoreFocus();
+            if (impersonating_) Direct("REVERT");
+            for (const auto& sql : cleanup_sql_) Direct(sql);
+            Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc_name_ + "]");
+            Direct("DROP TYPE IF EXISTS dbo.[" + type_name_ + "]");
+        }
+        ODBCTest::TearDown();
+    }
+
+    SQLRETURN DirectRc(const std::string& sql) {
+        SQLRETURN close_rc = SQLFreeStmt(stmt_, SQL_CLOSE);
+        if (!SQL_SUCCEEDED(close_rc)) return close_rc;
+        auto text = ODBCTestUtils::ToSqlTStr(sql);
+        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
+    }
+    void Direct(const std::string& sql) {
+        EXPECT_SQL_OK(DirectRc(sql), SQL_HANDLE_STMT, stmt_);
+    }
+
+    SQLRETURN Prepare(const std::string& sql) {
+        auto text = ODBCTestUtils::ToSqlTStr(sql);
+        return SQLPrepare(stmt_, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
+    }
+
+    SQLHDESC Ipd() {
+        SQLHDESC ipd = SQL_NULL_HDESC;
+        EXPECT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        return ipd;
+    }
+
+    void VerifyFocusedCapacityCanBeRaised(bool use_desc_header) {
+        ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+        auto type = ToSqlW(type_name_);
+        SQLLEN row_count = 2;
+        ASSERT_SQL_OK(
+            SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                             1, 0, type.data(),
+                             static_cast<SQLLEN>((type.size() - 1) * sizeof(SQLWCHAR)), &row_count),
+            SQL_HANDLE_STMT, stmt_);
+        auto schema = ToSqlW("dbo");
+        ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_CA_SS_SCHEMA_NAME, schema.data(),
+                                       static_cast<SQLINTEGER>((schema.size() - 1) * sizeof(SQLWCHAR))),
+                      SQL_HANDLE_DESC, Ipd());
+
+        Focus(1);
+        if (use_desc_header) {
+            SQLHDESC apd = SQL_NULL_HDESC;
+            ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLSetDescFieldW(apd, 0, SQL_DESC_ARRAY_SIZE,
+                                           reinterpret_cast<SQLPOINTER>(2), 0),
+                          SQL_HANDLE_DESC, apd);
+        } else {
+            ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                         reinterpret_cast<SQLPOINTER>(2), 0),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+
+        std::array<SQLINTEGER, 2> ids = {17, 29};
+        std::array<SQLLEN, 2> id_indicators = {0, 0};
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                       0, 0, ids.data(), 0, id_indicators.data()),
+                      SQL_HANDLE_STMT, stmt_);
+        std::array<SQLWCHAR, 102> labels{};
+        std::array<SQLLEN, 2> label_indicators = {SQL_NULL_DATA, SQL_NULL_DATA};
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                       50, 0, labels.data(),
+                                       static_cast<SQLLEN>(51 * sizeof(SQLWCHAR)),
+                                       label_indicators.data()),
+                      SQL_HANDLE_STMT, stmt_);
+        RestoreFocus();
+
+        SQLULEN outer_array_size = 0;
+        ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_PARAMSET_SIZE, &outer_array_size, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(outer_array_size, 1);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLINTEGER actual = 0;
+        SQLLEN indicator = 0;
+        for (const SQLINTEGER expected : ids) {
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual, 0, &indicator),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(actual, expected);
+        }
+        EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+    }
+
+    // Binds the top-level TVP at `ordinal`: the type name in the value buffer,
+    // the schema through SQL_CA_SS_SCHEMA_NAME, and `rows` (or SQL_DEFAULT_PARAM)
+    // as the indicator. The type-name buffer is retained in `type_bufs_` so the
+    // pointer stays valid until execute.
+    void BindTvp(SQLUSMALLINT ordinal, const std::string& type_name, SQLLEN rows,
+                 const std::string& schema = "dbo") {
+        type_bufs_.push_back(ToSqlW(type_name));
+        std::vector<SQLWCHAR>& tw = type_bufs_.back();
+        row_counts_.push_back(rows);
+        SQLLEN& ind = row_counts_.back();
+        ASSERT_SQL_OK(
+            SQLBindParameter(stmt_, ordinal, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                             rows == SQL_DEFAULT_PARAM ? 0 : static_cast<SQLULEN>(rows), 0,
+                             tw.data(),
+                             static_cast<SQLLEN>((tw.size() - 1) * sizeof(SQLWCHAR)), &ind),
+            SQL_HANDLE_STMT, stmt_);
+        schema_bufs_.push_back(ToSqlW(schema));
+        std::vector<SQLWCHAR>& sw = schema_bufs_.back();
+        ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), ordinal, SQL_CA_SS_SCHEMA_NAME,
+                                       sw.data(),
+                                       static_cast<SQLINTEGER>((sw.size() - 1) * sizeof(SQLWCHAR))),
+                      SQL_HANDLE_DESC, Ipd());
+    }
+
+    void Focus(SQLINTEGER ordinal) {
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_SOPT_SS_PARAM_FOCUS,
+                                     reinterpret_cast<SQLPOINTER>(
+                                         static_cast<SQLLEN>(ordinal)),
+                                     SQL_IS_INTEGER),
+                      SQL_HANDLE_STMT, stmt_);
+    }
+    void RestoreFocus() { Focus(0); }
+
+    void VerifyDaeFocusedCapacity(SQLULEN initial_capacity, SQLULEN focused_capacity) {
+        ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+        auto type = ToSqlW(type_name_);
+        SQLLEN indicator = SQL_DATA_AT_EXEC;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT, SQL_SS_TABLE,
+                                       initial_capacity, 0, type.data(), SQL_NTS, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        Focus(1);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                     reinterpret_cast<SQLPOINTER>(focused_capacity), 0),
+                      SQL_HANDLE_STMT, stmt_);
+        std::array<SQLINTEGER, 2> ids = {17, 29};
+        std::array<SQLLEN, 2> lengths = {0, 0};
+        std::array<SQLLEN, 2> nulls = {SQL_NULL_DATA, SQL_NULL_DATA};
+        std::array<SQLWCHAR, 2> labels{};
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                       0, 0, ids.data(), sizeof(SQLINTEGER), lengths.data()),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                       50, 0, labels.data(), sizeof(SQLWCHAR), nulls.data()),
+                      SQL_HANDLE_STMT, stmt_);
+        RestoreFocus();
+        ASSERT_EQ(SQLExecute(stmt_), SQL_NEED_DATA);
+        SQLPOINTER token = nullptr;
+        ASSERT_EQ(SQLParamData(stmt_, &token), SQL_NEED_DATA);
+        for (SQLULEN rows = 0; rows < focused_capacity; rows += 2) {
+            EXPECT_EQ(token, type.data());
+            ASSERT_SQL_OK(SQLPutData(stmt_, reinterpret_cast<SQLPOINTER>(1), 2),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_EQ(SQLParamData(stmt_, &token), SQL_NEED_DATA);
+        }
+        EXPECT_EQ(SQLPutData(stmt_, reinterpret_cast<SQLPOINTER>(1), 2), SQL_ERROR);
+        SQLWCHAR state[6]{}, message[256]{};
+        SQLINTEGER native = 0;
+        SQLSMALLINT message_length = 0;
+        ASSERT_SQL_OK(SQLGetDiagRecW(SQL_HANDLE_STMT, stmt_, 1, state, &native, message,
+                                     256, &message_length), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SqlWToAscii(state, 5), "HY090");
+        ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+
+    std::string suffix_;
+    std::string type_name_;
+    std::string proc_name_;
+    // Buffers retained for the lifetime of a bind so their pointers stay valid
+    // until execute. `deque`, not `vector`: binding a second TVP must not
+    // reallocate and invalidate the first TVP's retained name pointers.
+    std::deque<std::vector<SQLWCHAR>> type_bufs_;
+    std::deque<std::vector<SQLWCHAR>> schema_bufs_;
+    std::deque<SQLLEN> row_counts_;
+    std::vector<std::string> cleanup_sql_;
+    bool impersonating_ = false;
+};
+
+// SQLDescribeParam reports the TVP as SQL_SS_TABLE and the IPD exposes the
+// table type's name through SQL_CA_SS_TYPE_NAME.
+TEST_F(TvpTest, DescribeReportsTableTypeAndName) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT data_type = 0;
+    SQLULEN param_size = 0;
+    SQLSMALLINT decimal_digits = 0;
+    SQLSMALLINT nullable = 0;
+    ASSERT_SQL_OK(SQLDescribeParam(stmt_, 1, &data_type, &param_size, &decimal_digits, &nullable),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(data_type, SQL_SS_TABLE);
+
+    SQLWCHAR name[128] = {0};
+    SQLINTEGER name_len = 0;
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_CA_SS_TYPE_NAME, name,
+                                   sizeof(name), &name_len),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(SqlWToAscii(name, static_cast<size_t>(name_len) / sizeof(SQLWCHAR)), type_name_);
+}
+
+// A populated TVP round-trips: two rows bound column-wise under param focus are
+// returned verbatim by the procedure.
+TEST_F(TvpTest, PopulatedTableRoundTrips) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+
+    // The top-level TVP: value pointer is the type name, indicator the row count.
+    std::vector<SQLWCHAR> type_w = ToSqlW(type_name_);
+    SQLLEN row_count = 2;
+    ASSERT_SQL_OK(
+        SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                         static_cast<SQLULEN>(row_count), 0,
+                         type_w.data(),
+                         static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)), &row_count),
+        SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLWCHAR> schema_w = ToSqlW("dbo");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_CA_SS_SCHEMA_NAME,
+                                   schema_w.data(),
+                                   static_cast<SQLINTEGER>((schema_w.size() - 1) * sizeof(SQLWCHAR))),
+                  SQL_HANDLE_DESC, Ipd());
+
+    // Focus on the TVP and bind its two columns as arrays of row_count rows.
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_SOPT_SS_PARAM_FOCUS,
+                                 reinterpret_cast<SQLPOINTER>(1), SQL_IS_INTEGER),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+
+    std::array<SQLINTEGER, 2> ids = {1, 2};
+    std::array<SQLLEN, 2> id_ind = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, ids.data(), 0, id_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Two fixed-width wide-char rows, each padded to 50 chars + NUL.
+    const SQLULEN label_cap = 50;
+    std::vector<SQLWCHAR> labels((label_cap + 1) * 2, 0);
+    std::array<SQLLEN, 2> label_ind = {0, 0};
+    const char* texts[2] = {"Keyboard", "Mouse"};
+    for (size_t r = 0; r < 2; ++r) {
+        std::string t(texts[r]);
+        for (size_t c = 0; c < t.size(); ++c) {
+            labels[r * (label_cap + 1) + c] = static_cast<SQLWCHAR>(t[c]);
+        }
+        label_ind[r] = static_cast<SQLLEN>(t.size() * sizeof(SQLWCHAR));
+    }
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   label_cap, 0, labels.data(),
+                                   static_cast<SQLLEN>((label_cap + 1) * sizeof(SQLWCHAR)),
+                                   label_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_SOPT_SS_PARAM_FOCUS,
+                                 reinterpret_cast<SQLPOINTER>(0), SQL_IS_INTEGER),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Row 1.
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER id = 0;
+    SQLLEN id_len = 0;
+    SQLWCHAR label[64] = {0};
+    SQLLEN label_len = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_WCHAR, label, sizeof(label), &label_len),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(id, 1);
+    EXPECT_EQ(SqlWToAscii(label, sizeof(label) / sizeof(SQLWCHAR)), "Keyboard");
+
+    // Row 2.
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_WCHAR, label, sizeof(label), &label_len),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(id, 2);
+    EXPECT_EQ(SqlWToAscii(label, sizeof(label) / sizeof(SQLWCHAR)), "Mouse");
+
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Benefits-from-mock-tds: Assert the focused row-control capacity and both
+// rows in the serialized TVP RPC, not only the values returned by SQL Server.
+TEST_F(TvpTest, FocusedParamsetSizeRaisesBoundCapacity) {
+    VerifyFocusedCapacityCanBeRaised(false);
+}
+
+// Benefits-from-mock-tds: Assert the child array capacity and both serialized
+// rows while verifying the outer parameter-set size remains unchanged.
+TEST_F(TvpTest, FocusedArraySizeRaisesBoundCapacity) {
+    VerifyFocusedCapacityCanBeRaised(true);
+}
+
+TEST_F(TvpTest, DaeFocusedSizeReplacesLargerParentCapacity) {
+    VerifyDaeFocusedCapacity(6, 2);
+}
+
+TEST_F(TvpTest, DaeFocusedSizeReplacesSmallerParentCapacity) {
+    VerifyDaeFocusedCapacity(2, 6);
+}
+
+TEST_F(TvpTest, FocusedDescriptorWritesLeaveParentUnchanged) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    auto parent_name = ToSqlW("@t");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, parent_name.data(), SQL_NTS),
+                  SQL_HANDLE_DESC, Ipd());
+    Focus(1);
+    SQLINTEGER value = 17;
+    SQLLEN length = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &value, 0, &length), SQL_HANDLE_STMT, stmt_);
+    auto child_name = ToSqlW("child");
+    EXPECT_EQ(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_name.data(), SQL_NTS), SQL_ERROR);
+    SQLWCHAR state[6]{}, message[256]{};
+    SQLINTEGER native = 0;
+    SQLSMALLINT message_length = 0;
+    ASSERT_SQL_OK(SQLGetDiagRecW(SQL_HANDLE_DESC, Ipd(), 1, state, &native, message,
+                                 256, &message_length), SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(SqlWToAscii(state, 5), "HY092");
+    child_name = ToSqlW("@child");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_name.data(), SQL_NTS),
+                  SQL_HANDLE_DESC, Ipd());
+    SQLWCHAR child_readback[32]{};
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_readback,
+                                   sizeof(child_readback), nullptr), SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(SqlWToAscii(child_readback, 32), "@child");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, nullptr, 0),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_readback,
+                                   sizeof(child_readback), nullptr), SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(SqlWToAscii(child_readback, 32), "");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_NAME, child_name.data(), SQL_NTS),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_UNNAMED,
+                                   reinterpret_cast<SQLPOINTER>(SQL_UNNAMED), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_PARAMETER_TYPE,
+                                   reinterpret_cast<SQLPOINTER>(SQL_PARAM_OUTPUT), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_OCTET_LENGTH,
+                                   reinterpret_cast<SQLPOINTER>(8), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    SQLSMALLINT direction = 0;
+    SQLLEN octets = 0;
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_PARAMETER_TYPE, &direction, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(direction, SQL_PARAM_OUTPUT);
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_OCTET_LENGTH, &octets, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(octets, 8);
+    RestoreFocus();
+    SQLWCHAR name[32]{};
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_NAME, name, sizeof(name), nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(SqlWToAscii(name, 32), "@t");
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_PARAMETER_TYPE, &direction, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(direction, SQL_PARAM_INPUT);
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_OCTET_LENGTH, &octets, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(octets, 0);
+}
+
+TEST_F(TvpTest, FocusedTimestampPrecisionAliasesScaleAndPreservesLength) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    SQL_TIMESTAMP_STRUCT value{};
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP,
+                                   SQL_TYPE_TIMESTAMP, 27, 7, &value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_PRECISION, reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    SQLSMALLINT precision = -1, scale = -1;
+    SQLULEN length = 0;
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_PRECISION, &precision, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_SCALE, &scale, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_LENGTH, &length, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(precision, 3);
+    EXPECT_EQ(scale, 3);
+    EXPECT_EQ(length, 27);
+    SQLWCHAR name[8]{};
+    SQLSMALLINT name_length = 0, type = 0, subtype = 0, nullable = 0;
+    SQLLEN octet_length = 0;
+    ASSERT_SQL_OK(SQLGetDescRecW(Ipd(), 1, name, 8, &name_length, &type, &subtype,
+                                 &octet_length, &precision, &scale, &nullable),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(precision, 3);
+    EXPECT_EQ(scale, 3);
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_SCALE, reinterpret_cast<SQLPOINTER>(5), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_PRECISION, &precision, 0, nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(precision, 5);
+    RestoreFocus();
+}
+
+// Benefits-from-mock-tds: Assert typed NULL payload without a deferred RPC.
+TEST_F(TvpTest, NullCellIndicatorOverridesSeparateDaeLength) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    SQLINTEGER id = 42;
+    SQLLEN id_length = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &id, sizeof(id), &id_length), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR label[8]{};
+    SQLLEN indicator = SQL_NULL_DATA, length = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   50, 0, label, sizeof(label), &indicator), SQL_HANDLE_STMT, stmt_);
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescFieldW(apd, 2, SQL_DESC_OCTET_LENGTH_PTR, &length, 0),
+                  SQL_HANDLE_DESC, apd);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLLEN actual_length = 0;
+    SQLINTEGER actual_id = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual_id, 0, &actual_length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual_id, 42);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_WCHAR, label, sizeof(label), &actual_length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual_length, SQL_NULL_DATA);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Benefits-from-mock-tds: Assert complete named declarations on the deferred text RPC.
+TEST_F(TvpTest, DirectCallWithChildDaeKeepsScalarAndReturnBindings) {
+    const std::string proc = "direct_dae_proc_" + suffix_;
+    cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]"};
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type_name_ +
+                           "] READONLY, @n INT AS SELECT id + @n, label FROM @t; RETURN 37"),
+                  SQL_HANDLE_STMT, stmt_);
+    for (bool returns_status : {false, true}) {
+        SCOPED_TRACE(returns_status);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        const SQLUSMALLINT table_ordinal = returns_status ? 2 : 1;
+        BindTvp(table_ordinal, type_name_, 1);
+        SQLINTEGER status = -1, scalar = 13;
+        SQLLEN status_length = 0, scalar_length = 0;
+        if (returns_status) {
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER,
+                                           0, 0, &status, sizeof(status), &status_length),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, table_ordinal + 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                       SQL_INTEGER, 0, 0, &scalar, sizeof(scalar), &scalar_length),
+                      SQL_HANDLE_STMT, stmt_);
+        Focus(table_ordinal);
+        SQLINTEGER id = 42;
+        SQLLEN id_length = 0, label_length = SQL_DATA_AT_EXEC;
+        SQLWCHAR label_token[8]{};
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                       0, 0, &id, sizeof(id), &id_length), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                       50, 0, label_token, sizeof(label_token), &label_length),
+                      SQL_HANDLE_STMT, stmt_);
+        RestoreFocus();
+        auto sql = ODBCTestUtils::ToSqlTStr(
+            std::string(returns_status ? "{? = call dbo.[" : "{call dbo.[") + proc + "](?, ?)}");
+        ASSERT_EQ(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS), SQL_NEED_DATA)
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+        SQLPOINTER token = nullptr;
+        ASSERT_EQ(SQLParamData(stmt_, &token), SQL_NEED_DATA);
+        EXPECT_EQ(token, label_token);
+        auto text = ToSqlW("hello");
+        ASSERT_SQL_OK(SQLPutData(stmt_, text.data(), 5 * sizeof(SQLWCHAR)), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLParamData(stmt_, &token), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER actual = 0;
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual, 0, &length), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(actual, 55);
+        char label[16]{};
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, label, sizeof(label), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(std::string(label), "hello");
+        EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+        SQLRETURN more;
+        while ((more = SQLMoreResults(stmt_)) == SQL_SUCCESS) {}
+        EXPECT_EQ(more, SQL_NO_DATA);
+        if (returns_status) EXPECT_EQ(status, 37);
+    }
+}
+
+// Benefits-from-mock-tds: Assert row and column order in the assembled TVP payload.
+TEST_F(TvpTest, MaterializedParentOffersOnlyDaeCellTokens) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 3);
+    Focus(1);
+    std::array<SQLINTEGER, 3> ids = {11, 22, 33};
+    std::array<SQLLEN, 3> id_lengths = {0, 0, 0};
+    std::array<std::array<SQLWCHAR, 51>, 3> labels{};
+    labels[0][0] = 'o';
+    labels[0][1] = 'n';
+    labels[0][2] = 'e';
+    std::array<SQLLEN, 3> label_lengths = {
+        static_cast<SQLLEN>(3 * sizeof(SQLWCHAR)), SQL_DATA_AT_EXEC, SQL_NULL_DATA};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, ids.data(), sizeof(SQLINTEGER), id_lengths.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   50, 0, labels.data(), sizeof(labels[0]), label_lengths.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_EQ(SQLExecute(stmt_), SQL_NEED_DATA);
+    SQLPOINTER token = nullptr;
+    ASSERT_EQ(SQLParamData(stmt_, &token), SQL_NEED_DATA);
+    EXPECT_EQ(token, labels[1].data());
+    auto text = ToSqlW("two");
+    ASSERT_SQL_OK(SQLPutData(stmt_, text.data(), 3 * sizeof(SQLWCHAR)), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &token), SQL_HANDLE_STMT, stmt_);
+    for (size_t row = 0; row < ids.size(); ++row) {
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER actual_id = 0;
+        SQLLEN length = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual_id, 0, &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(actual_id, ids[row]);
+        char actual_label[16]{};
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, actual_label, sizeof(actual_label), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        if (row == 2) {
+            EXPECT_EQ(length, SQL_NULL_DATA);
+        } else {
+            EXPECT_EQ(std::string(actual_label), row == 0 ? "one" : "two");
+        }
+    }
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Benefits-from-mock-tds: Assert MAX metadata and PLP framing for all LONG columns.
+TEST_F(TvpTest, LongColumnsAndNullsUseMaxWithEitherLongAsMaxSetting) {
+    const std::string type = "long_type_" + suffix_;
+    const std::string proc = "long_proc_" + suffix_;
+    cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]",
+                    "DROP TYPE IF EXISTS dbo.[" + type + "]"};
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE dbo.[" + type +
+                           "] AS TABLE (v VARCHAR(MAX), w NVARCHAR(MAX), b VARBINARY(MAX))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type +
+                           "] READONLY AS SELECT v, w, b FROM @t ORDER BY v DESC"),
+                  SQL_HANDLE_STMT, stmt_);
+    for (SQLULEN long_as_max : {0, 1}) {
+        ASSERT_SQL_OK(SQLSetConnectAttrW(dbc_, 1403, reinterpret_cast<SQLPOINTER>(long_as_max), 0),
+                      SQL_HANDLE_DBC, dbc_);
+        for (int mode : {0, 1, 2}) {
+            SCOPED_TRACE("LongAsMax=" + std::to_string(long_as_max) + " mode=" + std::to_string(mode));
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+            BindTvp(1, type, 2);
+            if (mode == 2) row_counts_.back() = SQL_DATA_AT_EXEC;
+            Focus(1);
+            char text[2][2] = {{'x', 0}, {}};
+            SQLWCHAR wide[2][2] = {{'x', 0}, {}};
+            unsigned char binary[2] = {0x78, 0};
+            SQLLEN text_lengths[2] = {mode ? SQL_DATA_AT_EXEC : 1, SQL_NULL_DATA};
+            SQLLEN wide_lengths[2] = {mode ? SQL_DATA_AT_EXEC : static_cast<SQLLEN>(sizeof(SQLWCHAR)), SQL_NULL_DATA};
+            SQLLEN binary_lengths[2] = {mode ? SQL_DATA_AT_EXEC : 1, SQL_NULL_DATA};
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR,
+                                           10, 0, text, sizeof(text[0]), text_lengths),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WLONGVARCHAR,
+                                           10, 0, wide, sizeof(wide[0]), wide_lengths),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY,
+                                           10, 0, binary, 1, binary_lengths),
+                          SQL_HANDLE_STMT, stmt_);
+            RestoreFocus();
+            SQLRETURN rc = SQLExecute(stmt_);
+            int table_tokens = 0, cell_tokens = 0;
+            if (mode) {
+                ASSERT_EQ(rc, SQL_NEED_DATA);
+                SQLPOINTER token = nullptr;
+                while ((rc = SQLParamData(stmt_, &token)) == SQL_NEED_DATA) {
+                    ASSERT_LT(table_tokens + cell_tokens, 6);
+                    if (mode == 2 && token == type_bufs_.back().data()) {
+                        ASSERT_SQL_OK(SQLPutData(stmt_, table_tokens == 0 ? reinterpret_cast<SQLPOINTER>(1) : nullptr,
+                                                 table_tokens == 0 ? 2 : 0), SQL_HANDLE_STMT, stmt_);
+                        ++table_tokens;
+                    } else if (token == text) {
+                        ASSERT_SQL_OK(SQLPutData(stmt_, text, 1), SQL_HANDLE_STMT, stmt_);
+                        ++cell_tokens;
+                    } else if (token == wide) {
+                        ASSERT_SQL_OK(SQLPutData(stmt_, wide, sizeof(SQLWCHAR)), SQL_HANDLE_STMT, stmt_);
+                        ++cell_tokens;
+                    } else if (token == binary) {
+                        ASSERT_SQL_OK(SQLPutData(stmt_, binary, 1), SQL_HANDLE_STMT, stmt_);
+                        ++cell_tokens;
+                    } else {
+                        FAIL() << "unexpected TVP token";
+                    }
+                }
+                EXPECT_EQ(cell_tokens, 3);
+                EXPECT_EQ(table_tokens, mode == 2 ? 2 : 0);
+            }
+            ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            for (SQLUSMALLINT column : {1, 2, 3}) {
+                unsigned char actual[8]{};
+                SQLLEN actual_length = 0;
+                ASSERT_SQL_OK(SQLGetData(stmt_, column, column == 3 ? SQL_C_BINARY : SQL_C_CHAR,
+                                         actual, sizeof(actual), &actual_length), SQL_HANDLE_STMT, stmt_);
+                EXPECT_EQ(actual[0], 0x78);
+                EXPECT_EQ(actual_length, 1);
+            }
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            for (SQLUSMALLINT column : {1, 2, 3}) {
+                unsigned char actual[8]{};
+                SQLLEN actual_length = 0;
+                ASSERT_SQL_OK(SQLGetData(stmt_, column, SQL_C_BINARY, actual, sizeof(actual), &actual_length),
+                              SQL_HANDLE_STMT, stmt_);
+                EXPECT_EQ(actual_length, SQL_NULL_DATA);
+            }
+            EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+        }
+    }
+}
+
+// Benefits-from-mock-tds: Assert scale-2 numeric payloads rather than server conversion.
+TEST_F(TvpTest, NumericScaleReductionTruncatesForMaterializedAndDaeCells) {
+    const std::string type = "numeric_type_" + suffix_;
+    const std::string proc = "numeric_proc_" + suffix_;
+    cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]",
+                    "DROP TYPE IF EXISTS dbo.[" + type + "]"};
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE dbo.[" + type + "] AS TABLE (v DECIMAL(3,2))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type +
+                           "] READONLY AS SELECT v FROM @t ORDER BY v"), SQL_HANDLE_STMT, stmt_);
+    for (int mode : {0, 1, 2}) {
+        SCOPED_TRACE("mode=" + std::to_string(mode));
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+        BindTvp(1, type, 4);
+        if (mode == 2) row_counts_.back() = SQL_DATA_AT_EXEC;
+        Focus(1);
+        std::array<SQL_NUMERIC_STRUCT, 4> numbers{};
+        std::array<SQLLEN, 4> lengths{};
+        for (size_t i = 0; i < numbers.size(); ++i) {
+            numbers[i].precision = 4;
+            numbers[i].scale = 3;
+            numbers[i].sign = i % 2 == 0 ? 1 : 0;
+            const uint64_t magnitude = i < 2 ? 1235 : 9995;
+            std::memcpy(numbers[i].val, &magnitude, sizeof(magnitude));
+            lengths[i] = mode ? SQL_DATA_AT_EXEC : sizeof(SQL_NUMERIC_STRUCT);
+        }
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL,
+                                       3, 2, numbers.data(), sizeof(SQL_NUMERIC_STRUCT), lengths.data()),
+                      SQL_HANDLE_STMT, stmt_);
+        SQLHDESC apd = SQL_NULL_HDESC;
+        ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_PRECISION, reinterpret_cast<SQLPOINTER>(4), 0),
+                      SQL_HANDLE_DESC, apd);
+        ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_SCALE, reinterpret_cast<SQLPOINTER>(3), 0),
+                      SQL_HANDLE_DESC, apd);
+        ASSERT_SQL_OK(SQLSetDescFieldW(apd, 1, SQL_DESC_DATA_PTR, numbers.data(), 0),
+                      SQL_HANDLE_DESC, apd);
+        RestoreFocus();
+        SQLRETURN rc = SQLExecute(stmt_);
+        size_t cell_tokens = 0, table_tokens = 0;
+        if (mode) {
+            ASSERT_EQ(rc, SQL_NEED_DATA);
+            SQLPOINTER token = nullptr;
+            while ((rc = SQLParamData(stmt_, &token)) == SQL_NEED_DATA) {
+                ASSERT_LT(cell_tokens + table_tokens, 7);
+                if (mode == 2 && token == type_bufs_.back().data()) {
+                    ASSERT_SQL_OK(SQLPutData(stmt_, table_tokens == 0 ? reinterpret_cast<SQLPOINTER>(1) : nullptr,
+                                             table_tokens == 0 ? 4 : 0), SQL_HANDLE_STMT, stmt_);
+                    ++table_tokens;
+                } else {
+                    ASSERT_LT(cell_tokens, numbers.size());
+                    EXPECT_EQ(token, &numbers[cell_tokens]);
+                    ASSERT_SQL_OK(SQLPutData(stmt_, &numbers[cell_tokens], sizeof(SQL_NUMERIC_STRUCT)),
+                                  SQL_HANDLE_STMT, stmt_);
+                    ++cell_tokens;
+                }
+            }
+            EXPECT_EQ(cell_tokens, 4);
+        }
+        ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        for (const char* expected : {"-9.99", "-1.23", "1.23", "9.99"}) {
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            char actual[32]{};
+            SQLLEN length = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, actual, sizeof(actual), &length),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(std::string(actual), expected);
+        }
+        EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+    }
+}
+
+TEST_F(TvpTest, FocusedSetDescRecPreservesTimestampSubtype) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    SQL_TIMESTAMP_STRUCT timestamp = {2026, 1, 2, 3, 4, 5, 6};
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLSetDescRec(apd, 1, SQL_DATETIME, SQL_CODE_TIMESTAMP,
+                                static_cast<SQLLEN>(sizeof(timestamp)), 0, 9,
+                                &timestamp, nullptr, &indicator),
+                  SQL_HANDLE_DESC, apd);
+
+    SQLSMALLINT concise_type = 0;
+    SQLSMALLINT datetime_code = 0;
+    ASSERT_SQL_OK(SQLGetDescFieldW(apd, 1, SQL_DESC_CONCISE_TYPE, &concise_type,
+                                   sizeof(concise_type), nullptr),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(SQLGetDescFieldW(apd, 1, SQL_DESC_DATETIME_INTERVAL_CODE, &datetime_code,
+                                   sizeof(datetime_code), nullptr),
+                  SQL_HANDLE_DESC, apd);
+    RestoreFocus();
+    EXPECT_EQ(concise_type, SQL_C_TYPE_TIMESTAMP);
+    EXPECT_EQ(datetime_code, SQL_CODE_TIMESTAMP);
+}
+
+// An empty TVP (indicator SQL_DEFAULT_PARAM, no column binds) yields zero rows.
+TEST_F(TvpTest, EmptyTableYieldsNoRows) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLWCHAR> type_w = ToSqlW(type_name_);
+    SQLLEN indicator = SQL_DEFAULT_PARAM;
+    ASSERT_SQL_OK(
+        SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE, 0, 0,
+                         type_w.data(),
+                         static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)), &indicator),
+        SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLWCHAR> schema_w = ToSqlW("dbo");
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_CA_SS_SCHEMA_NAME,
+                                   schema_w.data(),
+                                   static_cast<SQLINTEGER>((schema_w.size() - 1) * sizeof(SQLWCHAR))),
+                  SQL_HANDLE_DESC, Ipd());
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Rows with NULL and all-NULL cells round-trip; the column's declared type
+// still drives the wire metadata even when every value is NULL.
+TEST_F(TvpTest, NullAndAllNullCells) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 2);
+    Focus(1);
+
+    std::array<SQLINTEGER, 2> ids = {0, 0};         // values ignored for NULLs
+    std::array<SQLLEN, 2> id_ind = {SQL_NULL_DATA, SQL_NULL_DATA};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, ids.data(), 0, id_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+
+    const SQLULEN cap = 50;
+    std::vector<SQLWCHAR> labels((cap + 1) * 2, 0);
+    // Row 0 has a label, row 1 is NULL.
+    const std::string first = "only";
+    for (size_t c = 0; c < first.size(); ++c) labels[c] = static_cast<SQLWCHAR>(first[c]);
+    std::array<SQLLEN, 2> label_ind = {
+        static_cast<SQLLEN>(first.size() * sizeof(SQLWCHAR)), SQL_NULL_DATA};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   cap, 0, labels.data(),
+                                   static_cast<SQLLEN>((cap + 1) * sizeof(SQLWCHAR)),
+                                   label_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Both id cells are NULL; exactly one label is "only" and one is NULL.
+    int rows = 0;
+    int only_labels = 0;
+    int null_labels = 0;
+    SQLINTEGER id = 0;
+    SQLLEN id_len = 0;
+    SQLWCHAR label[64] = {0};
+    SQLLEN label_len = 0;
+    while (SQLFetch(stmt_) == SQL_SUCCESS) {
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_WCHAR, label, sizeof(label), &label_len),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(id_len, SQL_NULL_DATA) << "both id cells were bound NULL";
+        if (label_len == SQL_NULL_DATA) {
+            ++null_labels;
+        } else {
+            EXPECT_EQ(label_len, static_cast<SQLLEN>(first.size() * sizeof(SQLWCHAR)));
+            EXPECT_EQ(SqlWToAscii(label, sizeof(label) / sizeof(SQLWCHAR)), first);
+            ++only_labels;
+        }
+        ++rows;
+    }
+    EXPECT_EQ(rows, 2);
+    EXPECT_EQ(only_labels, 1);
+    EXPECT_EQ(null_labels, 1);
+}
+
+// Binding a TVP with any direction other than SQL_PARAM_INPUT is HY105.
+TEST_F(TvpTest, NonInputDirectionIsRejected) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLWCHAR> type_w = ToSqlW(type_name_);
+    SQLLEN ind = 0;
+    EXPECT_EQ(
+        SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_BINARY, SQL_SS_TABLE, 0, 0,
+                         type_w.data(),
+                         static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)), &ind),
+        SQL_ERROR);
+    EXPECT_EQ(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_), "HY105");
+}
+
+// A TVP cannot be a column of another TVP: binding SQL_SS_TABLE while focus is
+// set is HY004.
+TEST_F(TvpTest, NestedTvpIsRejected) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    std::vector<SQLWCHAR> type_w = ToSqlW(type_name_);
+    SQLLEN ind = 0;
+    EXPECT_EQ(
+        SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE, 0, 0,
+                         type_w.data(),
+                         static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)), &ind),
+        SQL_ERROR);
+    EXPECT_EQ(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_), "HY004");
+    RestoreFocus();
+}
+
+// Parameter focus must be reset to 0 before execute, else HY024.
+TEST_F(TvpTest, FocusMustBeZeroAtExecute) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    // Deliberately not restored.
+    EXPECT_EQ(SQLExecute(stmt_), SQL_ERROR);
+    EXPECT_EQ(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_), "HY024");
+    RestoreFocus();
+}
+
+// Benefits-from-mock-tds: pins default-schema resolution; a mock could also
+// assert that the prepared declaration leaves the type name unqualified.
+TEST_F(TvpTest, UnqualifiedTypeUsesTheCallersDefaultSchemaWithoutDescribe) {
+    const std::string schema = "pytvp_default_" + suffix_;
+    const std::string user = "pytvp_user_" + suffix_;
+    const std::string type = "DefaultOrders";
+    const std::string proc = "ReadOrders";
+    cleanup_sql_ = {
+        "DROP PROCEDURE IF EXISTS [" + schema + "].[" + proc + "]",
+        "DROP TYPE IF EXISTS [" + schema + "].[" + type + "]",
+        "DROP USER IF EXISTS [" + user + "]",
+        "DROP SCHEMA IF EXISTS [" + schema + "]",
+    };
+    ASSERT_SQL_OK(DirectRc("CREATE SCHEMA [" + schema + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE [" + schema + "].[" + type + "] AS TABLE (id INT)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE [" + schema + "].[" + proc + "] @t [" +
+                           schema + "].[" + type + "] READONLY AS SELECT id FROM @t"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE USER [" + user + "] WITHOUT LOGIN WITH DEFAULT_SCHEMA = [" +
+                           schema + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("GRANT EXECUTE, REFERENCES ON SCHEMA::[" + schema + "] TO [" + user + "]"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("EXECUTE AS USER = '" + user + "'"), SQL_HANDLE_STMT, stmt_);
+    impersonating_ = true;
+    ASSERT_SQL_OK(Prepare("EXEC [" + schema + "].[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    auto type_w = ToSqlW(type);
+    SQLLEN count = 1;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                                   1, 0, type_w.data(),
+                                   static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)), &count),
+                  SQL_HANDLE_STMT, stmt_);
+    Focus(1);
+    SQLINTEGER value = 42;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &value, 0, &indicator), SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER actual = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual, 0, &indicator), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual, value);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Benefits-from-mock-tds: Assert the rebound RPC's TVP identity is unqualified
+// after the prior explicitly qualified binding.
+TEST_F(TvpTest, RebindingUnqualifiedTypeClearsPreviousSchema) {
+    const std::string schema_a = "pytvp_rebind_a_" + suffix_;
+    const std::string schema_b = "pytvp_rebind_b_" + suffix_;
+    const std::string user = "pytvp_rebind_user_" + suffix_;
+    const std::string type = "SharedRows";
+    const std::string proc_a = "ReadSharedRowsA";
+    const std::string proc = "ReadSharedRows";
+    cleanup_sql_ = {
+        "DROP PROCEDURE IF EXISTS [" + schema_b + "].[" + proc + "]",
+        "DROP PROCEDURE IF EXISTS [" + schema_a + "].[" + proc_a + "]",
+        "DROP TYPE IF EXISTS [" + schema_a + "].[" + type + "]",
+        "DROP TYPE IF EXISTS [" + schema_b + "].[" + type + "]",
+        "DROP USER IF EXISTS [" + user + "]",
+        "DROP SCHEMA IF EXISTS [" + schema_a + "]",
+        "DROP SCHEMA IF EXISTS [" + schema_b + "]",
+    };
+    ASSERT_SQL_OK(DirectRc("CREATE SCHEMA [" + schema_a + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE SCHEMA [" + schema_b + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE [" + schema_a + "].[" + type + "] AS TABLE (id INT)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE [" + schema_b + "].[" + type + "] AS TABLE (id INT)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE [" + schema_a + "].[" + proc_a + "] @t [" +
+                           schema_a + "].[" + type + "] READONLY AS SELECT id FROM @t"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE [" + schema_b + "].[" + proc + "] @t [" +
+                           schema_b + "].[" + type + "] READONLY AS SELECT id FROM @t"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE USER [" + user +
+                           "] WITHOUT LOGIN WITH DEFAULT_SCHEMA = [" + schema_b + "]"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("GRANT EXECUTE, REFERENCES ON SCHEMA::[" + schema_b + "] TO [" +
+                           user + "]"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("GRANT EXECUTE, REFERENCES ON SCHEMA::[" + schema_a + "] TO [" +
+                           user + "]"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("EXECUTE AS USER = '" + user + "'"), SQL_HANDLE_STMT, stmt_);
+    impersonating_ = true;
+
+    ASSERT_SQL_OK(Prepare("EXEC [" + schema_a + "].[" + proc_a + "] ?"), SQL_HANDLE_STMT, stmt_);
+    auto type_a = ToSqlW(type);
+    SQLLEN row_count = 1;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                                   1, 0, type_a.data(),
+                                   static_cast<SQLLEN>((type_a.size() - 1) * sizeof(SQLWCHAR)),
+                                   &row_count),
+                  SQL_HANDLE_STMT, stmt_);
+    auto schema_a_w = ToSqlW(schema_a);
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_CA_SS_SCHEMA_NAME, schema_a_w.data(),
+                                   static_cast<SQLINTEGER>((schema_a_w.size() - 1) * sizeof(SQLWCHAR))),
+                  SQL_HANDLE_DESC, Ipd());
+
+    ASSERT_SQL_OK(Prepare("EXEC [" + schema_b + "].[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    auto type_b = ToSqlW(type);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                                   1, 0, type_b.data(),
+                                   static_cast<SQLLEN>((type_b.size() - 1) * sizeof(SQLWCHAR)),
+                                   &row_count),
+                  SQL_HANDLE_STMT, stmt_);
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        EXPECT_SQL_ERROR(SQLSetStmtAttr(stmt_, SQL_SOPT_SS_PARAM_FOCUS,
+                                        reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(1)),
+                                        SQL_IS_INTEGER));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "IM020");
+        return;
+    }
+
+    Focus(1);
+    SQLINTEGER id = 42;
+    SQLLEN id_indicator = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &id, 0, &id_indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER actual = 0;
+    SQLLEN actual_length = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual, 0, &actual_length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual, id);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// A table type in a non-dbo schema round-trips when the schema is set through
+// SQL_CA_SS_SCHEMA_NAME.
+TEST_F(TvpTest, SchemaQualifiedType) {
+    const std::string schema = "pytvp_s_" + suffix_;
+    const std::string type = "qtype_" + suffix_;
+    const std::string proc = "qproc_" + suffix_;
+    Direct("DROP PROCEDURE IF EXISTS [" + schema + "].[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS [" + schema + "].[" + type + "]");
+    Direct("DROP SCHEMA IF EXISTS [" + schema + "]");
+    ASSERT_SQL_OK(DirectRc("CREATE SCHEMA [" + schema + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        DirectRc("CREATE TYPE [" + schema + "].[" + type + "] AS TABLE (id INT)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        DirectRc("CREATE PROCEDURE [" + schema + "].[" + proc + "] @t [" + schema + "].[" +
+                 type + "] READONLY AS SELECT id FROM @t ORDER BY id"),
+        SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("EXEC [" + schema + "].[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type, 2, schema);
+    Focus(1);
+    std::array<SQLINTEGER, 2> ids = {7, 9};
+    std::array<SQLLEN, 2> id_ind = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, ids.data(), 0, id_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER id = 0;
+    SQLLEN id_len = 0;
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(id, 7);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(id, 9);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+
+    Direct("DROP PROCEDURE IF EXISTS [" + schema + "].[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS [" + schema + "].[" + type + "]");
+    Direct("DROP SCHEMA IF EXISTS [" + schema + "]");
+}
+
+// A TVP with a mix of column types (bit, bigint, decimal, varbinary) round-trips
+// each value through the server.
+TEST_F(TvpTest, MixedColumnTypes) {
+    const std::string type = "mtype_" + suffix_;
+    const std::string proc = "mproc_" + suffix_;
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS dbo.[" + type + "]");
+    ASSERT_SQL_OK(
+        DirectRc("CREATE TYPE dbo.[" + type +
+                 "] AS TABLE (flag BIT, big BIGINT, amount DECIMAL(10,2), blob VARBINARY(16))"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type +
+                 "] READONLY AS SELECT flag, big, amount, blob FROM @t"),
+        SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type, 1);
+    Focus(1);
+
+    unsigned char flag = 1;
+    SQLLEN flag_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BIT, SQL_BIT, 0, 0,
+                                   &flag, 0, &flag_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLBIGINT big = 9000000000LL;
+    SQLLEN big_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                                   &big, 0, &big_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    // Decimal carried as its character form (the driver resolves it on the wire).
+    std::string amount = "1234.56";
+    SQLLEN amount_ind = SQL_NTS;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_DECIMAL, 10, 2,
+                                   const_cast<char*>(amount.c_str()),
+                                   static_cast<SQLLEN>(amount.size() + 1), &amount_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    unsigned char blob[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    SQLLEN blob_ind = sizeof(blob);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 4, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 16, 0,
+                                   blob, sizeof(blob), &blob_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    unsigned char got_flag = 0;
+    SQLBIGINT got_big = 0;
+    unsigned char got_blob[8] = {0};
+    char got_amount[32] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BIT, &got_flag, 0, &ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SBIGINT, &got_big, 0, &ind), SQL_HANDLE_STMT, stmt_);
+    SQLLEN amount_len = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_CHAR, got_amount, sizeof(got_amount), &amount_len),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLLEN blob_len = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 4, SQL_C_BINARY, got_blob, sizeof(got_blob), &blob_len),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(got_flag, 1);
+    EXPECT_EQ(got_big, 9000000000LL);
+    EXPECT_EQ(std::string(got_amount), "1234.56");
+    EXPECT_EQ(amount_len, static_cast<SQLLEN>(std::strlen("1234.56")));
+    ASSERT_EQ(blob_len, 4);
+    EXPECT_EQ(std::memcmp(got_blob, blob, 4), 0);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS dbo.[" + type + "]");
+}
+
+// Benefits-from-mock-tds: Assert scale 3 in the TVP column metadata and payload,
+// rather than only observing SQL Server's converted result.
+TEST_F(TvpTest, FocusedIpdScaleControlsDecimalColumnConversion) {
+    const std::string type = "scale_type_" + suffix_;
+    const std::string proc = "scale_proc_" + suffix_;
+    cleanup_sql_ = {
+        "DROP PROCEDURE IF EXISTS dbo.[" + proc + "]",
+        "DROP TYPE IF EXISTS dbo.[" + type + "]",
+    };
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE dbo.[" + type +
+                           "] AS TABLE (amount DECIMAL(10,3))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type +
+                           "] READONLY AS SELECT amount FROM @t"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type, 1);
+    Focus(1);
+    std::string amount = "1.234";
+    SQLLEN amount_indicator = SQL_NTS;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_DECIMAL,
+                                   10, 2, amount.data(),
+                                   static_cast<SQLLEN>(amount.size() + 1), &amount_indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_SCALE,
+                                   reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    char actual[32] = {};
+    SQLLEN actual_length = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, actual, sizeof(actual), &actual_length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(std::string(actual), "1.234");
+    EXPECT_EQ(actual_length, 5);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+TEST_F(TvpTest, FocusedIpdTypeWritePreservesTheChildBinding) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+
+    SQLINTEGER id = 42;
+    SQLLEN id_indicator = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, &id, 0, &id_indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    std::array<SQLWCHAR, 51> label{};
+    SQLLEN label_indicator = SQL_NULL_DATA;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   50, 0, label.data(),
+                                   static_cast<SQLLEN>(label.size() * sizeof(SQLWCHAR)),
+                                   &label_indicator),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), 1, SQL_DESC_TYPE,
+                                   reinterpret_cast<SQLPOINTER>(SQL_INTEGER), 0),
+                  SQL_HANDLE_DESC, Ipd());
+    SQLSMALLINT concise_type = 0;
+    ASSERT_SQL_OK(SQLGetDescFieldW(Ipd(), 1, SQL_DESC_CONCISE_TYPE, &concise_type,
+                                   sizeof(concise_type), nullptr),
+                  SQL_HANDLE_DESC, Ipd());
+    EXPECT_EQ(concise_type, SQL_INTEGER);
+
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER actual_id = 0;
+    SQLLEN actual_length = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual_id, 0, &actual_length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual_id, id);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+TEST_F(TvpTest, DaeRefillsMultipleTvpBatchesBeforeScalarDae) {
+    const std::string type = "dae_type_" + suffix_;
+    const std::string proc = "dae_proc_" + suffix_;
+    cleanup_sql_ = {
+        "DROP PROCEDURE IF EXISTS dbo.[" + proc + "]",
+        "DROP TYPE IF EXISTS dbo.[" + type + "]",
+    };
+    ASSERT_SQL_OK(DirectRc("CREATE TYPE dbo.[" + type +
+                           "] AS TABLE (id INT, label NVARCHAR(50))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc +
+                           "] @t dbo.[" + type +
+                           "] READONLY, @marker NVARCHAR(20) "
+                           "AS SELECT id, label, @marker AS marker FROM @t ORDER BY id"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?, ?"), SQL_HANDLE_STMT, stmt_);
+
+    auto type_w = ToSqlW(type);
+    constexpr SQLULEN max_rows = 6;
+    SQLLEN tvp_indicator = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT, SQL_SS_TABLE,
+                                   max_rows, 0, type_w.data(),
+                                   static_cast<SQLLEN>((type_w.size() - 1) * sizeof(SQLWCHAR)),
+                                   &tvp_indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    Focus(1);
+
+    std::array<SQLINTEGER, 2> ids{};
+    std::array<SQLLEN, 2> id_indicators = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, ids.data(), 0, id_indicators.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    std::array<SQLWCHAR, 102> labels{};
+    std::array<SQLLEN, 2> label_indicators{};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   50, 0, labels.data(),
+                                   static_cast<SQLLEN>(51 * sizeof(SQLWCHAR)),
+                                   label_indicators.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+
+    auto set_label = [&](size_t row, const std::string& value) {
+        const size_t start = row * 51;
+        for (size_t i = 0; i < 51; ++i) labels[start + i] = 0;
+        for (size_t i = 0; i < value.size(); ++i) {
+            labels[start + i] = static_cast<SQLWCHAR>(value[i]);
+        }
+    };
+    auto set_batch = [&](size_t batch) {
+        switch (batch) {
+            case 0:
+                ids = {1, 2};
+                label_indicators = {SQL_DATA_AT_EXEC,
+                                    static_cast<SQLLEN>(sizeof(SQLWCHAR) * 3)};
+                set_label(1, "two");
+                break;
+            case 1:
+                ids = {3, 4};
+                label_indicators = {static_cast<SQLLEN>(sizeof(SQLWCHAR) * 5),
+                                    SQL_DATA_AT_EXEC};
+                set_label(0, "three");
+                break;
+            case 2:
+                ids = {5, 6};
+                label_indicators = {SQL_DATA_AT_EXEC, SQL_DATA_AT_EXEC};
+                break;
+            default:
+                FAIL() << "unexpected fourth TVP batch";
+        }
+    };
+    set_batch(0);
+
+    SQLWCHAR scalar_token = 0;
+    SQLLEN scalar_indicator = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   20, 0, &scalar_token, 0, &scalar_indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    size_t batch = 0;
+    size_t streamed_cells = 0;
+    bool scalar_streamed = false;
+    SQLPOINTER token = nullptr;
+    SQLRETURN rc = SQLParamData(stmt_, &token);
+    int iterations = 0;
+    while (rc == SQL_NEED_DATA) {
+        ASSERT_LT(++iterations, 20) << "SQLParamData did not terminate";
+        if (token == type_w.data()) {
+            if (batch < 3) {
+                set_batch(batch);
+                ASSERT_SQL_OK(SQLPutData(stmt_, reinterpret_cast<SQLPOINTER>(1), 2),
+                              SQL_HANDLE_STMT, stmt_);
+                ++batch;
+            } else {
+                ASSERT_SQL_OK(SQLPutData(stmt_, nullptr, 0), SQL_HANDLE_STMT, stmt_);
+            }
+        } else if (token == labels.data() || token == labels.data() + 51) {
+            const size_t row = token == labels.data() ? 0 : 1;
+            const std::string value =
+                batch == 1 ? "one" :
+                batch == 2 ? "four" :
+                row == 0 ? "five" : "six";
+            auto wide = ToSqlW(value);
+            ASSERT_SQL_OK(SQLPutData(
+                              stmt_, wide.data(),
+                              static_cast<SQLLEN>((wide.size() - 1) * sizeof(SQLWCHAR))),
+                          SQL_HANDLE_STMT, stmt_);
+            ++streamed_cells;
+        } else if (token == &scalar_token) {
+            auto marker = ToSqlW("done");
+            ASSERT_SQL_OK(SQLPutData(
+                              stmt_, marker.data(),
+                              static_cast<SQLLEN>((marker.size() - 1) * sizeof(SQLWCHAR))),
+                          SQL_HANDLE_STMT, stmt_);
+            scalar_streamed = true;
+        } else {
+            FAIL() << "SQLParamData returned an unexpected TVP/scalar token";
+        }
+        rc = SQLParamData(stmt_, &token);
+    }
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(batch, 3);
+    EXPECT_EQ(streamed_cells, 4);
+    EXPECT_TRUE(scalar_streamed);
+
+    const std::array<SQLINTEGER, 6> expected_ids = {1, 2, 3, 4, 5, 6};
+    const std::array<std::string, 6> expected_labels = {
+        "one", "two", "three", "four", "five", "six"};
+    for (size_t i = 0; i < expected_ids.size(); ++i) {
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER actual_id = 0;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual_id, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(actual_id, expected_ids[i]);
+        std::array<char, 64> actual_label{};
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, actual_label.data(),
+                                 static_cast<SQLLEN>(actual_label.size()), &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(std::string(actual_label.data()), expected_labels[i]);
+        std::array<char, 32> actual_marker{};
+        ASSERT_SQL_OK(SQLGetData(stmt_, 3, SQL_C_CHAR, actual_marker.data(),
+                                 static_cast<SQLLEN>(actual_marker.size()), &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(std::string(actual_marker.data()), "done");
+    }
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Two TVPs with a scalar parameter between them bind and execute together; each
+// TVP's columns are captured under its own focus.
+// Benefits-from-mock-tds: Assert distinct TVP payloads after lazy token-list extension.
+TEST_F(TvpTest, TwoDaeTvpsGrowAcrossRefilledBatchesWithScalarBetween) {
+    const std::string proc = "m2dae_proc_" + suffix_;
+    cleanup_sql_ = {"DROP PROCEDURE IF EXISTS dbo.[" + proc + "]"};
+    ASSERT_SQL_OK(DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @a dbo.[" + type_name_ +
+                           "] READONLY, @n NVARCHAR(20), @b dbo.[" + type_name_ +
+                           "] READONLY AS SELECT (SELECT SUM(id) FROM @a) + CAST(@n AS INT) + "
+                           "(SELECT SUM(id) FROM @b)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?, ?, ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 6);
+    row_counts_.back() = SQL_DATA_AT_EXEC;
+    BindTvp(3, type_name_, 6);
+    row_counts_.back() = SQL_DATA_AT_EXEC;
+    auto scalar = ToSqlW("100");
+    SQLLEN scalar_length = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   20, 0, scalar.data(),
+                                   static_cast<SQLLEN>(scalar.size() * sizeof(SQLWCHAR)), &scalar_length),
+                  SQL_HANDLE_STMT, stmt_);
+    std::array<std::array<SQLINTEGER, 2>, 2> ids = {{{1, 2}, {10, 20}}};
+    std::array<std::array<SQLLEN, 2>, 2> lengths{};
+    std::array<std::array<SQLLEN, 2>, 2> nulls = {{
+        {SQL_NULL_DATA, SQL_NULL_DATA}, {SQL_NULL_DATA, SQL_NULL_DATA}}};
+    std::array<std::array<SQLWCHAR, 2>, 2> labels{};
+    for (size_t table = 0; table < 2; ++table) {
+        Focus(table == 0 ? 1 : 3);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                       0, 0, ids[table].data(), sizeof(SQLINTEGER), lengths[table].data()),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                       50, 0, labels[table].data(), sizeof(SQLWCHAR), nulls[table].data()),
+                      SQL_HANDLE_STMT, stmt_);
+    }
+    RestoreFocus();
+    ASSERT_EQ(SQLExecute(stmt_), SQL_NEED_DATA)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    std::array<size_t, 2> batches{};
+    bool scalar_supplied = false;
+    SQLPOINTER token = nullptr;
+    SQLRETURN rc;
+    size_t tokens = 0;
+    while ((rc = SQLParamData(stmt_, &token)) == SQL_NEED_DATA) {
+        ASSERT_LT(++tokens, 10);
+        if (token == scalar.data()) {
+            EXPECT_EQ(batches[0], 4);
+            EXPECT_EQ(batches[1], 0);
+            ASSERT_SQL_OK(SQLPutData(stmt_, scalar.data(), 3 * sizeof(SQLWCHAR)), SQL_HANDLE_STMT, stmt_);
+            scalar_supplied = true;
+        } else {
+            const size_t table = token == type_bufs_[0].data() ? 0 : 1;
+            ASSERT_EQ(token, type_bufs_[table].data());
+            if (table == 1) EXPECT_TRUE(scalar_supplied);
+            ASSERT_SQL_OK(SQLPutData(stmt_, batches[table] < 3 ? reinterpret_cast<SQLPOINTER>(1) : nullptr,
+                                     batches[table] < 3 ? 2 : 0), SQL_HANDLE_STMT, stmt_);
+            ++batches[table];
+        }
+    }
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(tokens, 9);
+    EXPECT_TRUE(scalar_supplied);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER actual = 0;
+    SQLLEN length = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &actual, 0, &length), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(actual, 199);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+TEST_F(TvpTest, MultipleTvpsWithInterleavedScalar) {
+    const std::string proc = "m2proc_" + suffix_;
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
+    // Reuses the fixture's (id, label) type for both TVPs.
+    ASSERT_SQL_OK(
+        DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @a dbo.[" + type_name_ +
+                 "] READONLY, @n INT, @b dbo.[" + type_name_ +
+                 "] READONLY AS SELECT COUNT(*) + @n AS c FROM (SELECT id FROM @a "
+                 "UNION ALL SELECT id FROM @b) u"),
+        SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?, ?, ?"), SQL_HANDLE_STMT, stmt_);
+
+    BindTvp(1, type_name_, 2);
+    BindTvp(3, type_name_, 1);
+    SQLINTEGER n = 100;
+    SQLLEN n_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &n, 0, &n_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // TVP @a: two rows.
+    Focus(1);
+    std::array<SQLINTEGER, 2> a_ids = {1, 2};
+    std::array<SQLLEN, 2> a_ind = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   a_ids.data(), 0, a_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLULEN cap = 50;
+    std::vector<SQLWCHAR> a_labels((cap + 1) * 2, 0);
+    std::array<SQLLEN, 2> a_lind = {SQL_NULL_DATA, SQL_NULL_DATA};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, cap, 0,
+                                   a_labels.data(),
+                                   static_cast<SQLLEN>((cap + 1) * sizeof(SQLWCHAR)),
+                                   a_lind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+
+    // TVP @b: one row.
+    Focus(3);
+    SQLINTEGER b_id = 9;
+    SQLLEN b_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &b_id, 0, &b_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLWCHAR> b_labels(cap + 1, 0);
+    SQLLEN b_lind = SQL_NULL_DATA;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, cap, 0,
+                                   b_labels.data(),
+                                   static_cast<SQLLEN>((cap + 1) * sizeof(SQLWCHAR)), &b_lind),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER total = 0;
+    SQLLEN total_ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &total, 0, &total_ind), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(total, 103) << "2 rows + 1 row + @n(100)";
+
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
+}

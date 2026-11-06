@@ -237,6 +237,10 @@ impl ClientEncoding {
         self == Self::UTF8
     }
 
+    pub(crate) fn code_page(self) -> u32 {
+        self.0
+    }
+
     pub(crate) fn is_ascii_compatible(self) -> bool {
         self.0 != 12000
     }

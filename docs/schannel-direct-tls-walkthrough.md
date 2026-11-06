@@ -90,7 +90,7 @@ flowchart TD
 
 The Schannel-direct engine is invoked from two *different* points in the connection sequence
 depending on the negotiated TDS version. This is decided in
-[network_transport.rs](mssql-tds/src/connection/transport/network_transport.rs) when the
+[network_transport.rs](../mssql-tds/src/connection/transport/network_transport.rs) when the
 `NetworkTransport` is created:
 
 - **TDS 8.0 (`Encrypt=Strict`)** — TLS is established **immediately on the raw TCP socket,
@@ -150,7 +150,7 @@ it just drives `InitializeSecurityContextW` against whatever `Box<dyn Stream>` i
 ### How the TLS-in-TDS framing works (TDS 7.4)
 
 The legacy path inserts a `TlsOverTdsStream<S>`
-([ssl_handler.rs](mssql-tds/src/connection/transport/ssl_handler.rs)) *between* the TLS
+([ssl_handler.rs](../mssql-tds/src/connection/transport/ssl_handler.rs)) *between* the TLS
 engine and the real socket. The TLS engine still writes/reads ordinary TLS handshake records;
 this wrapper transparently adds or strips a TDS packet header around each one. It is a pure
 framing shim — it never inspects or alters the TLS bytes themselves.
