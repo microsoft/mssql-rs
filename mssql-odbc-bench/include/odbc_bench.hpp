@@ -55,6 +55,8 @@ struct Config {
     std::string packet_size_keyword;
     std::string scenario;
     std::string write_mode;
+    /// Calls per latency sample; 0 keeps each latency workload's catalog size.
+    std::size_t latency_calls = 0;
 
     /// Read and validate the cross-platform perf-lab environment contract.
     static Config from_environment();
@@ -149,6 +151,34 @@ const std::array<TableSpec, kTableCount>& tables();
 /// Return the fixed workload catalog used by validation and measurement.
 const std::array<WorkloadSpec, kWorkloadCount>& workloads();
 
+/// How a latency workload submits its one-row, one-`INT` query.
+enum class LatencyCall {
+    /// `SQLExecDirectW`, `SQLFetch`, `SQLCloseCursor` per call.
+    exec_direct,
+    /// `SQLPrepareW("SELECT ?")` once; per call a new bound `SQL_C_SLONG` value,
+    /// `SQLExecute`, `SQLFetch`, `SQLCloseCursor`.
+    prepared_param,
+};
+
+/// A small call whose cost is per-call driver overhead rather than payload.
+///
+/// A sample is a fixed batch of complete call cycles on one held connection, so
+/// microsecond-scale differences accumulate into a wall time the comparator's
+/// ratios can resolve.
+struct LatencySpec {
+    const char* benchmark_name;
+    LatencyCall call;
+    /// Statement length in UTF-16 units. 0 sends plain `SELECT 1`; a larger value
+    /// pads `SELECT 1` with a trailing block comment to exactly this length.
+    std::size_t text_chars;
+    std::size_t calls_per_sample;
+};
+
+inline constexpr std::size_t kLatencyWorkloadCount = 3;
+
+/// Return the fixed small-call latency catalog (scenario `latency`).
+const std::array<LatencySpec, kLatencyWorkloadCount>& latency_workloads();
+
 /// Owns one ODBC handle chain so every workload uses the same connection lifecycle.
 class OdbcSession {
 public:
@@ -164,6 +194,11 @@ public:
 
     /// Separate statement used for setup and validation outside timed regions.
     SQLHSTMT admin_statement() const;
+
+    /// Allocate a statement the caller owns, for workloads whose prepared and bound
+    /// state must survive across samples. Free it before this session is destroyed:
+    /// `SQLDisconnect` releases it implicitly.
+    SQLHSTMT allocate_statement();
 
     /// Execute setup/cleanup SQL and drain every result before reusing the statement.
     void execute_non_query(const std::string& sql);
@@ -222,6 +257,9 @@ struct RetrievalMetrics {
     double fetch_seconds = 0.0;
     /// Number of SQLExecute calls used to submit a write workload.
     std::uint64_t execute_calls = 0;
+    /// Complete call cycles in a latency sample; zero for every other workload.
+    /// Latency samples take no per-phase timestamps, so the phase fields stay unset.
+    std::uint64_t calls = 0;
 };
 
 /// Drives one workload and validates that the timed work stays correct.
@@ -264,6 +302,34 @@ public:
 
     const char* name() const;
     void preflight();
+    RetrievalMetrics execute();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Runs one small-call latency workload on its own statement handle.
+///
+/// Statement text goes through the W entry points on every platform, matching
+/// `mssql-python`, even where the rest of the harness is built narrow (Linux).
+class LatencyRunner {
+public:
+    /// `calls_override` replaces the catalog batch size when non-zero.
+    LatencyRunner(OdbcSession& session, const LatencySpec& spec,
+                  std::size_t calls_override);
+    ~LatencyRunner();
+
+    LatencyRunner(const LatencyRunner&) = delete;
+    LatencyRunner& operator=(const LatencyRunner&) = delete;
+
+    const char* name() const;
+
+    /// Check the result shape once, then run an untimed, validated warm-up batch.
+    void preflight();
+
+    /// Time one batch. Every call still checks its fetched value, which costs a
+    /// compare against a round trip.
     RetrievalMetrics execute();
 
 private:
