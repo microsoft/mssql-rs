@@ -70,7 +70,7 @@ def test_stress_pipeline_runs_only_the_weekly_profile(stress_pipeline):
     assert "profile" not in {p["name"] for p in stress_pipeline["parameters"]}
     variables = stress_pipeline["variables"]
     assert variables["odbcMtProfile"] == "weekly"
-    assert variables["odbcMtJobTimeoutInMinutes"] == 240
+    assert variables["odbcMtJobTimeoutInMinutes"] == 360
     assert not any(key.startswith("${{") for key in variables)
     timeout = "${{ variables.odbcMtJobTimeoutInMinutes }}"
     windows = next(
