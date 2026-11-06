@@ -807,6 +807,81 @@ mod tests {
         }
     }
 
+    /// Preparing new text drops the classification before anything executes
+    /// (measured on msodbcsql 18.07.0001).
+    #[test]
+    fn preparing_new_text_drops_the_classification() {
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+
+        let text: Vec<SqlWChar> = UNCLASSIFIED.encode_utf16().collect();
+        let len = SqlInteger::try_from(text.len()).unwrap();
+        assert_eq!(
+            unsafe { sql_prepare_w(stmt, text.as_ptr(), len) },
+            SQL_SUCCESS
+        );
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+        assert_last_diag(&desc_diags(ird(stmt)), ERR_INVALID_DESCRIPTOR_FIELD);
+    }
+
+    /// A parameter that fails conversion rejects the execution before anything
+    /// is sent, so the previous classification stays (measured on msodbcsql
+    /// 18.07.0001).
+    #[test]
+    fn a_parameter_conversion_failure_keeps_the_classification() {
+        use crate::api::odbc_types::{
+            SQL_C_CHAR, SQL_C_SLONG, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT, SqlLen,
+        };
+
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = h.alloc_extra_stmt();
+        let mut id: i32 = 1;
+        let mut id_len: SqlLen = 0;
+        let bind = |c_type, value: SqlPointer, len: *mut SqlLen| unsafe {
+            crate::api::SQLBindParameter(
+                stmt,
+                1,
+                SQL_PARAM_INPUT,
+                c_type,
+                SQL_INTEGER,
+                0,
+                0,
+                value,
+                0,
+                len,
+            )
+        };
+        assert_eq!(
+            bind(SQL_C_SLONG, (&raw mut id).cast(), &raw mut id_len),
+            SQL_SUCCESS
+        );
+        let text: Vec<SqlWChar> = format!("{CLASSIFIED} WHERE ID = ?")
+            .encode_utf16()
+            .collect();
+        let len = SqlInteger::try_from(text.len()).unwrap();
+        assert_eq!(
+            unsafe { sql_prepare_w(stmt, text.as_ptr(), len) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_SUCCESS);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+
+        let mut bad = *b"not-an-int\0";
+        let mut bad_len = SqlLen::from(SQL_NTS);
+        assert_eq!(
+            bind(SQL_C_CHAR, bad.as_mut_ptr().cast(), &raw mut bad_len),
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_ERROR);
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+    }
+
     /// A failed execution reports no classification, not the one its
     /// statement had before.
     #[test]

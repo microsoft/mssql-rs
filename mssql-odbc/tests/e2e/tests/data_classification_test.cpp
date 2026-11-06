@@ -406,9 +406,9 @@ TEST_F(DataClassificationTest, VersionSetWhileConnectedAppliesAtTheNextLogin) {
 #endif
 }
 
-// A prepared statement keeps its classification across a cursor close; the
-// end of the batch and a failed execution drop it (measured on msodbcsql
-// 18.07.0001). A prepared statement's IRD stays readable under unixODBC.
+// A prepared statement keeps its classification across a cursor close; a new
+// prepare, the end of the batch and a failed execution drop it (measured on
+// msodbcsql 18.07.0001). A prepared statement's IRD stays readable under unixODBC.
 TEST_F(DataClassificationTest, PreparedStatementClassificationLifecycle) {
     ConnectDbc();
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
@@ -422,6 +422,13 @@ TEST_F(DataClassificationTest, PreparedStatementClassificationLifecycle) {
     ExpectClassifiedPayload(false);
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     ExpectClassifiedPayload(false);
+
+    auto unclassified = ODBCTestUtils::ToSqlTStr("SELECT 1 AS x");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(unclassified.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_FALSE(IrdPayload().has_value());
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
 
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     while (SQLFetch(stmt_) == SQL_SUCCESS) {
@@ -507,6 +514,35 @@ TEST_F(DataClassificationTest, EndTranDropsAClosedPreparedStatementsClassificati
     ASSERT_SQL_OK(SQLSetConnectAttrW(dbc_, SQL_ATTR_AUTOCOMMIT,
                                      reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0),
                   SQL_HANDLE_DBC, dbc_);
+}
+// A parameter that fails conversion is rejected before anything reaches the
+// server, so the previous classification stays readable in both drivers
+// (measured on msodbcsql 18.07.0001).
+TEST_F(DataClassificationTest, ParameterConversionFailureKeepsTheClassification) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+
+    auto sql = ODBCTestUtils::ToSqlTStr(ClassifiedSelect() + " WHERE id = ?");
+    SQLINTEGER id = 1;
+    SQLLEN id_len = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &id,
+                                   0, &id_len),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    char bad[] = "not-an-int";
+    SQLLEN bad_len = SQL_NTS;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_INTEGER, 0, 0, bad,
+                                   sizeof(bad), &bad_len),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+    ExpectClassifiedPayload(false);
+    SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
 }
 TEST_F(DataClassificationTest, ParameterArrayReportsEachSetsClassification) {
     ConnectDbc();

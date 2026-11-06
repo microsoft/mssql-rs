@@ -120,14 +120,16 @@ A result set's classification is read from its IRD header (`RecNumber` 0):
   without classification returns `HY091`.
 
 `SQLColAttribute` does not answer either field. Each result set reports only
-its own classification: as in msodbcsql, it is dropped when an execution
-starts or fails, when a row read is cancelled, at the end of the batch, and
-when a statement that is not prepared is closed, cancelled, or swept by
-`SQLEndTran`. Ending a started transaction also drops it from a prepared
-statement whose cursor was already closed. A server error that a fetch reports
-after rows were delivered leaves it readable, as in msodbcsql, so `SQL_ERROR`
-alone does not mean it was cleared; closing the statement afterwards follows
-the rules above.
+its own classification: as in msodbcsql, it is dropped when a statement is
+prepared, when an execution is sent to the server (whether it then succeeds or
+fails), when a row read is cancelled, at the end of the batch, and when a
+statement that is not prepared is closed, cancelled, or swept by `SQLEndTran`.
+Ending a started transaction also drops it from a prepared statement whose
+cursor was already closed. Two failures leave it readable, as in msodbcsql, so
+`SQL_ERROR` alone does not mean it was cleared: an execution rejected before
+anything is sent, such as a parameter that fails conversion (`22018`), and a
+server error that a fetch reports after rows were delivered. Closing the
+statement afterwards follows the rules above.
 
 ## Integer connection-attribute getters
 
