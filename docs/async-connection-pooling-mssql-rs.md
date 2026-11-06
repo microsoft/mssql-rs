@@ -962,7 +962,7 @@ Pool wait/provider work uses a public `tokio_util::sync::CancellationToken` owne
 acquisition plus the pool-generation-closure signal, and structured future drop. Add the direct
 dependency where needed; a transitive dependency is not an import contract.
 
-`mssql_tds::core::CancelHandle` exposes `new`, consuming `cancel`, and `child_handle`; it cannot
+`mssql_tds::core::CancelHandle` exposes `new`, `cancel(&self)`, and `child_handle`; it cannot
 be awaited externally. A per-operation guard owns the root, passes children to TDS, and calls
 `cancel()` on timeout/cancellation. Do not claim that receiving `CancelHandle` alone cancels a
 FIFO handoff wait.
