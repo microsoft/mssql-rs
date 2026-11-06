@@ -55,9 +55,9 @@ echo "=== Building mssql-odbc driver ($BUILD_TYPE) ==="
 (
     cd "$ODBC_CRATE_DIR"
     if [ "$BUILD_TYPE" = "release" ]; then
-        cargo build --release
+        cargo build --release --features e2e-test-client-code-page
     else
-        cargo build
+        cargo build --features e2e-test-client-code-page
     fi
 )
 

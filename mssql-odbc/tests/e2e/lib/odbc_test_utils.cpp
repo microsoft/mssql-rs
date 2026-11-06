@@ -372,11 +372,14 @@ std::string ODBCTestUtils::Utf8ToCodePage(const std::string& utf8, unsigned code
         return validated;
     }
 
-    const std::string encoding = "CP" + std::to_string(codePage);
     if (codePage != 1252 && codePage != 1251 && codePage != 932) {
         throw std::invalid_argument("unsupported test code page " +
                                     std::to_string(codePage));
     }
+    std::string encoding = "CP" + std::to_string(codePage);
+#if defined(__GLIBC__) || defined(__APPLE__)
+    encoding += "//TRANSLIT";
+#endif
     return ConvertNativeTestText(validated, encoding, true, usedDefault);
 #endif
 }
