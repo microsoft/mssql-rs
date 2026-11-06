@@ -228,9 +228,9 @@ bool HasExpectedState(int kind, SQLHDBC dbc) {
     return false;
 }
 
-// Short, for volume, where only the timeout can end the login (a refused port
-// is retried until it on Windows). Logins the server rejects keep a normal
-// timeout: 16 of them at once on a loaded CI agent missed 1 s and reported
+// 1 s, for volume, where only the timeout can end the login: a silent server,
+// and a refused port, which Windows retries for about 2 s. Logins the server
+// rejects keep a normal timeout: 16 of them at once on a loaded CI agent missed 1 s and reported
 // HYT00 instead of 42000 (stress build 188696).
 SQLULEN LoginTimeoutSeconds(int kind) {
     return kind == kRefused || kind == kNoAnswer ? 1 : 15;
