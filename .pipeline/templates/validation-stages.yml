@@ -1247,7 +1247,7 @@ stages:
               container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi8:latest
               entry: odbc-e2e-rhel.sh
 
-# Merge the mssql-tds Rust coverage from every OS that runs the tests
+# Merge Rust workspace coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS), the ODBC C++ e2e coverage
 # (Build_Linux x64 and Build_Windows), and the mssql-py-core coverage from the
 # Python tests (Build_Linux) into one Cobertura report. ADO does not merge
@@ -1269,14 +1269,14 @@ stages:
     steps:
       - checkout: self
       - task: DownloadPipelineArtifact@2
-        displayName: Download Rust (mssql-tds) Windows coverage
+        displayName: Download Rust workspace Windows coverage
         continueOnError: true
         inputs:
           buildType: 'current'
           artifactName: 'CoberturaCoverageRust_Windows'
           targetPath: '$(Pipeline.Workspace)/cov-rust-windows'
       - task: DownloadPipelineArtifact@2
-        displayName: Download Rust (mssql-tds) Linux coverage
+        displayName: Download Rust workspace Linux coverage
         continueOnError: true
         inputs:
           buildType: 'current'
@@ -1297,7 +1297,7 @@ stages:
           artifactName: 'CoberturaCoverageOdbcE2E_Windows'
           targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-windows'
       - task: DownloadPipelineArtifact@2
-        displayName: Download Rust (mssql-tds) macOS coverage
+        displayName: Download Rust workspace macOS coverage
         continueOnError: true
         inputs:
           buildType: 'current'
@@ -1321,7 +1321,7 @@ stages:
           set -euo pipefail
           mkdir -p "$(Build.SourcesDirectory)/target"
           inputs=()
-          # Each OS emits its mssql-tds + mssql-odbc report with repo-root-relative
+          # Each OS emits its Rust workspace report with repo-root-relative
           # paths, so the same source file lines up across reports and coverage is
           # unioned: a line covered on any OS counts as covered in the merged result.
           # The ODBC e2e reports (Linux x64 and Windows) are also repo-root-relative

@@ -917,7 +917,34 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
         encoding="utf-8"
     )
     assert "cargo nextest archive" in script
-    assert "--features gssapi" in script
+    assert "--features mssql-tds/gssapi," in script
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "command", "expected_count"),
+    [
+        (".pipeline/scripts/containerized-build.sh", "cargo nextest archive", 1),
+        ("scripts/dockerentry/alpine-build.sh", "cargo nextest archive", 1),
+        (".pipeline/scripts/containerized-test.sh", "cargo llvm-cov nextest", 1),
+        (".pipeline/scripts/containerized-test.sh", "cargo llvm-cov report", 2),
+        (".pipeline/templates/build-template.yml", "cargo llvm-cov nextest", 1),
+        (".pipeline/templates/build-template.yml", "cargo llvm-cov report", 2),
+    ],
+)
+def test_rust_driver_is_included_in_ci_archives_and_pr_tests(
+    relative_path, command, expected_count
+):
+    source = (_ROOT / relative_path).read_text(encoding="utf-8")
+    commands = [line for line in source.splitlines() if command in line]
+    assert len(commands) == expected_count
+    for selected in commands:
+        assert "--package mssql-tds" in selected
+        assert "--package mssql-rs" in selected
+        if command == "cargo llvm-cov report":
+            assert "--features" not in selected
+        else:
+            for feature in ("arrow", "jiff", "serde", "time"):
+                assert f"mssql-rs/{feature}" in selected
 
 
 def test_mssql_python_odbc_failures_are_advisory_only_in_ci():

@@ -13,8 +13,8 @@ mkdir -p /workspace/target/nextest/ci
 # mssql-odbc is a workspace member but was excluded by the mssql-tds-only filter.
 # Include it so its Rust unit tests run and land in the shared JUnit report. Its
 # pure-Rust unit tests need no SQL Server; the C++ e2e suite runs separately.
-cargo llvm-cov nextest "$@" --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --no-fail-fast --profile ci --success-output immediate
+cargo llvm-cov nextest "$@" --frozen --no-report --all-targets --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --features mssql-rs/arrow,mssql-rs/jiff,mssql-rs/serde,mssql-rs/time --no-fail-fast --profile ci --success-output immediate
 
 echo '==> Generating coverage report...'
-cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --lcov --output-path /workspace/target/lcov.info
-cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --cobertura --output-path /workspace/target/cobertura.xml
+cargo llvm-cov report --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --lcov --output-path /workspace/target/lcov.info
+cargo llvm-cov report --package mssql-tds --package mssql-rs --package mssqlodbc --package mssql-sqlcmd --cobertura --output-path /workspace/target/cobertura.xml

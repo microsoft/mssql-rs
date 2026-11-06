@@ -8,7 +8,8 @@
 .DESCRIPTION
   Official builds retain the source version. Non-official scheduled builds use a
   nightly version, while other non-official builds use a unique dev version.
-  mssql-mock-tds is kept aligned with mssql-tds, including its dependency version.
+  mssql-mock-tds and mssql-rs are kept aligned with mssql-tds, including their
+  dependency versions.
   All inputs and planned edits are validated before logging versions or writing.
   See README.md for supported manifest syntax and version inputs.
 #>
@@ -22,7 +23,7 @@ param(
 
     [string]$IsOfficial = 'False',
 
-    [string[]]$Crates = @('mssql-tds', 'mssql-mock-tds'),
+    [string[]]$Crates = @('mssql-tds', 'mssql-mock-tds', 'mssql-rs'),
 
     [switch]$WhatIf,
 
@@ -134,7 +135,8 @@ function Set-MssqlTdsDependencyVersion {
     param(
         [Parameter(Mandatory = $true)][string]$Content,
         [Parameter(Mandatory = $true)][string]$Version,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$IncludeDevDependency
     )
 
     $quotedString = '(?:"(?:\\.|[^"\\\r\n])*"|''[^''\r\n]*'')'
@@ -176,80 +178,94 @@ function Set-MssqlTdsDependencyVersion {
         }
     }
     $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
+    $devSections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*dev-dependencies[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     $dependencySections = [regex]::Matches($Content, "(?ms)^[ \t]*\[[ \t]*(?:$targetPrefix)?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)")
     $declarationCount = 0
     foreach ($dependencySection in $dependencySections) {
         Assert-BareSectionKeys -Content $dependencySection.Value -Path $Path
         $declarationCount += [regex]::Matches($dependencySection.Value, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]').Count
     }
-    if ($declarationCount -ne 1 -or $sections.Count -ne 1 -or
+    $expectedDeclarations = if ($IncludeDevDependency) { 2 } else { 1 }
+    if ($declarationCount -ne $expectedDeclarations -or $sections.Count -ne 1 -or
+        ($IncludeDevDependency -and $devSections.Count -ne 1) -or
         $Content -match ('(?m)^[ \t]*\[[ \t]*(?:' + $targetPrefix + ')?(?:dependencies|dev-dependencies|build-dependencies)[ \t]*\.[ \t]*(?:["'']|mssql-tds(?:[ \t.\]]))')) {
-        throw "Expected one inline mssql-tds dependency in [dependencies] in $Path"
+        throw "Expected inline mssql-tds dependencies in the required sections of $Path"
     }
 
-    $section = $sections[0]
-    $dependencies = [regex]::Matches($section.Value, '(?m)^[ \t]*mssql-tds[ \t]*=[ \t]*\{(?<fields>(?:' + $quotedString + '|[^{}"''\r\n])*)\}[ \t]*(?:#[^\r\n]*)?\r?$')
-    if ($dependencies.Count -ne 1) {
-        throw "Expected one single-line mssql-tds inline dependency in $Path"
+    $editSections = @($sections[0])
+    if ($IncludeDevDependency) {
+        $editSections += $devSections[0]
     }
-    $fields = $dependencies[0].Groups['fields']
-    $quote = [char]0
-    $depth = 0
-    $start = 0
-    $versionIndex = -1
-    $versionLength = 0
-    $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    # Only commas outside strings and arrays delimit inline-table fields.
-    for ($i = 0; $i -le $fields.Length; $i++) {
-        if ($i -lt $fields.Length) {
-            $character = $fields.Value[$i]
-            if ($quote -ne [char]0) {
-                if ($quote -eq '"' -and $character -eq '\') {
-                    throw "Escaped basic-string dependency values are unsupported in $Path"
+    $versionEdits = foreach ($section in $editSections) {
+        $dependencies = [regex]::Matches($section.Value, '(?m)^[ \t]*mssql-tds[ \t]*=[ \t]*\{(?<fields>(?:' + $quotedString + '|[^{}"''\r\n])*)\}[ \t]*(?:#[^\r\n]*)?\r?$')
+        if ($dependencies.Count -ne 1) {
+            throw "Expected one single-line mssql-tds inline dependency per section in $Path"
+        }
+        $fields = $dependencies[0].Groups['fields']
+        $quote = [char]0
+        $depth = 0
+        $start = 0
+        $versionIndex = -1
+        $versionLength = 0
+        $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        # Only commas outside strings and arrays delimit inline-table fields.
+        for ($i = 0; $i -le $fields.Length; $i++) {
+            if ($i -lt $fields.Length) {
+                $character = $fields.Value[$i]
+                if ($quote -ne [char]0) {
+                    if ($quote -eq '"' -and $character -eq '\') {
+                        throw "Escaped basic-string dependency values are unsupported in $Path"
+                    }
+                    if ($character -eq $quote) { $quote = [char]0 }
+                    continue
                 }
-                if ($character -eq $quote) { $quote = [char]0 }
-                continue
+                if ($character -eq '"' -or $character -eq "'") {
+                    $quote = $character
+                    continue
+                }
+                if ($character -eq '[') { $depth++; continue }
+                if ($character -eq ']') {
+                    $depth--
+                    if ($depth -lt 0) { throw "Unbalanced inline dependency array in $Path" }
+                    continue
+                }
+                if ($character -ne ',' -or $depth -ne 0) { continue }
             }
-            if ($character -eq '"' -or $character -eq "'") {
-                $quote = $character
-                continue
+            if ($quote -ne [char]0 -or $depth -ne 0) {
+                throw "Unterminated inline dependency value in $Path"
             }
-            if ($character -eq '[') { $depth++; continue }
-            if ($character -eq ']') {
-                $depth--
-                if ($depth -lt 0) { throw "Unbalanced inline dependency array in $Path" }
-                continue
+            $field = [regex]::Match($fields.Value.Substring($start, $i - $start), '\A[ \t]*(?<key>[A-Za-z0-9_-]+)[ \t]*=[ \t]*(?<value>.+?)[ \t]*\z')
+            if (-not $field.Success -or -not $keys.Add($field.Groups['key'].Value)) {
+                throw "Expected unique bare inline dependency keys in $Path"
             }
-            if ($character -ne ',' -or $depth -ne 0) { continue }
-        }
-        if ($quote -ne [char]0 -or $depth -ne 0) {
-            throw "Unterminated inline dependency value in $Path"
-        }
-        $field = [regex]::Match($fields.Value.Substring($start, $i - $start), '\A[ \t]*(?<key>[A-Za-z0-9_-]+)[ \t]*=[ \t]*(?<value>.+?)[ \t]*\z')
-        if (-not $field.Success -or -not $keys.Add($field.Groups['key'].Value)) {
-            throw "Expected unique bare inline dependency keys in $Path"
-        }
-        if ($field.Groups['key'].Value -ceq 'package') {
-            throw "The mssql-tds dependency key must not override its package in $Path"
-        }
-        if ($field.Groups['key'].Value -ceq 'version') {
-            $value = $field.Groups['value']
-            if ($value.Value -cnotmatch '\A"[^"]+"\z') {
-                throw "Expected a double-quoted mssql-tds dependency version in $Path"
+            if ($field.Groups['key'].Value -ceq 'package') {
+                throw "The mssql-tds dependency key must not override its package in $Path"
             }
-            $sourceVersion = $value.Value.Substring(1, $value.Length - 2)
-            Assert-SemVer -Version $sourceVersion
-            $versionIndex = $start + $value.Index + 1
-            $versionLength = $sourceVersion.Length
+            if ($field.Groups['key'].Value -ceq 'version') {
+                $value = $field.Groups['value']
+                if ($value.Value -cnotmatch '\A"[^"]+"\z') {
+                    throw "Expected a double-quoted mssql-tds dependency version in $Path"
+                }
+                $sourceVersion = $value.Value.Substring(1, $value.Length - 2)
+                Assert-SemVer -Version $sourceVersion
+                $versionIndex = $start + $value.Index + 1
+                $versionLength = $sourceVersion.Length
+            }
+            $start = $i + 1
         }
-        $start = $i + 1
+        if ($versionIndex -lt 0) {
+            throw "Expected one literal mssql-tds dependency version with bare keys in $Path"
+        }
+        [pscustomobject]@{
+            Index = $section.Index + $fields.Index + $versionIndex
+            Length = $versionLength
+        }
     }
-    if ($versionIndex -lt 0) {
-        throw "Expected one literal mssql-tds dependency version with bare keys in $Path"
+    foreach ($edit in ($versionEdits | Sort-Object -Property Index -Descending)) {
+        $Content = $Content.Substring(0, $edit.Index) + $Version +
+            $Content.Substring($edit.Index + $edit.Length)
     }
-    $index = $section.Index + $fields.Index + $versionIndex
-    return $Content.Substring(0, $index) + $Version +
-        $Content.Substring($index + $versionLength)
+    return $Content
 }
 
 if ($BuildReason -cnotmatch '\A[A-Za-z][A-Za-z0-9]*\z') {
@@ -300,8 +316,9 @@ Assert-SemVer -Version $crateVersion
 
 $edits = foreach ($manifest in $manifests) {
     $updated = Set-PackageVersion -Content $manifest.Content -Version $crateVersion -VersionMatch $manifest.VersionMatch
-    if ($manifest.Crate -eq 'mssql-mock-tds') {
-        $updated = Set-MssqlTdsDependencyVersion -Content $updated -Version $crateVersion -Path $manifest.Path
+    if ($manifest.Crate -in @('mssql-mock-tds', 'mssql-rs')) {
+        $updated = Set-MssqlTdsDependencyVersion -Content $updated -Version $crateVersion -Path $manifest.Path `
+            -IncludeDevDependency:($manifest.Crate -eq 'mssql-rs')
     }
     [pscustomobject]@{ Path = $manifest.Path; Content = $manifest.Content; Updated = $updated }
 }

@@ -78,24 +78,18 @@ other; the run fails at the end if either track failed.
 
 #### Released Rust crates
 
-`mssql-tds` and `mssql-mock-tds` are checked against crates.io independently. If
+`mssql-tds`, `mssql-mock-tds`, and `mssql-rs` are checked against crates.io independently. If
 a crate's exact `[package].version` exists among its published versions
 (including older or yanked releases), the pipeline bumps it to the next minor
 version: `0.1.7` becomes `0.2.0`. Unpublished source versions and crates that
 return HTTP 404 are left alone. Other registry errors fail the track rather than
 assuming a crate is unpublished. If the proposed next minor version is also
 published, the track fails and a maintainer must choose a new version. Before any
-bump is planned, the track also fails when the current `mssql-tds` and
-`mssql-mock-tds` source versions differ in either direction (`mssql-tds` and
-`mssql-mock-tds` must stay aligned for a release), because silently tolerating a
-drifted state can leave the repo in a release-invalid configuration. If the mock
-source version is ahead of the core target, the track also fails so a maintainer
-can choose the versions manually. A mock-only bump is deferred until the current
-`mssql-tds` version is published, because the mock crate's exact versioned
-dependency must resolve from the registry when it is packaged. When `mssql-tds`
-is bumped, the mock source version and the mock crate's versioned `mssql-tds`
-requirement are kept aligned with the core target because the release pipeline
-stamps the mock crate from the core version.
+bump is planned, the track also fails when either dependent crate's source version
+differs from `mssql-tds`, because the release pipeline stamps all three from the
+core version. A dependent-only bump is deferred until the current `mssql-tds`
+version is published. When `mssql-tds` is bumped, both dependent source versions
+and their versioned `mssql-tds` requirements are kept aligned with the core target.
 
 Local versions come from `cargo metadata`. `Cargo.lock` is not tracked, and
 `--no-deps` means no lockfile is resolved or committed.
@@ -492,24 +486,24 @@ against that build's source metadata, even when feed publishing is disabled.
 | `publishToFeed` | Collect, authenticate and `twine upload` the validated wheels to the Azure Artifacts PyPI feed after wheel validation. When false, these upload-only steps are omitted; wheel download and validation still run. |
 | `publishMssqlTds` | Select `mssql-tds` for crates.io publication through ESRP. |
 | `publishMssqlMockTds` | Select `mssql-mock-tds` for crates.io publication through ESRP. |
-| `validateCratesOnly` | Validate the crate artifact and run selected-crate preflights without ESRP publication. Can also validate the artifact with neither crate selected. |
+| `publishMssqlRs` | Select `mssql-rs` for crates.io publication through ESRP. |
+| `validateCratesOnly` | Validate the crate artifact and run selected-crate preflights without ESRP publication. Can also validate the artifact with no crate selected. |
 | `tagRelease` | Tag and branch the selected build's `mssql-py-core` version. This does not tag Rust crate versions. |
 
 The wheel validation/feed publish and Rust crate stages have no dependency on each other.
 The crate stage downloads only crate artifacts and does not wait for wheel
 validation or feed publish. A failure in either wheel validation or feed publish does not block
-crates. OneBranch's per-job policy validation still applies. When publishing both
-crates, the core must become available on
-crates.io before the mock is published; mock-only publication requires the core
-version to be available already.
+crates. OneBranch's per-job policy validation still applies. The core must become
+available on crates.io before either dependent crate is published; publishing a
+dependent without the core requires that core version to be available already.
 
-The Rust job graph is `ValidateCrates -> RegistryPreflight -> PublishCore ->
-CoreAvailable -> PublishMock -> MockAvailable` when both crates are selected.
-Core-only stops after `CoreAvailable`; mock-only checks the existing core in
-`RegistryPreflight` before `PublishMock`. With `validateCratesOnly`, publication
-and post-publication waits are omitted. Selected versions must still be absent,
-and mock-only still requires its existing core dependency. Selecting both crates
-for validation does not wait for an unpublished proposed core version.
+The Rust job graph starts with `ValidateCrates -> RegistryPreflight`. When the core
+is selected, `PublishCore -> CoreAvailable` follows before the selected mock and
+driver publication jobs, which can run independently. Without the core, preflight
+checks its availability before either dependent publishes. With `validateCratesOnly`,
+publication and post-publication waits are omitted. Selected versions must still be
+absent, and dependent-only validation requires the existing core dependency.
+Selecting the core and a dependent for validation does not wait for the proposed core.
 
 Crates.io HTTP requests run only in read-only custom Windows jobs on the
 `Azure Pipelines` pool (`windows-2022`), supported by GovernedTemplates'
@@ -522,7 +516,9 @@ that consumers can resolve the crate before a dependent publication starts.
 
 Every Rust job re-downloads `drop_Build_RustCrates` from the same immutable
 `resources.pipeline.officialBuild` run and checks the original manifest, archive
-hashes, and mock dependency. Publishers do not consume files produced by registry
+hashes, and dependent crate requirements. Older two-crate artifacts remain valid
+unless `publishMssqlRs` is selected, which requires an artifact containing the driver.
+Publishers do not consume files produced by registry
 jobs. No crate job relies on another job's filesystem or job-local variables.
 
 Tagging always waits for successful wheel validation, plus feed publication when
@@ -549,9 +545,10 @@ Once a live run is authorized, select a known successful Official Build and leav
 off to exercise genuine artifacts in the governed container without publishing.
 That all-off run does not exercise the crate registry jobs. For an authorized
 non-publishing crate preflight run, set `validateCratesOnly: true` and select
-`publishMssqlTds` and/or `publishMssqlMockTds`; leave `publishToFeed` and `tagRelease`
-false. Use an Official Build whose selected crate versions are not yet published.
-Mock-only validation also requires its core version to be available already.
+`publishMssqlTds`, `publishMssqlMockTds`, and/or `publishMssqlRs`; leave
+`publishToFeed` and `tagRelease` false. Use an Official Build whose selected crate
+versions are not yet published. Dependent-only validation also requires its core
+version to be available already.
 Local regression tests also cover missing wheels, incorrect names/versions,
 missing ODBC payloads, and exact-source metadata failures.
 

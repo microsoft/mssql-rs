@@ -47,6 +47,7 @@ _SWITCHES = (
     "publishToFeed",
     "publishMssqlTds",
     "publishMssqlMockTds",
+    "publishMssqlRs",
     "validateCratesOnly",
     "tagRelease",
 )
@@ -107,7 +108,15 @@ def expand(value, parameters):
     if isinstance(value, dict):
         if value.get("template") == "/.pipeline/templates/validate-release-crates.yml@self":
             template = _ROOT / value["template"].removeprefix("/").removesuffix("@self")
-            return expand(yaml.safe_load(template.read_text(encoding="utf-8"))["steps"], parameters)
+            definition = yaml.safe_load(template.read_text(encoding="utf-8"))
+            template_parameters = {
+                item["name"]: item["default"] for item in definition.get("parameters", [])
+            }
+            template_parameters.update({
+                key: expand(item, parameters)
+                for key, item in value.get("parameters", {}).items()
+            })
+            return expand(definition["steps"], template_parameters)
         result = {}
         matched = False
         for key, item in value.items():
@@ -1128,7 +1137,7 @@ def test_crate_templates_resolve_in_self_repository():
         _PIPELINE.read_text(encoding="utf-8"),
         re.MULTILINE,
     )
-    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
+    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 8
 
 
 @pytest.mark.parametrize(
@@ -2066,12 +2075,12 @@ def test_odbc_build_script_enforces_glibc_ceiling(
         )
 
 
-@pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=5)))
+@pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=6)))
 def test_release_switch_graph(values):
     flags = dict(zip(_SWITCHES, values))
     pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
     stages = {stage["stage"]: stage for stage in pipeline["extends"]["parameters"]["stages"]}
-    to_feed, core, mock, dry_run, tag = values
+    to_feed, core, mock, driver, dry_run, tag = values
     for stage in stages.values():
         for job in stage["jobs"]:
             custom = job["pool"].get("isCustom", False)
@@ -2120,26 +2129,29 @@ def test_release_switch_graph(values):
                 for job in stage["jobs"] for step in job["steps"]
             )
 
-    assert ("ReleaseCrates" in stages) == (core or mock or dry_run)
+    assert ("ReleaseCrates" in stages) == (core or mock or driver or dry_run)
     if "ReleaseCrates" in stages:
         crates = stages["ReleaseCrates"]
         # Explicitly empty: wheel validation or NuGet failure cannot block crates.
         assert crates["dependsOn"] == []
         jobs = {job["job"]: job for job in crates["jobs"]}
         expected_jobs = {"ValidateCrates"}
-        if core or mock:
+        if core or mock or driver:
             expected_jobs.add("RegistryPreflight")
         if not dry_run:
             if core:
                 expected_jobs.update(("PublishCore", "CoreAvailable"))
             if mock:
                 expected_jobs.update(("PublishMock", "MockAvailable"))
+            if driver:
+                expected_jobs.update(("PublishDriver", "DriverAvailable"))
         assert set(jobs) == expected_jobs
         steps = [step for job in jobs.values() for step in job["steps"]]
         tasks = [step["displayName"] for step in steps if step.get("task") == "EsrpRelease@12"]
         assert tasks == (
             (["Publish mssql-tds to crates.io"] if core and not dry_run else [])
             + (["Publish mssql-mock-tds to crates.io"] if mock and not dry_run else [])
+            + (["Publish mssql-rs to crates.io"] if driver and not dry_run else [])
         )
         names = [step.get("displayName") for step in steps]
         for job in jobs.values():
@@ -2152,19 +2164,25 @@ def test_release_switch_graph(values):
             assert validation_index == (2 if job["pool"].get("isCustom") else 1)
             validation = job["steps"][validation_index]
             assert "$(Pipeline.Workspace)/officialBuild/drop_Build_RustCrates" in validation["pwsh"]
-        if core or mock:
+            assert f"-RequireMssqlRs '{str(driver).lower()}'" in validation["pwsh"]
+        if core or mock or driver:
             assert jobs["RegistryPreflight"]["dependsOn"] == "ValidateCrates"
         assert ("Preflight mssql-tds version" in names) == core
         assert ("Preflight mssql-mock-tds version" in names) == mock
-        assert ("Verify mssql-tds dependency is published" in names) == (mock and not core)
+        assert ("Preflight mssql-rs version" in names) == driver
+        assert ("Verify mssql-tds dependency is published" in names) == ((mock or driver) and not core)
         assert ("Wait for mssql-tds on crates.io" in names) == (core and not dry_run)
         assert ("Verify mssql-mock-tds on crates.io" in names) == (mock and not dry_run)
+        assert ("Verify mssql-rs on crates.io" in names) == (driver and not dry_run)
         if core and not dry_run:
             assert jobs["PublishCore"]["dependsOn"] == "RegistryPreflight"
             assert jobs["CoreAvailable"]["dependsOn"] == "PublishCore"
         if mock and not dry_run:
             assert jobs["PublishMock"]["dependsOn"] == ("CoreAvailable" if core else "RegistryPreflight")
             assert jobs["MockAvailable"]["dependsOn"] == "PublishMock"
+        if driver and not dry_run:
+            assert jobs["PublishDriver"]["dependsOn"] == ("CoreAvailable" if core else "RegistryPreflight")
+            assert jobs["DriverAvailable"]["dependsOn"] == "PublishDriver"
         for job in jobs.values():
             for step in job["steps"]:
                 if step.get("task") == "EsrpRelease@12":
@@ -2225,6 +2243,7 @@ def test_release_switch_graph(values):
     for gate in (
         "PublishRelease", "ValidateCrates", "RegistryPreflight",
         "PublishCore", "CoreAvailable", "PublishMock", "MockAvailable",
+        "PublishDriver", "DriverAvailable",
     )
     if core or gate not in ("PublishCore", "CoreAvailable")
 ])
@@ -2251,11 +2270,21 @@ def test_release_gate_failure_propagation(core, failed_gate, result):
                 results[job["job"]] = "Succeeded"
     if failed_gate == "PublishRelease":
         assert results["MockAvailable"] == "Succeeded"
+        assert results["DriverAvailable"] == "Succeeded"
     else:
         assert results["PublishRelease"] == "Succeeded"
-        assert results["MockAvailable"] != "Succeeded"
-        if failed_gate not in ("PublishMock", "MockAvailable"):
-            assert results["PublishMock"] == "Skipped"
+        if failed_gate in ("PublishDriver", "DriverAvailable"):
+            assert results["MockAvailable"] == "Succeeded"
+        else:
+            assert results["MockAvailable"] != "Succeeded"
+            if failed_gate not in ("PublishMock", "MockAvailable"):
+                assert results["PublishMock"] == "Skipped"
+        if failed_gate in ("PublishMock", "MockAvailable"):
+            assert results["DriverAvailable"] == "Succeeded"
+        else:
+            assert results["DriverAvailable"] != "Succeeded"
+            if failed_gate not in ("PublishDriver", "DriverAvailable"):
+                assert results["PublishDriver"] == "Skipped"
         if core and failed_gate in ("ValidateCrates", "RegistryPreflight"):
             assert results["PublishCore"] == "Skipped"
     assert stages["Tag"]["dependsOn"] == "Release"
@@ -2263,17 +2292,23 @@ def test_release_gate_failure_propagation(core, failed_gate, result):
 
 @pytest.fixture
 def stamp_manifests(tmp_path):
-    for name in ("mssql-tds", "mssql-mock-tds"):
+    for name in ("mssql-tds", "mssql-mock-tds", "mssql-rs"):
         folder = tmp_path / name
         folder.mkdir()
         manifest = (
             f'[package]\nname = "{name}"\nversion = "0.3.0" # source version\n'
             '\n[dependencies.uuid]\nversion = "1.19.0"\n'
         )
-        if name == "mssql-mock-tds":
+        if name in ("mssql-mock-tds", "mssql-rs"):
             manifest += (
                 '\n[dependencies]\n'
                 'mssql-tds = { path = "../mssql-tds", version = "0.3.0", default-features = false }\n'
+            )
+        if name == "mssql-rs":
+            manifest += (
+                '\n[dev-dependencies]\n'
+                'mssql-tds = { path = "../mssql-tds", version = "0.3.0", '
+                'default-features = false, features = ["test-util"] }\n'
             )
         (folder / "Cargo.toml").write_text(manifest, encoding="utf-8", newline="\n")
     return tmp_path
@@ -2331,14 +2366,125 @@ def test_crate_stamp_versions(stamp_manifests, version, reason, official, expect
             manifest = tomllib.loads(path.read_text())
             assert manifest["package"]["version"] == expected
             assert manifest["dependencies"]["uuid"]["version"] == "1.19.0"
-            if path.parent.name == "mssql-mock-tds":
+            if path.parent.name in ("mssql-mock-tds", "mssql-rs"):
                 assert manifest["dependencies"]["mssql-tds"]["version"] == expected
+            if path.parent.name == "mssql-rs":
+                assert manifest["dev-dependencies"]["mssql-tds"]["version"] == expected
     if what_if:
         assert "##vso[" not in result.stdout
     else:
         assert result.stdout.count("##vso[task.setvariable ") == 2
         assert f"##vso[task.setvariable variable=crateVersion]{expected}\n" in result.stdout
         assert f"##vso[task.setvariable variable=crateVersion;isOutput=true]{expected}\n" in result.stdout
+
+
+@pytest.mark.parametrize(("old", "new"), [
+    ('version = "0.3.0", ', ""),
+    ('version = "0.3.0", ', 'version = "0.3.0", version = "0.4.0", '),
+    ("mssql-tds = {", "other = {"),
+    ("mssql-tds = {", 'other = { package = "mssql-tds",'),
+    ("mssql-tds = {", 'mssql-tds = { package = "other",'),
+])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_invalid_driver_dev_dependency(stamp_manifests, old, new, what_if):
+    path = stamp_manifests / "mssql-rs" / "Cargo.toml"
+    prefix, section = path.read_text().split("[dev-dependencies]", 1)
+    assert old in section
+    path.write_text(prefix + "[dev-dependencies]" + section.replace(old, new, 1))
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_updates_driver_dependencies_in_reversed_section_order(stamp_manifests):
+    path = stamp_manifests / "mssql-rs" / "Cargo.toml"
+    prefix, dependencies = path.read_text().split("\n[dependencies]\n", 1)
+    normal, dev = dependencies.split("\n[dev-dependencies]\n", 1)
+    path.write_text(prefix + "\n[dev-dependencies]\n" + dev + "\n[dependencies]\n" + normal)
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    manifest = tomllib.loads(path.read_text())
+    assert manifest["dependencies"]["mssql-tds"]["version"] == "0.3.0-dev.20261015.123"
+    assert manifest["dev-dependencies"]["mssql-tds"]["version"] == "0.3.0-dev.20261015.123"
+
+
+def synthetic_crate_workspace(root):
+    root.mkdir()
+    (root / "Cargo.toml").write_text(
+        '[workspace]\nresolver = "2"\nmembers = ["mssql-tds", "mssql-mock-tds", "mssql-rs"]\n'
+    )
+    for crate in ("mssql-tds", "mssql-mock-tds", "mssql-rs"):
+        folder = root / crate
+        (folder / "src").mkdir(parents=True)
+        manifest = f'[package]\nname = "{crate}"\nversion = "0.3.0"\nedition = "2021"\n'
+        if crate == "mssql-tds":
+            manifest += '\n[features]\ntest-util = []\n'
+        else:
+            manifest += (
+                '\n[dependencies]\n'
+                'mssql-tds = { path = "../mssql-tds", version = "0.3.0" }\n'
+            )
+        if crate == "mssql-rs":
+            manifest += (
+                '\n[dev-dependencies]\n'
+                'mssql-tds = { path = "../mssql-tds", version = "0.3.0", '
+                'features = ["test-util"] }\n'
+            )
+        (folder / "Cargo.toml").write_text(manifest)
+        source = "pub fn value() -> u8 { 1 }\n" if crate == "mssql-tds" else (
+            "pub fn value() -> u8 { mssql_tds::value() }\n"
+        )
+        (folder / "src" / "lib.rs").write_text(source)
+
+
+def test_stamped_crate_package_and_release_validation(tmp_path):
+    root = tmp_path / "workspace"
+    synthetic_crate_workspace(root)
+    stamp = run_crate_stamp(root)
+    assert stamp.returncode == 0, stamp.stderr
+    version = "0.3.0-dev.20261015.123"
+    output = tmp_path / "artifacts"
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File",
+         str(_ROOT / ".pipeline" / "scripts" / "package-rust-crates.ps1"),
+         "-RepositoryRoot", str(root), "-OutputDirectory", str(output),
+         "-TargetDirectory", str(tmp_path / "target"), "-Version", version],
+        cwd=root, env=dict(os.environ, CARGO_NET_OFFLINE="true"),
+        capture_output=True, text=True, check=False, timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    entries = json.loads((output / "release-manifest.json").read_text())["crates"]
+    assert [entry["name"] for entry in entries] == ["mssql-tds", "mssql-mock-tds", "mssql-rs"]
+    assert all(entry["version"] == version for entry in entries)
+    assert "Verified packaged mssql-rs against packaged mssql-tds." in result.stdout
+    validation = validate_crate_artifact(output, require_driver=True)
+    assert validation.returncode == 0, validation.stderr
+
+
+@pytest.mark.parametrize("release_version", [False, True])
+def test_sandbox_stamp_keeps_published_workspace_resolvable(tmp_path, release_version):
+    root = tmp_path / "workspace"
+    synthetic_crate_workspace(root)
+    scripts = root / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("stamp-crate-versions.ps1", "stamp-crate-versions-sandbox.ps1"):
+        shutil.copy2(_ROOT / ".pipeline" / "scripts" / name, scripts / name)
+    script = str(scripts / "stamp-crate-versions-sandbox.ps1").replace("'", "''")
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+         "function Get-Date { param($Format) '20261015' }; "
+         f"& '{script}' -ReleaseVersion '{release_version}' -BuildId 123"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    expected = "0.3.0" if release_version else "0.3.0-dev.20261015.123"
+    manifest = tomllib.loads((root / "mssql-rs" / "Cargo.toml").read_text())
+    assert manifest["package"]["version"] == expected
+    assert manifest["dependencies"]["mssql-tds"]["version"] == expected
+    assert manifest["dev-dependencies"]["mssql-tds"]["version"] == expected
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--offline", "--format-version", "1"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    assert metadata.returncode == 0, metadata.stderr
 
 
 @pytest.mark.parametrize("version", [
@@ -2905,7 +3051,7 @@ def test_crate_stamp_supports_single_selected_crate(stamp_manifests):
 def test_crate_stamp_handles_literal_root_and_no_final_newline(stamp_manifests):
     root = stamp_manifests / "checkout [local]"
     root.mkdir()
-    for name in ("mssql-tds", "mssql-mock-tds"):
+    for name in ("mssql-tds", "mssql-mock-tds", "mssql-rs"):
         shutil.move(stamp_manifests / name, root / name)
     for path in root.rglob("Cargo.toml"):
         path.write_bytes(path.read_bytes().rstrip(b"\r\n"))
@@ -2981,52 +3127,84 @@ def test_cratesio_http_states(tmp_path, state, responses, success, requests):
     (None, None),
     ("hash", "mssql-tds"),
     ("hash", "mssql-mock-tds"),
+    ("hash", "mssql-rs"),
     ("dependency", "mssql-mock-tds"),
+    ("dependency", "mssql-rs"),
+    ("dev-dependency", "mssql-rs"),
+    ("missing-dev", "mssql-rs"),
+    ("registry", "mssql-rs"),
+    ("version", "mssql-rs"),
     ("missing", "mssql-tds"),
     ("missing", "mssql-mock-tds"),
+    ("missing", "mssql-rs"),
     ("extra", None),
     ("order", None),
 ])
 def test_crate_artifact_revalidation(tmp_path, damage, damaged_name):
+    write_crate_artifact(tmp_path, ("mssql-tds", "mssql-mock-tds", "mssql-rs"), damage, damaged_name)
+    result = validate_crate_artifact(tmp_path, require_driver=True)
+    assert (result.returncode == 0) == (damage is None), result.stderr
+    assert ("Rust crate release artifact is valid." in result.stdout) == (damage is None)
+    if damage is None:
+        assert "variable=mssqlRsCrateVersion]0.1.0" in result.stdout
+
+
+def write_crate_artifact(root, names, damage=None, damaged_name=None):
     entries = []
-    for name in ("mssql-tds", "mssql-mock-tds"):
-        folder = tmp_path / name
+    for name in names:
+        folder = root / name
         folder.mkdir()
         crate = folder / f"{name}-0.1.0.crate"
-        dependency = "9.9.9" if damage == "dependency" else "0.1.0"
+        dependency = "9.9.9" if damage == "dependency" and name == damaged_name else "0.1.0"
         manifest = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
-        if name == "mssql-mock-tds":
+        if name in ("mssql-mock-tds", "mssql-rs"):
             manifest += f'\n[dependencies.mssql-tds]\nversion = "{dependency}"\n'
+            if damage == "registry" and name == damaged_name:
+                manifest += 'registry-index = "https://example.invalid/index"\n'
+        if name == "mssql-rs" and damage != "missing-dev":
+            dev_version = "9.9.9" if damage == "dev-dependency" else "0.1.0"
+            manifest += f'\n[dev-dependencies.mssql-tds]\nversion = "{dev_version}"\n'
         with tarfile.open(crate, "w:gz") as archive:
             content = manifest.encode("utf-8")
             member = tarfile.TarInfo(f"{name}-0.1.0/Cargo.toml")
             member.size = len(content)
             archive.addfile(member, io.BytesIO(content))
         entries.append({
-            "name": name, "version": "0.1.0", "file": f"{name}/{crate.name}",
+            "name": name, "version": "0.1.1" if damage == "version" and name == damaged_name else "0.1.0",
+            "file": f"{name}/{crate.name}",
             "sha256": hashlib.sha256(crate.read_bytes()).hexdigest(),
         })
     if damage in ("hash", "missing"):
-        damaged_crate = tmp_path / damaged_name / f"{damaged_name}-0.1.0.crate"
+        damaged_crate = root / damaged_name / f"{damaged_name}-0.1.0.crate"
         if damage == "hash":
             damaged_crate.write_bytes(b"replaced after preflight")
         else:
             damaged_crate.unlink()
     elif damage == "extra":
-        (tmp_path / "extra.crate").write_bytes(b"unexpected")
+        (root / "extra.crate").write_bytes(b"unexpected")
     elif damage == "order":
         entries.reverse()
-    (tmp_path / "release-manifest.json").write_text(
+    (root / "release-manifest.json").write_text(
         json.dumps({"schemaVersion": 1, "crates": entries}), encoding="utf-8",
     )
-    result = subprocess.run(
+
+
+def validate_crate_artifact(root, require_driver):
+    return subprocess.run(
         ["pwsh", "-NoProfile", "-File",
          str(_ROOT / ".pipeline" / "scripts" / "validate-crate-release-artifact.ps1"),
-         "-ArtifactDirectory", str(tmp_path)],
+         "-ArtifactDirectory", str(root), "-RequireMssqlRs", str(require_driver)],
         capture_output=True, text=True, check=False,
     )
-    assert (result.returncode == 0) == (damage is None), result.stderr
-    assert ("Rust crate release artifact is valid." in result.stdout) == (damage is None)
+
+
+@pytest.mark.parametrize("require_driver", [False, True])
+def test_legacy_crate_artifact_is_valid_only_when_driver_is_not_selected(tmp_path, require_driver):
+    write_crate_artifact(tmp_path, ("mssql-tds", "mssql-mock-tds"))
+    result = validate_crate_artifact(tmp_path, require_driver)
+    assert (result.returncode == 0) is (not require_driver), result.stderr
+    if require_driver:
+        assert "must contain mssql-rs" in result.stderr
 
 
 def git(directory, *arguments):

@@ -38,7 +38,7 @@ fi
 # Archive nextest (used by later test stages)
 echo '==> Creating nextest archive...'
 cd mssql-tds
-cargo nextest archive --archive-file tdslib-nextest.tar.zst
+cargo nextest archive --archive-file tdslib-nextest.tar.zst --package mssql-tds --package mssql-rs --features mssql-rs/arrow,mssql-rs/jiff,mssql-rs/serde,mssql-rs/time
 mv tdslib-nextest.tar.zst /workspace/
 cd ..
 
