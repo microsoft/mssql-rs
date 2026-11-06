@@ -105,6 +105,21 @@ fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(format!("{user_msg}: {e}"))
 }
 
+fn map_connect_error(error: TdsError, uses_async_auth: bool) -> PyErr {
+    if uses_async_auth && matches!(error, TdsError::OperationCancelledError(_)) {
+        tracing::debug!("PyAsyncConnection::connect: token acquisition cancelled");
+        return Python::attach(|py| {
+            py.import("asyncio")?
+                .getattr("CancelledError")?
+                .call0()
+                .map(PyErr::from_value)
+        })
+        .unwrap_or_else(|error| error);
+    }
+    tracing::error!("PyAsyncConnection::connect: failed: {error}");
+    crate::async_errors::map_tds_error("Failed to connect to SQL Server", error, Vec::new())
+}
+
 /// Maps a connection lifecycle or session-ownership rejection to `RuntimeError`.
 ///
 /// A busy connection may be owned by either a cursor or another connection-level
@@ -231,6 +246,8 @@ impl PyAsyncConnection {
     /// loop running until credential tasks have settled.
     /// Cancelled connect futures cannot publish tokens from queued acquisition
     /// or credential-close completions.
+    /// TDS connect failures use DB-API exceptions regardless of authentication
+    /// mode; async Entra cancellation raises asyncio.CancelledError.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false, *, token_provider=None))]
     fn connect<'py>(
@@ -301,33 +318,7 @@ impl PyAsyncConnection {
                     let client = provider
                         .create_client(context, &datasource, None)
                         .await
-                        .map_err(|e| {
-                            if !uses_async_auth {
-                                return map_tds_error(
-                                    "connect",
-                                    "Failed to connect to SQL Server",
-                                    e,
-                                );
-                            }
-                            if matches!(e, TdsError::OperationCancelledError(_)) {
-                                tracing::debug!(
-                                    "PyAsyncConnection::connect: token acquisition cancelled"
-                                );
-                                return Python::attach(|py| {
-                                    py.import("asyncio")?
-                                        .getattr("CancelledError")?
-                                        .call0()
-                                        .map(PyErr::from_value)
-                                })
-                                .unwrap_or_else(|error| error);
-                            }
-                            tracing::error!("PyAsyncConnection::connect: failed: {e}");
-                            crate::async_errors::map_tds_error(
-                                "Failed to connect to SQL Server",
-                                e,
-                                Vec::new(),
-                            )
-                        })?;
+                        .map_err(|error| map_connect_error(error, uses_async_auth))?;
 
                     tracing::info!("PyAsyncConnection::connect: connection established");
                     Python::attach(|py| {
@@ -350,6 +341,7 @@ impl PyAsyncConnection {
             callback.borrow(py).bind_future(&future)?;
             future.call_method1("add_done_callback", (callback,))?;
         }
+
         Ok(future)
     }
 
@@ -654,5 +646,99 @@ impl PyAsyncConnection {
             self.session_state.allocate_cursor_id(),
             self.default_query_timeout,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use mssql_tds::error::{Error, SqlErrorInfo, SqlServerDiagnostics, TimeoutErrorType};
+    use pyo3::prelude::*;
+
+    use super::map_connect_error;
+    use crate::async_errors::{DatabaseError, OperationalError};
+
+    #[test]
+    fn connect_transport_errors_are_independent_of_auth_mode() {
+        for uses_async_auth in [false, true] {
+            for error in [
+                Error::ConnectionError("connection refused".into()),
+                Error::TlsHandshakeError {
+                    source: Box::new(io::Error::other("certificate verification failed")),
+                    expected_host: "server".into(),
+                },
+                Error::TimeoutError(TimeoutErrorType::String("login timed out".into())),
+            ] {
+                let error = map_connect_error(error, uses_async_auth);
+                Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Failed to connect to SQL Server")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn connect_login_errors_preserve_diagnostics_for_all_auth_modes() {
+        for uses_async_auth in [false, true] {
+            let error = map_connect_error(
+                Error::SqlServerError {
+                    diagnostics: SqlServerDiagnostics::new(
+                        vec![SqlErrorInfo {
+                            message: "Login failed".into(),
+                            state: 1,
+                            class: 14,
+                            number: 18456,
+                            server_name: Some("server".into()),
+                            proc_name: None,
+                            line_number: None,
+                        }],
+                        Vec::new(),
+                    ),
+                },
+                uses_async_auth,
+            );
+            Python::attach(|py| {
+                assert!(error.is_instance_of::<DatabaseError>(py));
+                assert_eq!(
+                    error
+                        .value(py)
+                        .getattr("sql_errors")
+                        .unwrap()
+                        .get_item(0)
+                        .unwrap()
+                        .get_item("number")
+                        .unwrap()
+                        .extract::<i32>()
+                        .unwrap(),
+                    18456
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn only_async_auth_connect_cancellation_raises_cancelled_error() {
+        Python::attach(|py| {
+            let cancelled_error = py
+                .import("asyncio")
+                .unwrap()
+                .getattr("CancelledError")
+                .unwrap();
+            for uses_async_auth in [false, true] {
+                let error = map_connect_error(
+                    Error::OperationCancelledError("cancelled".into()),
+                    uses_async_auth,
+                );
+                assert_eq!(error.is_instance(py, &cancelled_error), uses_async_auth);
+                assert_eq!(
+                    error.is_instance_of::<OperationalError>(py),
+                    !uses_async_auth
+                );
+            }
+        });
     }
 }

@@ -143,6 +143,17 @@ async def main():
 asyncio.run(main())
 ```
 
+### Connect errors
+
+Native async TDS connect failures use the same `mssql_py_core` DB-API exception
+mapping for every authentication mode. Transport, TLS, and login-timeout failures
+raise `OperationalError`; server login errors raise `DatabaseError` with
+`sql_errors` and `info_messages` diagnostics. This replaces the previous
+`RuntimeError` mapping for SqlPassword and raw access-token connect failures.
+Async Entra cancellation during initial login still raises
+`asyncio.CancelledError`. Connection lifecycle and ownership rejections retain
+their existing behavior.
+
 ### Custom providers and cleanup
 
 Pass a caller-owned credential using the keyword-only `token_provider` argument
