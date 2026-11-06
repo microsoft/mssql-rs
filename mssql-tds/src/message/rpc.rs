@@ -89,6 +89,30 @@ pub(crate) fn output_names_by_ordinal<'p>(
         .collect()
 }
 
+/// Writes one of an RPC's named values. Also used by the streamed write to
+/// send materialized values that follow a data-at-execution one.
+pub(crate) async fn write_named_value(
+    parameter: &RpcParameter,
+    packet_writer: &mut PacketWriter<'_>,
+    db_collation: &SqlCollation,
+    binding: ValueBinding,
+    encoder: &GenericEncoder,
+) -> TdsResult<()> {
+    parameter
+        .serialize(
+            packet_writer,
+            db_collation,
+            binding == ValueBinding::ByOrdinal,
+            encoder,
+        )
+        .await
+        .map_err(|error| {
+            error.with_tvp_parameter_context(parameter.tvp_parameter_ref(TvpParameterRef::Name(
+                parameter.name.as_deref().unwrap_or("unnamed").to_string(),
+            )))
+        })
+}
+
 impl<'a> SqlRpc<'a> {
     pub fn new(
         rpc_type: RpcType,
@@ -119,8 +143,9 @@ impl<'a> SqlRpc<'a> {
         self.value_binding
     }
 
-    /// See [`output_names_by_ordinal`]. `trailing` are values appended after
-    /// this message's own, such as streamed parameters.
+    /// See [`output_names_by_ordinal`]. `trailing` are the values written after
+    /// this message's own: a streamed RPC's values from its first
+    /// data-at-execution one on.
     pub(crate) fn output_names_by_ordinal<'p>(
         &'p self,
         trailing: impl IntoIterator<Item = &'p RpcParameter>,
@@ -218,28 +243,17 @@ impl<'a> SqlRpc<'a> {
     }
 
     async fn write_named_parameters(&self, packet_writer: &mut PacketWriter<'_>) -> TdsResult<()> {
-        // Implement the logic for writing parameters
-        // Example: Write a placeholder implementation
         if let Some(parameters) = &self.named_parameters {
             let encoder = GenericEncoder::new();
             for parameter in parameters {
-                if let Err(error) = parameter
-                    .serialize(
-                        packet_writer,
-                        self.db_collation,
-                        self.value_binding == ValueBinding::ByOrdinal,
-                        &encoder,
-                    )
-                    .await
-                {
-                    return Err(
-                        error.with_tvp_parameter_context(parameter.tvp_parameter_ref(
-                            TvpParameterRef::Name(
-                                parameter.name.as_deref().unwrap_or("unnamed").to_string(),
-                            ),
-                        )),
-                    );
-                }
+                write_named_value(
+                    parameter,
+                    packet_writer,
+                    self.db_collation,
+                    self.value_binding,
+                    &encoder,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -249,10 +263,11 @@ impl<'a> SqlRpc<'a> {
     /// parameters, but does **not** send the terminating `finalize` packet.
     ///
     /// Used by the incremental (streamed) PLP write path: the caller writes the
-    /// header, proc, positional and materialized named parameters here, then
-    /// appends one or more streamed parameters chunk-by-chunk before calling
-    /// `finalize` itself. For the normal atomic send, use [`serialize`], which
-    /// wraps this and then finalizes.
+    /// header, proc, positional parameters and the named values before the
+    /// first data-at-execution one here, then appends the remaining values in
+    /// order - streamed ones chunk-by-chunk - before calling `finalize` itself.
+    /// For the normal atomic send, use [`serialize`], which wraps this and then
+    /// finalizes.
     pub(crate) async fn serialize_prefix<'s, 'b>(
         &'s self,
         packet_writer: &'s mut PacketWriter<'b>,

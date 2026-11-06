@@ -1068,8 +1068,17 @@ pub(crate) fn build_parameter_list_string(
     build_parameter_list_string_impl(named_params, params_list)
 }
 
-fn build_parameter_list_string_impl(
-    named_params: &Vec<RpcParameter>,
+/// [`build_parameter_list_string`] over borrowed parameters held in more than
+/// one collection.
+pub(crate) fn build_parameter_list_string_from<'a>(
+    named_params: impl IntoIterator<Item = &'a RpcParameter>,
+    params_list: &mut String,
+) -> TdsResult<()> {
+    build_parameter_list_string_impl(named_params, params_list)
+}
+
+fn build_parameter_list_string_impl<'a>(
+    named_params: impl IntoIterator<Item = &'a RpcParameter>,
     params_list: &mut String,
 ) -> TdsResult<()> {
     let mut first_param = true;

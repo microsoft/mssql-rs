@@ -168,9 +168,9 @@ rc = SQLExecute(hstmt);   /* → SQL_NEED_DATA */
 
 When DAE parameters are detected, the entry point calls into the TDS client
 with the full parameter list (materialized params carry real values; DAE params
-carry `data_at_exec()` placeholders). This writes the RPC header plus all
-non-DAE parameters, then suspends the message in the `StreamedWriteState`
-machine.
+carry `data_at_exec()` placeholders). This writes the RPC header plus the
+parameters before the first DAE one, then suspends the message in the
+`StreamedWriteState` machine.
 
 Which RPC that is depends on the entry point, and streaming does not change the
 choice:
@@ -202,8 +202,9 @@ return value into the handle map.
 `SQLPutData` calls `TdsClient::write_streamed_chunk` (or
 `write_streamed_null`). `SQLParamData` calls
 `TdsClient::end_execute_prepared_param` with the sequence's plan and orphan, or
-`end_streamed_param` for an ad-hoc request. Both write the PLP terminator and
-either open the next parameter's header or finalise and send the packet.
+`end_streamed_param` for an ad-hoc request. Both write the PLP terminator, then
+the bound parameters up to the next DAE one, and either open that parameter's
+header or finalise and send the packet.
 Prepared ownership is restored to the sequence even on error: a final packet
 may reach the server before a timeout or response error is reported.
 
@@ -214,14 +215,15 @@ with ordinary bound parameters. `build_named_params` decides per marker,
 so a `SELECT ? + ? + ?` with only the middle parameter streamed is supported
 (`DataAtExecutionInterleavesWithBoundParams` covers exactly that).
 
-Both streamed entry points emit materialized parameters ahead of streamed ones,
-on the wire and in the `@params` declaration where there is one. This is
-invisible to the application, because `build_named_params` names every parameter
-`@P{n}`: `@P2` in the SQL text resolves to the `@P2` that was sent regardless of
-position, and that holds for `sp_execute` against a cached plan just as it does
-for `sp_executesql`. The partition is order-stable, so the k-th entry in the
-parked DAE list still identifies the k-th streamed parameter and the
-`SQLParamData` token sequence follows ascending parameter number.
+Both streamed entry points send every parameter in bound order, on the wire and
+in the `@params` declaration where there is one, as msodbcsql's
+`AddRPCUserParameters` does: a bound parameter after a DAE one is written when
+that DAE value closes. The values are sent unnamed and bind by ordinal, so the
+declaration, the wire and the application's ordinals must agree. That also
+holds for the plan a streamed `sp_prepexec` leaves behind: a later scalar
+`sp_execute` or parameter-array execute sends its values by ordinal against it
+(AB#50084, where a materialized-first declaration swapped every array value).
+The `SQLParamData` token sequence follows ascending parameter number.
 
 ### State Lifecycle
 
