@@ -574,6 +574,7 @@ fn run_catalog_operation(
         mssql_tds::trace_context::activate_execution();
         (stmt_state.query_timeout, cancel_handle)
     };
+    super::ird::clear_ird_classification(stmt);
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, name) {
         Ok(client) => client,

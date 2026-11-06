@@ -580,6 +580,7 @@ fn set_focused_tvp_header_field(
             diag_records: Vec::new(),
             header: Default::default(),
             records: Vec::new(),
+            data_classification: None,
         };
         let result = set_desc_field(
             &mut scratch,
@@ -623,6 +624,7 @@ fn set_focused_tvp_header_field(
         diag_records: Vec::new(),
         header,
         records: Vec::new(),
+        data_classification: None,
     };
     let result = set_desc_field(
         &mut scratch,
@@ -698,6 +700,7 @@ fn focused_tvp_type_after_set(
         diag_records: Vec::new(),
         header: Default::default(),
         records: vec![record],
+        data_classification: None,
     };
     if set_desc_field(
         &mut state,
