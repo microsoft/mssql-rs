@@ -194,6 +194,15 @@ const MAX_PLP_SIZE: usize = i32::MAX as usize;
 const MAX_DECIMAL_INT_PARTS: usize = 4;
 const MAX_DECIMAL_PRECISION: u8 = 38;
 
+fn sql_variant_scalar_length(data_length: u32, tds_type: TdsDataType) -> TdsResult<u8> {
+    u8::try_from(data_length).map_err(|_| {
+        crate::error::Error::ProtocolError(format!(
+            "SQL_VARIANT data length {data_length} exceeds {} for base type {tds_type:?}",
+            u8::MAX
+        ))
+    })
+}
+
 pub(crate) const fn decimal_metadata_is_valid(precision: u8, scale: u8) -> bool {
     precision > 0 && precision <= MAX_DECIMAL_PRECISION && scale <= precision
 }
@@ -1885,8 +1894,14 @@ impl GenericDecoder {
             _ => {
                 // If the type is not a fixed length type, we should not reach here.
                 match tds_type {
-                    TdsDataType::Guid => Self::read_guid(reader, data_length as u8).await,
-                    TdsDataType::DateN => Self::read_daten(reader, data_length as u8).await,
+                    TdsDataType::Guid => {
+                        Self::read_guid(reader, sql_variant_scalar_length(data_length, tds_type)?)
+                            .await
+                    }
+                    TdsDataType::DateN => {
+                        Self::read_daten(reader, sql_variant_scalar_length(data_length, tds_type)?)
+                            .await
+                    }
                     _ => Err(crate::error::Error::ProtocolError(format!(
                         "For 0 byte property, only Guid and DateN are expected, but got: {tds_type:?}"
                     ))),
@@ -1905,17 +1920,15 @@ impl GenericDecoder {
         T: TdsPacketReader + Send + Sync,
     {
         let scale = read_sync_first!(reader, try_read_byte, read_byte);
+        let data_length = sql_variant_scalar_length(data_length, tds_type)?;
         Ok(match tds_type {
             TdsDataType::TimeN => {
-                let time_nanos = self.read_time(reader, data_length as u8, scale).await?;
+                let time_nanos = self.read_time(reader, data_length, scale).await?;
                 ColumnValues::Time(time_nanos)
             }
-            TdsDataType::DateTime2N => {
-                self.read_datetime2(reader, data_length as u8, scale)
-                    .await?
-            }
+            TdsDataType::DateTime2N => self.read_datetime2(reader, data_length, scale).await?,
             TdsDataType::DateTimeOffsetN => {
-                self.read_datetime_offset(reader, data_length as u8, scale)
+                self.read_datetime_offset(reader, data_length, scale)
                     .await?
             }
             _ => {
@@ -3683,9 +3696,9 @@ where
         TdsDataType::NumericN | TdsDataType::DecimalN => {
             let precision = read_sync_first!(reader, try_read_byte, read_byte);
             let scale = read_sync_first!(reader, try_read_byte, read_byte);
+            let data_length = sql_variant_scalar_length(data_length, tds_type)?;
             let decimal_parts =
-                GenericDecoder::read_decimal_data(reader, data_length as u8, precision, scale)
-                    .await?;
+                GenericDecoder::read_decimal_data(reader, data_length, precision, scale).await?;
 
             if matches!(tds_type, TdsDataType::NumericN) {
                 match decimal_parts {
@@ -6909,6 +6922,104 @@ mod test {
         }
 
         // ── SQL_VARIANT tests ──────────────────────────────────────────
+
+        #[tokio::test]
+        async fn ssvariant_valid_lengths_preserve_following_field() {
+            let cases: [(TdsDataType, &[u8], usize); 15] = [
+                (TdsDataType::Guid, &[], 16),
+                (TdsDataType::DateN, &[], 3),
+                (TdsDataType::TimeN, &[0], 3),
+                (TdsDataType::TimeN, &[4], 4),
+                (TdsDataType::TimeN, &[7], 5),
+                (TdsDataType::DateTime2N, &[0], 6),
+                (TdsDataType::DateTime2N, &[4], 7),
+                (TdsDataType::DateTime2N, &[7], 8),
+                (TdsDataType::DateTimeOffsetN, &[0], 8),
+                (TdsDataType::DateTimeOffsetN, &[4], 9),
+                (TdsDataType::DateTimeOffsetN, &[7], 10),
+                (TdsDataType::NumericN, &[18, 0], 5),
+                (TdsDataType::DecimalN, &[38, 0], 17),
+                (TdsDataType::BigVarBinary, &[0, 1], 256),
+                (TdsDataType::NVarChar, &[0, 0, 0, 0, 0, 0, 1], 256),
+            ];
+            let md = ssvariant_metadata();
+            let decoder = GenericDecoder::default();
+            let trailing = 0x5A5A_5A5Ai32;
+
+            for (base, properties, data_length) in cases {
+                let mut wire = ((data_length + 2 + properties.len()) as u32)
+                    .to_le_bytes()
+                    .to_vec();
+                wire.extend_from_slice(&[base as u8, properties.len() as u8]);
+                wire.extend_from_slice(properties);
+                wire.resize(wire.len() + data_length, 1);
+                let expected = assert_decode_equivalence(wire.clone(), &md).await;
+                assert_ne!(expected, ColumnValues::Null, "{base:?}");
+                wire.extend_from_slice(&trailing.to_le_bytes());
+
+                for buffered in [false, true] {
+                    let mut reader = if buffered {
+                        ByteReader::new(wire.clone())
+                    } else {
+                        ByteReader::new_unbuffered(wire.clone())
+                    };
+                    assert_eq!(decoder.decode(&mut reader, &md).await.unwrap(), expected);
+                    assert_eq!(reader.read_int32().await.unwrap(), trailing, "{base:?}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn ssvariant_scalar_lengths_do_not_wrap() {
+            let cases: [(TdsDataType, &[u8], u32); 10] = [
+                (TdsDataType::NumericN, &[18, 0], 65539),
+                (TdsDataType::NumericN, &[18, 0], 256),
+                (TdsDataType::DecimalN, &[18, 0], 261),
+                (TdsDataType::Guid, &[], 272),
+                (TdsDataType::DateN, &[], 256),
+                (TdsDataType::DateN, &[], 259),
+                (TdsDataType::TimeN, &[7], 256),
+                (TdsDataType::TimeN, &[7], 261),
+                (TdsDataType::DateTime2N, &[7], 264),
+                (TdsDataType::DateTimeOffsetN, &[7], 266),
+            ];
+            let decoder = GenericDecoder::default();
+            let md = ssvariant_metadata();
+            let trailing = 0x5A5A_5A5Ai32;
+
+            for (base, properties, data_length) in cases {
+                let mut wire = (data_length + 2 + properties.len() as u32)
+                    .to_le_bytes()
+                    .to_vec();
+                wire.extend_from_slice(&[base as u8, properties.len() as u8]);
+                wire.extend_from_slice(properties);
+                let payload = vec![1; data_length as usize];
+                wire.extend_from_slice(&payload);
+                wire.extend_from_slice(&trailing.to_le_bytes());
+                let mut writer_reader = ByteReader::new_unbuffered(wire.clone());
+                let mut writer = DefaultRowWriter::new(1);
+                assert!(matches!(
+                    decoder
+                        .decode_into(&mut writer_reader, &md, 0, &mut writer)
+                        .await,
+                    Err(crate::error::Error::ProtocolError(_))
+                ));
+                assert!(writer.take_row().is_empty());
+                let mut reader = ByteReader::new(wire);
+
+                let result = decoder.decode(&mut reader, &md).await;
+                assert!(
+                    matches!(&result, Err(crate::error::Error::ProtocolError(message))
+                        if message.contains(&format!("data length {data_length}"))
+                            && message.contains(&format!("{base:?}"))),
+                    "{base:?}, data length {data_length}: {result:?}"
+                );
+                let mut unread = vec![0; payload.len()];
+                reader.read_bytes(&mut unread).await.unwrap();
+                assert_eq!(unread, payload, "{base:?}, data length {data_length}");
+                assert_eq!(reader.read_int32().await.unwrap(), trailing);
+            }
+        }
 
         #[tokio::test]
         async fn ssvariant_length_underflow() {
