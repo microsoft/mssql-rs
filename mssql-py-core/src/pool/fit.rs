@@ -995,9 +995,21 @@ async fn backend_failure_preserves_cause_and_settles_registration() {
 #[tokio::test]
 async fn cancelled_open_drops_partial_client_before_releasing_its_slot() {
     let pool = Prototype::new(1, None);
-    let observations = Arc::default();
+    let observations: Arc<Mutex<Observations>> = Arc::default();
     let lease = ready(&mut request(&pool));
-    let partial = Client::new(1, &observations);
+    let mut queued = request(&pool);
+    assert!(poll(&mut queued).is_pending());
+    let destruction_probe = Arc::new(Mutex::new(None));
+    let probe = destruction_probe.clone();
+    let probe_observations = observations.clone();
+    let mut partial = Client::new(1, &observations);
+    partial.on_drop = Some(Box::new(move || {
+        let outcome = poll(&mut queued);
+        if let Poll::Ready(Ok(lease)) = &outcome {
+            lease.install(Client::new(2, &probe_observations));
+        }
+        *probe.lock().unwrap() = Some((queued, outcome));
+    }));
     let mut opening = Opening {
         lease: Some(lease),
         open: Some(Box::pin(async move {
@@ -1010,14 +1022,21 @@ async fn cancelled_open_drops_partial_client_before_releasing_its_slot() {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
     );
-    let mut queued = request(&pool);
-    assert!(poll(&mut queued).is_pending());
     drop(opening);
+    let (mut queued, during_destruction) = destruction_probe.lock().unwrap().take().unwrap();
+    let peak = observations.lock().unwrap().peak;
+    assert_eq!(peak, 1);
+    assert!(
+        during_destruction.is_pending(),
+        "slot granted before partial-client destruction finished"
+    );
     let next = ready(&mut queued);
     assert_eq!(observations.lock().unwrap().destroyed, [1]);
     next.install(Client::new(2, &observations));
     assert_eq!(observations.lock().unwrap().peak, 1);
     drop(next);
+    assert_eq!(observations.lock().unwrap().live, 0);
+    assert_eq!(pool.state.lock().unwrap().demand, 0);
 }
 
 #[tokio::test]
