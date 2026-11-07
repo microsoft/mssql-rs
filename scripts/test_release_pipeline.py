@@ -1128,7 +1128,7 @@ def test_crate_templates_resolve_in_self_repository():
         _PIPELINE.read_text(encoding="utf-8"),
         re.MULTILINE,
     )
-    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
+    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 3
 
 
 @pytest.mark.parametrize(
