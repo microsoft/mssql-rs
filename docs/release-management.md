@@ -492,38 +492,34 @@ against that build's source metadata, even when feed publishing is disabled.
 | `publishToFeed` | Collect, authenticate and `twine upload` the validated wheels to the Azure Artifacts PyPI feed after wheel validation. When false, these upload-only steps are omitted; wheel download and validation still run. |
 | `publishMssqlTds` | Select `mssql-tds` for crates.io publication through ESRP. |
 | `publishMssqlMockTds` | Select `mssql-mock-tds` for crates.io publication through ESRP. |
-| `validateCratesOnly` | Validate the crate artifact and run selected-crate preflights without ESRP publication. Can also validate the artifact with neither crate selected. |
+| `validateCratesOnly` | Validate the crate artifact offline without ESRP publication or registry requests. |
 | `tagRelease` | Tag and branch the selected build's `mssql-py-core` version. This does not tag Rust crate versions. |
 
 The wheel validation/feed publish and Rust crate stages have no dependency on each other.
 The crate stage downloads only crate artifacts and does not wait for wheel
 validation or feed publish. A failure in either wheel validation or feed publish does not block
-crates. OneBranch's per-job policy validation still applies. When publishing both
-crates, the core must become available on
-crates.io before the mock is published; mock-only publication requires the core
-version to be available already.
+crates. OneBranch's per-job policy validation still applies.
 
-The Rust job graph is `ValidateCrates -> RegistryPreflight -> PublishCore ->
-CoreAvailable -> PublishMock -> MockAvailable` when both crates are selected.
-Core-only stops after `CoreAvailable`; mock-only checks the existing core in
-`RegistryPreflight` before `PublishMock`. With `validateCratesOnly`, publication
-and post-publication waits are omitted. Selected versions must still be absent,
-and mock-only still requires its existing core dependency. Selecting both crates
-for validation does not wait for an unpublished proposed core version.
+The Rust job graph is `ValidateCrates -> PublishCore -> PublishMock` when both
+crates are selected. Each ESRP task waits for its release to complete, so mock
+publication starts only after successful core release completion. Core-only
+stops after `PublishCore`; mock-only runs `ValidateCrates -> PublishMock`.
+Duplicate-version preflights are omitted; crates.io rejects attempts to overwrite
+a published version during publication. With `validateCratesOnly`, publication
+is omitted and every crate selection runs only offline checks.
 
-Crates.io HTTP requests run only in read-only custom Windows jobs on the
-`Azure Pipelines` pool (`windows-2022`), supported by GovernedTemplates'
-`Windows.Custom.Job.yml`. Those jobs run without a container or a user-specified
-`target: host`; policy validation and the prohibition on custom-pool release
-tasks remain enabled. They receive no ESRP variable group or release service
-connection. Offline crate validation and ESRP publication remain
-governed. ESRP waits for completion; the network availability job then confirms
-that consumers can resolve the crate before a dependent publication starts.
+Release agents make no direct crates.io requests: centrally enforced 1ES policies
+block public package feeds even on custom pools. Offline validation and ESRP
+publication remain governed, and ESRP release completion determines publication
+success. The pipeline does not independently confirm public index availability.
+For mock-only releases, the operator must ensure the required core version is
+already published. After a partial release, select only the unpublished crate
+rather than attempting to publish the core again.
 
 Every Rust job re-downloads `drop_Build_RustCrates` from the same immutable
 `resources.pipeline.officialBuild` run and checks the original manifest, archive
-hashes, and mock dependency. Publishers do not consume files produced by registry
-jobs. No crate job relies on another job's filesystem or job-local variables.
+hashes, and mock dependency. No crate job relies on another job's filesystem or
+job-local variables.
 
 Tagging always waits for successful wheel validation, plus feed publication when
 `publishToFeed` is selected. It never waits for Rust crate publication. Leaving all
@@ -538,20 +534,16 @@ Governed Git jobs configure OneBranch's built-in checkout with `ob_git_fetchDept
 checkout can relocate the repository while governed task restrictions prevent
 updating the source path. Git commands use the explicit source directory, and
 wheel validation and packaging remain inside the governed build container.
-Custom registry jobs declare an explicit `checkout: self`, which replaces Azure
-Pipelines' implicit checkout rather than adding a second one. Native template
-preview confirms exactly one checkout per job.
 
 For release-pipeline changes, use the ADO Preview API first to inspect expanded
 gates and OneBranch policy/checkout settings without queuing a run. Preview proves
 the selected agent context, not runtime pool authorization or registry reachability.
 Once a live run is authorized, select a known successful Official Build and leave all switches
 off to exercise genuine artifacts in the governed container without publishing.
-That all-off run does not exercise the crate registry jobs. For an authorized
-non-publishing crate preflight run, set `validateCratesOnly: true` and select
+For an authorized non-publishing crate validation run, set
+`validateCratesOnly: true` and select
 `publishMssqlTds` and/or `publishMssqlMockTds`; leave `publishToFeed` and `tagRelease`
-false. Use an Official Build whose selected crate versions are not yet published.
-Mock-only validation also requires its core version to be available already.
+false. All crate validation selections are offline.
 Local regression tests also cover missing wheels, incorrect names/versions,
 missing ODBC payloads, and exact-source metadata failures.
 
