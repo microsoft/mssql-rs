@@ -7,7 +7,7 @@ This directory contains tools for running fuzz tests with coverage analysis.
 ### Generate Combined Coverage Report
 
 ```bash
-cd /home/saurabh/work/mssql-tds/mssql-tds/fuzz
+cd mssql-tds/fuzz
 ./run-fuzz-coverage.sh
 ```
 
@@ -45,8 +45,8 @@ tar -xzf corpus-fuzz_tds_client.tar.gz
 
 ```bash
 # Run with nightly toolchain (required for fuzzing)
-cargo +nightly fuzz run fuzz_token_stream -- -max_total_time=60
-cargo +nightly fuzz run fuzz_tds_client -- -max_total_time=60
+RUSTFLAGS="--cfg fuzzing" cargo +nightly fuzz run fuzz_token_stream -- -max_total_time=60
+RUSTFLAGS="--cfg fuzzing" cargo +nightly fuzz run fuzz_tds_client -- -max_total_time=60
 ```
 
 ## Minimizing Corpus

@@ -11,7 +11,7 @@
 //! matter most. Rotation therefore bounds only the size of an individual file,
 //! so each one stays openable, searchable and attachable to a bug report.
 //! Total output is bounded by the operator, who owns reclaiming the space; see
-//! the tracing section of `mssql-odbc/README.md` (AB#48091).
+//! the tracing section of `mssql-odbc/docs/driver-guide.md` (AB#48091).
 
 use chrono::Utc;
 use std::ffi::OsString;

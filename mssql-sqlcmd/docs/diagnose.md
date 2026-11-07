@@ -102,8 +102,19 @@ addresses, and `tcpConnect` is still checked with those addresses. The report ad
 - `coverageMatrixVersion`, the version of
   [the diagnostic coverage matrix](diagnose-coverage.md) the checks follow.
 
+Both reports follow sqlcmd's locale (see [localization](localization.md)). In
+JSON only sqlcmd's own prose is translated: `sharingWarning`,
+`exitCategory.meaning`, `checks[].detail`, `findings[].text`, `limitations`,
+`specialistDomain.note`, `client.osVersion`'s wording and sqlcmd's own
+`errors[].message`. Keys, ids, names, codes, statuses, exit codes and
+`contractVersion` are the same in every locale, as are texts sqlcmd does not
+own: SQL Server's, the operating system's and `mssql-tds`'s messages as
+received, and the driver's wording in `errors[].text`.
+
 Diagnose output is for review before sharing; it is never share-safe. Every
-report begins with this warning (in JSON, the top-level `sharingWarning`):
+report begins with this warning, in the report's locale
+(`diagnose.sharing.warning`; in JSON, the top-level `sharingWarning`); in
+English:
 "Diagnostic output may contain unobfuscated server names, host names, and IP
 addresses. Review the output before sharing it." Server, instance and host
 names (the `-F` certificate name included), IP addresses, named pipe paths and

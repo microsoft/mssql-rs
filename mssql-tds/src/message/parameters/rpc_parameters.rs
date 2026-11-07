@@ -16,7 +16,7 @@ use crate::datatypes::tds_value_serializer::TdsValueSerializer;
 use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
-    error::Error,
+    error::{Error, TvpParameterRef},
     io::packet_writer::{PacketWriter, TdsPacketWriter},
     token::tokens::SqlCollation,
 };
@@ -219,6 +219,11 @@ pub struct RpcParameter {
     /// `SqlParameter.ForceColumnEncryption`; a client-side directive that is
     /// never sent on the wire.
     force_column_encryption: bool,
+
+    /// Original one-based ODBC ordinal, when this RPC parameter was built by
+    /// the ODBC driver.
+    /// Zero means unavailable; ODBC descriptor ordinals fit in `SQLSMALLINT`.
+    odbc_ordinal: u16,
 }
 
 impl RpcParameter {
@@ -234,6 +239,7 @@ impl RpcParameter {
             narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
+            odbc_ordinal: 0,
         }
     }
 
@@ -253,7 +259,31 @@ impl RpcParameter {
             narrow_string_byte_limit: None,
             encrypted: None,
             force_column_encryption: false,
+            odbc_ordinal: 0,
         }
+    }
+
+    /// Associates the original ODBC ordinal with this RPC parameter for
+    /// diagnostics. This is used when a TVP cell fails during wire
+    /// serialization, where the RPC position may differ from the ODBC ordinal.
+    #[doc(hidden)]
+    pub fn with_odbc_ordinal(mut self, ordinal: usize) -> Self {
+        self.odbc_ordinal = u16::try_from(ordinal).unwrap_or_default();
+        self
+    }
+
+    /// Returns the original ODBC ordinal for an RPC parameter built by the
+    /// ODBC driver.
+    #[doc(hidden)]
+    pub fn odbc_ordinal(&self) -> Option<usize> {
+        (self.odbc_ordinal != 0).then_some(usize::from(self.odbc_ordinal))
+    }
+
+    pub(crate) fn tvp_parameter_ref(&self, fallback: TvpParameterRef) -> TvpParameterRef {
+        self.odbc_ordinal()
+            .map(TvpParameterRef::OdbcOrdinal)
+            .or_else(|| self.name.clone().map(TvpParameterRef::Name))
+            .unwrap_or(fallback)
     }
 
     /// Declares this parameter as `declaration` in the `@params` string while
@@ -558,13 +588,22 @@ impl RpcParameter {
     /// Formats a table-valued parameter's declaration name for `sp_executesql`,
     /// e.g. `[dbo].[MyType] READONLY`.
     ///
-    /// The schema defaults to `dbo` when unspecified (SQL Server's default
-    /// schema). The catalog/database part is intentionally omitted: SQL Server
+    /// An absent schema resolves against the caller's default schema.
+    /// The catalog/database part is intentionally omitted: SQL Server
     /// forbids cross-database TVP types in parameter declarations. The
     /// `READONLY` suffix is mandatory for TVP parameters.
     fn format_tvp_sql_name(type_name: &TvpTypeName) -> String {
-        let schema = type_name.schema_name.as_deref().unwrap_or("dbo");
-        format!("[{schema}].[{}] READONLY", type_name.type_name)
+        let quote = |part: &str| format!("[{}]", part.replace(']', "]]"));
+        match type_name
+            .schema_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            Some(schema) => {
+                format!("{}.{} READONLY", quote(schema), quote(&type_name.type_name))
+            }
+            None => format!("{} READONLY", quote(&type_name.type_name)),
+        }
     }
 
     /// Formats a UDT's declaration name for `sp_executesql`, e.g.
@@ -1922,7 +1961,7 @@ mod tests {
     }
 
     /// Table-valued parameters are declared by their schema-qualified table type
-    /// name with the mandatory `READONLY` suffix; the schema defaults to `dbo`.
+    /// name with the mandatory `READONLY` suffix; an absent schema stays unqualified.
     #[test]
     fn test_get_sql_name_tvp() {
         use crate::datatypes::sql_tvp::TvpTypeName;
@@ -1939,7 +1978,21 @@ mod tests {
         let default_schema = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
         assert_eq!(
             RpcParameter::get_sql_name(&default_schema, None).unwrap(),
-            "[dbo].[OrderList] READONLY"
+            "[OrderList] READONLY"
+        );
+    }
+
+    #[test]
+    fn test_get_sql_name_tvp_escapes_closing_brackets() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+
+        let name = SqlType::Table(
+            TvpTypeName::new(Some("sales]x".to_string()), "Order]List".to_string()),
+            None,
+        );
+        assert_eq!(
+            RpcParameter::get_sql_name(&name, None).unwrap(),
+            "[sales]]x].[Order]]List] READONLY"
         );
     }
 

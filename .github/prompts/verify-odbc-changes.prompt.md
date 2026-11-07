@@ -9,7 +9,7 @@ applyTo: "mssql-odbc/**"
 ## Checklist
 
 ### 1. Project Context
-- [ ] Read [mssql-odbc/README.md](README.md) to understand architecture, supported features, and build/run instructions
+- [ ] Read [mssql-odbc/README.md](../../mssql-odbc/README.md) for architecture and build/run instructions, and its [driver guide](../../mssql-odbc/docs/driver-guide.md) for supported behavior and limitations
 
 ### 2. Guidelines Compliance
 - [ ] Review changes against [.github/instructions/mssql-odbc.instructions.md](../../.github/instructions/mssql-odbc.instructions.md)

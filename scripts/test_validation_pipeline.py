@@ -1160,9 +1160,9 @@ def test_miri_is_limited_to_windows_and_linux_x64_pr_jobs():
     )
     toolchain = build["variables"]["miriToolchain"]
     assert re.fullmatch(r"nightly-\d{4}-\d{2}-\d{2}", toolchain)
-    readme = (_ROOT / "mssql-odbc" / "README.md").read_text(encoding="utf-8")
-    assert set(re.findall(r"nightly-\d{4}-\d{2}-\d{2}", readme)) == {toolchain}, (
-        "Update the README's Miri version when changing miriToolchain"
+    guide = (_ROOT / "mssql-odbc" / "docs" / "testing.md").read_text(encoding="utf-8")
+    assert set(re.findall(r"nightly-\d{4}-\d{2}-\d{2}", guide)) == {toolchain}, (
+        "Update mssql-odbc/docs/testing.md's Miri version when changing miriToolchain"
     )
     expected = {
         "Build_Windows": ("pwsh", "x86_64-pc-windows-msvc", "Windows x64"),

@@ -4,11 +4,13 @@ This directory contains git hooks that can be shared across the team to maintain
 
 ## Setup
 
-To install the git hooks for this project, run:
+From a regular clone's repository root, run:
 
 ```bash
-dev/setup-hooks.sh
+bash dev/setup-hooks.sh
 ```
+
+The installer expects a `.git` directory; it does not support linked worktrees.
 
 ## Available Hooks
 
@@ -16,9 +18,12 @@ dev/setup-hooks.sh
 
 - **Purpose**: Ensures code is properly formatted before commits
 - **What it does**: 
-  - Runs `cargo fmt` to format Rust code
+  - Runs `cargo fmt` for the workspace and the excluded `mssql-py-core` crate
   - Prevents commit if formatting changes are needed
   - Shows which files need to be reviewed and re-staged
+
+The hook does not run clippy or tests. Run the repository's local checks
+separately.
 
 ### Usage
 

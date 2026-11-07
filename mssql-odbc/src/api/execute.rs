@@ -109,6 +109,7 @@ struct DaeExecution {
     params: Vec<RpcParameter>,
     /// The streamed parameters, in original parameter order.
     dae_params: Vec<DaeParam>,
+    tvp_row_counts: std::collections::BTreeMap<usize, usize>,
     fractional_truncated: bool,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
@@ -173,6 +174,12 @@ impl Iterator for PreparedRows<'_> {
         let built = match unsafe {
             build_named_params_for_row(
                 self.bound_params,
+                // Table-valued parameters are not supported inside a parameter
+                // array (a TVP is one logical value, not a batch row), so no
+                // captured columns are threaded through this path.
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
+                1,
                 self.marker_count,
                 self.bind_offset,
                 self.param_bind_type,
@@ -342,6 +349,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_params,
+            tvp_row_counts,
             fractional_truncated,
             mut prepared,
             mut orphaned,
@@ -406,6 +414,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     Some(prepared),
                     orphaned,
                     dae_params,
+                    tvp_row_counts,
                     params,
                     None,
                     query_timeout,
@@ -460,6 +469,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     Some(prepared),
                     orphaned,
                     dae_params,
+                    tvp_row_counts,
                     fractional_truncated,
                     "SQLExecute",
                 ),
@@ -1102,6 +1112,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<(ExecutionStaging, CancelHandle)
             return Err(SQL_ERROR);
         }
 
+        super::exec_common::validate_parameter_focus(&mut stmt_state, "SQLExecute")?;
         // Consume before snapshotting, not when the staged plan is restored:
         // that execution may still materialize the snapshot's old declaration.
         stmt_state.apply_parameter_definition_changes();
@@ -1240,6 +1251,15 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
                 post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
                 return Err(SQL_ERROR);
             };
+            if bound.param.sql_type == crate::api::odbc_types::SQL_SS_TABLE {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Table-valued parameters are not supported in parameter arrays",
+                );
+                return Err(SQL_ERROR);
+            }
             if bound.param.input_output_type != SQL_PARAM_INPUT {
                 post_sql_error(
                     &mut stmt_state,
@@ -1365,6 +1385,7 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
     let ParamsWithDae {
         params,
         dae_params,
+        tvp_row_counts,
         fractional_truncated,
     } = unsafe { build_named_params(&mut stmt_state, marker_count, bind_offset, "SQLExecute") }?;
 
@@ -1395,6 +1416,7 @@ fn stage_execution_claimed(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlRet
         Ok(ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_params,
+            tvp_row_counts,
             fractional_truncated,
             prepared,
             orphaned,
@@ -2747,6 +2769,7 @@ mod tests {
                     Some(execution.prepared),
                     execution.orphaned,
                     execution.dae_params,
+                    execution.tvp_row_counts,
                     execution.params,
                     None,
                     0,
@@ -2760,6 +2783,7 @@ mod tests {
                     Some(execution.prepared),
                     execution.orphaned,
                     execution.dae_params,
+                    execution.tvp_row_counts,
                     false,
                     "test",
                 )
@@ -4023,6 +4047,37 @@ mod tests {
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
+    #[test]
+    fn stage_parameter_array_rejects_tvp_before_batch_construction() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "EXEC dbo.p ?");
+        set_array_size(h.apd(), 2);
+        let mut indicator: SqlLen = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::bind_param::sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    crate::api::odbc_types::SQL_C_BINARY,
+                    crate::api::odbc_types::SQL_SS_TABLE,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stage_execution(stmt).is_err());
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
     fn reported_row(row_index: usize) -> PreparedBatchRowResult {
         PreparedBatchRowResult {
             row_index,
@@ -4390,6 +4445,57 @@ mod tests {
             ExecutionStaging::Ready(_) | ExecutionStaging::Batch(_) => {
                 panic!("expected NeedData staging for DAE param")
             }
+        }
+    }
+
+    /// msodbcsql sends `sp_prepexec` and `sp_execute` user values unnamed
+    /// (`AddRPCUserParameters`); the declaration keeps `@P1`.
+    #[test]
+    fn execute_sends_prepexec_and_execute_values_unnamed() {
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{
+            done_no_more, int_columns, return_value, tds_client_from_tokens_capturing,
+        };
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+
+        const UNNAMED_INT_7: [u8; 9] = [0x00, 0x00, 0x26, 0x04, 0x04, 7, 0, 0, 0];
+        const NAMED_P: [u8; 5] = [0x03, b'@', 0, b'P', 0];
+        let contains =
+            |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let (client, sent) = tds_client_from_tokens_capturing(vec![
+            return_value(ReturnValue {
+                param_ordinal: 0,
+                param_name: String::new(),
+                value: ColumnValues::Int(55),
+                column_metadata: Box::new(int_columns(1).remove(0)),
+                status: ReturnValueStatus::OutputParam,
+            }),
+            done_no_more(),
+            done_no_more(),
+        ]);
+        let dbc = unsafe { handle_from_raw::<StmtHandle>(h.stmt) }.parent_dbc();
+        dbc.inner.lock().unwrap().wire.put_client_for_test(client);
+        set_prepared(h.stmt, "SELECT ?");
+        let mut value = 7;
+        bind_cached_test_value(h.stmt, &mut value);
+
+        for proc_id in [13u8, 12] {
+            assert_eq!(
+                unsafe { sql_execute(h.stmt) },
+                SQL_SUCCESS,
+                "proc {proc_id}"
+            );
+            let bytes = std::mem::take(&mut *sent.lock().unwrap());
+            assert!(
+                contains(&bytes, &[0xFF, 0xFF, proc_id, 0]),
+                "proc {proc_id}"
+            );
+            assert!(contains(&bytes, &UNNAMED_INT_7), "proc {proc_id}");
+            assert!(!contains(&bytes, &NAMED_P), "proc {proc_id}");
         }
     }
 }

@@ -376,15 +376,17 @@ impl ResultSetResponse {
 /// ignored, since `Begin` always acknowledges with an `EnvChange` + `DONE`.
 pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
 
-/// Like [`TM_BEGIN_DELAY_KEY`], for a transaction commit response.
+/// Delays BEGIN's DONE after sending its transaction ENVCHANGE.
+pub const TM_BEGIN_COMPLETION_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_COMPLETION_DELAY__";
+
+/// Delays a transaction commit response, using only [`QueryResponse::delay`].
 pub const TM_COMMIT_DELAY_KEY: &str = "__MOCK_TDS_TM_COMMIT_DELAY__";
 
-/// Like [`TM_BEGIN_DELAY_KEY`], for a transaction rollback response.
+/// Delays a transaction rollback response, using only [`QueryResponse::delay`].
 pub const TM_ROLLBACK_DELAY_KEY: &str = "__MOCK_TDS_TM_ROLLBACK_DELAY__";
 
 /// Delays ATTENTION acknowledgement to exercise cancellation settlement limits.
 pub const ATTENTION_DELAY_KEY: &str = "__MOCK_TDS_ATTENTION_DELAY__";
-
 /// Reserved [`QueryRegistry`] key that delays the mock server's answer to an
 /// RPC request that matched no specific registration.
 ///

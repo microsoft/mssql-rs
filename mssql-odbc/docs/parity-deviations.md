@@ -1330,3 +1330,57 @@ msodbcsql build is measured.
     this entry does not settle its eventual replacement. No runtime behavior
     changes here; maintainer parity sign-off remains pending on
     [PR #770](https://github.com/microsoft/mssql-rs/pull/770).
+
+39. **Finite packet sends are bounded, and language batches and transaction
+    requests share send time with their response budget.** In the reference
+    source, `ExecImmediate` and `ExecTMRImmediate`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlccmd.cpp`, synchronous send/response branches)
+    pass the same `TimeOut` to `SendSQLFromStmt`/`SendTMRequest` and then
+    `ProcessTDSStream`, without deducting send elapsed time. `SendPacket`
+    (`Sql/Ntdbms/sqlncli/tds/TdsSend.cpp:1220`) calls
+    `SNIWrite(packet, length)` without an explicit request-deadline argument.
+    That call signature alone does not establish a retail stalled-write bound.
+
+    This driver's `PacketWriter` rejects an expired deadline before sending
+    and bounds a pending send with the remaining write-operation budget.
+    Language batches and transaction requests additionally subtract
+    serialization/send/finish time before reading their response. This
+    intentionally avoids granting a second full budget after a slow send.
+    Expiry reports `HYT00`; an unsafe partial write retires the transport
+    without further protocol writes. Cancellation settlement has a separate
+    budget, so this is not an exact whole-API-call deadline.
+
+    The scope is wider than connection-owned requests: the same writer
+    bounds statement and bulk-copy packets. Language batches, transaction
+    requests, and array-bound prepared batches subtract send time; other RPC
+    requests (`sp_executesql`, single-row `sp_execute`, stored-procedure and
+    catalog calls) bound their send but do not subtract it from the response
+    budget. These paths therefore need not have identical total elapsed limits
+    for `SQL_ATTR_QUERY_TIMEOUT`. No cross-RPC accounting change is implied by
+    this decision.
+
+    **Evidence limit:** the reference comparison is source-only, not measured
+    retail parity. Mock regressions cover expiry before sending, stalled
+    sends, and a 700 ms send plus 700 ms response under a one-second budget.
+    A connected stalled-write and combined-delay comparison with the
+    CI-pinned retail build, recording `SQL_DRIVER_VER`, remains outstanding.
+    Human parity sign-off has not been recorded. Tracked in AB#49298.
+
+40. **Rebinding a TVP that is the last bound parameter does not preserve
+    parameter focus on msodbcsql 18.07.0001.** A measured end-to-end attempt
+    accepts the second `SQLBindParameter`, then returns IM020 when the same
+    statement is focused again. In msodbcsql, `SQLBindParameter` calls
+    `UnbindParam` when replacing a TVP child descriptor
+    (`sqlcdesc.cpp:3230-3247`); `UnbindParam` deletes that parameter with
+    `PlDeleteI` (`sqlcdesc.cpp:3246`, `sqlcfunc.cpp:1505-1522`), which reduces
+    the descriptor's item count only when deleting its last item. The next
+    focus validation rejects an ordinal beyond that count
+    (`sqlcdesc.cpp:3478-3509`). This explains the measured last-parameter
+    case; it does not establish that rebinding a non-last TVP behaves the same.
+    This driver treats the new TVP bind as a fresh identity, clears the prior
+    catalog/schema, and supports rebinding its child columns under the caller's
+    default schema. `RebindingUnqualifiedTypeClearsPreviousSchema` now asserts
+    successful execution on this driver and IM020 on the msodbcsql comparison
+    leg, keeping the reference behavior measured. No existing call sequence is
+    changed. The runtime evidence was collected with the C++ test against the
+    local SQL Server and ODBC Driver 18.07.0001. Tracked in AB#49353.

@@ -1,0 +1,83 @@
+#################################################################################
+#                 mssql-sqlcmd localization OneLocBuild pipeline                #
+#################################################################################
+# Sends the en-US catalog (mssql-sqlcmd/i18n/locales/en-US/sqlcmd.json) for
+# translation and publishes the payload as an artifact. It never opens a pull
+# request: the localization team's hand-back pull request, which adds or
+# updates mssql-sqlcmd/i18n/LCL/<lang>/sqlcmd.json.lcl, is the only one per
+# round, and build.rs compiles those files into the library.
+
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - mssql-sqlcmd/i18n/locales/en-US/sqlcmd.json
+
+pr: none
+
+schedules:
+- cron: '0 3 * * 1'
+  displayName: Weekly localization sync
+  branches:
+    include:
+      - main
+  always: true
+
+variables:
+  CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]
+  WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+extends:
+  template: v2/OneBranch.NonOfficial.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      EnableCDPxPAT: false
+      WindowsHostVersion: 1ESWindows2022
+    stages:
+    - stage: Localization
+      displayName: mssql-sqlcmd localization
+      jobs:
+      - job: OneLocBuild
+        displayName: Send the en-US catalog for translation
+        pool:
+          type: windows
+          isCustom: true
+          name: RUST-X64-WUS3
+          demands:
+            - imageOverride -equals RUST-W22-SQL25
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+        steps:
+        - checkout: self
+        # The task pushes nothing and opens no pull request. patVariable only
+        # authenticates the Azure DevOps feed the task's dependency package
+        # (Localization.XLoc) comes from: LocalizationFeed, which this
+        # pipeline's identity can read.
+        - task: OneLocBuild@2
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          inputs:
+            isCreatePrSelected: false
+            locProj: mssql-sqlcmd/i18n/LocProject.json
+            outDir: '$(Build.ArtifactStagingDirectory)'
+            packageSourceAuth: patAuth
+            dependencyPackageSource: 'https://pkgs.dev.azure.com/sqlclientdrivers/ADO.Net/_packaging/LocalizationFeed/nuget/v3/index.json'
+            patVariable: $(System.AccessToken)
+        # The payload the localization team picks up (sqlcmd.json, its .lcg
+        # and LocPayload.json) and each language's output, for checking a run.
+        # OneBranch requires the name drop_<stage>_<job>.
+        - task: PublishPipelineArtifact@1
+          displayName: Publish localization artifacts
+          inputs:
+            targetPath: '$(Build.ArtifactStagingDirectory)'
+            artifact: drop_Localization_OneLocBuild

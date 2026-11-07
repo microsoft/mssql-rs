@@ -12,7 +12,7 @@ mod unknown_token_tests {
         ColumnDefinition, ColumnValue, MockTdsServer, QueryResponse, Row, SqlDataType,
     };
     use mssql_tds::connection::client_context::ClientContext;
-    use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
+    use mssql_tds::connection::tds_client::{BatchErrorMode, ExecuteOptions, ResultSet, TdsClient};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
     use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
     use mssql_tds::error::Error;
@@ -83,6 +83,13 @@ mod unknown_token_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_token_without_a_parser_fails_closed() {
+        // A DONE (`FD`, status 0, command 0xC1, count 0) that ends the stream
+        // as far as a drain can tell. As the payload of a token the client
+        // cannot read past, it would let `close_query` report success over a
+        // desynchronized stream.
+        const FINAL_DONE: [u8; 13] = [0xFD, 0, 0, 0xC1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let unknown_aliasing_done = [&[0xA6][..], &FINAL_DONE].concat();
+        let unparsed_aliasing_done = [&[0x88][..], &FINAL_DONE].concat();
         let cases = [
             (
                 vec![0xA6, 0x02, 0x00, 0xAA, 0xBB],
@@ -92,34 +99,50 @@ mod unknown_token_tests {
                 vec![0x88, 0x00, 0x00],
                 "No parser implemented for token type: AltMetadata",
             ),
+            (unknown_aliasing_done, "Unknown token type: 0xA6"),
+            (
+                unparsed_aliasing_done,
+                "No parser implemented for token type: AltMetadata",
+            ),
         ];
         for (token, expected) in cases {
-            for session_recovery in [false, true] {
-                let (datasource, shutdown, handle) = start(token.clone(), session_recovery).await;
-                let mut client = connect(&datasource).await;
-                assert_eq!(client.is_session_recovery_enabled(), session_recovery);
+            for mode in [BatchErrorMode::Abort, BatchErrorMode::Continue] {
+                for session_recovery in [false, true] {
+                    let (datasource, shutdown, handle) =
+                        start(token.clone(), session_recovery).await;
+                    let mut client = connect(&datasource).await;
+                    assert_eq!(client.is_session_recovery_enabled(), session_recovery);
+                    let case = format!("{token:02X?} {mode:?} recovery={session_recovery}");
 
-                client.execute(QUERY.to_string(), ()).await.unwrap();
-                let error = client.next_row().await.unwrap_err();
-                assert!(
-                    matches!(&error, Error::ProtocolError(message) if message.contains(expected)),
-                    "{error}"
-                );
+                    client
+                        .execute(QUERY.to_string(), ExecuteOptions::new().on_error(mode))
+                        .await
+                        .unwrap();
+                    let error = client.next_row().await.unwrap_err();
+                    assert!(
+                        matches!(&error, Error::ProtocolError(message) if message.contains(expected)),
+                        "{case}: {error}"
+                    );
 
-                // The bytes after the token cannot be told apart from tokens,
-                // so the drain fails and retires the connection; a desynchronized
-                // session is not recovered either.
-                assert!(client.close_query().await.is_err());
-                assert!(client.is_connection_dead());
-                let error = client
-                    .execute("SELECT 1".to_string(), ())
-                    .await
-                    .unwrap_err();
-                assert!(matches!(error, Error::ConnectionClosed(_)), "{error}");
-                assert_eq!(client.connection_recovery_count(), 0);
+                    // The failing read itself retires the connection: nothing
+                    // after the token can be told apart from tokens, so it is
+                    // neither drained, reused, nor recovered.
+                    assert!(client.is_connection_dead(), "{case}");
+                    assert!(!client.is_session_recovery_enabled(), "{case}");
+                    client.close_query().await.unwrap();
+                    let error = client
+                        .execute("SELECT 1".to_string(), ())
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        matches!(error, Error::ConnectionClosed(_)),
+                        "{case}: {error}"
+                    );
+                    assert_eq!(client.connection_recovery_count(), 0, "{case}");
 
-                let _ = shutdown.send(());
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+                    let _ = shutdown.send(());
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+                }
             }
         }
     }

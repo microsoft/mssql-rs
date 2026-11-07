@@ -8,7 +8,7 @@ use crate::{
     connection::execution_context::ExecutionContext,
     core::TdsResult,
     datatypes::encoder::GenericEncoder,
-    error::Error,
+    error::{Error, TvpParameterRef},
     io::packet_writer::{PacketWriter, TdsPacketWriter, TdsPacketWriterUnchecked},
     message::messages::PacketType,
     token::tokens::SqlCollation,
@@ -51,6 +51,44 @@ pub(crate) enum RpcType {
     ProcId(RpcProcs),
 }
 
+/// How an RPC sends the values in its `named_parameters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ValueBinding {
+    /// With their names; the server matches each one to its declaration.
+    #[default]
+    ByName,
+    /// With zero-length names, so the server binds them by ordinal.
+    ///
+    /// Valid only when the values follow the order of the `@params`
+    /// declaration. That holds for any `sp_executesql` or `sp_prepexec` whose
+    /// declaration is built from the same list. SQL Server matches named
+    /// values to the declaration in time quadratic in the parameter count;
+    /// msodbcsql sends these values unnamed (`AddRPCUserParameters`).
+    ByOrdinal,
+}
+
+/// The RPC ordinal and declared name of each output value among `values`,
+/// whose first element has RPC ordinal `first_ordinal`.
+///
+/// SQL Server returns an output value bound by ordinal with an empty name
+/// and this ordinal, which counts every parameter of the RPC.
+pub(crate) fn output_names_by_ordinal<'p>(
+    first_ordinal: usize,
+    values: impl IntoIterator<Item = &'p RpcParameter>,
+) -> Vec<(u16, String)> {
+    values
+        .into_iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_output())
+        .filter_map(|(index, value)| {
+            Some((
+                u16::try_from(first_ordinal + index).ok()?,
+                value.name.clone()?,
+            ))
+        })
+        .collect()
+}
+
 impl<'a> SqlRpc<'a> {
     pub fn new(
         rpc_type: RpcType,
@@ -68,7 +106,32 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            value_binding: ValueBinding::ByName,
         }
+    }
+
+    pub(crate) fn with_value_binding(mut self, binding: ValueBinding) -> Self {
+        self.value_binding = binding;
+        self
+    }
+
+    pub(crate) fn value_binding(&self) -> ValueBinding {
+        self.value_binding
+    }
+
+    /// See [`output_names_by_ordinal`]. `trailing` are values appended after
+    /// this message's own, such as streamed parameters.
+    pub(crate) fn output_names_by_ordinal<'p>(
+        &'p self,
+        trailing: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> Vec<(u16, String)> {
+        if self.value_binding == ValueBinding::ByName {
+            return Vec::new();
+        }
+        output_names_by_ordinal(
+            self.positional_parameters.as_ref().map_or(0, Vec::len),
+            self.named_parameters.iter().flatten().chain(trailing),
+        )
     }
 
     pub(crate) fn new_batch_command(
@@ -91,6 +154,7 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            value_binding: ValueBinding::ByName,
         }
     }
 
@@ -117,6 +181,13 @@ impl<'a> SqlRpc<'a> {
             parameter.validate_before_send(self.db_collation)?;
         }
         for parameter in self.named_parameters.iter().flatten() {
+            // An unnamed value here would be missing from the `@params`
+            // declaration, so binding by ordinal would shift every later value.
+            if parameter.name.is_none() {
+                return Err(Error::UsageError(
+                    "Named RPC parameters must have a name.".to_string(),
+                ));
+            }
             parameter.validate_named_before_send(self.db_collation)?;
         }
         Ok(())
@@ -130,10 +201,15 @@ impl<'a> SqlRpc<'a> {
         // Example: Write a placeholder implementation
         if let Some(positional_parameters) = &self.positional_parameters {
             let encoder = GenericEncoder::new();
-            for parameter in positional_parameters {
-                parameter
+            for (index, parameter) in positional_parameters.iter().enumerate() {
+                if let Err(error) = parameter
                     .serialize(packet_writer, self.db_collation, true, &encoder)
-                    .await?;
+                    .await
+                {
+                    return Err(error.with_tvp_parameter_context(
+                        parameter.tvp_parameter_ref(TvpParameterRef::RpcPosition(index + 1)),
+                    ));
+                }
             }
         } else {
             debug!("Positional parameters are None, skipping serialization.");
@@ -147,9 +223,23 @@ impl<'a> SqlRpc<'a> {
         if let Some(parameters) = &self.named_parameters {
             let encoder = GenericEncoder::new();
             for parameter in parameters {
-                parameter
-                    .serialize(packet_writer, self.db_collation, false, &encoder)
-                    .await?;
+                if let Err(error) = parameter
+                    .serialize(
+                        packet_writer,
+                        self.db_collation,
+                        self.value_binding == ValueBinding::ByOrdinal,
+                        &encoder,
+                    )
+                    .await
+                {
+                    return Err(
+                        error.with_tvp_parameter_context(parameter.tvp_parameter_ref(
+                            TvpParameterRef::Name(
+                                parameter.name.as_deref().unwrap_or("unnamed").to_string(),
+                            ),
+                        )),
+                    );
+                }
             }
         }
         Ok(())
@@ -325,6 +415,7 @@ pub(crate) struct SqlRpc<'param> {
     pub named_parameters: Option<Vec<RpcParameter>>,
     pub db_collation: &'param SqlCollation,
     pub proc_options: ProcOptions,
+    value_binding: ValueBinding,
 }
 
 #[async_trait]
@@ -387,6 +478,53 @@ mod tests {
         });
         drop(writer);
         mock.data
+    }
+
+    #[test]
+    fn tvp_serialization_error_uses_the_original_odbc_ordinal() {
+        let collation = SqlCollation::default();
+        let table = SqlType::Table(
+            crate::datatypes::sql_tvp::TvpTypeName::new(
+                Some("dbo".to_string()),
+                "ExampleType".to_string(),
+            ),
+            Some(crate::datatypes::sql_tvp::TvpTableData::new(
+                vec![crate::datatypes::sql_tvp::TvpColumnDef::new(
+                    SqlType::Varchar(None, 2),
+                )],
+                vec![vec![SqlType::Varchar(
+                    Some(SqlString::from_utf8_string("too long".to_string())),
+                    2,
+                )]],
+            )),
+        );
+        let parameter = RpcParameter::new(None, StatusFlags::NONE, table).with_odbc_ordinal(2);
+        let context = ExecutionContext::new();
+        let rpc = SqlRpc::new(
+            RpcType::Named("proc".to_string()),
+            Some(vec![parameter]),
+            None,
+            &collation,
+            &context,
+        );
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+
+        let error = block_on(rpc.serialize_prefix(&mut writer)).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::TvpCellSerialization {
+                parameter,
+                row: 1,
+                column: 1,
+                ..
+            } if parameter == &TvpParameterRef::OdbcOrdinal(2)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("TVP parameter ODBC ordinal 2, row 1, column 1")
+        );
     }
 
     #[test]
@@ -556,6 +694,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn output_names_by_ordinal_count_leading_and_trailing_parameters() {
+        let collation = SqlCollation::default();
+        let named = |name: &str, flags| {
+            RpcParameter::new(Some(name.to_string()), flags, SqlType::Int(None))
+        };
+        let build = |binding| {
+            SqlRpc::new(
+                RpcType::ProcId(RpcProcs::Execute),
+                Some(vec![param(SqlType::Int(Some(55)))]),
+                Some(vec![
+                    named("@P1", StatusFlags::NONE),
+                    named("@P2", StatusFlags::BY_REF_VALUE),
+                ]),
+                &collation,
+                &ExecutionContext::new(),
+            )
+            .with_value_binding(binding)
+        };
+        let trailing = [named("@P3", StatusFlags::BY_REF_VALUE)];
+        assert!(
+            build(ValueBinding::ByName)
+                .output_names_by_ordinal(&trailing)
+                .is_empty()
+        );
+        assert_eq!(
+            build(ValueBinding::ByOrdinal).output_names_by_ordinal(&trailing),
+            vec![(2, "@P2".to_string()), (3, "@P3".to_string())]
+        );
     }
 
     #[test]
