@@ -1110,8 +1110,8 @@ by this design review.
 
 `mssql-py-core/src/pool/fit.rs` is a test-only, Python-free experiment against
 Deadpool 0.13.1. It is not a production pool, does not expose a Python API,
-and does not change direct AQE connections. Deadpool is a pinned development
-dependency only.
+and does not change direct AQE connections. A1 introduced Deadpool as a pinned
+development dependency; A2 uses that same reviewed release in normal builds.
 
 The adapter serializes admission, every slot-get poll, cancellation and slot
 return. With fixed capacity and infallible, immediately-ready slot hooks,
@@ -1205,14 +1205,73 @@ lock or the AQE close barrier.
 The module has a non-test `dead_code` expectation while these internal
 contracts have no AQE consumers. Test builds do not suppress that lint.
 Remove the expectation when production integration supplies the consumers.
-Deadpool remains a development dependency, confined to the A1 experiment.
+Deadpool was development-only in A1; A2 promotes the same pinned dependency
+for the compiled lifecycle adapter.
 
 The core developer can build A2's manager and lifecycle behind these contracts.
 The AQE developer can work on B2/B3's logical ownership and close coordination
-on the existing direct path. There is deliberately no placeholder
-`AsyncPoolManager`, `PoolLease`, `ConnHandle` or Python `AsyncPool`: their safe
-implementations, full reset/return protocol, real SQL validation and platform
-matrix remain subsequent approved slices.
+on the existing direct path. There is no placeholder `PoolLease`, `ConnHandle` or Python `AsyncPool`.
+A2's compiled manager is described below; ready SQL acquisition, the full
+reset/return protocol, real SQL validation and platform matrix remain
+subsequent approved slices.
+
+### 10.3 A2 compiled lifecycle
+
+`pool/manager.rs` implements the private `AsyncPoolManager` lifecycle and keyed
+pool map. `pool/lifecycle.rs` implements the private Deadpool capacity-slot
+adapter. Deadpool 0.13.1 is now an exact, normal dependency with only the managed
+feature; the A1 experiment remains test-only. Dependency/license validation
+still belongs to repository review.
+
+The manager starts disabled, enables idempotently for identical configuration,
+and retains the same per-key capacity allowance across disable/re-enable.
+Changed configuration is rejected while enabled or while old acquisitions,
+owners or retirement remain. Async operations validate the owning Tokio runtime
+identity. Construction captures its current runtime handle; the module creates
+no runtime, and that handle does not prevent its application owner from shutting
+the runtime down. Explicit shutdown before runtime destruction remains required.
+
+The internal `reserve` operation admits under the manager lock and obtains an
+empty or cached capacity slot under the original acquisition control. It is
+**not** section 9.1's complete `acquire`: no factory, reset carrier, isolation,
+identity/expiry policy or Python delivery is enabled. Its default payload is an
+`OpenedConnection`, which owns the physical `TdsClient` and auth metadata by value.
+Tests use instrumented, Send-but-not-Sync payloads to observe destructor-time
+capacity without requiring SQL.
+
+Admission, every bounded slot-get poll and slot return are serialized per key,
+using A1's fixed-capacity accounting argument. Only non-I/O slot-get polling
+bypasses Tokio cooperativity. Generation closure, cancellation and deadlines
+reclaim pending gets and untouched assigned grants; assigned idle timestamps are
+preserved when still eligible. A maintenance barrier permits FIFO assignment
+while preventing publication until detached clients have been destroyed off-lock.
+
+Selected-key idle pruning runs at admission; wider sweeps and eviction scans
+are throttled to `max(1 second, idle_timeout)`. Empty cached Deadpool slots do not prevent removal
+of fully inactive pools. External owners and retiring clients do prevent removal.
+There is no reaper or detached teardown task.
+
+Shutdown permanently stops admission, cancels pending acquisition, discards idle
+clients and waits on driver-owned settlement notifications. Published application
+owners are not revoked. Timeout or cancellation of the wait cannot reopen the
+manager; a later shutdown can wait again. Off-lock local retirement consumes the
+same shutdown budget; it cannot be preempted by an async timer, but budget
+overruns are reported rather than treated as timely success.
+
+The slot guard drops its owned payload before returning empty capacity. Its
+clean-return test seam is compiled only for tests: A4 must provide awaited
+quiescence before a production check-in path exists. A3 must provide complete
+initialization before publishing ready SQL leases. Existing AQE connections,
+cursors, transactions, finalizers and Python APIs remain unchanged.
+
+Run the A2 tests with the existing native runner:
+
+```powershell
+cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --lib -E 'test(pool::manager::)' --no-fail-fast
+```
+
+These tests are lifecycle and scripted-client evidence, not live pooled SQL,
+transport-child-task settlement, Python bridge or performance certification.
 
 ### Upstream contracts reviewed
 
