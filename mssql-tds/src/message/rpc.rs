@@ -1352,3 +1352,105 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod request_text_tests {
+    use super::*;
+    use crate::datatypes::{sql_string::SqlString, sqltypes::SqlType};
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::parameters::rpc_parameters::{StatusFlags, build_parameter_list_string};
+    use futures::executor::block_on;
+
+    fn serialize(
+        packet_size: u32,
+        proc: RpcProcs,
+        positional: Vec<RpcParameter>,
+        named: Vec<RpcParameter>,
+    ) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(packet_size);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let context = ExecutionContext::new();
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(proc),
+            Some(positional),
+            Some(named),
+            &collation,
+            &context,
+        )
+        .with_value_binding(ValueBinding::ByOrdinal);
+        block_on(rpc.serialize(&mut writer)).unwrap();
+        drop(writer);
+        mock.data
+    }
+
+    fn materialized(text: &str) -> RpcParameter {
+        RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(text.to_string()))),
+        )
+    }
+
+    fn streamed(text: &str) -> RpcParameter {
+        RpcParameter::request_text(text.to_string()).unwrap()
+    }
+
+    /// The sp_executesql and sp_prepexec requests written from UTF-8 text are
+    /// byte-identical, packet headers included, to the ones built from
+    /// materialized UTF-16 `nvarchar(max)` values. Leading 7-byte `int`s shift
+    /// the text so packet boundaries split it on even and odd offsets,
+    /// including inside a surrogate pair.
+    #[test]
+    fn request_text_matches_materialized_nvarchar_max_on_the_wire() {
+        let named: Vec<RpcParameter> = (1..=300)
+            .map(|ordinal| {
+                let flags = if ordinal % 7 == 0 {
+                    StatusFlags::BY_REF_VALUE
+                } else {
+                    StatusFlags::NONE
+                };
+                RpcParameter::new(
+                    Some(format!("@P{ordinal}")),
+                    flags,
+                    SqlType::Int(Some(ordinal)),
+                )
+            })
+            .collect();
+        let mut declaration = String::new();
+        build_parameter_list_string(&named, &mut declaration).unwrap();
+        assert!(declaration.starts_with("@P1 int,@P2 int,"));
+        assert!(declaration.contains(",@P7 int OUTPUT,@P8 int,"));
+        assert!(declaration.ends_with(",@P300 int"));
+
+        let long_unicode = "𐐀a".repeat(700);
+        let sqls = ["", "SELECT 1", "SELECT N'é你好𐐀' AS [列]", &long_unicode];
+        for sql in sqls {
+            for leading in 0..4 {
+                for packet_size in [512u32, 4096] {
+                    let ints = || {
+                        (0..leading).map(|value| {
+                            RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(value)))
+                        })
+                    };
+                    let handle =
+                        || RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None));
+                    let executesql = |text: fn(&str) -> RpcParameter| {
+                        let positional = ints().chain([text(sql), text(&declaration)]).collect();
+                        serialize(packet_size, RpcProcs::ExecuteSql, positional, named.clone())
+                    };
+                    let prepexec = |text: fn(&str) -> RpcParameter| {
+                        let positional = ints()
+                            .chain([handle(), text(&declaration), text(sql)])
+                            .collect();
+                        serialize(packet_size, RpcProcs::PrepExec, positional, named.clone())
+                    };
+                    let prefix: String = sql.chars().take(12).collect();
+                    let case = format!("{prefix:?} leading {leading} packet {packet_size}");
+                    assert_eq!(executesql(streamed), executesql(materialized), "{case}");
+                    assert_eq!(prepexec(streamed), prepexec(materialized), "{case}");
+                }
+            }
+        }
+    }
+}

@@ -1714,7 +1714,7 @@ mod tests {
             );
 
             let bytes = sent.lock().unwrap();
-            let declaration: Vec<u8> = "@P2 int , @P1 "
+            let declaration: Vec<u8> = "@P2 int,@P1 "
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect();
