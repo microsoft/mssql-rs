@@ -3,20 +3,21 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 
 use deadpool::managed::{Manager, Metrics, Object, Pool, RecycleResult};
+use tokio::runtime::Id;
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use super::config::PoolConfig;
 use super::control::AcquireControl;
 use super::error::{AcquireStage, PoolError, PoolResult};
-use super::manager::Activity;
+use super::manager::{Activity, check_runtime};
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> PoolResult<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| PoolError::Internal {
@@ -142,6 +143,7 @@ pub(super) struct PerKeyPool<C: Send + 'static> {
     slots: Pool<SlotManager<C>>,
     state: Mutex<State<C>>,
     config: PoolConfig,
+    runtime: Id,
     wakes: Arc<WakeBatch>,
     activity: Arc<Activity>,
 }
@@ -151,6 +153,7 @@ impl<C: Send + 'static> PerKeyPool<C> {
         config: PoolConfig,
         generation: u64,
         activity: Arc<Activity>,
+        runtime: Id,
     ) -> PoolResult<Arc<Self>> {
         let slots = Pool::builder(SlotManager(PhantomData))
             .max_size(config.max_size().get())
@@ -170,9 +173,14 @@ impl<C: Send + 'static> PerKeyPool<C> {
                 next_id: 0,
             }),
             config,
+            runtime,
             wakes: Arc::default(),
             activity,
         }))
+    }
+
+    fn check_runtime(&self) -> PoolResult<()> {
+        check_runtime(self.runtime)
     }
 
     pub(super) fn enable(&self, generation: u64) -> PoolResult<()> {
@@ -221,6 +229,7 @@ impl<C: Send + 'static> PerKeyPool<C> {
     }
 
     pub(super) fn request(self: &Arc<Self>, control: AcquireControl) -> PoolResult<AcquireSlot<C>> {
+        self.check_runtime()?;
         let state = lock(&self.state)?;
         Ok(AcquireSlot {
             pool: self.clone(),
@@ -427,6 +436,9 @@ impl<C: Send + 'static> Future for AcquireSlot<C> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        if let Err(error) = this.pool.check_runtime() {
+            return Poll::Ready(Err(error));
+        }
         let _ = this.closed.as_mut().poll(cx);
         let _ = this.cancelled.as_mut().poll(cx);
         let _ = this.deadline.as_mut().poll(cx);
@@ -637,21 +649,36 @@ impl<C: Send + 'static> SlotGuard<C> {
         stage: AcquireStage,
         work: impl Future<Output = PoolResult<T>>,
     ) -> PoolResult<T> {
+        self.pool.check_runtime()?;
         if self.published {
             return Err(PoolError::Internal {
                 reason: "published slot cannot perform acquisition work",
             });
         }
-        let result = self
-            .control
-            .run(stage, async {
-                tokio::select! {
-                    biased;
-                    _ = self.generation_cancel.cancelled() => Err(PoolError::Closed),
-                    result = work => result,
-                }
-            })
-            .await;
+        let operation = self.control.run(stage, async {
+            tokio::select! {
+                biased;
+                _ = self.generation_cancel.cancelled() => Err(PoolError::Closed),
+                result = work => result,
+            }
+        });
+        tokio::pin!(operation);
+        let result = poll_fn(|cx| {
+            if let Err(error) = self.pool.check_runtime() {
+                return Poll::Ready(Err(error));
+            }
+            let state = match lock(&self.pool.state) {
+                Ok(state) => state,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            if !state.accepting || state.generation != self.generation {
+                return Poll::Ready(Err(PoolError::Closed));
+            }
+            drop(state);
+            operation.as_mut().poll(cx)
+        })
+        .await;
+        self.pool.check_runtime()?;
         let state = lock(&self.pool.state)?;
         if !state.accepting || state.generation != self.generation {
             return Err(PoolError::Closed);
@@ -661,6 +688,7 @@ impl<C: Send + 'static> SlotGuard<C> {
     }
 
     pub(super) fn publish(&mut self) -> PoolResult<()> {
+        self.pool.check_runtime()?;
         let state = lock(&self.pool.state)?;
         if !state.accepting || state.generation != self.generation {
             return Err(PoolError::Closed);

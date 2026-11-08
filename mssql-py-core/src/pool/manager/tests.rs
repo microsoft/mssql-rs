@@ -933,3 +933,251 @@ async fn shutdown_includes_off_lock_retirement_in_its_original_budget() {
     assert_eq!(seen.lock().unwrap().live, 0);
     manager.shutdown().await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_failed_admissions_even_after_the_last_client_is_destroyed() {
+    let manager = manager(config(1, Some(1), 10));
+    let observations: Arc<Mutex<Observations>> = Arc::default();
+    let mut held = ready(&mut request(&manager, 1));
+    held.install(Client::new(1, &observations)).unwrap();
+    held.publish().unwrap();
+    let target = pool(&manager, 1);
+    let mut waiting = request(&manager, 1);
+    assert!(poll(waiting.as_mut()).is_pending());
+    let started = Instant::now();
+    let mut shutdown = Box::pin(manager.shutdown());
+    assert!(poll(shutdown.as_mut()).is_pending());
+    drop(held);
+    assert_eq!(observations.lock().unwrap().live, 0);
+    assert_eq!(target.counts(), (0, 0, 1));
+    assert_eq!(manager.activity.in_flight.load(Ordering::SeqCst), 1);
+    assert!(poll(shutdown.as_mut()).is_pending());
+    drop(waiting);
+    assert!(matches!(poll(shutdown.as_mut()), Poll::Ready(Ok(()))));
+    assert_eq!(Instant::now(), started);
+    assert_eq!(target.counts(), (0, 0, 0));
+    assert_eq!(manager.activity.in_flight.load(Ordering::SeqCst), 0);
+    assert_eq!(manager.state.lock().unwrap().lifecycle, Lifecycle::Closed);
+}
+
+#[tokio::test]
+async fn claimed_work_cancellation_discards_partial_clients_but_retains_capacity_until_guard_drop()
+{
+    for before_poll in [false, true] {
+        let manager = manager(config(1, Some(1), 10));
+        let observations: Arc<Mutex<Observations>> = Arc::default();
+        let cancelled = CancellationToken::new();
+        let mut held = ready(&mut request_with(
+            &manager,
+            1,
+            AcquireControl::new(control().deadline(), cancelled.clone()),
+        ));
+        let partial = Client::new(1, &observations);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let observed = polled.clone();
+        let mut work = Box::pin(held.run(AcquireStage::Open, async move {
+            let _partial = partial;
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<PoolResult<()>>().await
+        }));
+        if !before_poll {
+            assert!(poll(work.as_mut()).is_pending());
+        }
+        cancelled.cancel();
+        assert!(matches!(
+            poll(work.as_mut()),
+            Poll::Ready(Err(PoolError::Cancelled))
+        ));
+        drop(work);
+        assert_eq!(polled.load(Ordering::SeqCst), usize::from(!before_poll));
+        assert_eq!(observations.lock().unwrap().destroyed, [1]);
+        assert_eq!(pool(&manager, 1).counts(), (1, 0, 0));
+        let mut next = request(&manager, 1);
+        assert!(poll(next.as_mut()).is_pending());
+        drop(held);
+        drop(ready(&mut next));
+        assert_eq!(pool(&manager, 1).counts(), (0, 0, 0));
+        assert_eq!(observations.lock().unwrap().peak, 1);
+    }
+}
+
+#[tokio::test]
+async fn successful_work_cannot_cross_a_disable_reenable_generation_boundary() {
+    let cfg = config(1, Some(1), 10);
+    let manager = manager(cfg.clone());
+    let observations: Arc<Mutex<Observations>> = Arc::default();
+    let mut held = ready(&mut request(&manager, 1));
+    held.install(Client::new(1, &observations)).unwrap();
+    let target = pool(&manager, 1);
+    assert!(matches!(
+        held.run(AcquireStage::Reset, async {
+            manager.disable();
+            manager.enable(cfg)?;
+            Ok(())
+        })
+        .await,
+        Err(PoolError::Closed)
+    ));
+    assert!(manager.is_enabled());
+    assert!(Arc::ptr_eq(&target, &pool(&manager, 1)));
+    assert!(matches!(held.publish(), Err(PoolError::Closed)));
+    assert_eq!(held.value_mut().unwrap().id.get(), 1);
+    let mut next = request(&manager, 1);
+    assert!(poll(next.as_mut()).is_pending());
+    drop(held);
+    let mut next = ready(&mut next);
+    assert!(next.value_mut().is_none());
+    drop(next);
+    assert_eq!(observations.lock().unwrap().destroyed, [1]);
+    assert_eq!(observations.lock().unwrap().peak, 1);
+}
+
+#[tokio::test]
+async fn generation_overflow_does_not_enable_or_mutate_configuration() {
+    let cfg = config(1, Some(1), 10);
+    let manager = TestManager::new(cfg.clone()).unwrap();
+    manager.state.lock().unwrap().generation = u64::MAX;
+    assert!(matches!(
+        manager.enable(cfg.clone()),
+        Err(PoolError::Internal {
+            reason: "generation overflow"
+        })
+    ));
+    let state = manager.state.lock().unwrap();
+    assert_eq!(state.lifecycle, Lifecycle::Disabled);
+    assert_eq!(state.generation, u64::MAX);
+    assert_eq!(state.config, cfg);
+    assert!(state.pools.is_empty());
+}
+
+#[tokio::test]
+async fn claimed_work_and_publication_reject_foreign_runtimes_without_polling_work() {
+    let manager = manager(config(1, Some(1), 10));
+    let observations: Arc<Mutex<Observations>> = Arc::default();
+    let mut held = ready(&mut request(&manager, 1));
+    held.install(Client::new(1, &observations)).unwrap();
+    let polled = Arc::new(AtomicUsize::new(0));
+    let observed = polled.clone();
+    let (mut held, work, publication) = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let work = held
+                .run(AcquireStage::Open, async {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            let publication = held.publish();
+            (held, work, publication)
+        })
+    })
+    .join()
+    .unwrap();
+    assert!(matches!(
+        work,
+        Err(PoolError::InvalidRequest {
+            field: "runtime",
+            ..
+        })
+    ));
+    assert!(matches!(
+        publication,
+        Err(PoolError::InvalidRequest {
+            field: "runtime",
+            ..
+        })
+    ));
+    assert_eq!(polled.load(Ordering::SeqCst), 0);
+    assert_eq!(pool(&manager, 1).counts(), (1, 0, 0));
+    assert_eq!(held.value_mut().unwrap().id.get(), 1);
+    held.run(AcquireStage::Open, async { Ok(()) })
+        .await
+        .unwrap();
+    held.publish().unwrap();
+    drop(held);
+    assert_eq!(observations.lock().unwrap().destroyed, [1]);
+    assert_eq!(pool(&manager, 1).counts(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn queued_reservation_rejects_resuming_on_a_foreign_runtime_and_releases_admission() {
+    let manager = manager(config(1, Some(1), 10));
+    let held = ready(&mut request(&manager, 1));
+    let mut waiting = request(&manager, 1);
+    assert!(poll(waiting.as_mut()).is_pending());
+    let (waiting, outcome) = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let outcome = poll(waiting.as_mut());
+            (waiting, outcome)
+        })
+    })
+    .join()
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        Poll::Ready(Err(PoolError::InvalidRequest {
+            field: "runtime",
+            ..
+        }))
+    ));
+    drop(waiting);
+    assert_eq!(pool(&manager, 1).counts(), (1, 0, 0));
+    assert_eq!(manager.activity.in_flight.load(Ordering::SeqCst), 0);
+    drop(held);
+    drop(ready(&mut request(&manager, 1)));
+    assert_eq!(pool(&manager, 1).counts(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn claimed_initialization_cannot_resume_on_a_foreign_runtime() {
+    let manager = manager(config(1, Some(1), 10));
+    let observations: Arc<Mutex<Observations>> = Arc::default();
+    let mut held = ready(&mut request(&manager, 1));
+    held.install(Client::new(1, &observations)).unwrap();
+    let polled = AtomicUsize::new(0);
+    let mut work = Box::pin(held.run(
+        AcquireStage::Open,
+        std::future::poll_fn(|_| {
+            polled.fetch_add(1, Ordering::SeqCst);
+            Poll::<PoolResult<()>>::Pending
+        }),
+    ));
+    assert!(poll(work.as_mut()).is_pending());
+    assert_eq!(polled.load(Ordering::SeqCst), 1);
+    let (work, outcome) = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let outcome = poll(work.as_mut());
+                    (work, outcome)
+                })
+            })
+            .join()
+            .unwrap()
+    });
+    assert!(matches!(
+        outcome,
+        Poll::Ready(Err(PoolError::InvalidRequest {
+            field: "runtime",
+            ..
+        }))
+    ));
+    assert_eq!(polled.load(Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(held.value_mut().unwrap().id.get(), 1);
+    assert_eq!(pool(&manager, 1).counts(), (1, 0, 0));
+    drop(held);
+    assert_eq!(observations.lock().unwrap().destroyed, [1]);
+    assert_eq!(pool(&manager, 1).counts(), (0, 0, 0));
+}

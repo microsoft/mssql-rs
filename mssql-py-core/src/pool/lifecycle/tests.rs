@@ -1,9 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use super::super::{connection::PoolKey, manager::AsyncPoolManager};
 use super::*;
+
+struct DropCounter(Arc<AtomicUsize>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 fn pool() -> Arc<PerKeyPool<()>> {
     let budget = Duration::from_secs(1);
@@ -11,6 +21,7 @@ fn pool() -> Arc<PerKeyPool<()>> {
         PoolConfig::new(budget, budget, budget).unwrap(),
         1,
         Arc::default(),
+        tokio::runtime::Handle::current().id(),
     )
     .unwrap()
 }
@@ -99,7 +110,13 @@ async fn assigned_reclamation_preserves_idle_age_or_destroys_ineligible_payloads
             .unwrap()
             .with_idle_timeout(Duration::from_secs(10))
             .unwrap();
-        let pool = PerKeyPool::<()>::new(cfg, 1, Arc::default()).unwrap();
+        let pool = PerKeyPool::<()>::new(
+            cfg,
+            1,
+            Arc::default(),
+            tokio::runtime::Handle::current().id(),
+        )
+        .unwrap();
         let make_control = || {
             AcquireControl::from_timeout(Instant::now(), budget, CancellationToken::new()).unwrap()
         };
@@ -243,7 +260,13 @@ async fn dropping_an_assigned_request_reclaims_stale_clients_without_cancelling_
         .unwrap()
         .with_idle_timeout(Duration::from_secs(10))
         .unwrap();
-    let pool = PerKeyPool::<()>::new(cfg, 1, Arc::default()).unwrap();
+    let pool = PerKeyPool::<()>::new(
+        cfg,
+        1,
+        Arc::default(),
+        tokio::runtime::Handle::current().id(),
+    )
+    .unwrap();
     let parent = CancellationToken::new();
     let make_control =
         || AcquireControl::from_timeout(Instant::now(), budget, parent.clone()).unwrap();
@@ -278,5 +301,276 @@ async fn dropping_an_assigned_request_reclaims_stale_clients_without_cancelling_
     });
     drop(barrier);
     drop(empty.await.unwrap());
+    assert_eq!(pool.counts(), (0, 0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn claim_checks_idle_expiry_even_without_an_admission_sweep() {
+    for (elapsed, expired) in [(999, false), (1000, true)] {
+        let budget = Duration::from_secs(30);
+        let cfg = PoolConfig::new(budget, budget, budget)
+            .unwrap()
+            .with_max_size(1)
+            .unwrap()
+            .with_idle_timeout(Duration::from_secs(1))
+            .unwrap();
+        let pool = PerKeyPool::<DropCounter>::new(
+            cfg,
+            1,
+            Arc::default(),
+            tokio::runtime::Handle::current().id(),
+        )
+        .unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut held = pool.request(control()).unwrap().await.unwrap();
+        held.install(DropCounter(dropped.clone())).unwrap();
+        held.return_quiescent().unwrap();
+        tokio::time::advance(Duration::from_millis(elapsed)).await;
+        let mut claimed = pool.request(control()).unwrap().await.unwrap();
+        assert_eq!(claimed.value_mut().is_none(), expired);
+        assert_eq!(dropped.load(Ordering::SeqCst), usize::from(expired));
+        assert_eq!(pool.counts(), (1, 0, 0));
+        drop(claimed);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.counts(), (0, 0, 0));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn claim_time_discard_consumes_the_original_acquisition_budget() {
+    struct SlowDrop(Arc<AtomicUsize>);
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            let mut advance = Box::pin(tokio::time::advance(Duration::from_secs(2)));
+            let _ = advance
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let budget = Duration::from_secs(30);
+    let cfg = PoolConfig::new(budget, budget, budget)
+        .unwrap()
+        .with_max_size(1)
+        .unwrap()
+        .with_idle_timeout(Duration::ZERO)
+        .unwrap();
+    let pool = PerKeyPool::<SlowDrop>::new(
+        cfg,
+        1,
+        Arc::default(),
+        tokio::runtime::Handle::current().id(),
+    )
+    .unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut held = pool.request(control()).unwrap().await.unwrap();
+    held.install(SlowDrop(dropped.clone())).unwrap();
+    held.return_quiescent().unwrap();
+    let acquisition = control();
+    let deadline = acquisition.deadline();
+    assert!(matches!(
+        pool.request(acquisition).unwrap().await,
+        Err(PoolError::AcquireTimeout {
+            stage: AcquireStage::Wait
+        })
+    ));
+    assert!(Instant::now() >= deadline);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(pool.counts(), (0, 0, 0));
+    drop(pool.request(control()).unwrap().await.unwrap());
+    assert_eq!(pool.counts(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn shutdown_reports_poisoned_pools_but_still_discards_healthy_idle_clients() {
+    for poison_state in [false, true] {
+        let budget = Duration::from_secs(30);
+        let cfg = PoolConfig::new(budget, budget, budget).unwrap();
+        let manager: AsyncPoolManager<DropCounter> = AsyncPoolManager::new(cfg.clone()).unwrap();
+        manager.enable(cfg).unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut bad = manager
+            .reserve(PoolKey::new(vec![1].into_boxed_slice()).unwrap(), control())
+            .await
+            .unwrap()
+            .unwrap();
+        bad.install(DropCounter(dropped.clone())).unwrap();
+        let mut healthy = manager
+            .reserve(PoolKey::new(vec![2].into_boxed_slice()).unwrap(), control())
+            .await
+            .unwrap()
+            .unwrap();
+        healthy.install(DropCounter(dropped.clone())).unwrap();
+        healthy.return_quiescent().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if poison_state {
+                    let _state = bad.pool.state.lock().unwrap();
+                    panic!("shutdown state poison probe");
+                } else {
+                    let _cached = bad.slot.as_ref().unwrap().cached.lock().unwrap();
+                    panic!("shutdown idle poison probe");
+                }
+            }))
+            .is_err()
+        );
+        if poison_state {
+            assert!(matches!(
+                manager.shutdown().await,
+                Err(PoolError::Internal {
+                    reason: "poisoned state mutex"
+                })
+            ));
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            drop(bad);
+        } else {
+            drop(bad);
+            assert!(matches!(
+                manager.shutdown().await,
+                Err(PoolError::Internal {
+                    reason: "poisoned idle slot"
+                })
+            ));
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert!(!manager.is_enabled());
+        assert!(matches!(
+            manager
+                .reserve(PoolKey::new(vec![3].into_boxed_slice()).unwrap(), control())
+                .await,
+            Err(PoolError::Closed)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn poisoned_slot_load_fails_explicitly_and_returns_empty_capacity() {
+    let pool = pool();
+    let mut held = pool.request(control()).unwrap().await.unwrap();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cached = held.slot.as_ref().unwrap().cached.lock().unwrap();
+            panic!("claim poison probe");
+        }))
+        .is_err()
+    );
+    assert!(matches!(
+        held.load(),
+        Err(PoolError::Internal {
+            reason: "poisoned state mutex"
+        })
+    ));
+    drop(held);
+    assert_eq!(pool.counts(), (0, 0, 0));
+    assert!(matches!(
+        pool.maintain(Instant::now(), false).unwrap().finish(),
+        Err(PoolError::Internal {
+            reason: "poisoned idle slot"
+        })
+    ));
+}
+
+#[tokio::test]
+async fn closing_retirement_rejects_claimed_work_before_delivering_cancellation() {
+    let budget = Duration::from_secs(30);
+    let cfg = PoolConfig::new(budget, budget, budget).unwrap();
+    let pool = PerKeyPool::<DropCounter>::new(
+        cfg,
+        1,
+        Arc::default(),
+        tokio::runtime::Handle::current().id(),
+    )
+    .unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut held = pool.request(control()).unwrap().await.unwrap();
+    held.install(DropCounter(dropped.clone())).unwrap();
+    let closing = pool.maintain(Instant::now(), true).unwrap();
+    assert!(!held.generation_cancel.is_cancelled());
+    let polled = AtomicUsize::new(0);
+    for stage in [
+        AcquireStage::Open,
+        AcquireStage::Reset,
+        AcquireStage::Isolation,
+    ] {
+        assert!(matches!(
+            held.run(stage, async {
+                polled.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await,
+            Err(PoolError::Closed)
+        ));
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(pool.counts(), (1, 0, 0));
+    drop(closing);
+    assert!(held.generation_cancel.is_cancelled());
+    drop(held);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(pool.counts(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn slot_requests_reject_foreign_or_missing_runtime_before_creating_timers() {
+    let pool = pool();
+    let other = pool.clone();
+    std::thread::spawn(move || {
+        assert!(matches!(
+            other.request(control()),
+            Err(PoolError::InvalidRequest {
+                field: "runtime",
+                ..
+            })
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(matches!(
+                other.request(control()),
+                Err(PoolError::InvalidRequest {
+                    field: "runtime",
+                    ..
+                })
+            ));
+        });
+    })
+    .join()
+    .unwrap();
+    assert_eq!(pool.counts(), (0, 0, 0));
+    drop(pool.request(control()).unwrap().await.unwrap());
+    assert_eq!(pool.counts(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn claimed_work_stops_while_closing_retirement_still_holds_cancellation() {
+    let pool = pool();
+    let mut held = pool.request(control()).unwrap().await.unwrap();
+    let polled = AtomicUsize::new(0);
+    let mut work = Box::pin(held.run(
+        AcquireStage::Reset,
+        std::future::poll_fn(|_| {
+            polled.fetch_add(1, Ordering::SeqCst);
+            Poll::<PoolResult<()>>::Pending
+        }),
+    ));
+    assert!(
+        work.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let closing = pool.maintain(Instant::now(), true).unwrap();
+    assert!(!lock(&pool.state).unwrap().cancel.is_cancelled());
+    assert!(matches!(
+        work.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(PoolError::Closed))
+    ));
+    assert_eq!(polled.load(Ordering::SeqCst), 1);
+    drop(work);
+    assert_eq!(pool.counts(), (1, 0, 0));
+    drop(closing);
+    drop(held);
     assert_eq!(pool.counts(), (0, 0, 0));
 }

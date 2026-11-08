@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, Id};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -24,6 +24,17 @@ enum Lifecycle {
     Enabled,
     ShuttingDown,
     Closed,
+}
+
+pub(super) fn check_runtime(expected: Id) -> PoolResult<()> {
+    if Handle::try_current().is_ok_and(|current| current.id() == expected) {
+        Ok(())
+    } else {
+        Err(PoolError::InvalidRequest {
+            field: "runtime",
+            reason: "operation requires the owning Tokio runtime",
+        })
+    }
 }
 
 #[derive(Default)]
@@ -77,14 +88,7 @@ impl<C: Send + 'static> AsyncPoolManager<C> {
     }
 
     fn check_runtime(&self) -> PoolResult<()> {
-        if Handle::try_current().is_ok_and(|current| current.id() == self.runtime.id()) {
-            Ok(())
-        } else {
-            Err(PoolError::InvalidRequest {
-                field: "runtime",
-                reason: "operation requires the owning Tokio runtime",
-            })
-        }
+        check_runtime(self.runtime.id())
     }
 
     pub(crate) fn enable(&self, config: PoolConfig) -> PoolResult<()> {
@@ -237,6 +241,7 @@ impl<C: Send + 'static> AsyncPoolManager<C> {
                     state.config.clone(),
                     state.generation,
                     self.activity.clone(),
+                    self.runtime.id(),
                 )?;
                 state.pools.insert(key, pool.clone());
                 pool

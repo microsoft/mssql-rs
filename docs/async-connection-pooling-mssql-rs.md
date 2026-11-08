@@ -1227,7 +1227,13 @@ The manager starts disabled, enables idempotently for identical configuration,
 and retains the same per-key capacity allowance across disable/re-enable.
 Changed configuration is rejected while enabled or while old acquisitions,
 owners or retirement remain. Async operations validate the owning Tokio runtime
-identity. Construction captures its current runtime handle; the module creates
+identity at manager admission/shutdown, request construction and each request
+poll, every claimed-initialization poll and final publication. Each per-key pool
+retains the manager's runtime identity, so moving a Send request or guard does
+not permit work on another runtime. Synchronous discard remains runtime-neutral.
+This includes initialization that first becomes pending on the owning runtime
+and is later resumed on a different runtime.
+Construction captures its current runtime handle; the module creates
 no runtime, and that handle does not prevent its application owner from shutting
 the runtime down. Explicit shutdown before runtime destruction remains required.
 
@@ -1238,6 +1244,12 @@ identity/expiry policy or Python delivery is enabled. Its default payload is an
 `OpenedConnection`, which owns the physical `TdsClient` and auth metadata by value.
 Tests use instrumented, Send-but-not-Sync payloads to observe destructor-time
 capacity without requiring SQL.
+
+Before each initialization poll, a reserved guard checks acceptance and
+generation under the pool lock. This rejects both starting and continuing work
+while closing retirement is held and its cancellation signal has not yet been
+delivered. The lock is released before polling work; generation/deadline checks
+after work and at publication remain.
 
 Admission, every bounded slot-get poll and slot return are serialized per key,
 using A1's fixed-capacity accounting argument. Only non-I/O slot-get polling
@@ -1264,11 +1276,22 @@ quiescence before a production check-in path exists. A3 must provide complete
 initialization before publishing ready SQL leases. Existing AQE connections,
 cursors, transactions, finalizers and Python APIs remain unchanged.
 
-Run the A2 tests with the existing native runner:
+Run the pool contract suite, including both A2 lifecycle modules, with the existing native runner:
 
 ```powershell
-cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --lib -E 'test(pool::manager::)' --no-fail-fast
+cargo nextest run --manifest-path .\mssql-py-core\Cargo.toml --frozen --lib -E 'test(pool::)' --no-fail-fast
 ```
+
+Coverage must exceed 90% for A2's manager and lifecycle production code.
+Measure the complete native suite with `cargo llvm-cov nextest`, not just the
+pool-filtered suite. Report both lifecycle files separately, and exclude the
+test-only `counts` and `return_quiescent` methods from production-only totals.
+The test suite includes claim-time idle expiry and deadline consumption,
+claimed-work cancellation, generation changes during successful work, shutdown
+settlement of failed admissions, poisoned-pool cleanup, delayed closure signals,
+and foreign-runtime startup, continuation and publication. Mutation checks
+verify that removing shutdown admission tracking or the claim's final deadline
+check causes the corresponding regression test to fail.
 
 These tests are lifecycle and scripted-client evidence, not live pooled SQL,
 transport-child-task settlement, Python bridge or performance certification.
