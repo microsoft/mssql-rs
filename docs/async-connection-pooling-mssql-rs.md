@@ -1227,12 +1227,14 @@ The manager starts disabled, enables idempotently for identical configuration,
 and retains the same per-key capacity allowance across disable/re-enable.
 Changed configuration is rejected while enabled or while old acquisitions,
 owners or retirement remain. Async operations validate the owning Tokio runtime
-identity at manager admission/shutdown, request construction and each request
-poll, every claimed-initialization poll and final publication. Each per-key pool
+identity at manager admission, shutdown entry and every shutdown-wait poll,
+request construction and each request poll, every claimed-initialization poll
+and final publication. Each per-key pool
 retains the manager's runtime identity, so moving a Send request or guard does
 not permit work on another runtime. Synchronous discard remains runtime-neutral.
-This includes initialization that first becomes pending on the owning runtime
-and is later resumed on a different runtime.
+This includes initialization or a shutdown wait that first becomes pending on
+the owning runtime and is later resumed on a different runtime, even if the last
+owner settles before shutdown resumes.
 Construction captures its current runtime handle; the module creates
 no runtime, and that handle does not prevent its application owner from shutting
 the runtime down. Explicit shutdown before runtime destruction remains required.

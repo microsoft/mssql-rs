@@ -2,10 +2,12 @@
 // Licensed under the MIT License.
 
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::task::Poll;
 use std::time::Duration;
 
 use tokio::runtime::{Handle, Id};
@@ -288,9 +290,17 @@ impl<C: Send + 'static> AsyncPoolManager<C> {
             if complete {
                 return Ok(());
             }
-            tokio::time::timeout_at(deadline, settled)
-                .await
-                .map_err(|_| PoolError::ShutdownTimeout)?;
+            let wait = tokio::time::timeout_at(deadline, settled);
+            tokio::pin!(wait);
+            poll_fn(|cx| {
+                if let Err(error) = self.check_runtime() {
+                    return Poll::Ready(Err(error));
+                }
+                wait.as_mut()
+                    .poll(cx)
+                    .map(|result| result.map_err(|_| PoolError::ShutdownTimeout))
+            })
+            .await?;
         }
     }
 }

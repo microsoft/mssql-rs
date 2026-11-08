@@ -1181,3 +1181,60 @@ async fn claimed_initialization_cannot_resume_on_a_foreign_runtime() {
     assert_eq!(observations.lock().unwrap().destroyed, [1]);
     assert_eq!(pool(&manager, 1).counts(), (0, 0, 0));
 }
+
+#[tokio::test]
+async fn shutdown_wait_cannot_resume_on_a_foreign_runtime_before_or_after_settlement() {
+    for settle_before_resume in [true, false] {
+        let manager = manager(config(1, Some(1), 10));
+        let observations: Arc<Mutex<Observations>> = Arc::default();
+        let mut held = ready(&mut request(&manager, 1));
+        held.install(Client::new(1, &observations)).unwrap();
+        held.publish().unwrap();
+        let mut held = Some(held);
+        let mut shutdown = Box::pin(manager.shutdown());
+        assert!(poll(shutdown.as_mut()).is_pending());
+        if settle_before_resume {
+            drop(held.take());
+        }
+        let (shutdown, outcome) = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async move {
+                        let outcome = poll(shutdown.as_mut());
+                        (shutdown, outcome)
+                    })
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(matches!(
+            outcome,
+            Poll::Ready(Err(PoolError::InvalidRequest {
+                field: "runtime",
+                ..
+            }))
+        ));
+        drop(shutdown);
+        assert_eq!(
+            manager.state.lock().unwrap().lifecycle,
+            Lifecycle::ShuttingDown
+        );
+        assert!(matches!(
+            manager.enable(config(1, None, 10)),
+            Err(PoolError::Closed)
+        ));
+        if let Some(held) = held.as_mut() {
+            assert_eq!(held.value_mut().unwrap().id.get(), 1);
+            assert_eq!(observations.lock().unwrap().live, 1);
+        }
+        drop(held);
+        manager.shutdown().await.unwrap();
+        assert_eq!(manager.state.lock().unwrap().lifecycle, Lifecycle::Closed);
+        assert_eq!(observations.lock().unwrap().destroyed, [1]);
+        assert_eq!(pool(&manager, 1).counts(), (0, 0, 0));
+    }
+}
