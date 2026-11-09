@@ -94,29 +94,26 @@ fn take_ird_classification(stmt: &StmtHandle) -> Option<Box<[u8]>> {
 /// statement, held until that request is known to have been sent.
 pub(super) struct PendingClassification {
     payload: Option<Box<[u8]>>,
-    connection_was_dead: bool,
-    connection_id: uuid::Uuid,
+    requests_admitted: u64,
 }
 
 /// [`clear_ird_classification`] for the moment the request that runs `stmt`
 /// is handed to `client`. Call without the STMT lock held.
 pub(super) fn clear_for_send(stmt: &StmtHandle, client: &TdsClient) -> PendingClassification {
     PendingClassification {
-        connection_was_dead: client.is_connection_dead(),
-        connection_id: client.client_connection_id(),
+        requests_admitted: client.requests_admitted(),
         payload: take_ird_classification(stmt),
     }
 }
 
 impl PendingClassification {
     /// Puts the classification back after a request that failed without
-    /// reaching the server. On a connection already known dead, mssql-tds
-    /// writes nothing unless it reconnects first, and a reconnect gives the
-    /// client a new connection ID. msodbcsql likewise fails
-    /// `GetBatchCtxOrRecover` before it reaches `ClearColinfo`
+    /// reaching the server: mssql-tds rejected it while checking or recovering
+    /// the connection, so it never admitted the request. msodbcsql likewise
+    /// fails `GetBatchCtxOrRecover` before it reaches `ClearColinfo`
     /// (`sqlccmd.cpp:1870`, `sqlccmd.cpp:2893`).
     pub(super) fn restore_if_unsent(self, stmt: &StmtHandle, client: &TdsClient) {
-        if self.connection_was_dead && client.client_connection_id() == self.connection_id {
+        if client.requests_admitted() == self.requests_admitted {
             self.restore(stmt);
         }
     }

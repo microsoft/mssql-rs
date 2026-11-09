@@ -1281,12 +1281,13 @@ mod tests {
         assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
     }
 
-    /// A connection already known dead that session recovery reconnects does
-    /// send the request, so a server error afterwards drops the classification,
-    /// including a fatal one that leaves the new connection dead too.
+    /// With session recovery on, a request sent on a healthy connection, or on
+    /// one known dead that recovery reconnects, drops the classification when
+    /// the server fails it, including a fatal error that leaves the new
+    /// connection dead too.
     #[test]
     fn a_send_after_a_successful_reconnect_drops_the_classification() {
-        for severity in [16, 20] {
+        for (dead, severity) in [(false, 16), (true, 16), (true, 20)] {
             let (server, payload) = classified_server();
             server.runtime.block_on(async {
                 server.registry.lock().await.set_session_recovery(true);
@@ -1301,19 +1302,18 @@ mod tests {
                 QueryResponse::error_only(TerminalError::new(208, severity, "Server failure.")),
             );
             let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-            dbc.inner
-                .lock()
-                .unwrap()
-                .wire
-                .client_mut_for_test()
-                .unwrap()
-                .mark_connection_dead();
+            if dead {
+                dbc.inner
+                    .lock()
+                    .unwrap()
+                    .wire
+                    .client_mut_for_test()
+                    .unwrap()
+                    .mark_connection_dead();
+            }
+            let case = format!("dead: {dead}, severity {severity}");
 
-            assert_eq!(
-                unsafe { sql_execute(stmt) },
-                SQL_ERROR,
-                "severity {severity}"
-            );
+            assert_eq!(unsafe { sql_execute(stmt) }, SQL_ERROR, "{case}");
             assert_eq!(
                 dbc.inner
                     .lock()
@@ -1322,15 +1322,52 @@ mod tests {
                     .client()
                     .is_some_and(|client| client.is_connection_dead()),
                 severity >= 20,
-                "severity {severity}"
+                "{case}"
             );
-            assert_eq!(
-                classification(ird(stmt)).0,
-                SQL_ERROR,
-                "severity {severity}"
-            );
+            assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{case}");
         }
     }
+    /// With session recovery on, an idle socket can die before the client has
+    /// seen it. mssql-tds then finds it dead while checking the connection and,
+    /// when the reconnect fails, rejects the request before sending anything,
+    /// so the classification stays.
+    #[test]
+    fn a_failed_reconnect_on_an_unobserved_dead_socket_keeps_the_classification() {
+        const CLOSE_AFTER: &str = "CLOSE AFTER";
+        let (server, payload) = classified_server();
+        server.register(CLOSE_AFTER, QueryResponse::select_one());
+        server.runtime.block_on(async {
+            let mut registry = server.registry.lock().await;
+            registry.set_session_recovery(true);
+            registry.close_connection_after(CLOSE_AFTER);
+        });
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        let closer = h.alloc_extra_stmt();
+        exec(closer, CLOSE_AFTER);
+        assert_eq!(unsafe { sql_close_cursor(closer) }, SQL_SUCCESS);
+        // The reconnect's login is no longer acknowledged for recovery, so
+        // mssql-tds rejects the recovered session.
+        server.runtime.block_on(async {
+            server.registry.lock().await.set_session_recovery(false);
+        });
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .client()
+                .is_some_and(|client| !client.is_connection_dead()),
+            "the closed socket is not yet observed"
+        );
+
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_ERROR);
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+    }
+
     /// With two streamed data-at-execution parameters, closing the first sends
     /// no complete request, so the classification stays through that
     /// `SQLParamData` and a cancel after it; the last one drops it even when

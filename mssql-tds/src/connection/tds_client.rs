@@ -607,6 +607,8 @@ pub struct TdsClient {
     current_decryptor: Option<MemoizedCellDecryptor>,
     buffered_row_support: Option<Box<BufferedRowSupport>>,
     count_map: HashMap<CurrentCommand, u64>,
+    /// See [`requests_admitted`](Self::requests_admitted).
+    requests_admitted: u64,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
     /// Per-statement affected-row counts captured (in order) from every counted
@@ -829,6 +831,7 @@ impl TdsClient {
             current_decryptor: None,
             buffered_row_support: None,
             count_map: HashMap::new(),
+            requests_admitted: 0,
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
             prepared_batch: None,
@@ -1507,6 +1510,14 @@ impl TdsClient {
         self.transport.mark_known_dead();
     }
 
+    /// How many requests have passed the pre-send connection check, which
+    /// recovers a dead connection or rejects the request before any of it is
+    /// written. A call that fails with this count unchanged sent nothing, so a
+    /// caller can keep state the request would otherwise have replaced.
+    pub fn requests_admitted(&self) -> u64 {
+        self.requests_admitted
+    }
+
     pub(crate) fn get_current_metadata(&self) -> Option<&ColMetadataToken> {
         self.current_metadata.as_deref()
     }
@@ -1626,7 +1637,7 @@ impl TdsClient {
 
         #[cfg(test)]
         if let Some(elapsed) = self.reconnect_elapsed_for_test.take() {
-            return Ok(elapsed);
+            return Ok(self.admit(elapsed));
         }
 
         let connect_retry_count = self
@@ -1651,17 +1662,17 @@ impl TdsClient {
         // Only attempt recovery when session recovery was negotiated and
         // the server supports retry (connect_retry_count > 0).
         if !self.recovery_context.session_recovery_negotiated {
-            return Ok(Duration::ZERO);
+            return Ok(self.admit(Duration::ZERO));
         }
         if connect_retry_count == 0 {
-            return Ok(Duration::ZERO);
+            return Ok(self.admit(Duration::ZERO));
         }
 
         // Non-blocking poll — returns immediately. Skipped once the verdict is
         // already in: a session retired by a fatal ERROR token or a failed drain
         // stays unusable however healthy its socket still looks.
         if !known_dead && !self.transport.is_connection_dead() {
-            return Ok(Duration::ZERO);
+            return Ok(self.admit(Duration::ZERO));
         }
 
         // Connection is dead. Check if recovery is possible.
@@ -1693,7 +1704,14 @@ impl TdsClient {
         // Keep the login/recovery state out of every command's future. Allocate
         // only after detecting a dead connection, not on the healthy hot path.
         Box::pin(self.reconnect(reconnect_timeout, cancel_handle)).await?;
-        Ok(start.elapsed())
+        Ok(self.admit(start.elapsed()))
+    }
+
+    /// Counts a request [`check_and_reconnect`](Self::check_and_reconnect)
+    /// lets through; see [`requests_admitted`](Self::requests_admitted).
+    fn admit(&mut self, elapsed: Duration) -> Duration {
+        self.requests_admitted = self.requests_admitted.wrapping_add(1);
+        elapsed
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -16826,6 +16844,7 @@ mod tests {
         // Should return Ok(Duration::ZERO) even though transport is "dead"
         let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
         assert_eq!(elapsed, Duration::ZERO);
+        assert_eq!(client.requests_admitted(), 1);
     }
 
     #[tokio::test]
@@ -16855,6 +16874,7 @@ mod tests {
         // Should skip even with dead transport because retry count is 0
         let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
         assert_eq!(elapsed, Duration::ZERO);
+        assert_eq!(client.requests_admitted(), 1);
     }
 
     #[tokio::test]
@@ -16872,6 +16892,7 @@ mod tests {
             err.to_string().contains("Connection is dead"),
             "Expected ConnectionClosed, got: {err}"
         );
+        assert_eq!(client.requests_admitted(), 0);
     }
 
     #[tokio::test]
@@ -16890,6 +16911,7 @@ mod tests {
             err.to_string().contains("Session recovery failed"),
             "Expected reconnect attempt resulting in SessionRecoveryFailed, got: {err}"
         );
+        assert_eq!(client.requests_admitted(), 0);
     }
 
     #[tokio::test]
