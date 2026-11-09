@@ -36,7 +36,8 @@ pub(super) fn capture(client: &TdsClient) -> Option<Box<[u8]>> {
 /// Serializes `metadata` in the DATACLASSIFICATION payload layout. `None` only
 /// for metadata no parsed token can produce.
 pub(super) fn payload(metadata: &DataClassificationMetadata) -> Option<Box<[u8]>> {
-    let mut out = Vec::with_capacity(capacity(metadata));
+    let capacity = capacity(metadata);
+    let mut out = Vec::with_capacity(capacity);
     write_count(&mut out, metadata.sensitivity_labels().len())?;
     for label in metadata.sensitivity_labels() {
         write_b_varchar(&mut out, label.name())?;
@@ -71,6 +72,7 @@ pub(super) fn payload(metadata: &DataClassificationMetadata) -> Option<Box<[u8]>
             }
         }
     }
+    debug_assert!(out.len() <= capacity, "capacity() undercounts the payload");
     Some(out.into_boxed_slice())
 }
 
@@ -93,7 +95,9 @@ fn capacity(metadata: &DataClassificationMetadata) -> usize {
         .iter()
         .map(|column| column.properties().len())
         .sum();
-    10 + 2 * strings + 2 * dictionary_entries + 2 * metadata.columns().len() + 8 * properties
+    // Three u16 counts and the v2 payload rank; each property holds two u16
+    // indexes and its v2 rank.
+    3 * 2 + 4 + 2 * strings + 2 * dictionary_entries + 2 * metadata.columns().len() + 8 * properties
 }
 
 fn write_count(out: &mut Vec<u8>, count: usize) -> Option<()> {
@@ -516,29 +520,39 @@ mod tests {
 
     /// A B_VARCHAR length is an unsigned byte. SQL Server sends names of up to
     /// 128 UTF-16 units, where msodbcsql 18.07.0001 times out (parity deviation
-    /// 41); every length up to 255 round-trips here.
+    /// 41); every length up to 255 round-trips here. ASCII names make
+    /// `capacity` exact, so its debug assertion checks every v2 rank is counted.
     #[test]
     fn names_up_to_255_units_are_returned_verbatim() {
         let (n127, n128, n255) = ("a".repeat(127), "b".repeat(128), "c".repeat(255));
-        let wire = token(
-            false,
-            &[(&n127, "L127"), (&n128, &n128)],
-            &[(&n255, "I255")],
-            0,
-            &[&[(0, UNSPECIFIED, 0)], &[(1, 0, 0)]],
-        );
-        let registered = wire.clone();
-        let server = Server::start(DataClassificationAck::Requested, |registry| {
-            registry.register_with_data_classification(
-                CLASSIFIED,
-                int_response(&["ssn", "phone"]),
-                registered,
+        for v2 in [false, true] {
+            let wire = token(
+                v2,
+                &[(&n127, "L127"), (&n128, &n128)],
+                &[(&n255, "I255")],
+                30,
+                &[&[(0, UNSPECIFIED, 10)], &[(1, 0, 20)]],
             );
-        });
-        let mut h = TestHandles::with_env_dbc();
-        let stmt = execute(&server, &mut h, CLASSIFIED);
+            let registered = wire.clone();
+            let server = Server::start(DataClassificationAck::Requested, |registry| {
+                registry.register_with_data_classification(
+                    CLASSIFIED,
+                    int_response(&["ssn", "phone"]),
+                    registered,
+                );
+            });
+            let mut h = TestHandles::with_env_dbc();
+            if v2 {
+                assert_eq!(set_requested_version(h.dbc, 2), SQL_SUCCESS);
+            }
+            let stmt = execute(&server, &mut h, CLASSIFIED);
 
-        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, wire[1..].to_vec()));
+            assert_eq!(
+                classification(ird(stmt)),
+                (SQL_SUCCESS, wire[1..].to_vec()),
+                "v2: {v2}"
+            );
+        }
     }
 
     #[test]
