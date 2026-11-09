@@ -16,12 +16,13 @@ mssql-rs repo
 Azure Artifacts feed: public/mssql-rs_Public
   │  @Local    every published version (test builds and releases)
   │  @Release  only versions promoted after a release
-        ▼   (upstream: mssql-rs_Public@Release)
+        │
+        ├── nonofficial msodbcsql: latest compatible nightly from Local
+        └── official msodbcsql: latest compatible stable from Release
+          ▼   (resolve once; share exact package and SHA-256)
+      msodbcsql build → native sqlcmd (the library is linked into sqlcmd)
 
-Azure Artifacts feed: msodbcsql_PublicPackages
-        ▼   (version pinned in msodbcsql Directory.Packages.props)
-
-msodbcsql build → native sqlcmd (the library is linked into sqlcmd)
+      msodbcsql_PublicPackages retains its Release upstream for optional local restore.
 ```
 
 Customers never install `mssql-sqlcmd`; it ships inside native sqlcmd.
@@ -111,28 +112,39 @@ Done by the release owner, the person who runs the release pipeline.
    - It publishes to `public/mssql-rs_Public` (the `Local` view).
 4. **Promote it.** Azure DevOps → Artifacts → `mssql-rs_Public` →
    `mssql-sqlcmd` → the version → **Promote** → `Release`.
-5. **Update msodbcsql.** Change the `mssql-sqlcmd` version in msodbcsql's
-   `Directory.Packages.props`. msodbcsql sees only promoted versions, so it keeps
-   building with the version it pins until then.
+5. **Validate the consumer.** The next official msodbcsql build selects the latest
+  compatible stable version in `Release`. No consumer version-bump PR is needed
+  for each compatible release. A new ABI compatibility range still requires a
+  coordinated consumer update.
 
 ## Consumer: msodbcsql
 
-- **Windows:** `NuGetRestore/NuGetRestore.proj` restores the package with the
-  others, and `sqlcmd.props` links the library for the platform being built.
-- **Linux and macOS:** `.pipelines/scripts/fetch-nuget-package.sh mssql-sqlcmd`
-  downloads the same pinned version into `packages/`, where the sqlcmd Makefile
-  finds it.
+- **Pipeline channel:** nonofficial builds select the latest published compatible
+  `-nightly` version from the producer's default `Local` view. Official builds
+  select the latest compatible non-prerelease version actually in `Release`.
+  The companion msodbcsql change currently accepts the `0.1.x` ABI range.
+- **Reproducibility:** one resolution job downloads the package and records its
+  version, source, channel, required runtimes, and SHA-256. Every Windows, Linux,
+  and macOS job verifies and extracts those same bytes. An exact version override
+  must belong to the selected channel and compatibility range.
+- **Native linking:** consumers supply `SQLCMD_RUST_PACKAGE_DIR`; Windows skips
+  only the redundant `mssql-sqlcmd` restore. Enabled supported-platform builds
+  fail if the required header, archive, or native dependency list is missing.
+  ARM32 remains unsupported; x86 supports JSON but not diagnose.
+- **No fallback or promotion:** an empty Release view fails the official build;
+  it never falls back to a nightly. Consumer builds never publish or promote
+  packages. Nightlies must not be promoted to `Release`.
 - **Upstream:** `msodbcsql_PublicPackages` reads `mssql-rs_Public@Release` as
-  an upstream source. Adding it is a one-time change by a feed admin. No
-  cross-project write permission is needed.
-- **Opt-in:** until a released version is reachable, restoring the package is
-  off unless `SQLCMD_RUST_PACKAGE_ENABLED=true`. Without the package, sqlcmd
-  builds as before, without the Rust features.
+  an upstream source for optional local NuGet restore. Its checked-in version
+  default does not select the pipeline package. No cross-project write permission
+  is needed.
 
 ## Testing a change before a release
 
-- **From the feed:** pin a `-dev` or `-nightly` version in msodbcsql (or fetch
-  it) after the change merges to `main`.
+- **From the feed:** run the nonofficial msodbcsql pipeline to consume the latest
+  published nightly, or specify an exact compatible nightly override. Testing an
+  existing nightly does not require publishing another package. To test a `-dev`
+  package locally, extract it and supply `SQLCMD_RUST_PACKAGE_DIR`.
 - **From a local build:** build and pack the same layout with
   `.pipeline/scripts/build-mssql-sqlcmd-native.{ps1,sh}` and
   `.pipeline/scripts/pack-mssql-sqlcmd.ps1`, then point native sqlcmd at it with
