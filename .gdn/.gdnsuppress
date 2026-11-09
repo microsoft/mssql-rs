@@ -8,7 +8,7 @@
     "default": {
       "name": "default",
       "createdDate": "2026-02-26 00:51:41Z",
-      "lastUpdatedDate": "2026-02-26 00:51:41Z"
+      "lastUpdatedDate": "2026-11-07 08:19:04Z"
     }
   },
   "results": {
@@ -24,6 +24,44 @@
       "tool": "credscan",
       "ruleId": "CSCAN-GENERAL0030",
       "createdDate": "2026-02-26 00:51:41Z"
+    },
+    "5904959de6bfd54c42d727293f8cfe458d138f014e95e2483d20e3d05de7c4e7": {
+      "signature": "5904959de6bfd54c42d727293f8cfe458d138f014e95e2483d20e3d05de7c4e7",
+      "alternativeSignatures": [
+        "c2ddafb701ba00aedd9a64ebfbef38017c468c82355c3e0be7845fbc700fcbb1",
+        "1478af14fd928bf61fec256ac9501fe289bdd5449665da8d6185c504e3b92dd1",
+        "60430b45affba565dd432b3ca02ef24651bb1e2da9097245698e993df1549177"
+      ],
+      "target": "mssql-odbc/tests/e2e/tests/get_info_test.cpp",
+      "line": 165,
+      "uriBaseId": "file:///D:/a/_work/1/s/",
+      "memberOf": [
+        "default"
+      ],
+      "tool": "credscan",
+      "ruleId": "CSCAN-GENERAL0030",
+      "justification": "Generated test identity; no committed credential.",
+      "createdDate": "2026-11-07 08:18:52Z",
+      "expirationDate": "2027-02-05"
+    },
+    "8f3d1e00682dde30c3e129f1b80963b195ead65df7b6fbf765d6d7ff55a2f3af": {
+      "signature": "8f3d1e00682dde30c3e129f1b80963b195ead65df7b6fbf765d6d7ff55a2f3af",
+      "alternativeSignatures": [
+        "5c5b7b58b41f52826737390673ac5f65e3215aa589d1396dc4db840f86c97be1",
+        "61c5c681123f0c1d3313961c18d1d720eec1507e6ac6d0f2755595a05083c339",
+        "f88cbf281ffd12920cd1060b927e88612d8d169199469be0809610c6298d1364"
+      ],
+      "target": "mssql-tds/tests/TRANSPORT_TESTS_README.md",
+      "line": 142,
+      "uriBaseId": "file:///D:/a/_work/1/s/",
+      "memberOf": [
+        "default"
+      ],
+      "tool": "credscan",
+      "ruleId": "CSCAN-GENERAL0060",
+      "justification": "Documentation-only sample; no production credential.",
+      "createdDate": "2026-11-07 08:19:04Z",
+      "expirationDate": "2027-02-05"
     }
   }
 }

@@ -1250,6 +1250,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursor_routes_declare_parameters_like_msodbcsql() {
+        use crate::test_client_support::tds_client_from_tokens_capturing;
+
+        let declaration: Vec<u8> = "@v int,@w nvarchar(max) OUTPUT"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        for route in 0..2 {
+            let (mut client, sent) = tds_client_from_tokens_capturing(Vec::new());
+            let params = vec![
+                RpcParameter::new(
+                    Some("@v".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(1)),
+                ),
+                RpcParameter::new(
+                    Some("@w".to_string()),
+                    StatusFlags::BY_REF_VALUE,
+                    SqlType::NVarcharMax(None),
+                ),
+            ];
+            // The empty replay stream ends only after the RPC is sent.
+            let _ = call_cursor_route(&mut client, route, params).await;
+            let sent = sent.lock().unwrap();
+            assert!(
+                sent.windows(declaration.len()).any(|w| w == declaration),
+                "route {route}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cursor_routes_validate_vector_parameters() {
         for version in 0..=2 {
             for route in 0..4 {
