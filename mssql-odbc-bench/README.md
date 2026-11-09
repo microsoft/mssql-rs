@@ -81,12 +81,12 @@ Change only `ODBC_BENCH_DRIVER` and the output path for other driver legs. Every
 leg reads the same tables:
 
 - `dbo.mssql_odbc_bench_fixed_2m_c15`
-- `dbo.mssql_odbc_bench_fixed_10k_c600`
+- `dbo.mssql_odbc_bench_fixed_40k_c600`
 - `dbo.mssql_odbc_bench_fixed_100k_c15`
-- `dbo.mssql_odbc_bench_fixed_20k_c15`
+- `dbo.mssql_odbc_bench_fixed_200k_c15`
 - `dbo.mssql_odbc_bench_varwidth_100k_c7`
-- `dbo.mssql_odbc_bench_lobmax_1k_c3`
-- `dbo.mssql_odbc_bench_mixedlob_20k_c16`
+- `dbo.mssql_odbc_bench_lobmax_10k_c3`
+- `dbo.mssql_odbc_bench_mixedlob_200k_c16`
 - `dbo.mssql_odbc_bench_variant_20k_c4`
 - `dbo.mssql_odbc_bench_param_array`
 
@@ -111,11 +111,16 @@ Every id encodes the data shape, the row and column counts, and the access shape
 and is identical on all three driver legs. The shapes are drawn from what
 `mssql-python` asks a driver to do; nothing here runs Python.
 
+The `fixed_40k_c600`, `fixed_200k_c15`, `lobmax_10k_c3`, and `mixedlob_200k_c16`
+tables are sized so one sample takes roughly a second on mssql-odbc. Same-commit
+runs with 100-300 ms samples drifted 5-13% between runs, wider than the 5%
+regression gate.
+
 ### `narrow` and `wide` — bound fetch at the fetchall cadence
 
 - `fetch/narrow_2m_c15_fixed/bound_rowset_1000`: 2,000,000 rows, one 15-column
   pattern.
-- `fetch/wide_10k_c600_fixed/bound_rowset_1000`: 10,000 rows, 40 repeats of the
+- `fetch/wide_40k_c600_fixed/bound_rowset_1000`: 40,000 rows, 40 repeats of the
   same pattern.
 
 The pattern is `BIT`, `TINYINT`, `SMALLINT`, `INT`, `BIGINT`, `REAL`,
@@ -136,7 +141,10 @@ land in the tens; and `fetchall()` caps its computed batch at **1000**
 - `fetch/rowset_100k_c15_fixed/bound_rowset_64`
 - `fetch/rowset_100k_c15_fixed/bound_rowset_1000`
 
-The same 100,000 rows in all three, so only the cadence differs.
+The same 100,000 rows in all three, so only the cadence differs. Increasing the
+shared table to 1,000,000 rows did not materially improve confirmation
+variability and added about four minutes to each run, so the smaller table is
+retained.
 
 `fetchmany()` does not bind once and drain: every call re-describes the columns,
 rebinds them, sets the row-array size, fetches one rowset, resets the size to 1,
@@ -144,9 +152,9 @@ and unbinds. Two workloads model that complete lifecycle:
 
 - `fetch/rowset_100k_c15_fixed/bind_cycle_rowset_64` — same table and cadence as
   `bound_rowset_64`, so the pair isolates the per-call bind/unbind cost.
-- `fetch/rowset_20k_c15_fixed/bind_cycle_rowset_1` — the default `arraysize`, one
-  full lifecycle per row. A smaller table because this shape issues dozens of
-  ODBC calls per row.
+- `fetch/rowset_200k_c15_fixed/bind_cycle_rowset_1` — the default `arraysize`, one
+  full lifecycle per row. It reads a separate 200,000-row table, sized for this
+  shape's dozens of ODBC calls per row.
 
 ### `varwidth` — nullable inline variable width
 
@@ -169,10 +177,10 @@ A LOB or `sql_variant` column makes `mssql-python` abandon bound fetching for th
 **whole** result and read every column of every row with `SQLGetData`, so these
 four measure that path.
 
-- `getdata/rowwise_20k_c15_fixed/inline_values` — ordinary fixed inline values
+- `getdata/rowwise_200k_c15_fixed/inline_values` — ordinary fixed inline values
   read one cell at a time. Same columns as `bound_rowset_1`, so the pair
   separates the call shape from the cadence.
-- `getdata/rowwise_1k_c3_lob_max/chunked_8192` — `NVARCHAR(MAX)` of 9,000-9,999
+- `getdata/rowwise_10k_c3_lob_max/chunked_8192` — `NVARCHAR(MAX)` of 9,000-9,999
   characters and `VARCHAR(MAX)` of 20,000-20,999 bytes. Both are past one
   8192-byte chunk, so each non-NULL value needs at least three calls total (the
   initial call plus two continuations); conversion may produce shorter chunks and
@@ -181,7 +189,7 @@ four measure that path.
   Payload is read up to the first NUL character in each chunk, not inferred from
   the remaining-length indicator or unused buffer contents. The generated text
   contains no embedded NULs.
-- `getdata/rowwise_20k_c16_mixed_lob/whole_result_rowwise` — the 15-column fixed
+- `getdata/rowwise_200k_c16_mixed_lob/whole_result_rowwise` — the 15-column fixed
   pattern plus one *small* `NVARCHAR(MAX)`. The payload is tiny on purpose: what
   this measures is one PLP column moving all sixteen onto the row-at-a-time path.
 - `getdata/rowwise_20k_c4_variant/probe_colattribute` — `sql_variant` columns read
