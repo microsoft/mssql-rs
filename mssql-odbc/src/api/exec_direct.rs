@@ -1665,11 +1665,9 @@ mod tests {
             assert_eq!(output_length, 4);
         }
 
-        /// Materialized values precede streamed ones on the wire, and the
-        /// declaration lists them in that order too, so every value is sent
-        /// unnamed and binds to its own declaration.
+        /// Values are sent and declared in bound order, unnamed.
         #[test]
-        fn exec_direct_with_data_at_execution_sends_values_unnamed_in_declaration_order() {
+        fn exec_direct_with_data_at_execution_sends_values_unnamed_in_bound_order() {
             let h = TestHandles::with_env_dbc_stmt();
             let sent = connect(&h, vec![done_no_more()]);
             let mut token = 1_i32;
@@ -1714,16 +1712,17 @@ mod tests {
             );
 
             let bytes = sent.lock().unwrap();
-            let declaration: Vec<u8> = "@P2 int , @P1 "
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect();
-            assert!(contains(&bytes, &declaration));
-            assert!(contains(&bytes, &UNNAMED_INT_7));
-            assert!(
-                contains(&bytes, &[0x00, 0x00, 0xA5, 0xFF, 0xFF]),
-                "unnamed streamed header"
-            );
+            let position = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+            let utf16 = |text: &str| -> Vec<u8> {
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            };
+            let first = position(&utf16("@P1 ")).expect("@P1 declared");
+            let second = position(&utf16(", @P2 int ")).expect("@P2 declared");
+            assert!(first < second, "declared in bound order");
+            let streamed =
+                position(&[0x00, 0x00, 0xA5, 0xFF, 0xFF]).expect("unnamed streamed header");
+            let value = position(&UNNAMED_INT_7).expect("unnamed @P2 value");
+            assert!(streamed < value, "sent in bound order");
             assert!(!contains(&bytes, &NAMED_P));
         }
     }

@@ -2685,3 +2685,178 @@ ODBC_TEST_F_MODES(PrepareExecuteLiveTest, RunUniqueDataAtExecutionStreamsArriveW
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
+
+// -------------------------------------------------------------------
+// AB#50084: every value, a data-at-execution one included, keeps its bound
+// position on sp_prepexec and on the sp_execute that reuses its plan.
+//
+// Benefits-from-mock-tds: would assert the wire order, pinned meanwhile by
+// tds_client.rs::value_binding.
+// -------------------------------------------------------------------
+
+namespace {
+
+// Drives one data-at-execution sequence and records the token order.
+::testing::AssertionResult StreamEach(SQLHSTMT stmt, SQLRETURN first,
+                                      const std::vector<std::pair<SQLPOINTER, std::string>>& values,
+                                      std::vector<SQLPOINTER>* order) {
+    if (first != SQL_NEED_DATA) {
+        return ::testing::AssertionFailure()
+               << "expected SQL_NEED_DATA, got " << first << ": "
+               << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt);
+    }
+    SQLPOINTER token = nullptr;
+    SQLRETURN rc;
+    while ((rc = SQLParamData(stmt, &token)) == SQL_NEED_DATA) {
+        if (order->size() >= values.size()) {
+            return ::testing::AssertionFailure() << "SQLParamData did not terminate";
+        }
+        order->push_back(token);
+        auto match = std::find_if(values.begin(), values.end(),
+                                  [&](const auto& entry) { return entry.first == token; });
+        if (match == values.end()) {
+            return ::testing::AssertionFailure() << "unrecognised token";
+        }
+        SQLRETURN put = SQLPutData(stmt, const_cast<char*>(match->second.data()),
+                                   static_cast<SQLLEN>(match->second.size()));
+        if (!SQL_SUCCEEDED(put)) {
+            return ::testing::AssertionFailure()
+                   << "SQLPutData: " << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt);
+        }
+    }
+    if (!SQL_SUCCEEDED(rc)) {
+        return ::testing::AssertionFailure()
+               << "final SQLParamData: " << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt);
+    }
+    return ::testing::AssertionSuccess();
+}
+
+} // namespace
+
+// Streamed values first, in the middle and last: streamed twice (sp_prepexec,
+// then sp_execute), then inline, binding by ordinal against the streamed plan.
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, DataAtExecutionFirstMiddleAndLastKeepBoundPositions,
+                  odbc_concurrency::kAllModes) {
+    ASSERT_SQL_OK(Prepare("SELECT CONCAT(?, '|', ?, '|', ?, '|', ?, '|', ?) AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+    char text[3][16] = {};
+    SQLLEN text_ind[3] = {};
+    SQLINTEGER numbers[2] = {2, 4};
+    SQLLEN number_ind[2] = {0, 0};
+    for (SQLUSMALLINT param = 1; param <= 5; ++param) {
+        const int slot = (param - 1) / 2;
+        SQLRETURN rc = param % 2 == 1
+            ? SQLBindParameter(stmt_, param, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 15, 0,
+                               text[slot], sizeof(text[slot]), &text_ind[slot])
+            : SQLBindParameter(stmt_, param, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                               &numbers[slot], 0, &number_ind[slot]);
+        ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    }
+
+    for (int pass = 0; pass < 3; ++pass) {
+        SCOPED_TRACE(pass);
+        const std::string suffix = std::to_string(pass);
+        std::vector<std::pair<SQLPOINTER, std::string>> values;
+        for (int slot = 0; slot < 3; ++slot) {
+            const std::string value = std::string(1, static_cast<char>('a' + 2 * slot)) + suffix;
+            values.emplace_back(text[slot], value);
+            if (pass < 2) {
+                text_ind[slot] = SQL_DATA_AT_EXEC;
+            } else {
+                std::memcpy(text[slot], value.c_str(), value.size() + 1);
+                text_ind[slot] = SQL_NTS;
+            }
+        }
+        if (pass < 2) {
+            std::vector<SQLPOINTER> order;
+            ASSERT_TRUE(StreamEach(stmt_, SQLExecute(stmt_), values, &order));
+            EXPECT_EQ((std::vector<SQLPOINTER>{text[0], text[1], text[2]}), order);
+        } else {
+            ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("a" + suffix + "|2|c" + suffix + "|4|e" + suffix, GetColumnChar(1));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// A buffered data-at-execution value (no PLP form), a bound value and two
+// streamed values keep their positions.
+ODBC_TEST_F_MODES(PrepareExecuteLiveTest, BufferedAndStreamedDataAtExecutionKeepBoundPositions,
+                  odbc_concurrency::kAllModes) {
+    ASSERT_SQL_OK(Prepare("SELECT CONCAT(?, '|', ?, '|', ?, '|', ?) AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLCHAR buffered = 0;
+    char streamed[2][16] = {};
+    SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
+    SQLLEN streamed_ind[2] = {SQL_DATA_AT_EXEC, SQL_DATA_AT_EXEC};
+    SQLINTEGER number = 3;
+    SQLLEN number_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_INTEGER, 10, 0,
+                                   &buffered, 0, &buffered_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 15, 0,
+                                   streamed[0], sizeof(streamed[0]), &streamed_ind[0]),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   &number, 0, &number_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 4, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 15, 0,
+                                   streamed[1], sizeof(streamed[1]), &streamed_ind[1]),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (int pass = 0; pass < 2; ++pass) {
+        SCOPED_TRACE(pass == 0 ? "sp_prepexec" : "sp_execute (cached plan)");
+        buffered_ind = SQL_DATA_AT_EXEC;
+        streamed_ind[0] = SQL_DATA_AT_EXEC;
+        streamed_ind[1] = SQL_DATA_AT_EXEC;
+        const std::string n = std::to_string(11 + pass);
+        std::vector<SQLPOINTER> order;
+        ASSERT_TRUE(StreamEach(stmt_, SQLExecute(stmt_),
+                               {{&buffered, n}, {streamed[0], "b"}, {streamed[1], "d"}}, &order));
+        EXPECT_EQ((std::vector<SQLPOINTER>{&buffered, streamed[0], streamed[1]}), order);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(n + "|b|3|d", GetColumnChar(1));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// An OUTPUT after a streamed value returns to its binding, on sp_prepexec and
+// sp_execute.
+//
+// Not /SharedDbc: there msodbcsql 18 sometimes validates the prepared text with
+// `SET NOEXEC ON`, substituting `' '` for the output marker (`SET ' ' = @d`),
+// which fails with 42000/102 (XE). Unrelated to data-at-execution.
+ODBC_TEST_F(PrepareExecuteLiveTest, OutputAfterDataAtExecutionReturnsToItsBinding) {
+    ASSERT_SQL_OK(Prepare("DECLARE @d varchar(60) = CONCAT(?, ':', ?); SET ? = @d"),
+                  SQL_HANDLE_STMT, stmt_);
+    char streamed[16] = {};
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLINTEGER number = 0;
+    SQLLEN number_ind = 0;
+    SQLCHAR out[61] = {};
+    SQLLEN out_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 15, 0,
+                                   streamed, sizeof(streamed), &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   &number, 0, &number_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 60, 0,
+                                   out, sizeof(out), &out_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (int pass = 0; pass < 2; ++pass) {
+        SCOPED_TRACE(pass == 0 ? "sp_prepexec" : "sp_execute (cached plan)");
+        streamed_ind = SQL_DATA_AT_EXEC;
+        number = 5 + pass;
+        out[0] = '\0';
+        const std::string text = pass == 0 ? "dae" : "again";
+        std::vector<SQLPOINTER> order;
+        ASSERT_TRUE(StreamEach(stmt_, SQLExecute(stmt_), {{streamed, text}}, &order));
+        while (SQL_SUCCEEDED(SQLMoreResults(stmt_))) {
+        }
+        EXPECT_EQ(text + ":" + std::to_string(5 + pass), reinterpret_cast<const char*>(out));
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+}
