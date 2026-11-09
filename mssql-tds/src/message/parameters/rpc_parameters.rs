@@ -135,7 +135,7 @@ impl StreamedSqlType {
     /// The equivalent materialized type. Also names the default `@params`
     /// declaration when the caller supplied no narrower one via
     /// [`RpcParameter::with_streamed_declaration`], so the declaration reuses
-    /// the materialized `nvarchar(MAX)` / `varchar(MAX)` / `varbinary(MAX)`
+    /// the materialized `nvarchar(max)` / `varchar(max)` / `varbinary(max)`
     /// names rather than duplicating them.
     fn as_sql_type(&self) -> SqlType {
         match self {
@@ -159,6 +159,9 @@ impl StreamedSqlType {
 enum RpcValue {
     Materialized(SqlType),
     Streamed(StreamedSqlType),
+    /// Statement or `@params` text of a system procedure. Built only by
+    /// [`RpcParameter::request_text`], so it is always positional, unnamed,
+    /// unencrypted and never declared in `@params`.
     Text(RequestText),
 }
 
@@ -168,16 +171,21 @@ enum RpcValue {
 /// Kept as UTF-8 and transcoded to UTF-16LE straight into the packet, as
 /// msodbcsql streams its command text, rather than materialized as a UTF-16
 /// copy first. The wire bytes match the materialized `NVarcharMax` path.
+///
+/// Measured on construction, so callers build it before any round trip and
+/// borrow [`Self::as_str`] for an Always Encrypted describe request.
 #[derive(Debug, Clone)]
-struct RequestText {
+pub(crate) struct RequestText {
     text: String,
-    /// UTF-16LE byte length: the PLP chunk length, measured on construction
-    /// so an unrepresentable text fails before the RPC writes anything.
+    /// UTF-16LE byte length: the single PLP chunk length.
     byte_len: u32,
 }
 
 impl RequestText {
-    fn new(text: String) -> TdsResult<Self> {
+    /// Fails only when the UTF-16 length overflows the `u32` chunk length
+    /// (over 4 GiB). Text between 2 and 4 GiB still exceeds the server's
+    /// `nvarchar(max)` limit and is rejected by the server instead.
+    pub(crate) fn new(text: String) -> TdsResult<Self> {
         let byte_len = u32::try_from(utf16_byte_len(&text)).map_err(|_| {
             Error::UsageError(format!(
                 "Request text exceeds the maximum PLP chunk size ({} bytes).",
@@ -185,6 +193,10 @@ impl RequestText {
             ))
         })?;
         Ok(Self { text, byte_len })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.text
     }
 
     async fn write(
@@ -203,6 +215,11 @@ impl RequestText {
         }
         packet_writer.write_u32_async(PLP_TERMINATOR).await
     }
+}
+
+/// Appends `(value)`. Formatting into a `String` cannot fail.
+fn push_parenthesized(out: &mut String, value: impl std::fmt::Display) {
+    let _ = write!(out, "({value})");
 }
 
 /// Length of `text` encoded as UTF-16LE. Every UTF-8 lead byte starts one
@@ -319,11 +336,11 @@ impl RpcParameter {
 
     /// Creates a positional `nvarchar(max)` parameter carrying request text:
     /// a statement or an `@params` declaration.
-    pub(crate) fn request_text(text: String) -> TdsResult<Self> {
-        Ok(Self {
+    pub(crate) fn request_text(text: RequestText) -> Self {
+        Self {
             name: None,
             options: StatusFlags::NONE,
-            value: RpcValue::Text(RequestText::new(text)?),
+            value: RpcValue::Text(text),
             type_metadata: None,
             numeric_declaration: None,
             streamed_declaration: None,
@@ -331,7 +348,7 @@ impl RpcParameter {
             encrypted: None,
             force_column_encryption: false,
             odbc_ordinal: 0,
-        })
+        }
     }
 
     /// Associates the original ODBC ordinal with this RPC parameter for
@@ -489,10 +506,26 @@ impl RpcParameter {
         Ok(self)
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn sql_declaration(&self) -> TdsResult<String> {
         let mut declaration = String::new();
         self.write_sql_declaration(&mut declaration)?;
         Ok(declaration)
+    }
+
+    /// Appends one `@params` entry, `name type[ OUTPUT]`, for this parameter
+    /// under `name`. Shared by every declaration list, including the Always
+    /// Encrypted stored-procedure describe request.
+    pub(crate) fn write_declaration_entry(&self, name: &str, out: &mut String) -> TdsResult<()> {
+        out.push_str(name);
+        out.push(' ');
+        self.write_sql_declaration(out)?;
+        // OUTPUT has to appear in the declaration as well as at the call
+        // site; sp_executesql silently drops the value if either is missing.
+        if self.is_output() {
+            out.push_str(" OUTPUT");
+        }
+        Ok(())
     }
 
     fn write_sql_declaration(&self, out: &mut String) -> TdsResult<()> {
@@ -545,30 +578,17 @@ impl RpcParameter {
     ///
     /// Returns [`Error::ImplementationError`] if the `SqlType` maps to a [`TdsDataType`]
     /// variant that has no SQL declaration name (see [`TdsDataType::get_meta_type_name`]).
-    #[cfg(fuzzing)]
-    pub fn get_sql_name(value: &SqlType, metadata: Option<RpcTypeMetadata>) -> TdsResult<String> {
-        Self::get_sql_name_impl(value, metadata)
-    }
-
-    #[cfg(all(test, not(fuzzing)))]
-    pub(crate) fn get_sql_name(
-        value: &SqlType,
-        metadata: Option<RpcTypeMetadata>,
-    ) -> TdsResult<String> {
-        Self::get_sql_name_impl(value, metadata)
-    }
-
     #[cfg(any(test, fuzzing))]
-    fn get_sql_name_impl(value: &SqlType, metadata: Option<RpcTypeMetadata>) -> TdsResult<String> {
+    pub fn get_sql_name(value: &SqlType, metadata: Option<RpcTypeMetadata>) -> TdsResult<String> {
         let mut name = String::new();
         Self::write_sql_name(value, metadata, &mut name)?;
         Ok(name)
     }
 
-    /// Appends the declaration type name of `value` to `out`. The single
-    /// formatter behind [`Self::get_sql_name`] and the `@params` declaration,
-    /// so the two cannot drift. Writing to a `String` cannot fail, so the
-    /// `fmt::Result`s below are discarded.
+    /// Appends the declaration type name of `value` to `out`, spelled as
+    /// msodbcsql spells it (`CRPCSQLSender::SendParamList`, `sqlccmd.cpp`):
+    /// `nvarchar(max)`, `decimal(p,s)`, `vector(n, float16)`. The single
+    /// formatter behind every `@params` declaration.
     fn write_sql_name(
         value: &SqlType,
         metadata: Option<RpcTypeMetadata>,
@@ -596,7 +616,7 @@ impl RpcParameter {
 
         match value {
             SqlType::NVarcharMax(_) | SqlType::VarBinaryMax(_) | SqlType::VarcharMax(_) => {
-                out.push_str("(MAX)");
+                out.push_str("(max)");
             }
             SqlType::Varchar(_, len) | SqlType::VarBinary(_, len) | SqlType::NVarchar(_, len) => {
                 // The user may have specified an large length length.
@@ -608,14 +628,14 @@ impl RpcParameter {
                     && matches!(value, SqlType::Varchar(_, _) | SqlType::VarBinary(_, _)))
                     || (*len > 4000 && matches!(value, SqlType::NVarchar(_, _)))
                 {
-                    out.push_str("(MAX)");
+                    out.push_str("(max)");
                 } else {
-                    let _ = write!(out, "({len})");
+                    push_parenthesized(out, len);
                 }
             }
             // Binary, Char and NChar declare their length: `binary(N)`, `char(N)`, `nchar(N)`.
             SqlType::Binary(_, len) | SqlType::Char(_, len) | SqlType::NChar(_, len) => {
-                let _ = write!(out, "({len})");
+                push_parenthesized(out, len);
             }
             // Temporal types declare their scale, from the metadata, then the
             // value, then the default.
@@ -624,14 +644,14 @@ impl RpcParameter {
                     .and_then(|m| m.scale)
                     .or_else(|| time.as_ref().map(|time| time.get_scale()))
                     .unwrap_or(DEFAULT_VARTIME_SCALE);
-                let _ = write!(out, "({scale})");
+                push_parenthesized(out, scale);
             }
             SqlType::DateTime2(datetime2) => {
                 let scale = metadata
                     .and_then(|m| m.scale)
                     .or_else(|| datetime2.as_ref().map(|val| val.time.get_scale()))
                     .unwrap_or(DEFAULT_VARTIME_SCALE);
-                let _ = write!(out, "({scale})");
+                push_parenthesized(out, scale);
             }
             SqlType::DateTimeOffset(datetimeoffset) => {
                 let scale = metadata
@@ -642,31 +662,28 @@ impl RpcParameter {
                             .map(|val| val.datetime2.time.get_scale())
                     })
                     .unwrap_or(DEFAULT_VARTIME_SCALE);
-                let _ = write!(out, "({scale})");
+                push_parenthesized(out, scale);
             }
-            SqlType::Decimal(value) | SqlType::Numeric(value) => match (metadata, value) {
-                (
-                    Some(RpcTypeMetadata {
-                        precision: Some(p),
-                        scale,
-                    }),
-                    _,
-                ) => {
-                    let _ = write!(out, "({p},{})", scale.unwrap_or(0));
-                }
-                (_, Some(parts)) => {
-                    let _ = write!(out, "({},{})", parts.precision, parts.scale);
-                }
-                _ => out.push_str("(18, 10)"),
-            },
+            SqlType::Decimal(value) | SqlType::Numeric(value) => {
+                let (precision, scale) = match (metadata, value) {
+                    (
+                        Some(RpcTypeMetadata {
+                            precision: Some(precision),
+                            scale,
+                        }),
+                        _,
+                    ) => (precision, scale.unwrap_or(0)),
+                    (_, Some(parts)) => (parts.precision, parts.scale),
+                    _ => (18, 10),
+                };
+                push_parenthesized(out, format_args!("{precision},{scale}"));
+            }
             // `vector(N)` implies the float32 base type; float16 must be spelled
             // out explicitly (msodbcsql `Sql/Ntdbms/sqlncli/odbc/sqlccmd.cpp`).
             SqlType::Vector(_, dims, base_type) => match base_type {
-                VectorBaseType::Float32 => {
-                    let _ = write!(out, "({dims})");
-                }
+                VectorBaseType::Float32 => push_parenthesized(out, dims),
                 VectorBaseType::Float16 => {
-                    let _ = write!(out, "({dims}, float16)");
+                    push_parenthesized(out, format_args!("{dims}, float16"));
                 }
             },
             _ => {}
@@ -836,6 +853,11 @@ impl RpcParameter {
         is_positional: bool,
         encoder: &T,
     ) -> TdsResult<()> {
+        debug_assert!(
+            !matches!(self.value, RpcValue::Text(_))
+                || (is_positional && self.name.is_none() && self.encrypted.is_none()),
+            "request text is always positional, unnamed and plaintext"
+        );
         let options_written = is_positional
             && self.encrypted.is_none()
             && matches!(self.value, RpcValue::Materialized(_) | RpcValue::Text(_));
@@ -1187,19 +1209,12 @@ fn build_parameter_list_string_impl<'p>(
     let mut first_param = true;
     for param in named_params {
         if let Some(param_name) = &param.name {
-            if !std::mem::take(&mut first_param) {
+            if first_param {
+                first_param = false;
+            } else {
                 params_list.push(',');
             }
-            params_list.push_str(param_name);
-            params_list.push(' ');
-            param.write_sql_declaration(params_list)?;
-            // OUTPUT has to appear in the declaration as well as at the call
-            // site; sp_executesql silently drops the value if either is
-            // missing, which is why an output parameter over the text path
-            // used to come back unset.
-            if param.is_output() {
-                params_list.push_str(" OUTPUT");
-            }
+            param.write_declaration_entry(param_name, params_list)?;
         }
     }
     Ok(())
@@ -1891,12 +1906,12 @@ mod tests {
             (SqlType::Time(None), "time(7)"),
             (SqlType::DateTimeOffset(None), "datetimeoffset(7)"),
             (SqlType::DateTime2(None), "datetime2(7)"),
-            (SqlType::NVarcharMax(None), "nvarchar(MAX)"),
-            (SqlType::VarcharMax(None), "varchar(MAX)"),
+            (SqlType::NVarcharMax(None), "nvarchar(max)"),
+            (SqlType::VarcharMax(None), "varchar(max)"),
             (SqlType::NVarchar(None, 4000), "nvarchar(4000)"),
             (SqlType::Varchar(None, 4000), "varchar(4000)"),
             (SqlType::VarBinary(None, 4000), "varbinary(4000)"),
-            (SqlType::VarBinaryMax(None), "varbinary(MAX)"),
+            (SqlType::VarBinaryMax(None), "varbinary(max)"),
             (
                 SqlType::Vector(
                     None,
@@ -1908,7 +1923,7 @@ mod tests {
             // GH #45: SqlType::Numeric must not error when generating the RPC parameter
             // declaration. Covers both the value-present and value-absent paths.
             (SqlType::Numeric(Some(decimal)), "numeric(18,5)"),
-            (SqlType::Numeric(None), "numeric(18, 10)"),
+            (SqlType::Numeric(None), "numeric(18,10)"),
             // Sibling fix: SqlType::Char / SqlType::NChar must produce `char(N)` / `nchar(N)`.
             (SqlType::Char(None, 10), "char(10)"),
             (SqlType::NChar(None, 25), "nchar(25)"),
@@ -2229,9 +2244,9 @@ mod tests {
     #[test]
     fn streamed_params_declare_their_sql_type_name() {
         let cases = [
-            (StreamedSqlType::NVarcharMax, "nvarchar(MAX)"),
-            (StreamedSqlType::VarcharMax, "varchar(MAX)"),
-            (StreamedSqlType::VarBinaryMax, "varbinary(MAX)"),
+            (StreamedSqlType::NVarcharMax, "nvarchar(max)"),
+            (StreamedSqlType::VarcharMax, "varchar(max)"),
+            (StreamedSqlType::VarBinaryMax, "varbinary(max)"),
             (StreamedSqlType::Xml, "xml"),
             (
                 StreamedSqlType::Udt(UdtTypeName::new(
@@ -2363,7 +2378,8 @@ mod tests {
             }
             expected.extend(0u32.to_le_bytes());
 
-            let param = RpcParameter::request_text(text.to_string()).unwrap();
+            let param =
+                RpcParameter::request_text(super::RequestText::new(text.to_string()).unwrap());
             assert_eq!(serialize_positional(&param), expected, "{text:?}");
             let materialized = RpcParameter::new(
                 None,
@@ -2425,7 +2441,7 @@ mod tests {
         assert_eq!(
             declaration,
             "@P1 int,@P2 nvarchar(40) OUTPUT,@P3 [dbo].[Point],@P4 [dbo].[IntList] READONLY,\
-             @P5 varbinary(MAX) OUTPUT,@P6 nvarchar(MAX)"
+             @P5 varbinary(max) OUTPUT,@P6 nvarchar(max)"
         );
 
         let mut empty = String::new();
