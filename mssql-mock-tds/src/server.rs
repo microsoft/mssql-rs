@@ -5,17 +5,17 @@
 
 use crate::protocol::{
     FEATURE_EXT_DATA_CLASSIFICATION, FEATURE_EXT_ENHANCED_ROUTING, FEATURE_EXT_SESSION_RECOVERY,
-    PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT, TM_COMMIT_XACT,
-    TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token, build_error_response,
-    build_feature_ext_ack, build_feature_ext_ack_fedauth, build_fedauth_challenge_response,
-    build_login_ack, build_prelogin_response, build_prelogin_response_with_fedauth,
-    build_query_results, build_routing_login_response, build_transaction_manager_response,
-    parse_fedauth_token, parse_login7, parse_login7_auth, parse_sql_batch,
-    parse_transaction_descriptor_header, parse_transaction_manager_request,
+    PACKET_HEADER_SIZE, PacketHeader, PacketStatus, PacketType, ProtocolError, TM_BEGIN_XACT,
+    TM_COMMIT_XACT, TM_ROLLBACK_XACT, build_attention_ack_packet, build_done_token,
+    build_error_response, build_feature_ext_ack, build_feature_ext_ack_fedauth,
+    build_fedauth_challenge_response, build_login_ack, build_prelogin_response,
+    build_prelogin_response_with_fedauth, build_query_results, build_routing_login_response,
+    build_transaction_manager_response, parse_fedauth_token, parse_login7, parse_login7_auth,
+    parse_sql_batch, parse_transaction_descriptor_header, parse_transaction_manager_request,
 };
 use crate::query_response::{
     ATTENTION_DELAY_KEY, DataClassificationAck, LOGIN_DELAY_KEY, QueryRegistry, RPC_DELAY_KEY,
-    TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
+    TM_BEGIN_COMPLETION_DELAY_KEY, TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
 };
 use bytes::BytesMut;
 use native_tls::Identity;
@@ -397,7 +397,7 @@ impl ConnectionProcessor {
         socket: &mut S,
     ) -> Result<Option<BytesMut>, ProtocolError>
     where
-        S: AsyncRead + Unpin + Send,
+        S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
         let (header, packet_data) = loop {
             if self.buffer.len() < PACKET_HEADER_SIZE {
@@ -819,11 +819,38 @@ impl ConnectionProcessor {
                     }
                 }
 
-                let tokens = build_transaction_manager_response(request_type);
+                let mut tokens = build_transaction_manager_response(request_type);
+                let mut packet_id = 1;
+                if request_type == TM_BEGIN_XACT {
+                    let delay = self
+                        .query_registry
+                        .lock()
+                        .await
+                        .get(TM_BEGIN_COMPLETION_DELAY_KEY)
+                        .and_then(|r| r.delay);
+                    if delay.is_some() {
+                        let envchange = tokens.split_to(tokens.len() - build_done_token(0).len());
+                        let length = (PACKET_HEADER_SIZE + envchange.len()) as u16;
+                        let mut packet = BytesMut::with_capacity(usize::from(length));
+                        let mut header = PacketHeader::new(PacketType::TabularResult, length, 1);
+                        header.status = PacketStatus::normal();
+                        header.write(&mut packet);
+                        packet.extend_from_slice(&envchange);
+                        socket.write_all(&packet).await?;
+                        socket.flush().await?;
+                        packet_id = 2;
+                        match self.wait_out_delay_or_attention(socket, delay).await? {
+                            DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                            DelayOutcome::Closed => return Ok(None),
+                            DelayOutcome::Elapsed => {}
+                        }
+                    }
+                }
 
                 let total_length = (PACKET_HEADER_SIZE + tokens.len()) as u16;
                 let mut packet = BytesMut::with_capacity(total_length as usize);
-                let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
+                let resp_header =
+                    PacketHeader::new(PacketType::TabularResult, total_length, packet_id);
                 resp_header.write(&mut packet);
                 packet.extend_from_slice(&tokens);
 

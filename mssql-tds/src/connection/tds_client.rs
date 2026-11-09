@@ -19,9 +19,9 @@ use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
-    RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
+    RequestText, RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
 };
-use crate::message::rpc::{RpcProcs, RpcType, SqlRpc};
+use crate::message::rpc::{RpcProcs, RpcType, SqlRpc, ValueBinding};
 use crate::message::transaction_management::{
     CreateTxnParams, TransactionIsolationLevel, TransactionManagementRequest,
     TransactionManagementType,
@@ -532,6 +532,9 @@ struct StreamedWriteContext {
     pending: std::collections::VecDeque<RpcParameter>,
     /// Collation used to write `TYPE_INFO` for subsequent streamed parameters.
     db_collation: SqlCollation,
+    /// Whether streamed values are sent with their names, as the RPC's
+    /// materialized values were.
+    value_binding: ValueBinding,
     /// `true` once the unknown-length PLP opener (`PLP_UNKNOWN_LEN`) has been
     /// written for the currently-open parameter — i.e. at least one value chunk
     /// has been emitted. The opener is written lazily (on the first chunk) so a
@@ -552,6 +555,8 @@ struct StreamedWriteContext {
 #[derive(Debug)]
 struct StreamedPreparedContext {
     issued_id: Option<StatementId>,
+    /// Parameter names of the issued plan's declaration, in order.
+    declaration: Box<[String]>,
     orphaned: Option<StatementId>,
 }
 
@@ -683,6 +688,11 @@ pub struct TdsClient {
     /// output parameters. Cleared and repopulated by `encrypt_parameters` on
     /// every command.
     output_param_ceks: HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
+    /// RPC ordinal and declared name of each output value the current command
+    /// bound by ordinal. SQL Server returns such a value with an empty name;
+    /// the name is restored so callers, and the CEK lookup above, see what a
+    /// named send returns. msodbcsql pairs them by ordinal (`GetReturnValue`).
+    output_names_by_ordinal: Vec<(u16, String)>,
     /// State of the most recent `ReturnStatus` token, captured while draining a
     /// cursor RPC response and interpreted as a [`CursorStatus`](crate::cursor::CursorStatus).
     pub(in crate::connection) last_return_status: ReturnStatus,
@@ -836,6 +846,7 @@ impl TdsClient {
             query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache::new(),
             describe_round_trips: 0,
             output_param_ceks: HashMap::new(),
+            output_names_by_ordinal: Vec::new(),
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
             current_result_ended_with_done_in_proc: false,
@@ -1054,7 +1065,7 @@ impl TdsClient {
         self.current_metadata = None;
         self.current_data_classification = None;
         self.count_map.clear();
-        self.return_values.clear();
+        self.clear_return_values();
         self.info_messages.clear();
         self.info_messages.extend(info_messages);
         // Prepared-statement handles belong to the dead session and do not
@@ -1877,9 +1888,11 @@ impl TdsClient {
     /// first navigable result.
     ///
     /// The SQL text and parameter declarations are sent as positional RPC
-    /// arguments. Caller-supplied `named_params` are appended as named
-    /// parameters — each [`RpcParameter`] must have a `name` matching the
-    /// declaration in the query (e.g. `@id`).
+    /// arguments. Each of `named_params` must have a `name` (e.g. `@id`): it is
+    /// declared under that name in `@params`, in list order. The values
+    /// themselves are sent unnamed in the same order, so the server binds them
+    /// by ordinal instead of matching names. Output values are still reported
+    /// under their names by [`get_return_values`](Self::get_return_values).
     ///
     /// This is the primary path for parameterized queries; prefer it over
     /// string interpolation to avoid SQL injection and benefit from plan
@@ -1912,9 +1925,10 @@ impl TdsClient {
         };
         RpcParameter::reject_data_at_exec(named_params.iter())?;
 
-        let declaration_params = named_params.clone();
         let mut params_list_as_string = String::new();
-        build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+        build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
@@ -1926,8 +1940,8 @@ impl TdsClient {
 
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
-                &sql,
-                &params_list_as_string,
+                statement.as_str(),
+                declaration.as_str(),
                 &mut named_params,
                 timeout_sec,
                 cancel_handle,
@@ -1939,12 +1953,9 @@ impl TdsClient {
             self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         }
 
-        let rpc = self.build_sp_executesql_rpc(
-            sql,
-            named_params,
-            params_list_as_string,
-            &database_collation,
-        );
+        let rpc =
+            self.build_sp_executesql_rpc(statement, declaration, named_params, &database_collation);
+        self.output_names_by_ordinal = rpc.output_names_by_ordinal(std::iter::empty());
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
@@ -2503,10 +2514,13 @@ impl TdsClient {
             ));
         }
 
-        let mut declaration_params = materialized_params.clone();
-        declaration_params.extend(streamed_params.iter().cloned());
         let mut params_list_as_string = String::new();
-        build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+        build_parameter_list_string(
+            materialized_params.iter().chain(&streamed_params),
+            &mut params_list_as_string,
+        )?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         let (timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
@@ -2514,9 +2528,9 @@ impl TdsClient {
             materialized_params.iter().chain(streamed_params.iter()),
         )?;
         let rpc = self.build_sp_executesql_rpc(
-            sql,
+            statement,
+            declaration,
             materialized_params,
-            params_list_as_string,
             &database_collation,
         );
 
@@ -2574,24 +2588,15 @@ impl TdsClient {
 
     fn build_sp_executesql_rpc<'a>(
         &self,
-        sql: String,
+        statement: RequestText,
+        declaration: RequestText,
         named_params: Vec<RpcParameter>,
-        params_list_as_string: String,
         database_collation: &'a SqlCollation,
     ) -> SqlRpc<'a> {
-        let statement_parameter = RpcParameter::new(
-            None,
-            StatusFlags::NONE,
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql))),
-        );
-
-        let params_parameter = RpcParameter::new(
-            None,
-            StatusFlags::NONE,
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
-        );
-
-        let positional_parameters = Some(vec![statement_parameter, params_parameter]);
+        let positional_parameters = Some(vec![
+            RpcParameter::request_text(statement),
+            RpcParameter::request_text(declaration),
+        ]);
 
         SqlRpc::new(
             RpcType::ProcId(RpcProcs::ExecuteSql),
@@ -2600,6 +2605,8 @@ impl TdsClient {
             database_collation,
             &self.execution_context,
         )
+        // `@params` is built from `named_params` in this order.
+        .with_value_binding(ValueBinding::ByOrdinal)
     }
 
     fn split_and_validate_streamed_params(
@@ -2641,6 +2648,9 @@ impl TdsClient {
             .clone()
             .expect("streamed parameter names validated above");
         let xml_bom_state = StreamedXmlBomState::for_param(&first);
+        let value_binding = rpc.value_binding();
+        self.output_names_by_ordinal =
+            rpc.output_names_by_ordinal(std::iter::once(&first).chain(&pending));
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
@@ -2660,7 +2670,7 @@ impl TdsClient {
                 .serialize(
                     &mut packet_writer,
                     &database_collation,
-                    false,
+                    value_binding == ValueBinding::ByOrdinal,
                     &GenericEncoder::new(),
                 )
                 .await
@@ -2680,6 +2690,7 @@ impl TdsClient {
             message,
             pending,
             db_collation: database_collation,
+            value_binding,
             value_opened: false,
             xml_bom_state,
             null_signaled: false,
@@ -2740,6 +2751,7 @@ impl TdsClient {
             message,
             pending,
             db_collation,
+            value_binding,
             value_opened,
             mut xml_bom_state,
             null_signaled,
@@ -2759,6 +2771,7 @@ impl TdsClient {
                     message,
                     pending,
                     db_collation,
+                    value_binding,
                     value_opened,
                     xml_bom_state,
                     null_signaled,
@@ -2780,6 +2793,7 @@ impl TdsClient {
                     message,
                     pending,
                     db_collation,
+                    value_binding,
                     value_opened,
                     xml_bom_state,
                     null_signaled,
@@ -2808,6 +2822,7 @@ impl TdsClient {
                         message,
                         pending,
                         db_collation,
+                        value_binding,
                         value_opened,
                         xml_bom_state,
                         null_signaled,
@@ -2863,6 +2878,7 @@ impl TdsClient {
                         message,
                         pending,
                         db_collation,
+                        value_binding,
                         value_opened: true,
                         xml_bom_state: match xml_bom_state {
                             StreamedXmlBomState::Pending { .. } => StreamedXmlBomState::Written,
@@ -3225,6 +3241,7 @@ impl TdsClient {
             message,
             pending,
             db_collation,
+            value_binding,
             value_opened,
             xml_bom_state,
             null_signaled: _,
@@ -3240,6 +3257,7 @@ impl TdsClient {
                     message,
                     pending,
                     db_collation,
+                    value_binding,
                     value_opened,
                     xml_bom_state,
                     null_signaled: false,
@@ -3255,6 +3273,7 @@ impl TdsClient {
             message,
             pending,
             db_collation,
+            value_binding,
             value_opened: false,
             xml_bom_state,
             null_signaled: true,
@@ -3328,6 +3347,7 @@ impl TdsClient {
             message,
             mut pending,
             db_collation,
+            value_binding,
             value_opened,
             xml_bom_state,
             null_signaled,
@@ -3374,7 +3394,7 @@ impl TdsClient {
                     next.serialize(
                         &mut packet_writer,
                         &db_collation,
-                        false,
+                        value_binding == ValueBinding::ByOrdinal,
                         &GenericEncoder::new(),
                     )
                     .await?;
@@ -3401,7 +3421,7 @@ impl TdsClient {
                 *orphaned = None;
             }
             if let Some(id) = prepared.issued_id {
-                statement.id = Some(id);
+                statement.materialize(id, prepared.declaration.clone());
             }
         }
 
@@ -3415,6 +3435,7 @@ impl TdsClient {
                         message,
                         pending,
                         db_collation,
+                        value_binding,
                         // Fresh parameter: its opener has not been written and it
                         // has not been marked NULL.
                         value_opened: false,
@@ -4000,17 +4021,12 @@ impl TdsClient {
 
         let database_collation = self.negotiated_settings.database_collation;
 
-        let sql_statement_value =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
-
-        // Create the parameter list for sp_prepare
-        let execute_sql_statement_parameter =
-            RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
-
         // Build the comma separated list of parameters
         let mut params_list_as_string = String::new();
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         // Always Encrypted: describe the statement's parameters now (serving from
         // or populating the query-metadata cache) and pin the result under the
@@ -4022,8 +4038,8 @@ impl TdsClient {
             let has_output = named_params.iter().any(|p| p.is_output());
             let describe = self
                 .describe_parameters_cached(
-                    &sql,
-                    &params_list_as_string,
+                    statement.as_str(),
+                    declaration.as_str(),
                     has_output,
                     timeout_sec,
                     cancel_handle,
@@ -4040,10 +4056,8 @@ impl TdsClient {
             None
         };
 
-        let params_as_sql_string =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));
-
-        let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
+        let execute_sql_statement_parameter = RpcParameter::request_text(statement);
+        let params_parameter = RpcParameter::request_text(declaration);
 
         let output_handler_value = SqlType::Int(None);
 
@@ -4303,13 +4317,15 @@ impl TdsClient {
             .filter(|id| self.prepared_handles.contains_key(id))
         {
             Some(statement_id) => {
-                self.execute_sp_execute(statement_id, None, Some(named_params), true, opts)
+                let binding = statement.value_binding(&named_params);
+                self.execute_sp_execute(statement_id, None, Some(named_params), binding, true, opts)
                     .await
             }
             None => {
                 // Reported by `sp_prepexec` whenever the server's prepare `@handle`
                 // landed - including on a failed batch, where the plan still
                 // exists and must stay releasable (Ex: prepare passed but execute failed).
+                let declaration = declared_names(&named_params);
                 let mut issued_id = None;
                 let result = self
                     .execute_sp_prepexec(
@@ -4321,8 +4337,8 @@ impl TdsClient {
                         opts,
                     )
                     .await;
-                if issued_id.is_some() {
-                    statement.id = issued_id;
+                if let Some(id) = issued_id {
+                    statement.materialize(id, declaration);
                 }
                 result
             }
@@ -4439,7 +4455,7 @@ impl TdsClient {
                     opts.timeout = budget.into_timeout()?.seconds();
                 }
 
-                let declaration_params = declaration_params
+                let declaration_params: Vec<RpcParameter> = declaration_params
                     .iter()
                     .cloned()
                     .enumerate()
@@ -4448,6 +4464,7 @@ impl TdsClient {
                         parameter
                     })
                     .collect();
+                let declaration = declared_names(&declaration_params);
                 let statement_id = self
                     .execute_sp_prepare(
                         statement.sql.clone(),
@@ -4456,7 +4473,7 @@ impl TdsClient {
                         opts.clone(),
                     )
                     .await?;
-                statement.id = Some(statement_id);
+                statement.materialize(statement_id, declaration);
                 budget = Self::deduct_timeout(original_timeout, started.elapsed());
                 opts.timeout = budget.into_timeout()?.seconds();
                 statement_id
@@ -4571,40 +4588,38 @@ impl TdsClient {
         let live_handle = statement
             .id
             .and_then(|id| self.prepared_handles.get(&id).copied());
-        let (rpc, issued_id) = match live_handle {
+        let (rpc, issued_id, declaration) = match live_handle {
             Some(handle) => {
                 // `sp_execute` carries the handle plus the parameter values; the
                 // prepared plan already declares their types, so there is no
                 // `@params` string the streamed entries have to appear in.
                 let handle_parameter =
                     RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
+                // Streamed values follow the materialized ones on the wire.
+                let binding =
+                    statement.value_binding(materialized_params.iter().chain(&streamed_params));
                 let rpc = SqlRpc::new(
                     RpcType::ProcId(RpcProcs::Execute),
                     Some(vec![handle_parameter]),
                     Some(materialized_params),
                     &database_collation,
                     &self.execution_context,
-                );
-                (rpc, None)
+                )
+                .with_value_binding(binding);
+                (rpc, None, Box::default())
             }
             None => {
                 // The `@params` declaration covers the streamed parameters too,
                 // even though their values arrive later.
-                let mut declaration_params = materialized_params.clone();
-                declaration_params.extend(streamed_params.iter().cloned());
+                let declaration_params = || materialized_params.iter().chain(&streamed_params);
                 let mut params_list_as_string = String::new();
-                build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+                build_parameter_list_string(declaration_params(), &mut params_list_as_string)?;
+                let declaration = declared_names(declaration_params());
 
-                let statement_parameter = RpcParameter::new(
-                    None,
-                    StatusFlags::NONE,
-                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(statement.sql.clone()))),
-                );
-                let params_parameter = RpcParameter::new(
-                    None,
-                    StatusFlags::NONE,
-                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
-                );
+                let statement_parameter =
+                    RpcParameter::request_text(RequestText::new(statement.sql.clone())?);
+                let params_parameter =
+                    RpcParameter::request_text(RequestText::new(params_list_as_string)?);
                 let handle_parameter = RpcParameter::new(
                     None,
                     StatusFlags::BY_REF_VALUE,
@@ -4621,7 +4636,9 @@ impl TdsClient {
                     Some(materialized_params),
                     &database_collation,
                     &self.execution_context,
-                );
+                )
+                // The declaration lists the values in the order they are sent.
+                .with_value_binding(ValueBinding::ByOrdinal);
 
                 // Armed after the RPC is built, so a build failure cannot leave a
                 // stale target: the `@handle` RETURNVALUE trailing the result set
@@ -4629,7 +4646,7 @@ impl TdsClient {
                 self.pending_prepared_param_encryption = None;
                 let issued_id = self.issue_statement_id();
                 self.pending_capture = Some(issued_id);
-                (rpc, Some(issued_id))
+                (rpc, Some(issued_id), declaration)
             }
         };
 
@@ -4648,6 +4665,7 @@ impl TdsClient {
         if let StreamedWriteState::Active(ctx) = &mut self.streamed_write_state {
             ctx.prepared = Some(StreamedPreparedContext {
                 issued_id,
+                declaration,
                 orphaned: *orphaned,
             });
         }
@@ -4797,21 +4815,17 @@ impl TdsClient {
 
         let database_collation = self.negotiated_settings.database_collation;
 
-        let sql_statement_value =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
-
         // The capture target is armed just before the send below so a failure
         // while building the RPC cannot leave it set.
         self.pending_prepared_param_encryption = None;
         self.pending_capture = None;
 
-        // Create the parameter list for sp_prepexec
-        let statement_parameter = RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
-
         // Build the comma separated list of parameters
         let mut params_list_as_string = String::new();
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         // Always Encrypted: sp_prepexec prepares and executes in one round-trip,
         // so — like sp_executesql — it runs `sp_describe_parameter_encryption`
@@ -4823,8 +4837,8 @@ impl TdsClient {
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.pending_prepared_param_encryption = Some(
                 self.encrypt_parameters(
-                    &sql,
-                    &params_list_as_string,
+                    statement.as_str(),
+                    declaration.as_str(),
                     &mut named_params,
                     timeout_sec,
                     cancel_handle,
@@ -4838,10 +4852,8 @@ impl TdsClient {
             self.transport.reset_reader();
         }
 
-        let params_as_sql_string =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));
-
-        let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
+        let statement_parameter = RpcParameter::request_text(statement);
+        let params_parameter = RpcParameter::request_text(declaration);
 
         // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
         // input tells the server to drop prepared statement `h` before
@@ -4869,7 +4881,10 @@ impl TdsClient {
             Some(named_params),
             &database_collation,
             &self.execution_context,
-        );
+        )
+        // `@params` is built from `named_params` in this order.
+        .with_value_binding(ValueBinding::ByOrdinal);
+        self.output_names_by_ordinal = rpc.output_names_by_ordinal(std::iter::empty());
 
         // Armed here, not earlier: the AE describe round-trip above emits its own
         // RETURNVALUEs, and a build failure must not leave a stale target.
@@ -4945,6 +4960,7 @@ impl TdsClient {
         statement_id: StatementId,
         mut positional_parameters: Option<Vec<RpcParameter>>,
         mut named_parameters: Option<Vec<RpcParameter>>,
+        value_binding: ValueBinding,
         command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
@@ -5053,7 +5069,9 @@ impl TdsClient {
             named_parameters,
             &database_collation,
             &self.execution_context,
-        );
+        )
+        .with_value_binding(value_binding);
+        self.output_names_by_ordinal = rpc.output_names_by_ordinal(std::iter::empty());
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
@@ -5137,6 +5155,7 @@ impl TdsClient {
             statement_id,
             positional_parameters,
             named_parameters,
+            ValueBinding::ByName,
             false,
             options,
         )
@@ -5528,7 +5547,7 @@ impl TdsClient {
         self.count_map.clear();
         self.last_rows_affected = -1;
         self.dml_result_counts.clear();
-        self.return_values.clear();
+        self.clear_return_values();
         self.output_param_ceks.clear();
         self.last_return_status = ReturnStatus::NotReceived;
         self.abort_pending_prepare_capture();
@@ -6542,8 +6561,18 @@ impl TdsClient {
     /// surfacing ciphertext to the caller.
     fn finalize_return_value(
         &self,
-        token: crate::token::tokens::ReturnValueToken,
+        mut token: crate::token::tokens::ReturnValueToken,
     ) -> TdsResult<ReturnValue> {
+        if token.param_name.is_empty()
+            && let Some((_, name)) = self
+                .output_names_by_ordinal
+                .iter()
+                .find(|(ordinal, _)| *ordinal == token.param_ordinal)
+        {
+            // The parser copies the wire name into both fields.
+            token.param_name.clone_from(name);
+            token.column_metadata.column_name.clone_from(name);
+        }
         // Only decrypt when the encrypted value carries crypto metadata and
         // result decryption is enabled for this command. Otherwise pass the value
         // through unchanged (plaintext, or ciphertext varbinary when encryption is
@@ -7032,7 +7061,7 @@ impl TdsClient {
     /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
     ///
     /// Example: `EXEC dbo.p @ce_pos_0, @name1=@name1 OUTPUT` with
-    /// `@ce_pos_0 int, @name1 nvarchar(10) OUTPUT`. Mirrors dotnet
+    /// `@ce_pos_0 int,@name1 nvarchar(10) OUTPUT`. Mirrors dotnet
     /// `BuildStoredProcedureStatementForColumnEncryption`, extended to cover the
     /// positional-parameter case the Rust API exposes.
     fn build_stored_procedure_describe_request(
@@ -7067,7 +7096,6 @@ impl TdsClient {
         // Positional parameters: synthetic name, bound by position in the EXEC.
         for (ordinal, param) in positional_params.iter().enumerate() {
             let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
-            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -7075,12 +7103,12 @@ impl TdsClient {
                 first = false;
             } else {
                 tsql.push_str(", ");
-                params_decl.push_str(", ");
+                params_decl.push(',');
             }
 
             // `write!` into a String is infallible.
             let _ = write!(tsql, "{synthetic}{output}");
-            let _ = write!(params_decl, "{synthetic} {type_name}{output}");
+            param.write_declaration_entry(&synthetic, &mut params_decl)?;
         }
 
         // Named parameters: bound by name.
@@ -7088,7 +7116,6 @@ impl TdsClient {
             let Some(name) = param.name.as_deref() else {
                 continue;
             };
-            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -7096,12 +7123,12 @@ impl TdsClient {
                 first = false;
             } else {
                 tsql.push_str(", ");
-                params_decl.push_str(", ");
+                params_decl.push(',');
             }
 
             // `write!` into a String is infallible.
             let _ = write!(tsql, "{name}={name}{output}");
-            let _ = write!(params_decl, "{name} {type_name}{output}");
+            param.write_declaration_entry(name, &mut params_decl)?;
         }
 
         Ok((tsql, params_decl))
@@ -9053,6 +9080,14 @@ impl TdsClient {
         }
     }
 
+    /// Drops the previous request's output values together with the output
+    /// names it sent unnamed, so a later RPC's RETURNVALUEs (for example a
+    /// cursor RPC's) are never renamed with them.
+    pub(in crate::connection) fn clear_return_values(&mut self) {
+        self.return_values.clear();
+        self.output_names_by_ordinal.clear();
+    }
+
     /// Resets the informational-message buffer at the start of a new command so
     /// [`info_messages()`](Self::info_messages) reflects only that command.
     ///
@@ -9072,7 +9107,7 @@ impl TdsClient {
         // Clear output parameters / return values from the previous command so a
         // fully-navigated prior RPC does not leave `get_return_values()` /
         // `retrieve_output_params()` reporting stale values for this new command.
-        self.return_values.clear();
+        self.clear_return_values();
         // Every execution RPC path (plain batch, sp_executesql, sp_execute,
         // sp_prepexec, stored proc) funnels through here, so reset the
         // affected-row count for the new command. A prior DML count must not
@@ -9251,7 +9286,7 @@ impl TdsClient {
         // (see push_return_value) and survives this clear.
         self.current_metadata = None;
         self.current_result_ended_with_done_in_proc = false;
-        self.return_values.clear();
+        self.clear_return_values();
         self.abort_pending_prepare_capture();
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
@@ -9760,6 +9795,9 @@ impl StatementId {
 pub struct PreparedStatement {
     sql: String,
     id: Option<StatementId>,
+    /// Parameter names of the live plan's `@params` declaration, in order;
+    /// `None` when unknown.
+    declaration: Option<Box<[String]>>,
 }
 
 impl PreparedStatement {
@@ -9769,6 +9807,7 @@ impl PreparedStatement {
         Self {
             sql: sql.into(),
             id: None,
+            declaration: None,
         }
     }
 
@@ -9782,6 +9821,7 @@ impl PreparedStatement {
     /// with its SQL intact. The caller owns releasing the associated server
     /// handle via [`TdsClient::unprepare`].
     pub fn take_id(&mut self) -> Option<StatementId> {
+        self.declaration = None;
         self.id.take()
     }
 
@@ -9789,6 +9829,42 @@ impl PreparedStatement {
     pub fn sql(&self) -> &str {
         &self.sql
     }
+
+    fn materialize(&mut self, id: StatementId, declaration: Box<[String]>) {
+        self.id = Some(id);
+        self.declaration = Some(declaration);
+    }
+
+    /// `sp_execute` binds `values` by ordinal only when they arrive in the
+    /// order the plan declared them. A plan prepared with streamed values
+    /// declares those last, and a caller may supply names in another order.
+    fn value_binding<'p>(
+        &self,
+        values: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> ValueBinding {
+        let Some(declaration) = &self.declaration else {
+            return ValueBinding::ByName;
+        };
+        let mut declared = declaration.iter();
+        let in_order = values
+            .into_iter()
+            .all(|value| value.name.as_ref() == declared.next())
+            && declared.next().is_none();
+        if in_order {
+            ValueBinding::ByOrdinal
+        } else {
+            ValueBinding::ByName
+        }
+    }
+}
+
+/// Names of `values` in order: the declaration `build_parameter_list_string`
+/// produces from them.
+fn declared_names<'p>(values: impl IntoIterator<Item = &'p RpcParameter>) -> Box<[String]> {
+    values
+        .into_iter()
+        .filter_map(|value| value.name.clone())
+        .collect()
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -9800,6 +9876,7 @@ impl PreparedStatement {
         Self {
             sql: sql.into(),
             id: Some(id),
+            declaration: None,
         }
     }
 }
@@ -11075,7 +11152,14 @@ mod tests {
             "execute_positional" => {
                 let id = client.register_prepared_handle_for_test(7);
                 client
-                    .execute_sp_execute(id, Some(vec![param]), None, false, ())
+                    .execute_sp_execute(
+                        id,
+                        Some(vec![param]),
+                        None,
+                        ValueBinding::ByName,
+                        false,
+                        (),
+                    )
                     .await
                     .map(|_| ())
             }
@@ -18638,7 +18722,7 @@ mod tests {
         // The name is bracketed per part: it is application text on the
         // ODBC {call ...} path.
         assert_eq!(tsql, "EXEC [dbo].[my_proc] @id=@id, @count=@count OUTPUT");
-        assert_eq!(params_decl, "@id int, @count bigint OUTPUT");
+        assert_eq!(params_decl, "@id int,@count bigint OUTPUT");
     }
 
     #[test]
@@ -18663,10 +18747,7 @@ mod tests {
                 .expect("building the describe request should succeed");
 
         assert_eq!(tsql, "EXEC [proc] @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
-        assert_eq!(
-            params_decl,
-            "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
-        );
+        assert_eq!(params_decl, "@ce_pos_0 int,@ce_pos_1 bigint OUTPUT,@b int");
     }
 
     #[test]
@@ -24577,6 +24658,479 @@ mod tests {
             "a class < 20 error must not mark the connection dead"
         );
     }
+
+    /// Caller values of the wrapper RPCs are sent unnamed when they follow the
+    /// `@params` declaration, as msodbcsql sends them.
+    mod value_binding {
+        use super::*;
+        use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
+        use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
+
+        /// B_VARCHAR name `@P1`: length 3, then UTF-16LE.
+        const NAMED_P1: [u8; 7] = [0x03, b'@', 0, b'P', 0, b'1', 0];
+        /// Any B_VARCHAR `@P` name. The SQL text and declaration never put
+        /// 0x03 before an `@`.
+        const NAMED_P: [u8; 5] = [0x03, b'@', 0, b'P', 0];
+        /// Zero-length name, status NONE, INTN(4) = 7. Also a suffix of
+        /// [`NAMED_INT_7`], so only meaningful together with `!NAMED_P1`.
+        const UNNAMED_INT_7: [u8; 9] = [0x00, 0x00, 0x26, 0x04, 0x04, 7, 0, 0, 0];
+        const NAMED_INT_7: [u8; 15] = [
+            0x03, b'@', 0, b'P', 0, b'1', 0, 0x00, 0x26, 0x04, 0x04, 7, 0, 0, 0,
+        ];
+        /// Zero-length name, status NONE, BIGVARBINARY(max) TYPE_INFO.
+        const UNNAMED_STREAMED_VARBINARY: [u8; 5] = [0x00, 0x00, 0xA5, 0xFF, 0xFF];
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        fn utf16le(text: &str) -> Vec<u8> {
+            text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        }
+
+        fn int_param(name: &str, value: Option<i32>, flags: StatusFlags) -> RpcParameter {
+            RpcParameter::new(Some(name.to_string()), flags, SqlType::Int(value))
+        }
+
+        fn take_sent(sent: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
+            reassemble_sent(&std::mem::take(&mut *sent.lock().unwrap()))
+        }
+
+        fn output_token(ordinal: u16, value: i32) -> Tokens {
+            let mut token = ae_return_value_token("", ColumnValues::Int(value), None);
+            token.param_ordinal = ordinal;
+            token.status = crate::token::tokenitems::ReturnValueStatus::OutputParam;
+            Tokens::ReturnValue(token)
+        }
+
+        /// The `sp_prepexec` `@handle`: RPC ordinal 0.
+        fn handle_token(handle: i32) -> Tokens {
+            output_token(0, handle)
+        }
+
+        fn encrypted(mut parameter: RpcParameter) -> RpcParameter {
+            parameter.set_encrypted(
+                Some(vec![0xC1, 0xC2, 0xC3]),
+                RpcEncryptionMetadata {
+                    cipher_algorithm_id: 2,
+                    encryption_type: 1,
+                    database_id: 5,
+                    cek_id: 6,
+                    cek_version: 1,
+                    cek_md_version: [9; 8],
+                    normalization_rule_version: 1,
+                },
+                false,
+            );
+            parameter
+        }
+
+        #[tokio::test]
+        async fn sp_executesql_sends_values_unnamed_and_declares_them_by_name() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            client
+                .execute_sp_executesql(
+                    "SELECT @P1".to_string(),
+                    vec![int_param("@P1", Some(7), StatusFlags::NONE)],
+                    (),
+                )
+                .await
+                .unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xFF, 0xFF, 10, 0]), "sp_executesql");
+            assert!(contains(&bytes, &UNNAMED_INT_7));
+            assert!(!contains(&bytes, &NAMED_P1));
+            assert!(contains(&bytes, &utf16le("@P1 int")));
+        }
+
+        #[tokio::test]
+        async fn prepared_execution_sends_prepexec_and_execute_values_unnamed() {
+            let (mut client, sent) =
+                create_capturing_client(vec![handle_token(55), done_no_more(), done_no_more()]);
+            let mut statement = PreparedStatement::new("SELECT @P1");
+            let mut orphan = None;
+            for proc_id in [13u8, 12] {
+                client
+                    .execute_prepared(
+                        &mut statement,
+                        vec![int_param("@P1", Some(7), StatusFlags::NONE)],
+                        &mut orphan,
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                client.close_query().await.unwrap();
+                let bytes = take_sent(&sent);
+                assert!(
+                    contains(&bytes, &[0xFF, 0xFF, proc_id, 0]),
+                    "proc {proc_id}"
+                );
+                assert!(contains(&bytes, &UNNAMED_INT_7), "proc {proc_id}");
+                assert!(!contains(&bytes, &NAMED_P1), "proc {proc_id}");
+            }
+        }
+
+        /// Names supplied in another order than the plan declared them would
+        /// bind to the wrong declarations by ordinal.
+        #[tokio::test]
+        async fn execute_with_values_in_another_order_sends_them_named() {
+            let (mut client, sent) =
+                create_capturing_client(vec![handle_token(55), done_no_more(), done_no_more()]);
+            let mut statement = PreparedStatement::new("SELECT @P1, @P2");
+            let mut orphan = None;
+            client
+                .execute_prepared(
+                    &mut statement,
+                    vec![
+                        int_param("@P1", Some(7), StatusFlags::NONE),
+                        int_param("@P2", Some(8), StatusFlags::NONE),
+                    ],
+                    &mut orphan,
+                    (),
+                )
+                .await
+                .unwrap();
+            client.close_query().await.unwrap();
+            take_sent(&sent);
+
+            client
+                .execute_prepared(
+                    &mut statement,
+                    vec![
+                        int_param("@P2", Some(8), StatusFlags::NONE),
+                        int_param("@P1", Some(7), StatusFlags::NONE),
+                    ],
+                    &mut orphan,
+                    (),
+                )
+                .await
+                .unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xFF, 0xFF, 12, 0]));
+            assert!(contains(&bytes, &NAMED_INT_7));
+        }
+
+        /// A plan whose declaration is unknown keeps `sp_execute` named.
+        #[tokio::test]
+        async fn execute_of_a_plan_with_unknown_declaration_sends_values_named() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            let id = client.register_prepared_handle_for_test(55);
+            let mut statement = PreparedStatement::materialized_for_test("SELECT @P1", id);
+            client
+                .execute_prepared(
+                    &mut statement,
+                    vec![int_param("@P1", Some(7), StatusFlags::NONE)],
+                    &mut None,
+                    (),
+                )
+                .await
+                .unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xFF, 0xFF, 12, 0]));
+            assert!(contains(&bytes, &NAMED_INT_7));
+        }
+
+        /// Streamed values follow the materialized ones on the wire, and the
+        /// declaration lists them in the same order.
+        #[tokio::test]
+        async fn streamed_sp_executesql_sends_every_value_unnamed_in_declaration_order() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            let status = client
+                .begin_sp_executesql(
+                    "SELECT @P1, @P2".to_string(),
+                    vec![
+                        streamed_varbinary("@P1"),
+                        int_param("@P2", Some(7), StatusFlags::NONE),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@P1")
+            );
+            client.write_streamed_chunk(&[1, 2]).await.unwrap();
+            client.end_streamed_param().await.unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &utf16le("@P2 int,@P1 varbinary(max)")));
+            let value = bytes.windows(9).position(|w| w == UNNAMED_INT_7).unwrap();
+            let streamed = bytes
+                .windows(5)
+                .position(|w| w == UNNAMED_STREAMED_VARBINARY)
+                .unwrap();
+            assert!(value < streamed, "materialized value first, as declared");
+            assert!(!contains(&bytes, &NAMED_P));
+        }
+
+        /// A plan prepared with a streamed value declares that value last, so a
+        /// later execute supplying the values in ordinal order stays named.
+        #[tokio::test]
+        async fn execute_of_a_streamed_prepexec_plan_sends_reordered_values_named() {
+            let (mut client, sent) =
+                create_capturing_client(vec![handle_token(55), done_no_more(), done_no_more()]);
+            let mut statement = PreparedStatement::new("SELECT @P1, @P2");
+            let mut orphan = None;
+            client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![
+                        streamed_varbinary("@P1"),
+                        int_param("@P2", Some(7), StatusFlags::NONE),
+                    ],
+                    &mut orphan,
+                    (),
+                )
+                .await
+                .unwrap();
+            client.write_streamed_chunk(&[1, 2]).await.unwrap();
+            client
+                .end_execute_prepared_param(&mut statement, &mut orphan)
+                .await
+                .unwrap();
+            client.close_query().await.unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xFF, 0xFF, 13, 0]));
+            assert!(!contains(&bytes, &NAMED_P));
+
+            client
+                .execute_prepared(
+                    &mut statement,
+                    vec![
+                        int_param("@P1", Some(1), StatusFlags::NONE),
+                        int_param("@P2", Some(7), StatusFlags::NONE),
+                    ],
+                    &mut orphan,
+                    (),
+                )
+                .await
+                .unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xFF, 0xFF, 12, 0]));
+            assert!(contains(&bytes, &NAMED_P1));
+        }
+
+        #[tokio::test]
+        async fn materialized_tvp_is_sent_unnamed() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            let tvp = RpcParameter::new(
+                Some("@P1".to_string()),
+                StatusFlags::NONE,
+                SqlType::Table(
+                    TvpTypeName::new(Some("dbo".to_string()), "IntList".to_string()),
+                    Some(TvpTableData::new(
+                        vec![TvpColumnDef::new(SqlType::Int(None))],
+                        vec![vec![SqlType::Int(Some(5))]],
+                    )),
+                ),
+            );
+            client
+                .execute_sp_executesql("SELECT * FROM @P1".to_string(), vec![tvp], ())
+                .await
+                .unwrap();
+            let bytes = take_sent(&sent);
+            assert!(!contains(&bytes, &NAMED_P1));
+            assert!(contains(&bytes, &[0x00, 0x00, 0xF3]), "unnamed TVP header");
+        }
+
+        #[tokio::test]
+        async fn encrypted_values_are_sent_unnamed() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            client
+                .execute_sp_executesql(
+                    "SET @P2 = @P1".to_string(),
+                    vec![
+                        encrypted(int_param("@P1", Some(7), StatusFlags::NONE)),
+                        encrypted(int_param("@P2", None, StatusFlags::BY_REF_VALUE)),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xC1, 0xC2, 0xC3]));
+            assert!(!contains(&bytes, &NAMED_P));
+        }
+
+        /// The server reports an output bound by ordinal with an empty name and
+        /// its RPC ordinal (`@stmt` and `@params` are 0 and 1).
+        #[tokio::test]
+        async fn sp_executesql_output_is_reported_under_its_declared_name() {
+            let (mut client, _sent) =
+                create_capturing_client(vec![output_token(3, 8), done_no_more()]);
+            client
+                .execute_sp_executesql(
+                    "SET @P2 = @P1 + 1".to_string(),
+                    vec![
+                        int_param("@P1", Some(7), StatusFlags::NONE),
+                        int_param("@P2", None, StatusFlags::BY_REF_VALUE),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            client.close_query().await.unwrap();
+            let values = client.get_return_values();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].param_name, "@P2");
+            assert_eq!(values[0].column_metadata.column_name, "@P2");
+            assert_eq!(values[0].param_ordinal, 3);
+            assert_eq!(values[0].value, ColumnValues::Int(8));
+
+            client.begin_command();
+            assert!(client.output_names_by_ordinal.is_empty());
+        }
+
+        /// `sp_prepexec` puts three parameters before the values and `sp_execute`
+        /// one, so a re-execute reports the same output at a lower ordinal.
+        #[tokio::test]
+        async fn prepared_output_is_reported_under_its_name_on_prepexec_and_execute() {
+            let (mut client, _sent) = create_capturing_client(vec![
+                handle_token(55),
+                output_token(4, 8),
+                done_no_more(),
+                output_token(2, 9),
+                done_no_more(),
+            ]);
+            let mut statement = PreparedStatement::new("SET @P2 = @P1 + 1");
+            let mut orphan = None;
+            for (proc_id, value) in [(13u8, 8), (12, 9)] {
+                client
+                    .execute_prepared(
+                        &mut statement,
+                        vec![
+                            int_param("@P1", Some(value - 1), StatusFlags::NONE),
+                            int_param("@P2", None, StatusFlags::BY_REF_VALUE),
+                        ],
+                        &mut orphan,
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                client.close_query().await.unwrap();
+                let values = client.get_return_values();
+                assert_eq!(values.len(), 1, "proc {proc_id}");
+                assert_eq!(values[0].param_name, "@P2", "proc {proc_id}");
+                assert_eq!(values[0].column_metadata.column_name, "@P2");
+                assert_eq!(values[0].value, ColumnValues::Int(value));
+            }
+        }
+
+        /// Streamed values extend the ordinal map past the materialized ones.
+        #[tokio::test]
+        async fn streamed_output_is_reported_under_its_declared_name() {
+            let (mut client, _sent) =
+                create_capturing_client(vec![output_token(3, 8), done_no_more()]);
+            let mut streamed = streamed_varbinary("@P2");
+            streamed = RpcParameter::data_at_exec(
+                streamed.name.take(),
+                StatusFlags::BY_REF_VALUE,
+                StreamedSqlType::VarBinaryMax,
+            );
+            client
+                .begin_sp_executesql(
+                    "SELECT @P1, @P2".to_string(),
+                    vec![int_param("@P1", Some(7), StatusFlags::NONE), streamed],
+                    (),
+                )
+                .await
+                .unwrap();
+            client.end_streamed_param().await.unwrap();
+            client.close_query().await.unwrap();
+            let values = client.get_return_values();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].param_name, "@P2");
+        }
+
+        /// The CEK of an encrypted output is retained under its name, so the
+        /// name is restored before the lookup.
+        #[test]
+        fn encrypted_output_bound_by_ordinal_decrypts() {
+            use crate::security::encryption::{AeadAes256CbcHmacSha256, ColumnEncryptionType};
+            let mut client = create_test_client();
+            client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+            let cek = [0x2a_u8; 32];
+            insert_test_cek(&mut client, "@P2", cek.to_vec());
+            client.output_names_by_ordinal = vec![(3, "@P2".to_string())];
+            let cipher = AeadAes256CbcHmacSha256::new(&cek)
+                .unwrap()
+                .encrypt(&987_654_i64.to_le_bytes(), ColumnEncryptionType::Randomized)
+                .unwrap();
+            let mut token =
+                ae_return_value_token("", ColumnValues::Bytes(cipher), Some(ae_crypto_metadata()));
+            token.param_ordinal = 3;
+
+            let value = client.finalize_return_value(token).unwrap();
+
+            assert_eq!(value.param_name, "@P2");
+            assert_eq!(value.column_metadata.column_name, "@P2");
+            assert_eq!(value.value, ColumnValues::Int(987_654));
+        }
+
+        #[tokio::test]
+        async fn unnamed_value_is_rejected_before_anything_is_sent() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            let error = client
+                .execute_sp_executesql(
+                    "SELECT 1".to_string(),
+                    vec![RpcParameter::new(
+                        None,
+                        StatusFlags::NONE,
+                        SqlType::Int(Some(7)),
+                    )],
+                    (),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, UsageError(_)), "{error}");
+            assert!(sent.lock().unwrap().is_empty());
+        }
+
+        /// Cursor RPCs skip `begin_command`, so the reset that drops their
+        /// predecessor's output values must also drop its output names.
+        #[tokio::test]
+        async fn cursor_rpc_after_an_unnamed_output_keeps_its_own_names() {
+            use crate::connection::cursor_ops::CursorClient;
+
+            let (mut client, _sent) =
+                create_capturing_client(vec![done_no_more(), output_token(3, 9), done_no_more()]);
+            client
+                .execute_sp_executesql(
+                    "SET @P2 = @P1".to_string(),
+                    vec![
+                        int_param("@P1", Some(7), StatusFlags::NONE),
+                        int_param("@P2", None, StatusFlags::BY_REF_VALUE),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.output_names_by_ordinal, [(3, "@P2".to_string())]);
+
+            client.cursor_close(1, None, None).await.unwrap();
+
+            let values = client.get_return_values();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].param_name, "");
+            assert_eq!(values[0].column_metadata.column_name, "");
+        }
+
+        #[tokio::test]
+        async fn stored_procedure_values_keep_their_names() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            client
+                .execute_stored_procedure(
+                    "dbo.p".to_string(),
+                    None,
+                    Some(vec![int_param("@P1", Some(7), StatusFlags::NONE)]),
+                    (),
+                )
+                .await
+                .unwrap();
+            assert!(contains(&take_sent(&sent), &NAMED_INT_7));
+        }
+    }
+
+    mod request_text;
 }
 
 #[cfg(test)]

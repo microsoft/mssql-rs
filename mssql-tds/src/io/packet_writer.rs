@@ -509,6 +509,12 @@ impl<'a> PacketWriter<'a> {
         let deadline = self
             .max_timeout_sec
             .map(|seconds| self.start_time + Duration::from_secs(u64::from(seconds)));
+        // The timer driver may not have observed expiry during synchronous work.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(TimeoutError(TimeoutErrorType::String(
+                "Timeout expired".to_string(),
+            )));
+        }
         let elapsed = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -527,6 +533,13 @@ impl<'a> PacketWriter<'a> {
             tokio::pin!(send_data_fut);
             tokio::select! {
                 biased;
+                () = elapsed => {
+                    // The write may have stopped inside a packet or TLS record.
+                    // Keep send_incomplete set so the caller retires the stream.
+                    return Err(TimeoutError(TimeoutErrorType::String(
+                        "Timeout expired".to_string(),
+                    )));
+                }
                 result = &mut send_data_fut => result?,
                 () = handle.cancel_token.cancelled() => {
                     cancelled = true;
@@ -543,21 +556,14 @@ impl<'a> PacketWriter<'a> {
                         "Cancellation timed out completing the current packet".to_string(),
                     ))??;
                 }
-                () = elapsed => {
-                    // The write may have stopped inside a packet or TLS record.
-                    // Keep send_incomplete set so the caller retires the stream.
-                    return Err(TimeoutError(TimeoutErrorType::String(
-                        "Timeout expired".to_string(),
-                    )));
-                }
             }
         } else if deadline.is_some() {
             tokio::select! {
                 biased;
-                result = CancelHandle::run_until_cancelled(handle, send_data_fut) => result?,
                 () = elapsed => return Err(TimeoutError(TimeoutErrorType::String(
                     "Timeout expired".to_string(),
                 ))),
+                result = CancelHandle::run_until_cancelled(handle, send_data_fut) => result?,
             }
         } else {
             CancelHandle::run_until_cancelled(handle, send_data_fut).await?;
@@ -732,8 +738,9 @@ impl TdsPacketWriter for PacketWriter<'_> {
     }
 
     async fn write_string_unicode_async(&mut self, value: &str) -> TdsResult<()> {
-        // Streaming UTF-16LE encoding: encodes and writes directly to buffer without intermediate Vec allocation
-        let mut utf16_iter = value.encode_utf16();
+        // A packet boundary may split a surrogate pair, or a code unit at an
+        // odd boundary.
+        let mut units = Utf16Units::new(value);
 
         loop {
             let packet_space_left = self.max_payload_size - self.position() as usize;
@@ -744,11 +751,12 @@ impl TdsPacketWriter for PacketWriter<'_> {
             if u16_units_available == 0 {
                 // Check if we have exactly 1 byte left - we can write the low byte of next u16
                 if packet_space_left == 1 {
-                    if let Some(u16_char) = utf16_iter.next() {
+                    if let Some(unit) = units.next_unit() {
+                        let [low, high] = unit.to_le_bytes();
                         // Write the low byte of the u16
-                        self.write_byte_async(u16_char as u8).await?;
+                        self.write_byte_async(low).await?;
                         // After flush, write the high byte
-                        self.write_byte_async((u16_char >> 8) as u8).await?;
+                        self.write_byte_async(high).await?;
                         continue;
                     } else {
                         // No more characters to write
@@ -762,26 +770,12 @@ impl TdsPacketWriter for PacketWriter<'_> {
                 continue;
             }
 
-            // Write as many u16 units as we can fit
-            let mut units_written = 0;
-            for _ in 0..u16_units_available {
-                if let Some(u16_char) = utf16_iter.next() {
-                    // Write u16 in little-endian directly to buffer
-                    self.write_u16_unchecked(u16_char);
-                    units_written += 1;
-                } else {
-                    // Finished writing all characters
-                    if units_written > 0 {
-                        // Check for overflow after batch write
-                        self.check_overflow().await?;
-                    }
-                    return Ok(());
-                }
-            }
-
-            // We filled the available space, check overflow and loop to flush
+            let units_written = units.write_le(&mut self.payload_cursor, u16_units_available);
             if units_written > 0 {
                 self.check_overflow().await?;
+            }
+            if units_written < u16_units_available {
+                return Ok(());
             }
         }
     }
@@ -863,6 +857,117 @@ impl TdsPacketWriterUnchecked for PacketWriter<'_> {
     }
 }
 
+/// A resumable UTF-16 encoder over `&str` that writes runs of units at once,
+/// widening ASCII spans without per-unit iteration. A supplementary character
+/// cut by the unit limit leaves its low surrogate pending for the next write.
+struct Utf16Units<'s> {
+    rest: &'s str,
+    pending_low: Option<u16>,
+}
+
+impl<'s> Utf16Units<'s> {
+    /// Units staged per buffer write; the stack buffer never outlives a sync call.
+    const STAGE_UNITS: usize = 256;
+    const ASCII_BLOCK: usize = 16;
+
+    fn new(value: &'s str) -> Self {
+        Self {
+            rest: value,
+            pending_low: None,
+        }
+    }
+
+    fn next_unit(&mut self) -> Option<u16> {
+        if let Some(low) = self.pending_low.take() {
+            return Some(low);
+        }
+        let ch = self.rest.chars().next()?;
+        self.rest = &self.rest[ch.len_utf8()..];
+        let mut buf = [0; 2];
+        let units = ch.encode_utf16(&mut buf);
+        self.pending_low = units.get(1).copied();
+        units.first().copied()
+    }
+
+    /// Writes up to `max_units` UTF-16LE units at the cursor and returns how
+    /// many were written; fewer than `max_units` means the text is exhausted.
+    fn write_le(&mut self, out: &mut Cursor<Vec<u8>>, max_units: usize) -> usize {
+        let mut stage = [0_u8; 2 * Self::STAGE_UNITS];
+        let mut written = 0;
+        while written < max_units {
+            let room = (max_units - written).min(Self::STAGE_UNITS);
+            let staged = self.stage_le(&mut stage[..2 * room]);
+            if staged == 0 {
+                break;
+            }
+            let _ = std::io::Write::write_all(out, &stage[..2 * staged]);
+            written += staged;
+            if staged < room {
+                break;
+            }
+        }
+        written
+    }
+
+    fn stage_le(&mut self, dst: &mut [u8]) -> usize {
+        let capacity = dst.len() / 2;
+        let mut staged = 0;
+        if capacity > 0
+            && let Some(low) = self.pending_low.take()
+        {
+            dst[..2].copy_from_slice(&low.to_le_bytes());
+            staged = 1;
+        }
+        while staged < capacity {
+            let bytes = self.rest.as_bytes();
+            let ascii = Self::ascii_prefix_len(&bytes[..bytes.len().min(capacity - staged)]);
+            for (unit, &byte) in dst[2 * staged..2 * (staged + ascii)]
+                .chunks_exact_mut(2)
+                .zip(&bytes[..ascii])
+            {
+                unit[0] = byte;
+                unit[1] = 0;
+            }
+            staged += ascii;
+            self.rest = &self.rest[ascii..];
+            if staged == capacity {
+                break;
+            }
+            let Some(ch) = self.rest.chars().next() else {
+                break;
+            };
+            self.rest = &self.rest[ch.len_utf8()..];
+            let mut units = [0; 2];
+            let units = ch.encode_utf16(&mut units);
+            dst[2 * staged..2 * staged + 2].copy_from_slice(&units[0].to_le_bytes());
+            staged += 1;
+            if let Some(&low) = units.get(1) {
+                if staged < capacity {
+                    dst[2 * staged..2 * staged + 2].copy_from_slice(&low.to_le_bytes());
+                    staged += 1;
+                } else {
+                    self.pending_low = Some(low);
+                }
+            }
+        }
+        staged
+    }
+
+    fn ascii_prefix_len(bytes: &[u8]) -> usize {
+        let mut len = 0;
+        while let Some(block) = bytes.get(len..len + Self::ASCII_BLOCK) {
+            if !block.is_ascii() {
+                break;
+            }
+            len += Self::ASCII_BLOCK;
+        }
+        len + bytes[len..]
+            .iter()
+            .take_while(|byte| byte.is_ascii())
+            .count()
+    }
+}
+
 /// Read-only access to the buffer the writer has accumulated, for tests that
 /// assert on serialized bytes without a server.
 ///
@@ -891,6 +996,7 @@ pub(crate) mod tests {
         pub(crate) data: Vec<u8>,
         pub(crate) reset_mode: ResetConnectionMode,
         pub(crate) reset_dispatched: bool,
+        blocking_send: Option<Duration>,
     }
 
     impl MockNetworkWriter {
@@ -900,6 +1006,7 @@ pub(crate) mod tests {
                 data: vec![],
                 reset_mode: ResetConnectionMode::None,
                 reset_dispatched: false,
+                blocking_send: None,
             }
         }
     }
@@ -908,7 +1015,9 @@ pub(crate) mod tests {
     impl NetworkWriter for MockNetworkWriter {
         #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
         async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
-            // No op
+            if let Some(duration) = self.blocking_send {
+                std::thread::sleep(duration);
+            }
             self.data.extend_from_slice(_data);
             Ok(())
         }
@@ -1931,56 +2040,301 @@ pub(crate) mod tests {
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
     }
 
-    /// A ready send can finish before expiry is observed, leaving `finalize`'s
-    /// terminating packet on the wire. Such a message needs cancelling, not
-    /// withdrawing: a second `EOM | IGNORE` would leave the server owing two
-    /// responses and the extra DONE for the next command.
-    #[test]
-    fn a_finalized_message_that_times_out_is_still_complete() {
-        let mut mock = MockNetworkWriter::new(16);
-        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
-        block_on(writer.write_async(&[0xABu8; 4])).unwrap();
-        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+    #[tokio::test]
+    async fn expired_deadline_after_synchronous_work_does_not_send() {
+        for with_settlement in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            writer.write_async(&[0xAB; 4]).await.unwrap();
+            // Keep the runtime's timer driver from observing expiry first.
+            std::thread::sleep(Duration::from_millis(1100));
 
-        let result = block_on(writer.finalize());
-        let message = writer.suspend();
-
-        assert!(result.is_err(), "the overrun budget must surface an error");
-        assert!(
-            mock.data[1] & (PacketStatusFlags::Eom as u8) != 0,
-            "the terminating packet reached the wire"
-        );
-        assert!(
-            message.message_complete(),
-            "a terminated message must not be withdrawn as if it were partial"
-        );
+            let result = writer.finalize().await;
+            let message = writer.suspend();
+            assert!(matches!(result, Err(TimeoutError(_))), "{result:?}");
+            assert!(message.nothing_sent());
+            assert!(!message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.message_complete());
+            assert!(mock.data.is_empty());
+        }
     }
 
-    /// A ready write can finish before expiry is observed, so this error path
-    /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
-    /// the flushed flag can tell the caller the server is mid-message, and
-    /// getting it wrong means the request is dropped instead of withdrawn.
-    #[test]
-    fn a_packet_that_lands_then_times_out_is_not_nothing_sent() {
+    #[tokio::test]
+    async fn completed_send_overrun_preserves_message_accounting() {
+        for (final_packet, with_settlement) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(3);
+            let mut mock = MockNetworkWriter::new(16);
+            mock.blocking_send = Some(Duration::from_millis(1100));
+            let mut writer = PacketWriter::new(
+                PacketType::RpcRequest,
+                &mut mock,
+                Some(1),
+                with_settlement.then_some(&cancel),
+            );
+            let result = if final_packet {
+                writer.write_async(&[0xAB; 4]).await.unwrap();
+                writer.finalize().await
+            } else {
+                writer.write_async(&[0xAB; 9]).await
+            };
+            let message = writer.suspend();
+            assert!(matches!(result, Err(TimeoutError(_))), "{result:?}");
+            assert!(message.send_attempted());
+            assert!(!message.send_incomplete());
+            assert!(!message.nothing_sent());
+            assert_eq!(message.message_complete(), final_packet);
+            assert!(!mock.data.is_empty());
+            assert_eq!(
+                mock.data[1] & PacketStatusFlags::Eom as u8 != 0,
+                final_packet
+            );
+        }
+    }
+
+    /// An expired deadline must win before the final packet is sent, leaving no
+    /// partial message to withdraw.
+    #[tokio::test]
+    async fn an_expired_deadline_does_not_send_the_final_packet() {
         let mut mock = MockNetworkWriter::new(16);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        writer.write_async(&[0xABu8; 4]).await.unwrap();
         writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
 
-        let result = block_on(writer.write_async(&[0xABu8; 64]));
+        let result = writer.finalize().await;
         let message = writer.suspend();
 
         assert!(result.is_err(), "the overrun budget must surface an error");
         assert!(
-            !mock.data.is_empty(),
-            "the packet reached the wire before the budget was checked"
+            mock.data.is_empty(),
+            "the expired deadline must precede send"
+        );
+        assert!(!message.message_complete());
+        assert!(message.nothing_sent());
+    }
+
+    /// A ready write must not be polled after its deadline has expired.
+    #[tokio::test]
+    async fn an_expired_deadline_is_checked_before_polling_the_transport() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+
+        let result = writer.write_async(&[0xABu8; 64]).await;
+        let message = writer.suspend();
+
+        assert!(result.is_err(), "the overrun budget must surface an error");
+        assert!(
+            mock.data.is_empty(),
+            "the expired deadline must precede send"
         );
         assert!(
             message.is_first_packet,
             "the first-packet flag is still set on this path"
         );
-        assert!(
-            !message.nothing_sent(),
-            "a request the server has part of must be withdrawn, not discarded"
+        assert!(message.nothing_sent());
+    }
+
+    /// The per-unit encoder `write_string_unicode_async` replaced, kept as its
+    /// differential oracle.
+    async fn write_string_unicode_reference(
+        writer: &mut PacketWriter<'_>,
+        value: &str,
+    ) -> TdsResult<()> {
+        let mut utf16_iter = value.encode_utf16();
+        loop {
+            let packet_space_left = writer.max_payload_size - writer.position() as usize;
+            let u16_units_available = packet_space_left / 2;
+            if u16_units_available == 0 {
+                if packet_space_left == 1 {
+                    if let Some(u16_char) = utf16_iter.next() {
+                        writer.write_byte_async(u16_char as u8).await?;
+                        writer.write_byte_async((u16_char >> 8) as u8).await?;
+                        continue;
+                    } else {
+                        return Ok(());
+                    }
+                }
+                writer.populate_header_and_send(false, false).await?;
+                writer
+                    .payload_cursor
+                    .set_position(PacketWriter::PACKET_HEADER_SIZE as u64);
+                continue;
+            }
+            let mut units_written = 0;
+            for _ in 0..u16_units_available {
+                if let Some(u16_char) = utf16_iter.next() {
+                    writer.write_u16_unchecked(u16_char);
+                    units_written += 1;
+                } else {
+                    if units_written > 0 {
+                        writer.check_overflow().await?;
+                    }
+                    return Ok(());
+                }
+            }
+            if units_written > 0 {
+                writer.check_overflow().await?;
+            }
+        }
+    }
+
+    /// The packet count and buffered payload after the string, and the wire
+    /// bytes after `finalize`. Together they pin packet boundaries, including
+    /// an eager send on an exact fill.
+    fn encode_with(
+        packet_size: u32,
+        prefix: usize,
+        value: &str,
+        reference: bool,
+    ) -> (u8, usize, Vec<u8>, Vec<u8>) {
+        let mut mock = MockNetworkWriter::new(packet_size);
+        let mut writer = PacketWriter::new(PacketType::SqlBatch, &mut mock, None, None);
+        let filler: Vec<u8> = (0..prefix).map(|index| index as u8 | 0x80).collect();
+        block_on(writer.write_async(&filler)).unwrap();
+        if reference {
+            block_on(write_string_unicode_reference(&mut writer, value)).unwrap();
+        } else {
+            block_on(writer.write_string_unicode_async(value)).unwrap();
+        }
+        let packet_id = writer.packet_id;
+        let position = writer.payload_cursor.position() as usize;
+        let payload = writer.payload_cursor.get_ref();
+        let buffered = payload[..position.min(payload.len())].to_vec();
+        block_on(writer.finalize()).unwrap();
+        (packet_id, position, buffered, mock.data)
+    }
+
+    fn assert_encode_matches_reference(packet_size: u32, prefix: usize, value: &str) {
+        assert_eq!(
+            encode_with(packet_size, prefix, value, false),
+            encode_with(packet_size, prefix, value, true),
+            "packet {packet_size} prefix {prefix} value {value:?}"
         );
+    }
+
+    const ENCODE_PACKET_SIZES: [u32; 5] = [512, 513, 517, 4096, 16250];
+
+    fn encode_prefixes(packet_size: u32) -> Vec<usize> {
+        let max = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+        vec![0, 1, 2, 3, max - 3, max - 2, max - 1, max]
+    }
+
+    #[test]
+    fn bulk_utf16_encode_matches_per_unit_encode_for_ascii() {
+        for packet_size in ENCODE_PACKET_SIZES {
+            let max = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+            let mut lengths: Vec<usize> = (0..=40).collect();
+            for packets in 1..=4 {
+                let units = packets * max / 2;
+                lengths.extend(units.saturating_sub(3)..=units + 3);
+            }
+            lengths.extend([70_000, 16_384]);
+            for prefix in encode_prefixes(packet_size) {
+                for &len in &lengths {
+                    let value: String = (0..len).map(|i| (b'!' + (i % 90) as u8) as char).collect();
+                    assert_encode_matches_reference(packet_size, prefix, &value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_utf16_encode_matches_per_unit_encode_at_every_boundary() {
+        for packet_size in ENCODE_PACKET_SIZES {
+            let max = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+            for prefix in [0, 1, 2, 3] {
+                let edge = (max - prefix) / 2;
+                let leads = (0..=40)
+                    .chain(250..=260)
+                    .chain(edge - 3..=edge + 3)
+                    .chain(edge + max / 2 - 3..=edge + max / 2 + 3);
+                for lead in leads {
+                    for special in [
+                        "😀",
+                        "é",
+                        "東",
+                        "\u{7f}",
+                        "\u{80}",
+                        "\u{ffff}",
+                        "\u{10ffff}",
+                    ] {
+                        let value = format!("{}{special}{}", "a".repeat(lead), "b".repeat(300));
+                        assert_encode_matches_reference(packet_size, prefix, &value);
+                        let value = format!("{}{special}", "a".repeat(lead));
+                        assert_encode_matches_reference(packet_size, prefix, &value);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deterministic generator for randomized wire-equivalence tests.
+    pub(crate) struct SplitMix64(pub(crate) u64);
+
+    impl SplitMix64 {
+        pub(crate) fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        pub(crate) fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    #[test]
+    fn bulk_utf16_encode_matches_per_unit_encode_for_mixed_text() {
+        const ALPHABET: &[&str] = &["a", "\u{7f}", "\u{80}", "é", "東", "😀", "\u{10ffff}", "\0"];
+        let mut rng = SplitMix64(0x7574_6631_362D_7772);
+        for packet_size in ENCODE_PACKET_SIZES {
+            let max = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+            for _ in 0..400 {
+                let len = rng.below(3 * max);
+                let value: String = (0..len)
+                    .map(|_| match rng.below(4) {
+                        0 => ALPHABET[rng.below(ALPHABET.len())],
+                        _ => "x",
+                    })
+                    .collect();
+                let prefixes = encode_prefixes(packet_size);
+                let prefix = prefixes[rng.below(prefixes.len())];
+                assert_encode_matches_reference(packet_size, prefix, &value);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_string_flushes_a_full_packet_like_per_unit_encode() {
+        for packet_size in ENCODE_PACKET_SIZES {
+            let max = packet_size as usize - PacketWriter::PACKET_HEADER_SIZE;
+            for prefix in [max, max - 1] {
+                let (_, position, _, _) = encode_with(packet_size, prefix, "", false);
+                assert_eq!(position == PacketWriter::PACKET_HEADER_SIZE, prefix == max);
+                assert_encode_matches_reference(packet_size, prefix, "");
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_utf16_encode_does_not_grow_the_future() {
+        let mut mock = MockNetworkWriter::new(512);
+        let mut writer = PacketWriter::new(PacketType::SqlBatch, &mut mock, None, None);
+        let bulk = size_of_val(&writer.write_string_unicode_async("x"));
+        let reference = size_of_val(&write_string_unicode_reference(&mut writer, "x"));
+        assert!(bulk <= reference, "bulk {bulk} > reference {reference}");
     }
 }

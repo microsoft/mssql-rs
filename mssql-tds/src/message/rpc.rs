@@ -51,6 +51,44 @@ pub(crate) enum RpcType {
     ProcId(RpcProcs),
 }
 
+/// How an RPC sends the values in its `named_parameters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ValueBinding {
+    /// With their names; the server matches each one to its declaration.
+    #[default]
+    ByName,
+    /// With zero-length names, so the server binds them by ordinal.
+    ///
+    /// Valid only when the values follow the order of the `@params`
+    /// declaration. That holds for any `sp_executesql` or `sp_prepexec` whose
+    /// declaration is built from the same list. SQL Server matches named
+    /// values to the declaration in time quadratic in the parameter count;
+    /// msodbcsql sends these values unnamed (`AddRPCUserParameters`).
+    ByOrdinal,
+}
+
+/// The RPC ordinal and declared name of each output value among `values`,
+/// whose first element has RPC ordinal `first_ordinal`.
+///
+/// SQL Server returns an output value bound by ordinal with an empty name
+/// and this ordinal, which counts every parameter of the RPC.
+pub(crate) fn output_names_by_ordinal<'p>(
+    first_ordinal: usize,
+    values: impl IntoIterator<Item = &'p RpcParameter>,
+) -> Vec<(u16, String)> {
+    values
+        .into_iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_output())
+        .filter_map(|(index, value)| {
+            Some((
+                u16::try_from(first_ordinal + index).ok()?,
+                value.name.clone()?,
+            ))
+        })
+        .collect()
+}
+
 impl<'a> SqlRpc<'a> {
     pub fn new(
         rpc_type: RpcType,
@@ -68,7 +106,32 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            value_binding: ValueBinding::ByName,
         }
+    }
+
+    pub(crate) fn with_value_binding(mut self, binding: ValueBinding) -> Self {
+        self.value_binding = binding;
+        self
+    }
+
+    pub(crate) fn value_binding(&self) -> ValueBinding {
+        self.value_binding
+    }
+
+    /// See [`output_names_by_ordinal`]. `trailing` are values appended after
+    /// this message's own, such as streamed parameters.
+    pub(crate) fn output_names_by_ordinal<'p>(
+        &'p self,
+        trailing: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> Vec<(u16, String)> {
+        if self.value_binding == ValueBinding::ByName {
+            return Vec::new();
+        }
+        output_names_by_ordinal(
+            self.positional_parameters.as_ref().map_or(0, Vec::len),
+            self.named_parameters.iter().flatten().chain(trailing),
+        )
     }
 
     pub(crate) fn new_batch_command(
@@ -91,6 +154,7 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            value_binding: ValueBinding::ByName,
         }
     }
 
@@ -117,6 +181,13 @@ impl<'a> SqlRpc<'a> {
             parameter.validate_before_send(self.db_collation)?;
         }
         for parameter in self.named_parameters.iter().flatten() {
+            // An unnamed value here would be missing from the `@params`
+            // declaration, so binding by ordinal would shift every later value.
+            if parameter.name.is_none() {
+                return Err(Error::UsageError(
+                    "Named RPC parameters must have a name.".to_string(),
+                ));
+            }
             parameter.validate_named_before_send(self.db_collation)?;
         }
         Ok(())
@@ -153,7 +224,12 @@ impl<'a> SqlRpc<'a> {
             let encoder = GenericEncoder::new();
             for parameter in parameters {
                 if let Err(error) = parameter
-                    .serialize(packet_writer, self.db_collation, false, &encoder)
+                    .serialize(
+                        packet_writer,
+                        self.db_collation,
+                        self.value_binding == ValueBinding::ByOrdinal,
+                        &encoder,
+                    )
                     .await
                 {
                     return Err(
@@ -339,6 +415,7 @@ pub(crate) struct SqlRpc<'param> {
     pub named_parameters: Option<Vec<RpcParameter>>,
     pub db_collation: &'param SqlCollation,
     pub proc_options: ProcOptions,
+    value_binding: ValueBinding,
 }
 
 #[async_trait]
@@ -617,6 +694,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn output_names_by_ordinal_count_leading_and_trailing_parameters() {
+        let collation = SqlCollation::default();
+        let named = |name: &str, flags| {
+            RpcParameter::new(Some(name.to_string()), flags, SqlType::Int(None))
+        };
+        let build = |binding| {
+            SqlRpc::new(
+                RpcType::ProcId(RpcProcs::Execute),
+                Some(vec![param(SqlType::Int(Some(55)))]),
+                Some(vec![
+                    named("@P1", StatusFlags::NONE),
+                    named("@P2", StatusFlags::BY_REF_VALUE),
+                ]),
+                &collation,
+                &ExecutionContext::new(),
+            )
+            .with_value_binding(binding)
+        };
+        let trailing = [named("@P3", StatusFlags::BY_REF_VALUE)];
+        assert!(
+            build(ValueBinding::ByName)
+                .output_names_by_ordinal(&trailing)
+                .is_empty()
+        );
+        assert_eq!(
+            build(ValueBinding::ByOrdinal).output_names_by_ordinal(&trailing),
+            vec![(2, "@P2".to_string()), (3, "@P3".to_string())]
+        );
     }
 
     #[test]
@@ -1240,6 +1348,126 @@ mod tests {
                     .filter(|window| *window == type_info)
                     .count(),
                 2000
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_text_tests {
+    use super::*;
+    use crate::datatypes::{sql_string::SqlString, sqltypes::SqlType};
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::parameters::rpc_parameters::{RequestText, StatusFlags};
+    use futures::executor::block_on;
+
+    fn serialize(
+        packet_size: u32,
+        proc: RpcProcs,
+        positional: Vec<RpcParameter>,
+        named: Vec<RpcParameter>,
+    ) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(packet_size);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let context = ExecutionContext::new();
+        let rpc = SqlRpc::new(
+            RpcType::ProcId(proc),
+            Some(positional),
+            Some(named),
+            &collation,
+            &context,
+        )
+        .with_value_binding(ValueBinding::ByOrdinal);
+        block_on(rpc.serialize(&mut writer)).unwrap();
+        drop(writer);
+        mock.data
+    }
+
+    fn materialized(text: &str) -> RpcParameter {
+        RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(text.to_string()))),
+        )
+    }
+
+    fn streamed(text: &str) -> RpcParameter {
+        RpcParameter::request_text(RequestText::new(text.to_string()).unwrap())
+    }
+
+    /// A positional `varbinary` of `padding` bytes, then `text` as the last
+    /// parameter, so moving `padding` by one moves the text's end by one byte.
+    fn padded_text_rpc(
+        packet_size: u32,
+        padding: usize,
+        text: &str,
+        build: fn(&str) -> RpcParameter,
+    ) -> Vec<u8> {
+        let pad = RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::VarBinary(Some(vec![0xab; padding]), 8000),
+        );
+        serialize(
+            packet_size,
+            RpcProcs::ExecuteSql,
+            vec![pad, build(text)],
+            Vec::new(),
+        )
+    }
+
+    /// Sweeping the padding across a whole packet puts the end of the text at
+    /// every offset of a packet, including exactly on its end, so the PLP
+    /// terminator opens the final packet on its own.
+    #[test]
+    fn request_text_matches_materialized_at_every_packet_offset() {
+        let text = format!("{}é", "a😀".repeat(40));
+        let last_unit = 0xE9u16.to_le_bytes();
+        for packet_size in [512u32, 513] {
+            let packet = usize::try_from(packet_size).unwrap();
+            let mut terminator_alone = false;
+            for padding in 0..packet {
+                let wire = padded_text_rpc(packet_size, padding, &text, streamed);
+                assert_eq!(
+                    wire,
+                    padded_text_rpc(packet_size, padding, &text, materialized),
+                    "packet {packet_size} padding {padding}"
+                );
+                let last_packet_start = wire.len() - (wire.len() - 1) % packet - 1;
+                if wire.len() - last_packet_start == 8 + 4 {
+                    assert_eq!(wire[last_packet_start + 8..], [0; 4]);
+                    assert_eq!(wire[last_packet_start - 2..last_packet_start], last_unit);
+                    terminator_alone = true;
+                }
+            }
+            assert!(terminator_alone, "packet {packet_size}");
+        }
+    }
+
+    /// Random text of every UTF-8 width, at random sizes, offsets and packet
+    /// sizes, frames identically to the materialized UTF-16 value.
+    #[test]
+    fn request_text_matches_materialized_for_random_text() {
+        use crate::io::packet_writer::tests::SplitMix64;
+
+        const ALPHABET: &[&str] = &["a", "\u{7f}", "\u{80}", "é", "東", "😀", "\u{10ffff}", "\0"];
+        let mut rng = SplitMix64(0x7265_7174_6578_7431);
+        for _ in 0..300 {
+            let packet_size = [512u32, 513, 4096][rng.below(3)];
+            let packet = usize::try_from(packet_size).unwrap();
+            let len = rng.below(3 * packet);
+            let text: String = (0..len)
+                .map(|_| match rng.below(3) {
+                    0 => ALPHABET[rng.below(ALPHABET.len())],
+                    _ => "x",
+                })
+                .collect();
+            let padding = rng.below(packet);
+            assert_eq!(
+                padded_text_rpc(packet_size, padding, &text, streamed),
+                padded_text_rpc(packet_size, padding, &text, materialized),
+                "packet {packet_size} padding {padding} text {text:?}"
             );
         }
     }
