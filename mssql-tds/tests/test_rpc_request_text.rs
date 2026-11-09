@@ -29,6 +29,7 @@ mod rpc_request_text {
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
     use mssql_tds::query::metadata::ColumnMetadata;
     use mssql_tds::query::result::ReturnValue;
+    use uuid::Uuid;
 
     #[ctor::ctor]
     fn init() {
@@ -37,7 +38,6 @@ mod rpc_request_text {
 
     /// Characters outside the BMP: each one is a UTF-16 surrogate pair.
     const SUPPLEMENTARY: &str = "𐐀😀";
-    const TVP_TYPE: &str = "dbo.RequestTextIds";
 
     fn param(name: &str, flags: StatusFlags, value: SqlType) -> RpcParameter {
         RpcParameter::new(Some(name.to_string()), flags, value)
@@ -130,24 +130,25 @@ mod rpc_request_text {
     /// then prepared (`sp_prepexec`) and executed again (`sp_execute`).
     #[tokio::test]
     async fn every_declaration_shape_round_trips() {
+        // Unique per run: parallel test runs can share one SQL host.
+        let tvp_type = format!("RequestTextIds_{}", Uuid::new_v4().simple());
         let mut client = begin_connection(&build_tcp_datasource()).await;
-        exec_ddl(&mut client, &format!("DROP TYPE IF EXISTS {TVP_TYPE}")).await;
         exec_ddl(
             &mut client,
-            &format!("CREATE TYPE {TVP_TYPE} AS TABLE (id INT)"),
+            &format!("CREATE TYPE dbo.{tvp_type} AS TABLE (id INT)"),
         )
         .await;
 
-        let outcome = AssertUnwindSafe(assert_every_declaration_shape(&mut client))
+        let outcome = AssertUnwindSafe(assert_every_declaration_shape(&mut client, &tvp_type))
             .catch_unwind()
             .await;
-        exec_ddl(&mut client, &format!("DROP TYPE IF EXISTS {TVP_TYPE}")).await;
+        exec_ddl(&mut client, &format!("DROP TYPE IF EXISTS dbo.{tvp_type}")).await;
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
     }
 
-    async fn assert_every_declaration_shape(client: &mut TdsClient) {
+    async fn assert_every_declaration_shape(client: &mut TdsClient, tvp_type: &str) {
         let hierarchyid = serialized_hierarchyid(client, "/4/").await;
         let text = format!("{SUPPLEMENTARY}é");
         let params = || {
@@ -177,7 +178,7 @@ mod rpc_request_text {
                     "@P7",
                     StatusFlags::NONE,
                     SqlType::Table(
-                        TvpTypeName::new(Some("dbo".to_string()), "RequestTextIds".to_string()),
+                        TvpTypeName::new(Some("dbo".to_string()), tvp_type.to_string()),
                         Some(TvpTableData::new(
                             vec![TvpColumnDef::new(SqlType::Int(None))],
                             (1..=3).map(|id| vec![SqlType::Int(Some(id))]).collect(),
