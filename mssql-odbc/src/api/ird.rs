@@ -13,6 +13,7 @@
 
 use tracing::error;
 
+use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use crate::api::col_attribute::{desc_length, octet_length, precision};
@@ -78,9 +79,57 @@ pub(super) fn populate_ird(
 /// the STMT lock held. A poisoned IRD is left alone: `SQLGetDescField` already
 /// fails on it.
 pub(super) fn clear_ird_classification(stmt: &StmtHandle) {
+    take_ird_classification(stmt);
+}
+
+fn take_ird_classification(stmt: &StmtHandle) -> Option<Box<[u8]>> {
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
-    if let Ok(mut desc_state) = desc.inner.lock() {
-        desc_state.data_classification = None;
+    desc.inner
+        .lock()
+        .ok()
+        .and_then(|mut desc_state| desc_state.data_classification.take())
+}
+
+/// The classification taken off the IRD just before the request that runs its
+/// statement, held until that request is known to have been sent.
+pub(super) struct PendingClassification {
+    payload: Option<Box<[u8]>>,
+    connection_was_dead: bool,
+}
+
+/// [`clear_ird_classification`] for the moment the request that runs `stmt`
+/// is handed to `client`. Call without the STMT lock held.
+pub(super) fn clear_for_send(stmt: &StmtHandle, client: &TdsClient) -> PendingClassification {
+    PendingClassification {
+        connection_was_dead: client.is_connection_dead(),
+        payload: take_ird_classification(stmt),
+    }
+}
+
+impl PendingClassification {
+    /// Puts the classification back after a request that failed without
+    /// reaching the server. On a connection already known dead, mssql-tds
+    /// writes nothing unless it reconnects first, and one still dead after the
+    /// failure did not reconnect. msodbcsql likewise fails
+    /// `GetBatchCtxOrRecover` before it reaches `ClearColinfo`
+    /// (`sqlccmd.cpp:1870`, `sqlccmd.cpp:2893`).
+    pub(super) fn restore_if_unsent(self, stmt: &StmtHandle, client: &TdsClient) {
+        if self.connection_was_dead && client.is_connection_dead() {
+            self.restore(stmt);
+        }
+    }
+
+    /// Puts the classification back after a call that sent nothing.
+    pub(super) fn restore(self, stmt: &StmtHandle) {
+        let Some(payload) = self.payload else {
+            return;
+        };
+        let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+        if let Ok(mut desc_state) = desc.inner.lock()
+            && desc_state.data_classification.is_none()
+        {
+            desc_state.data_classification = Some(payload);
+        }
     }
 }
 

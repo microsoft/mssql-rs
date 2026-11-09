@@ -1152,6 +1152,263 @@ mod tests {
             assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{sql_type}");
         }
     }
+    /// An execute on a connection already known dead, with no session recovery
+    /// to reconnect it, fails before anything is sent, so the classification
+    /// stays: msodbcsql's `GetBatchCtxOrRecover` fails before `ClearColinfo`
+    /// (`sqlccmd.cpp:1870`, `sqlcfunc.cpp:641`).
+    #[test]
+    fn a_failed_reconnect_keeps_the_classification() {
+        const KILL_SESSION: &str = "KILL SESSION";
+        let (server, payload) = classified_server();
+        server.register(KILL_SESSION, QueryResponse::select_one());
+        server.runtime.block_on(async {
+            server
+                .registry
+                .lock()
+                .await
+                .close_connection_after(KILL_SESSION);
+        });
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+
+        let killer = h.alloc_extra_stmt();
+        exec(killer, KILL_SESSION);
+        assert_eq!(unsafe { sql_close_cursor(killer) }, SQL_SUCCESS);
+        let text: Vec<SqlWChar> = UNCLASSIFIED.encode_utf16().collect();
+        let len = SqlInteger::try_from(text.len()).unwrap();
+        while unsafe { sql_exec_direct_w(killer, text.as_ptr(), len) } != SQL_ERROR {
+            assert_eq!(unsafe { sql_close_cursor(killer) }, SQL_SUCCESS);
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .client()
+                .is_some_and(|client| client.is_connection_dead()),
+            "the failed execute marks the connection dead"
+        );
+
+        let unclassified: Vec<SqlWChar> = UNCLASSIFIED.encode_utf16().collect();
+        let calls: [(&str, &dyn Fn() -> SqlReturn); 4] = [
+            ("SQLExecute", &|| unsafe { sql_execute(stmt) }),
+            ("SQLTables", &|| unsafe {
+                crate::api::SQLTablesW(
+                    stmt,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            }),
+            ("SQLGetTypeInfo", &|| unsafe {
+                crate::api::SQLGetTypeInfoW(stmt, crate::api::odbc_types::SQL_ALL_TYPES)
+            }),
+            ("SQLExecDirect", &|| unsafe {
+                crate::api::SQLExecDirectW(
+                    stmt,
+                    unclassified.as_ptr(),
+                    SqlInteger::try_from(unclassified.len()).unwrap(),
+                )
+            }),
+        ];
+        for (name, call) in calls {
+            assert_eq!(call(), SQL_ERROR, "{name}");
+            assert_eq!(
+                classification(ird(stmt)),
+                (SQL_SUCCESS, payload.clone()),
+                "{name}"
+            );
+        }
+    }
+
+    /// A connection not yet known dead does not stop the send, so a request
+    /// that then fails on the closed socket drops the classification, as
+    /// msodbcsql's does once `GetBatchCtxOrRecover` passes.
+    #[test]
+    fn a_send_that_finds_the_connection_closed_drops_the_classification() {
+        const CLOSE_AFTER: &str = "CLOSE AFTER";
+        let (server, payload) = classified_server();
+        server.register(CLOSE_AFTER, QueryResponse::select_one());
+        server.runtime.block_on(async {
+            server
+                .registry
+                .lock()
+                .await
+                .close_connection_after(CLOSE_AFTER);
+        });
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        let closer = h.alloc_extra_stmt();
+        exec(closer, CLOSE_AFTER);
+        assert_eq!(unsafe { sql_close_cursor(closer) }, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .client()
+                .is_some_and(|client| !client.is_connection_dead()),
+            "the closed socket is not yet observed"
+        );
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_ERROR);
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+    }
+
+    /// A connection already known dead that session recovery reconnects does
+    /// send the request, so a server error afterwards drops the classification.
+    #[test]
+    fn a_send_after_a_successful_reconnect_drops_the_classification() {
+        let (server, payload) = classified_server();
+        server.runtime.block_on(async {
+            server.registry.lock().await.set_session_recovery(true);
+        });
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+        server.register(
+            CLASSIFIED,
+            QueryResponse::error_only(TerminalError::new(208, 16, "Invalid object name.")),
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .client_mut_for_test()
+            .unwrap()
+            .mark_connection_dead();
+
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_ERROR);
+        assert!(
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .client()
+                .is_some_and(|client| !client.is_connection_dead()),
+            "session recovery reconnected before the request was sent"
+        );
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+    }
+
+    /// With two streamed data-at-execution parameters, closing the first sends
+    /// no complete request, so the classification stays through that
+    /// `SQLParamData` and a cancel after it; the last one drops it even when
+    /// the server then fails the request.
+    #[test]
+    fn closing_a_streamed_parameter_before_the_last_keeps_the_classification() {
+        use crate::api::odbc_types::{
+            SQL_C_CHAR, SQL_C_SLONG, SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NEED_DATA, SQL_NTS,
+            SQL_PARAM_INPUT, SQL_VARCHAR,
+        };
+
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = h.alloc_extra_stmt();
+        let mut id: i32 = 1;
+        let mut id_len: SqlLen = 0;
+        let mut dae = SQL_DATA_AT_EXEC;
+        let bind = |streamed: bool, id: &mut i32, id_len: &mut SqlLen, dae: &mut SqlLen| {
+            for number in 1..=2u16 {
+                let rc = unsafe {
+                    if streamed {
+                        crate::api::SQLBindParameter(
+                            stmt,
+                            number,
+                            SQL_PARAM_INPUT,
+                            SQL_C_CHAR,
+                            SQL_VARCHAR,
+                            0,
+                            0,
+                            usize::from(number) as SqlPointer,
+                            0,
+                            dae,
+                        )
+                    } else {
+                        crate::api::SQLBindParameter(
+                            stmt,
+                            number,
+                            SQL_PARAM_INPUT,
+                            SQL_C_SLONG,
+                            SQL_INTEGER,
+                            0,
+                            0,
+                            std::ptr::from_mut(id).cast(),
+                            0,
+                            id_len,
+                        )
+                    }
+                };
+                assert_eq!(rc, SQL_SUCCESS);
+            }
+        };
+        bind(false, &mut id, &mut id_len, &mut dae);
+        let text: Vec<SqlWChar> = format!("{CLASSIFIED} WHERE ID = ? OR ID = ?")
+            .encode_utf16()
+            .collect();
+        let len = SqlInteger::try_from(text.len()).unwrap();
+        assert_eq!(
+            unsafe { sql_prepare_w(stmt, text.as_ptr(), len) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_SUCCESS);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        bind(true, &mut id, &mut id_len, &mut dae);
+
+        let mut token: SqlPointer = std::ptr::null_mut();
+        let mut value = *b"1\0";
+        let mut send_first_parameter = || unsafe {
+            assert_eq!(sql_execute(stmt), SQL_NEED_DATA);
+            assert_eq!(
+                crate::api::SQLParamData(stmt, &raw mut token),
+                SQL_NEED_DATA
+            );
+            assert_eq!(
+                crate::api::SQLPutData(stmt, value.as_mut_ptr().cast(), SqlLen::from(SQL_NTS)),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                crate::api::SQLParamData(stmt, &raw mut token),
+                SQL_NEED_DATA
+            );
+        };
+        send_first_parameter();
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload.clone()));
+        assert_eq!(unsafe { crate::api::SQLCancel(stmt) }, SQL_SUCCESS);
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload.clone()));
+
+        server.register(
+            CLASSIFIED,
+            QueryResponse::error_only(TerminalError::new(208, 16, "Invalid object name.")),
+        );
+        send_first_parameter();
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+        let mut value = *b"2\0";
+        unsafe {
+            assert_eq!(
+                crate::api::SQLPutData(stmt, value.as_mut_ptr().cast(), SqlLen::from(SQL_NTS)),
+                SQL_SUCCESS
+            );
+            assert_eq!(crate::api::SQLParamData(stmt, &raw mut token), SQL_ERROR);
+        }
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+    }
     /// A failed execution reports no classification, not the one its
     /// statement had before.
     #[test]

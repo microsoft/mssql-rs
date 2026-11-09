@@ -309,7 +309,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // `query_timeout` (already deducted above) bounds the whole call,
             // including any reconnect charged above; `0` means unlimited, matching
             // the ODBC default.
-            super::ird::clear_ird_classification(stmt);
+            let pending = super::ird::clear_for_send(stmt, &client);
             let exec_result = dbc.runtime.block_on(
                 client.execute_prepared(
                     &mut prepared.stmt,
@@ -331,6 +331,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
 
             if let Err(e) = exec_result {
                 error!(%e, "SQLExecute: prepared execution failed");
+                pending.restore_if_unsent(stmt, &client);
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
@@ -562,6 +563,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 failures: Vec::new(),
                 truncated_rows: Vec::new(),
             };
+            let pending = super::ird::clear_for_send(stmt, &client);
             let batch_result = dbc.runtime.block_on(
                 client.begin_execute_prepared_batch(
                     &mut prepared.stmt,
@@ -613,14 +615,15 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     stmt_state.clear_exhaustion_state();
                     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
                 }
+                pending.restore(stmt);
                 return SQL_ERROR;
             }
-            super::ird::clear_ird_classification(stmt);
 
             let result = match batch_result {
                 Ok(result) => result,
                 Err(error) => {
                     error!(%error, "SQLExecute: parameter-array execution failed");
+                    pending.restore_if_unsent(stmt, &client);
                     return fail_with_tds(dbc, stmt, statement_handle, client, &error);
                 }
             };

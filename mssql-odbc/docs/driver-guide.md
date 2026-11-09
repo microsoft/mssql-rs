@@ -130,9 +130,11 @@ or swept by `SQLEndTran`. Ending a started transaction also drops it from a
 prepared statement whose cursor was already closed. A call that sends nothing
 keeps it, as in msodbcsql, so `SQL_ERROR` alone does not mean it was cleared:
 a parameter that fails conversion (`22018`), a connection busy with another
-statement's results, a parameter array whose every set is ignored or fails
-conversion, and a data-at-execution `SQLExecute` or `SQLExecDirect` before its
-last `SQLParamData` (including one cancelled at `SQL_NEED_DATA`). A server
+statement's results, a connection already known to be dead that session
+recovery cannot reconnect, a parameter array whose every set is ignored or
+fails conversion, and a data-at-execution `SQLExecute` or `SQLExecDirect`
+before its last `SQLParamData` (including one cancelled at `SQL_NEED_DATA` or
+between parameters). A server
 error that a fetch reports after rows were delivered also keeps it. Closing
 the statement afterwards follows the rules above.
 

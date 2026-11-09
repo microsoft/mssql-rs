@@ -579,9 +579,9 @@ TEST_F(DataClassificationTest, NothingSentKeepsTheClassification) {
         EXPECT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
         return other;
     };
-    auto release = [&](SQLHSTMT other) {
+    auto release = [&](SQLHSTMT& other) {
         SQLFreeStmt(other, SQL_CLOSE);
-        SQLFreeHandle(SQL_HANDLE_STMT, other);
+        FreeStmt(other);
     };
 
     ASSERT_NO_FATAL_FAILURE(prepare_and_close());
@@ -774,6 +774,12 @@ TEST_F(DataClassificationTest, LabelsUpTo128CharactersAreReturned) {
                std::string(127, 'a') + "', LABEL_ID = 'L');" +
                "ADD SENSITIVITY CLASSIFICATION TO dbo." + table_ + ".note WITH (LABEL = '" +
                std::string(128, 'b') + "', LABEL_ID = 'L');");
+    // Read both statements' results, so closing cannot cancel the second ADD
+    // or hide its error.
+    SQLRETURN more;
+    while (SQL_SUCCEEDED(more = SQLMoreResults(stmt_))) {
+    }
+    ASSERT_EQ(SQL_NO_DATA, more) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
     SQLFreeStmt(stmt_, SQL_CLOSE);
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(5), 0),
                   SQL_HANDLE_STMT, stmt_);

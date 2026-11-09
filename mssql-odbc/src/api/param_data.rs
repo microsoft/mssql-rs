@@ -558,7 +558,7 @@ fn sql_param_data_operation(
         };
         (dae.take_prepared(), dae.take_orphaned())
     };
-    super::ird::clear_ird_classification(stmt);
+    let pending = super::ird::clear_for_send(stmt, &client);
     let end_result = match prepared.as_mut() {
         Some(plan) => dbc
             .runtime
@@ -586,6 +586,8 @@ fn sql_param_data_operation(
 
     match end_result {
         Ok(StreamedParamStatus::NeedData { param_name: _ }) => {
+            // Another parameter follows, so the request is still incomplete.
+            pending.restore(stmt);
             // Advance to the next DAE parameter.
             let next_ptr = {
                 let mut stmt_state = match stmt.inner.lock() {
@@ -956,7 +958,7 @@ fn run_deferred_execute(
     let options = ExecuteOptions::new()
         .timeout_secs(timeout_secs)
         .cancel(&cancel_handle);
-    super::ird::clear_ird_classification(stmt);
+    let pending = super::ird::clear_for_send(stmt, &client);
     let exec_result = match (prepared.as_mut(), sql) {
         (Some(plan), _) => dbc
             .runtime
@@ -983,6 +985,7 @@ fn run_deferred_execute(
 
     if let Err(e) = exec_result {
         error!(%e, "SQLParamData: deferred execute failed");
+        pending.restore_if_unsent(stmt, &client);
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
