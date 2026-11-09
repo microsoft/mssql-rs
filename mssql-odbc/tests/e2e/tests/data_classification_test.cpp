@@ -743,7 +743,7 @@ TEST_F(DataClassificationTest, ShortBufferReturnsThePrefixAndFullLength) {
     EXPECT_EQ(static_cast<SQLINTEGER>(full->size()), length);
 }
 
-// Pins parity-deviations entry 40: msodbcsql posts IDS_S1_004 (HY004, "Invalid
+// Pins parity-deviations entry 41: msodbcsql posts IDS_S1_004 (HY004, "Invalid
 // SQL data type") for a truncated payload (sqlcdesc.cpp:5240-5256); this driver
 // reports the ODBC truncation state.
 TEST_F(DataClassificationTest, ShortBufferSqlState) {
@@ -764,7 +764,7 @@ TEST_F(DataClassificationTest, ShortBufferSqlState) {
 
 // SQL Server allows a 128-character label, the most a B_VARCHAR length byte
 // holds below 256. msodbcsql 18.07.0001 handles 127 units but times out on 128
-// (parity deviation 41); this driver returns both. A finite query timeout
+// (parity deviation 42); this driver returns both. A finite query timeout
 // keeps the reference leg from hanging.
 TEST_F(DataClassificationTest, LabelsUpTo128CharactersAreReturned) {
     ConnectDbc();

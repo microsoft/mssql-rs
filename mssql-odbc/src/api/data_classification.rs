@@ -520,7 +520,7 @@ mod tests {
 
     /// A B_VARCHAR length is an unsigned byte. SQL Server sends names of up to
     /// 128 UTF-16 units, where msodbcsql 18.07.0001 times out (parity deviation
-    /// 41); every length up to 255 round-trips here. ASCII names make
+    /// 42); every length up to 255 round-trips here. ASCII names make
     /// `capacity` exact, so its debug assertion checks every v2 rank is counted.
     #[test]
     fn names_up_to_255_units_are_returned_verbatim() {
