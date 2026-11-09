@@ -25,6 +25,7 @@ mod rpc_request_text {
     use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
     use mssql_tds::datatypes::sql_udt::UdtTypeName;
     use mssql_tds::datatypes::sqltypes::SqlType;
+    use mssql_tds::error::Error;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
     use mssql_tds::query::metadata::ColumnMetadata;
     use mssql_tds::query::result::ReturnValue;
@@ -57,6 +58,18 @@ mod rpc_request_text {
     fn sum_statement(count: usize) -> String {
         let terms: Vec<String> = (1..=count).map(|ordinal| format!("@P{ordinal}")).collect();
         format!("SELECT {}", terms.join("+"))
+    }
+
+    /// Error 8003: the RPC exceeds the server's 2100-parameter limit. The
+    /// number, not the message, is stable across server languages.
+    fn assert_too_many_parameters(error: &Error) {
+        match error {
+            Error::SqlServerError { diagnostics } => assert!(
+                diagnostics.errors.iter().any(|e| e.number == 8003),
+                "{error}"
+            ),
+            other => panic!("expected SQL Server error 8003, got {other:?}"),
+        }
     }
 
     fn string_value(value: &ColumnValues) -> String {
@@ -281,7 +294,7 @@ mod rpc_request_text {
             .execute_sp_executesql(sum_statement(2099), int_params(2099), ())
             .await
             .expect_err("2101 RPC parameters exceed the server limit");
-        assert!(error.to_string().contains("too many parameters"), "{error}");
+        assert_too_many_parameters(&error);
         client.close_query().await.unwrap();
 
         let mut statement = PreparedStatement::new(sum_statement(2097));
@@ -301,7 +314,7 @@ mod rpc_request_text {
             .execute_prepared(&mut statement, int_params(2098), &mut orphaned, ())
             .await
             .expect_err("2101 RPC parameters exceed the server limit");
-        assert!(error.to_string().contains("too many parameters"), "{error}");
+        assert_too_many_parameters(&error);
         client.close_query().await.unwrap();
 
         client.execute("SELECT 1".to_string(), ()).await.unwrap();
