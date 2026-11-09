@@ -2,8 +2,7 @@
 # Licensed under the MIT License.
 
 # Re-download the immutable selected build artifact in every job, never an
-# intermediate artifact or a directory supplied by the registry-check agent.
-# Sets crate version variables from the manifest for later steps in the same job.
+# intermediate artifact or a directory supplied by another job.
 parameters:
 - name: requireMssqlRs
   type: boolean
