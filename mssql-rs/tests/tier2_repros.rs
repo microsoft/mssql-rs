@@ -8,8 +8,8 @@
 //! use the shared live-test environment (`tests/common/mod.rs`) when run.
 //!
 //! Triage status when added: #368 and the chrono path for #316 did not
-//! reproduce. #333 preserves special-character passwords and fails with a clean
-//! authentication error when the test user is absent.
+//! reproduce. #333 preserves special-character passwords; its live repro
+//! creates and drops a temporary login with a generated password.
 
 pub mod common;
 
@@ -47,9 +47,16 @@ fn test_316_datetime_before_1900_chrono_does_not_panic() {
     );
 }
 
+/// Characters that are significant in connection strings and T-SQL literals.
+const SPECIAL_PASSWORD_PREFIX: &str = ";{}='!@%&*()";
+
+fn special_character_password() -> String {
+    format!("{SPECIAL_PASSWORD_PREFIX}{}", uuid::Uuid::new_v4())
+}
+
 #[test]
 fn test_333_special_character_password_is_preserved_in_config() {
-    let password = format!("{}!@%&*()", uuid::Uuid::new_v4());
+    let password = special_character_password();
     let mut cfg = Config::new();
     cfg.authentication(AuthMethod::sql_server("user", &password));
 
@@ -76,8 +83,8 @@ async fn test_160_trigger_rows_affected_has_single_update_count() {
     };
 
     let suffix = uuid::Uuid::new_v4().simple();
-    let table = format!("t_bridge_tier2_160_{suffix}");
-    let trigger = format!("tr_bridge_tier2_160_{suffix}");
+    let table = format!("t_driver_tier2_160_{suffix}");
+    let trigger = format!("tr_driver_tier2_160_{suffix}");
     client
         .simple_query(&format!(
             "BEGIN TRANSACTION;
@@ -196,7 +203,7 @@ async fn test_282_stored_procedure_string_parameter_has_no_added_quotes() {
     client
         .simple_query(
             r#"
-            CREATE PROCEDURE #p_bridge_tier2_282 @v NVARCHAR(50) AS
+            CREATE PROCEDURE #p_driver_tier2_282 @v NVARCHAR(50) AS
             BEGIN
                 SET NOCOUNT ON;
                 SELECT @v AS v;
@@ -207,13 +214,13 @@ async fn test_282_stored_procedure_string_parameter_has_no_added_quotes() {
         .expect("create procedure");
 
     let rows = client
-        .query("EXEC #p_bridge_tier2_282 @P1", &[&"hello"])
+        .query("EXEC #p_driver_tier2_282 @P1", &[&"hello"])
         .await
         .expect("exec procedure")
         .into_first_result();
 
     client
-        .simple_query("DROP PROCEDURE #p_bridge_tier2_282")
+        .simple_query("DROP PROCEDURE #p_driver_tier2_282")
         .await
         .expect("drop procedure");
 
@@ -236,20 +243,20 @@ async fn test_221_nan_parameter_errors_without_poisoning_connection()
     };
 
     client
-        .simple_query("CREATE TABLE #t_bridge_tier2_221(v decimal(19, 4) NULL);")
+        .simple_query("CREATE TABLE #t_driver_tier2_221(v decimal(19, 4) NULL);")
         .await
         .expect("create NaN repro table");
 
     let err = client
         .execute(
-            "INSERT INTO #t_bridge_tier2_221(v) VALUES (@P1)",
+            "INSERT INTO #t_driver_tier2_221(v) VALUES (@P1)",
             &[&f64::NAN],
         )
         .await
         .expect_err("NaN insert into decimal should fail gracefully");
 
     let rows = client
-        .simple_query("SELECT 1 AS ok; DROP TABLE #t_bridge_tier2_221;")
+        .simple_query("SELECT 1 AS ok; DROP TABLE #t_driver_tier2_221;")
         .await
         .map_err(|follow_up| {
             format!(
@@ -303,52 +310,50 @@ async fn test_316_live_datetime_before_1900_chrono_does_not_panic() {
 
 #[tokio::test]
 #[ignore]
-async fn test_333_special_character_password_connect_fails_cleanly_or_succeeds() {
-    let password = match std::env::var("BRIDGE_SPECIAL_PASSWORD") {
-        Ok(password) => password,
-        Err(_) => {
-            eprintln!("BRIDGE_SPECIAL_PASSWORD not set; skipping #333 live repro");
-            return;
-        }
-    };
-    let Some(mut cfg) = common::live_config() else {
+async fn test_333_special_character_password_login_succeeds() {
+    let Some(mut admin) = live_client().await else {
         eprintln!("SQL_PASSWORD not set; skipping #333 live repro");
         return;
     };
-    cfg.authentication(AuthMethod::sql_server(
-        std::env::var("BRIDGE_SPECIAL_PASSWORD_USER").unwrap_or_else(|_| "user".into()),
-        password,
-    ));
 
-    match Client::connect(&cfg).await {
-        Ok(mut client) => {
-            let rows = client
-                .simple_query("SELECT 1 AS ok")
-                .await
-                .expect("query with special-character password login")
-                .into_first_result();
-            assert_eq!(
-                rows.first()
-                    .expect("expected row at index 0")
-                    .get::<i32, _>("ok"),
-                Some(1)
-            );
-        }
-        Err(err) => {
-            let message = format!("{err:?}").to_lowercase();
-            assert!(
-                message.contains("login")
-                    || message.contains("auth")
-                    || message.contains("password")
-                    || message.contains("user"),
-                "special-character password should fail as a clean auth error, got: {err:?}"
-            );
-            assert!(
-                !message.contains("parse") && !message.contains("datasource"),
-                "special-character password caused a parse-like error: {err:?}"
-            );
-        }
+    let login = format!("mssql_rs_tier2_333_{}", uuid::Uuid::new_v4().simple());
+    let password = special_character_password();
+    admin
+        .simple_query(format!(
+            "CREATE LOGIN [{login}] WITH PASSWORD = N'{}', CHECK_POLICY = OFF",
+            password.replace('\'', "''")
+        ))
+        .await
+        .expect("create special-character password login");
+
+    let mut cfg = common::live_config().expect("live config");
+    cfg.database("master")
+        .authentication(AuthMethod::sql_server(&login, &password));
+    let result = async {
+        let mut client = Client::connect(&cfg).await?;
+        let rows = client
+            .simple_query("SELECT 1 AS ok")
+            .await?
+            .into_first_result();
+        Ok::<_, mssql_rs::Error>(rows.first().and_then(|row| row.get::<i32, _>("ok")))
     }
+    .await;
+
+    admin
+        .simple_query(format!(
+            "DECLARE @kill nvarchar(max) = N'';
+             SELECT @kill += N'KILL ' + CAST(session_id AS nvarchar(10)) + N';'
+             FROM sys.dm_exec_sessions WHERE login_name = N'{login}';
+             EXEC(@kill);
+             DROP LOGIN [{login}];"
+        ))
+        .await
+        .expect("drop special-character password login");
+
+    assert_eq!(
+        result.expect("connect with special-character password"),
+        Some(1)
+    );
 }
 
 #[test]
@@ -356,6 +361,6 @@ fn test_221_nan_parameter_is_currently_encoded_as_float_nan() {
     let sql_type = f64::NAN.to_sql();
     assert!(
         matches!(sql_type, mssql_tds::datatypes::sqltypes::SqlType::Float(Some(v)) if v.is_nan()),
-        "bridge currently passes NaN through to mssql-tds; live test verifies graceful recovery"
+        "driver currently passes NaN through to mssql-tds; live test verifies graceful recovery"
     );
 }

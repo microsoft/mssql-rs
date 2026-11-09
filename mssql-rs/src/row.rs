@@ -182,7 +182,7 @@ impl Row {
     /// Try to get a value using Tiberius-compatible conversion errors.
     ///
     /// A target-compatible typed SQL NULL returns `Ok(None)`; an incompatible
-    /// variant returns [`Error::Conversion`]. The bridge-native
+    /// variant returns [`Error::Conversion`]. The driver-native
     /// [`Row::try_get`] is unchanged.
     pub fn try_get_compat<'a, T: crate::compat::FromSql<'a>, I: ColumnIndex>(
         &'a self,
@@ -794,7 +794,7 @@ impl<'a> FromSql<'a> for rust_decimal::Decimal {
 /// A [`RowWriter`] that builds a [`Row`] directly during TDS wire decode,
 /// avoiding the intermediate `Vec<ColumnValues>` allocation and the second
 /// pass over values to decode strings.
-pub(crate) struct BridgeRowWriter {
+pub(crate) struct DriverRowWriter {
     schema: Arc<RowSchema>,
     result_index: usize,
     values: Vec<ColumnValues>,
@@ -802,7 +802,7 @@ pub(crate) struct BridgeRowWriter {
     col_count: usize,
 }
 
-impl BridgeRowWriter {
+impl DriverRowWriter {
     #[cfg(test)]
     pub(crate) fn new(schema: Arc<RowSchema>) -> Self {
         Self::with_result_index(schema, 0)
@@ -835,7 +835,7 @@ impl BridgeRowWriter {
     }
 }
 
-impl RowWriter for BridgeRowWriter {
+impl RowWriter for DriverRowWriter {
     fn write_null(&mut self, _col: usize) {
         self.values.push(ColumnValues::Null);
         self.decoded_strings.push(None);
@@ -1243,7 +1243,7 @@ mod tests {
             bytes.extend_from_slice(&1.0f64.to_le_bytes());
             bytes.extend_from_slice(&2.0f64.to_le_bytes());
             let expected = Row::from_tds(&metadata, vec![ColumnValues::Bytes(bytes.clone())]);
-            let mut writer = BridgeRowWriter::new(RowSchema::from_metadata(&metadata));
+            let mut writer = DriverRowWriter::new(RowSchema::from_metadata(&metadata));
 
             writer.write_null(0);
             let null = writer.take_row();
@@ -1298,7 +1298,7 @@ mod tests {
     #[test]
     fn writer_owns_borrowed_wire_values() {
         let schema = make_row(&["text", "bytes"], vec![]).schema;
-        let mut writer = BridgeRowWriter::new(schema);
+        let mut writer = DriverRowWriter::new(schema);
         let mut text: Vec<u8> = "héllo".encode_utf16().flat_map(u16::to_le_bytes).collect();
         let mut bytes = vec![1, 2, 3];
         writer.write_string(0, Cow::Borrowed(&text), EncodingType::Utf16);
@@ -1505,7 +1505,7 @@ mod tests {
     #[test]
     fn ne_different_column_types_same_arity() {
         // Build two rows where the value types coincide on the wire (both
-        // are the bridge's "Int" carrier) but the schemas claim different
+        // are the driver's "Int" carrier) but the schemas claim different
         // column types — equality should reject the mismatch.
         let cols_a = vec![Column::test_column("v", crate::column::ColumnType::Int4, 4)];
         let cols_b = vec![Column::test_column("v", crate::column::ColumnType::Int8, 8)];

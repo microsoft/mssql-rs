@@ -80,7 +80,7 @@ async fn into_row_stream_supports_map_next() {
 async fn into_row_stream_dropped_early_does_not_panic() {
     // Mirrors tiberius'
     // `drop_stream_before_handling_all_results_should_not_cause_weird_things`.
-    // Because the bridge buffers rows up-front, dropping the stream simply
+    // Because the driver buffers rows up-front, dropping the stream simply
     // drops the in-memory Vec — no wire state to corrupt. The client must
     // remain usable for subsequent queries.
     let mut client = connect().await;

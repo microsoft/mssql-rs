@@ -54,13 +54,13 @@ async fn image_column_exposes_source_table() {
     let mut client = Client::connect(&cfg).await.expect("connect failed");
     client
         .simple_query(
-            "CREATE TABLE #bridge_metadata_source (value IMAGE NULL); \
-             INSERT INTO #bridge_metadata_source (value) VALUES (0x01);",
+            "CREATE TABLE #driver_metadata_source (value IMAGE NULL); \
+             INSERT INTO #driver_metadata_source (value) VALUES (0x01);",
         )
         .await
         .expect("create metadata source");
     let rows = client
-        .simple_query("SELECT value FROM #bridge_metadata_source")
+        .simple_query("SELECT value FROM #driver_metadata_source")
         .await
         .expect("select metadata source")
         .into_first_result();
@@ -72,7 +72,7 @@ async fn image_column_exposes_source_table() {
         .expect("expected image column")
         .multi_part_name()
         .expect("expected source table name");
-    assert!(source.table_name.starts_with("#bridge_metadata_source"));
+    assert!(source.table_name.starts_with("#driver_metadata_source"));
 }
 
 #[tokio::test]

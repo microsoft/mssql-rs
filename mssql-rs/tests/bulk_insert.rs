@@ -5,7 +5,7 @@
 //! Integration test for `Client::bulk_insert` (issue #53).
 //!
 //! Mirrors `mssql-tds`'s bulk_copy integration coverage but exercises the
-//! bridge wrapper. Skipped when the shared live-test password is unavailable.
+//! driver API. Skipped when the shared live-test password is unavailable.
 
 pub mod common;
 
@@ -52,7 +52,7 @@ async fn bulk_insert_thousand_rows() {
 
     client
         .execute(
-            "CREATE TABLE #BridgeBulkPeople (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
+            "CREATE TABLE #DriverBulkPeople (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
             &[],
         )
         .await
@@ -69,7 +69,7 @@ async fn bulk_insert_thousand_rows() {
     // Functional values are kept conservative (false / off) so the load
     // succeeds against any default destination table.
     let result = client
-        .bulk_insert("#BridgeBulkPeople")
+        .bulk_insert("#DriverBulkPeople")
         .batch_size(500)
         .timeout(std::time::Duration::from_secs(60))
         .check_constraints(false)
@@ -87,7 +87,7 @@ async fn bulk_insert_thousand_rows() {
     assert!(result.elapsed.as_nanos() > 0);
 
     let count_rows = client
-        .simple_query("SELECT COUNT(*) AS n FROM #BridgeBulkPeople")
+        .simple_query("SELECT COUNT(*) AS n FROM #DriverBulkPeople")
         .await
         .expect("select count failed")
         .into_first_result();
@@ -106,7 +106,7 @@ async fn bulk_insert_with_columns_and_named_mapping() {
 
     client
         .execute(
-            "CREATE TABLE #BridgeBulkPeopleByCols (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
+            "CREATE TABLE #DriverBulkPeopleByCols (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
             &[],
         )
         .await
@@ -117,7 +117,7 @@ async fn bulk_insert_with_columns_and_named_mapping() {
         name: "Margaret".into(),
     }];
     let r = client
-        .bulk_insert_with_columns("#BridgeBulkPeopleByCols", &["id", "name"])
+        .bulk_insert_with_columns("#DriverBulkPeopleByCols", &["id", "name"])
         .send(rows)
         .await
         .expect("bulk_insert_with_columns failed");
@@ -126,7 +126,7 @@ async fn bulk_insert_with_columns_and_named_mapping() {
     // map_column (by-name helper) path
     client
         .execute(
-            "CREATE TABLE #BridgeBulkPeopleByName (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
+            "CREATE TABLE #DriverBulkPeopleByName (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
             &[],
         )
         .await
@@ -136,7 +136,7 @@ async fn bulk_insert_with_columns_and_named_mapping() {
         name: "Linus".into(),
     }];
     let r2 = client
-        .bulk_insert("#BridgeBulkPeopleByName")
+        .bulk_insert("#DriverBulkPeopleByName")
         .map_column("source-id-ignored-by-ordinal-fallback", "id")
         .map_column("source-name-ignored-by-ordinal-fallback", "name")
         // Also exercise add_column_mapping directly (re-adding "id" by ordinal)
@@ -145,7 +145,7 @@ async fn bulk_insert_with_columns_and_named_mapping() {
         .await;
     // The by-name source mappings won't actually match a source-column-name
     // for our raw `BulkLoadRow` impl (we have no source schema). The point
-    // here is purely to cover the bridge-side builder forwarding paths;
+    // here is purely to cover the driver-side builder forwarding paths;
     // we accept either Ok or Err — only the call site must execute.
     drop(r2);
 }
@@ -159,7 +159,7 @@ async fn bulk_insert_via_inner_mut() {
 
     client
         .execute(
-            "CREATE TABLE #BridgeBulkLowLevel (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
+            "CREATE TABLE #DriverBulkLowLevel (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
             &[],
         )
         .await
@@ -170,7 +170,7 @@ async fn bulk_insert_via_inner_mut() {
         name: "Linus".into(),
     }];
 
-    let bi = mssql_rs::bulk::BulkInsert::new(client.inner_mut(), "#BridgeBulkLowLevel");
+    let bi = mssql_rs::bulk::BulkInsert::new(client.inner_mut(), "#DriverBulkLowLevel");
     let result = bi
         .map_column_by_ordinal(0, "id")
         .map_column_by_ordinal(1, "name")

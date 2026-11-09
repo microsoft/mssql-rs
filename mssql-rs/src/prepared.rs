@@ -60,7 +60,7 @@
 //! `#[must_use]` to nudge callers toward explicit cleanup.
 //!
 //! Preparation, execution, and explicit close follow [`Client`]'s cancellation
-//! safety contract. Dropping an in-flight bridge operation marks the connection
+//! safety contract. Dropping an in-flight driver operation marks the connection
 //! dead, including when preparation is still reading its output handle. Discard
 //! the client and prepare new handles on the replacement connection.
 //!
@@ -148,7 +148,7 @@ impl PreparedStatement {
             ),
         ];
         // The managed driver API prepares lazily and hides the server handle.
-        // A named RPC preserves the bridge's eager prepare and raw-handle API.
+        // A named RPC preserves the driver's eager prepare and raw-handle API.
         client
             .execute_stored_procedure("sp_prepare".into(), Some(parameters), None, ())
             .await

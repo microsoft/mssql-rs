@@ -25,7 +25,7 @@ async fn bulk_insert_send_arrow_mixed_types() {
 
     client
         .execute(
-            "CREATE TABLE #BridgeBulkArrow (
+            "CREATE TABLE #DriverBulkArrow (
                 id INT NOT NULL,
                 name NVARCHAR(100) NOT NULL,
                 price DECIMAL(10, 2) NOT NULL,
@@ -67,7 +67,7 @@ async fn bulk_insert_send_arrow_mixed_types() {
     .expect("RecordBatch::try_new failed");
 
     let result = client
-        .bulk_insert("#BridgeBulkArrow")
+        .bulk_insert("#DriverBulkArrow")
         .batch_size(500)
         .table_lock(true)
         .send_arrow(batch)
@@ -80,7 +80,7 @@ async fn bulk_insert_send_arrow_mixed_types() {
     );
 
     let count_rows = client
-        .simple_query("SELECT COUNT(*) AS n FROM #BridgeBulkArrow")
+        .simple_query("SELECT COUNT(*) AS n FROM #DriverBulkArrow")
         .await
         .expect("select count failed")
         .into_first_result();
@@ -99,7 +99,7 @@ async fn bulk_insert_send_arrow_batches() {
 
     client
         .execute(
-            "CREATE TABLE #BridgeBulkArrowBatches (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
+            "CREATE TABLE #DriverBulkArrowBatches (id INT NOT NULL, name NVARCHAR(100) NOT NULL)",
             &[],
         )
         .await
@@ -124,7 +124,7 @@ async fn bulk_insert_send_arrow_batches() {
         .collect();
 
     let result = client
-        .bulk_insert("#BridgeBulkArrowBatches")
+        .bulk_insert("#DriverBulkArrowBatches")
         .send_arrow_batches(batches)
         .await
         .expect("send_arrow_batches failed");

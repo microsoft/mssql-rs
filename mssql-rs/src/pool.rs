@@ -8,7 +8,7 @@
 //! `READ COMMITTED` isolation. Use [`RecyclingMethod::Ping`] only when retaining
 //! session state and relying on cached connection health is intentional.
 //!
-//! Connections marked dead after cancelled bridge I/O are rejected before the
+//! Connections marked dead after cancelled driver I/O are rejected before the
 //! recycle reset or ping, so deadpool drops them and creates replacements.
 //! Healthy connections follow the selected recycling policy. See [`Client`]'s
 //! cancellation safety contract, including the unguarded [`Client::inner_mut`]

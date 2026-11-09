@@ -4,38 +4,30 @@
 
 //! SSRP / SQL Browser instance lookup integration test (issue #14).
 //!
-//! Skipped unless `BRIDGE_SSRP_HOST` and `BRIDGE_SSRP_INSTANCE` are set,
-//! because the standard MSSQL Docker images don't run the SQL Browser
-//! service (UDP 1434).
-//!
-//! Set `SQL_PASSWORD` before running:
-//!     BRIDGE_SSRP_HOST=mssql.lab \
-//!     BRIDGE_SSRP_INSTANCE=SQLEXPRESS \
-//!     DB_USERNAME=sa \
-//!     cargo nextest run -p mssql-rs --test ssrp
+//! Windows-only and gated on `SSPI_TEST`, matching
+//! `mssql-tds/tests/test_ssrp_local.rs`. Requires SQL Browser and a local
+//! named instance reachable with integrated authentication. The instance name
+//! comes from `SSPI_NAMED_INSTANCE` (default: `sqldev`), which CI provisions in
+//! `.pipeline/templates/sql-setup-template.yml`.
 
-pub mod common;
+#![cfg(windows)]
 
 use mssql_rs::{AuthMethod, Client, Config};
 
 #[tokio::test]
 async fn ssrp_named_instance_connect() {
-    let Ok(host) = std::env::var("BRIDGE_SSRP_HOST") else {
-        eprintln!("BRIDGE_SSRP_HOST not set, skipping");
+    if std::env::var("SSPI_TEST").is_err() {
+        eprintln!("SSPI_TEST not set, skipping");
         return;
-    };
-    let Ok(instance) = std::env::var("BRIDGE_SSRP_INSTANCE") else {
-        eprintln!("BRIDGE_SSRP_INSTANCE not set, skipping");
-        return;
-    };
-    let password = common::password().expect("SQL_PASSWORD required");
+    }
+    let instance = std::env::var("SSPI_NAMED_INSTANCE").unwrap_or_else(|_| "sqldev".into());
 
     let mut cfg = Config::new();
-    cfg.host(host)
+    cfg.host("localhost")
         .instance_name(instance)
-        .database(common::database())
-        .authentication(AuthMethod::sql_server(common::user_name(), password));
-    common::apply_certificate_settings(&mut cfg);
+        .database("master")
+        .authentication(AuthMethod::integrated())
+        .trust_cert();
 
     let mut client = Client::connect(&cfg)
         .await

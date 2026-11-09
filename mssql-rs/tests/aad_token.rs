@@ -4,9 +4,10 @@
 
 //! AAD/Entra ID federated auth integration test (issue #17).
 //!
-//! Gated on `BRIDGE_AAD_TOKEN` (a JWT for `https://database.windows.net/.default`)
-//! plus the shared live-test `DB_HOST`, `DB_PORT`, and `DB_DATABASE` pointing
-//! at an AAD-enabled SQL Server (Azure SQL DB or Managed Instance).
+//! Gated on `ACCESS_TOKEN` (a JWT for `https://database.windows.net/.default`,
+//! matching the `mssql-py-core` access-token tests) plus the shared live-test
+//! `DB_HOST`, `DB_PORT`, and `DB_DATABASE` pointing at an AAD-enabled SQL
+//! Server (Azure SQL DB or Managed Instance).
 
 pub mod common;
 
@@ -14,8 +15,8 @@ use mssql_rs::{AuthMethod, Client, Config, EncryptionLevel};
 
 #[tokio::test]
 async fn aad_token_login() {
-    let Ok(token) = std::env::var("BRIDGE_AAD_TOKEN") else {
-        eprintln!("BRIDGE_AAD_TOKEN not set, skipping");
+    let Ok(token) = std::env::var("ACCESS_TOKEN") else {
+        eprintln!("ACCESS_TOKEN not set, skipping");
         return;
     };
     let host = std::env::var("DB_HOST").unwrap_or_else(|_| "localhost".into());

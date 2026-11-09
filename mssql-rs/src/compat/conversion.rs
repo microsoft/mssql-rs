@@ -21,7 +21,7 @@ use crate::row::FromSql as NativeFromSql;
 
 /// Tiberius-shaped SQL value used by the compatibility conversion traits.
 ///
-/// Values delegate their encoding to the bridge's native [`NativeToSql`]
+/// Values delegate their encoding to the driver's native [`NativeToSql`]
 /// implementations. Unsupported native-only parameter forms remain available
 /// through [`ColumnData::Native`] without claiming a Tiberius equivalent.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,7 +47,7 @@ pub enum ColumnData<'a> {
     Money(Option<SqlMoney>),
     SmallMoney(Option<SqlSmallMoney>),
     Json(Option<Cow<'a, str>>),
-    /// A bridge-native parameter with no faithful Tiberius `ColumnData` shape.
+    /// A driver-native parameter with no faithful Tiberius `ColumnData` shape.
     Native(SqlType),
 }
 
@@ -125,7 +125,7 @@ impl ColumnData<'_> {
             ColumnData::Json(Some(value)) => ColumnValues::Json(SqlJson::from(value.into_owned())),
             ColumnData::Native(value) => {
                 return Err(Error::Conversion(format!(
-                    "cannot decode bridge-native parameter {value:?} as a row value"
+                    "cannot decode driver-native parameter {value:?} as a row value"
                 )));
             }
             ColumnData::Bit(None)
@@ -1234,7 +1234,7 @@ mod tests {
         assert!(matches!(
             native.into_column_value(),
             Err(Error::Conversion(message))
-                if message.contains("bridge-native parameter")
+                if message.contains("driver-native parameter")
         ));
     }
 

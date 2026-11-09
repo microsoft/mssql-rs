@@ -81,7 +81,7 @@ async fn example() -> mssql_rs::Result<()> {
 
 ### `instance_name(...)`
 
-Default is no named instance, so the datasource is `tcp:host,port`. Set an instance such as `SQLEXPRESS` when you want SQL Browser / SSRP to resolve the TCP port; when set, the bridge builds `tcp:host\\instance` and drops the explicit port.
+Default is no named instance, so the datasource is `tcp:host,port`. Set an instance such as `SQLEXPRESS` when you want SQL Browser / SSRP to resolve the TCP port; when set, the driver builds `tcp:host\\instance` and drops the explicit port.
 
 ```rust,no_run
 async fn example() -> mssql_rs::Result<()> {
@@ -115,7 +115,7 @@ async fn example() -> mssql_rs::Result<()> {
 
 ### `authentication(AuthMethod::integrated())`
 
-Default is SQL authentication, not integrated auth. Use `AuthMethod::integrated()` for Windows SSPI or Kerberos/GSSAPI; the bridge sets `TdsAuthenticationMethod::SSPI`.
+Default is SQL authentication, not integrated auth. Use `AuthMethod::integrated()` for Windows SSPI or Kerberos/GSSAPI; the driver sets `TdsAuthenticationMethod::SSPI`.
 
 ```rust,no_run
 async fn example() -> mssql_rs::Result<()> {
@@ -131,7 +131,7 @@ async fn example() -> mssql_rs::Result<()> {
 
 ### `authentication(AuthMethod::aad_token(...))`
 
-Default is SQL authentication, not Entra ID. Use `AuthMethod::aad_token(token)` with a pre-acquired JWT scoped for `https://database.windows.net/.default`; the bridge sets access-token authentication and leaves username/password empty.
+Default is SQL authentication, not Entra ID. Use `AuthMethod::aad_token(token)` with a pre-acquired JWT scoped for `https://database.windows.net/.default`; the driver sets access-token authentication and leaves username/password empty.
 
 ```rust,no_run
 async fn example() -> mssql_rs::Result<()> {
@@ -445,7 +445,7 @@ async fn example() -> mssql_rs::Result<()> {
 
 ### `to_client_context()`
 
-This is the internal bridge to `mssql-tds`, exposed publicly for inspection. It wires database, authentication, TLS options, application/client names, driver identity, application intent, and MultiSubnetFailover into `ClientContext`; normal code should call `Client::connect(&cfg)` instead.
+This converts the driver configuration into an `mssql-tds` `ClientContext` and is exposed publicly for inspection. It includes database, authentication, TLS options, application/client names, driver identity, application intent, and MultiSubnetFailover; normal code should call `Client::connect(&cfg)` instead.
 
 ```rust,no_run
 async fn example() -> mssql_rs::Result<()> {
@@ -484,10 +484,10 @@ dead, and the pool discards failed recycle attempts.
 Checkout-time reset prevents state reaching another borrower, but does not
 release an abandoned transaction's locks while the connection sits idle.
 
-If a bridge operation is dropped while I/O is pending (for example by
+If a driver operation is dropped while I/O is pending (for example by
 `tokio::time::timeout`), the client is marked dead. Recycling checks that native
 state before reset or ping and rejects the client so deadpool replaces it. Outside a pool,
-drop the client and reconnect; later bridge calls return a typed `ConnectionClosed`
+drop the client and reconnect; later driver calls return a typed `ConnectionClosed`
 error without I/O. `Client::is_connection_dead()` is a cached, no-I/O check.
 
 This does not abort or roll back SQL reliably, so do not automatically retry
@@ -562,14 +562,14 @@ Use this policy only when retaining session state and relying on cached health
 are intentional; default `Reset` recycling still performs a server round trip.
 
 Outside a pool, call `client.reset_session().await?` directly for the same
-reset-and-validate behavior. Use this bridge method rather than arming a reset
-through `inner_mut()` so bridge-owned prepared handles are also invalidated.
+reset-and-validate behavior. Use this driver method rather than arming a reset
+through `inner_mut()` so driver-owned prepared handles are also invalidated.
 
 ## Tiberius API mapping
 
 Use this table when migrating code that already builds a `tiberius::Config`.
 
-| Bridge option | tiberius `Config` API |
+| Driver option | tiberius `Config` API |
 |---|---|
 | `Config::new()` | `tiberius::Config::new()` |
 | `host(...)` | `tiberius::Config::host(...)` |
@@ -593,7 +593,7 @@ Use this table when migrating code that already builds a `tiberius::Config`.
 | `send_string_parameters_as_unicode(...)` | `tiberius::Config::send_string_parameters_as_unicode(...)` |
 | `instance_name(...)` | `tiberius::Config::instance_name(...)` |
 | `get_addr()` | `tiberius::Config::get_addr()` |
-| `datasource_string()` | No direct migration requirement; bridge-specific inspection of the datasource passed to `mssql-tds` |
-| `to_client_context()` | No tiberius equivalent; bridge-specific conversion to `mssql-tds` `ClientContext` |
-| `Client::connect(&cfg)` | `tiberius::Client::connect(config, tcp_stream)`; the bridge owns TCP setup |
-| `TdsManager::create_pool(cfg, max_size)` | Common tiberius + `deadpool` manager pattern, provided by the bridge |
+| `datasource_string()` | No direct migration requirement; driver-specific inspection of the datasource passed to `mssql-tds` |
+| `to_client_context()` | No tiberius equivalent; driver-specific conversion to `mssql-tds` `ClientContext` |
+| `Client::connect(&cfg)` | `tiberius::Client::connect(config, tcp_stream)`; the driver owns TCP setup |
+| `TdsManager::create_pool(cfg, max_size)` | Common tiberius + `deadpool` manager pattern, provided by the driver |

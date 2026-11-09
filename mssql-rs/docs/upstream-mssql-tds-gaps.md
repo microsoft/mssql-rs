@@ -1,8 +1,7 @@
 # Original upstream mssql-tds gaps
 
-These were tracked in the upstream bridge. The status below reflects the
-`mssql-tds` implementation in this workspace. The upstream bridge tracked
-these metadata needs in [issue #63](https://github.com/saurabh500/mssql-tiberius-bridge/issues/63).
+These metadata needs were tracked in [upstream issue #63](https://github.com/saurabh500/mssql-tiberius-bridge/issues/63).
+The status below reflects the `mssql-tds` implementation in this workspace.
 
 ## `ColumnMetadata::get_precision() -> Option<u8>`
 

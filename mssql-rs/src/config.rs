@@ -91,7 +91,7 @@ pub enum EncryptionLevel {
 
 /// Network transport used to reach SQL Server.
 ///
-/// The bridge defaults to [`Transport::Tcp`]. Named Pipes and Shared Memory
+/// The driver defaults to [`Transport::Tcp`]. Named Pipes and Shared Memory
 /// are exposed for parity with ODBC / .NET / tiberius and are only usable
 /// against a SQL Server that has the corresponding SNI provider enabled.
 ///
@@ -106,14 +106,14 @@ pub enum Transport {
     /// [`Config::host`] / [`Config::port`] / [`Config::instance_name`].
     Tcp,
     /// Named Pipes (Windows). The optional `pipe` field overrides the pipe
-    /// path; when `None`, the bridge synthesizes the standard path
+    /// path; when `None`, the driver synthesizes the standard path
     /// `\\<host>\pipe\sql\query` for the default instance, or
     /// `\\<host>\pipe\MSSQL$<instance>\sql\query` when
     /// [`Config::instance_name`] is set. A leading `.` for `host` resolves
     /// to the local machine, matching SQL Server convention.
     NamedPipe {
         /// Explicit pipe path (e.g. `\\\\.\\pipe\\sql\\query`). When `None`,
-        /// the bridge derives one from `host` and `instance_name`.
+        /// the driver derives one from `host` and `instance_name`.
         pipe: Option<String>,
     },
     /// Shared Memory / Local Procedure Call (Windows-only, local only).
@@ -280,7 +280,7 @@ impl Config {
     ///
     /// # Interaction with [`trust_cert`](Self::trust_cert)
     ///
-    /// `trust_cert_ca` **supersedes** `trust_cert`. The bridge forwards both
+    /// `trust_cert_ca` **supersedes** `trust_cert`. The driver forwards both
     /// fields to `mssql-tds`, which logs a warning and uses the pinned
     /// certificate (`ServerCertificate takes precedence`). Net effect:
     /// validation is performed against the pinned cert, and `trust_cert` has
@@ -373,7 +373,7 @@ impl Config {
     /// Use the Named Pipes transport instead of TCP.
     ///
     /// Pass `Some("\\\\.\\pipe\\sql\\query")` to force a specific pipe path,
-    /// or `None` to let the bridge synthesize the standard pipe path from
+    /// or `None` to let the driver synthesize the standard pipe path from
     /// [`host`](Self::host) and [`instance_name`](Self::instance_name):
     ///
     /// - default instance: `\\<host>\pipe\sql\query`
@@ -452,7 +452,7 @@ impl Config {
     ///     is set the port is omitted so `mssql-tds` runs SSRP / SQL Browser
     ///   - Per MDAC convention, including both an explicit port and an
     ///     instance name causes the instance to be silently ignored, so the
-    ///     bridge drops the port whenever an instance is specified.
+    ///     driver drops the port whenever an instance is specified.
     /// - **Named Pipes**:
     ///   - `np:<pipe-path>` — when an explicit pipe path was supplied
     ///   - `np:\\host\pipe\sql\query` — derived (default instance)

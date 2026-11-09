@@ -2,11 +2,11 @@
 // Licensed under the MIT License.
 // Portions derived from saurabh500/mssql-tiberius-bridge (MIT).
 
-//! Tiberius data-query compatibility over the bridge's existing connection.
+//! Tiberius data-query compatibility over the driver's existing connection.
 //!
 //! Use [`Client::query_compat`](crate::Client::query_compat) or
 //! [`Client::simple_query_compat`](crate::Client::simple_query_compat) when
-//! migrating code that consumes Tiberius `QueryStream` items. The bridge's
+//! migrating code that consumes Tiberius `QueryStream` items. The driver's
 //! native buffered and row-only streaming APIs remain unchanged.
 
 use std::borrow::Cow;
@@ -165,7 +165,7 @@ impl<'a> QueryStream<'a> {
     /// Return columns for the current or next result set.
     ///
     /// A stream error encountered while looking ahead is returned once and
-    /// consumed. Unlike Tiberius, the bridge error is not `Clone`, so a later
+    /// consumed. Unlike Tiberius, the driver error is not `Clone`, so a later
     /// [`Stream::poll_next`] observes the item after that error rather than
     /// receiving the same error again.
     pub async fn columns(&mut self) -> Result<Option<&[Column]>> {
@@ -204,7 +204,7 @@ impl<'a> QueryStream<'a> {
 
     /// Collect all result sets.
     ///
-    /// Unlike Tiberius at the pinned compatibility commit, the bridge keeps
+    /// Unlike Tiberius at the pinned compatibility commit, the driver keeps
     /// empty middle and trailing result sets instead of dropping them.
     pub async fn into_results(mut self) -> Result<Vec<Vec<Row>>> {
         let mut results = Vec::new();

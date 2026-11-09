@@ -27,8 +27,8 @@ use crate::query::{ExecuteResult, QueryResult, ToSql, build_params_with_string_e
 ///
 /// # Cancellation safety
 ///
-/// Dropping an in-flight bridge operation (for example, when
-/// `tokio::time::timeout` expires) marks this connection dead. Subsequent bridge
+/// Dropping an in-flight driver operation (for example, when
+/// `tokio::time::timeout` expires) marks this connection dead. Subsequent driver
 /// operations fail immediately with [`Error::Tds`] wrapping
 /// [`mssql_tds::error::Error::ConnectionClosed`], without sending or draining
 /// anything. Drop the client and reconnect; [`TdsManager`](crate::TdsManager)
@@ -54,7 +54,7 @@ use crate::query::{ExecuteResult, QueryResult, ToSql, build_params_with_string_e
 ///
 /// Native cooperative cancellation through `ExecuteOptions` is different: the
 /// native operation must keep being polled to finish its ATTENTION cleanup.
-/// Direct operations through [`inner_mut`](Self::inner_mut) bypass the bridge's
+/// Direct operations through [`inner_mut`](Self::inner_mut) bypass the driver's
 /// guards; see that method's safety contract.
 ///
 /// # Example
@@ -396,7 +396,7 @@ impl Client {
                     crate::compat::ResultMetadata::new(std::sync::Arc::clone(&schema), result_index)
                 );
                 let mut writer =
-                    crate::row::BridgeRowWriter::with_result_index(schema, result_index);
+                    crate::row::DriverRowWriter::with_result_index(schema, result_index);
                 while {
                     let mut operation = Operation::new(&mut self.inner)?;
                     let result = operation.next_row_into(&mut writer).await.map_err(Error::Tds);
@@ -466,11 +466,11 @@ impl Client {
     /// Access the underlying `mssql-tds` [`TdsClient`] for advanced operations.
     ///
     /// Use this escape hatch when you need functionality not yet exposed
-    /// by the bridge API (e.g., bulk copy, stored procedure output parameters).
-    /// Use [`reset_session`](Self::reset_session) for resets so the bridge can
+    /// by the driver API (e.g., bulk copy, stored procedure output parameters).
+    /// Use [`reset_session`](Self::reset_session) for resets so the driver can
     /// also invalidate its prepared-statement handles.
     ///
-    /// Direct native operations bypass the bridge's dead-state checks and
+    /// Direct native operations bypass the driver's dead-state checks and
     /// cancellation guards. If you drop an in-flight native future, call
     /// [`TdsClient::mark_connection_dead`] and discard the client; do not reuse it
     /// or return it to a pool as healthy. Native cooperative cancellation must be
@@ -658,7 +658,7 @@ impl Client {
 
         while inner.on_rows() || inner.advance_to_rows().await.map_err(Error::Tds)? {
             let schema = crate::row::RowSchema::from_metadata(inner.get_metadata());
-            let mut writer = crate::row::BridgeRowWriter::with_result_index(schema, result_index);
+            let mut writer = crate::row::DriverRowWriter::with_result_index(schema, result_index);
             let mut rows: Vec<crate::row::Row> = Vec::new();
 
             while inner.next_row_into(&mut writer).await.map_err(Error::Tds)? {

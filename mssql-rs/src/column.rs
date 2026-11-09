@@ -139,7 +139,7 @@ impl ColumnType {
     }
 }
 
-/// SQL Server collation metadata exposed through a bridge-owned type.
+/// SQL Server collation metadata exposed through a driver-owned type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Collation {
     /// Raw 32-bit collation info value.

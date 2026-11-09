@@ -4,7 +4,7 @@
 
 //! Tiberius public data API contract from saurabh500/tiberius@e01b6a4.
 //!
-//! Connection construction is intentionally bridge-native. Every other live
+//! Connection construction is intentionally driver-native. Every other live
 //! assertion states data behavior from `tests/data_api.rs`, `tests/query.rs`,
 //! or `tests/bulk.rs` at that commit.
 
@@ -1149,7 +1149,7 @@ async fn compat_bulk_oversized_value_is_explicit_input_error() {
         .expect("adapter retains native-only row until finalize");
     assert!(matches!(
         native.finalize().await,
-        Err(Error::BulkInput(message)) if message.contains("bridge-native parameter")
+        Err(Error::BulkInput(message)) if message.contains("driver-native parameter")
     ));
 
     let mut healthy = client
@@ -1171,7 +1171,7 @@ async fn compat_bulk_oversized_value_is_explicit_input_error() {
 }
 
 #[test]
-fn local_conversion_contract_uses_bridge_value_types() {
+fn local_conversion_contract_uses_driver_value_types() {
     assert!(matches!(
         None::<i32>.to_sql(),
         mssql_tds::datatypes::sqltypes::SqlType::Int(None)

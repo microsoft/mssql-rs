@@ -72,14 +72,14 @@ async fn native_pool_reset_isolates_borrowers_on_the_same_connection() {
 
     conn.simple_query(
         "USE tempdb; \
-         CREATE TABLE #bridge_pool_reset (value int); \
+         CREATE TABLE #driver_pool_reset (value int); \
          SET LOCK_TIMEOUT 1234; \
          SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; \
          BEGIN TRANSACTION; \
-         INSERT INTO #bridge_pool_reset VALUES (42)",
+         INSERT INTO #driver_pool_reset VALUES (42)",
     )
     .await
-    .expect("query succeeds: USE tempdb; CREATE TABLE #bridge_pool_reset (value int); SET LOCK_TIMEOUT 1234; SET TRANSACTION I...");
+    .expect("query succeeds: USE tempdb; CREATE TABLE #driver_pool_reset (value int); SET LOCK_TIMEOUT 1234; SET TRANSACTION I...");
     assert_eq!(scalar(&mut conn, "SELECT @@TRANCOUNT").await, 1);
     drop(conn);
 
@@ -89,7 +89,7 @@ async fn native_pool_reset_isolates_borrowers_on_the_same_connection() {
         .simple_query(
             "SELECT @@SPID AS spid, DB_NAME() AS db, @@LOCK_TIMEOUT AS lock_timeout, \
              @@TRANCOUNT AS tran_count, \
-             CASE WHEN OBJECT_ID('tempdb..#bridge_pool_reset') IS NULL THEN 1 ELSE 0 END AS cleared, \
+             CASE WHEN OBJECT_ID('tempdb..#driver_pool_reset') IS NULL THEN 1 ELSE 0 END AS cleared, \
              CAST(transaction_isolation_level AS int) AS isolation_level \
              FROM sys.dm_exec_sessions WHERE session_id = @@SPID",
         )
@@ -309,12 +309,12 @@ async fn explicit_ping_recycling_preserves_legacy_session_state() {
         .await
         .expect("prepare statement");
     conn.simple_query(
-        "CREATE TABLE #bridge_pool_legacy (value int); \
+        "CREATE TABLE #driver_pool_legacy (value int); \
          SET LOCK_TIMEOUT 1234; BEGIN TRANSACTION; \
-         INSERT INTO #bridge_pool_legacy VALUES (7)",
+         INSERT INTO #driver_pool_legacy VALUES (7)",
     )
     .await
-    .expect("query succeeds: CREATE TABLE #bridge_pool_legacy (value int); SET LOCK_TIMEOUT 1234; BEGIN TRANSACTION; INSERT IN...");
+    .expect("query succeeds: CREATE TABLE #driver_pool_legacy (value int); SET LOCK_TIMEOUT 1234; BEGIN TRANSACTION; INSERT IN...");
     drop(conn);
 
     let mut conn = Box::pin(pool.get()).await.expect("pool checkout failed");
@@ -322,7 +322,7 @@ async fn explicit_ping_recycling_preserves_legacy_session_state() {
     assert_eq!(scalar(&mut conn, "SELECT @@LOCK_TIMEOUT").await, 1234);
     assert_eq!(scalar(&mut conn, "SELECT @@TRANCOUNT").await, 1);
     assert_eq!(
-        scalar(&mut conn, "SELECT value FROM #bridge_pool_legacy").await,
+        scalar(&mut conn, "SELECT value FROM #driver_pool_legacy").await,
         7
     );
     let rows = statement

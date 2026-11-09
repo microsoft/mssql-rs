@@ -478,7 +478,7 @@ impl ToSql for &[u8] {
 // chrono date/time
 // ---------------------------------------------------------------------------
 
-// chrono is an unconditional dep on the bridge; FromSql for these types
+// chrono is an unconditional dep of the driver; FromSql for these types
 // already lives in `row.rs`, so the ToSql side is provided unconditionally too.
 mod chrono_to_sql {
     use super::{SqlType, ToSql};

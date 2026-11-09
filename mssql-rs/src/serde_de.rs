@@ -251,7 +251,7 @@ impl<'a> ColumnValueDeserializer<'a> {
     fn temporal_string(&self) -> Option<String> {
         // Reuse the chrono FromSql impls already in row.rs to render a stable
         // ISO-8601 representation. This keeps the deserializer in sync with
-        // the rest of the bridge's temporal semantics.
+        // the rest of the driver's temporal semantics.
         use crate::row::FromSql;
         match self.val {
             ColumnValues::Date(_) => {

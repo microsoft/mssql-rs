@@ -750,7 +750,7 @@ async fn serde_json_value_param_variant_dispatch() {
 /// `Config::readonly(true)` must surface `ApplicationIntent=ReadOnly` in the
 /// Login7 packet. The unit test in `src/config.rs` verifies the
 /// `ClientContext.application_intent` field; this test verifies the login is
-/// accepted by SQL Server end-to-end. (Bridge #15.)
+/// accepted by SQL Server end-to-end. (Upstream issue #15.)
 ///
 /// Note: standalone SQL Server doesn't expose the negotiated value via
 /// `CONNECTIONPROPERTY('client_app_intent')` (always NULL), so a true
