@@ -158,7 +158,7 @@ client encoding: its binary continuation returns wire bytes, not UTF-32LE
 converted carry.
 
 `client_code_page_test` adds four isolated client-code-page runs (1252, 65001,
-932, and 1251) for collation transcoding, narrow character boundaries, UTF-16
+932, and 1251) for collation transcoding, narrow `SQLGetData` chunking, UTF-16
 surrogate streaming, and PLP/bound-column lengths. `run_e2e.ps1`, `run_e2e.sh`,
 and `build_e2e.sh` build the driver with the private
 `e2e-test-client-code-page` feature; release driver builds do not enable it.

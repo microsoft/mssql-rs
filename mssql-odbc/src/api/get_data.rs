@@ -2478,12 +2478,6 @@ fn stream_active_plp_chunk_once<'a>(
     // those bytes untouched, so verbatim narrow text is staged and copied with
     // its terminator only. It keeps read-ahead: its bytes are still the output.
     let direct_wire_output = read_ahead && !(narrow_verbatim && target_type == SQL_C_CHAR);
-    // Parity deviation 8: UTF-8 chunks end on whole characters. A truncated
-    // sequence at the end of the value can never complete, so it is delivered.
-    let direct_utf8_output = direct_wire_output
-        && target_type == SQL_C_CHAR
-        && text_output.encoding.is_utf8()
-        && narrow_encoding == Some(encoding_rs::UTF_8.into());
     let mut inline_payload = [0_u8; 256];
     let mut heap_payload = if typed_target {
         std::mem::take(&mut progress.typed_scratch)
@@ -2604,65 +2598,6 @@ fn stream_active_plp_chunk_once<'a>(
             return SQL_ERROR;
         }
     };
-
-    if direct_utf8_output
-        && read > 0
-        && !reached_end
-        && let Some(prefix_len) = utf8_complete_prefix_len(&payload[..read])
-        && prefix_len < read
-    {
-        let tail = &payload[prefix_len..read];
-        if let Some(state) = retained_stmt_state.as_mut() {
-            let Some(stream) = state.active_plp.as_mut() else {
-                post_diag(&mut **state, ERR_INTERNAL_CONVERSION);
-                return SQL_ERROR;
-            };
-            stream.restore_source_prefix(tail, total_read, known_total, reached_end);
-            if prefix_len == 0 {
-                // SAFETY: direct output requires a non-null caller buffer with
-                // room for the terminator.
-                unsafe {
-                    target_value_ptr.cast::<u8>().write_unaligned(0);
-                }
-                post_sql_error(
-                    &mut **state,
-                    SQLSTATE_HY090,
-                    0,
-                    "Buffer length too small to hold a single character and null terminator",
-                );
-                return SQL_ERROR;
-            }
-        } else {
-            let Ok(mut state) = stmt.inner.lock() else {
-                error!(
-                    "SQLGetData: stmt mutex poisoned while restoring an incomplete UTF-8 character"
-                );
-                return SQL_ERROR;
-            };
-            let Some(stream) = state.active_plp.as_mut() else {
-                post_diag(&mut state, ERR_INTERNAL_CONVERSION);
-                return SQL_ERROR;
-            };
-            stream.restore_source_prefix(tail, total_read, known_total, reached_end);
-            if prefix_len == 0 {
-                // SAFETY: direct output requires a non-null caller buffer with
-                // room for the terminator.
-                unsafe {
-                    target_value_ptr.cast::<u8>().write_unaligned(0);
-                }
-                post_sql_error(
-                    &mut state,
-                    SQLSTATE_HY090,
-                    0,
-                    "Buffer length too small to hold a single character and null terminator",
-                );
-                return SQL_ERROR;
-            }
-        }
-        total_read = total_read.saturating_sub(read - prefix_len);
-        read = prefix_len;
-        reached_end = false;
-    }
 
     if typed_target {
         let mut state = match retained_stmt_state.take() {
@@ -3762,14 +3697,6 @@ fn narrow_source_fit(source: &[u8], room: usize, held_partial: bool) -> usize {
     };
     let fit = ascii + narrow_max_read(room - ascii, 0);
     fit.max(1).min(source.len())
-}
-
-fn utf8_complete_prefix_len(bytes: &[u8]) -> Option<usize> {
-    match std::str::from_utf8(bytes) {
-        Ok(_) => Some(bytes.len()),
-        Err(error) if error.error_len().is_none() => Some(error.valid_up_to()),
-        Err(_) => None,
-    }
 }
 
 /// Decodes one chunk of narrow PLP wire bytes to UTF-8 for `SQL_C_CHAR`
@@ -5778,19 +5705,6 @@ mod tests {
                 "narrow_max_read({capacity}, {carry})"
             );
         }
-    }
-
-    #[test]
-    fn utf8_complete_prefix_excludes_only_a_trailing_partial_character() {
-        let value = "A😀B".as_bytes();
-        for (length, expected) in [(0, 0), (1, 1), (2, 1), (4, 1), (5, 5), (6, 6)] {
-            assert_eq!(
-                utf8_complete_prefix_len(&value[..length]),
-                Some(expected),
-                "length={length}"
-            );
-        }
-        assert_eq!(utf8_complete_prefix_len(b"A\xff"), None);
     }
 
     /// Option-returning shim so these tests read the same as before the
@@ -13416,56 +13330,6 @@ mod tests {
         );
         assert_eq!(&output[..8], &[0x3d, 0xd8, 0, 0xde, b'A', 0, 0, 0]);
         assert_eq!(&output[8..], &[0xcc; 2]);
-    }
-
-    #[test]
-    fn plp_utf8_client_char_chunks_end_on_whole_characters() {
-        let (h, _server) = open_mock_utf8_plp(vec!["A😀B".as_bytes().to_vec()]);
-        client_code_page(&h, 65001, false);
-        let mut delivered = Vec::new();
-        for (expected, rc) in [
-            ("A", SQL_SUCCESS_WITH_INFO),
-            ("😀", SQL_SUCCESS_WITH_INFO),
-            ("B", SQL_SUCCESS),
-        ] {
-            let mut output = [0xcc; 5];
-            assert_eq!(read_plp_test_chunk(&h, SQL_C_CHAR, &mut output).0, rc);
-            let len = output.iter().position(|&b| b == 0).unwrap();
-            assert_eq!(&output[..len], expected.as_bytes());
-            delivered.extend_from_slice(&output[..len]);
-        }
-        assert_eq!(delivered, "A😀B".as_bytes());
-    }
-
-    #[test]
-    fn plp_utf8_client_char_rejects_a_buffer_without_room_for_a_character() {
-        let (h, _server) = open_mock_utf8_plp(vec!["😀".as_bytes().to_vec()]);
-        client_code_page(&h, 65001, false);
-        let mut small = [0xcc; 2];
-        assert_eq!(read_plp_test_chunk(&h, SQL_C_CHAR, &mut small).0, SQL_ERROR);
-        assert_eq!(small[0], 0);
-        let mut output = [0xcc; 5];
-        assert_eq!(
-            read_plp_test_chunk(&h, SQL_C_CHAR, &mut output),
-            (SQL_SUCCESS, 4)
-        );
-        assert_eq!(&output, "😀\0".as_bytes());
-    }
-
-    #[test]
-    fn plp_utf8_client_char_delivers_a_truncated_sequence_at_end_of_value() {
-        let (h, _server) = open_mock_utf8_plp(vec![vec![b'A', 0xf0, 0x9f]]);
-        client_code_page(&h, 65001, false);
-        let mut output = [0xcc; 8];
-        assert_eq!(
-            read_plp_test_chunk(&h, SQL_C_CHAR, &mut output),
-            (SQL_SUCCESS, 3)
-        );
-        assert_eq!(&output[..4], &[b'A', 0xf0, 0x9f, 0]);
-        assert_eq!(
-            read_plp_test_chunk(&h, SQL_C_CHAR, &mut output).0,
-            SQL_NO_DATA
-        );
     }
 
     #[test]

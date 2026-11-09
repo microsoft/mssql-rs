@@ -189,7 +189,7 @@ ODBC_TEST_F(ClientCodePageTest, NativeNarrowFetchTranscodesAcrossCollations) {
 
 // Benefits-from-mock-tds: synthetic UTF-8/DBCS PLP payloads could place encoded
 // characters at exact TDS chunk boundaries without relying on SQL Server casts.
-ODBC_TEST_F(ClientCodePageTest, NarrowChunksEndAtClientCharacterBoundaries) {
+ODBC_TEST_F(ClientCodePageTest, NarrowChunksFillBufferAndReassemble) {
     const ServerText& text = TextForCodePage(client_code_page_);
     std::string sql = VarcharQuery(text);
     if (client_code_page_ == 1252) {
@@ -212,16 +212,18 @@ ODBC_TEST_F(ClientCodePageTest, NarrowChunksEndAtClientCharacterBoundaries) {
                                     "A\xF0\x9F\x98\x80" "B";
     const std::string encoded =
         ODBCTestUtils::Utf8ToCodePage(utf8_value, client_code_page_);
+    // AB#47564: UTF-8 SQL_C_CHAR chunks fill the byte capacity even mid-character,
+    // so the 4-byte character splits across the first two chunks.
     const std::vector<size_t> chunk_sizes =
-        client_code_page_ == 65001 ? std::vector<size_t>{1, 4, 1} :
+        client_code_page_ == 65001 ? std::vector<size_t>{4, 2} :
         client_code_page_ == 932 ? std::vector<size_t>{3, 1} :
                                    std::vector<size_t>{1, 1, 1};
     const SQLLEN buffer_length =
         client_code_page_ == 65001 ? 5 : client_code_page_ == 932 ? 4 : 2;
-    // Parity deviation 8: msodbcsql copies same-code-page UTF-8 verbatim, so
-    // only the shared truncation contract is asserted on that leg.
+    // msodbcsql's SQLGetData chunk sizes at 65001 are unmeasured; its leg runs
+    // only when the Windows ACP is 65001, so that leg asserts reassembly only.
     const char* target = std::getenv("ODBC_TEST_TARGET");
-    const bool whole_character_chunks =
+    const bool exact_chunks =
         client_code_page_ != 65001 || target == nullptr || std::string(target) != "msodbcsql";
     ASSERT_EQ(SQL_SUCCESS, Execute(sql));
     ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
@@ -238,7 +240,7 @@ ODBC_TEST_F(ClientCodePageTest, NarrowChunksEndAtClientCharacterBoundaries) {
             std::begin(output));
         ASSERT_GT(written, 0u) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
         ASSERT_LE(written, static_cast<size_t>(buffer_length - 1));
-        if (whole_character_chunks) {
+        if (exact_chunks) {
             ASSERT_LT(chunk_index, chunk_sizes.size());
             ASSERT_EQ(chunk_sizes[chunk_index], written);
         }
@@ -258,7 +260,7 @@ ODBC_TEST_F(ClientCodePageTest, NarrowChunksEndAtClientCharacterBoundaries) {
         consumed += written;
         ++chunk_index;
     }
-    if (whole_character_chunks) {
+    if (exact_chunks) {
         EXPECT_EQ(chunk_sizes.size(), chunk_index);
     }
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
