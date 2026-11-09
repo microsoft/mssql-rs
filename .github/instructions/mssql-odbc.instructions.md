@@ -185,6 +185,17 @@ on the `master` branch.
     commitment, and the severity fallback already covers unmapped errors.
   Never hand-roll `post_sql_error` over a `TdsError` — you lose the
   per-server-error fan-out and the SQLSTATE mapping.
+- `SQLGetDiagRec` and record-scoped `SQLGetDiagField` read diagnostics in
+  msodbcsql order: row number, message-resource priority, then stable posting
+  order. Sort only when a record is read; header fields do not trigger it.
+  Mapped SQL Server messages use priority 0; unmapped messages use the
+  severity fallback priorities 40136, 40146, or 40401. Do not infer exact
+  driver resource IDs from SQLSTATE; unmeasured driver diagnostics retain
+  stable posting order.
+- Plain, unparameterized `SQLExecDirect` batches use statement-wise error
+  continuation. An error result remains on the statement with the connection
+  reserved, and `SQLMoreResults` continues to later statements. Prepared and
+  parameterized execution paths retain their existing abort behavior.
 - Every ODBC entry point must clear the handle's diagnostic records at API
   entry by calling `free_errors(...)` after acquiring the handle lock, so a
   fresh call starts without stale diagnostics.

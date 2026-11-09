@@ -7,7 +7,7 @@ use crate::error::diag::post_prefixed;
 use crate::error::{DiagRecord, HasDiagnostics, post_sql_error};
 use crate::handles::wire::ClaimError;
 use mssql_tds::error::Error as TdsError;
-use mssql_tds::error::SqlInfoMessage;
+use mssql_tds::error::{SqlErrorInfo, SqlInfoMessage};
 
 pub(crate) const SQLSTATE_01000: [u8; 5] = *b"01000";
 pub(crate) const SQLSTATE_01004: [u8; 5] = *b"01004";
@@ -387,11 +387,13 @@ pub(crate) fn post_tds_error_as(
         post_tds_error(state, err, SQLSTATE_HY000);
         return;
     }
-    for e in &diagnostics.errors {
-        let native = i32::try_from(e.number).unwrap_or(i32::MAX);
-        post_server_message(state, forced_state, native, &e.message);
-    }
-    post_tds_info_messages(state, &diagnostics.info_messages);
+    post_server_diagnostics(
+        state,
+        &diagnostics.errors,
+        &diagnostics.info_messages,
+        &[],
+        Some(forced_state),
+    );
 }
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
@@ -408,14 +410,94 @@ fn post_server_message(
     state: &mut impl HasDiagnostics,
     sql_state: [u8; 5],
     native_error: i32,
+    priority: u16,
     message: &str,
 ) {
+    let row_number = state.server_row_number();
     post_prefixed(
         state,
         sql_state,
         native_error,
         &[SERVER_DIAG_SUBSOURCE, message],
     );
+    if let Some(record) = state.diag_records_mut().last_mut() {
+        record.row_number = row_number;
+        record.priority = priority;
+    }
+}
+
+fn server_message_priority(number: u32, severity: i32) -> u16 {
+    if sqlstate_for_sql_error(number).is_some() {
+        0
+    } else if severity <= 10 {
+        40401
+    } else if severity <= 18 {
+        40136
+    } else {
+        40146
+    }
+}
+
+enum ServerDiagnosticRef<'a> {
+    Error(&'a SqlErrorInfo),
+    Info(&'a SqlInfoMessage),
+}
+
+fn post_server_diagnostics(
+    state: &mut impl HasDiagnostics,
+    errors: &[SqlErrorInfo],
+    info_messages: &[SqlInfoMessage],
+    additional_info_messages: &[SqlInfoMessage],
+    forced_error_state: Option<[u8; 5]>,
+) {
+    let mut ordered =
+        Vec::with_capacity(errors.len() + info_messages.len() + additional_info_messages.len());
+    ordered.extend(
+        errors
+            .iter()
+            .map(|error| (error.diagnostic_ordinal, ServerDiagnosticRef::Error(error))),
+    );
+    ordered.extend(info_messages.iter().map(|message| {
+        (
+            message.diagnostic_ordinal,
+            ServerDiagnosticRef::Info(message),
+        )
+    }));
+    ordered.extend(additional_info_messages.iter().map(|message| {
+        (
+            message.diagnostic_ordinal,
+            ServerDiagnosticRef::Info(message),
+        )
+    }));
+    ordered.sort_by_key(|(ordinal, _)| *ordinal);
+
+    for (_, diagnostic) in ordered {
+        let (number, severity, message, forced) = match diagnostic {
+            ServerDiagnosticRef::Error(error) => (
+                error.number,
+                error.class,
+                error.message.as_str(),
+                forced_error_state,
+            ),
+            ServerDiagnosticRef::Info(message) => (
+                message.number,
+                message.class,
+                message.message.as_str(),
+                None,
+            ),
+        };
+        let sqlstate = forced.unwrap_or_else(|| {
+            sqlstate_for_sql_error(number).unwrap_or_else(|| sqlstate_for_severity(severity))
+        });
+        let native = i32::try_from(number).unwrap_or(i32::MAX);
+        post_server_message(
+            state,
+            sqlstate,
+            native,
+            server_message_priority(number, severity),
+            message,
+        );
+    }
 }
 
 /// Sub-source tag msodbcsql inserts after the driver prefix for diagnostics
@@ -604,10 +686,9 @@ fn sqlstate_for_severity(class: i32) -> [u8; 5] {
 /// [`DiagRecord`](crate::error::DiagRecord) each. Each record's SQLSTATE
 /// comes from [`sqlstate_for_sql_error`]; any error number not in the map
 /// falls back to [`sqlstate_for_severity`]. Native error and message are taken
-/// straight from the server-reported error. Any informational/warning messages
-/// the server sent alongside the errors are posted after the error records so a
-/// failing call still surfaces the full server diagnostic set (matching
-/// msodbcsql).
+/// straight from the server-reported error. Informational/warning messages are
+/// merged with errors by their TDS arrival ordinal before lazy ODBC-priority
+/// sorting, preserving chronology for equal-priority records.
 ///
 /// For any non-`SqlServerError` variant (transport, TLS, redirect, protocol,
 /// timeout, …), pushes a single record with `default`, native error 0, and
@@ -618,6 +699,15 @@ fn sqlstate_for_severity(class: i32) -> [u8; 5] {
 /// for general execution / fetch failures. A server error carries its own
 /// severity, so it never uses `default`.
 pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, default: [u8; 5]) {
+    post_tds_error_with_info(state, err, default, &[]);
+}
+
+pub(crate) fn post_tds_error_with_info(
+    state: &mut impl HasDiagnostics,
+    err: &TdsError,
+    default: [u8; 5],
+    additional_info_messages: &[SqlInfoMessage],
+) {
     if let TdsError::SqlServerError { diagnostics } = err {
         if diagnostics.errors.is_empty() {
             // An error return must surface at least one error record. If the
@@ -625,16 +715,22 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
             // default record from the error's Display text so the caller still
             // sees a primary failure.
             post_sql_error(state, default, 0, err.to_string());
+            post_server_diagnostics(
+                state,
+                &[],
+                &diagnostics.info_messages,
+                additional_info_messages,
+                None,
+            );
         } else {
-            for e in &diagnostics.errors {
-                let sqlstate = sqlstate_for_sql_error(e.number)
-                    .unwrap_or_else(|| sqlstate_for_severity(e.class));
-                let native = i32::try_from(e.number).unwrap_or(i32::MAX);
-                post_server_message(state, sqlstate, native, &e.message);
-            }
+            post_server_diagnostics(
+                state,
+                &diagnostics.errors,
+                &diagnostics.info_messages,
+                additional_info_messages,
+                None,
+            );
         }
-        // Informational/warning records follow the primary error record(s).
-        post_tds_info_messages(state, &diagnostics.info_messages);
         return;
     }
     // An unacknowledged connection reset is a property of the link, not of the
@@ -658,6 +754,7 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
         _ => default,
     };
     post_sql_error(state, sqlstate, 0, err.to_string());
+    post_tds_info_messages(state, additional_info_messages);
 }
 
 /// Post one ODBC diagnostic record per SQL Server INFO token.
@@ -669,12 +766,7 @@ pub(crate) fn post_tds_info_messages(
     state: &mut impl HasDiagnostics,
     messages: &[SqlInfoMessage],
 ) -> bool {
-    for message in messages {
-        let sqlstate = sqlstate_for_sql_error(message.number)
-            .unwrap_or_else(|| sqlstate_for_severity(message.class));
-        let native = i32::try_from(message.number).unwrap_or(i32::MAX);
-        post_server_message(state, sqlstate, native, &message.message);
-    }
+    post_server_diagnostics(state, &[], messages, &[], None);
 
     !messages.is_empty()
 }
@@ -733,6 +825,7 @@ mod tests {
 
     fn sql_error(number: u32, message: &str) -> SqlErrorInfo {
         SqlErrorInfo {
+            diagnostic_ordinal: 0,
             message: message.into(),
             state: 1,
             class: 14,
@@ -867,6 +960,7 @@ mod tests {
         let diagnostics = SqlServerDiagnostics::new(
             vec![sql_error(18456, "Login failed.")],
             vec![SqlInfoMessage {
+                diagnostic_ordinal: 0,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -886,6 +980,70 @@ mod tests {
     }
 
     #[test]
+    fn server_diagnostics_sort_by_priority_then_wire_order() {
+        use mssql_tds::error::SqlServerDiagnostics;
+
+        let error = SqlErrorInfo {
+            diagnostic_ordinal: 1,
+            message: "unmapped server error".into(),
+            state: 1,
+            class: 16,
+            number: 50000,
+            server_name: None,
+            proc_name: None,
+            line_number: Some(2),
+        };
+        let info = SqlInfoMessage {
+            diagnostic_ordinal: 0,
+            message: "truncated value".into(),
+            state: 1,
+            class: 10,
+            number: 8153,
+            server_name: None,
+            proc_name: None,
+            line_number: Some(1),
+        };
+        let err =
+            TdsError::from_sql_diagnostics(SqlServerDiagnostics::new(vec![error], vec![info]));
+        let mut state = FakeState::default();
+
+        post_tds_error(&mut state, &err, SQLSTATE_HY000);
+        crate::error::sort_diagnostics(&mut state);
+
+        assert_eq!(state.records[0].sql_state, *b"01003");
+        assert_eq!(state.records[0].native_error, 8153);
+        assert_eq!(state.records[1].sql_state, SQLSTATE_42000);
+        assert_eq!(state.records[1].native_error, 50000);
+    }
+
+    #[test]
+    fn equal_priority_server_diagnostics_keep_wire_order() {
+        use mssql_tds::error::SqlServerDiagnostics;
+
+        let mut error = sql_error(207, "invalid column");
+        error.diagnostic_ordinal = 1;
+        let info = SqlInfoMessage {
+            diagnostic_ordinal: 0,
+            message: "first warning".into(),
+            state: 1,
+            class: 10,
+            number: 8153,
+            server_name: None,
+            proc_name: None,
+            line_number: Some(1),
+        };
+        let err =
+            TdsError::from_sql_diagnostics(SqlServerDiagnostics::new(vec![error], vec![info]));
+        let mut state = FakeState::default();
+
+        post_tds_error(&mut state, &err, SQLSTATE_HY000);
+        crate::error::sort_diagnostics(&mut state);
+
+        assert_eq!(state.records[0].native_error, 8153);
+        assert_eq!(state.records[1].native_error, 207);
+    }
+
+    #[test]
     fn post_tds_error_info_only_diagnostics_still_posts_primary_error() {
         // A SqlServerError that unexpectedly carries only INFO messages (no
         // ERROR tokens) must still surface a primary error record for the error
@@ -895,6 +1053,7 @@ mod tests {
         let diagnostics = SqlServerDiagnostics::new(
             vec![],
             vec![SqlInfoMessage {
+                diagnostic_ordinal: 0,
                 message: "info only".into(),
                 state: 1,
                 class: 10,
@@ -1011,6 +1170,7 @@ mod tests {
         let diagnostics = SqlServerDiagnostics::new(
             vec![sql_error(911, "no such db"), sql_error(5701, "context")],
             vec![SqlInfoMessage {
+                diagnostic_ordinal: 0,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -1059,6 +1219,7 @@ mod tests {
         let mut s = FakeState::default();
         let messages = vec![
             SqlInfoMessage {
+                diagnostic_ordinal: 0,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -1068,6 +1229,7 @@ mod tests {
                 line_number: Some(1),
             },
             SqlInfoMessage {
+                diagnostic_ordinal: 0,
                 message: "hello from PRINT".into(),
                 state: 1,
                 class: 0,

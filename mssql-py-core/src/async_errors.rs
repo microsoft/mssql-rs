@@ -242,6 +242,7 @@ mod tests {
     fn preserves_sql_server_diagnostics() {
         let diagnostics = SqlServerDiagnostics::new(
             vec![SqlErrorInfo {
+                diagnostic_ordinal: 0,
                 message: "test failure".to_string(),
                 state: 2,
                 class: 16,
@@ -251,6 +252,7 @@ mod tests {
                 line_number: Some(7),
             }],
             vec![SqlInfoMessage {
+                diagnostic_ordinal: 0,
                 message: "existing info".to_string(),
                 state: 1,
                 class: 0,
@@ -264,6 +266,7 @@ mod tests {
             "PyAsyncCursor.nextset failed while advancing results",
             TdsError::SqlServerError { diagnostics },
             vec![SqlInfoMessage {
+                diagnostic_ordinal: 0,
                 message: "statement info".to_string(),
                 state: 1,
                 class: 10,

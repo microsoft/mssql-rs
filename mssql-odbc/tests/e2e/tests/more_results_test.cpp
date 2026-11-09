@@ -80,6 +80,74 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, MultipleSelectBatchAdvances, odbc_concurr
     EXPECT_EQ(SQL_NO_DATA, rc);
 }
 
+// Plain batches expose a failed statement as its own SQLMoreResults boundary;
+// later statements remain reachable after the error (msodbcsql B1 parity).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchInfoErrorInfoHaveSeparateBoundaries,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT OFF; RAISERROR('i1',0,1); RAISERROR('e16',16,1); RAISERROR('i2',0,1);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
+// A batch whose failing first statement is followed by another server error
+// keeps that later error for the next SQLMoreResults call (msodbcsql B3 parity).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchContinuesAfterInitialStatementError,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; EXEC('RAISERROR(''e16'',16,1); DECLARE @x int = 1/0;')");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+
+    rc = SQLMoreResults(stmt_);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
+// For diagnostics returned by one execution call, a mapped server warning
+// precedes the subsequent unmapped server error.
+ODBC_TEST_F_MODES(MoreResultsLiveTest, ServerDiagnosticsUseMsodbcsqlPriorityOrder,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; EXEC('DECLARE @x int; SELECT @x = SUM(v) FROM "
+        "(VALUES(CAST(NULL AS int)),(1)) t(v); RAISERROR(''e16'',16,1);')");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+
+    const auto read_state = [&](SQLSMALLINT record, SQLINTEGER expected_native,
+                                const char* expected_state) {
+        SQLWCHAR state[6] = {};
+        SQLINTEGER native = -1;
+        SQLWCHAR message[512] = {};
+        SQLSMALLINT message_len = 0;
+        SQLRETURN diag_rc = SQLGetDiagRecW(
+            SQL_HANDLE_STMT, stmt_, record, state, &native, message,
+            static_cast<SQLSMALLINT>(sizeof(message) / sizeof(message[0])), &message_len);
+        ASSERT_TRUE(diag_rc == SQL_SUCCESS || diag_rc == SQL_SUCCESS_WITH_INFO);
+        std::string actual_state;
+        for (int i = 0; i < 5; ++i) {
+            actual_state.push_back(static_cast<char>(state[i]));
+        }
+        EXPECT_EQ(expected_state, actual_state);
+        EXPECT_EQ(expected_native, native);
+    };
+    read_state(1, 8153, "01003");
+    read_state(2, 50000, "42000");
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
 // An informational message emitted between two result sets (here a PRINT)
 // surfaces as a diagnostic on the SQLMoreResults call that advances past it,
 // and that call returns SQL_SUCCESS_WITH_INFO so the application is told to read

@@ -7,7 +7,7 @@ use tracing::{debug, error};
 
 use std::time::Instant;
 
-use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
+use mssql_tds::connection::tds_client::{BatchErrorMode, ExecuteOptions, StreamedParamStatus};
 
 use super::escape::{CallSite, translate_for_execution};
 use super::exec_common::{
@@ -565,6 +565,7 @@ fn sql_exec_direct_w_operation(
                     rewritten_sql,
                     ExecuteOptions::new()
                         .timeout_secs(query_timeout)
+                        .on_error(BatchErrorMode::Continue)
                         .cancel(&cancel_handle),
                 ),
             )
@@ -1277,6 +1278,56 @@ mod tests {
         let ds = dbc.inner.lock().unwrap();
         assert_eq!(ds.wire.statement_owner(), Some(h.stmt));
         assert!(ds.wire.client().is_some());
+    }
+
+    #[test]
+    fn exec_direct_preserves_batch_after_statement_error() {
+        use crate::api::more_results::sql_more_results;
+        use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS};
+        use crate::error::sort_diagnostics;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_more, done_no_more, info, sql_error, tds_client_from_tokens,
+        };
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        let client = tds_client_from_tokens(vec![
+            info(8153, 10, "before error"),
+            sql_error(50000, 16, "first statement failed"),
+            done_more(),
+            col_metadata_empty(),
+            done_no_more(),
+        ]);
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.wire.put_client_for_test(client);
+        }
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert_eq!(
+            sql_exec_direct_w_safe(handles.stmt, stmt, "RAISERROR(...); SELECT 1".to_string()),
+            SQL_ERROR
+        );
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert!(state.error_result);
+            sort_diagnostics(&mut state);
+            assert_eq!(state.diag_records[0].native_error, 8153);
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.native_error == 50000)
+            );
+        }
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(handles.stmt)
+        );
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,

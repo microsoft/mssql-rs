@@ -672,6 +672,7 @@ pub struct TdsClient {
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
+    next_diagnostic_ordinal: u64,
     /// Whether the work most recently completed on this connection substituted
     /// a character the narrow encoding it was sent in could not represent.
     ///
@@ -868,6 +869,7 @@ impl TdsClient {
             last_result_row_count: None,
             return_values: Vec::new(),
             info_messages: Vec::new(),
+            next_diagnostic_ordinal: 0,
             code_page_conversion_loss: false,
             prepared_param_encryption: HashMap::new(),
             query_metadata_cache: crate::security::query_metadata_cache::QueryMetadataCache::new(),
@@ -1367,7 +1369,9 @@ impl TdsClient {
             );
             self.transport.mark_known_dead();
         }
-        let error = SqlErrorInfo::from(error_token);
+        let mut error = SqlErrorInfo::from(error_token);
+        error.diagnostic_ordinal = self.next_diagnostic_ordinal;
+        self.next_diagnostic_ordinal = self.next_diagnostic_ordinal.saturating_add(1);
         if let Some(batch) = self.prepared_batch.as_mut()
             && let Some(row) = batch.current.as_mut()
         {
@@ -2182,6 +2186,12 @@ impl TdsClient {
     /// can report.
     pub fn has_prepared_batch(&self) -> bool {
         self.prepared_batch.is_some()
+    }
+
+    /// Returns whether statement errors leave the current language batch open
+    /// so the caller can continue with the next statement.
+    pub fn continues_batch_on_error(&self) -> bool {
+        self.batch_error_mode == BatchErrorMode::Continue
     }
 
     fn observe_prepared_batch_done(&mut self, token: &Tokens) -> TdsResult<()> {
@@ -9157,7 +9167,10 @@ impl TdsClient {
     }
 
     fn capture_info_message(&mut self, token: &crate::token::tokens::InfoToken) {
-        self.info_messages.push(SqlInfoMessage::from(token));
+        let mut message = SqlInfoMessage::from(token);
+        message.diagnostic_ordinal = self.next_diagnostic_ordinal;
+        self.next_diagnostic_ordinal = self.next_diagnostic_ordinal.saturating_add(1);
+        self.info_messages.push(message);
         if let Some(batch) = self.prepared_batch.as_mut()
             && let Some(row) = batch.current.as_mut()
         {
@@ -9186,6 +9199,7 @@ impl TdsClient {
         self.settle_abandoned_reset_verification();
         self.interrupted_read_settled = false;
         self.info_messages.clear();
+        self.next_diagnostic_ordinal = 0;
         // A token parked by the look-ahead belongs to the previous response;
         // replaying it here would desynchronize this command's reader.
         self.parked_token = None;
@@ -14140,6 +14154,7 @@ mod tests {
     #[test]
     fn skipped_errors_keep_a_prefix() {
         let error = |message: String| SqlErrorInfo {
+            diagnostic_ordinal: 0,
             message,
             state: 1,
             class: 16,
@@ -16449,6 +16464,7 @@ mod tests {
 
         // Stale message left over from an earlier command / login.
         client.extend_info_messages(vec![SqlInfoMessage {
+            diagnostic_ordinal: 0,
             message: "stale from previous command".to_string(),
             state: 1,
             class: 10,

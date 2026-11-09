@@ -741,10 +741,40 @@ pub(super) fn fail_with_tds(
     err: &TdsError,
 ) -> SqlReturn {
     let info_messages = client.take_info_messages();
+    if client.continues_batch_on_error() && client.has_open_batch() {
+        let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
+        let row_count = client.last_rows_affected();
+        if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+            return SQL_ERROR;
+        }
+        let ird_ok = populate_ird(stmt, &[]).is_ok();
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            stmt_state.begin_batch(Vec::new());
+            stmt_state.reset_row_stream();
+            stmt_state.row_count = row_count;
+            stmt_state.clear_exhaustion_state();
+            stmt_state.error_result = true;
+            stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
+            stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+            post_tds_error_with_info(&mut stmt_state, err, SQLSTATE_HY000, &info_messages);
+            post_code_page_conversion_loss(&mut stmt_state, warn_cp_loss);
+        } else {
+            error!("stmt mutex poisoned while preserving failed batch");
+            return SQL_ERROR;
+        }
+        if !ird_ok && let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error refreshing result-set metadata",
+            );
+        }
+        return SQL_ERROR;
+    }
     return_client_idle(dbc, statement_handle, client);
     if let Ok(mut stmt_state) = stmt.inner.lock() {
-        post_tds_error(&mut stmt_state, err, SQLSTATE_HY000);
-        post_tds_info_messages(&mut stmt_state, &info_messages);
+        post_tds_error_with_info(&mut stmt_state, err, SQLSTATE_HY000, &info_messages);
     } else {
         error!("stmt mutex poisoned — could not post TDS error");
     }
@@ -3245,6 +3275,7 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
         let earlier = [SqlInfoMessage {
+            diagnostic_ordinal: 0,
             message: "row loop message".to_string(),
             state: 1,
             class: 10,

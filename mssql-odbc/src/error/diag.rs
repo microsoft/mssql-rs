@@ -10,6 +10,8 @@ use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 use std::sync::MutexGuard;
 
+use crate::api::odbc_types::{SQL_NO_ROW_NUMBER, SqlLen};
+
 /// SQLSTATE stored as 5 ASCII bytes (no NUL).
 pub(crate) type SqlState = [u8; 5];
 
@@ -33,6 +35,10 @@ pub(crate) const DRIVER_DIAG_PREFIX: &str = driver_diag_prefix!();
 pub(crate) trait HasDiagnostics {
     fn diag_records(&self) -> &[DiagRecord];
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord>;
+
+    fn server_row_number(&self) -> SqlLen {
+        SQL_NO_ROW_NUMBER
+    }
 }
 
 // If T implements HasDiagnostics, then MutexGuard<T> does too by delegation.
@@ -45,12 +51,21 @@ impl<T: HasDiagnostics + ?Sized> HasDiagnostics for MutexGuard<'_, T> {
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
         self.deref_mut().diag_records_mut()
     }
+
+    fn server_row_number(&self) -> SqlLen {
+        self.deref().server_row_number()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DiagRecord {
     pub(crate) sql_state: SqlState,
     pub(crate) native_error: i32,
+    /// Internal row key used by msodbcsql's diagnostic comparator.
+    pub(crate) row_number: SqlLen,
+    /// msodbcsql's internal message-resource ID (or the matching server
+    /// fallback tier). Equal keys retain posting order.
+    pub(crate) priority: u16,
     /// Borrowed for driver-raised `DiagMsg` text, so posting a fixed
     /// diagnostic (e.g. the `01004` of a `SQLGetData` length probe) does
     /// not allocate.
@@ -63,12 +78,32 @@ impl DiagRecord {
         native_error: i32,
         message: impl Into<Cow<'static, str>>,
     ) -> Self {
+        Self::with_sort_key(sql_state, native_error, SQL_NO_ROW_NUMBER, 0, message)
+    }
+
+    pub(crate) fn with_sort_key(
+        sql_state: SqlState,
+        native_error: i32,
+        row_number: SqlLen,
+        priority: u16,
+        message: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             sql_state,
             native_error,
+            row_number,
+            priority,
             message: message.into(),
         }
     }
+}
+
+/// Sort records in place once, matching msodbcsql's stable
+/// `(row number, resource ID, posting ordinal)` order.
+pub(crate) fn sort_diagnostics<T: HasDiagnostics + ?Sized>(state: &mut T) {
+    state
+        .diag_records_mut()
+        .sort_by_key(|record| (record.row_number, record.priority));
 }
 
 /// Post an ODBC diagnostic record onto a handle-local diagnostic list.

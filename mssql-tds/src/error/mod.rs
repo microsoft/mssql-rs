@@ -18,6 +18,8 @@ use tokio::time::error::Elapsed;
 /// is available via [`SqlServerDiagnostics`] inside `Error::SqlServerError`.
 #[derive(Debug, Clone)]
 pub struct SqlErrorInfo {
+    /// Arrival order among SQL Server ERROR and INFO tokens for this command.
+    pub diagnostic_ordinal: u64,
     /// Error message text returned by the server.
     pub message: String,
     /// Error state, used by the server to indicate specific error conditions.
@@ -53,6 +55,7 @@ impl std::fmt::Display for SqlErrorInfo {
 impl From<&crate::token::tokens::ErrorToken> for SqlErrorInfo {
     fn from(token: &crate::token::tokens::ErrorToken) -> Self {
         Self {
+            diagnostic_ordinal: 0,
             message: token.message.clone(),
             state: token.state,
             class: token.severity as i32,
@@ -71,6 +74,8 @@ impl From<&crate::token::tokens::ErrorToken> for SqlErrorInfo {
 /// language changes, and low-severity RAISERROR output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlInfoMessage {
+    /// Arrival order among SQL Server ERROR and INFO tokens for this command.
+    pub diagnostic_ordinal: u64,
     /// Message text returned by the server.
     pub message: String,
     /// Message state, used by the server to indicate specific conditions.
@@ -90,6 +95,7 @@ pub struct SqlInfoMessage {
 impl From<&crate::token::tokens::InfoToken> for SqlInfoMessage {
     fn from(token: &crate::token::tokens::InfoToken) -> Self {
         Self {
+            diagnostic_ordinal: 0,
             message: token.message.clone(),
             state: token.state,
             class: token.severity as i32,
@@ -596,6 +602,7 @@ mod tests {
     #[test]
     fn test_sql_server_error_full() {
         let error = Error::from_sql_error(SqlErrorInfo {
+            diagnostic_ordinal: 0,
             message: "Login failed".to_string(),
             state: 1,
             class: 14,
@@ -615,6 +622,7 @@ mod tests {
     #[test]
     fn test_sql_server_error_with_none_values() {
         let error = Error::from_sql_error(SqlErrorInfo {
+            diagnostic_ordinal: 0,
             message: "Error occurred".to_string(),
             state: 2,
             class: 16,
@@ -633,6 +641,7 @@ mod tests {
     fn test_sql_server_error_multiple() {
         let error = Error::from_sql_errors(vec![
             SqlErrorInfo {
+                diagnostic_ordinal: 0,
                 message: "First error".to_string(),
                 state: 1,
                 class: 16,
@@ -642,6 +651,7 @@ mod tests {
                 line_number: Some(1),
             },
             SqlErrorInfo {
+                diagnostic_ordinal: 0,
                 message: "Second error".to_string(),
                 state: 1,
                 class: 16,
@@ -730,6 +740,7 @@ mod tests {
     fn permanent_sql_server_error_is_not_transient() {
         // 18456 = Login failed — permanent, should not retry
         let err = Error::from_sql_error(SqlErrorInfo {
+            diagnostic_ordinal: 0,
             message: "Login failed".to_string(),
             state: 1,
             class: 14,
@@ -748,6 +759,7 @@ mod tests {
             49919, 49920,
         ] {
             let err = Error::from_sql_error(SqlErrorInfo {
+                diagnostic_ordinal: 0,
                 message: "transient".to_string(),
                 state: 1,
                 class: 16,
@@ -768,6 +780,7 @@ mod tests {
         // If any error in the batch is transient, the whole error is transient
         let err = Error::from_sql_errors(vec![
             SqlErrorInfo {
+                diagnostic_ordinal: 0,
                 message: "Login failed".to_string(),
                 state: 1,
                 class: 14,
@@ -777,6 +790,7 @@ mod tests {
                 line_number: None,
             },
             SqlErrorInfo {
+                diagnostic_ordinal: 0,
                 message: "Service busy".to_string(),
                 state: 1,
                 class: 16,
@@ -827,6 +841,7 @@ mod tests {
 
     fn sample_error(number: u32, message: &str) -> SqlErrorInfo {
         SqlErrorInfo {
+            diagnostic_ordinal: 0,
             message: message.to_string(),
             state: 1,
             class: 16,
@@ -839,6 +854,7 @@ mod tests {
 
     fn sample_info(number: u32, message: &str) -> SqlInfoMessage {
         SqlInfoMessage {
+            diagnostic_ordinal: 0,
             message: message.to_string(),
             state: 1,
             class: 10,

@@ -22,7 +22,9 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlReturn,
 };
-use crate::api::sqlstate::{SQLSTATE_HY000, post_tds_error, post_tds_info_messages};
+use crate::api::sqlstate::{
+    SQLSTATE_HY000, post_tds_error, post_tds_error_with_info, post_tds_info_messages,
+};
 use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
@@ -395,6 +397,35 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         Err(e) => {
             error!(%e, "SQLMoreResults: advance failed");
             let info_messages = client.take_info_messages();
+            if client.continues_batch_on_error() && client.has_open_batch() {
+                let row_count = client.last_rows_affected();
+                let ird_ok = populate_ird(stmt, &[]).is_ok();
+                if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
+                    return SQL_ERROR;
+                }
+                let _array_rc = match array_update {
+                    Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
+                    Err(rc) => rc,
+                };
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.begin_result_set(Vec::new());
+                    stmt_state.reset_row_stream();
+                    stmt_state.row_count = row_count;
+                    stmt_state.result_set_exhausted = false;
+                    stmt_state.batch_exhausted = false;
+                    stmt_state.error_result = true;
+                    post_tds_error_with_info(&mut stmt_state, &e, SQLSTATE_HY000, &info_messages);
+                }
+                if !ird_ok && let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
+            }
             if !dbc.return_lease(client, LeaseReturn::Release) {
                 return SQL_ERROR;
             }
@@ -405,8 +436,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
-                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
-                post_tds_info_messages(&mut stmt_state, &info_messages);
+                post_tds_error_with_info(&mut stmt_state, &e, SQLSTATE_HY000, &info_messages);
             }
             clear_ird_classification(stmt);
             SQL_ERROR
@@ -435,12 +465,27 @@ mod tests {
     /// open cursor — mirroring the state left by a successful `SQLExecDirect`.
     /// Returns the first statement's result so callers can assert on it.
     fn position_first_and_inject(h: &TestHandles, tokens: Vec<ScriptedToken>) -> StatementResult {
+        position_first_and_inject_with_continue(h, tokens, false)
+    }
+
+    fn position_first_and_inject_with_continue(
+        h: &TestHandles,
+        tokens: Vec<ScriptedToken>,
+        continue_on_error: bool,
+    ) -> StatementResult {
+        use mssql_tds::connection::tds_client::{BatchErrorMode, ExecuteOptions};
+
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut client = tds_client_from_tokens(tokens);
+        let options = if continue_on_error {
+            ExecuteOptions::new().on_error(BatchErrorMode::Continue)
+        } else {
+            ExecuteOptions::new()
+        };
         let first = dbc
             .runtime
-            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .block_on(client.execute("SELECT 1;".to_string(), options))
             .unwrap();
         {
             let mut ss = stmt.inner.lock().unwrap();
@@ -452,6 +497,55 @@ mod tests {
             ds.wire.set_owner_for_test(Some(h.stmt));
         }
         first
+    }
+
+    #[test]
+    fn more_results_keeps_continuable_error_batch_open() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject_with_continue(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                info(50000, 10, "before error"),
+                sql_error(1222, 16, "Lock request time out period exceeded."),
+                done_more(),
+                col_metadata(int_columns(1)),
+                done_no_more(),
+            ],
+            true,
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert!(state.error_result);
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.native_error == 1222)
+            );
+            assert!(
+                state
+                    .diag_records
+                    .iter()
+                    .any(|record| record.message.contains("before error"))
+            );
+        }
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().wire.statement_owner(),
+            Some(handles.stmt)
+        );
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
     }
 
     /// SQLMoreResults advances from one row set to the next, keeping the cursor
