@@ -4783,8 +4783,8 @@ impl TdsClient {
     ///   metadata still cached, if no send was attempted - the call failed
     ///   while building the request, or was cancelled or timed out before the
     ///   first packet - so the caller may retry the release. It is `None` once
-    ///   a send was attempted: the server may have consumed the drop even if
-    ///   the call then fails.
+    ///   a send was attempted, including when this future is dropped mid-send:
+    ///   the server may have consumed the drop even if the call then fails.
     ///
     /// - `command_started` - `true` when the caller already opened the command
     ///   boundary via `begin_command` (as
@@ -4921,17 +4921,30 @@ impl TdsClient {
         let issued_id = self.issue_statement_id();
         self.pending_capture = Some(issued_id);
 
+        // Taken before serializing: `serialize` is pending only after a send was
+        // attempted, so a future dropped mid-send leaves the drop consumed.
+        let released = orphan.take().map(|id| {
+            (
+                id,
+                self.prepared_handles.remove(&id),
+                self.prepared_param_encryption.remove(&id),
+            )
+        });
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
         drop(rpc);
-        // Settled before the await so ownership stays consistent if it is dropped.
-        if message.send_attempted()
-            && let Some(orphan_id) = orphan.take()
+        if !message.send_attempted()
+            && let Some((orphan_id, handle, encryption)) = released
         {
-            self.prepared_param_encryption.remove(&orphan_id);
-            self.prepared_handles.remove(&orphan_id);
+            *orphan = Some(orphan_id);
+            if let Some(handle) = handle {
+                self.prepared_handles.insert(orphan_id, handle);
+            }
+            if let Some(encryption) = encryption {
+                self.prepared_param_encryption.insert(orphan_id, encryption);
+            }
         }
         if let Err(e) = self.finish_send(serialize_result, message).await {
             self.report_issued_id(issued_id, statement_id);
@@ -18854,6 +18867,39 @@ mod tests {
             assert_eq!(statement_id, None);
             assert!(client.pending_capture.is_none());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_sp_prepexec_dropped_mid_send_consumes_orphan() {
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        transport
+            .send_should_hang
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        transport.send_prefix_before_hang = true;
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+        let (orphan_id, _metadata) = seed_prepared_orphan(&mut client, ORPHAN_HANDLE);
+        let mut orphan = Some(orphan_id);
+        let mut statement_id = None;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.execute_sp_prepexec(
+                "SELECT 1".to_string(),
+                Vec::new(),
+                &mut statement_id,
+                &mut orphan,
+                false,
+                (),
+            ),
+        )
+        .await
+        .expect_err("the stalled send never completes, so the future is dropped");
+
+        assert_eq!(sent.lock().unwrap().len(), 8, "dropped inside the packet");
+        assert_eq!(orphan, None, "the server may have consumed the drop");
+        assert!(!client.prepared_handles.contains_key(&orphan_id));
+        assert!(!client.prepared_param_encryption.contains_key(&orphan_id));
     }
 
     #[tokio::test]
