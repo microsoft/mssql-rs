@@ -71,9 +71,10 @@ pub(super) fn populate_ird(
 }
 
 /// Drops the IRD's `SQL_CA_SS_DATA_CLASSIFICATION` once its result set is gone:
-/// when an execution starts, at batch end, and when a statement that is not
-/// prepared closes its cursor. Matches where msodbcsql clears it
-/// (`ClearColinfo`, `sqlcfunc.cpp:641`), measured on 18.07.0001. Call without
+/// when the request that runs a statement is sent, at batch end, and when a
+/// statement that is not prepared closes its cursor. Matches where msodbcsql
+/// clears it (`ClearColinfo`, `sqlcfunc.cpp:641`), measured on 18.07.0001: a
+/// call that sends nothing, such as one refused as busy, keeps it. Call without
 /// the STMT lock held. A poisoned IRD is left alone: `SQLGetDescField` already
 /// fails on it.
 pub(super) fn clear_ird_classification(stmt: &StmtHandle) {

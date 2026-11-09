@@ -232,7 +232,6 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         Ok(s) => s,
         Err(rc) => return rc,
     };
-    super::ird::clear_ird_classification(stmt);
 
     #[cfg(test)]
     tests::after_execution_staging();
@@ -310,6 +309,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // `query_timeout` (already deducted above) bounds the whole call,
             // including any reconnect charged above; `0` means unlimited, matching
             // the ODBC default.
+            super::ird::clear_ird_classification(stmt);
             let exec_result = dbc.runtime.block_on(
                 client.execute_prepared(
                     &mut prepared.stmt,
@@ -615,6 +615,7 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
                 return SQL_ERROR;
             }
+            super::ird::clear_ird_classification(stmt);
 
             let result = match batch_result {
                 Ok(result) => result,

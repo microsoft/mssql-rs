@@ -377,7 +377,6 @@ fn sql_exec_direct_w_operation(
             return rc;
         }
     };
-    super::ird::clear_ird_classification(stmt);
 
     let ParamsWithDae {
         params,
@@ -523,6 +522,7 @@ fn sql_exec_direct_w_operation(
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
     // STMT lock is held during I/O. `query_timeout` (already deducted above)
     // bounds either call; `0` means unlimited, matching the ODBC default.
+    super::ird::clear_ird_classification(stmt);
     let exec_result: Result<(), mssql_tds::error::Error> = if let Some(call) = call.as_ref() {
         // A statement that is nothing but `{call proc(?)}` goes out as a TDS
         // RPC rather than as text, which is what makes output parameters and

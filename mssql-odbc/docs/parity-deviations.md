@@ -1365,7 +1365,7 @@ msodbcsql build is measured.
     msodbcsql copies the token payload without checking it (`Parse.cpp`
     `ProcessDataClassification`, `sqlctokn.cpp` `OnDataClassification`).
     mssql-tds validates the token before the IRD sees it, and the IRD payload
-    is rebuilt from that metadata in the [MS-TDS] 2.2.7.5 layout. Three cases
+    is rebuilt from that metadata in the [MS-TDS] 2.2.7.5 layout. Four cases
     differ from msodbcsql:
     - An out-of-range dictionary index or an undefined rank is a protocol
       error that retires the connection; only a non-compliant server sends
@@ -1377,6 +1377,16 @@ msodbcsql build is measured.
       returned as U+FFFD where msodbcsql returns the original code unit.
       SQL Server stores these names as `nvarchar`, so a compliant server can
       send one.
+    - A name of 128 UTF-16 units, the longest SQL Server accepts for a label
+      or information type, is returned verbatim. msodbcsql 18.07.0001 handles
+      127 units but returns `HYT00` once the query timeout expires for 128,
+      against SQL Server 2022 (270 and 272-byte payloads for a one-character
+      label ID). This driver keeps the correct behavior rather than
+      reproducing the failure; `LabelsUpTo128CharactersAreReturned` asserts
+      each driver's outcome with a five-second timeout, and
+      `names_up_to_255_units_are_returned_verbatim` covers every length a
+      `B_VARCHAR` can encode.
 
-    For well-formed names the payload is byte-identical to msodbcsql's;
+    For well-formed names shorter than 128 UTF-16 units the payload is
+    byte-identical to msodbcsql's;
     measured at versions 1 and 2 on msodbcsql 18.07.0001 and SQL Server 2022.

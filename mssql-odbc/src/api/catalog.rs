@@ -574,7 +574,6 @@ fn run_catalog_operation(
         mssql_tds::trace_context::activate_execution();
         (stmt_state.query_timeout, cancel_handle)
     };
-    super::ird::clear_ird_classification(stmt);
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, name) {
         Ok(client) => client,
@@ -630,6 +629,7 @@ fn run_catalog_operation(
     };
 
     let (positional, named) = build_params(false);
+    super::ird::clear_ird_classification(stmt);
     let mut exec_result = dbc.runtime.block_on(
         client.execute_stored_procedure(
             qualified_proc_name(catalog, proc),

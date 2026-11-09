@@ -175,7 +175,6 @@ fn sql_get_type_info_w_operation(
         mssql_tds::trace_context::activate_execution();
         (stmt_state.query_timeout, cancel_handle)
     };
-    super::ird::clear_ird_classification(stmt);
 
     // `@data_type` is positional and uses the ODBC 3.x identifier unchanged.
     let (positional, named) = type_info_rpc_params(data_type);
@@ -239,6 +238,7 @@ fn sql_get_type_info_w_operation(
         }
     };
 
+    super::ird::clear_ird_classification(stmt);
     let exec_result = dbc.runtime.block_on(
         client.execute_stored_procedure(
             DATATYPE_INFO_PROC.to_string(),

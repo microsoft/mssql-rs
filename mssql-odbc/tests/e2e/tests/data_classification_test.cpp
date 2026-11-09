@@ -544,6 +544,110 @@ TEST_F(DataClassificationTest, ParameterConversionFailureKeepsTheClassification)
     ExpectClassifiedPayload(false);
     SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
 }
+// msodbcsql drops the classification only once a request reaches the server
+// (measured on 18.07.0001): a call refused because the connection is busy, a
+// parameter array that sends no set, and a data-at-execution execute
+// cancelled at SQL_NEED_DATA all keep it.
+TEST_F(DataClassificationTest, NothingSentKeepsTheClassification) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+
+    auto sql = ODBCTestUtils::ToSqlTStr(ClassifiedSelect() + " WHERE id = ?");
+    SQLINTEGER id = 1;
+    SQLLEN id_len = 0;
+    auto prepare_and_close = [&] {
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(
+            SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, reinterpret_cast<SQLPOINTER>(1), 0),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                       &id, 0, &id_len),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    };
+    // Unread rows on another statement keep the connection busy.
+    auto occupy = [&] {
+        SQLHSTMT other = AllocStmt();
+        auto big = ODBCTestUtils::ToSqlTStr(
+            "SELECT TOP 200000 a.object_id FROM sys.all_columns a CROSS JOIN sys.all_columns b");
+        EXPECT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(big.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, other);
+        EXPECT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+        return other;
+    };
+    auto release = [&](SQLHSTMT other) {
+        SQLFreeStmt(other, SQL_CLOSE);
+        SQLFreeHandle(SQL_HANDLE_STMT, other);
+    };
+
+    ASSERT_NO_FATAL_FAILURE(prepare_and_close());
+    SQLHSTMT other = occupy();
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY000");
+    ExpectClassifiedPayload(false);
+    release(other);
+
+#ifdef _WIN32
+    // A failed SQLExecDirect or catalog call leaves the statement unprepared,
+    // where unixODBC rejects an IRD read with HY007.
+    auto direct = ODBCTestUtils::ToSqlTStr("SELECT 1 AS x");
+    ASSERT_NO_FATAL_FAILURE(prepare_and_close());
+    other = occupy();
+    EXPECT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(direct.c_str()), SQL_NTS));
+    ExpectClassifiedPayload(false);
+    release(other);
+
+    ASSERT_NO_FATAL_FAILURE(prepare_and_close());
+    other = occupy();
+    EXPECT_EQ(SQL_ERROR, SQLTables(stmt_, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0));
+    ExpectClassifiedPayload(false);
+    release(other);
+#endif
+
+    ASSERT_NO_FATAL_FAILURE(prepare_and_close());
+    char bad[2][12] = {"not-an-int", "nope"};
+    SQLLEN bad_lens[2] = {SQL_NTS, SQL_NTS};
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_INTEGER, 0, 0, bad,
+                                   sizeof(bad[0]), bad_lens),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+    ExpectClassifiedPayload(false);
+
+    ASSERT_NO_FATAL_FAILURE(prepare_and_close());
+    SQLINTEGER ids[2] = {1, 1};
+    SQLLEN id_lens[2] = {0, 0};
+    SQLUSMALLINT operations[2] = {SQL_PARAM_IGNORE, SQL_PARAM_IGNORE};
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_OPERATION_PTR, operations, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, ids,
+                                   0, id_lens),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_OPERATION_PTR, nullptr, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, reinterpret_cast<SQLPOINTER>(1), 0),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_NO_FATAL_FAILURE(prepare_and_close());
+    SQLLEN dae = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_INTEGER, 0, 0,
+                                   reinterpret_cast<SQLPOINTER>(1), 0, &dae),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    EXPECT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+    ExpectClassifiedPayload(false);
+    SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
+}
 TEST_F(DataClassificationTest, ParameterArrayReportsEachSetsClassification) {
     ConnectDbc();
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
@@ -656,4 +760,43 @@ TEST_F(DataClassificationTest, ShortBufferSqlState) {
     const char* target = std::getenv("ODBC_TEST_TARGET");
     bool reference = target != nullptr && std::string(target) == "msodbcsql";
     EXPECT_SQLSTATE(SQL_HANDLE_DESC, ird, reference ? "HY004" : "01004");
+}
+
+// SQL Server allows a 128-character label, the most a B_VARCHAR length byte
+// holds below 256. msodbcsql 18.07.0001 handles 127 units but times out on 128
+// (parity deviation 41); this driver returns both. A finite query timeout
+// keeps the reference leg from hanging.
+TEST_F(DataClassificationTest, LabelsUpTo128CharactersAreReturned) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+    ExecDirect("ADD SENSITIVITY CLASSIFICATION TO dbo." + table_ + ".id WITH (LABEL = '" +
+               std::string(127, 'a') + "', LABEL_ID = 'L');" +
+               "ADD SENSITIVITY CLASSIFICATION TO dbo." + table_ + ".note WITH (LABEL = '" +
+               std::string(128, 'b') + "', LABEL_ID = 'L');");
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(5), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    bool reference = target != nullptr && std::string(target) == "msodbcsql";
+
+    for (auto [column, units] : {std::pair<const char*, size_t>{"id", 127}, {"note", 128}}) {
+        auto sql = ODBCTestUtils::ToSqlTStr(std::string("SELECT ") + column + " FROM dbo." + table_);
+        SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+        if (reference && units == 128) {
+            EXPECT_EQ(SQL_ERROR, rc);
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYT00");
+            continue;
+        }
+        ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        auto bytes = IrdPayload();
+        ASSERT_TRUE(bytes.has_value()) << units;
+        EXPECT_EQ(16 + 2 * units, bytes->size());
+        auto payload = Parse(*bytes, false);
+        ASSERT_TRUE(payload.has_value()) << units;
+        ASSERT_EQ(1u, payload->columns.size());
+        ASSERT_EQ(1u, payload->columns[0].size());
+        EXPECT_EQ(std::string(units, units == 127 ? 'a' : 'b'), payload->columns[0][0].label);
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+    }
 }

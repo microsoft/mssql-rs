@@ -558,6 +558,7 @@ fn sql_param_data_operation(
         };
         (dae.take_prepared(), dae.take_orphaned())
     };
+    super::ird::clear_ird_classification(stmt);
     let end_result = match prepared.as_mut() {
         Some(plan) => dbc
             .runtime
@@ -955,6 +956,7 @@ fn run_deferred_execute(
     let options = ExecuteOptions::new()
         .timeout_secs(timeout_secs)
         .cancel(&cancel_handle);
+    super::ird::clear_ird_classification(stmt);
     let exec_result = match (prepared.as_mut(), sql) {
         (Some(plan), _) => dbc
             .runtime

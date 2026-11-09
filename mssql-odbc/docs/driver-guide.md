@@ -113,7 +113,9 @@ A result set's classification is read from its IRD header (`RecNumber` 0):
   acknowledged for the session, or `0` when it did not enable the feature.
 - `SQL_CA_SS_DATA_CLASSIFICATION` (1237) is the DATACLASSIFICATION token
   payload in the [MS-TDS] layout, byte-identical to msodbcsql's for
-  well-formed names; an unpaired UTF-16 surrogate is returned as U+FFFD (see
+  well-formed names shorter than 128 UTF-16 units. A 128-unit name, the
+  longest SQL Server accepts, is returned where msodbcsql 18.07.0001 times
+  out, and an unpaired UTF-16 surrogate is returned as U+FFFD (see
   [parity deviation 41](parity-deviations.md)). A short
   buffer receives a prefix with `01004` (msodbcsql reports `HY004`; see
   [parity deviation 40](parity-deviations.md)), and a result set
@@ -121,15 +123,18 @@ A result set's classification is read from its IRD header (`RecNumber` 0):
 
 `SQLColAttribute` does not answer either field. Each result set reports only
 its own classification: as in msodbcsql, it is dropped when a statement is
-prepared, when an execution is sent to the server (whether it then succeeds or
-fails), when a row read is cancelled, at the end of the batch, and when a
-statement that is not prepared is closed, cancelled, or swept by `SQLEndTran`.
-Ending a started transaction also drops it from a prepared statement whose
-cursor was already closed. Two failures leave it readable, as in msodbcsql, so
-`SQL_ERROR` alone does not mean it was cleared: an execution rejected before
-anything is sent, such as a parameter that fails conversion (`22018`), and a
-server error that a fetch reports after rows were delivered. Closing the
-statement afterwards follows the rules above.
+prepared, when the request that runs a statement is sent to the server
+(whether it then succeeds or fails), when a row read is cancelled, at the end
+of the batch, and when a statement that is not prepared is closed, cancelled,
+or swept by `SQLEndTran`. Ending a started transaction also drops it from a
+prepared statement whose cursor was already closed. A call that sends nothing
+keeps it, as in msodbcsql, so `SQL_ERROR` alone does not mean it was cleared:
+a parameter that fails conversion (`22018`), a connection busy with another
+statement's results, a parameter array whose every set is ignored or fails
+conversion, and a data-at-execution `SQLExecute` or `SQLExecDirect` before its
+last `SQLParamData` (including one cancelled at `SQL_NEED_DATA`). A server
+error that a fetch reports after rows were delivered also keeps it. Closing
+the statement afterwards follows the rules above.
 
 ## Integer connection-attribute getters
 

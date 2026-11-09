@@ -139,8 +139,8 @@ mod tests {
     use crate::api::odbc_types::{
         SQL_CA_SS_DATA_CLASSIFICATION, SQL_CA_SS_DATA_CLASSIFICATION_VERSION,
         SQL_COPT_SS_DATACLASSIFICATION_VERSION, SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_NO_DATA,
-        SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
-        SqlSmallInt, SqlWChar,
+        SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlLen, SqlPointer,
+        SqlReturn, SqlSmallInt, SqlWChar,
     };
     use crate::api::prepare::sql_prepare_w;
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
@@ -514,6 +514,33 @@ mod tests {
         assert_last_diag(&desc_diags(ird(stmt)), ERR_INVALID_DESCRIPTOR_FIELD);
     }
 
+    /// A B_VARCHAR length is an unsigned byte. SQL Server sends names of up to
+    /// 128 UTF-16 units, where msodbcsql 18.07.0001 times out (parity deviation
+    /// 41); every length up to 255 round-trips here.
+    #[test]
+    fn names_up_to_255_units_are_returned_verbatim() {
+        let (n127, n128, n255) = ("a".repeat(127), "b".repeat(128), "c".repeat(255));
+        let wire = token(
+            false,
+            &[(&n127, "L127"), (&n128, &n128)],
+            &[(&n255, "I255")],
+            0,
+            &[&[(0, UNSPECIFIED, 0)], &[(1, 0, 0)]],
+        );
+        let registered = wire.clone();
+        let server = Server::start(DataClassificationAck::Requested, |registry| {
+            registry.register_with_data_classification(
+                CLASSIFIED,
+                int_response(&["ssn", "phone"]),
+                registered,
+            );
+        });
+        let mut h = TestHandles::with_env_dbc();
+        let stmt = execute(&server, &mut h, CLASSIFIED);
+
+        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, wire[1..].to_vec()));
+    }
+
     #[test]
     fn each_result_set_reports_only_its_own_classification() {
         let first = single_label_token("First");
@@ -834,7 +861,7 @@ mod tests {
     #[test]
     fn a_parameter_conversion_failure_keeps_the_classification() {
         use crate::api::odbc_types::{
-            SQL_C_CHAR, SQL_C_SLONG, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT, SqlLen,
+            SQL_C_CHAR, SQL_C_SLONG, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT,
         };
 
         let (server, payload) = classified_server();
@@ -882,6 +909,249 @@ mod tests {
         assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
     }
 
+    /// Prepares and executes `{CLASSIFIED} WHERE ID = ?` with `id` bound as an
+    /// integer, then closes the cursor, which a prepared statement survives with
+    /// its classification.
+    fn prepared_with_parameter(
+        h: &mut TestHandles,
+        id: &mut i32,
+        id_len: &mut SqlLen,
+    ) -> SqlHandle {
+        use crate::api::odbc_types::{SQL_C_SLONG, SQL_INTEGER, SQL_PARAM_INPUT};
+
+        let stmt = h.alloc_extra_stmt();
+        let rc = unsafe {
+            crate::api::SQLBindParameter(
+                stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_SLONG,
+                SQL_INTEGER,
+                0,
+                0,
+                std::ptr::from_mut(id).cast(),
+                0,
+                id_len,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        let text: Vec<SqlWChar> = format!("{CLASSIFIED} WHERE ID = ?")
+            .encode_utf16()
+            .collect();
+        let len = SqlInteger::try_from(text.len()).unwrap();
+        assert_eq!(
+            unsafe { sql_prepare_w(stmt, text.as_ptr(), len) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { sql_execute(stmt) }, SQL_SUCCESS);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        stmt
+    }
+
+    /// msodbcsql drops the classification only once a request reaches the
+    /// server, so a call refused because another owner holds the connection
+    /// keeps it (measured on 18.07.0001 for SQLExecute, SQLExecDirect and
+    /// SQLTables).
+    #[test]
+    fn a_busy_connection_keeps_the_classification() {
+        use crate::api::odbc_types::SQL_ALL_TYPES;
+        use crate::api::sqlstate::ERR_CONNECTION_BUSY;
+        use crate::handles::wire::{ClaimPolicy, LeaseReturn, WireOwner};
+
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .wire
+            .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+            .unwrap();
+        let unclassified: Vec<SqlWChar> = UNCLASSIFIED.encode_utf16().collect();
+        let calls: [(&str, &dyn Fn() -> SqlReturn); 4] = [
+            ("SQLExecute", &|| unsafe { sql_execute(stmt) }),
+            ("SQLExecDirect", &|| unsafe {
+                crate::api::SQLExecDirectW(
+                    stmt,
+                    unclassified.as_ptr(),
+                    SqlInteger::try_from(unclassified.len()).unwrap(),
+                )
+            }),
+            ("SQLTables", &|| unsafe {
+                crate::api::SQLTablesW(
+                    stmt,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                )
+            }),
+            ("SQLGetTypeInfo", &|| unsafe {
+                crate::api::SQLGetTypeInfoW(stmt, SQL_ALL_TYPES)
+            }),
+        ];
+        for (name, call) in calls {
+            assert_eq!(call(), SQL_ERROR, "{name}");
+            assert_last_diag(
+                &unsafe { handle_from_raw::<StmtHandle>(stmt) }
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .diag_records,
+                ERR_CONNECTION_BUSY,
+            );
+            assert_eq!(
+                classification(ird(stmt)),
+                (SQL_SUCCESS, payload.clone()),
+                "{name}"
+            );
+        }
+        dbc.return_lease(lease, LeaseReturn::Release);
+    }
+
+    /// A parameter array that sends no set keeps the classification, whether
+    /// every set is ignored or every set fails conversion (measured on
+    /// msodbcsql 18.07.0001).
+    #[test]
+    fn a_parameter_array_that_sends_nothing_keeps_the_classification() {
+        use crate::api::odbc_types::{
+            SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAMSET_SIZE, SQL_C_CHAR, SQL_INTEGER, SQL_NTS,
+            SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SqlUSmallInt,
+        };
+
+        for ignored in [true, false] {
+            let (server, payload) = classified_server();
+            let mut h = TestHandles::with_env_dbc();
+            server.connect(h.dbc);
+            let (mut id, mut id_len) = (1, 0);
+            let stmt = prepared_with_parameter(&mut h, &mut id, &mut id_len);
+            let mut operations: [SqlUSmallInt; 2] = [SQL_PARAM_IGNORE; 2];
+            let mut values = *b"not-an-int\0nope\0\0\0\0\0\0\0";
+            let mut lengths = [SqlLen::from(SQL_NTS); 2];
+            unsafe {
+                assert_eq!(
+                    crate::api::SQLSetStmtAttrW(stmt, SQL_ATTR_PARAMSET_SIZE, 2 as SqlPointer, 0),
+                    SQL_SUCCESS
+                );
+                if ignored {
+                    assert_eq!(
+                        crate::api::SQLSetStmtAttrW(
+                            stmt,
+                            SQL_ATTR_PARAM_OPERATION_PTR,
+                            operations.as_mut_ptr().cast(),
+                            0,
+                        ),
+                        SQL_SUCCESS
+                    );
+                } else {
+                    assert_eq!(
+                        crate::api::SQLBindParameter(
+                            stmt,
+                            1,
+                            SQL_PARAM_INPUT,
+                            SQL_C_CHAR,
+                            SQL_INTEGER,
+                            0,
+                            0,
+                            values.as_mut_ptr().cast(),
+                            12,
+                            lengths.as_mut_ptr(),
+                        ),
+                        SQL_SUCCESS
+                    );
+                }
+            }
+            let rc = unsafe { sql_execute(stmt) };
+            assert_eq!(rc, if ignored { SQL_SUCCESS } else { SQL_ERROR });
+            assert_eq!(
+                classification(ird(stmt)),
+                (SQL_SUCCESS, payload),
+                "ignored: {ignored}"
+            );
+        }
+    }
+
+    /// `SQLExecute` stops at `SQL_NEED_DATA` before anything runs, so a cancel
+    /// there keeps the classification; the last `SQLParamData` sends the
+    /// request and drops it even when the server then fails it (measured on
+    /// msodbcsql 18.07.0001). Covers the buffered and the streamed sequence.
+    #[test]
+    fn data_at_execution_drops_the_classification_only_when_it_runs() {
+        use crate::api::odbc_types::{
+            SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NEED_DATA, SQL_NTS, SQL_PARAM_INPUT,
+            SQL_VARCHAR,
+        };
+
+        for sql_type in [SQL_INTEGER, SQL_VARCHAR] {
+            let (server, payload) = classified_server();
+            let mut h = TestHandles::with_env_dbc();
+            server.connect(h.dbc);
+            let (mut id, mut id_len) = (1, 0);
+            let stmt = prepared_with_parameter(&mut h, &mut id, &mut id_len);
+            let mut dae = SQL_DATA_AT_EXEC;
+            let rc = unsafe {
+                crate::api::SQLBindParameter(
+                    stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    sql_type,
+                    0,
+                    0,
+                    1 as SqlPointer,
+                    0,
+                    &raw mut dae,
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS);
+
+            assert_eq!(unsafe { sql_execute(stmt) }, SQL_NEED_DATA, "{sql_type}");
+            assert_eq!(unsafe { crate::api::SQLCancel(stmt) }, SQL_SUCCESS);
+            assert_eq!(
+                classification(ird(stmt)),
+                (SQL_SUCCESS, payload.clone()),
+                "{sql_type}"
+            );
+
+            server.register(
+                CLASSIFIED,
+                QueryResponse::error_only(TerminalError::new(208, 16, "Invalid object name.")),
+            );
+            assert_eq!(unsafe { sql_execute(stmt) }, SQL_NEED_DATA, "{sql_type}");
+            let mut token: SqlPointer = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { crate::api::SQLParamData(stmt, &raw mut token) },
+                SQL_NEED_DATA
+            );
+            assert_eq!(
+                classification(ird(stmt)),
+                (SQL_SUCCESS, payload),
+                "{sql_type}"
+            );
+            let mut value = *b"1\0";
+            assert_eq!(
+                unsafe {
+                    crate::api::SQLPutData(stmt, value.as_mut_ptr().cast(), SqlLen::from(SQL_NTS))
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::SQLParamData(stmt, &raw mut token) },
+                SQL_ERROR,
+                "{sql_type}"
+            );
+            assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{sql_type}");
+        }
+    }
     /// A failed execution reports no classification, not the one its
     /// statement had before.
     #[test]
