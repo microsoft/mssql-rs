@@ -1268,44 +1268,55 @@ mod tests {
     }
 
     /// A connection already known dead that session recovery reconnects does
-    /// send the request, so a server error afterwards drops the classification.
+    /// send the request, so a server error afterwards drops the classification,
+    /// including a fatal one that leaves the new connection dead too.
     #[test]
     fn a_send_after_a_successful_reconnect_drops_the_classification() {
-        let (server, payload) = classified_server();
-        server.runtime.block_on(async {
-            server.registry.lock().await.set_session_recovery(true);
-        });
-        let mut h = TestHandles::with_env_dbc();
-        server.connect(h.dbc);
-        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
-        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
-        assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
-        server.register(
-            CLASSIFIED,
-            QueryResponse::error_only(TerminalError::new(208, 16, "Invalid object name.")),
-        );
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        dbc.inner
-            .lock()
-            .unwrap()
-            .wire
-            .client_mut_for_test()
-            .unwrap()
-            .mark_connection_dead();
-
-        assert_eq!(unsafe { sql_execute(stmt) }, SQL_ERROR);
-        assert!(
+        for severity in [16, 20] {
+            let (server, payload) = classified_server();
+            server.runtime.block_on(async {
+                server.registry.lock().await.set_session_recovery(true);
+            });
+            let mut h = TestHandles::with_env_dbc();
+            server.connect(h.dbc);
+            let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+            assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+            assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+            server.register(
+                CLASSIFIED,
+                QueryResponse::error_only(TerminalError::new(208, severity, "Server failure.")),
+            );
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
             dbc.inner
                 .lock()
                 .unwrap()
                 .wire
-                .client()
-                .is_some_and(|client| !client.is_connection_dead()),
-            "session recovery reconnected before the request was sent"
-        );
-        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
-    }
+                .client_mut_for_test()
+                .unwrap()
+                .mark_connection_dead();
 
+            assert_eq!(
+                unsafe { sql_execute(stmt) },
+                SQL_ERROR,
+                "severity {severity}"
+            );
+            assert_eq!(
+                dbc.inner
+                    .lock()
+                    .unwrap()
+                    .wire
+                    .client()
+                    .is_some_and(|client| client.is_connection_dead()),
+                severity >= 20,
+                "severity {severity}"
+            );
+            assert_eq!(
+                classification(ird(stmt)).0,
+                SQL_ERROR,
+                "severity {severity}"
+            );
+        }
+    }
     /// With two streamed data-at-execution parameters, closing the first sends
     /// no complete request, so the classification stays through that
     /// `SQLParamData` and a cancel after it; the last one drops it even when
