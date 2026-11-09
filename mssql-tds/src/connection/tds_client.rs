@@ -25136,8 +25136,6 @@ mod tests {
         use super::*;
         use crate::connection::client_context::ExecutionColumnEncryptionSetting;
         use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
-        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
-        use crate::security::query_metadata_cache::QueryMetadataCache;
 
         const UNICODE_SQL: &str = "SELECT @P1 AS [é你好𐐀], N'𐐀'; SET @P2 = 1";
         const EXECUTESQL: [u8; 6] = [0xFF, 0xFF, 10, 0, 0, 0];
@@ -25179,7 +25177,16 @@ mod tests {
             bytes
         }
 
-        fn enable_always_encrypted(client: &mut TdsClient, sql: &str) {
+        /// The same text as a named `nvarchar(max)` parameter, as the
+        /// `sp_describe_parameter_encryption` request sends `@tsql` and `@params`.
+        fn named_text_param(client: &TdsClient, name: &str, text: &str) -> Vec<u8> {
+            let mut bytes = vec![u8::try_from(name.len()).unwrap()];
+            bytes.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes.extend(&text_param(client, text)[1..]);
+            bytes
+        }
+
+        fn enable_always_encrypted(client: &mut TdsClient) {
             use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
             use crate::message::login::Feature;
 
@@ -25190,12 +25197,26 @@ mod tests {
                 .session_settings
                 .supported_features
                 .push(Box::new(feature));
-            // A cached describe that reports nothing encrypted: the AE path runs
-            // without a describe round trip and sends the values in plaintext.
-            let key = QueryMetadataCache::key(&client.negotiated_settings.database, sql);
-            client
-                .query_metadata_cache
-                .insert(key, Arc::new(DescribeParameterEncryptionResult::new()));
+        }
+
+        /// An `sp_describe_parameter_encryption` response reporting no CEKs and
+        /// no encrypted parameters, so the values then go out in plaintext.
+        fn empty_describe_response() -> [Tokens; 4] {
+            [
+                int_col_metadata(1),
+                done_more(),
+                int_col_metadata(1),
+                done_no_more(),
+            ]
+        }
+
+        /// Splits the captured bytes at the RPC that follows the describe request.
+        fn split_at_rpc<'b>(bytes: &'b [u8], proc_header: &[u8]) -> (&'b [u8], &'b [u8]) {
+            let at = bytes
+                .windows(proc_header.len())
+                .position(|window| window == proc_header)
+                .expect("RPC follows the describe request");
+            bytes.split_at(at)
         }
 
         #[tokio::test]
@@ -25369,13 +25390,19 @@ mod tests {
             assert!(contains(&take_sent(&sent), &expected));
         }
 
-        /// Always Encrypted materializes the same declaration for its describe
-        /// request and then sends it like any other.
+        /// Always Encrypted sends the declaration to
+        /// `sp_describe_parameter_encryption`, then sends the identical text in
+        /// the RPC it describes. Output parameters bypass the describe cache, so
+        /// both executions make a round trip.
         #[tokio::test]
-        async fn always_encrypted_sends_the_described_declaration() {
-            let (mut client, sent) =
-                create_capturing_client(vec![done_no_more(), handle_token(55), done_no_more()]);
-            enable_always_encrypted(&mut client, UNICODE_SQL);
+        async fn always_encrypted_describes_and_sends_the_same_declaration() {
+            const DECLARATION: &str = "@P1 int,@P2 int OUTPUT";
+            let mut tokens = Vec::from(empty_describe_response());
+            tokens.push(done_no_more());
+            tokens.extend(empty_describe_response());
+            tokens.extend([handle_token(55), done_no_more()]);
+            let (mut client, sent) = create_capturing_client(tokens);
+            enable_always_encrypted(&mut client);
             let options = || {
                 ExecuteOptions::new().column_encryption(ExecutionColumnEncryptionSetting::Enabled)
             };
@@ -25385,32 +25412,48 @@ mod tests {
                     int_param("@P2", StatusFlags::BY_REF_VALUE),
                 ]
             };
+            let described = |client: &TdsClient| {
+                [
+                    named_text_param(client, "@tsql", UNICODE_SQL),
+                    named_text_param(client, "@params", DECLARATION),
+                ]
+                .concat()
+            };
 
             client
                 .execute_sp_executesql(UNICODE_SQL.to_string(), params(), options())
                 .await
                 .unwrap();
             client.close_query().await.unwrap();
+            assert_eq!(client.describe_round_trips(), 1);
+            let bytes = take_sent(&sent);
+            let (describe, rpc) = split_at_rpc(&bytes, &EXECUTESQL);
+            assert!(contains(describe, &described(&client)));
             let expected = [
                 EXECUTESQL.to_vec(),
                 text_param(&client, UNICODE_SQL),
-                text_param(&client, "@P1 int,@P2 int OUTPUT"),
+                text_param(&client, DECLARATION),
             ]
             .concat();
-            assert!(contains(&take_sent(&sent), &expected));
+            assert!(rpc.starts_with(&expected));
 
             let mut statement = PreparedStatement::new(UNICODE_SQL);
             client
                 .execute_prepared(&mut statement, params(), &mut None, options())
                 .await
                 .unwrap();
+            assert_eq!(client.describe_round_trips(), 2);
+            let id = statement.id().expect("the @handle was captured");
+            assert!(client.prepared_param_encryption.contains_key(&id));
+            let bytes = take_sent(&sent);
+            let (describe, rpc) = split_at_rpc(&bytes, &PREPEXEC);
+            assert!(contains(describe, &described(&client)));
             let expected = [
-                text_param(&client, "@P1 int,@P2 int OUTPUT"),
+                text_param(&client, DECLARATION),
                 text_param(&client, UNICODE_SQL),
             ]
             .concat();
-            assert!(contains(&take_sent(&sent), &expected));
-            assert_eq!(client.describe_round_trips(), 0);
+            assert!(contains(rpc, &expected));
         }
     }
 }
