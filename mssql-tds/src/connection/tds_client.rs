@@ -19,7 +19,7 @@ use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
-    RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
+    RequestText, RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
 };
 use crate::message::rpc::{RpcProcs, RpcType, SqlRpc, ValueBinding};
 use crate::message::transaction_management::{
@@ -1925,9 +1925,10 @@ impl TdsClient {
         };
         RpcParameter::reject_data_at_exec(named_params.iter())?;
 
-        let declaration_params = named_params.clone();
         let mut params_list_as_string = String::new();
-        build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+        build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
@@ -1939,8 +1940,8 @@ impl TdsClient {
 
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
-                &sql,
-                &params_list_as_string,
+                statement.as_str(),
+                declaration.as_str(),
                 &mut named_params,
                 timeout_sec,
                 cancel_handle,
@@ -1952,12 +1953,8 @@ impl TdsClient {
             self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         }
 
-        let rpc = self.build_sp_executesql_rpc(
-            sql,
-            named_params,
-            params_list_as_string,
-            &database_collation,
-        );
+        let rpc =
+            self.build_sp_executesql_rpc(statement, declaration, named_params, &database_collation);
         self.output_names_by_ordinal = rpc.output_names_by_ordinal(std::iter::empty());
 
         let mut packet_writer =
@@ -2517,10 +2514,13 @@ impl TdsClient {
             ));
         }
 
-        let mut declaration_params = materialized_params.clone();
-        declaration_params.extend(streamed_params.iter().cloned());
         let mut params_list_as_string = String::new();
-        build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+        build_parameter_list_string(
+            materialized_params.iter().chain(&streamed_params),
+            &mut params_list_as_string,
+        )?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         let (timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
@@ -2528,9 +2528,9 @@ impl TdsClient {
             materialized_params.iter().chain(streamed_params.iter()),
         )?;
         let rpc = self.build_sp_executesql_rpc(
-            sql,
+            statement,
+            declaration,
             materialized_params,
-            params_list_as_string,
             &database_collation,
         );
 
@@ -2588,24 +2588,15 @@ impl TdsClient {
 
     fn build_sp_executesql_rpc<'a>(
         &self,
-        sql: String,
+        statement: RequestText,
+        declaration: RequestText,
         named_params: Vec<RpcParameter>,
-        params_list_as_string: String,
         database_collation: &'a SqlCollation,
     ) -> SqlRpc<'a> {
-        let statement_parameter = RpcParameter::new(
-            None,
-            StatusFlags::NONE,
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql))),
-        );
-
-        let params_parameter = RpcParameter::new(
-            None,
-            StatusFlags::NONE,
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
-        );
-
-        let positional_parameters = Some(vec![statement_parameter, params_parameter]);
+        let positional_parameters = Some(vec![
+            RpcParameter::request_text(statement),
+            RpcParameter::request_text(declaration),
+        ]);
 
         SqlRpc::new(
             RpcType::ProcId(RpcProcs::ExecuteSql),
@@ -4030,17 +4021,12 @@ impl TdsClient {
 
         let database_collation = self.negotiated_settings.database_collation;
 
-        let sql_statement_value =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
-
-        // Create the parameter list for sp_prepare
-        let execute_sql_statement_parameter =
-            RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
-
         // Build the comma separated list of parameters
         let mut params_list_as_string = String::new();
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         // Always Encrypted: describe the statement's parameters now (serving from
         // or populating the query-metadata cache) and pin the result under the
@@ -4052,8 +4038,8 @@ impl TdsClient {
             let has_output = named_params.iter().any(|p| p.is_output());
             let describe = self
                 .describe_parameters_cached(
-                    &sql,
-                    &params_list_as_string,
+                    statement.as_str(),
+                    declaration.as_str(),
                     has_output,
                     timeout_sec,
                     cancel_handle,
@@ -4070,10 +4056,8 @@ impl TdsClient {
             None
         };
 
-        let params_as_sql_string =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));
-
-        let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
+        let execute_sql_statement_parameter = RpcParameter::request_text(statement);
+        let params_parameter = RpcParameter::request_text(declaration);
 
         let output_handler_value = SqlType::Int(None);
 
@@ -4627,22 +4611,15 @@ impl TdsClient {
             None => {
                 // The `@params` declaration covers the streamed parameters too,
                 // even though their values arrive later.
-                let mut declaration_params = materialized_params.clone();
-                declaration_params.extend(streamed_params.iter().cloned());
+                let declaration_params = || materialized_params.iter().chain(&streamed_params);
                 let mut params_list_as_string = String::new();
-                build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
-                let declaration = declared_names(&declaration_params);
+                build_parameter_list_string(declaration_params(), &mut params_list_as_string)?;
+                let declaration = declared_names(declaration_params());
 
-                let statement_parameter = RpcParameter::new(
-                    None,
-                    StatusFlags::NONE,
-                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(statement.sql.clone()))),
-                );
-                let params_parameter = RpcParameter::new(
-                    None,
-                    StatusFlags::NONE,
-                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
-                );
+                let statement_parameter =
+                    RpcParameter::request_text(RequestText::new(statement.sql.clone())?);
+                let params_parameter =
+                    RpcParameter::request_text(RequestText::new(params_list_as_string)?);
                 let handle_parameter = RpcParameter::new(
                     None,
                     StatusFlags::BY_REF_VALUE,
@@ -4838,21 +4815,17 @@ impl TdsClient {
 
         let database_collation = self.negotiated_settings.database_collation;
 
-        let sql_statement_value =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
-
         // The capture target is armed just before the send below so a failure
         // while building the RPC cannot leave it set.
         self.pending_prepared_param_encryption = None;
         self.pending_capture = None;
 
-        // Create the parameter list for sp_prepexec
-        let statement_parameter = RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
-
         // Build the comma separated list of parameters
         let mut params_list_as_string = String::new();
 
         build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+        let statement = RequestText::new(sql)?;
+        let declaration = RequestText::new(params_list_as_string)?;
 
         // Always Encrypted: sp_prepexec prepares and executes in one round-trip,
         // so — like sp_executesql — it runs `sp_describe_parameter_encryption`
@@ -4864,8 +4837,8 @@ impl TdsClient {
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.pending_prepared_param_encryption = Some(
                 self.encrypt_parameters(
-                    &sql,
-                    &params_list_as_string,
+                    statement.as_str(),
+                    declaration.as_str(),
                     &mut named_params,
                     timeout_sec,
                     cancel_handle,
@@ -4879,10 +4852,8 @@ impl TdsClient {
             self.transport.reset_reader();
         }
 
-        let params_as_sql_string =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string)));
-
-        let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
+        let statement_parameter = RpcParameter::request_text(statement);
+        let params_parameter = RpcParameter::request_text(declaration);
 
         // The by-reference `@handle`: NULL input prepares fresh; a `Some(h)`
         // input tells the server to drop prepared statement `h` before
@@ -7090,7 +7061,7 @@ impl TdsClient {
     /// [`apply_parameter_encryption`](Self::apply_parameter_encryption).
     ///
     /// Example: `EXEC dbo.p @ce_pos_0, @name1=@name1 OUTPUT` with
-    /// `@ce_pos_0 int, @name1 nvarchar(10) OUTPUT`. Mirrors dotnet
+    /// `@ce_pos_0 int,@name1 nvarchar(10) OUTPUT`. Mirrors dotnet
     /// `BuildStoredProcedureStatementForColumnEncryption`, extended to cover the
     /// positional-parameter case the Rust API exposes.
     fn build_stored_procedure_describe_request(
@@ -7125,7 +7096,6 @@ impl TdsClient {
         // Positional parameters: synthetic name, bound by position in the EXEC.
         for (ordinal, param) in positional_params.iter().enumerate() {
             let synthetic = format!("@{SYNTHETIC_POSITIONAL_PARAM_PREFIX}{ordinal}");
-            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -7133,12 +7103,12 @@ impl TdsClient {
                 first = false;
             } else {
                 tsql.push_str(", ");
-                params_decl.push_str(", ");
+                params_decl.push(',');
             }
 
             // `write!` into a String is infallible.
             let _ = write!(tsql, "{synthetic}{output}");
-            let _ = write!(params_decl, "{synthetic} {type_name}{output}");
+            param.write_declaration_entry(&synthetic, &mut params_decl)?;
         }
 
         // Named parameters: bound by name.
@@ -7146,7 +7116,6 @@ impl TdsClient {
             let Some(name) = param.name.as_deref() else {
                 continue;
             };
-            let type_name = param.sql_declaration()?;
             let output = if param.is_output() { " OUTPUT" } else { "" };
 
             if first {
@@ -7154,12 +7123,12 @@ impl TdsClient {
                 first = false;
             } else {
                 tsql.push_str(", ");
-                params_decl.push_str(", ");
+                params_decl.push(',');
             }
 
             // `write!` into a String is infallible.
             let _ = write!(tsql, "{name}={name}{output}");
-            let _ = write!(params_decl, "{name} {type_name}{output}");
+            param.write_declaration_entry(name, &mut params_decl)?;
         }
 
         Ok((tsql, params_decl))
@@ -18753,7 +18722,7 @@ mod tests {
         // The name is bracketed per part: it is application text on the
         // ODBC {call ...} path.
         assert_eq!(tsql, "EXEC [dbo].[my_proc] @id=@id, @count=@count OUTPUT");
-        assert_eq!(params_decl, "@id int, @count bigint OUTPUT");
+        assert_eq!(params_decl, "@id int,@count bigint OUTPUT");
     }
 
     #[test]
@@ -18778,10 +18747,7 @@ mod tests {
                 .expect("building the describe request should succeed");
 
         assert_eq!(tsql, "EXEC [proc] @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
-        assert_eq!(
-            params_decl,
-            "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
-        );
+        assert_eq!(params_decl, "@ce_pos_0 int,@ce_pos_1 bigint OUTPUT,@b int");
     }
 
     #[test]
@@ -24886,7 +24852,7 @@ mod tests {
             client.write_streamed_chunk(&[1, 2]).await.unwrap();
             client.end_streamed_param().await.unwrap();
             let bytes = take_sent(&sent);
-            assert!(contains(&bytes, &utf16le("@P2 int , @P1 ")));
+            assert!(contains(&bytes, &utf16le("@P2 int,@P1 varbinary(max)")));
             let value = bytes.windows(9).position(|w| w == UNNAMED_INT_7).unwrap();
             let streamed = bytes
                 .windows(5)
@@ -25163,6 +25129,8 @@ mod tests {
             assert!(contains(&take_sent(&sent), &NAMED_INT_7));
         }
     }
+
+    mod request_text;
 }
 
 #[cfg(test)]

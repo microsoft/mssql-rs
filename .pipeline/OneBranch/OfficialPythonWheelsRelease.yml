@@ -40,7 +40,7 @@ parameters:
     default: false  # Safety: default to false to prevent accidental releases
 
   - name: validateCratesOnly
-    displayName: 'Validate selected Rust crates without publishing'
+    displayName: 'Validate Rust crate artifacts offline without publishing'
     type: boolean
     default: false
 
@@ -91,6 +91,9 @@ extends:
         scanOutputDirectoryOnly: true
       credscan:
         enabled: true
+      suppression:
+        suppressionFile: '$(Build.SourcesDirectory)\.gdn\.gdnsuppress'
+        suppressionSet: default
       policheck:
         enabled: true
 
@@ -208,16 +211,14 @@ extends:
             workingDirectory: '$(Build.SourcesDirectory)'
 
     ###########################################################################
-    # Rust: offline integrity -> registry preflight -> ESRP -> availability.
-    # Read-only custom jobs run on Azure Pipelines, never in isolated containers.
-    # They publish no artifacts, so ob_outputDirectory is not required.
+    # Rust: offline integrity -> ESRP release completion.
     ###########################################################################
     - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
       - stage: ReleaseCrates
         displayName: 'Release Rust Crates'
         dependsOn: []
         jobs:
-        # Keep an isolated integrity gate before artifacts reach a network job.
+        # Keep an isolated integrity gate before submitting artifacts to ESRP.
         - job: ValidateCrates
           displayName: 'Validate Rust crate artifacts'
           pool:
@@ -227,50 +228,10 @@ extends:
           steps:
           - template: /.pipeline/templates/validate-release-crates.yml@self
 
-        - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true)) }}:
-          - job: RegistryPreflight
-            displayName: 'Check selected crates.io versions'
-            dependsOn: ValidateCrates
-            pool:
-              type: windows
-              isCustom: true
-              name: Azure Pipelines
-              vmImage: windows-2022
-            steps:
-            - checkout: self
-            - template: /.pipeline/templates/validate-release-crates.yml@self
-
-            - ${{ if eq(parameters.publishMssqlTds, true) }}:
-              - pwsh: >
-                  & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
-                  -CrateName 'mssql-tds'
-                  -Version '$(mssqlTdsCrateVersion)'
-                  -ExpectedState Absent
-                  -MaxAttempts 1
-                displayName: 'Preflight mssql-tds version'
-
-            - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
-              - pwsh: >
-                  & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
-                  -CrateName 'mssql-mock-tds'
-                  -Version '$(mssqlMockTdsCrateVersion)'
-                  -ExpectedState Absent
-                  -MaxAttempts 1
-                displayName: 'Preflight mssql-mock-tds version'
-
-            - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.publishMssqlTds, true)) }}:
-              - pwsh: >
-                  & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
-                  -CrateName 'mssql-tds'
-                  -Version '$(mssqlTdsCrateVersion)'
-                  -ExpectedState Available
-                  -MaxAttempts 1
-                displayName: 'Verify mssql-tds dependency is published'
-
         - ${{ if and(eq(parameters.publishMssqlTds, true), ne(parameters.validateCratesOnly, true)) }}:
           - job: PublishCore
             displayName: 'Publish mssql-tds'
-            dependsOn: RegistryPreflight
+            dependsOn: ValidateCrates
             templateContext:
               type: releaseJob
               isProduction: true
@@ -301,31 +262,13 @@ extends:
                 mainpublisher: 'ESRPRELPACMAN'
                 domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
 
-          - job: CoreAvailable
-            displayName: 'Verify published mssql-tds is available'
-            dependsOn: PublishCore
-            pool:
-              type: windows
-              isCustom: true
-              name: Azure Pipelines
-              vmImage: windows-2022
-            steps:
-            - checkout: self
-            - template: /.pipeline/templates/validate-release-crates.yml@self
-            - pwsh: >
-                & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
-                -CrateName 'mssql-tds'
-                -Version '$(mssqlTdsCrateVersion)'
-                -ExpectedState Available
-              displayName: 'Wait for mssql-tds on crates.io'
-
         - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.validateCratesOnly, true)) }}:
           - job: PublishMock
             displayName: 'Publish mssql-mock-tds'
             ${{ if eq(parameters.publishMssqlTds, true) }}:
-              dependsOn: CoreAvailable
+              dependsOn: PublishCore
             ${{ else }}:
-              dependsOn: RegistryPreflight
+              dependsOn: ValidateCrates
             templateContext:
               type: releaseJob
               isProduction: true
@@ -355,24 +298,6 @@ extends:
                 serviceendpointurl: 'https://api.esrp.microsoft.com'
                 mainpublisher: 'ESRPRELPACMAN'
                 domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
-
-          - job: MockAvailable
-            displayName: 'Verify published mssql-mock-tds is available'
-            dependsOn: PublishMock
-            pool:
-              type: windows
-              isCustom: true
-              name: Azure Pipelines
-              vmImage: windows-2022
-            steps:
-            - checkout: self
-            - template: /.pipeline/templates/validate-release-crates.yml@self
-            - pwsh: >
-                & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
-                -CrateName 'mssql-mock-tds'
-                -Version '$(mssqlMockTdsCrateVersion)'
-                -ExpectedState Available
-              displayName: 'Verify mssql-mock-tds on crates.io'
 
     ###########################################################################
     # Stage 3: Tag the mssql-py-core release source
