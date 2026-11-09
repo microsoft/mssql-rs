@@ -541,9 +541,8 @@ the selected agent context, not runtime pool authorization or registry reachabil
 Once a live run is authorized, select a known successful Official Build and leave all switches
 off to exercise genuine artifacts in the governed container without publishing.
 For an authorized non-publishing crate validation run, set
-`validateCratesOnly: true` and select
-`publishMssqlTds` and/or `publishMssqlMockTds`; leave `publishToFeed` and `tagRelease`
-false. All crate validation selections are offline.
+`validateCratesOnly: true`; crate selection does not change the offline checks.
+Leave `publishToFeed` and `tagRelease` false.
 Local regression tests also cover missing wheels, incorrect names/versions,
 missing ODBC payloads, and exact-source metadata failures.
 

@@ -40,7 +40,7 @@ parameters:
     default: false  # Safety: default to false to prevent accidental releases
 
   - name: validateCratesOnly
-    displayName: 'Validate selected Rust crates without publishing'
+    displayName: 'Validate Rust crate artifacts offline without publishing'
     type: boolean
     default: false
 
