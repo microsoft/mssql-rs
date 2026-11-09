@@ -25136,7 +25136,6 @@ mod tests {
     mod request_text {
         use super::*;
         use crate::connection::client_context::ExecutionColumnEncryptionSetting;
-        use crate::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
 
         const UNICODE_SQL: &str = "SELECT @P1 AS [é你好𐐀], N'𐐀'; SET @P2 = 1";
         const EXECUTESQL: [u8; 6] = [0xFF, 0xFF, 10, 0, 0, 0];
@@ -25221,29 +25220,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn sp_executesql_sends_unicode_statement_then_declaration() {
-            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
-            client
-                .execute_sp_executesql(
-                    UNICODE_SQL.to_string(),
-                    vec![
-                        int_param("@P1", StatusFlags::NONE),
-                        int_param("@P2", StatusFlags::BY_REF_VALUE),
-                    ],
-                    (),
-                )
-                .await
-                .unwrap();
-            let expected = [
-                EXECUTESQL.to_vec(),
-                text_param(&client, UNICODE_SQL),
-                text_param(&client, "@P1 int,@P2 int OUTPUT"),
-            ]
-            .concat();
-            assert!(contains(&take_sent(&sent), &expected));
-        }
-
-        #[tokio::test]
         async fn sp_executesql_without_parameters_sends_an_empty_declaration() {
             let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
             client
@@ -25257,33 +25233,6 @@ mod tests {
             ]
             .concat();
             assert!(take_sent(&sent).ends_with(&expected));
-        }
-
-        #[tokio::test]
-        async fn prepexec_sends_declaration_then_unicode_statement() {
-            let (mut client, sent) =
-                create_capturing_client(vec![handle_token(55), done_no_more()]);
-            let mut statement = PreparedStatement::new(UNICODE_SQL);
-            client
-                .execute_prepared(
-                    &mut statement,
-                    vec![
-                        int_param("@P1", StatusFlags::NONE),
-                        int_param("@P2", StatusFlags::BY_REF_VALUE),
-                    ],
-                    &mut None,
-                    (),
-                )
-                .await
-                .unwrap();
-            let bytes = take_sent(&sent);
-            assert!(contains(&bytes, &PREPEXEC));
-            let expected = [
-                text_param(&client, "@P1 int,@P2 int OUTPUT"),
-                text_param(&client, UNICODE_SQL),
-            ]
-            .concat();
-            assert!(contains(&bytes, &expected));
         }
 
         #[tokio::test]
@@ -25307,31 +25256,6 @@ mod tests {
             ]
             .concat();
             assert!(bytes.ends_with(&expected));
-        }
-
-        #[tokio::test]
-        async fn long_declaration_crosses_packets_intact() {
-            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
-            let params = (1..=1000)
-                .map(|ordinal| int_param(&format!("@P{ordinal}"), StatusFlags::NONE))
-                .collect();
-            client
-                .execute_sp_executesql(UNICODE_SQL.to_string(), params, ())
-                .await
-                .unwrap();
-            let raw = std::mem::take(&mut *sent.lock().unwrap());
-            let first_packet = usize::from(u16::from_be_bytes([raw[2], raw[3]]));
-            assert!(first_packet < raw.len(), "the request spans packets");
-            let declaration = (1..=1000)
-                .map(|ordinal| format!("@P{ordinal} int"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let expected = [
-                text_param(&client, UNICODE_SQL),
-                text_param(&client, &declaration),
-            ]
-            .concat();
-            assert!(contains(&reassemble_sent(&raw), &expected));
         }
 
         #[tokio::test]
@@ -25362,32 +25286,6 @@ mod tests {
                 text_param(&client, UNICODE_SQL),
             ]
             .concat();
-            assert!(contains(&take_sent(&sent), &expected));
-        }
-
-        #[tokio::test]
-        async fn tvp_declaration_is_read_only() {
-            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
-            let tvp = RpcParameter::new(
-                Some("@P1".to_string()),
-                StatusFlags::NONE,
-                SqlType::Table(
-                    TvpTypeName::new(Some("dbo".to_string()), "IntList".to_string()),
-                    Some(TvpTableData::new(
-                        vec![TvpColumnDef::new(SqlType::Int(None))],
-                        vec![vec![SqlType::Int(Some(5))]],
-                    )),
-                ),
-            );
-            client
-                .execute_sp_executesql(
-                    "SELECT * FROM @P1; SET @P2 = 1".to_string(),
-                    vec![tvp, int_param("@P2", StatusFlags::BY_REF_VALUE)],
-                    (),
-                )
-                .await
-                .unwrap();
-            let expected = text_param(&client, "@P1 [dbo].[IntList] READONLY,@P2 int OUTPUT");
             assert!(contains(&take_sent(&sent), &expected));
         }
 

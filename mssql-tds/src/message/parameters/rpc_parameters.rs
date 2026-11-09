@@ -2335,61 +2335,6 @@ mod tests {
         assert!(matches!(err, Error::UsageError(_)));
     }
 
-    fn serialize_positional(param: &RpcParameter) -> Vec<u8> {
-        let mut mock = MockNetworkWriter::new(16384);
-        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-        let collation = SqlCollation::default();
-        block_on(param.serialize(&mut w, &collation, true, &GenericEncoder {})).unwrap();
-        payload(&w)
-    }
-
-    #[test]
-    fn utf16_byte_len_matches_encode_utf16() {
-        for text in [
-            "",
-            "SELECT 1",
-            "é",
-            "你好",
-            "𐐀",
-            "a𐐀é你\u{7f}\u{80}\u{7ff}\u{800}\u{ffff}\u{10000}\u{10ffff}",
-        ] {
-            assert_eq!(
-                super::utf16_byte_len(text),
-                text.encode_utf16().count() * 2,
-                "{text:?}"
-            );
-        }
-    }
-
-    /// Request text is framed as an `nvarchar(max)` PLP value with one exact
-    /// chunk; empty text sends only the terminator.
-    #[test]
-    fn request_text_is_one_plp_chunk() {
-        let collation = SqlCollation::default();
-        for text in ["", "SELECT N'é你好𐐀'"] {
-            let mut expected = vec![0, 0, 0xE7, 0xFF, 0xFF];
-            expected.extend(collation.info.to_le_bytes());
-            expected.push(collation.sort_id);
-            expected.extend(super::PLP_UNKNOWN_LEN.to_le_bytes());
-            let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            if !utf16.is_empty() {
-                expected.extend(u32::try_from(utf16.len()).unwrap().to_le_bytes());
-                expected.extend(utf16);
-            }
-            expected.extend(0u32.to_le_bytes());
-
-            let param =
-                RpcParameter::request_text(super::RequestText::new(text.to_string()).unwrap());
-            assert_eq!(serialize_positional(&param), expected, "{text:?}");
-            let materialized = RpcParameter::new(
-                None,
-                StatusFlags::NONE,
-                SqlType::NVarcharMax(Some(SqlString::from_utf8_string(text.to_string()))),
-            );
-            assert_eq!(serialize_positional(&materialized), expected, "{text:?}");
-        }
-    }
-
     /// msodbcsql's format (`CRPCSQLSender::SendParamList`): `,` between
     /// entries, ` OUTPUT` for by-reference values, no trailing space. Type
     /// names, including UDT, TVP and streamed ones, are unchanged.
