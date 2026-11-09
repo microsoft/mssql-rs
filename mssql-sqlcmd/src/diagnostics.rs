@@ -3472,19 +3472,35 @@ impl Diagnosis {
                         .as_deref()
                         .is_some_and(|name| !name.is_empty())
                 {
+                    // -C and -F override the data source each on its own, so
+                    // the finding names where each of the two settings came from.
                     let sources = &self.request.sources;
-                    let text = match sources
-                        .dsn_name(|s| &s.trust_server_certificate)
-                        .or_else(|| sources.dsn_name(|s| &s.host_name_in_certificate))
-                    {
-                        Some(dsn) => LocalizedText::new(
+                    let text = match (
+                        sources.dsn_name(|s| &s.trust_server_certificate),
+                        sources.dsn_name(|s| &s.host_name_in_certificate),
+                    ) {
+                        (Some(dsn), Some(_)) => LocalizedText::new(
                             "diagnose.finding.dsn_certificate_name_not_validated_when_trusted",
                             format!(
                                 "The certificate host name is not validated when the server certificate is trusted (DSN {dsn})."
                             ),
                             vec![("dsn", dsn)],
                         ),
-                        None => LocalizedText::new(
+                        (None, Some(dsn)) => LocalizedText::new(
+                            "diagnose.finding.dsn_certificate_name_not_validated_with_c",
+                            format!(
+                                "The certificate host name from DSN {dsn} is not validated when -C trusts the server certificate."
+                            ),
+                            vec![("dsn", dsn)],
+                        ),
+                        (Some(dsn), None) => LocalizedText::new(
+                            "diagnose.finding.certificate_name_not_validated_with_dsn_trust",
+                            format!(
+                                "The certificate host name from -F is not validated when the DSN {dsn} trusts the server certificate."
+                            ),
+                            vec![("dsn", dsn)],
+                        ),
+                        (None, None) => LocalizedText::new(
                             "diagnose.finding.certificate_name_not_validated_when_trusted",
                             "The certificate host name from -F is not validated when -C trusts the server certificate.",
                             vec![],
@@ -5615,6 +5631,24 @@ pub(crate) mod tests {
             "{finding}"
         );
         assert!(!finding.contains("-S"), "{finding}");
+
+        // A client message that is a sentence keeps its one closing period.
+        let mut local_db = request("(localdb)\\MSSQLLocalDB", Depth::ConnectionInput);
+        local_db.dsn = Some(Dsn {
+            name: "SalesDsn".to_string(),
+            status: DsnStatus::Found,
+        });
+        let report = run_on(local_db, false);
+        assert_eq!(
+            report.errors[0].code.as_deref(),
+            Some("localDbNotSupported")
+        );
+        let finding = report.findings[0].text.render("en-US");
+        assert!(
+            finding.starts_with("The server in DSN SalesDsn could not be parsed: LocalDB "),
+            "{finding}"
+        );
+        assert!(finding.ends_with("(e.g., 'tcp:server,port')."), "{finding}");
     }
 
     /// The driver logs in with integrated authentication when the data source
@@ -5664,6 +5698,16 @@ pub(crate) mod tests {
             .is_empty()
         );
         assert!(findings(None, SettingOrigin::dsn("SalesDsn")).is_empty());
+
+        // A SQL login uses the login, wherever the authentication came from.
+        let mut sql_login = request("tcp:db01,1433", Depth::ConnectionInput);
+        sql_login.dsn = Some(Dsn {
+            name: "SalesDsn".to_string(),
+            status: DsnStatus::Found,
+        });
+        sql_login.sources.user = Some(SettingOrigin::command_line("-U"));
+        sql_login.sources.authentication = Some(SettingOrigin::dsn("SalesDsn"));
+        assert!(run(sql_login).findings.is_empty());
     }
 
     /// With -D and neither -U nor -E, the driver logs in as a SQL login with
@@ -5734,6 +5778,83 @@ pub(crate) mod tests {
             findings,
             [
                 "The DSN SalesDsn sets TrustServerCertificate=yes, which is ignored with strict encryption (-Ns): the server certificate is validated."
+            ]
+        );
+    }
+
+    /// -C and -F override the data source each on its own: when one of the
+    /// two certificate settings comes from the data source and the other from
+    /// the command line, the depth line and the finding name both origins.
+    #[test]
+    fn mixed_certificate_sources_name_both_origins() {
+        let report_for = |trust: SettingOrigin, name: SettingOrigin| {
+            let mut mixed = request("tcp:db01,1433", Depth::ConnectionInput);
+            mixed.host_name_in_certificate = Some("db01.contoso.com".to_string());
+            mixed.dsn = Some(Dsn {
+                name: "SalesDsn".to_string(),
+                status: DsnStatus::Found,
+            });
+            mixed.sources = SettingSources {
+                trust_server_certificate: Some(trust),
+                host_name_in_certificate: Some(name),
+                ..SettingSources::default()
+            };
+            let report = run(mixed);
+            let findings: Vec<String> = report
+                .findings
+                .iter()
+                .map(|f| f.text.render("en-US"))
+                .collect();
+            (report::text(&report), findings)
+        };
+
+        // Trust from -C, the certificate name from the data source.
+        let (text, findings) = report_for(
+            SettingOrigin::command_line("-C"),
+            SettingOrigin::dsn("SalesDsn"),
+        );
+        assert!(
+            text.contains(
+                "; server certificate trusted (-C); certificate name db01.contoso.com (DSN SalesDsn)\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            findings,
+            [
+                "The certificate host name from DSN SalesDsn is not validated when -C trusts the server certificate."
+            ]
+        );
+        assert!(findings[0].contains("SalesDsn") && findings[0].contains("-C"));
+
+        // Trust from the data source, the certificate name from -F.
+        let (text, findings) = report_for(
+            SettingOrigin::dsn("SalesDsn"),
+            SettingOrigin::command_line("-F"),
+        );
+        assert!(
+            text.contains(
+                "; server certificate trusted (DSN SalesDsn); certificate name db01.contoso.com (-F)\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            findings,
+            [
+                "The certificate host name from -F is not validated when the DSN SalesDsn trusts the server certificate."
+            ]
+        );
+        assert!(findings[0].contains("SalesDsn") && findings[0].contains("-F"));
+
+        // Both from the command line: the wording without a data source.
+        let (_, findings) = report_for(
+            SettingOrigin::command_line("-C"),
+            SettingOrigin::command_line("-F"),
+        );
+        assert_eq!(
+            findings,
+            [
+                "The certificate host name from -F is not validated when -C trusts the server certificate."
             ]
         );
     }

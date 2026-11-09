@@ -2886,6 +2886,36 @@
           "expr": "dsn"
         }
       ]
+    },
+    {
+      "id": "diagnose.finding.dsn_certificate_name_not_validated_with_c",
+      "message": "The certificate host name from DSN {dsn} is not validated when -C trusts the server certificate.",
+      "translation": "The certificate host name from DSN {dsn} is not validated when -C trusts the server certificate.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.certificate_name_not_validated_with_dsn_trust",
+      "message": "The certificate host name from -F is not validated when the DSN {dsn} trusts the server certificate.",
+      "translation": "The certificate host name from -F is not validated when the DSN {dsn} trusts the server certificate.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
     }
   ]
 }

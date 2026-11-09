@@ -32,7 +32,10 @@ from the DSN). sqlcmd always sets encryption itself, so a DSN's `Encrypt` is
 not used. Each setting the DSN supplied has the source `dsn` (in JSON
 `"source": "dsn", "name": "<dsn>"`; in text, `server from DSN <dsn>`, and in
 the depth line `server certificate trusted (DSN <dsn>)` rather than `(-C)`),
-and `connectionInput` names the DSN (`dsn`). A
+and `connectionInput` names the DSN (`dsn`). `-C` and `-F` override the DSN's
+`TrustServerCertificate` and `HostNameInCertificate` each on its own, so the
+finding about a certificate name that trust leaves unvalidated names where each
+of the two came from, the DSN or the option. A
 DSN that was not found, or names no driver (`dsnNotFound`), is `diagnosed` at
 `connectionInput`, with `client.inputConfiguration`, and the checks after it,
 which need a server, are skipped. A DSN that names no server is its own server,
