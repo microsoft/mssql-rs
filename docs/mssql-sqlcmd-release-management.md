@@ -18,7 +18,7 @@ Azure Artifacts feed: public/mssql-rs_Public
   │  @Release  only versions promoted after a release
         │
         ├── nonofficial msodbcsql: latest compatible nightly from Local
-        └── official msodbcsql: latest compatible stable from Release
+        └── official msodbcsql (when enabled): latest compatible stable from Release
           ▼   (resolve once; share exact package and SHA-256)
       msodbcsql build → native sqlcmd (the library is linked into sqlcmd)
 
@@ -112,13 +112,20 @@ Done by the release owner, the person who runs the release pipeline.
    - It publishes to `public/mssql-rs_Public` (the `Local` view).
 4. **Promote it.** Azure DevOps → Artifacts → `mssql-rs_Public` →
    `mssql-sqlcmd` → the version → **Promote** → `Release`.
-5. **Validate the consumer.** The next official msodbcsql build selects the latest
-  compatible stable version in `Release`. No consumer version-bump PR is needed
+5. **Validate the consumer.** Queue an official msodbcsql build with
+  `useSqlcmdReleasePackage: true` to select the latest compatible stable version
+  in `Release`. After validation, change that option's default to true in a
+  consumer PR. No consumer version-bump PR is needed
   for each compatible release. A new ABI compatibility range still requires a
   coordinated consumer update.
 
 ## Consumer: msodbcsql
 
+- **Official rollout gate:** `useSqlcmdReleasePackage` defaults to false until a
+  compatible stable package is available and validated. Disabled builds skip
+  package resolution and Rust linking and do not provide the Rust JSON/diagnose
+  features. This is an explicit build choice, not a fallback after resolution
+  failure. Nonofficial builds continue to consume nightlies.
 - **Pipeline channel:** nonofficial builds select the latest published compatible
   `-nightly` version from the producer's default `Local` view. Official builds
   select the latest compatible non-prerelease version actually in `Release`.
