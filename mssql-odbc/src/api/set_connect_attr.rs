@@ -7,8 +7,9 @@
 //! pre-acquired Entra access token), `SQL_ATTR_LOGIN_TIMEOUT` (the login
 //! deadline applied at connect time), `SQL_ATTR_CURRENT_CATALOG` (the current
 //! database, which sends `USE` when connected), and `SQL_ATTR_QUERY_TIMEOUT`
-//! (the statement option in its connection-wide form). Other standard
-//! attributes are accepted as no-ops for now.
+//! (the statement option in its connection-wide form).
+//! `SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-owned network requests and
+//! supplies the separate cancellation settlement budget.
 
 use tracing::{debug, error};
 
@@ -441,10 +442,10 @@ unsafe fn sql_set_connect_attr_w_impl(
             }
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
+            // Connection-owned requests use this for request I/O; statement
+            // execution keeps its query timeout. Zero leaves requests unbounded
+            // and selects the 120-second cancellation settlement default.
             // Publish to execution children here, not on every fetch/GetData call.
-            // Connection operations also use this for request I/O and cancellation.
-            // Zero leaves requests unlimited and selects the native driver's
-            // 120-second default for explicit statement cancellation.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
             // warning rather than reusing msodbcsql's "Login timeout changed".

@@ -28,8 +28,8 @@ pub mod tls_helper;
 pub use query_response::{
     ATTENTION_DELAY_KEY, ColumnDefinition, ColumnValue, DataClassificationAck, InfoMessage,
     LOGIN_DELAY_KEY, LeadingError, QueryRegistry, QueryResponse, RPC_DELAY_KEY, ResultSetResponse,
-    Row, SqlDataType, TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY,
-    TerminalError,
+    Row, SqlDataType, TM_BEGIN_COMPLETION_DELAY_KEY, TM_BEGIN_DELAY_KEY, TM_COMMIT_DELAY_KEY,
+    TM_ROLLBACK_DELAY_KEY, TerminalError,
 };
 pub use server::{ConnectionInfo, ConnectionStore, LoginDetails, MockTdsServer, RedirectionConfig};
 pub use tds_tls_wrapper::TdsTlsWrapper;

@@ -51,6 +51,44 @@ pub(crate) enum RpcType {
     ProcId(RpcProcs),
 }
 
+/// How an RPC sends the values in its `named_parameters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ValueBinding {
+    /// With their names; the server matches each one to its declaration.
+    #[default]
+    ByName,
+    /// With zero-length names, so the server binds them by ordinal.
+    ///
+    /// Valid only when the values follow the order of the `@params`
+    /// declaration. That holds for any `sp_executesql` or `sp_prepexec` whose
+    /// declaration is built from the same list. SQL Server matches named
+    /// values to the declaration in time quadratic in the parameter count;
+    /// msodbcsql sends these values unnamed (`AddRPCUserParameters`).
+    ByOrdinal,
+}
+
+/// The RPC ordinal and declared name of each output value among `values`,
+/// whose first element has RPC ordinal `first_ordinal`.
+///
+/// SQL Server returns an output value bound by ordinal with an empty name
+/// and this ordinal, which counts every parameter of the RPC.
+pub(crate) fn output_names_by_ordinal<'p>(
+    first_ordinal: usize,
+    values: impl IntoIterator<Item = &'p RpcParameter>,
+) -> Vec<(u16, String)> {
+    values
+        .into_iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_output())
+        .filter_map(|(index, value)| {
+            Some((
+                u16::try_from(first_ordinal + index).ok()?,
+                value.name.clone()?,
+            ))
+        })
+        .collect()
+}
+
 impl<'a> SqlRpc<'a> {
     pub fn new(
         rpc_type: RpcType,
@@ -68,7 +106,32 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            value_binding: ValueBinding::ByName,
         }
+    }
+
+    pub(crate) fn with_value_binding(mut self, binding: ValueBinding) -> Self {
+        self.value_binding = binding;
+        self
+    }
+
+    pub(crate) fn value_binding(&self) -> ValueBinding {
+        self.value_binding
+    }
+
+    /// See [`output_names_by_ordinal`]. `trailing` are values appended after
+    /// this message's own, such as streamed parameters.
+    pub(crate) fn output_names_by_ordinal<'p>(
+        &'p self,
+        trailing: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> Vec<(u16, String)> {
+        if self.value_binding == ValueBinding::ByName {
+            return Vec::new();
+        }
+        output_names_by_ordinal(
+            self.positional_parameters.as_ref().map_or(0, Vec::len),
+            self.named_parameters.iter().flatten().chain(trailing),
+        )
     }
 
     pub(crate) fn new_batch_command(
@@ -91,6 +154,7 @@ impl<'a> SqlRpc<'a> {
             named_parameters,
             db_collation,
             proc_options: ProcOptions::None,
+            value_binding: ValueBinding::ByName,
         }
     }
 
@@ -117,6 +181,13 @@ impl<'a> SqlRpc<'a> {
             parameter.validate_before_send(self.db_collation)?;
         }
         for parameter in self.named_parameters.iter().flatten() {
+            // An unnamed value here would be missing from the `@params`
+            // declaration, so binding by ordinal would shift every later value.
+            if parameter.name.is_none() {
+                return Err(Error::UsageError(
+                    "Named RPC parameters must have a name.".to_string(),
+                ));
+            }
             parameter.validate_named_before_send(self.db_collation)?;
         }
         Ok(())
@@ -153,7 +224,12 @@ impl<'a> SqlRpc<'a> {
             let encoder = GenericEncoder::new();
             for parameter in parameters {
                 if let Err(error) = parameter
-                    .serialize(packet_writer, self.db_collation, false, &encoder)
+                    .serialize(
+                        packet_writer,
+                        self.db_collation,
+                        self.value_binding == ValueBinding::ByOrdinal,
+                        &encoder,
+                    )
                     .await
                 {
                     return Err(
@@ -339,6 +415,7 @@ pub(crate) struct SqlRpc<'param> {
     pub named_parameters: Option<Vec<RpcParameter>>,
     pub db_collation: &'param SqlCollation,
     pub proc_options: ProcOptions,
+    value_binding: ValueBinding,
 }
 
 #[async_trait]
@@ -617,6 +694,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn output_names_by_ordinal_count_leading_and_trailing_parameters() {
+        let collation = SqlCollation::default();
+        let named = |name: &str, flags| {
+            RpcParameter::new(Some(name.to_string()), flags, SqlType::Int(None))
+        };
+        let build = |binding| {
+            SqlRpc::new(
+                RpcType::ProcId(RpcProcs::Execute),
+                Some(vec![param(SqlType::Int(Some(55)))]),
+                Some(vec![
+                    named("@P1", StatusFlags::NONE),
+                    named("@P2", StatusFlags::BY_REF_VALUE),
+                ]),
+                &collation,
+                &ExecutionContext::new(),
+            )
+            .with_value_binding(binding)
+        };
+        let trailing = [named("@P3", StatusFlags::BY_REF_VALUE)];
+        assert!(
+            build(ValueBinding::ByName)
+                .output_names_by_ordinal(&trailing)
+                .is_empty()
+        );
+        assert_eq!(
+            build(ValueBinding::ByOrdinal).output_names_by_ordinal(&trailing),
+            vec![(2, "@P2".to_string()), (3, "@P3".to_string())]
+        );
     }
 
     #[test]
