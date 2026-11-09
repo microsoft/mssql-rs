@@ -2854,8 +2854,10 @@ ODBC_TEST_F(PrepareExecuteLiveTest, OutputAfterDataAtExecutionReturnsToItsBindin
         const std::string text = pass == 0 ? "dae" : "again";
         std::vector<SQLPOINTER> order;
         ASSERT_TRUE(StreamEach(stmt_, SQLExecute(stmt_), {{streamed, text}}, &order));
-        while (SQL_SUCCEEDED(SQLMoreResults(stmt_))) {
+        SQLRETURN rc;
+        while (SQL_SUCCEEDED(rc = SQLMoreResults(stmt_))) {
         }
+        EXPECT_EQ(SQL_NO_DATA, rc) << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(text + ":" + std::to_string(5 + pass), reinterpret_cast<const char*>(out));
         ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
     }

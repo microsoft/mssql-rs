@@ -89,9 +89,10 @@ pub(crate) fn output_names_by_ordinal<'p>(
         .collect()
 }
 
-/// Writes one of an RPC's named values. Also used by the streamed write to
-/// send materialized values that follow a data-at-execution one.
-pub(crate) async fn write_named_value(
+/// Writes one of an RPC's named-parameter values, unnamed under
+/// [`ValueBinding::ByOrdinal`]. The streamed write uses it for materialized
+/// values after a data-at-execution one.
+pub(crate) async fn write_rpc_value(
     parameter: &RpcParameter,
     packet_writer: &mut PacketWriter<'_>,
     db_collation: &SqlCollation,
@@ -245,7 +246,7 @@ impl<'a> SqlRpc<'a> {
         if let Some(parameters) = &self.named_parameters {
             let encoder = GenericEncoder::new();
             for parameter in parameters {
-                write_named_value(
+                write_rpc_value(
                     parameter,
                     packet_writer,
                     self.db_collation,

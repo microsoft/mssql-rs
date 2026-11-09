@@ -22,7 +22,7 @@ use crate::message::parameters::rpc_parameters::{
     RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
     build_parameter_list_string_from,
 };
-use crate::message::rpc::{RpcProcs, RpcType, SqlRpc, ValueBinding, write_named_value};
+use crate::message::rpc::{RpcProcs, RpcType, SqlRpc, ValueBinding, write_rpc_value};
 use crate::message::transaction_management::{
     CreateTxnParams, TransactionIsolationLevel, TransactionManagementRequest,
     TransactionManagementType,
@@ -2661,19 +2661,20 @@ impl TdsClient {
         trailing.extend(named_params);
 
         for param in &trailing {
-            if param.is_data_at_exec() {
-                if param.name.is_none() {
-                    return Err(UsageError("Streamed parameters must be named.".to_string()));
-                }
-                param.validate_named_before_send(db_collation)?;
+            let streamed = param.is_data_at_exec();
+            if param.name.is_none() {
+                return Err(UsageError(
+                    if streamed {
+                        "Streamed parameters must be named."
+                    } else {
+                        "Named RPC parameters must have a name."
+                    }
+                    .to_string(),
+                ));
+            }
+            param.validate_named_before_send(db_collation)?;
+            if streamed {
                 param.validate_streamed_configuration()?;
-            } else {
-                if param.name.is_none() {
-                    return Err(UsageError(
-                        "Named RPC parameters must have a name.".to_string(),
-                    ));
-                }
-                param.validate_named_before_send(db_collation)?;
             }
         }
 
@@ -3437,7 +3438,7 @@ impl TdsClient {
             let encoder = GenericEncoder::new();
             while let Some(next) = pending.pop_front() {
                 if !next.is_data_at_exec() {
-                    write_named_value(
+                    write_rpc_value(
                         &next,
                         &mut packet_writer,
                         &db_collation,
