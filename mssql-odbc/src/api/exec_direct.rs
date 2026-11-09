@@ -1717,7 +1717,7 @@ mod tests {
                 text.encode_utf16().flat_map(u16::to_le_bytes).collect()
             };
             let first = position(&utf16("@P1 ")).expect("@P1 declared");
-            let second = position(&utf16(", @P2 int ")).expect("@P2 declared");
+            let second = position(&utf16(",@P2 int")).expect("@P2 declared");
             assert!(first < second, "declared in bound order");
             let streamed =
                 position(&[0x00, 0x00, 0xA5, 0xFF, 0xFF]).expect("unnamed streamed header");
