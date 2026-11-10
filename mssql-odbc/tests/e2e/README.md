@@ -162,9 +162,10 @@ converted carry.
 surrogate streaming, and PLP/bound-column lengths. `run_e2e.ps1`, `run_e2e.sh`,
 and `build_e2e.sh` build the driver with the private
 `e2e-test-client-code-page` feature; release driver builds do not enable it.
-CTest sets `MSSQL_ODBC_TEST_CLIENT_CODE_PAGE` before each process starts. The
-override is validated by the driver and does not change the default
-system-locale path when the variable is absent. On the msodbcsql comparison leg,
+CTest sets `MSSQL_ODBC_TEST_CLIENT_CODE_PAGE` before each process starts. An
+invalid value fails `SQLAllocHandle(SQL_HANDLE_DBC)` with `HY000`, and the
+override does not change the default system-locale path when the variable is
+absent. On the msodbcsql comparison leg,
 which has no override, a run executes only on Windows when its code page matches
 `GetACP()`; the other runs skip.
 

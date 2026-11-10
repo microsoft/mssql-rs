@@ -12,8 +12,9 @@ use crate::api::odbc_types::{
     SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn,
     SqlSmallInt,
 };
-use crate::api::sqlstate::{ERR_ODBC_VERSION_NOT_SET, post_diag};
-use crate::error::free_errors;
+use crate::api::sqlstate::{ERR_ODBC_VERSION_NOT_SET, SQLSTATE_HY000, post_diag};
+use crate::conversion::client_encoding::ClientEncoding;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::desc::DescKind;
 use crate::handles::{
     DbcHandle, DescHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw,
@@ -144,7 +145,21 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         return SQL_ERROR;
     }
 
-    let dbc = Box::new(DbcHandle::new(input_handle, Arc::clone(&env.runtime)));
+    // Resolve before constructing the handle: nothing below may unwind while
+    // the ENV lock is held, or the poisoned lock fails every later allocation.
+    let client_encoding = match ClientEncoding::for_new_connection() {
+        Ok(encoding) => encoding,
+        Err(message) => {
+            error!("SQLAllocHandle(DBC): {message}");
+            post_sql_error(&mut env_state, SQLSTATE_HY000, 0, message);
+            return SQL_ERROR;
+        }
+    };
+    let dbc = Box::new(DbcHandle::new(
+        input_handle,
+        Arc::clone(&env.runtime),
+        client_encoding,
+    ));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
 

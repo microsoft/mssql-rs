@@ -416,7 +416,11 @@ impl DbcHandle {
         }
     }
 
-    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
+    pub(crate) fn new(
+        parent_env: *mut c_void,
+        runtime: Arc<SharedRuntime>,
+        client_encoding: ClientEncoding,
+    ) -> Self {
         Self {
             trace: Arc::default(),
             object_type: HandleType::Dbc,
@@ -425,7 +429,7 @@ impl DbcHandle {
             connection_timeout: AtomicU32::new(0),
             inner: Mutex::new(DbcState {
                 diag_records: Vec::new(),
-                client_encoding: ClientEncoding::system_default(),
+                client_encoding,
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
                 descriptors: Vec::new(),

@@ -12,6 +12,9 @@ use super::error::ConvError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClientEncoding(u32);
 
+#[cfg(feature = "e2e-test-client-code-page")]
+const E2E_TEST_CLIENT_CODE_PAGE: &str = "MSSQL_ODBC_TEST_CLIENT_CODE_PAGE";
+
 #[derive(Debug)]
 pub(crate) struct ClientEncoded<'a> {
     pub(crate) bytes: Cow<'a, [u8]>,
@@ -176,6 +179,24 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "e2e-test-client-code-page")]
+    #[test]
+    fn e2e_test_override_reports_invalid_values_instead_of_panicking() {
+        use std::ffi::OsStr;
+
+        assert_eq!(ClientEncoding::e2e_test_override(None), Ok(None));
+        assert_eq!(
+            ClientEncoding::e2e_test_override(Some(OsStr::new("65001"))),
+            Ok(Some(ClientEncoding::UTF8))
+        );
+        for value in ["", "utf8", "-1", "4294967296"] {
+            assert!(
+                ClientEncoding::e2e_test_override(Some(OsStr::new(value))).is_err(),
+                "{value:?}"
+            );
+        }
+    }
+
     #[test]
     fn system_default_can_convert_ascii() {
         let encoding = ClientEncoding::system_default();
@@ -207,30 +228,38 @@ impl ClientEncoding {
 
     /// Match `InitDbcCodePages` / `SystemLocale::AnsiCP`, not a server code page.
     pub(crate) fn system_default() -> Self {
-        #[cfg(feature = "e2e-test-client-code-page")]
-        if let Some(encoding) = Self::e2e_test_override() {
-            return encoding;
-        }
-
         // Native SystemLocale::Singleton captures the locale on its first use.
         static DEFAULT: std::sync::OnceLock<ClientEncoding> = std::sync::OnceLock::new();
         *DEFAULT.get_or_init(platform::system_default)
     }
 
+    /// The encoding a new connection captures. Errors only for an invalid
+    /// e2e-test override, which `SQLAllocHandle(DBC)` reports as a diagnostic.
+    pub(crate) fn for_new_connection() -> Result<Self, String> {
+        #[cfg(feature = "e2e-test-client-code-page")]
+        if let Some(encoding) =
+            Self::e2e_test_override(std::env::var_os(E2E_TEST_CLIENT_CODE_PAGE).as_deref())?
+        {
+            return Ok(encoding);
+        }
+        Ok(Self::system_default())
+    }
+
     #[cfg(feature = "e2e-test-client-code-page")]
-    fn e2e_test_override() -> Option<Self> {
-        const ENV: &str = "MSSQL_ODBC_TEST_CLIENT_CODE_PAGE";
-        let value = std::env::var_os(ENV)?;
-        let value = value
+    fn e2e_test_override(value: Option<&std::ffi::OsStr>) -> Result<Option<Self>, String> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        value
             .to_str()
-            .unwrap_or_else(|| panic!("{ENV} must contain a numeric code page"));
-        let code_page = value
-            .parse::<u32>()
-            .unwrap_or_else(|_| panic!("{ENV} must contain a numeric code page"));
-        Some(
-            Self::for_code_page(code_page)
-                .unwrap_or_else(|| panic!("{ENV} contains unsupported code page {code_page}")),
-        )
+            .and_then(|code_page| code_page.parse::<u32>().ok())
+            .and_then(Self::for_code_page)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "{E2E_TEST_CLIENT_CODE_PAGE} must name a supported code page, not {value:?}"
+                )
+            })
     }
 
     pub(crate) fn is_utf8(self) -> bool {
