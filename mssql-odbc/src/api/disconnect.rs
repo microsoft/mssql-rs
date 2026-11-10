@@ -160,6 +160,7 @@ pub(super) fn clear_session(dbc: &DbcHandle, state: &mut DbcState) {
     drop(state.wire.uninstall());
     state.effective_vendor_settings = None;
     state.effective_packet_size = None;
+    dbc.publish_data_classification_version(None);
     state.identity = ConnectionIdentity::default();
     dbc.trace.clear();
     state.database_user_name = None;

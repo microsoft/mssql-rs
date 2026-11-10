@@ -396,6 +396,7 @@ fn focused_tvp_ipd_desc_rec(
         diag_records: Vec::new(),
         header: DescHeader::default(),
         records,
+        data_classification: None,
     };
     if set_desc_rec(
         &mut state,
@@ -493,6 +494,7 @@ fn focused_tvp_desc_rec_type(
         diag_records: Vec::new(),
         header: DescHeader::default(),
         records,
+        data_classification: None,
     };
     if set_desc_rec(
         &mut state,

@@ -206,7 +206,7 @@ fn publish(
         return Err(SQL_ERROR);
     }
     if let Some(client) = client
-        && !state.wire.restore(client, LeaseReturn::Release)
+        && !dbc.restore_lease(&mut state, client, LeaseReturn::Release)
     {
         post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
         return Err(SQL_ERROR);
