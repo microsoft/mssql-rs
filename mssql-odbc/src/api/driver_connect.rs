@@ -26,6 +26,7 @@ use mssql_tds::connection::client_context::{ClientContext, DriverVersion, IPAddr
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
 use mssql_tds::message::login_options::ApplicationIntent;
+use mssql_tds::token::data_classification::DataClassificationVersion;
 use std::{path::PathBuf, sync::OnceLock};
 
 use super::util::read_utf16;
@@ -289,6 +290,12 @@ fn effective_vendor_settings(
     }
 }
 
+/// Maps the stored `SQL_COPT_SS_DATACLASSIFICATION_VERSION` (already validated
+/// to `1..=2` by the setter) to the LOGIN7 request.
+fn requested_data_classification_version(version: u8) -> Option<DataClassificationVersion> {
+    DataClassificationVersion::try_from(version).ok()
+}
+
 fn initial_database(database_keyword: &str, current_catalog: Option<&str>) -> String {
     if database_keyword.is_empty() {
         current_catalog.unwrap_or_default().to_string()
@@ -438,6 +445,8 @@ fn do_connect(
     if let Some(secs) = state.login_timeout {
         context.login_timeout = Some(secs);
     }
+    context.requested_data_classification_version =
+        requested_data_classification_version(state.data_classification_version);
 
     if let Err(UnsupportedAuth(method)) = configure_auth(&mut context, resolved, &params.server) {
         error!(
@@ -520,6 +529,7 @@ fn do_connect(
         client.is_encrypted(),
         network_policy.enabled,
     ));
+    dbc.publish_data_classification_version(client.negotiated_data_classification_version());
     state.identity = ConnectionIdentity {
         client_connection_id: Some(std::sync::Arc::clone(&dbc.trace)),
         data_source_name: params.dsn.clone(),
