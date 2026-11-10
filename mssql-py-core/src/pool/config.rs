@@ -9,8 +9,7 @@ use tokio::time::Instant;
 
 use super::error::{PoolError, PoolResult};
 
-// Per-key limits and budgets, not live manager reconfiguration.
-// README.md maps these settings to the other foundation contracts.
+/// Validated per-key limits and operation budgets, not live pool reconfiguration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PoolConfig {
     max_size: NonZeroUsize,
@@ -23,7 +22,7 @@ pub(crate) struct PoolConfig {
 }
 
 impl PoolConfig {
-    /// Timeout defaults require agreement; construction always supplies all three.
+    /// Builds settings with explicit acquisition, cleanup and shutdown budgets.
     pub(crate) fn new(
         acquire_timeout: Duration,
         cleanup_timeout: Duration,
@@ -43,6 +42,7 @@ impl PoolConfig {
         })
     }
 
+    /// Sets a positive per-key slot cap within the scheduler's supported range.
     pub(crate) fn with_max_size(mut self, value: usize) -> PoolResult<Self> {
         if value > Semaphore::MAX_PERMITS {
             return Err(PoolError::InvalidConfig {
@@ -54,6 +54,7 @@ impl PoolConfig {
         Ok(self)
     }
 
+    /// Sets a positive queued-only limit; `None` permits unlimited waiting.
     pub(crate) fn with_max_waiting(mut self, value: Option<usize>) -> PoolResult<Self> {
         self.max_waiting = value
             .map(|value| positive_limit("max_waiting", value))
@@ -61,12 +62,14 @@ impl PoolConfig {
         Ok(self)
     }
 
+    /// Sets idle expiry; zero makes clients eligible at the next lazy prune.
     pub(crate) fn with_idle_timeout(mut self, value: Duration) -> PoolResult<Self> {
         validate_duration("idle_timeout", value, true)?;
         self.idle_timeout = value;
         Ok(self)
     }
 
+    /// Sets the pre-expiry reuse margin; zero removes only the extra margin.
     pub(crate) fn with_token_refresh_margin(mut self, value: Duration) -> PoolResult<Self> {
         validate_duration("token_refresh_margin", value, true)?;
         self.token_refresh_margin = value;
@@ -103,6 +106,7 @@ fn positive_limit(field: &'static str, value: usize) -> PoolResult<NonZeroUsize>
     })
 }
 
+/// Rejects disallowed zero budgets and durations outside the monotonic clock range.
 pub(super) fn validate_duration(
     field: &'static str,
     value: Duration,

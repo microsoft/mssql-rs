@@ -15,6 +15,7 @@ use super::error::{OpenError, PoolError, PoolResult};
 pub(crate) struct PoolKey(Box<[u8]>);
 
 impl PoolKey {
+    /// Rejects empty fingerprints; the caller owns canonicalization.
     pub(crate) fn new(fingerprint: Box<[u8]>) -> PoolResult<Self> {
         if fingerprint.is_empty() {
             return Err(PoolError::InvalidRequest {
@@ -37,6 +38,7 @@ impl fmt::Debug for PoolKey {
 pub(crate) struct AuthBinding(Box<[u8]>);
 
 impl AuthBinding {
+    /// Rejects empty bindings; the caller owns identity and credential-version mapping.
     pub(crate) fn new(fingerprint: Box<[u8]>) -> PoolResult<Self> {
         if fingerprint.is_empty() {
             return Err(PoolError::InvalidRequest {
@@ -54,13 +56,18 @@ impl fmt::Debug for AuthBinding {
     }
 }
 
+/// Expiry information for evaluating token reuse, not a credential-refresh policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenExpiry {
+    /// No token-expiry policy applies to this authentication method.
     NonToken,
+    /// Known UTC expiry supplied by the authentication adapter.
     Known(DateTime<Utc>),
+    /// A raw token's expiry is unknown, not unlimited.
     UnknownRawToken,
 }
 
+/// Authentication binding and expiry reported by a physical open.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthMetadata {
     pub(crate) binding: AuthBinding,
@@ -68,6 +75,7 @@ pub(crate) struct AuthMetadata {
 }
 
 impl AuthMetadata {
+    /// Compares fingerprints only; it does not verify the server's login principal.
     pub(crate) fn verify_binding(&self, expected: &AuthBinding) -> PoolResult<()> {
         if self.binding != *expected {
             return Err(PoolError::IdentityMismatch);
@@ -76,13 +84,14 @@ impl AuthMetadata {
     }
 }
 
-/// The caller supplies already-validated effective options, including recovery policy.
+/// Caller-validated connection options and expected authentication binding.
 pub(crate) struct ConnectSpec {
     context: ClientContext,
     expected_auth: AuthBinding,
 }
 
 impl ConnectSpec {
+    /// Takes ownership of effective options without repeating caller validation.
     pub(crate) fn new(context: ClientContext, expected_auth: AuthBinding) -> Self {
         Self {
             context,
@@ -98,7 +107,7 @@ impl ConnectSpec {
     }
 }
 
-// A shared raw-client owner could outlive the slot; this handoff moves ownership.
+/// Moves a physical client and its authentication metadata without shared ownership.
 pub(crate) struct OpenedConnection {
     client: TdsClient,
     auth: AuthMetadata,
@@ -109,14 +118,16 @@ impl OpenedConnection {
         Self { client, auth }
     }
 
+    /// Transfers the client and authentication metadata to their next owner.
     pub(crate) fn into_parts(self) -> (TdsClient, AuthMetadata) {
         (self.client, self.auth)
     }
 }
 
-// Each open receives its own spec; do not retain shared "current request" state.
+/// Opens physical connections with per-call options, not shared request state.
 #[async_trait]
 pub(crate) trait ConnectionFactory: Send + Sync {
+    /// The caller must enforce deadlines and settle any transport or provider work.
     async fn open(
         &self,
         spec: &ConnectSpec,

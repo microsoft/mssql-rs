@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::validate_duration;
 use super::error::{AcquireStage, PoolError, PoolResult};
 
-// Every acquisition stage shares this deadline; stage labels never restart it.
+/// One absolute acquisition deadline and cancellation signal shared by all stages.
 pub(crate) struct AcquireControl {
     deadline: Instant,
     cancel: CancellationToken,
@@ -21,6 +21,7 @@ impl AcquireControl {
         Self { deadline, cancel }
     }
 
+    /// Derives one absolute deadline from the supplied start instant, not each stage.
     pub(crate) fn from_timeout(
         now: Instant,
         timeout: Duration,
@@ -41,6 +42,7 @@ impl AcquireControl {
         &self.cancel
     }
 
+    /// Checks cancellation before deadline expiry; the stage only labels timeout errors.
     pub(crate) fn check(&self, stage: AcquireStage) -> PoolResult<()> {
         if self.cancel.is_cancelled() {
             return Err(PoolError::Cancelled);

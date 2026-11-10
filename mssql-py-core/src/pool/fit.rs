@@ -16,12 +16,14 @@ use tokio::time::{Instant, Sleep};
 
 use super::config::PoolConfig;
 
+/// Test capacity slot containing at most one instrumented client.
 #[derive(Default)]
 struct Slot {
     client: Mutex<Option<Client>>,
     last_returned: Option<Instant>,
 }
 
+/// Keeps Deadpool create/recycle hooks infallible and free of physical I/O.
 struct SlotManager;
 
 impl Manager for SlotManager {
@@ -37,6 +39,7 @@ impl Manager for SlotManager {
     }
 }
 
+/// Records client counts and destruction order for capacity assertions.
 #[derive(Default)]
 struct Observations {
     live: usize,
@@ -44,6 +47,7 @@ struct Observations {
     destroyed: Vec<usize>,
 }
 
+/// Instrumented stand-in for a physical client, with observable destruction.
 struct Client {
     id: usize,
     observations: Arc<Mutex<Observations>>,
@@ -74,6 +78,7 @@ impl Drop for Client {
     }
 }
 
+/// Admission bookkeeping shared across generations of the same capacity pool.
 #[derive(Default)]
 struct State {
     demand: usize,
@@ -87,6 +92,7 @@ struct State {
     next_request: u64,
 }
 
+/// Registered demand waiting for, or already assigned, a Deadpool slot.
 struct PendingGet {
     get: Option<Get>,
     assigned: Option<Object<SlotManager>>,
@@ -116,12 +122,12 @@ impl State {
     }
 }
 
-// Semaphore release may wake synchronously. Never call executor wakers under
-// the admission lock, including from get-future destruction.
+/// Defers executor wakeups until the admission lock has been released.
 #[derive(Default)]
 struct WakeBatch(Mutex<Vec<Waker>>);
 
 impl WakeBatch {
+    /// Must run outside the admission lock because executor wakers may reenter it.
     fn flush(&self) {
         let wakers = std::mem::take(&mut *self.0.lock().unwrap());
         for waker in wakers {
@@ -130,6 +136,7 @@ impl WakeBatch {
     }
 }
 
+/// Routes scheduler wakeups into a batch instead of invoking the executor.
 struct DeferredWake {
     batch: Arc<WakeBatch>,
     target: Waker,
@@ -145,6 +152,7 @@ impl Wake for DeferredWake {
     }
 }
 
+/// Test-only slot adapter; Deadpool remains the sole capacity scheduler.
 struct Prototype {
     slots: Pool<SlotManager>,
     state: Mutex<State>,
@@ -154,6 +162,7 @@ struct Prototype {
     settled: Notify,
 }
 
+/// Fit-experiment outcomes, separate from the compiled pool error contract.
 #[derive(Debug)]
 enum Error {
     WaitQueueFull,
@@ -211,6 +220,7 @@ impl Prototype {
         })
     }
 
+    /// Captures the current generation; demand is admitted only on first poll.
     fn acquire(self: &Arc<Self>, deadline: Instant) -> Acquire {
         let state = self.state.lock().unwrap();
         Acquire {
@@ -222,6 +232,7 @@ impl Prototype {
         }
     }
 
+    /// Destroys clients off-lock before returning slots and unblocking admission.
     fn finish_retirement(&self, clients: Vec<Client>, slots: Vec<Object<SlotManager>>) {
         drop(clients);
         let mut state = self.state.lock().unwrap();
@@ -241,6 +252,7 @@ impl Prototype {
         self.wakes.flush();
     }
 
+    /// Destroys expired idle clients off-lock without removing capacity slots.
     fn prune(&self, now: Instant, idle_timeout: std::time::Duration) {
         let mut state = self.state.lock().unwrap();
         state.retiring += 1;
@@ -259,6 +271,7 @@ impl Prototype {
         self.finish_retirement(clients, Vec::new());
     }
 
+    /// Closes admission and retires idle/pending clients without revoking leases.
     fn disable(&self) {
         let mut state = self.state.lock().unwrap();
         state.accepting = false;
@@ -292,6 +305,7 @@ impl Prototype {
         self.finish_retirement(clients, slots);
     }
 
+    /// Reopens a nonterminal pool without replacing its capacity scheduler.
     fn enable(&self) -> Result<(), Error> {
         let mut state = self.state.lock().unwrap();
         if state.terminal {
@@ -305,6 +319,7 @@ impl Prototype {
         Ok(())
     }
 
+    /// Closes permanently and waits for tracked demand and retirement to settle.
     async fn shutdown(&self, deadline: Instant) -> Result<(), Error> {
         {
             let mut state = self.state.lock().unwrap();
@@ -329,8 +344,10 @@ impl Prototype {
     }
 }
 
+/// Registered Deadpool slot-acquisition future.
 type Get = Pin<Box<dyn Future<Output = Result<Object<SlotManager>, PoolError<Infallible>>> + Send>>;
 
+/// Cancel-safe slot request bound to one generation and absolute deadline.
 struct Acquire {
     pool: Arc<Prototype>,
     generation: u64,
@@ -459,6 +476,7 @@ impl Drop for Acquire {
     }
 }
 
+/// Owns a slot; unclean Drop destroys its client before releasing capacity.
 struct Lease {
     slot: Option<Object<SlotManager>>,
     pool: Arc<Prototype>,
@@ -483,7 +501,7 @@ impl Lease {
             .map(|client| client.id)
     }
 
-    // The test caller asserts successful quiescence. No TDS cleanup is modeled.
+    /// Test-only clean return: the caller asserts quiescence; no TDS cleanup is modeled.
     fn release_clean(mut self) {
         let mut state = self.pool.state.lock().unwrap();
         state.expire(Instant::now(), &self.pool.wakes);
@@ -514,8 +532,10 @@ impl Drop for Lease {
     }
 }
 
+/// Instrumented open future used to model partial-client destruction.
 type Open = Pin<Box<dyn Future<Output = Result<Client, std::io::Error>> + Send>>;
 
+/// Drops partial-open work before releasing its reserved lease.
 struct Opening {
     open: Option<Open>,
     lease: Option<Lease>,
