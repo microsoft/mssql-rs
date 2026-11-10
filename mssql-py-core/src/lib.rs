@@ -21,6 +21,14 @@ mod bulkcopy;
 mod connection;
 mod cursor;
 mod odbc_auth;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Pool contracts are not wired into AQE until A2/B2/B3"
+    )
+)]
+mod pool;
 mod python_entra_token_factory;
 mod python_logger_adapter;
 mod row_writer;
