@@ -171,7 +171,7 @@ fn redactor(report: &Report) -> Redactor {
     if let Some(name) = &report.request.host_name_in_certificate {
         r.name(Category::Host, name);
     }
-    if let super::Authentication::SqlPassword { user, .. } = &report.request.authentication {
+    if let Some(user) = report.request.authentication.user() {
         r.name(Category::User, user);
     }
     for check in &report.checks {
@@ -229,6 +229,7 @@ fn skip_text(skip: &Skip, locale: &str) -> String {
         ),
         Skip::NotApplicable(why) => why.render(locale),
         Skip::Canceled => tr(locale, "diagnose.skip.canceled", &[]),
+        Skip::NotSupported(why) => why.render(locale),
     }
 }
 
@@ -238,6 +239,7 @@ fn skip_reason(skip: &Skip) -> &'static str {
         Skip::PortRequired => "explicitPortRequired",
         Skip::NotApplicable(_) => "notApplicable",
         Skip::Canceled => "canceled",
+        Skip::NotSupported(_) => "notSupported",
     }
 }
 
@@ -471,7 +473,18 @@ fn settings_text(sources: &SettingSources, locale: &str) -> Option<String> {
 /// `protocol` is the target's: what instance resolution looks up.
 fn check_text(check: &Check, protocol: Option<Protocol>, r: &mut Redactor, locale: &str) -> String {
     if let Some(skip) = &check.skip {
-        return skip_text(skip, locale);
+        // A check that stopped part way shows the phases it went through.
+        if check.subphases.is_empty() {
+            return skip_text(skip, locale);
+        }
+        return tr(
+            locale,
+            "diagnose.detail.phases_then_skip",
+            &[
+                ("phases", &phases_text(&check.subphases, None, locale)),
+                ("skip", &skip_text(skip, locale)),
+            ],
+        );
     }
     let field = |key: &str| check.field(key).unwrap_or_default().to_string();
     let named = |r: &mut Redactor, key: &str| {
@@ -745,8 +758,12 @@ pub fn text_in(report: &Report, locale: &str) -> String {
             tr(locale, "diagnose.depth.default_suffix", &[])
         };
         // The user name goes inside the sentence, so a translation can place it.
-        let mut depth_line = match &request.authentication {
-            super::Authentication::SqlPassword { user, .. } if !user.is_empty() => tr(
+        let mut depth_line = match request
+            .authentication
+            .user()
+            .filter(|user| !user.is_empty())
+        {
+            Some(user) => tr(
                 locale,
                 "diagnose.depth.line_with_user",
                 &[
@@ -756,8 +773,9 @@ pub fn text_in(report: &Report, locale: &str) -> String {
                     ("user", &r.name(Category::User, user)),
                 ],
             ),
-            // Integrated, or a SQL login with no name (as with -D and neither -U nor -E).
-            _ => tr(
+            // Integrated, an access token, or a login with no name (as with -D
+            // and neither -U nor -E).
+            None => tr(
                 locale,
                 "diagnose.depth.line",
                 &[
@@ -1104,10 +1122,10 @@ pub fn json_in(report: &Report, version: &str, locale: &str) -> Result<String, s
     let mut r = redactor(report);
     let request = &report.request;
     let local_detail = r.reveals();
-    let user = match &request.authentication {
-        super::Authentication::SqlPassword { user, .. } => Some(r.name(Category::User, user)),
-        super::Authentication::Integrated => None,
-    };
+    let user = request
+        .authentication
+        .user()
+        .map(|user| r.name(Category::User, user));
     let category = report.exit_category();
     let document = ReportView {
         contract_version: CONTRACT_VERSION,
@@ -2897,7 +2915,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.3\""),
+            json.contains("\"coverageMatrixVersion\": \"1.4\""),
             "{json}"
         );
         assert!(

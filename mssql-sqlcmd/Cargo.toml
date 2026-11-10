@@ -29,11 +29,18 @@ workspace = true
 # spans it opens. mssql-tds is 64-bit only, so 32-bit builds (win-x86) leave
 # diagnostics out; mssql_sqlcmd_diagnostics_run reports it as unsupported there.
 [target.'cfg(target_pointer_width = "64")'.dependencies]
+# The token factory diagnose registers with mssql-tds for Microsoft Entra
+# authentication (-G).
+async-trait = "0.1.89"
 mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1.48.0", features = ["rt", "time", "macros", "sync"] }
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", default-features = false, features = ["registry", "std"] }
 unicode-width = "0.2"
+
+# diagnostics tests: a TDS server that answers a Microsoft Entra login.
+[target.'cfg(target_pointer_width = "64")'.dev-dependencies]
+mssql-mock-tds = { path = "../mssql-mock-tds" }
 
 # diagnostics: the client's operating-system version and, off Windows, the
 # Kerberos ticket cache of the user.

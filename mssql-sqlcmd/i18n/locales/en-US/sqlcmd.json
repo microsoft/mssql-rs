@@ -2946,6 +2946,106 @@
           "expr": "function"
         }
       ]
+    },
+    {
+      "id": "diagnose.finding.access_token_file_not_found",
+      "message": "The access token file given with -P was not found.",
+      "translation": "The access token file given with -P was not found.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.access_token_file_unreadable",
+      "message": "The access token file given with -P could not be read: {error}",
+      "translation": "The access token file given with -P could not be read: {error}",
+      "placeholders": [
+        {
+          "id": "error",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.access_token_file_too_large",
+      "message": "The access token file given with -P is {size} bytes, more than the {max} bytes sqlcmd reads.",
+      "translation": "The access token file given with -P is {size} bytes, more than the {max} bytes sqlcmd reads.",
+      "placeholders": [
+        {
+          "id": "size",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "size"
+        },
+        {
+          "id": "max",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "max"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.access_token_file_not_utf16",
+      "message": "The access token file given with -P is not UTF-16LE text, the form in which sqlcmd passes the token to the driver.",
+      "translation": "The access token file given with -P is not UTF-16LE text, the form in which sqlcmd passes the token to the driver.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.skip.entra_token_not_acquired",
+      "message": "sqlcmd diagnose does not acquire Microsoft Entra tokens yet",
+      "translation": "sqlcmd diagnose does not acquire Microsoft Entra tokens yet",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.finding.entra_token_requested",
+      "message": "The server asked for a Microsoft Entra token; the login was not evaluated.",
+      "translation": "The server asked for a Microsoft Entra token; the login was not evaluated.",
+      "placeholders": []
+    },
+    {
+      "id": "diagnose.limitation.entra_token_not_acquired",
+      "message": "sqlcmd diagnose does not acquire Microsoft Entra tokens yet: with {method} it checks the connection up to the server's request for a token, and the login is not evaluated.",
+      "translation": "sqlcmd diagnose does not acquire Microsoft Entra tokens yet: with {method} it checks the connection up to the server's request for a token, and the login is not evaluated.",
+      "placeholders": [
+        {
+          "id": "method",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "method"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.detail.phases_then_skip",
+      "message": "{phases}; {skip}",
+      "translation": "{phases}; {skip}",
+      "placeholders": [
+        {
+          "id": "phases",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "phases"
+        },
+        {
+          "id": "skip",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "skip"
+        }
+      ]
     }
   ]
 }

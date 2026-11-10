@@ -1,6 +1,6 @@
 # `sqlcmd diagnose` coverage matrix
 
-Matrix version: **1.3** (reported in the JSON report as `coverageMatrixVersion`).
+Matrix version: **1.4** (reported in the JSON report as `coverageMatrixVersion`).
 
 This matrix maps each connection phase of the sqlcmd specification (its
 `PHASE-*` ids) to the check that evaluates it, the stable signals the check
@@ -32,7 +32,7 @@ text), `inconclusive`, `skipped` (with what blocked it), `notApplicable`.
 | `PHASE-TLS` | `connectionAttempt` (`connectionAttempt`) | the TLS phase of `mssql-tds`'s connect-stage spans; the typed TLS error, else its text (marked) | passed, diagnosed, classified, inconclusive | all | P1, shipped. Certificate subject/SAN and validity details are not exposed by the client yet. |
 | `PHASE-KERBEROS` | `connectionAttempt` (`connectionAttempt`) | the SPN the client requested, as its `login` stage records it; off Windows, whether a file ticket cache exists (`KRB5CCNAME`, `/tmp/krb5cc_<uid>`); the server/client clock offset from session validation | passed, diagnosed, classified, inconclusive | Windows (SSPI), Linux and macOS (GSSAPI) | P1, partial: encryption types, KCM/KEYRING caches and SPN registration are not inspected. Delegation and gMSA are P2. |
 | `PHASE-SQL-AUTH` | `connectionAttempt` (`connectionAttempt`) | SQL Server error number, state and class (18456, 18452, 18470, 18486-18488) | passed, diagnosed | all | P1, shipped |
-| `PHASE-ENTRA-AUTH` | — | — | — | — | P1, not yet: `-G` is refused by `sqlcmd diagnose`. |
+| `PHASE-ENTRA-AUTH` | `connectionAttempt` (`connectionAttempt`) | the method sqlcmd selects for `-G` (`ActiveDirectoryPassword`, `ActiveDirectoryAccessToken`); for an access token (`-G -P <file>`), the file connection input reads as sqlcmd reads it, the token the client sends as sqlcmd's driver does, and the server's rejection (SQL Server error number, state and class; `entraStage: serverRejection`); for `ActiveDirectoryPassword`, which needs a credential provider, whether the server asked for a token after pre-login and TLS | passed, diagnosed, skipped (`notSupported`) | all | P1, partial: an access token is evaluated end to end; with `ActiveDirectoryPassword` diagnose does not acquire the token, so the login is `notEvaluated` and the run `partial`. `-G` without `-U` or `-P` (`ActiveDirectoryIntegrated`) is refused: sqlcmd's driver then logs in with Microsoft Entra or with Windows authentication, depending on the server's pre-login answer, which diagnose does not model yet. Credential and token acquisition will be told apart once the connection attempt goes through sqlcmd's own driver and credential provider. Methods selected only by an ODBC DSN (managed identity, service principal, interactive) are not modeled. |
 | `PHASE-DATABASE` | `connectionAttempt` (`connectionAttempt`) | SQL Server errors 4060 and 4064 after a good login | diagnosed | all | P1, shipped |
 | `PHASE-CONNECTION-DEADLINE` | every timed check | each check's `deadlineMs` and `durationMs`; the connection attempt's failed phase | inconclusive | all | P1, shipped |
 | `PHASE-SESSION-TRANSPORT` | `sessionValidation` (`sessionValidation`) | the minimal query's result or SQL Server error, within the time limit | passed, diagnosed, inconclusive | all | P1, shipped. Transport-loss retry counts are not modelled. |
