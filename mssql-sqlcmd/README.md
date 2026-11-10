@@ -30,6 +30,12 @@ Restore the NuGet package from your configured feed, include `mssql_sqlcmd.h`,
 and link the archive for your runtime **plus the system libraries listed in
 `native-static-libs.txt`**. Rust dependencies are compiled into the archive.
 
+On Linux the archive does not link OpenSSL: it loads `libssl.so.4`, else
+`libssl.so.3`, else `libssl.so.1.1` (the ODBC driver's order), when TLS is first
+used, so one build links and runs with any of these versions, and an executable
+that links it does not need OpenSSL to start. Without OpenSSL installed, only TLS
+connections are unavailable.
+
 macOS consumers must target macOS 10.15 or later (11.0 or later for Apple
 Silicon), matching the archive's default-enabled Network.framework dependency.
 The package does not supply automatic MSBuild integration.

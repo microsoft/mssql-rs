@@ -2666,6 +2666,36 @@
           "expr": "seconds"
         }
       ]
+    },
+    {
+      "id": "openssl.not_found",
+      "message": "OpenSSL was not found ({libraries}); TLS connections are unavailable.",
+      "translation": "OpenSSL was not found ({libraries}); TLS connections are unavailable.",
+      "placeholders": [
+        {
+          "id": "libraries",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "libraries"
+        }
+      ]
+    },
+    {
+      "id": "openssl.unsupported",
+      "message": "The loaded OpenSSL does not export {function}; it is not a supported version.",
+      "translation": "The loaded OpenSSL does not export {function}; it is not a supported version.",
+      "placeholders": [
+        {
+          "id": "function",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "function"
+        }
+      ]
     }
   ]
 }

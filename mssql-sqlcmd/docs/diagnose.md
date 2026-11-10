@@ -175,6 +175,9 @@ the outcome is `inconclusive`. Run the default depth, or give
 
 `mssql-tds` is 64-bit only, so 32-bit builds (`win-x86`) leave diagnose out:
 there `mssql_sqlcmd_diagnostics_run` returns `MSSQL_SQLCMD_UNSUPPORTED`.
-`mssql-tds` is compiled into the archive and needs the TLS libraries it uses:
-Schannel and other Win32 libraries on Windows, OpenSSL (`libssl`,
-`libcrypto`) on Linux, listed in `native-static-libs.txt`.
+`mssql-tds` is compiled into the archive and needs the TLS libraries it uses.
+On Windows these are Schannel and other Win32 libraries, listed in
+`native-static-libs.txt`. On Linux the archive does not link OpenSSL: it loads
+`libssl.so.4`, else `libssl.so.3`, else `libssl.so.1.1`, when TLS is first used,
+so `native-static-libs.txt` lists no `libssl` or `libcrypto`; without OpenSSL
+installed, only TLS connections are unavailable.
