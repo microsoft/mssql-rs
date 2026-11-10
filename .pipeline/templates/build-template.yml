@@ -168,14 +168,6 @@ steps:
       testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
       testRunTitle: $(System.PhaseName)
 
-  # `test_client_support.rs` is test-only scaffolding (gated behind the
-  # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
-  # unit tests; it is not product code, so it is excluded from coverage.
-  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
-    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-    workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in lcov format (mssql-tds and mssqlodbc)
-
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |
         echo "Running Python tests for mssql-py-core..."
@@ -191,6 +183,9 @@ steps:
   # with the mssql-py-core Python report and publishes the single combined
   # report to the ADO coverage tab, because ADO does not merge coverage across
   # stages/jobs. The merged report is what the GitHub diff-cover workflow uses.
+  # `test_client_support.rs` is test-only scaffolding (gated behind the
+  # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
+  # unit tests; it is not product code, so it is excluded from coverage.
   - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
@@ -233,9 +228,10 @@ steps:
       # publish path deterministic regardless of the job's CARGO_TARGET_DIR.
       # Bound build/test workers independently of CTest's environment defaults.
       # The legs remain sequential, with CTest enforcing resource exclusions.
-      $jobs = [Math]::Min(4, [Environment]::ProcessorCount)
+      $buildJobs = [Environment]::ProcessorCount
+      $testJobs = [Math]::Min(6, [Environment]::ProcessorCount)
       ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries 3 -Coverage `
-        -CompareWithMsodbcsql -BuildJobs $jobs -TestJobs $jobs `
+        -CompareWithMsodbcsql -BuildJobs $buildJobs -TestJobs $testJobs `
         -CoverageOutput "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
     displayName: Run ODBC C++ e2e tests (Windows) with coverage and msodbcsql parity comparison
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))

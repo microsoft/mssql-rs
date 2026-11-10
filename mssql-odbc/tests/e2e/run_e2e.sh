@@ -11,10 +11,14 @@
 # Usage:
 #   ./run_e2e.sh [--release] [--verbose] [--retries=N] [--coverage[=OUTPUT]]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
-#                [--skip-build] [--driver=PATH]
+#                [--skip-build] [--driver=PATH] [--test-jobs=N]
 #                [--filter=REGEX] [--mt-profile=pr|nightly|weekly]
 #
 # Default: runs the e2e suite against mssql-odbc only.
+#
+# --test-jobs=N (1-64, default 1) bounds parallel ctest entries within each
+# driver leg. The legs stay sequential, and the CMake resource locks keep an
+# executable's entries, and RUN_SERIAL entries, from overlapping.
 #
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
@@ -161,6 +165,7 @@ SKIP_BUILD=0
 DRIVER_OVERRIDE=""
 TEST_FILTER=""
 MT_PROFILE="pr"
+TEST_JOBS=1
 # Extra environment for the msodbcsql leg only (see apply_mt_profile).
 MS_LEG_ENV=()
 
@@ -196,10 +201,18 @@ parse_args() {
             --driver=*) DRIVER_OVERRIDE="${arg#--driver=}" ;;
             --filter=*) TEST_FILTER="${arg#--filter=}" ;;
             --mt-profile=*) MT_PROFILE="${arg#--mt-profile=}" ;;
+            --test-jobs=*) TEST_JOBS="${arg#--test-jobs=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
     done
+    case "$TEST_JOBS" in
+        ''|*[!0-9]*) TEST_JOBS=0 ;;
+    esac
+    if [ "$TEST_JOBS" -lt 1 ] || [ "$TEST_JOBS" -gt 64 ]; then
+        echo "--test-jobs must be an integer from 1 to 64" >&2
+        exit 2
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -577,6 +590,7 @@ generate_coverage_report() {
 main() {
     parse_args "$@"
     apply_mt_profile
+    CTEST_ARGS+=(--parallel "$TEST_JOBS")
     if [ -n "$TEST_FILTER" ]; then
         CTEST_ARGS+=(-R "$TEST_FILTER")
     fi

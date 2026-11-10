@@ -163,10 +163,78 @@ def test_windows_pr_e2e_bounds_build_and_test_workers():
         if key.startswith("${{ if ") and "parameters.enableOdbcE2E" in key
     )
     command = next(step["pwsh"] for step in branch if "pwsh" in step)
-    assert "$jobs = [Math]::Min(4, [Environment]::ProcessorCount)" in command
-    assert "-BuildJobs $jobs -TestJobs $jobs" in command
+    assert "$buildJobs = [Environment]::ProcessorCount" in command
+    assert "$testJobs = [Math]::Min(6, [Environment]::ProcessorCount)" in command
+    assert "-BuildJobs $buildJobs -TestJobs $testJobs" in command
     assert "-Retries 3 -Coverage" in command
     assert "-CompareWithMsodbcsql" in command
+
+
+def test_windows_arm_e2e_bounds_build_and_test_workers():
+    steps = load_template("odbc-e2e-windows-remote-sql-template.yml")["steps"]
+    command = next(s["pwsh"] for s in steps if s.get("displayName") == "Run ODBC C++ e2e tests")
+    assert "$buildJobs = [Environment]::ProcessorCount" in command
+    assert "$testJobs = [Math]::Min(4, [Environment]::ProcessorCount)" in command
+    assert "-BuildJobs $buildJobs -TestJobs $testJobs" in command
+
+
+def test_unix_pr_e2e_bounds_test_workers():
+    container = (_TEMPLATES / "build-template-container.yml").read_text(encoding="utf-8")
+    assert '-e ODBC_E2E_TEST_JOBS="$(( $(nproc) < 4 ? $(nproc) : 4 ))"' in container
+    wrapper = (_ROOT / ".pipeline" / "scripts" / "containerized-odbc-e2e.sh").read_text(
+        encoding="utf-8"
+    )
+    assert '--test-jobs="${ODBC_E2E_TEST_JOBS:-1}"' in wrapper
+    stages = (_TEMPLATES / "validation-stages.yml").read_text(encoding="utf-8")
+    assert '--test-jobs="$(( cpus < 4 ? cpus : 4 ))"' in stages
+
+
+def test_rust_coverage_publishes_only_cobertura():
+    template = (_TEMPLATES / "build-template.yml").read_text(encoding="utf-8")
+    assert "--lcov" not in template
+    assert "--cobertura" in template
+
+
+def test_kerberos_archive_flag_matches_bash_comparison():
+    template = (_TEMPLATES / "kerberos-test-template.yml").read_text(encoding="utf-8")
+    # Template expressions render booleans as True/False.
+    assert "USE_ARCHIVE: '${{ lower(parameters.useArchive) }}'" in template
+    assert 'if [ "$USE_ARCHIVE" = "true" ]; then' in template
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [("", "1"), ("--test-jobs=4", "4"), ("--test-jobs=64", "64"),
+     ("--test-jobs=0", None), ("--test-jobs=65", None), ("--test-jobs=x", None),
+     ("--test-jobs=", None)],
+)
+def test_unix_e2e_validates_test_jobs(tmp_path, args, expected):
+    runner = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.sh").read_text(
+        encoding="utf-8"
+    )
+    function = re.search(r"^parse_args\(\) \{\n.*?^\}", runner, re.M | re.S)
+    assert function, "parse_args not found"
+    script = f"""
+set -euo pipefail
+TEST_JOBS=1
+CTEST_ARGS=()
+usage() {{ :; }}
+{function.group()}
+parse_args {args}
+printf "jobs:%s\\n" "$TEST_JOBS"
+"""
+    script_path = tmp_path / "parse.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name], cwd=tmp_path, capture_output=True, text=True,
+    )
+    if expected is None:
+        assert result.returncode == 2
+        assert "--test-jobs must be an integer from 1 to 64" in result.stderr
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"jobs:{expected}" in result.stdout.splitlines()
 
 
 @pytest.mark.skipif(

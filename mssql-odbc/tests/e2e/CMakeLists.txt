@@ -337,3 +337,15 @@ add_odbc_test(text_money_types_test tests/text_money_types_test.cpp)
 add_odbc_test(fetch_error_semantics_test tests/fetch_error_semantics_test.cpp)
 add_odbc_direct_load_test(dll_unload_stress_test tests/dll_unload_stress_test.cpp)
 add_odbc_direct_load_test(trace_rotation_test tests/trace_rotation_test.cpp)
+
+# Fresh CI agents have no CTest cost history; start the longest entries first
+# so they do not form the tail of a parallel run.
+foreach(entry_cost get_data_test_mt:75 param_conversions_test_mt:75
+                   execute_test_mt:45 fetch_scroll_test_mt:42 param_array_test_mt:30)
+    string(REPLACE ":" ";" entry_cost "${entry_cost}")
+    list(GET entry_cost 0 entry)
+    list(GET entry_cost 1 cost)
+    if(TEST ${entry})
+        set_tests_properties(${entry} PROPERTIES COST ${cost})
+    endif()
+endforeach()

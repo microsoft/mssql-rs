@@ -572,7 +572,9 @@ stages:
           set -euo pipefail
           CMAKE_PREFIX_PATH="$(brew --prefix unixodbc)${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
           export CMAKE_PREFIX_PATH
-          bash mssql-odbc/tests/e2e/run_e2e.sh --retries=3
+          cpus="$(sysctl -n hw.ncpu)"
+          bash mssql-odbc/tests/e2e/run_e2e.sh --retries=3 \
+            --test-jobs="$(( cpus < 4 ? cpus : 4 ))"
         displayName: 'Run ODBC C++ e2e tests (macOS)'
         condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
         env:
