@@ -973,6 +973,45 @@ mod tests {
         }
     }
 
+    /// Another statement can add user work to the driver-begun transaction
+    /// after the switch's first snapshot and before it claims the client. The
+    /// switch must still commit that work, not roll it back as an empty
+    /// transaction, and end the transaction for the classification too.
+    #[test]
+    fn user_work_added_during_the_autocommit_switch_is_committed() {
+        use crate::api::odbc_types::{SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON};
+
+        let autocommit = |dbc: SqlHandle, value: u32| unsafe {
+            sql_set_connect_attr_w(dbc, SQL_ATTR_AUTOCOMMIT, value as usize as SqlPointer, 0)
+        };
+        let (server, _) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+        assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
+        let dbc = h.dbc;
+        let worker = h.alloc_extra_stmt();
+        crate::api::txn::test_hooks::set_after_autocommit_snapshot(move || {
+            exec(worker, UNCLASSIFIED);
+            assert_eq!(unsafe { sql_close_cursor(worker) }, SQL_SUCCESS);
+            assert!(
+                unsafe { handle_from_raw::<DbcHandle>(dbc) }
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .local_tran_started
+            );
+        });
+
+        assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_ON), SQL_SUCCESS_WITH_INFO);
+        assert_last_diag(
+            &dbc_diags(h.dbc),
+            crate::api::sqlstate::WARN_TRANSACTION_COMMITTED,
+        );
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+    }
+
     /// Preparing new text drops the classification before anything executes
     /// (measured on msodbcsql 18.07.0001).
     #[test]

@@ -678,21 +678,32 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// silently (`sqlcconn.cpp:3692-3741`). The cursor sweep is `CommitAbortTran`'s,
 /// so it ends a transaction exactly when user work started one.
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    // Read once, as `end_transaction` does, so the sweep and the commit decide
-    // on the same transaction.
-    let had_user_txn = match dbc.inner.lock() {
+    // The sweep runs before the client is claimed, so another statement can
+    // still add user work after this snapshot. The commit decision re-reads
+    // the flag once the claim shuts that out, and a sweep that missed the
+    // work is redone after the commit.
+    let swept_as_ending = match dbc.inner.lock() {
         Ok(state) => state.local_tran_started,
         Err(_) => {
             error!("{op}: dbc mutex poisoned");
             return SQL_ERROR;
         }
     };
-    if sweep_cursors(dbc, had_user_txn) == SQL_ERROR {
+    #[cfg(test)]
+    test_hooks::after_autocommit_snapshot();
+    if sweep_cursors(dbc, swept_as_ending) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
         Err(ret) => return ret,
+    };
+    let had_user_txn = match dbc.inner.lock() {
+        Ok(state) => state.local_tran_started,
+        Err(_) => {
+            error!("{op}: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
     };
     let result = if had_user_txn && client.has_active_transaction() {
         debug!("{op}: committing user transaction");
@@ -715,7 +726,7 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     } else {
         Ok(())
     };
-    release_dbc_client_and_publish(dbc, client, op, |state| {
+    let rc = release_dbc_client_and_publish(dbc, client, op, |state| {
         if had_user_txn {
             // A failed commit has an unknown server outcome, but retaining this
             // flag would make SQLDisconnect reject the connection with 25000.
@@ -741,7 +752,31 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
             SQL_SUCCESS
         }
     })
-    .unwrap_or_else(|ret| ret)
+    .unwrap_or_else(|ret| ret);
+    if had_user_txn && !swept_as_ending && sweep_cursors(dbc, true) == SQL_ERROR {
+        error!("{op}: closing cursors for user work added during the switch failed");
+    }
+    rc
+}
+
+#[cfg(test)]
+pub(super) mod test_hooks {
+    std::thread_local! {
+        static AFTER_AUTOCOMMIT_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs `hook` once, between `switch_to_autocommit`'s snapshot and its
+    /// cursor sweep, on this thread.
+    pub(in crate::api) fn set_after_autocommit_snapshot(hook: impl FnOnce() + 'static) {
+        AFTER_AUTOCOMMIT_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_autocommit_snapshot() {
+        if let Some(hook) = AFTER_AUTOCOMMIT_SNAPSHOT.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
 }
 
 /// Autocommit → manual-commit. Opens a transaction immediately so `@@TRANCOUNT`
