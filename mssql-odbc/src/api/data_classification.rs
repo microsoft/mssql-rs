@@ -1062,7 +1062,7 @@ mod tests {
                     .local_tran_started
             );
         });
-        crate::api::txn::test_hooks::set_after_autocommit_sweep(move || {
+        crate::api::txn::test_hooks::set_after_ending_sweep(move || {
             prepare_and_run(late, 2);
             prepare_run_and_close(late_closed);
             prepare_run_and_close(spared_then_closed);
@@ -1095,6 +1095,58 @@ mod tests {
         }
     }
 
+    /// Work another statement runs between a transaction-ending sweep and the
+    /// client claim belongs to the transaction that then ends, so its
+    /// classification follows the same rules as work the sweep saw: closed or
+    /// read to `SQL_NO_DATA` drops it, on the last row keeps it.
+    #[test]
+    fn work_run_after_a_transaction_ending_sweep_is_swept_too() {
+        use crate::api::odbc_types::{
+            SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_COMMIT, SQL_HANDLE_DBC, SQL_ROLLBACK,
+        };
+
+        for end in ["autocommit", "commit", "rollback"] {
+            let (server, payload) = classified_server();
+            let mut h = TestHandles::with_env_dbc();
+            server.connect(h.dbc);
+            assert_eq!(set_autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
+            let first = h.alloc_extra_stmt();
+            prepare_and_run(first, 2);
+            let exhausted = h.alloc_extra_stmt();
+            let closed = h.alloc_extra_stmt();
+            let last_row = h.alloc_extra_stmt();
+            crate::api::txn::test_hooks::set_after_ending_sweep(move || {
+                prepare_and_run(exhausted, 2);
+                prepare_run_and_close(closed);
+                prepare_and_run(last_row, 1);
+            });
+
+            let rc = match end {
+                "autocommit" => set_autocommit(h.dbc, SQL_AUTOCOMMIT_ON),
+                "commit" => unsafe { crate::api::SQLEndTran(SQL_HANDLE_DBC, h.dbc, SQL_COMMIT) },
+                _ => unsafe { crate::api::SQLEndTran(SQL_HANDLE_DBC, h.dbc, SQL_ROLLBACK) },
+            };
+            let expected = if end == "autocommit" {
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            };
+            assert_eq!(rc, expected, "{end}");
+            for (stmt, case) in [
+                (first, "first"),
+                (exhausted, "exhausted"),
+                (closed, "closed"),
+            ] {
+                assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{end}: {case}");
+            }
+            assert_eq!(
+                classification(ird(last_row)),
+                (SQL_SUCCESS, payload.clone()),
+                "{end}: last row"
+            );
+        }
+    }
+
     /// A statement that runs as soon as the autocommit switch releases the
     /// connection keeps its cursor and classification: the switch finishes
     /// ending the transaction before anything else can run.
@@ -1108,7 +1160,7 @@ mod tests {
         assert_eq!(set_autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
         let late = h.alloc_extra_stmt();
         let next = h.alloc_extra_stmt();
-        crate::api::txn::test_hooks::set_after_autocommit_sweep(move || prepare_and_run(late, 2));
+        crate::api::txn::test_hooks::set_after_ending_sweep(move || prepare_and_run(late, 2));
         crate::api::txn::test_hooks::set_after_connection_release(move || prepare_and_run(next, 0));
 
         assert_eq!(
@@ -1164,7 +1216,7 @@ mod tests {
         let stmt_addr = stmt as usize;
         let worker = Arc::new(std::sync::Mutex::new(None));
         let worker_slot = Arc::clone(&worker);
-        crate::api::txn::test_hooks::set_after_autocommit_sweep(move || {
+        crate::api::txn::test_hooks::set_after_ending_sweep(move || {
             prepare_and_run(late, 2);
             let (paused, wait_for_pause) = std::sync::mpsc::channel();
             *worker_slot.lock().unwrap() = Some(std::thread::spawn(move || {

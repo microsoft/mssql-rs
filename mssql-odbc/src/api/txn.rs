@@ -303,7 +303,8 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     } else {
         Sweep::Close
     };
-    if sweep_cursors(dbc, sweep, None) == SQL_ERROR {
+    let mut spared = Vec::new();
+    if sweep_cursors(dbc, sweep, Some(&mut spared)) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
 
@@ -313,6 +314,8 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
         return SQL_SUCCESS;
     }
 
+    #[cfg(test)]
+    test_hooks::after_ending_sweep();
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -340,6 +343,7 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
         debug!("{op}: no server-side transaction active — clearing stale flag");
         Ok(())
     };
+    end_transaction_for_work_since_sweep(dbc, op, &mut spared);
 
     release_dbc_client_and_publish(dbc, client, op, |state| {
         // Cleared unconditionally, matching msodbcsql's `Return:` label, so a failed
@@ -691,8 +695,8 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     // The sweep runs before the client is claimed, so another statement can
     // still add user work after this snapshot. The commit decision re-reads
-    // the flag once the claim shuts that out, and a sweep that missed the
-    // work is finished before the claim is released.
+    // the flag once the claim shuts that out, and work that ran after the
+    // sweep is swept before the claim is released.
     let swept_as_ending = match dbc.inner.lock() {
         Ok(state) => state.local_tran_started,
         Err(_) => {
@@ -712,7 +716,7 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
         return fail_cursor_close(dbc, op);
     }
     #[cfg(test)]
-    test_hooks::after_autocommit_sweep();
+    test_hooks::after_ending_sweep();
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -745,13 +749,8 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     } else {
         Ok(())
     };
-    // Holding the wire keeps new executes out, and leaves every cursor still
-    // open with nothing to drain.
-    if had_user_txn
-        && !swept_as_ending
-        && sweep_cursors(dbc, Sweep::EndTransactionAfterClose, Some(&mut spared)) == SQL_ERROR
-    {
-        error!("{op}: ending the transaction for cursors opened during the switch failed");
+    if had_user_txn {
+        end_transaction_for_work_since_sweep(dbc, op, &mut spared);
     }
     release_dbc_client_and_publish(dbc, client, op, |state| {
         if had_user_txn {
@@ -782,6 +781,17 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     .unwrap_or_else(|ret| ret)
 }
 
+/// Applies the transaction-ending sweep to what other statements ran between
+/// the first sweep, which collected `spared`, and the client claim. Call
+/// holding the client: that keeps new executes out and leaves every open
+/// cursor with nothing to drain. A failure is logged rather than returned,
+/// because the transaction has already ended.
+fn end_transaction_for_work_since_sweep(dbc: &DbcHandle, op: &str, spared: &mut Vec<u64>) {
+    if sweep_cursors(dbc, Sweep::EndTransactionForLateWork, Some(spared)) == SQL_ERROR {
+        error!("{op}: ending the transaction for work since the sweep failed");
+    }
+}
+
 #[cfg(test)]
 pub(super) mod test_hooks {
     use std::cell::RefCell;
@@ -791,7 +801,7 @@ pub(super) mod test_hooks {
 
     std::thread_local! {
         static AFTER_AUTOCOMMIT_SNAPSHOT: Hook = const { RefCell::new(None) };
-        static AFTER_AUTOCOMMIT_SWEEP: Hook = const { RefCell::new(None) };
+        static AFTER_ENDING_SWEEP: Hook = const { RefCell::new(None) };
         static AFTER_CONNECTION_RELEASE: Hook = const { RefCell::new(None) };
         static AFTER_UNSENT_ARRAY_RELEASE: Hook = const { RefCell::new(None) };
     }
@@ -812,10 +822,11 @@ pub(super) mod test_hooks {
         set(&AFTER_AUTOCOMMIT_SNAPSHOT, hook);
     }
 
-    /// Runs `hook` once, between `switch_to_autocommit`'s cursor sweep and its
-    /// client claim, on this thread.
-    pub(in crate::api) fn set_after_autocommit_sweep(hook: impl FnOnce() + 'static) {
-        set(&AFTER_AUTOCOMMIT_SWEEP, hook);
+    /// Runs `hook` once, between the cursor sweep of `switch_to_autocommit`, or
+    /// of `end_transaction` with a transaction started, and its client claim,
+    /// on this thread.
+    pub(in crate::api) fn set_after_ending_sweep(hook: impl FnOnce() + 'static) {
+        set(&AFTER_ENDING_SWEEP, hook);
     }
 
     /// Runs `hook` once, as soon as a connection-scoped operation releases the
@@ -838,8 +849,8 @@ pub(super) mod test_hooks {
         run(&AFTER_AUTOCOMMIT_SNAPSHOT);
     }
 
-    pub(super) fn after_autocommit_sweep() {
-        run(&AFTER_AUTOCOMMIT_SWEEP);
+    pub(super) fn after_ending_sweep() {
+        run(&AFTER_ENDING_SWEEP);
     }
 
     pub(super) fn after_connection_release() {

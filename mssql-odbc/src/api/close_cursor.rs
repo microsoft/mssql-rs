@@ -227,11 +227,11 @@ pub(super) enum Sweep {
     /// prepared one whose result has no rows left, since `FreeStmt` keeps it
     /// only while the cursor is on (`sqlcfunc.cpp:494-500`).
     EndTransaction,
-    /// [`Sweep::EndTransaction`] after a [`Sweep::Close`] of the same
-    /// connection turned out to end a transaction. A statement whose cursor is
-    /// already closed keeps only a classification that sweep spared; its
-    /// diagnostics are left alone.
-    EndTransactionAfterClose,
+    /// [`Sweep::EndTransaction`] for what other statements ran since an
+    /// earlier sweep of the same connection, once that transaction has ended.
+    /// A statement whose cursor is already closed keeps only a classification
+    /// that sweep spared; its diagnostics are left alone.
+    EndTransactionForLateWork,
 }
 
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
@@ -257,9 +257,9 @@ pub(super) enum Sweep {
 /// request next is unsafe, which an already-closed batch's stale diagnostic
 /// does not make true.
 ///
-/// With `spared`, [`Sweep::Close`] records each classification it keeps that
-/// [`Sweep::EndTransaction`] would keep too, for a later
-/// [`Sweep::EndTransactionAfterClose`] to leave in place.
+/// With `spared`, [`Sweep::Close`] and [`Sweep::EndTransaction`] record each
+/// classification they keep that ending the transaction keeps too, for a later
+/// [`Sweep::EndTransactionForLateWork`] to leave in place.
 pub(super) fn close_cursor_for_connection_op(
     stmt: &StmtHandle,
     handle: SqlHandle,
@@ -276,7 +276,7 @@ pub(super) fn close_cursor_for_connection_op(
             return SQL_ERROR;
         };
         let cursor_open = stmt_state.has_state(STMT_STATE_CURSOR_OPEN);
-        if sweep == Sweep::EndTransactionAfterClose && !cursor_open {
+        if sweep == Sweep::EndTransactionForLateWork && !cursor_open {
             drop(stmt_state);
             super::ird::clear_ird_classification_unless(
                 stmt,
@@ -303,7 +303,7 @@ pub(super) fn close_cursor_for_connection_op(
     };
     if !keep_classification {
         super::ird::clear_ird_classification(stmt);
-    } else if sweep == Sweep::Close
+    } else if sweep != Sweep::EndTransactionForLateWork
         && kept_through_ending
         && let Some(spared) = spared
         && let Some(id) = super::ird::ird_classification_id(stmt)
