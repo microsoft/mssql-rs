@@ -1512,8 +1512,11 @@ impl TdsClient {
 
     /// How many requests have passed the pre-send connection check, which
     /// recovers a dead connection or rejects the request before any of it is
-    /// written. A call that fails with this count unchanged sent nothing, so a
-    /// caller can keep state the request would otherwise have replaced.
+    /// written. Statement requests (SQL batches, RPCs including cursor RPCs, and
+    /// bulk loads) run that check; transaction-manager requests skip it and are
+    /// not counted. A statement request that fails with this count unchanged
+    /// sent nothing, so a caller can keep state the request would otherwise
+    /// have replaced.
     pub fn requests_admitted(&self) -> u64 {
         self.requests_admitted
     }

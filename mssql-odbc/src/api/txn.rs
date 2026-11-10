@@ -678,26 +678,21 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// silently (`sqlcconn.cpp:3692-3741`). The cursor sweep is `CommitAbortTran`'s,
 /// so it ends a transaction exactly when user work started one.
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    let ending_user_txn = match dbc.inner.lock() {
-        Ok(state) => state.local_tran_started,
-        Err(_) => {
-            error!("{op}: dbc mutex poisoned");
-            return SQL_ERROR;
-        }
-    };
-    if sweep_cursors(dbc, ending_user_txn) == SQL_ERROR {
-        return fail_cursor_close(dbc, op);
-    }
-    let mut client = match claim_dbc_client(dbc, op) {
-        Ok(c) => c,
-        Err(ret) => return ret,
-    };
+    // Read once, as `end_transaction` does, so the sweep and the commit decide
+    // on the same transaction.
     let had_user_txn = match dbc.inner.lock() {
         Ok(state) => state.local_tran_started,
         Err(_) => {
             error!("{op}: dbc mutex poisoned");
             return SQL_ERROR;
         }
+    };
+    if sweep_cursors(dbc, had_user_txn) == SQL_ERROR {
+        return fail_cursor_close(dbc, op);
+    }
+    let mut client = match claim_dbc_client(dbc, op) {
+        Ok(c) => c,
+        Err(ret) => return ret,
     };
     let result = if had_user_txn && client.has_active_transaction() {
         debug!("{op}: committing user transaction");

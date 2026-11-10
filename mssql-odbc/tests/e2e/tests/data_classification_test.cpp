@@ -691,6 +691,18 @@ TEST_F(DataClassificationTest, EndingATransactionDropsAClassificationWithNoRowsL
     ASSERT_SQL_OK(autocommit(true), SQL_HANDLE_DBC, dbc_);
     EXPECT_FALSE(IrdPayload().has_value()) << "autocommit on after user work";
 
+    // The same sweep with the cursor left open: unread, on its last row, then
+    // past it.
+    for (const Case& c : {Case{&rows, 0, true}, Case{&rows, 1, true}, Case{&rows, 2, false}}) {
+        ASSERT_SQL_OK(autocommit(false), SQL_HANDLE_DBC, dbc_);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        for (int i = 0; i < c.fetches; ++i) SQLFetch(stmt_);
+        ASSERT_SQL_OK(autocommit(true), SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(c.kept, IrdPayload().has_value())
+            << "autocommit on after " << c.fetches << " fetches";
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+    }
+
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(autocommit(false), SQL_HANDLE_DBC, dbc_);

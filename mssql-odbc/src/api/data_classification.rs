@@ -913,8 +913,8 @@ mod tests {
 
     /// Turning autocommit back on runs `CommitAbortTran`'s sweep
     /// (`SetCommitModeOption`), so a transaction holding user work ends like
-    /// `SQLEndTran`; with no user work the classification stays (measured on
-    /// msodbcsql 18.07.0001).
+    /// `SQLEndTran`, including for a cursor left open with no rows left; with no
+    /// user work the classification stays (measured on msodbcsql 18.07.0001).
     #[test]
     fn enabling_autocommit_ends_the_transaction_for_the_classification() {
         use crate::api::odbc_types::{SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON};
@@ -922,7 +922,16 @@ mod tests {
         let autocommit = |dbc: SqlHandle, value: u32| unsafe {
             sql_set_connect_attr_w(dbc, SQL_ATTR_AUTOCOMMIT, value as usize as SqlPointer, 0)
         };
-        for user_work in [true, false] {
+        // `None` closes the cursor first; `Some(n)` leaves it open after `n`
+        // fetches: unread (0), on the last row (1), or past it with `SQL_NO_DATA`
+        // (2).
+        for (user_work, fetches, kept) in [
+            (true, None, false),
+            (false, None, true),
+            (true, Some(0), true),
+            (true, Some(1), true),
+            (true, Some(2), false),
+        ] {
             let (server, payload) = classified_server();
             let mut h = TestHandles::with_env_dbc();
             server.connect(h.dbc);
@@ -930,7 +939,14 @@ mod tests {
                 assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
             }
             let stmt = prepare_and_execute(&mut h, CLASSIFIED);
-            assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+            match fetches {
+                None => assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS),
+                Some(n) => {
+                    for _ in 0..n {
+                        unsafe { crate::api::SQLFetch(stmt) };
+                    }
+                }
+            }
             if !user_work {
                 assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
             }
@@ -943,15 +959,16 @@ mod tests {
                 user_work
             );
 
+            let case = format!("user work: {user_work}, fetches: {fetches:?}");
             let rc = autocommit(h.dbc, SQL_AUTOCOMMIT_ON);
             assert!(
                 matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
-                "user work: {user_work}: {rc}"
+                "{case}: {rc}"
             );
-            if user_work {
-                assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+            if kept {
+                assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload), "{case}");
             } else {
-                assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+                assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{case}");
             }
         }
     }
