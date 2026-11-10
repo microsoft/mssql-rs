@@ -25068,14 +25068,16 @@ mod tests {
             opened
         }
 
-        /// Streamed values first, in the middle and last keep their positions.
+        /// Materialized values before, between and after streamed ones keep
+        /// their positions in the declaration and on the wire.
         #[tokio::test]
         async fn streamed_values_first_middle_and_last_are_sent_in_caller_order() {
             let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
             let status = client
                 .begin_sp_executesql(
-                    "SELECT @P1, @P2, @P3, @P4, @P5".to_string(),
+                    "SELECT @P0, @P1, @P2, @P3, @P4, @P5".to_string(),
                     vec![
+                        int_param("@P0", Some(77), StatusFlags::NONE),
                         streamed_varbinary("@P1"),
                         int_param("@P2", Some(2), StatusFlags::NONE),
                         streamed_varbinary("@P3"),
@@ -25094,6 +25096,7 @@ mod tests {
             assert!(contains(
                 &bytes,
                 &declaration(&[
+                    int_param("@P0", None, StatusFlags::NONE),
                     streamed_varbinary("@P1"),
                     int_param("@P2", None, StatusFlags::NONE),
                     streamed_varbinary("@P3"),
@@ -25102,6 +25105,7 @@ mod tests {
                 ])
             ));
             let order = [
+                position(&bytes, &unnamed_int(77)),
                 position(&bytes, &[0xA1; 4]),
                 position(&bytes, &unnamed_int(2)),
                 position(&bytes, &[0xA3; 4]),
