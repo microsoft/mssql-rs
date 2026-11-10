@@ -171,10 +171,12 @@ pub(crate) const fn nvarchar_inline_max_bytes(chars: u16) -> Option<u16> {
     }
 }
 
-/// An RPC parameter `TYPE_INFO` and value that the batched `sp_execute` fast
-/// path writes without awaiting. Produced only by [`SqlType::rpc_inline`] for
-/// values whose async serialization cannot fail.
+/// An RPC parameter `TYPE_INFO` and value that the synchronous RPC fast paths
+/// write without awaiting. Produced only by [`SqlType::rpc_inline`] for values
+/// whose async serialization cannot fail.
 pub(crate) enum RpcInlineValue<'a> {
+    TinyInt(Option<u8>),
+    SmallInt(Option<i16>),
     Int(Option<i32>),
     BigInt(Option<i64>),
     NVarchar {
@@ -186,38 +188,45 @@ pub(crate) enum RpcInlineValue<'a> {
 impl RpcInlineValue<'_> {
     pub(crate) fn encoded_len(&self) -> usize {
         match self {
-            Self::Int(value) => 2 + value.map_or(1, |_| 5),
-            Self::BigInt(value) => 2 + value.map_or(1, |_| 9),
+            Self::TinyInt(value) => Self::intn_len::<1>(value.is_some()),
+            Self::SmallInt(value) => Self::intn_len::<2>(value.is_some()),
+            Self::Int(value) => Self::intn_len::<4>(value.is_some()),
+            Self::BigInt(value) => Self::intn_len::<8>(value.is_some()),
             Self::NVarchar { value, .. } => 8 + 2 + value.map_or(0, <[u8]>::len),
         }
+    }
+
+    const fn intn_len<const N: usize>(present: bool) -> usize {
+        if present { 3 + N } else { 3 }
+    }
+
+    /// INTN `TYPE_INFO` and value in a single buffer write.
+    fn write_intn<const N: usize>(packet_writer: &mut PacketWriter<'_>, value: Option<[u8; N]>) {
+        let mut bytes = [0u8; 11];
+        bytes[0] = TdsDataType::IntN as u8;
+        bytes[1] = N as u8;
+        let length = match value {
+            Some(value) => {
+                bytes[2] = N as u8;
+                bytes[3..3 + N].copy_from_slice(&value);
+                3 + N
+            }
+            None => {
+                bytes[2] = NULL_LENGTH;
+                3
+            }
+        };
+        packet_writer.write_bytes_within_packet(&bytes[..length]);
     }
 
     /// Must emit exactly the bytes `serialize_with_narrow_string_byte_limit`
     /// writes for the same value.
     pub(crate) fn write(&self, packet_writer: &mut PacketWriter<'_>, db_collation: &SqlCollation) {
-        const INTN: u8 = TdsDataType::IntN as u8;
         match *self {
-            Self::Int(value) => {
-                packet_writer.write_bytes_within_packet(&[INTN, 4]);
-                match value {
-                    Some(value) => {
-                        let [b0, b1, b2, b3] = value.to_le_bytes();
-                        packet_writer.write_bytes_within_packet(&[4, b0, b1, b2, b3]);
-                    }
-                    None => packet_writer.write_bytes_within_packet(&[NULL_LENGTH]),
-                }
-            }
-            Self::BigInt(value) => {
-                packet_writer.write_bytes_within_packet(&[INTN, 8]);
-                match value {
-                    Some(value) => {
-                        let [b0, b1, b2, b3, b4, b5, b6, b7] = value.to_le_bytes();
-                        packet_writer
-                            .write_bytes_within_packet(&[8, b0, b1, b2, b3, b4, b5, b6, b7]);
-                    }
-                    None => packet_writer.write_bytes_within_packet(&[NULL_LENGTH]),
-                }
-            }
+            Self::TinyInt(value) => Self::write_intn(packet_writer, value.map(u8::to_le_bytes)),
+            Self::SmallInt(value) => Self::write_intn(packet_writer, value.map(i16::to_le_bytes)),
+            Self::Int(value) => Self::write_intn(packet_writer, value.map(i32::to_le_bytes)),
+            Self::BigInt(value) => Self::write_intn(packet_writer, value.map(i64::to_le_bytes)),
             Self::NVarchar { max_bytes, value } => {
                 packet_writer.write_bytes_within_packet(&SqlType::collated_type_info_bytes(
                     TdsDataType::NVarChar as u8,
@@ -920,6 +929,8 @@ impl SqlType {
     /// other types.
     pub(crate) fn rpc_inline(&self) -> Option<RpcInlineValue<'_>> {
         match self {
+            SqlType::TinyInt(value) => Some(RpcInlineValue::TinyInt(*value)),
+            SqlType::SmallInt(value) => Some(RpcInlineValue::SmallInt(*value)),
             SqlType::Int(value) => Some(RpcInlineValue::Int(*value)),
             SqlType::BigInt(value) => Some(RpcInlineValue::BigInt(*value)),
             SqlType::NVarchar(value, chars) => {

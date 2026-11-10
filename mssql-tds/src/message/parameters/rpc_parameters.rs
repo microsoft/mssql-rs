@@ -18,7 +18,7 @@ use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
     error::{Error, TvpParameterRef},
-    io::packet_writer::{PacketWriter, TdsPacketWriter},
+    io::packet_writer::{PacketWriter, TdsPacketWriter, TdsPacketWriterUnchecked},
     token::tokens::SqlCollation,
 };
 
@@ -839,6 +839,26 @@ impl RpcParameter {
             RpcValue::Materialized(value) if self.encrypted.is_none() => value.rpc_inline(),
             _ => None,
         }
+    }
+
+    /// Writes this parameter in positional form without awaiting when it is
+    /// [`SqlType::rpc_inline`]-eligible and ends strictly before the packet
+    /// boundary. Otherwise returns `false` having written nothing, so the
+    /// caller's async [`Self::serialize`] owns every flush, error and EOM.
+    pub(crate) fn try_write_positional_within_packet(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+    ) -> bool {
+        let Some(value) = self.inline_value() else {
+            return false;
+        };
+        if !packet_writer.has_space(2 + value.encoded_len() + 1) {
+            return false;
+        }
+        packet_writer.write_bytes_within_packet(&[0, self.options.bits()]);
+        value.write(packet_writer, db_collation);
+        true
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
