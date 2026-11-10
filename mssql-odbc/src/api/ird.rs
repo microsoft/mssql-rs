@@ -20,7 +20,7 @@ use crate::api::col_attribute::{desc_length, octet_length, precision};
 use crate::api::describe_col::{decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{SQL_NO_NULLS, SQL_NULLABLE, SqlSmallInt, SqlULen};
 use crate::api::set_desc_field::datetime_interval_code_for;
-use crate::handles::desc::DescRecord;
+use crate::handles::desc::{DataClassification, DescRecord};
 use crate::handles::{DescHandle, StmtHandle, handle_from_raw};
 
 /// Rewrites `stmt`'s IRD to describe `metadata`, growing or shrinking its
@@ -67,7 +67,7 @@ pub(super) fn populate_ird(
             *record = ird_record_from_metadata(meta);
         }
     }
-    desc_state.data_classification = data_classification;
+    desc_state.data_classification = data_classification.map(DataClassification::new);
     Ok(())
 }
 
@@ -82,7 +82,28 @@ pub(super) fn clear_ird_classification(stmt: &StmtHandle) {
     take_ird_classification(stmt);
 }
 
-fn take_ird_classification(stmt: &StmtHandle) -> Option<Box<[u8]>> {
+/// Identifies the classification `stmt` reports now, for
+/// [`clear_ird_classification_if`]. Call without the STMT lock held.
+pub(super) fn ird_classification_id(stmt: &StmtHandle) -> Option<u64> {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+    desc.inner
+        .lock()
+        .ok()
+        .and_then(|desc_state| desc_state.data_classification.as_ref().map(|c| c.id))
+}
+
+/// [`clear_ird_classification`] only while `stmt` still reports the
+/// classification `id` names, not one a later execute replaced it with.
+pub(super) fn clear_ird_classification_if(stmt: &StmtHandle, id: u64) {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+    if let Ok(mut desc_state) = desc.inner.lock()
+        && desc_state.data_classification.as_ref().map(|c| c.id) == Some(id)
+    {
+        desc_state.data_classification = None;
+    }
+}
+
+fn take_ird_classification(stmt: &StmtHandle) -> Option<DataClassification> {
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
     desc.inner
         .lock()
@@ -93,7 +114,7 @@ fn take_ird_classification(stmt: &StmtHandle) -> Option<Box<[u8]>> {
 /// The classification taken off the IRD just before the request that runs its
 /// statement, held until that request is known to have been sent.
 pub(super) struct PendingClassification {
-    payload: Option<Box<[u8]>>,
+    payload: Option<DataClassification>,
     requests_admitted: u64,
 }
 

@@ -402,7 +402,7 @@ unsafe fn write_data_classification(
     buffer_length: SqlInteger,
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
-    let Some(payload) = state.data_classification.as_deref() else {
+    let Some(payload) = state.data_classification.as_ref().map(|c| &*c.payload) else {
         post_diag(state, ERR_INVALID_DESCRIPTOR_FIELD);
         return SQL_ERROR;
     };

@@ -215,6 +215,24 @@ pub(super) fn free_stmt_close_locked(
     }
 }
 
+/// How a connection-wide cursor sweep treats each statement's Data
+/// Classification; see [`close_cursor_for_connection_op`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Sweep {
+    /// Closes cursors as `SQLFreeStmt(SQL_CLOSE)` does.
+    Close,
+    /// msodbcsql's commit/rollback sweep, which strips `KEEP_COLUMN_INFO`
+    /// before closing (`sqlctran.cpp:308`): a statement with no open cursor
+    /// then loses its classification even when prepared, and so does a
+    /// prepared one whose result has no rows left, since `FreeStmt` keeps it
+    /// only while the cursor is on (`sqlcfunc.cpp:494-500`).
+    EndTransaction,
+    /// [`Sweep::EndTransaction`] for cursors opened since an earlier
+    /// [`Sweep::Close`] of the same connection, leaving the statements that
+    /// sweep closed alone.
+    EndTransactionOpenCursors,
+}
+
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
 /// (`SQLEndTran`, an autocommit switch, connection reset, disconnect).
 ///
@@ -238,15 +256,14 @@ pub(super) fn free_stmt_close_locked(
 /// request next is unsafe, which an already-closed batch's stale diagnostic
 /// does not make true.
 ///
-/// `ending_transaction` marks msodbcsql's commit/rollback sweep, which strips
-/// `KEEP_COLUMN_INFO` before closing (`sqlctran.cpp:308`): a statement with no
-/// open cursor then loses its Data Classification even when prepared, and so
-/// does a prepared one whose result has no rows left, since `FreeStmt` keeps
-/// it only while the cursor is on (`sqlcfunc.cpp:494-500`).
+/// `kept_until_ending` identifies a classification [`Sweep::Close`] kept that
+/// [`Sweep::EndTransaction`] would have dropped, so a caller that learns later
+/// that the transaction ended can drop it on the same evidence.
 pub(super) fn close_cursor_for_connection_op(
     stmt: &StmtHandle,
     handle: SqlHandle,
-    ending_transaction: bool,
+    sweep: Sweep,
+    kept_until_ending: &mut Option<u64>,
 ) -> SqlReturn {
     let _operation = match stmt.begin_operation() {
         Ok(operation) => operation,
@@ -257,10 +274,16 @@ pub(super) fn close_cursor_for_connection_op(
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
         };
+        let cursor_open = stmt_state.has_state(STMT_STATE_CURSOR_OPEN);
+        if sweep == Sweep::EndTransactionOpenCursors && !cursor_open {
+            return SQL_SUCCESS;
+        }
         free_errors(&mut stmt_state);
-        if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
+        if !cursor_open {
             drop(stmt_state);
-            if ending_transaction {
+            if sweep == Sweep::Close {
+                *kept_until_ending = super::ird::ird_classification_id(stmt);
+            } else {
                 super::ird::clear_ird_classification(stmt);
             }
             return SQL_SUCCESS;
@@ -269,9 +292,13 @@ pub(super) fn close_cursor_for_connection_op(
         // Read-ahead can find the end while the caller is still on the last
         // row, which msodbcsql has not looked past yet.
         let no_rows_left = stmt_state.result_set_exhausted && !stmt_state.row_positioned;
-        let keep =
-            stmt_state.has_state(STMT_STATE_PREPARED) && !(ending_transaction && no_rows_left);
+        let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
+        let keep = prepared && (sweep == Sweep::Close || !no_rows_left);
         reset_cursor_state(&mut stmt_state);
+        if sweep == Sweep::Close && prepared && no_rows_left {
+            drop(stmt_state);
+            *kept_until_ending = super::ird::ird_classification_id(stmt);
+        }
         (pending_fetch_error, keep)
     };
     if !keep_classification {
@@ -1286,7 +1313,7 @@ mod tests {
             .wire
             .put_client_for_test(tds_client_from_tokens(vec![]));
 
-        let ret = close_cursor_for_connection_op(stmt, h.stmt, false);
+        let ret = close_cursor_for_connection_op(stmt, h.stmt, Sweep::Close, &mut None);
 
         assert_eq!(ret, SQL_SUCCESS);
         let ss = stmt.inner.lock().unwrap();

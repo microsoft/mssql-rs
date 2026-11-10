@@ -581,7 +581,26 @@ pub(crate) struct DescState {
     /// payload. Replaced with the records, so a result set never reports an
     /// earlier one's classification, as msodbcsql's `ReleaseColinfo` clears
     /// it with the column metadata.
-    pub(crate) data_classification: Option<Box<[u8]>>,
+    pub(crate) data_classification: Option<DataClassification>,
+}
+
+/// One result set's `SQL_CA_SS_DATA_CLASSIFICATION` payload. The id is unique
+/// per result set, so a connection sweep can tell the classification it kept
+/// from one a later execute of the same statement put there.
+#[derive(Debug)]
+pub(crate) struct DataClassification {
+    pub(crate) id: u64,
+    pub(crate) payload: Box<[u8]>,
+}
+
+impl DataClassification {
+    pub(crate) fn new(payload: Box<[u8]>) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            payload,
+        }
+    }
 }
 
 impl DescState {
