@@ -500,6 +500,31 @@ runs, and a healthy readiness wait maxes out at 157s over 97 runs. An earlier
 `READY_TIMEOUT_SECONDS` (240), `MAX_START_ATTEMPTS` (3),
 `PROBE_LOGIN_TIMEOUT_SECONDS` (5), `PROBE_INTERVAL_SECONDS` (3).
 
+### background-step.sh
+Runs a command detached from one pipeline step and joins it in a later one:
+
+```bash
+background-step.sh start <state-dir> <command> [args...]
+background-step.sh wait  <state-dir> <timeout-seconds>
+```
+
+`wait` replays the command's output and exits with its status. The agent parses
+`##vso` and `##[error]` lines only from the running step, so commands such as
+`task.prependpath` take effect when replayed by `wait`. The timeout counts from
+`start` and bounds the command's total runtime. `wait` fails at once if the
+command exits without recording a status. The command must not depend on a
+later step's output.
+
+The macOS Test job uses it to hide two serial phases:
+
+- `sql-setup-template.yml` with `startMacOSSqlInBackground: true` boots Colima
+  and SQL Server while the Rust test binaries compile. The job joins them
+  before the tests run, through `build-template.yml`'s `prebuildTests` and
+  `beforeTestSteps`.
+- `build-template.yml` with `backgroundCoverageReport: true` generates the Rust
+  Cobertura report while the ODBC e2e suite runs. The job then joins and
+  publishes it.
+
 ## Pipeline Integration
 
 These scripts are referenced in the Azure DevOps pipeline template:

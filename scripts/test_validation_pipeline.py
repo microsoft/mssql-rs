@@ -164,7 +164,7 @@ def test_windows_pr_e2e_bounds_build_and_test_workers():
     )
     command = next(step["pwsh"] for step in branch if "pwsh" in step)
     assert "$buildJobs = [Environment]::ProcessorCount" in command
-    assert "$testJobs = [Math]::Min(6, [Environment]::ProcessorCount)" in command
+    assert "$testJobs = [Math]::Min(8, [Environment]::ProcessorCount)" in command
     assert "-BuildJobs $buildJobs -TestJobs $testJobs" in command
     assert "-Retries 3 -Coverage" in command
     assert "-CompareWithMsodbcsql" in command
@@ -954,19 +954,164 @@ def test_macos_docker_condition_preserves_other_callers():
     template = load_template("macos-docker-steps.yml")
     condition = next(p for p in template["parameters"] if p["name"] == "condition")
     assert condition == {"name": "condition", "type": "string", "default": "succeeded()"}
+    start_colima = "${{ if eq(parameters.startColima, true) }}"
+    steps = []
     for step in template["steps"]:
+        steps.extend(step.get(start_colima, [step]))
+    assert any("start-colima-macos.sh" in step.get("script", "") for step in steps)
+    for step in steps:
         assert step["condition"] == "${{ parameters.condition }}"
         assert not step.get("continueOnError", False)
 
     sql_steps = load_template("sql-setup-template.yml")["steps"]
-    macos = next(
-        step["${{ if eq(parameters.buildTarget, 'MacOS') }}"]
-        for step in sql_steps if "${{ if eq(parameters.buildTarget, 'MacOS') }}" in step
+    foreground = (
+        "${{ if and(eq(parameters.buildTarget, 'MacOS'), "
+        "eq(parameters.startMacOSSqlInBackground, false)) }}"
     )
+    macos = next(step[foreground] for step in sql_steps if foreground in step)
     docker = next(step for step in macos if step.get("template") == "macos-docker-steps.yml")
     assert "condition" not in docker.get("parameters", {})
     sql = next(step for step in macos if "start-sql-server-macos.sh" in step.get("script", ""))
     assert sql.get("condition", "succeeded()") == "succeeded()"
+
+
+def test_macos_sql_setup_can_start_in_the_background():
+    template = load_template("sql-setup-template.yml")
+    parameter = next(
+        p for p in template["parameters"] if p["name"] == "startMacOSSqlInBackground"
+    )
+    assert parameter == {
+        "name": "startMacOSSqlInBackground", "type": "boolean", "default": False,
+    }
+    background = (
+        "${{ if and(eq(parameters.buildTarget, 'MacOS'), "
+        "eq(parameters.startMacOSSqlInBackground, true)) }}"
+    )
+    steps = next(step[background] for step in template["steps"] if background in step)
+    docker, start = steps
+    assert docker == {
+        "template": "macos-docker-steps.yml", "parameters": {"startColima": False},
+    }
+    script = start["script"]
+    assert script.startswith(
+        'bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/macos-sql"'
+    )
+    colima = script.index("start-colima-macos.sh &&")
+    assert script.index('PATH="$TOOLCHAIN_DIR/bin:$PATH" bash .pipeline/scripts/'
+                        "start-sql-server-macos.sh") > colima
+    assert start["env"] == {
+        "TOOLCHAIN_DIR": "$(Agent.TempDirectory)/docker-toolchain",
+        "SQL_PASSWORD": "$(SQL_PASSWORD)",
+    }
+    assert start.get("condition", "succeeded()") == "succeeded()"
+
+
+def _background_step(tmp_path, *args, timeout=30):
+    script = tmp_path / "background-step.sh"
+    if not script.exists():
+        shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "background-step.sh", script)
+    return subprocess.run(
+        [_BASH, script.name, *args], cwd=tmp_path, capture_output=True, text=True,
+        timeout=timeout,
+    )
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("code", [0, 3])
+def test_background_step_replays_output_and_exit_code(tmp_path, code):
+    started = _background_step(
+        tmp_path, "start", "state", "bash", "-c",
+        f'echo "##vso[task.prependpath]/opt/tool"; echo "arg:$0"; exit {code}', "x y",
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    assert "Started in the background" in started.stdout
+    joined = _background_step(tmp_path, "wait", "state", "20")
+    assert joined.returncode == code, joined.stdout + joined.stderr
+    lines = joined.stdout.splitlines()
+    assert lines[:2] == ["##vso[task.prependpath]/opt/tool", "arg:x y"]
+    assert re.fullmatch(
+        r"The background command ran for \d+s; this step waited \d+s\.", lines[-1]
+    )
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_timeout_counts_from_start(tmp_path):
+    started = _background_step(tmp_path, "start", "state", "sleep", "30")
+    assert started.returncode == 0, started.stdout + started.stderr
+    joined = _background_step(tmp_path, "wait", "state", "1")
+    assert joined.returncode == 1
+    assert "did not finish within 1s of starting" in joined.stdout
+    pid = (tmp_path / "state" / "pid").read_text(encoding="utf-8").strip()
+    subprocess.run([_BASH, "-c", f"kill {pid}"], capture_output=True)
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    "args",
+    [(), ("start",), ("start", "state"), ("wait", "state"), ("wait", "state", "x"),
+     ("join", "state", "1")],
+)
+def test_background_step_rejects_bad_usage(tmp_path, args):
+    result = _background_step(tmp_path, *args)
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_wait_requires_a_started_command(tmp_path):
+    result = _background_step(tmp_path, "wait", "missing", "5")
+    assert result.returncode == 1
+    assert "No background command was started in missing" in result.stdout
+
+
+def test_build_template_test_overlap_parameters():
+    template = load_template("build-template.yml")
+    params = {p["name"]: p for p in template["parameters"]}
+    assert params["prebuildTests"] == {
+        "name": "prebuildTests", "type": "boolean", "default": False,
+    }
+    assert params["beforeTestSteps"] == {
+        "name": "beforeTestSteps", "type": "stepList", "default": [],
+    }
+    assert params["backgroundCoverageReport"] == {
+        "name": "backgroundCoverageReport", "type": "boolean", "default": False,
+    }
+    steps = next(
+        step["${{ if eq(parameters.enableTests, true) }}"] for step in template["steps"]
+        if isinstance(step, dict) and "${{ if eq(parameters.enableTests, true) }}" in step
+    )
+    keys = [
+        step if isinstance(step, str) else next(iter(step)) if len(step) == 1 else None
+        for step in steps
+    ]
+    prebuild_key = "${{ if eq(parameters.prebuildTests, true) }}"
+    prebuild = steps[keys.index(prebuild_key)][prebuild_key][0]
+    assert prebuild["script"] == (
+        "cargo llvm-cov nextest -E 'none()' --no-tests=pass --frozen --no-report "
+        "--all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd "
+        "--profile ci"
+    )
+    assert prebuild["condition"] == _PR
+    run = next(
+        step for step in steps if isinstance(step, dict)
+        and step.get("displayName") == "Run tests (mssql-tds and mssqlodbc packages)"
+    )
+    before = keys.index("${{ parameters.beforeTestSteps }}")
+    assert keys.index(prebuild_key) < before < steps.index(run)
+    assert "--no-clean" not in run["script"]
+
+    foreground = steps[keys.index("${{ if eq(parameters.backgroundCoverageReport, false) }}")]
+    foreground = next(iter(foreground.values()))
+    assert [step.get("task") for step in foreground] == [None, "PublishPipelineArtifact@1"]
+    report = foreground[0]["script"]
+    background = steps[keys.index("${{ if eq(parameters.backgroundCoverageReport, true) }}")]
+    (start,) = next(iter(background.values()))
+    assert start["script"] == (
+        'bash .pipeline/scripts/background-step.sh start '
+        '"$(Agent.TempDirectory)/rust-cobertura" ' + report
+    )
+    assert start["condition"] == foreground[0]["condition"]
+    assert start["workingDirectory"] == "$(Build.SourcesDirectory)"
 
 
 def test_mssql_python_macos_readiness_gates_provisioning():
@@ -1469,13 +1614,17 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     assert job["pool"]["vmImage"] == "macOS-latest"
     steps = job["steps"]
     sql = next(step for step in steps if step.get("template") == "sql-setup-template.yml")
-    assert sql["parameters"]["buildTarget"] == "MacOS"
-    verify = next(
-        step for step in steps
-        if step.get("displayName") == "Verify macOS SQL Server before tests"
-    )
+    assert sql["parameters"] == {"buildTarget": "MacOS", "startMacOSSqlInBackground": True}
     rust = next(step for step in steps if step.get("template") == "build-template.yml")
     assert rust["parameters"].get("enableTests", True) is True
+    assert rust["parameters"]["prebuildTests"] is True
+    assert rust["parameters"]["backgroundCoverageReport"] is True
+    join_sql, verify = rust["parameters"]["beforeTestSteps"]
+    assert join_sql["script"] == (
+        'bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 2400'
+    )
+    assert join_sql["timeoutInMinutes"] * 60 > 2400
+    assert verify["displayName"] == "Verify macOS SQL Server before tests"
     install = next(
         step for step in steps
         if step.get("displayName") == "Install ODBC C++ e2e dependencies (macOS)"
@@ -1488,8 +1637,28 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
         step for step in steps
         if step.get("displayName") == "Publish ODBC e2e test results (macOS)"
     )
-    order = [steps.index(step) for step in (sql, verify, rust, install, run, publish)]
+    join_report = next(
+        step for step in steps
+        if step.get("displayName") == "Wait for Cobertura coverage report (mssql-tds and mssqlodbc)"
+    )
+    coverage = next(
+        step for step in steps
+        if step.get("displayName") == "Publish Cobertura coverage artifact"
+    )
+    order = [steps.index(step) for step in (sql, rust, install, run, publish, join_report,
+                                            coverage)]
     assert order == sorted(order)
+    assert join_report["script"] == (
+        "bash .pipeline/scripts/background-step.sh wait "
+        '"$(Agent.TempDirectory)/rust-cobertura" 2400'
+    )
+    for step in (join_report, coverage):
+        assert step["condition"] == _PR.replace("succeeded()", "succeededOrFailed()")
+    assert coverage["task"] == "PublishPipelineArtifact@1"
+    assert coverage["inputs"] == {
+        "targetPath": "$(Build.SourcesDirectory)/target/cobertura.xml",
+        "artifactName": "CoberturaCoverageRust_MacOS",
+    }
     for step in (install, run):
         assert step["condition"] == _PR
         assert "set -euo pipefail" in step["script"]
