@@ -30,17 +30,18 @@ pub(crate) fn off_runtime_thread<T: Send + 'static>(
 /// acquisition (SSPI's default credentials) and LocalDB use the thread's
 /// identity, which a pool thread does not otherwise inherit.
 #[cfg(windows)]
-struct CallerIdentity(Option<impersonation::Token>);
+pub struct CallerIdentity(Option<impersonation::Token>);
 
 #[cfg(windows)]
 impl CallerIdentity {
-    fn capture() -> TdsResult<Self> {
+    /// Captures the current calling thread's impersonation token, if present.
+    pub fn capture() -> TdsResult<Self> {
         impersonation::Token::of_current_thread().map(Self)
     }
 
     /// Runs `work` impersonating the caller's token, if any, and reverts
     /// before returning, even if `work` panics.
-    fn run<T>(self, work: impl FnOnce() -> TdsResult<T>) -> TdsResult<T> {
+    pub fn run<T>(self, work: impl FnOnce() -> TdsResult<T>) -> TdsResult<T> {
         let Some(token) = self.0 else {
             return work();
         };
@@ -50,15 +51,18 @@ impl CallerIdentity {
 }
 
 #[cfg(not(windows))]
-struct CallerIdentity;
+/// Caller identity token; no impersonation is needed on non-Windows platforms.
+pub struct CallerIdentity;
 
 #[cfg(not(windows))]
 impl CallerIdentity {
-    fn capture() -> TdsResult<Self> {
+    /// Captures the caller identity (a no-op outside Windows).
+    pub fn capture() -> TdsResult<Self> {
         Ok(Self)
     }
 
-    fn run<T>(self, work: impl FnOnce() -> TdsResult<T>) -> TdsResult<T> {
+    /// Runs work under the captured caller identity.
+    pub fn run<T>(self, work: impl FnOnce() -> TdsResult<T>) -> TdsResult<T> {
         work()
     }
 }

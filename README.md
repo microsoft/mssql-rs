@@ -13,6 +13,7 @@ Start with the component documentation for installation, usage, and limitations:
 |---|---|
 | [mssql-tds](mssql-tds/README.md) | Async Rust TDS protocol client for SQL Server and Azure SQL Database |
 | [mssql-odbc](mssql-odbc/README.md) | Alpha ODBC 3.x driver exposing the native ODBC C API over `mssql-tds` |
+| [mssql-adbc](https://github.com/microsoft/mssql-rs/tree/main/mssql-adbc) | Experimental Arrow Database Connectivity driver with streaming queries and bulk ingestion |
 | [mssql-py-core](mssql-py-core/README.md) | PyO3 extension providing Rust TDS operations for [mssql-python](https://github.com/microsoft/mssql-python); not a standalone DB-API client |
 | [mssql-js](mssql-js/README.md) | Experimental Node.js bindings to `mssql-tds`, with a TypeScript wrapper |
 | [mssql-sqlcmd](mssql-sqlcmd/README.md) | Rust static library exposing a C ABI for native sqlcmd integration; not a standalone executable |
