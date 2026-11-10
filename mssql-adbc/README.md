@@ -9,6 +9,7 @@ not a published package.
 ## Build and load
 
 ```sh
+cargo fetch
 cargo build -p mssql-adbc --release --frozen
 ```
 

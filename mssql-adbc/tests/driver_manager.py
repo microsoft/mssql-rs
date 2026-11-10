@@ -29,9 +29,7 @@ def main():
             table = pa.table(
                 {"n": pa.array([1, 2, 3], type=pa.int32()), "label": ["a", None, "\u03b2"]}
             )
-            assert (
-                cursor.adbc_ingest("#adbc_python", table, temporary=True) == 3
-            )
+            assert cursor.adbc_ingest("#adbc_python", table, temporary=True) == 3
             cursor.execute("SELECT n,label FROM #adbc_python ORDER BY n")
             assert cursor.fetch_arrow_table().equals(table)
             cursor.execute("DROP TABLE #adbc_python")
