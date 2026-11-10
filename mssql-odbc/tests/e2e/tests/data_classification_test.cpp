@@ -648,6 +648,55 @@ TEST_F(DataClassificationTest, NothingSentKeepsTheClassification) {
     ExpectClassifiedPayload(false);
     SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
 }
+// Ending a transaction keeps a prepared statement's classification only while
+// its cursor still has rows to read, and turning autocommit back on ends the
+// transaction the same way when user work started one (measured on msodbcsql
+// 18.07.0001: `FreeStmt` after `CommitAbortTran` strips `KEEP_COLUMN_INFO`).
+TEST_F(DataClassificationTest, EndingATransactionDropsAClassificationWithNoRowsLeft) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+
+    auto autocommit = [&](bool on) {
+        return SQLSetConnectAttrW(dbc_, SQL_ATTR_AUTOCOMMIT,
+                                  reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(
+                                      on ? SQL_AUTOCOMMIT_ON : SQL_AUTOCOMMIT_OFF)),
+                                  0);
+    };
+    auto rows = ODBCTestUtils::ToSqlTStr(ClassifiedSelect());
+    auto none = ODBCTestUtils::ToSqlTStr(ClassifiedSelect() + " WHERE 1 = 0");
+    ASSERT_SQL_OK(autocommit(false), SQL_HANDLE_DBC, dbc_);
+    // One row: unread, on the last row, then past it with SQL_NO_DATA; then an
+    // empty result left unread.
+    struct Case {
+        const SqlTString* sql;
+        int fetches;
+        bool kept;
+    };
+    for (const Case& c : {Case{&rows, 0, true}, Case{&rows, 1, true}, Case{&rows, 2, false},
+                          Case{&none, 0, false}}) {
+        ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(c.sql->c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        for (int i = 0; i < c.fetches; ++i) SQLFetch(stmt_);
+        ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT), SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(c.kept, IrdPayload().has_value()) << c.fetches << " fetches";
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+    }
+
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(rows.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(autocommit(true), SQL_HANDLE_DBC, dbc_);
+    EXPECT_FALSE(IrdPayload().has_value()) << "autocommit on after user work";
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(autocommit(false), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(autocommit(true), SQL_HANDLE_DBC, dbc_);
+    EXPECT_TRUE(IrdPayload().has_value()) << "autocommit on with no user work";
+}
 TEST_F(DataClassificationTest, ParameterArrayReportsEachSetsClassification) {
     ConnectDbc();
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());

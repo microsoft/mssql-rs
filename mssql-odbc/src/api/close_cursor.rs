@@ -240,7 +240,9 @@ pub(super) fn free_stmt_close_locked(
 ///
 /// `ending_transaction` marks msodbcsql's commit/rollback sweep, which strips
 /// `KEEP_COLUMN_INFO` before closing (`sqlctran.cpp:308`): a statement with no
-/// open cursor then loses its Data Classification even when prepared.
+/// open cursor then loses its Data Classification even when prepared, and so
+/// does a prepared one whose result has no rows left, since `FreeStmt` keeps
+/// it only while the cursor is on (`sqlcfunc.cpp:494-500`).
 pub(super) fn close_cursor_for_connection_op(
     stmt: &StmtHandle,
     handle: SqlHandle,
@@ -250,7 +252,7 @@ pub(super) fn close_cursor_for_connection_op(
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
-    let (pending_fetch_error, prepared) = {
+    let (pending_fetch_error, keep_classification) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
@@ -264,11 +266,15 @@ pub(super) fn close_cursor_for_connection_op(
             return SQL_SUCCESS;
         }
         let pending_fetch_error = stmt_state.pending_fetch_error.take();
-        let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
+        // Read-ahead can find the end while the caller is still on the last
+        // row, which msodbcsql has not looked past yet.
+        let no_rows_left = stmt_state.result_set_exhausted && !stmt_state.row_positioned;
+        let keep =
+            stmt_state.has_state(STMT_STATE_PREPARED) && !(ending_transaction && no_rows_left);
         reset_cursor_state(&mut stmt_state);
-        (pending_fetch_error, prepared)
+        (pending_fetch_error, keep)
     };
-    if !prepared {
+    if !keep_classification {
         super::ird::clear_ird_classification(stmt);
     }
 

@@ -675,9 +675,17 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
 
 /// Manual-commit → autocommit. Any transaction holding user work is **committed**
 /// with a `01000` warning; a driver-begun piggyback transaction is rolled back
-/// silently (`sqlcconn.cpp:3692-3741`).
+/// silently (`sqlcconn.cpp:3692-3741`). The cursor sweep is `CommitAbortTran`'s,
+/// so it ends a transaction exactly when user work started one.
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    if close_all_cursors(dbc) == SQL_ERROR {
+    let ending_user_txn = match dbc.inner.lock() {
+        Ok(state) => state.local_tran_started,
+        Err(_) => {
+            error!("{op}: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if sweep_cursors(dbc, ending_user_txn) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
     let mut client = match claim_dbc_client(dbc, op) {

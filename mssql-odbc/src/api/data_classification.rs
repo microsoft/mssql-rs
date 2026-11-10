@@ -848,6 +848,114 @@ mod tests {
         }
     }
 
+    /// msodbcsql's `FreeStmt` keeps a prepared statement's classification
+    /// through the commit sweep only while its cursor still has rows to read:
+    /// unread or on its last row it stays, after `SQL_NO_DATA` or on an empty
+    /// result it goes (`sqlcfunc.cpp:494-500`, measured on 18.07.0001). With no
+    /// transaction started there is no sweep, so it stays either way.
+    #[test]
+    fn ending_a_transaction_drops_a_prepared_classification_with_no_rows_left() {
+        const EMPTY: &str = "SELECT SSN, PHONE, ID FROM NOBODY";
+        for (query, fetches, started, kept) in [
+            (CLASSIFIED, 0, true, true),
+            (CLASSIFIED, 1, true, true),
+            (CLASSIFIED, 2, true, false),
+            (EMPTY, 0, true, false),
+            (CLASSIFIED, 2, false, true),
+        ] {
+            let (server, payload) = classified_server();
+            let registered = classified_token(false);
+            server.runtime.block_on(async {
+                server
+                    .registry
+                    .lock()
+                    .await
+                    .register_with_data_classification(
+                        EMPTY,
+                        QueryResponse::new(
+                            ["ssn", "phone", "id"]
+                                .iter()
+                                .map(|name| ColumnDefinition::new(*name, SqlDataType::Int))
+                                .collect(),
+                            Vec::new(),
+                        ),
+                        registered,
+                    );
+            });
+            let mut h = TestHandles::with_env_dbc();
+            server.connect(h.dbc);
+            let stmt = prepare_and_execute(&mut h, query);
+            for _ in 0..fetches {
+                unsafe { crate::api::SQLFetch(stmt) };
+            }
+            unsafe { handle_from_raw::<DbcHandle>(h.dbc) }
+                .inner
+                .lock()
+                .unwrap()
+                .local_tran_started = started;
+
+            let rc = unsafe {
+                crate::api::SQLEndTran(
+                    crate::api::odbc_types::SQL_HANDLE_DBC,
+                    h.dbc,
+                    crate::api::odbc_types::SQL_COMMIT,
+                )
+            };
+            let case = format!("{query}, {fetches} fetches, started: {started}");
+            assert_eq!(rc, SQL_SUCCESS, "{case}");
+            if kept {
+                assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload), "{case}");
+            } else {
+                assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{case}");
+            }
+        }
+    }
+
+    /// Turning autocommit back on runs `CommitAbortTran`'s sweep
+    /// (`SetCommitModeOption`), so a transaction holding user work ends like
+    /// `SQLEndTran`; with no user work the classification stays (measured on
+    /// msodbcsql 18.07.0001).
+    #[test]
+    fn enabling_autocommit_ends_the_transaction_for_the_classification() {
+        use crate::api::odbc_types::{SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON};
+
+        let autocommit = |dbc: SqlHandle, value: u32| unsafe {
+            sql_set_connect_attr_w(dbc, SQL_ATTR_AUTOCOMMIT, value as usize as SqlPointer, 0)
+        };
+        for user_work in [true, false] {
+            let (server, payload) = classified_server();
+            let mut h = TestHandles::with_env_dbc();
+            server.connect(h.dbc);
+            if user_work {
+                assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
+            }
+            let stmt = prepare_and_execute(&mut h, CLASSIFIED);
+            assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+            if !user_work {
+                assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
+            }
+            assert_eq!(
+                unsafe { handle_from_raw::<DbcHandle>(h.dbc) }
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .local_tran_started,
+                user_work
+            );
+
+            let rc = autocommit(h.dbc, SQL_AUTOCOMMIT_ON);
+            assert!(
+                matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+                "user work: {user_work}: {rc}"
+            );
+            if user_work {
+                assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+            } else {
+                assert_eq!(classification(ird(stmt)), (SQL_SUCCESS, payload));
+            }
+        }
+    }
+
     /// Preparing new text drops the classification before anything executes
     /// (measured on msodbcsql 18.07.0001).
     #[test]

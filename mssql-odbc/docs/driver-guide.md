@@ -126,17 +126,19 @@ its own classification: as in msodbcsql, it is dropped when a statement is
 prepared, when the request that runs a statement is sent to the server
 (whether it then succeeds or fails), when a row read is cancelled, at the end
 of the batch, and when a statement that is not prepared is closed, cancelled,
-or swept by `SQLEndTran`. Ending a started transaction also drops it from a
-prepared statement whose cursor was already closed. A call that sends nothing
+or swept by `SQLEndTran`. Ending a started transaction, with `SQLEndTran` or
+by turning autocommit back on, also drops it from a prepared statement whose
+cursor was already closed or has no rows left to read: after `SQL_NO_DATA`, or
+on an empty result. A call that sends nothing
 keeps it, as in msodbcsql, so `SQL_ERROR` alone does not mean it was cleared:
 a parameter that fails conversion (`22018`), a connection busy with another
-statement's results, a connection already known to be dead that session
-recovery cannot reconnect, a parameter array whose every set is ignored or
+statement's results, a dead connection that session recovery cannot
+reconnect, a parameter array whose every set is ignored or
 fails conversion, and a data-at-execution `SQLExecute` or `SQLExecDirect`
 before its last `SQLParamData` (including one cancelled at `SQL_NEED_DATA` or
-between parameters). A server
-error that a fetch reports after rows were delivered also keeps it. Closing
-the statement afterwards follows the rules above.
+between parameters). A server error that a fetch reports after rows were
+delivered also keeps it. Closing the statement afterwards follows the rules
+above.
 
 ## Integer connection-attribute getters
 
