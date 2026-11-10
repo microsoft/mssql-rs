@@ -29,6 +29,7 @@ pub(crate) fn tds(error: TdsError) -> Error {
         TdsError::TimeoutError(_) => Status::Timeout,
         TdsError::OperationCancelledError(_) => Status::Cancelled,
         TdsError::UsageError(_) => Status::InvalidArguments,
+        TdsError::TypeConversionError(_) => Status::InvalidData,
         TdsError::SqlServerError { diagnostics } => {
             match diagnostics.errors.first().map(|error| error.number) {
                 Some(18456) => Status::Unauthenticated,

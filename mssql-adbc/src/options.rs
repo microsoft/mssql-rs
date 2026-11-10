@@ -83,8 +83,15 @@ impl Config {
                 let host = uri
                     .host_str()
                     .ok_or_else(|| invalid("URI requires a host"))?;
+                let database =
+                    percent_encoding::percent_decode_str(uri.path().trim_start_matches('/'))
+                        .decode_utf8()
+                        .map_err(|_| invalid("URI database is not UTF-8"))?;
+                if database.contains('\0') {
+                    return Err(invalid("URI database contains NUL"));
+                }
                 self.context.data_source = format!("tcp:{host},{}", uri.port().unwrap_or(1433));
-                self.context.database = uri.path().trim_start_matches('/').to_owned();
+                self.context.database = database.into_owned();
             }
             "username" => self.context.user_name = string(value)?,
             "password" => self.context.password = string(value)?,
@@ -159,5 +166,16 @@ mod tests {
         assert!(config.set(BATCH_BYTES, (-1_i64).into()).is_err());
         assert_eq!(config.batch_rows, 4096);
         assert_eq!(config.batch_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn uri_decodes_database_and_preserves_ipv6_brackets() {
+        let mut config = Config::default();
+        config
+            .set("uri", "mssql://[::1]:1434/my%20database".into())
+            .unwrap();
+        assert_eq!(config.context.data_source, "tcp:[::1],1434");
+        assert_eq!(config.context.database, "my database");
+        assert!(config.set("uri", "mssql://localhost/%ff".into()).is_err());
     }
 }

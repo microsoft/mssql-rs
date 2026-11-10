@@ -235,7 +235,12 @@ pub(crate) fn describe(
     };
     let mut fields = Vec::new();
     for row in &rows.values {
-        if hidden.is_some_and(|index| number(&row[index]).ok().flatten() == Some(1)) {
+        if hidden
+            .map(|index| number(&row[index]))
+            .transpose()?
+            .flatten()
+            == Some(1)
+        {
             continue;
         }
         let name = text(&row[name])?.unwrap_or_default();
@@ -282,10 +287,12 @@ pub(crate) fn table_types() -> Result<Reader> {
 
 pub(crate) fn info(shared: &Shared, requested: Option<HashSet<InfoCode>>) -> Result<Reader> {
     let version = shared.with(|_, session| {
-        Ok(session
-            .client
-            .server_version()
-            .map(|version| format!("{version:?}")))
+        Ok(session.client.server_version().map(|version| {
+            format!(
+                "{}.{}.{}.{}",
+                version.major, version.minor, version.build, version.revision
+            )
+        }))
     })?;
     let codes = [
         InfoCode::VendorName,

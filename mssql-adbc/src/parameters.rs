@@ -188,8 +188,13 @@ pub(crate) fn value(values: &dyn Array, row: usize) -> Result<SqlType> {
             SqlType::NVarcharMax(if is_null {
                 None
             } else {
-                Some(SqlString::from_utf8_string(
-                    array::<$array>(values)?.value(row).to_owned(),
+                Some(SqlString::new(
+                    array::<$array>(values)?
+                        .value(row)
+                        .encode_utf16()
+                        .flat_map(u16::to_le_bytes)
+                        .collect(),
+                    mssql_tds::datatypes::sql_string::EncodingType::Utf16,
                 ))
             })
         };

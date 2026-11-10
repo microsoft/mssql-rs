@@ -6,6 +6,22 @@ use std::future::Future;
 use adbc_core::error::{Error, Result, Status};
 use tokio::runtime::{Handle, Runtime};
 
+pub(crate) fn process_is_shutting_down() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn RtlDllShutdownInProgress() -> u8;
+        }
+        // SAFETY: ntdll's loader flag is a no-argument function returning BOOLEAN.
+        unsafe { RtlDllShutdownInProgress() != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 pub(crate) struct Executor(Option<Runtime>);
 
 impl Executor {
@@ -25,9 +41,14 @@ impl Executor {
             .as_ref()
             .ok_or_else(|| crate::error::state("runtime closed"))?;
         if Handle::try_current().is_ok() {
+            let identity = mssql_tds::CallerIdentity::capture().map_err(crate::error::tds)?;
             std::thread::scope(|scope| {
                 scope
-                    .spawn(|| runtime.block_on(future))
+                    .spawn(|| {
+                        identity
+                            .run(|| Ok(runtime.block_on(future)))
+                            .map_err(crate::error::tds)?
+                    })
                     .join()
                     .map_err(|_| {
                         Error::with_message_and_status(
@@ -45,6 +66,11 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         if let Some(runtime) = self.0.take() {
+            if process_is_shutting_down() {
+                // The Windows loader has already terminated threads a runtime drop would join.
+                std::mem::forget(runtime);
+                return;
+            }
             if Handle::try_current().is_ok() {
                 std::thread::scope(|scope| {
                     if scope.spawn(|| drop(runtime)).join().is_err() {

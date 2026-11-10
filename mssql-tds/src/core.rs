@@ -56,6 +56,11 @@ impl CancelHandle {
         self.cancel_token.cancel();
     }
 
+    /// Whether cancellation has been requested, including by a parent handle.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token.is_cancelled()
+    }
+
     /// Configure before deriving children; subsequent updates are shared with
     /// those children. Zero restores the TDS default. Cleanup already in
     /// progress keeps its original deadline.

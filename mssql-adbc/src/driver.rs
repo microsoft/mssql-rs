@@ -197,7 +197,7 @@ impl Session {
         cancel: &CancelHandle,
     ) -> Result<StatementResult> {
         let opts = ExecuteOptions::new().timeout_secs(timeout).cancel(cancel);
-        if let Some(mut prepared) = self.prepared.remove(&id) {
+        let result = if let Some(mut prepared) = self.prepared.remove(&id) {
             let mut orphaned = None;
             let result = self
                 .client
@@ -215,7 +215,11 @@ impl Session {
                 .execute_sp_executesql(sql.to_owned(), params, opts)
                 .await
                 .map_err(tds)
+        };
+        if result.is_err() && self.client.has_open_batch() {
+            self.abandon().await?;
         }
+        result
     }
     pub(crate) fn release_prepared(&mut self, statement: u64) {
         if let Some(mut prepared) = self.prepared.remove(&statement)
@@ -277,6 +281,16 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    pub(crate) fn with_release<T>(
+        &self,
+        work: impl FnOnce(&Executor, &mut Session) -> Result<T>,
+    ) -> Result<T> {
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| state("connection mutex poisoned"))?;
+        work(&self.executor, &mut guard)
+    }
     pub(crate) fn with<T>(
         &self,
         work: impl FnOnce(&Executor, &mut Session) -> Result<T>,
@@ -294,6 +308,9 @@ impl Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
+        if crate::runtime::process_is_shutting_down() {
+            return;
+        }
         let session = match self.session.get_mut() {
             Ok(session) => session,
             Err(_) => {

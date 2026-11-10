@@ -206,6 +206,7 @@ fn live_catalog_and_schema_description() {
             adbc_core::schemas::GET_OBJECTS_SCHEMA.clone()
         );
     }
+
     let mut statement = connection.new_statement().unwrap();
     statement
         .set_sql_query("SELECT CAST(NULL AS decimal(38,7)) AS d, CAST(NULL AS datetime2(7)) AS t")
@@ -216,4 +217,243 @@ fn live_catalog_and_schema_description() {
         &arrow_schema::DataType::Decimal128(38, 7)
     );
     assert_eq!(schema.fields().len(), 2);
+}
+
+#[test]
+#[ignore = "requires ADBC_TEST_SERVER/DATABASE/USER/PASSWORD"]
+fn live_bulk_ingestion_modes_and_atomic_failures() {
+    use adbc_core::options::OptionStatement;
+    let mut connection = connection();
+    let mut statement = connection.new_statement().unwrap();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "label",
+            Arc::new(StringArray::from(vec![Some("a"), Some("🦀"), None])) as ArrayRef,
+        ),
+        ("n", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+    ])
+    .unwrap();
+    statement
+        .set_option(OptionStatement::TargetTable, "#adbc_ingest".into())
+        .unwrap();
+    statement
+        .set_option(OptionStatement::Temporary, true.into())
+        .unwrap();
+    statement.bind(batch.clone()).unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(3));
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            "adbc.ingest.mode.append".into(),
+        )
+        .unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(3));
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            "adbc.ingest.mode.create_append".into(),
+        )
+        .unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(3));
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            "adbc.ingest.mode.replace".into(),
+        )
+        .unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(3));
+    statement
+        .set_sql_query("SELECT COUNT(*) AS n FROM #adbc_ingest")
+        .unwrap();
+    let batches = statement
+        .execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        3
+    );
+    statement
+        .set_sql_query("CREATE TABLE #adbc_short(n int NOT NULL, label nvarchar(2))")
+        .unwrap();
+    statement.execute_update().unwrap();
+    statement
+        .set_option(OptionStatement::TargetTable, "#adbc_short".into())
+        .unwrap();
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            "adbc.ingest.mode.append".into(),
+        )
+        .unwrap();
+    statement
+        .bind(
+            RecordBatch::try_from_iter([
+                (
+                    "label",
+                    Arc::new(StringArray::from(vec!["ok", "too long"])) as ArrayRef,
+                ),
+                ("n", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(statement.execute_update().is_err());
+    statement
+        .set_sql_query("SELECT COUNT(*) AS n FROM #adbc_short")
+        .unwrap();
+    let batches = statement
+        .execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        0
+    );
+    statement
+        .set_sql_query("DROP TABLE #adbc_short; DROP TABLE #adbc_ingest")
+        .unwrap();
+    statement.execute_update().unwrap();
+}
+
+#[test]
+#[ignore = "requires ADBC_TEST_SERVER/DATABASE/USER/PASSWORD"]
+fn live_cancel_timeout_and_error_recovery() {
+    use adbc_core::error::Status;
+    let mut connection = connection();
+    let mut statement = connection.new_statement().unwrap();
+    statement
+        .set_sql_query("WAITFOR DELAY '00:00:10'; SELECT 1")
+        .unwrap();
+    let cancel = statement.get_cancel_handle();
+    let worker = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cancel.try_cancel().unwrap();
+    });
+    let error = statement.execute().err().expect("query must be cancelled");
+    worker.join().unwrap();
+    assert_eq!(error.status, Status::Cancelled);
+    statement
+        .set_option(OptionStatement::from(options::QUERY_TIMEOUT), 1_i64.into())
+        .unwrap();
+    let error = statement.execute().err().expect("query must time out");
+    assert_eq!(error.status, Status::Timeout);
+    statement
+        .set_sql_query("SELECT CAST(1 AS int) AS n; RAISERROR('adbc late error',16,1)")
+        .unwrap();
+    assert!(
+        statement
+            .execute()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .is_err()
+    );
+    statement
+        .set_sql_query("SELECT CAST(42 AS int) AS n")
+        .unwrap();
+    assert_eq!(
+        statement
+            .execute()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()[0]
+            .num_rows(),
+        1
+    );
+}
+
+struct LiveTable {
+    connection: MssqlConnection,
+    name: String,
+}
+
+impl Drop for LiveTable {
+    fn drop(&mut self) {
+        let cleanup = (|| {
+            let mut statement = self.connection.new_statement()?;
+            statement.set_sql_query(format!(
+                "DROP TABLE IF EXISTS [dbo].{}",
+                mssql_tds::escape_identifier(&self.name)
+            ))?;
+            statement.execute_update()
+        })();
+        if let Err(error) = cleanup {
+            eprintln!("owned live-test table cleanup failed: {error}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires ADBC_TEST_SERVER/DATABASE/USER/PASSWORD"]
+fn live_nested_columns_and_constraints() {
+    use adbc_core::options::ObjectDepth;
+    use arrow_array::{ListArray, StructArray};
+    let mut table = LiveTable {
+        connection: connection(),
+        name: format!("adbc_test_{}", uuid::Uuid::new_v4().simple()),
+    };
+    let mut statement = table.connection.new_statement().unwrap();
+    statement.set_sql_query(format!("CREATE TABLE dbo.[{}](n int PRIMARY KEY, parent int REFERENCES dbo.[{}](n), label nvarchar(10) UNIQUE, CHECK(n>0))", table.name, table.name)).unwrap();
+    statement.execute_update().unwrap();
+    let schema = table
+        .connection
+        .get_table_schema(None, Some("dbo"), &table.name)
+        .unwrap();
+    assert_eq!(schema.fields().len(), 3);
+    let batches = table
+        .connection
+        .get_objects(
+            ObjectDepth::All,
+            None,
+            Some("dbo"),
+            Some(&table.name),
+            None,
+            None,
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let schemas = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let schemas = schemas.as_any().downcast_ref::<StructArray>().unwrap();
+    let tables = schemas
+        .column_by_name("db_schema_tables")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let tables = tables.as_any().downcast_ref::<StructArray>().unwrap();
+    let columns = tables
+        .column_by_name("table_columns")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(columns.len(), 3);
+    let constraints = tables
+        .column_by_name("table_constraints")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(constraints.len(), 4);
 }

@@ -30,7 +30,9 @@ mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "time"] }
 tracing = "0.1.43"
 url = "2"
+percent-encoding = "2"
 uuid = "1.19"
+async-trait = "0.1"
 
 [dev-dependencies]
 adbc_driver_manager = "=0.25.0"

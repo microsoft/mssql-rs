@@ -27,6 +27,7 @@ pub struct MssqlStatement {
     pub(crate) batch_rows: usize,
     pub(crate) batch_bytes: usize,
     pub(crate) binding: Option<Binding>,
+    ingestion: crate::ingestion::Ingestion,
 }
 
 impl MssqlStatement {
@@ -39,6 +40,7 @@ impl MssqlStatement {
             batch_rows: shared.config.batch_rows,
             batch_bytes: shared.config.batch_bytes,
             binding: None,
+            ingestion: Default::default(),
             shared,
         }
     }
@@ -57,6 +59,55 @@ impl MssqlStatement {
 impl Optionable for MssqlStatement {
     type Option = OptionStatement;
     fn set_option(&mut self, key: OptionStatement, value: OptionValue) -> Result<()> {
+        match key {
+            OptionStatement::TargetTable => self.ingestion.table = Some(options::string(value)?),
+            OptionStatement::TargetCatalog => {
+                self.ingestion.catalog = Some(options::string(value)?)
+            }
+            OptionStatement::TargetDbSchema => {
+                self.ingestion.schema = Some(options::string(value)?)
+            }
+            OptionStatement::IngestMode => self.ingestion.mode = (&value).try_into()?,
+            OptionStatement::Temporary => self.ingestion.temporary = bool::try_from(value)?,
+            _ => return self.set_execution_option(key, value),
+        }
+        self.invalidate()
+    }
+    fn get_option_string(&self, key: OptionStatement) -> Result<String> {
+        Ok(match key {
+            OptionStatement::TargetTable => self
+                .ingestion
+                .table
+                .clone()
+                .ok_or_else(|| state("target table not set"))?,
+            OptionStatement::TargetCatalog => self
+                .ingestion
+                .catalog
+                .clone()
+                .ok_or_else(|| state("target catalog not set"))?,
+            OptionStatement::TargetDbSchema => self
+                .ingestion
+                .schema
+                .clone()
+                .unwrap_or_else(|| "dbo".into()),
+            OptionStatement::IngestMode => self.ingestion.mode.into(),
+            OptionStatement::Temporary => self.ingestion.temporary.to_string(),
+            _ => return Err(unsupported(key.as_ref())),
+        })
+    }
+    fn get_option_int(&self, key: OptionStatement) -> Result<i64> {
+        match key.as_ref() {
+            options::QUERY_TIMEOUT => Ok(i64::from(self.timeout)),
+            options::BATCH_ROWS => Ok(self.batch_rows as i64),
+            options::BATCH_BYTES => Ok(self.batch_bytes as i64),
+            _ => Err(unsupported(key.as_ref())),
+        }
+    }
+    unsupported_getters!(OptionStatement);
+}
+
+impl MssqlStatement {
+    fn set_execution_option(&mut self, key: OptionStatement, value: OptionValue) -> Result<()> {
         match key.as_ref() {
             options::QUERY_TIMEOUT => {
                 self.timeout = options::integer(value, u32::MAX as usize)? as u32
@@ -79,18 +130,6 @@ impl Optionable for MssqlStatement {
         }
         Ok(())
     }
-    fn get_option_string(&self, key: OptionStatement) -> Result<String> {
-        Err(unsupported(key.as_ref()))
-    }
-    fn get_option_int(&self, key: OptionStatement) -> Result<i64> {
-        match key.as_ref() {
-            options::QUERY_TIMEOUT => Ok(i64::from(self.timeout)),
-            options::BATCH_ROWS => Ok(self.batch_rows as i64),
-            options::BATCH_BYTES => Ok(self.batch_bytes as i64),
-            _ => Err(unsupported(key.as_ref())),
-        }
-    }
-    unsupported_getters!(OptionStatement);
 }
 
 impl Statement for MssqlStatement {
@@ -102,6 +141,7 @@ impl Statement for MssqlStatement {
         })?;
         self.sql = Some(query.as_ref().to_owned());
         self.binding = None;
+        self.ingestion.table = None;
         Ok(())
     }
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
@@ -187,9 +227,12 @@ impl Statement for MssqlStatement {
     }
 
     fn execute(&mut self) -> Result<Reader> {
+        if self.ingestion.table.is_some() {
+            return Err(state("use execute_update for ingestion"));
+        }
         let sql = self.sql.clone().ok_or_else(|| state("SQL query not set"))?;
         let mut cursor = ParameterCursor::new(self.binding.as_mut())?;
-        let Some(params) = cursor.next()? else {
+        let Some(mut params) = cursor.next()? else {
             let schema = Arc::new(self.execute_schema()?);
             return Ok(Box::new(arrow_array::RecordBatchIterator::new(
                 std::iter::empty(),
@@ -200,45 +243,61 @@ impl Statement for MssqlStatement {
         self.cancel.set(Some(Arc::clone(&handle)))?;
         let result = self.shared.with(|executor, session| {
             executor.run(async {
-                let generation = session.start(self.id, self.timeout).await?;
-                self.shared.cancel.set(Some(Arc::clone(&handle)))?;
-                let mut result = session
-                    .request(self.id, &sql, params, self.timeout, &handle)
-                    .await?;
-                while matches!(result, StatementResult::NoRows { .. }) {
-                    result = session.client.advance().await.map_err(tds)?;
-                }
-                let schema = if result == StatementResult::Rows {
-                    match types::schema(session.client.get_metadata()) {
-                        Ok(schema) => schema,
-                        Err(error) => {
-                            session.abandon().await?;
-                            return Err(error);
+                let operation = async {
+                    let generation = session.start(self.id, self.timeout).await?;
+                    self.shared.cancel.set(Some(Arc::clone(&handle)))?;
+                    let result = loop {
+                        let mut result = session
+                            .request(self.id, &sql, params, self.timeout, &handle)
+                            .await?;
+                        while matches!(result, StatementResult::NoRows { .. }) {
+                            result = session.client.advance().await.map_err(tds)?;
                         }
+                        if result == StatementResult::Rows {
+                            break result;
+                        }
+                        match cursor.next()? {
+                            Some(next) => params = next,
+                            None => break StatementResult::End,
+                        }
+                    };
+                    let schema = if result == StatementResult::Rows {
+                        match types::schema(session.client.get_metadata()) {
+                            Ok(schema) => schema,
+                            Err(error) => {
+                                session.abandon().await?;
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        Arc::new(Schema::empty())
+                    };
+                    let done = result == StatementResult::End;
+                    if !done {
+                        session.active = Some((self.id, generation));
                     }
-                } else {
-                    Arc::new(Schema::empty())
-                };
-                let done = result == StatementResult::End;
-                if !done {
-                    session.active = Some((self.id, generation));
+                    Ok(QueryReader {
+                        shared: Arc::clone(&self.shared),
+                        owner: (self.id, generation),
+                        schema,
+                        batch_rows: self.batch_rows,
+                        batch_bytes: self.batch_bytes,
+                        cancel: self.cancel.clone(),
+                        handle: Arc::clone(&handle),
+                        sql,
+                        cursor,
+                        timeout: self.timeout,
+                        done,
+                    })
                 }
-                Ok(QueryReader {
-                    shared: Arc::clone(&self.shared),
-                    owner: (self.id, generation),
-                    schema,
-                    batch_rows: self.batch_rows,
-                    batch_bytes: self.batch_bytes,
-                    cancel: self.cancel.clone(),
-                    handle: Arc::clone(&handle),
-                    sql,
-                    cursor,
-                    timeout: self.timeout,
-                    done,
-                })
+                .await;
+                if operation.is_err() && session.client.has_open_batch() {
+                    session.abandon().await?;
+                }
+                operation
             })
         });
-        if result.is_err() {
+        if !result.as_ref().is_ok_and(|reader| !reader.done) {
             self.cancel.clear(&handle)?;
             self.shared.cancel.clear(&handle)?;
         }
@@ -246,13 +305,40 @@ impl Statement for MssqlStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
+        if self.ingestion.table.is_some() {
+            self.invalidate()?;
+            let reader = self
+                .binding
+                .as_mut()
+                .ok_or_else(|| state("bind Arrow input before ingestion"))?
+                .reader()?;
+            let handle = Arc::new(CancelHandle::new());
+            self.cancel.set(Some(handle.clone()))?;
+            let result = self.shared.with(|executor, session| {
+                executor.run(async {
+                    session.start(self.id, self.timeout).await?;
+                    self.shared.cancel.set(Some(handle.clone()))?;
+                    crate::ingestion::execute(
+                        session,
+                        &self.ingestion,
+                        reader,
+                        self.timeout,
+                        &handle,
+                    )
+                    .await
+                })
+            });
+            self.cancel.clear(&handle)?;
+            self.shared.cancel.clear(&handle)?;
+            return result.map(Some);
+        }
         let sql = self.sql.clone().ok_or_else(|| state("SQL query not set"))?;
         let mut cursor = ParameterCursor::new(self.binding.as_mut())?;
         let handle = Arc::new(CancelHandle::new());
         self.cancel.set(Some(Arc::clone(&handle)))?;
-        let result =
-            self.shared.with(|executor, session| {
-                executor.run(async {
+        let result = self.shared.with(|executor, session| {
+            executor.run(async {
+                let operation = async {
                     session.start(self.id, self.timeout).await?;
                     self.shared.cancel.set(Some(Arc::clone(&handle)))?;
                     let mut count: Option<i64> = None;
@@ -285,8 +371,14 @@ impl Statement for MssqlStatement {
                         }
                     }
                     Ok(count)
-                })
-            });
+                }
+                .await;
+                if operation.is_err() && session.client.has_open_batch() {
+                    session.abandon().await?;
+                }
+                operation
+            })
+        });
         self.cancel.clear(&handle)?;
         self.shared.cancel.clear(&handle)?;
         result
@@ -332,7 +424,8 @@ impl QueryReader {
                                 session.abandon().await?;
                                 return Err(unsupported("multiple tabular result sets"));
                             }
-                            if let Some(params) = self.cursor.next()? {
+                            let mut next_rows = false;
+                            while let Some(params) = self.cursor.next()? {
                                 let mut result = session
                                     .request(
                                         self.owner.0,
@@ -346,15 +439,17 @@ impl QueryReader {
                                     result = session.client.advance().await.map_err(tds)?;
                                 }
                                 if result != StatementResult::Rows {
-                                    return Err(state(
-                                        "parameterized query did not return a tabular result",
-                                    ));
+                                    continue;
                                 }
                                 if types::schema(session.client.get_metadata())? != self.schema {
                                     return Err(crate::error::data(
                                         "result schema changed across parameter rows",
                                     ));
                                 }
+                                next_rows = true;
+                                break;
+                            }
+                            if next_rows {
                                 continue;
                             }
                             session.active = None;
@@ -416,10 +511,10 @@ impl RecordBatchReader for QueryReader {
 
 impl Drop for QueryReader {
     fn drop(&mut self) {
-        if self.done {
+        if self.done || crate::runtime::process_is_shutting_down() {
             return;
         }
-        let result = self.shared.with(|executor, session| {
+        let result = self.shared.with_release(|executor, session| {
             if session.active == Some(self.owner) {
                 executor.run(session.abandon())?;
                 self.cancel.clear(&self.handle)?;
@@ -436,7 +531,10 @@ impl Drop for QueryReader {
 
 impl Drop for MssqlStatement {
     fn drop(&mut self) {
-        if let Err(error) = self.shared.with(|_, session| {
+        if crate::runtime::process_is_shutting_down() {
+            return;
+        }
+        if let Err(error) = self.shared.with_release(|_, session| {
             session.release_prepared(self.id);
             Ok(())
         }) {
