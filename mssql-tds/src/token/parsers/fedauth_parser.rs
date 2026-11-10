@@ -145,8 +145,10 @@ where
                     )
                 })?;
             let u16_slice: Vec<u16> = string_bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk))
                 .collect();
             let value = String::from_utf16(&u16_slice).map_err(|_| {
                 Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-16 sequence")
