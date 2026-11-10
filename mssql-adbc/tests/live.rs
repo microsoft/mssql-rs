@@ -457,3 +457,206 @@ fn live_nested_columns_and_constraints() {
         .value(0);
     assert_eq!(constraints.len(), 4);
 }
+
+#[test]
+#[ignore = "requires ADBC_TEST_SERVER/DATABASE/USER/PASSWORD"]
+fn live_wide_parameter_and_bulk_type_roundtrip() {
+    use arrow_array::*;
+    let mut connection = connection();
+    let mut statement = connection.new_statement().unwrap();
+    let decimal = Decimal128Array::from(vec![Some(-1234567), None])
+        .with_precision_and_scale(38, 7)
+        .unwrap();
+    let uuid = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [Some(&[1_u8; 16][..]), None].into_iter(),
+        16,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "bit",
+            Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
+        ),
+        ("tiny", Arc::new(UInt8Array::from(vec![Some(255), None]))),
+        (
+            "small",
+            Arc::new(Int16Array::from(vec![Some(-32768), None])),
+        ),
+        (
+            "int",
+            Arc::new(Int32Array::from(vec![Some(i32::MIN), None])),
+        ),
+        (
+            "big",
+            Arc::new(Int64Array::from(vec![Some(i64::MAX), None])),
+        ),
+        ("real", Arc::new(Float32Array::from(vec![Some(1.25), None]))),
+        (
+            "float",
+            Arc::new(Float64Array::from(vec![Some(-1.25), None])),
+        ),
+        ("decimal", Arc::new(decimal)),
+        (
+            "text",
+            Arc::new(StringArray::from(vec![Some("a\u{03b2}"), None])),
+        ),
+        (
+            "binary",
+            Arc::new(BinaryArray::from(vec![Some(&[0_u8, 255][..]), None])),
+        ),
+        ("uuid", Arc::new(uuid)),
+        (
+            "date",
+            Arc::new(Date32Array::from(vec![Some(-719162), None])),
+        ),
+        (
+            "time",
+            Arc::new(Time64NanosecondArray::from(vec![
+                Some(86_399_999_999_900),
+                None,
+            ])),
+        ),
+        (
+            "datetime",
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(-1), None])),
+        ),
+        (
+            "offset",
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(-1), None]).with_timezone("UTC")),
+        ),
+    ])
+    .unwrap();
+    let query = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            format!(
+                "@p{} AS {}",
+                index + 1,
+                mssql_tds::escape_identifier(field.name())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    statement.set_sql_query(format!("SELECT {query}")).unwrap();
+    statement.prepare().unwrap();
+    statement.bind(batch.clone()).unwrap();
+    let query = statement
+        .execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(query.len(), 1);
+    assert_eq!(query[0].num_rows(), 2);
+    statement
+        .set_option(OptionStatement::TargetTable, "#adbc_wide".into())
+        .unwrap();
+    statement
+        .set_option(OptionStatement::Temporary, true.into())
+        .unwrap();
+    assert_eq!(statement.execute_update().unwrap(), Some(2));
+    statement
+        .set_sql_query(
+            "SELECT * FROM #adbc_wide ORDER BY CASE WHEN [int] IS NULL THEN 1 ELSE 0 END",
+        )
+        .unwrap();
+    let bulk = statement
+        .execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(bulk[0].num_rows(), 2);
+    for (index, column) in bulk[0].columns().iter().enumerate() {
+        assert_eq!(column.to_data(), query[0].column(index).to_data());
+    }
+    statement.set_sql_query("DROP TABLE #adbc_wide").unwrap();
+    statement.execute_update().unwrap();
+}
+
+#[test]
+#[ignore = "requires ADBC_TEST_SERVER/DATABASE/USER/PASSWORD"]
+fn live_bound_stream_and_replace_rollback() {
+    use arrow_array::{Decimal128Array, RecordBatchIterator};
+    let mut connection = connection();
+    let mut statement = connection.new_statement().unwrap();
+    let batch = RecordBatch::try_from_iter([(
+        "d",
+        Arc::new(
+            Decimal128Array::from(vec![Some(7), None])
+                .with_precision_and_scale(38, 7)
+                .unwrap(),
+        ) as ArrayRef,
+    )])
+    .unwrap();
+    statement.set_sql_query("SELECT @p1 AS d").unwrap();
+    statement
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [
+                Ok(RecordBatch::new_empty(batch.schema())),
+                Ok(batch.clone()),
+                Ok(batch.clone()),
+            ],
+            batch.schema(),
+        )))
+        .unwrap();
+    assert_eq!(
+        statement
+            .execute()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        4
+    );
+    assert!(statement.execute().is_err());
+    statement
+        .set_option(OptionStatement::TargetTable, "#adbc_replace".into())
+        .unwrap();
+    statement
+        .set_option(OptionStatement::Temporary, true.into())
+        .unwrap();
+    statement.bind(batch.clone()).unwrap();
+    statement.execute_update().unwrap();
+    statement
+        .set_option(
+            OptionStatement::IngestMode,
+            "adbc.ingest.mode.replace".into(),
+        )
+        .unwrap();
+    statement
+        .bind_stream(Box::new(RecordBatchIterator::new(
+            [
+                Ok(batch.clone()),
+                Ok(batch.clone()),
+                Err(arrow_schema::ArrowError::ComputeError(
+                    "injected input failure".into(),
+                )),
+            ],
+            batch.schema(),
+        )))
+        .unwrap();
+    assert!(statement.execute_update().is_err());
+    statement
+        .set_sql_query("SELECT COUNT(*) AS n FROM #adbc_replace")
+        .unwrap();
+    let result = statement
+        .execute()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+    statement.set_sql_query("DROP TABLE #adbc_replace").unwrap();
+    statement.execute_update().unwrap();
+}

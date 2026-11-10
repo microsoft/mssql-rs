@@ -22,6 +22,7 @@ use crate::driver::Session;
 use crate::error::{data, invalid, tds, unsupported};
 use crate::parameters;
 
+#[derive(Clone)]
 pub(crate) struct Ingestion {
     pub(crate) table: Option<String>,
     pub(crate) catalog: Option<String>,

@@ -59,19 +59,18 @@ impl MssqlStatement {
 impl Optionable for MssqlStatement {
     type Option = OptionStatement;
     fn set_option(&mut self, key: OptionStatement, value: OptionValue) -> Result<()> {
+        let mut ingestion = self.ingestion.clone();
         match key {
-            OptionStatement::TargetTable => self.ingestion.table = Some(options::string(value)?),
-            OptionStatement::TargetCatalog => {
-                self.ingestion.catalog = Some(options::string(value)?)
-            }
-            OptionStatement::TargetDbSchema => {
-                self.ingestion.schema = Some(options::string(value)?)
-            }
-            OptionStatement::IngestMode => self.ingestion.mode = (&value).try_into()?,
-            OptionStatement::Temporary => self.ingestion.temporary = bool::try_from(value)?,
+            OptionStatement::TargetTable => ingestion.table = Some(options::string(value)?),
+            OptionStatement::TargetCatalog => ingestion.catalog = Some(options::string(value)?),
+            OptionStatement::TargetDbSchema => ingestion.schema = Some(options::string(value)?),
+            OptionStatement::IngestMode => ingestion.mode = (&value).try_into()?,
+            OptionStatement::Temporary => ingestion.temporary = bool::try_from(value)?,
             _ => return self.set_execution_option(key, value),
         }
-        self.invalidate()
+        self.invalidate()?;
+        self.ingestion = ingestion;
+        Ok(())
     }
     fn get_option_string(&self, key: OptionStatement) -> Result<String> {
         Ok(match key {
