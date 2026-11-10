@@ -8,12 +8,13 @@ use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
-use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult};
+use mssql_tds::connection::tds_client::{PreparedStatement, ResultSet, StatementResult};
 use mssql_tds::core::CancelHandle;
 
 use crate::driver::{Cancellation, Reader, Shared, unsupported_getters};
 use crate::error::{state, tds, unsupported};
 use crate::options;
+use crate::parameters::{self, Binding, ParameterCursor};
 use crate::types::{self, ArrowRowWriter};
 
 /// Reusable ADBC statement. SQL Server parameters use native `@p1`, `@p2`, ... names.
@@ -25,6 +26,7 @@ pub struct MssqlStatement {
     pub(crate) timeout: u32,
     pub(crate) batch_rows: usize,
     pub(crate) batch_bytes: usize,
+    pub(crate) binding: Option<Binding>,
 }
 
 impl MssqlStatement {
@@ -36,6 +38,7 @@ impl MssqlStatement {
             timeout: shared.config.timeout,
             batch_rows: shared.config.batch_rows,
             batch_bytes: shared.config.batch_bytes,
+            binding: None,
             shared,
         }
     }
@@ -93,7 +96,12 @@ impl Optionable for MssqlStatement {
 impl Statement for MssqlStatement {
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.invalidate()?;
+        self.shared.with(|_, session| {
+            session.release_prepared(self.id);
+            Ok(())
+        })?;
         self.sql = Some(query.as_ref().to_owned());
+        self.binding = None;
         Ok(())
     }
     fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
@@ -101,22 +109,75 @@ impl Statement for MssqlStatement {
     }
     fn prepare(&mut self) -> Result<()> {
         self.invalidate()?;
-        self.sql
+        let sql = self
+            .sql
             .as_ref()
             .ok_or_else(|| state("SQL query not set"))?;
+        self.shared.with(|_, session| {
+            session.release_prepared(self.id);
+            session
+                .prepared
+                .insert(self.id, PreparedStatement::new(sql));
+            Ok(())
+        })?;
         Ok(())
     }
     fn get_parameter_schema(&self) -> Result<Schema> {
-        Err(unsupported("parameter description"))
+        self.shared.with(|_, session| {
+            if !session.prepared.contains_key(&self.id) {
+                return Err(state("prepare the statement before describing parameters"));
+            }
+            Ok(())
+        })?;
+        if let Some(binding) = &self.binding {
+            return Ok(Schema::new(
+                binding
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        field.as_ref().clone().with_name(format!("@p{}", index + 1))
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        crate::metadata::describe(
+            &self.shared,
+            self.sql
+                .as_deref()
+                .ok_or_else(|| state("SQL query not set"))?,
+            None,
+            true,
+        )
     }
-    fn bind(&mut self, _batch: RecordBatch) -> Result<()> {
-        Err(unsupported("parameter binding"))
+    fn bind(&mut self, batch: RecordBatch) -> Result<()> {
+        parameters::validate(&batch.schema())?;
+        self.invalidate()?;
+        self.binding = Some(Binding::Batch(batch));
+        Ok(())
     }
-    fn bind_stream(&mut self, _reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
-        Err(unsupported("stream binding"))
+    fn bind_stream(&mut self, reader: Box<dyn RecordBatchReader + Send>) -> Result<()> {
+        let schema = reader.schema();
+        parameters::validate(&schema)?;
+        self.invalidate()?;
+        self.binding = Some(Binding::Stream {
+            schema,
+            reader: Some(reader),
+        });
+        Ok(())
     }
     fn execute_schema(&mut self) -> Result<Schema> {
-        Err(unsupported("schema description"))
+        self.invalidate()?;
+        let bound = self.binding.as_ref().map(Binding::schema);
+        crate::metadata::describe(
+            &self.shared,
+            self.sql
+                .as_deref()
+                .ok_or_else(|| state("SQL query not set"))?,
+            bound.as_deref(),
+            false,
+        )
     }
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
         Err(unsupported("partitioned execution"))
@@ -127,22 +188,23 @@ impl Statement for MssqlStatement {
 
     fn execute(&mut self) -> Result<Reader> {
         let sql = self.sql.clone().ok_or_else(|| state("SQL query not set"))?;
+        let mut cursor = ParameterCursor::new(self.binding.as_mut())?;
+        let Some(params) = cursor.next()? else {
+            let schema = Arc::new(self.execute_schema()?);
+            return Ok(Box::new(arrow_array::RecordBatchIterator::new(
+                std::iter::empty(),
+                schema,
+            )));
+        };
         let handle = Arc::new(CancelHandle::new());
         self.cancel.set(Some(Arc::clone(&handle)))?;
         let result = self.shared.with(|executor, session| {
-            self.shared.cancel.set(Some(Arc::clone(&handle)))?;
             executor.run(async {
                 let generation = session.start(self.id, self.timeout).await?;
+                self.shared.cancel.set(Some(Arc::clone(&handle)))?;
                 let mut result = session
-                    .client
-                    .execute(
-                        sql,
-                        ExecuteOptions::new()
-                            .timeout_secs(self.timeout)
-                            .cancel(&handle),
-                    )
-                    .await
-                    .map_err(tds)?;
+                    .request(self.id, &sql, params, self.timeout, &handle)
+                    .await?;
                 while matches!(result, StatementResult::NoRows { .. }) {
                     result = session.client.advance().await.map_err(tds)?;
                 }
@@ -168,63 +230,65 @@ impl Statement for MssqlStatement {
                     batch_rows: self.batch_rows,
                     batch_bytes: self.batch_bytes,
                     cancel: self.cancel.clone(),
+                    handle: Arc::clone(&handle),
+                    sql,
+                    cursor,
+                    timeout: self.timeout,
                     done,
                 })
             })
         });
         if result.is_err() {
-            self.cancel.set(None)?;
-            self.shared.cancel.set(None)?;
+            self.cancel.clear(&handle)?;
+            self.shared.cancel.clear(&handle)?;
         }
         Ok(Box::new(result?))
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
         let sql = self.sql.clone().ok_or_else(|| state("SQL query not set"))?;
+        let mut cursor = ParameterCursor::new(self.binding.as_mut())?;
         let handle = Arc::new(CancelHandle::new());
         self.cancel.set(Some(Arc::clone(&handle)))?;
-        let result = self.shared.with(|executor, session| {
-            self.shared.cancel.set(Some(Arc::clone(&handle)))?;
-            executor.run(async {
-                session.start(self.id, self.timeout).await?;
-                let mut result = session
-                    .client
-                    .execute(
-                        sql,
-                        ExecuteOptions::new()
-                            .timeout_secs(self.timeout)
-                            .cancel(&handle),
-                    )
-                    .await
-                    .map_err(tds)?;
-                let mut count: Option<i64> = None;
-                loop {
-                    match result {
-                        StatementResult::Rows => {
-                            session.abandon().await?;
-                            return Err(state("execute_update received a row result; use execute"));
+        let result =
+            self.shared.with(|executor, session| {
+                executor.run(async {
+                    session.start(self.id, self.timeout).await?;
+                    self.shared.cancel.set(Some(Arc::clone(&handle)))?;
+                    let mut count: Option<i64> = None;
+                    while let Some(params) = cursor.next()? {
+                        let mut result = session
+                            .request(self.id, &sql, params, self.timeout, &handle)
+                            .await?;
+                        loop {
+                            match result {
+                                StatementResult::Rows => {
+                                    session.abandon().await?;
+                                    return Err(state(
+                                        "execute_update received a row result; use execute",
+                                    ));
+                                }
+                                StatementResult::NoRows {
+                                    rows_affected: Some(rows),
+                                } => {
+                                    let rows = i64::try_from(rows)
+                                        .map_err(|_| crate::error::data("row count overflow"))?;
+                                    count =
+                                        Some(count.unwrap_or(0).checked_add(rows).ok_or_else(
+                                            || crate::error::data("row count overflow"),
+                                        )?);
+                                }
+                                StatementResult::End => break,
+                                _ => {}
+                            }
+                            result = session.client.advance().await.map_err(tds)?;
                         }
-                        StatementResult::NoRows {
-                            rows_affected: Some(rows),
-                        } => {
-                            let rows = i64::try_from(rows)
-                                .map_err(|_| crate::error::data("row count overflow"))?;
-                            count = Some(
-                                count
-                                    .unwrap_or(0)
-                                    .checked_add(rows)
-                                    .ok_or_else(|| crate::error::data("row count overflow"))?,
-                            );
-                        }
-                        StatementResult::End => return Ok(count),
-                        _ => {}
                     }
-                    result = session.client.advance().await.map_err(tds)?;
-                }
-            })
-        });
-        self.cancel.set(None)?;
-        self.shared.cancel.set(None)?;
+                    Ok(count)
+                })
+            });
+        self.cancel.clear(&handle)?;
+        self.shared.cancel.clear(&handle)?;
         result
     }
 }
@@ -236,6 +300,10 @@ struct QueryReader {
     batch_rows: usize,
     batch_bytes: usize,
     cancel: Cancellation,
+    handle: Arc<CancelHandle>,
+    sql: String,
+    cursor: ParameterCursor,
+    timeout: u32,
     done: bool,
 }
 
@@ -264,10 +332,35 @@ impl QueryReader {
                                 session.abandon().await?;
                                 return Err(unsupported("multiple tabular result sets"));
                             }
+                            if let Some(params) = self.cursor.next()? {
+                                let mut result = session
+                                    .request(
+                                        self.owner.0,
+                                        &self.sql,
+                                        params,
+                                        self.timeout,
+                                        &self.handle,
+                                    )
+                                    .await?;
+                                while matches!(result, StatementResult::NoRows { .. }) {
+                                    result = session.client.advance().await.map_err(tds)?;
+                                }
+                                if result != StatementResult::Rows {
+                                    return Err(state(
+                                        "parameterized query did not return a tabular result",
+                                    ));
+                                }
+                                if types::schema(session.client.get_metadata())? != self.schema {
+                                    return Err(crate::error::data(
+                                        "result schema changed across parameter rows",
+                                    ));
+                                }
+                                continue;
+                            }
                             session.active = None;
                             self.done = true;
-                            self.cancel.set(None)?;
-                            self.shared.cancel.set(None)?;
+                            self.cancel.clear(&self.handle)?;
+                            self.shared.cancel.clear(&self.handle)?;
                             break;
                         }
                         Err(error) => return Err(tds(error)),
@@ -304,8 +397,11 @@ impl Iterator for QueryReader {
                 }
                 let _ = self
                     .cancel
-                    .set(None)
+                    .clear(&self.handle)
                     .map_err(|error| tracing::error!(%error, "ADBC cancellation cleanup"));
+                if let Err(error) = self.shared.cancel.clear(&self.handle) {
+                    tracing::error!(%error, "ADBC connection cancellation cleanup");
+                }
                 Some(Err(ArrowError::ExternalError(Box::new(error))))
             }
         }
@@ -326,13 +422,25 @@ impl Drop for QueryReader {
         let result = self.shared.with(|executor, session| {
             if session.active == Some(self.owner) {
                 executor.run(session.abandon())?;
-                self.cancel.set(None)?;
-                self.shared.cancel.set(None)?;
+                self.cancel.clear(&self.handle)?;
+                self.shared.cancel.clear(&self.handle)?;
             }
+
             Ok(())
         });
         if let Err(error) = result {
             tracing::error!(%error, "ADBC dropped stream cleanup failed");
+        }
+    }
+}
+
+impl Drop for MssqlStatement {
+    fn drop(&mut self) {
+        if let Err(error) = self.shared.with(|_, session| {
+            session.release_prepared(self.id);
+            Ok(())
+        }) {
+            tracing::error!(%error, "ADBC prepared statement release deferred to connection closure");
         }
     }
 }

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use adbc_core::error::Result;
@@ -9,9 +9,12 @@ use adbc_core::options::*;
 use adbc_core::{Connection, Database, Driver, Optionable};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
-use mssql_tds::connection::tds_client::{ExecuteOptions, StatementId, TdsClient};
+use mssql_tds::connection::tds_client::{
+    ExecuteOptions, PreparedStatement, StatementId, StatementResult, TdsClient,
+};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::CancelHandle;
+use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 
 use crate::error::{state, tds, unsupported};
@@ -121,6 +124,7 @@ impl Database for MssqlDatabase {
                 autocommit: true,
                 isolation: TransactionIsolationLevel::ReadCommitted,
                 pending_unprepare: Vec::new(),
+                prepared: HashMap::new(),
             }),
             cancel: Cancellation::default(),
             config: self.config.clone(),
@@ -137,6 +141,19 @@ impl Database for MssqlDatabase {
 pub(crate) struct Cancellation(Arc<Mutex<Option<Arc<CancelHandle>>>>);
 
 impl Cancellation {
+    pub(crate) fn clear(&self, handle: &Arc<CancelHandle>) -> Result<()> {
+        let mut current = self
+            .0
+            .lock()
+            .map_err(|_| state("cancellation mutex poisoned"))?;
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            *current = None;
+        }
+        Ok(())
+    }
     pub(crate) fn set(&self, handle: Option<Arc<CancelHandle>>) -> Result<()> {
         *self
             .0
@@ -167,9 +184,46 @@ pub(crate) struct Session {
     pub(crate) autocommit: bool,
     pub(crate) isolation: TransactionIsolationLevel,
     pub(crate) pending_unprepare: Vec<StatementId>,
+    pub(crate) prepared: HashMap<u64, PreparedStatement>,
 }
 
 impl Session {
+    pub(crate) async fn request(
+        &mut self,
+        id: u64,
+        sql: &str,
+        params: Vec<RpcParameter>,
+        timeout: u32,
+        cancel: &CancelHandle,
+    ) -> Result<StatementResult> {
+        let opts = ExecuteOptions::new().timeout_secs(timeout).cancel(cancel);
+        if let Some(mut prepared) = self.prepared.remove(&id) {
+            let mut orphaned = None;
+            let result = self
+                .client
+                .execute_prepared(&mut prepared, params, &mut orphaned, opts)
+                .await;
+            self.prepared.insert(id, prepared);
+            if let Some(id) = orphaned {
+                self.pending_unprepare.push(id);
+            }
+            result.map_err(tds)
+        } else if params.is_empty() {
+            self.client.execute(sql.to_owned(), opts).await.map_err(tds)
+        } else {
+            self.client
+                .execute_sp_executesql(sql.to_owned(), params, opts)
+                .await
+                .map_err(tds)
+        }
+    }
+    pub(crate) fn release_prepared(&mut self, statement: u64) {
+        if let Some(mut prepared) = self.prepared.remove(&statement)
+            && let Some(id) = prepared.take_id()
+        {
+            self.pending_unprepare.push(id);
+        }
+    }
     pub(crate) fn idle(&self) -> Result<()> {
         if self.client.is_connection_dead() {
             return Err(state("connection is dead"));
@@ -309,6 +363,46 @@ impl Optionable for MssqlConnection {
     type Option = OptionConnection;
     fn set_option(&mut self, key: OptionConnection, value: OptionValue) -> Result<()> {
         match key {
+            OptionConnection::CurrentCatalog => {
+                let catalog = options::string(value)?;
+                crate::metadata::query(
+                    &self.shared,
+                    &format!("USE {}", mssql_tds::escape_identifier(&catalog)),
+                    vec![],
+                )?;
+                Ok(())
+            }
+            OptionConnection::IsolationLevel => {
+                use adbc_core::constants::*;
+                let value = options::string(value)?;
+                let isolation = match value.as_str() {
+                    ADBC_OPTION_ISOLATION_LEVEL_DEFAULT
+                    | ADBC_OPTION_ISOLATION_LEVEL_READ_COMMITTED => {
+                        TransactionIsolationLevel::ReadCommitted
+                    }
+                    ADBC_OPTION_ISOLATION_LEVEL_READ_UNCOMMITTED => {
+                        TransactionIsolationLevel::ReadUncommitted
+                    }
+                    ADBC_OPTION_ISOLATION_LEVEL_REPEATABLE_READ => {
+                        TransactionIsolationLevel::RepeatableRead
+                    }
+                    ADBC_OPTION_ISOLATION_LEVEL_SNAPSHOT => TransactionIsolationLevel::Snapshot,
+                    ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE => {
+                        TransactionIsolationLevel::Serializable
+                    }
+                    _ => return Err(unsupported("isolation level")),
+                };
+                self.shared.with(|_, session| {
+                    session.idle()?;
+                    if session.autocommit || session.client.has_active_transaction() {
+                        return Err(state(
+                            "set isolation with autocommit disabled before starting a transaction",
+                        ));
+                    }
+                    session.isolation = isolation;
+                    Ok(())
+                })
+            }
             OptionConnection::AutoCommit => {
                 let enabled = bool::try_from(value)?;
                 self.shared.with(|executor, session| {
@@ -338,6 +432,13 @@ impl Optionable for MssqlConnection {
         self.shared.with(|_, session| match key {
             OptionConnection::AutoCommit => Ok(session.autocommit.to_string()),
             OptionConnection::CurrentCatalog => Ok(session.client.database().to_owned()),
+            OptionConnection::IsolationLevel => Ok(String::from(match session.isolation {
+                TransactionIsolationLevel::ReadUncommitted => IsolationLevel::ReadUncommitted,
+                TransactionIsolationLevel::RepeatableRead => IsolationLevel::RepeatableRead,
+                TransactionIsolationLevel::Snapshot => IsolationLevel::Snapshot,
+                TransactionIsolationLevel::Serializable => IsolationLevel::Serializable,
+                _ => IsolationLevel::ReadCommitted,
+            })),
             _ => Err(unsupported(format!("connection option {}", key.as_ref()))),
         })
     }
@@ -368,30 +469,30 @@ impl Connection for MssqlConnection {
     fn rollback(&mut self) -> Result<()> {
         self.finish_transaction(false)
     }
-    fn get_info(&self, _codes: Option<HashSet<InfoCode>>) -> Result<Reader> {
-        Err(unsupported("get_info"))
+    fn get_info(&self, codes: Option<HashSet<InfoCode>>) -> Result<Reader> {
+        crate::metadata::info(&self.shared, codes)
     }
     fn get_objects(
         &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _schema: Option<&str>,
-        _table: Option<&str>,
-        _types: Option<Vec<&str>>,
-        _column: Option<&str>,
+        depth: ObjectDepth,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+        types: Option<Vec<&str>>,
+        column: Option<&str>,
     ) -> Result<Reader> {
-        Err(unsupported("get_objects"))
+        crate::metadata::objects(&self.shared, depth, catalog, schema, table, types, column)
     }
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
-        _schema: Option<&str>,
-        _table: &str,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
     ) -> Result<Schema> {
-        Err(unsupported("get_table_schema"))
+        crate::metadata::table_schema(&self.shared, catalog, schema, table)
     }
     fn get_table_types(&self) -> Result<Reader> {
-        Err(unsupported("get_table_types"))
+        crate::metadata::table_types()
     }
     fn get_statistic_names(&self) -> Result<Reader> {
         Err(unsupported("statistics"))

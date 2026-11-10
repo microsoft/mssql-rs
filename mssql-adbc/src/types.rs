@@ -151,7 +151,7 @@ impl ArrowRowWriter {
             self.fail(data("time value overflows Arrow time64"));
             return;
         };
-        if day < -EPOCH_DAYS || day > 3_652_058 - EPOCH_DAYS || nanos >= 86_400_000_000_000 {
+        if !(-EPOCH_DAYS..=3_652_058 - EPOCH_DAYS).contains(&day) || nanos >= 86_400_000_000_000 {
             self.fail(data("date/time outside SQL Server range"));
             return;
         }

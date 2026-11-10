@@ -114,6 +114,7 @@ pub mod message;
 pub mod query;
 pub mod security;
 pub(crate) mod sql_identifier;
+pub use sql_identifier::escape_identifier;
 pub(crate) mod ssrp;
 pub mod token;
 #[doc(hidden)]

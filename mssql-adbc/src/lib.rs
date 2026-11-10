@@ -5,7 +5,9 @@
 
 mod driver;
 mod error;
+mod metadata;
 pub mod options;
+mod parameters;
 mod runtime;
 mod statement;
 mod types;
