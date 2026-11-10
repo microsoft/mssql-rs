@@ -156,6 +156,170 @@ def test_windows_stress_builds_once_and_shares_attempt_scoped_artifact(
 _WINDOWS_E2E = _ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.ps1"
 
 
+def test_windows_pr_e2e_bounds_build_and_test_workers():
+    branch = next(
+        value for step in load_template("build-template.yml")["steps"]
+        for key, value in step.items()
+        if key.startswith("${{ if ") and "parameters.enableOdbcE2E" in key
+    )
+    command = next(step["pwsh"] for step in branch if "pwsh" in step)
+    assert "$jobs = [Math]::Min(4, [Environment]::ProcessorCount)" in command
+    assert "-BuildJobs $jobs -TestJobs $jobs" in command
+    assert "-Retries 3 -Coverage" in command
+    assert "-CompareWithMsodbcsql" in command
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("cmake", "ctest")),
+    reason="needs CMake and CTest",
+)
+def test_e2e_ctest_registration_protects_shared_resources(tmp_path):
+    # Configure the real project without downloading or compiling Google Test.
+    gtest = tmp_path / "googletest"
+    gtest.mkdir()
+    (gtest / "CMakeLists.txt").write_text(
+        "add_library(gtest INTERFACE)\nadd_library(gtest_main INTERFACE)\n",
+        encoding="utf-8",
+    )
+    build = tmp_path / "build"
+    result = subprocess.run(
+        ["cmake", "-S", str(_WINDOWS_E2E.parent), "-B", str(build),
+         f"-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST={gtest}",
+         "-DODBC_E2E_CONCURRENT=ON"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    result = subprocess.run(
+        ["ctest", "--show-only=json-v1", "-C", "Debug"], cwd=build,
+        capture_output=True, text=True, check=True,
+    )
+    tests = {
+        test["name"]: {prop["name"]: prop["value"] for prop in test["properties"]}
+        for test in json.loads(result.stdout)["tests"]
+    }
+    assert "escape_sequence_test_mt" in tests
+    for name, props in tests.items():
+        base = name.removesuffix("_mt")
+        assert props["RESOURCE_LOCK"] == [base]
+        assert props.get("RUN_SERIAL", False) == (base == "col_attribute_test")
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("pwsh", "ctest")),
+    reason="needs PowerShell and CTest",
+)
+@pytest.mark.parametrize("test_jobs", [1, 2, 4])
+def test_windows_ctest_workers_preserve_isolation_retries_and_results(tmp_path, test_jobs):
+    build = tmp_path / "build"
+    build.mkdir()
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import json, os, sys, time\n"
+        "from pathlib import Path\n"
+        "name = sys.argv[1]\n"
+        "target = os.environ['ODBC_TEST_TARGET']\n"
+        "path = Path(f'{target}-{name}.json')\n"
+        "failed = Path(f'{target}-{name}-failed.json')\n"
+        "retry = name == 'retry' and not failed.exists()\n"
+        "if retry: path = failed\n"
+        "start = time.monotonic()\n"
+        "time.sleep(0.3)\n"
+        "path.write_text(json.dumps(dict(start=start, end=time.monotonic(),\n"
+        "    target=target, driver=os.environ['ODBC_TEST_DRIVER'],\n"
+        "    dll=os.environ.get('MSSQL_ODBC_DLL', ''),\n"
+        "    threads=os.environ['MSSQL_ODBC_MT_THREADS'])))\n"
+        "sys.exit(1 if retry else 0)\n",
+        encoding="utf-8",
+    )
+    names = ("one", "one_mt", "two", "exclusive", "retry")
+    (build / "CTestTestfile.cmake").write_text(
+        "\n".join(
+            f'add_test({name} "{Path(sys.executable).as_posix()}" '
+            f'"{worker.as_posix()}" {name})'
+            for name in names
+        ) + '\nset_tests_properties(one one_mt PROPERTIES RESOURCE_LOCK one)\n'
+        'set_tests_properties(exclusive PROPERTIES RUN_SERIAL TRUE)\n',
+        encoding="utf-8",
+    )
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:RUNNER, [ref]$null, [ref]$null)
+foreach ($name in @('Invoke-CtestRun', 'Assert-TestsExecuted')) {
+    $function = $ast.Find({ param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $n.Name -eq $name
+    }, $true)
+    . ([scriptblock]::Create($function.Extent.Text))
+}
+$ScriptDir = $env:FIXTURE
+$TestJobs = [int]$env:TEST_JOBS
+$Retries = 1
+$FilterTests = ''
+$ExcludeTests = ''
+$script:MtStress = $false
+$env:ODBC_TEST_TARGET = 'outer'
+$env:ODBC_TEST_DRIVER = 'outer'
+$env:MSSQL_ODBC_DLL = 'outer'
+$env:MSSQL_ODBC_MT_THREADS = '8'
+foreach ($leg in @('mssql-odbc', 'msodbcsql')) {
+    $dll = if ($leg -eq 'mssql-odbc') { 'fixture.dll' } else { '' }
+    $rc = Invoke-CtestRun $leg "junit-$leg.xml" "$leg driver" $dll @{ MSSQL_ODBC_MT_THREADS = '2' }
+    if ($rc -ne 0) { throw "CTest failed: $rc" }
+    Assert-TestsExecuted "$ScriptDir\build\junit-$leg.xml" $leg
+    if ($env:ODBC_TEST_TARGET -ne 'outer' -or $env:ODBC_TEST_DRIVER -ne 'outer' -or
+        $env:MSSQL_ODBC_DLL -ne 'outer' -or $env:MSSQL_ODBC_MT_THREADS -ne '8') {
+        throw 'Leg environment was not restored'
+    }
+}
+"""
+    env = {**os.environ, "RUNNER": str(_WINDOWS_E2E), "FIXTURE": str(tmp_path),
+           "TEST_JOBS": str(test_jobs), "CTEST_PARALLEL_LEVEL": "64"}
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command], env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    legs = {}
+    for leg in ("mssql-odbc", "msodbcsql"):
+        assert f"{leg} leg executed 5 test(s)" in result.stdout
+        assert (build / f"junit-{leg}.xml").is_file()
+        records = {
+            name: json.loads((build / f"{leg}-{name}.json").read_text(encoding="utf-8"))
+            for name in names
+        }
+        records["retry-failed"] = json.loads(
+            (build / f"{leg}-retry-failed.json").read_text(encoding="utf-8")
+        )
+        legs[leg] = records
+        for record in records.values():
+            assert record["driver"] == f"{leg} driver"
+            assert record["dll"] == ("fixture.dll" if leg == "mssql-odbc" else "")
+            assert record["threads"] == "2"
+
+        def overlap(a, b):
+            return a["start"] < b["end"] and b["start"] < a["end"]
+
+        assert not overlap(records["one"], records["one_mt"])
+        assert not any(
+            overlap(records["exclusive"], record)
+            for name, record in records.items() if name != "exclusive"
+        )
+        events = sorted(
+            (record[key], delta) for record in records.values()
+            for key, delta in (("start", 1), ("end", -1))
+        )
+        active = peak = 0
+        for _, delta in events:
+            active += delta
+            peak = max(peak, active)
+        assert peak <= test_jobs
+        if test_jobs > 1:
+            assert peak > 1
+    assert max(record["end"] for record in legs["mssql-odbc"].values()) <= min(
+        record["start"] for record in legs["msodbcsql"].values()
+    )
+
+
 def _require_windows_cpp_toolchain():
     vswhere = Path(os.environ["ProgramFiles(x86)"]) / (
         "Microsoft Visual Studio/Installer/vswhere.exe"
@@ -363,7 +527,7 @@ function Get-MsodbcsqlDriverPath { return "$PSScriptRoot\reference.dll" }
 $source = [IO.File]::ReadAllText($env:RUNNER).Insert($main.Extent.StartOffset, $mocks + "`n")
 $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
 [IO.File]::WriteAllText($runner, $source)
-& $runner -SkipBuild -MtProfile nightly -CompareWithMsodbcsql -FilterTests $env:FIXTURE_FILTER
+& $runner -SkipBuild -MtProfile nightly -CompareWithMsodbcsql -TestJobs 2 -FilterTests $env:FIXTURE_FILTER
 """
     (consumer / "reference.dll").write_bytes(b"reference")
     dumps = consumer / "build" / "mt-dumps"
@@ -403,6 +567,8 @@ $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
         (["-SkipBuild", "-Coverage"], "-SkipBuild cannot be combined"),
         (["-SkipBuild", "-Release"], "-SkipBuild cannot be combined with -Release"),
         (["-BuildJobs", "0"], "BuildJobs"),
+        (["-TestJobs", "0"], "TestJobs"),
+        (["-TestJobs", "65"], "TestJobs"),
     ],
 )
 def test_windows_e2e_rejects_incompatible_build_options(args, error):

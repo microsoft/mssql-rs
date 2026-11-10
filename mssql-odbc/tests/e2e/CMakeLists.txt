@@ -208,11 +208,14 @@ function(odbc_register_ctest TEST_NAME)
             add_test(NAME ${TEST_NAME}_mt
                      COMMAND ${TEST_NAME} "--gtest_filter=${ODBC_MT_MODE_FILTER}")
         endif()
-        set_tests_properties(${TEST_NAME}_mt PROPERTIES SKIP_RETURN_CODE 77 LABELS mt)
+        # The two entries share fixture naming and must not run together.
+        set_tests_properties(${TEST_NAME}_mt PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS mt RESOURCE_LOCK ${TEST_NAME})
     else()
         add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
     endif()
-    set_tests_properties(${TEST_NAME} PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        SKIP_RETURN_CODE 77 RESOURCE_LOCK ${TEST_NAME})
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -261,6 +264,12 @@ add_odbc_test(set_env_attr_test  tests/set_env_attr_test.cpp)
 add_odbc_test(get_diag_rec_test  tests/get_diag_rec_test.cpp)
 add_odbc_test(describe_col_test  tests/describe_col_test.cpp)
 add_odbc_test(col_attribute_test tests/col_attribute_test.cpp)
+# Alias-type name lookups can deadlock with other suites' schema changes.
+foreach(entry col_attribute_test col_attribute_test_mt)
+    if(TEST ${entry})
+        set_tests_properties(${entry} PROPERTIES RUN_SERIAL TRUE)
+    endif()
+endforeach()
 add_odbc_test(fetch_scroll_test tests/fetch_scroll_test.cpp)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(get_data_iso88591_test

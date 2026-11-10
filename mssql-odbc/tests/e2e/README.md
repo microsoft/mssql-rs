@@ -637,9 +637,19 @@ the current PowerShell location. `-BuildOnly -Release` is rejected: the drop
 requires a debug driver with symbols.
 
 `-BuildJobs N` bounds parallel C++ build processes. The stress producer selects
-the smaller of four and the logical CPU count; other runner invocations retain
-the serial default of one. Test concurrency is unchanged. Measure build duration
-and memory use before increasing the limit.
+the smaller of four and the logical CPU count. Windows PR validation uses that
+same bound for both `-BuildJobs` and `-TestJobs`; other runner invocations retain
+the serial default of one. Measure build duration and memory use before
+increasing the limit.
+
+`-TestJobs N` bounds parallel CTest entries within each driver leg, independently
+of the threads inside an `_mt` entry. The Rust and msodbcsql legs remain
+sequential, preserving coverage and parity reporting. CTest resource locks keep
+an executable's single-threaded and `_mt` entries from overlapping. The
+`col_attribute_test` entries run exclusively because alias-type name lookups can
+deadlock with concurrent schema changes. Keep shared-resource restrictions in
+`CMakeLists.txt`, not runner-specific filters, so retries and manual CTest runs
+honor them too.
 
 The drop includes the driver, test binaries, and PDBs. Its generated CTest
 registration resolves executable paths relative to the downloaded drop, so
