@@ -43,6 +43,10 @@ For SDK authors integrating the native runtime:
 - [Bulk-copy behavior](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/docs/bulk-copy.md)
   for datetime string precision, offsets, and validation.
 
+For contributors, the
+[async pool context guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/src/pool/README.md)
+maps internal types and ownership; it does not describe an enabled pooling API.
+
 ## License
 
 Licensed under the [MIT License](https://github.com/microsoft/mssql-rs/blob/main/LICENSE).

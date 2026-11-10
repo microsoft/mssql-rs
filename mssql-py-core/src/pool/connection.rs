@@ -98,6 +98,7 @@ impl ConnectSpec {
     }
 }
 
+// A shared raw-client owner could outlive the slot; this handoff moves ownership.
 pub(crate) struct OpenedConnection {
     client: TdsClient,
     auth: AuthMetadata,
@@ -117,6 +118,7 @@ impl OpenedConnection {
     }
 }
 
+// Each open receives its own spec; do not retain shared "current request" state.
 #[async_trait]
 pub(crate) trait ConnectionFactory: Send + Sync {
     async fn open(

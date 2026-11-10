@@ -5,6 +5,7 @@
 #include "odbc_test_fixture.h"
 
 #include <array>
+#include <cstring>
 #include <string>
 
 class CallRoutingTest : public ODBCTest {
@@ -318,4 +319,51 @@ ODBC_TEST_F(CallRoutingTest, PreparedOutputDoesNotInheritPriorRpcReturnMapping) 
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     Exhaust();
     EXPECT_EQ(91, value);
+}
+
+// AB#50084: an input/output data-at-execution value before an input and an
+// output argument; each output returns to its own binding. Covers sp_prepexec,
+// sp_execute on the cached plan, and SQLExecDirect.
+//
+// Benefits-from-mock-tds: would assert the RETURNVALUE ordinals, pinned
+// meanwhile by tds_client.rs::value_binding.
+ODBC_TEST_F(CallRoutingTest, DataAtExecutionInputOutputPrecedesBoundAndOutputArguments) {
+    ExecDirect("CREATE PROCEDURE #route @a varchar(max) OUTPUT, @n int, @o int OUTPUT AS "
+               "SET @a = UPPER(@a) + CAST(@n AS varchar(11)); SET @o = @n * 2");
+    char text[32] = {};
+    SQLLEN text_length = SQL_DATA_AT_EXEC;
+    SQLINTEGER number = 0;
+    SQLLEN number_length = 0;
+    SQLINTEGER output = -1;
+    SQLLEN output_length = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT_OUTPUT, SQL_C_CHAR,
+                                  SQL_VARCHAR, 0, 0, text, sizeof(text), &text_length),
+                  SQL_HANDLE_STMT, stmt_);
+    BindInt(2, SQL_PARAM_INPUT, number, number_length);
+    BindInt(3, SQL_PARAM_OUTPUT, output, output_length);
+
+    const std::string call = "{call #route(?, ?, ?)}";
+    ASSERT_SQL_OK(Prepare(call), SQL_HANDLE_STMT, stmt_);
+    for (int pass = 0; pass < 3; ++pass) {
+        SCOPED_TRACE(pass == 0 ? "sp_prepexec" : pass == 1 ? "sp_execute" : "SQLExecDirect");
+        std::memset(text, 0, sizeof(text));
+        text_length = SQL_DATA_AT_EXEC;
+        number = 5 + pass;
+        output = -1;
+        ASSERT_EQ(SQL_NEED_DATA, pass < 2 ? SQLExecute(stmt_) : Direct(call))
+            << StmtDiagState();
+        SQLPOINTER requested = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &requested));
+        EXPECT_EQ(static_cast<SQLPOINTER>(text), requested);
+        char payload[] = "abc";
+        ASSERT_SQL_OK(SQLPutData(stmt_, payload, 3), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLParamData(stmt_, &requested), SQL_HANDLE_STMT, stmt_);
+        Exhaust();
+        const std::string expected = "ABC" + std::to_string(number);
+        EXPECT_EQ(expected, std::string(text));
+        EXPECT_EQ(static_cast<SQLLEN>(expected.size()), text_length);
+        EXPECT_EQ(number * 2, output);
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), output_length);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
 }

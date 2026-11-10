@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::config::validate_duration;
 use super::error::{AcquireStage, PoolError, PoolResult};
 
+// Every acquisition stage shares this deadline; stage labels never restart it.
 pub(crate) struct AcquireControl {
     deadline: Instant,
     cancel: CancellationToken,

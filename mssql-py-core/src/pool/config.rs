@@ -9,6 +9,8 @@ use tokio::time::Instant;
 
 use super::error::{PoolError, PoolResult};
 
+// Per-key limits and budgets, not live manager reconfiguration.
+// README.md maps these settings to the other foundation contracts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PoolConfig {
     max_size: NonZeroUsize,

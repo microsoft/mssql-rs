@@ -1128,7 +1128,7 @@ def test_crate_templates_resolve_in_self_repository():
         _PIPELINE.read_text(encoding="utf-8"),
         re.MULTILINE,
     )
-    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
+    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 3
 
 
 @pytest.mark.parametrize(
@@ -2074,20 +2074,10 @@ def test_release_switch_graph(values):
     to_feed, core, mock, dry_run, tag = values
     for stage in stages.values():
         for job in stage["jobs"]:
-            custom = job["pool"].get("isCustom", False)
+            assert not job["pool"].get("isCustom", False)
             assert not any("target" in step for step in job["steps"])
-            assert sum("checkout" in step for step in job["steps"]) == int(custom)
-            if custom:
-                assert stage["stage"] == "ReleaseCrates"
-                assert job["pool"] == {
-                    "type": "windows", "isCustom": True,
-                    "name": "Azure Pipelines", "vmImage": "windows-2022",
-                }
-                assert "ESRP Federated" not in str(job)
-                assert not any(step.get("task") in ("EsrpRelease@12", "NuGetCommand@2")
-                               for step in job["steps"])
-            else:
-                assert "test-cratesio-package.ps1" not in str(job)
+            assert not any("checkout" in step for step in job["steps"])
+            assert "test-cratesio-package.ps1" not in str(job)
             assert "continueOnError" not in job
             assert all("continueOnError" not in step for step in job["steps"])
 
@@ -2127,13 +2117,11 @@ def test_release_switch_graph(values):
         assert crates["dependsOn"] == []
         jobs = {job["job"]: job for job in crates["jobs"]}
         expected_jobs = {"ValidateCrates"}
-        if core or mock:
-            expected_jobs.add("RegistryPreflight")
         if not dry_run:
             if core:
-                expected_jobs.update(("PublishCore", "CoreAvailable"))
+                expected_jobs.add("PublishCore")
             if mock:
-                expected_jobs.update(("PublishMock", "MockAvailable"))
+                expected_jobs.add("PublishMock")
         assert set(jobs) == expected_jobs
         steps = [step for job in jobs.values() for step in job["steps"]]
         tasks = [step["displayName"] for step in steps if step.get("task") == "EsrpRelease@12"]
@@ -2149,22 +2137,19 @@ def test_release_switch_graph(values):
             assert downloads[0]["artifact"] == "drop_Build_RustCrates"
             job_names = [step.get("displayName") for step in job["steps"]]
             validation_index = job_names.index("Validate Rust crate release artifact")
-            assert validation_index == (2 if job["pool"].get("isCustom") else 1)
+            assert validation_index == 1
             validation = job["steps"][validation_index]
             assert "$(Pipeline.Workspace)/officialBuild/drop_Build_RustCrates" in validation["pwsh"]
-        if core or mock:
-            assert jobs["RegistryPreflight"]["dependsOn"] == "ValidateCrates"
-        assert ("Preflight mssql-tds version" in names) == core
-        assert ("Preflight mssql-mock-tds version" in names) == mock
-        assert ("Verify mssql-tds dependency is published" in names) == (mock and not core)
-        assert ("Wait for mssql-tds on crates.io" in names) == (core and not dry_run)
-        assert ("Verify mssql-mock-tds on crates.io" in names) == (mock and not dry_run)
+        assert "Preflight mssql-tds version" not in names
+        assert "Preflight mssql-mock-tds version" not in names
+        assert all("-ExpectedState Absent" not in step.get("pwsh", "") for step in steps)
+        assert "Verify mssql-tds dependency is published" not in names
+        assert "Wait for mssql-tds on crates.io" not in names
+        assert "Verify mssql-mock-tds on crates.io" not in names
         if core and not dry_run:
-            assert jobs["PublishCore"]["dependsOn"] == "RegistryPreflight"
-            assert jobs["CoreAvailable"]["dependsOn"] == "PublishCore"
+            assert jobs["PublishCore"]["dependsOn"] == "ValidateCrates"
         if mock and not dry_run:
-            assert jobs["PublishMock"]["dependsOn"] == ("CoreAvailable" if core else "RegistryPreflight")
-            assert jobs["MockAvailable"]["dependsOn"] == "PublishMock"
+            assert jobs["PublishMock"]["dependsOn"] == ("PublishCore" if core else "ValidateCrates")
         for job in jobs.values():
             for step in job["steps"]:
                 if step.get("task") == "EsrpRelease@12":
@@ -2223,10 +2208,9 @@ def test_release_switch_graph(values):
     (core, gate)
     for core in (False, True)
     for gate in (
-        "PublishRelease", "ValidateCrates", "RegistryPreflight",
-        "PublishCore", "CoreAvailable", "PublishMock", "MockAvailable",
+        "PublishRelease", "ValidateCrates", "PublishCore", "PublishMock",
     )
-    if core or gate not in ("PublishCore", "CoreAvailable")
+    if core or gate != "PublishCore"
 ])
 @pytest.mark.parametrize("result", ["Failed", "Canceled", "Skipped"])
 def test_release_gate_failure_propagation(core, failed_gate, result):
@@ -2250,13 +2234,13 @@ def test_release_gate_failure_propagation(core, failed_gate, result):
             else:
                 results[job["job"]] = "Succeeded"
     if failed_gate == "PublishRelease":
-        assert results["MockAvailable"] == "Succeeded"
+        assert results["PublishMock"] == "Succeeded"
     else:
         assert results["PublishRelease"] == "Succeeded"
-        assert results["MockAvailable"] != "Succeeded"
-        if failed_gate not in ("PublishMock", "MockAvailable"):
+        assert results["PublishMock"] != "Succeeded"
+        if failed_gate != "PublishMock":
             assert results["PublishMock"] == "Skipped"
-        if core and failed_gate in ("ValidateCrates", "RegistryPreflight"):
+        if core and failed_gate == "ValidateCrates":
             assert results["PublishCore"] == "Skipped"
     assert stages["Tag"]["dependsOn"] == "Release"
 
