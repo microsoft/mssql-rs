@@ -227,10 +227,11 @@ pub(super) enum Sweep {
     /// prepared one whose result has no rows left, since `FreeStmt` keeps it
     /// only while the cursor is on (`sqlcfunc.cpp:494-500`).
     EndTransaction,
-    /// [`Sweep::EndTransaction`] for cursors opened since an earlier
-    /// [`Sweep::Close`] of the same connection, leaving the statements that
-    /// sweep closed alone.
-    EndTransactionOpenCursors,
+    /// [`Sweep::EndTransaction`] after a [`Sweep::Close`] of the same
+    /// connection turned out to end a transaction. A statement whose cursor is
+    /// already closed keeps only a classification that sweep spared; its
+    /// diagnostics are left alone.
+    EndTransactionAfterClose,
 }
 
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
@@ -256,34 +257,37 @@ pub(super) enum Sweep {
 /// request next is unsafe, which an already-closed batch's stale diagnostic
 /// does not make true.
 ///
-/// `kept_until_ending` identifies a classification [`Sweep::Close`] kept that
-/// [`Sweep::EndTransaction`] would have dropped, so a caller that learns later
-/// that the transaction ended can drop it on the same evidence.
+/// With `spared`, [`Sweep::Close`] records each classification it keeps that
+/// [`Sweep::EndTransaction`] would keep too, for a later
+/// [`Sweep::EndTransactionAfterClose`] to leave in place.
 pub(super) fn close_cursor_for_connection_op(
     stmt: &StmtHandle,
     handle: SqlHandle,
     sweep: Sweep,
-    kept_until_ending: &mut Option<u64>,
+    spared: Option<&mut Vec<u64>>,
 ) -> SqlReturn {
     let _operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
-    let (pending_fetch_error, keep_classification) = {
+    let (pending_fetch_error, keep_classification, kept_through_ending) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
         };
         let cursor_open = stmt_state.has_state(STMT_STATE_CURSOR_OPEN);
-        if sweep == Sweep::EndTransactionOpenCursors && !cursor_open {
+        if sweep == Sweep::EndTransactionAfterClose && !cursor_open {
+            drop(stmt_state);
+            super::ird::clear_ird_classification_unless(
+                stmt,
+                spared.as_deref().map_or(&[], Vec::as_slice),
+            );
             return SQL_SUCCESS;
         }
         free_errors(&mut stmt_state);
         if !cursor_open {
             drop(stmt_state);
-            if sweep == Sweep::Close {
-                *kept_until_ending = super::ird::ird_classification_id(stmt);
-            } else {
+            if sweep != Sweep::Close {
                 super::ird::clear_ird_classification(stmt);
             }
             return SQL_SUCCESS;
@@ -295,14 +299,16 @@ pub(super) fn close_cursor_for_connection_op(
         let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
         let keep = prepared && (sweep == Sweep::Close || !no_rows_left);
         reset_cursor_state(&mut stmt_state);
-        if sweep == Sweep::Close && prepared && no_rows_left {
-            drop(stmt_state);
-            *kept_until_ending = super::ird::ird_classification_id(stmt);
-        }
-        (pending_fetch_error, keep)
+        (pending_fetch_error, keep, prepared && !no_rows_left)
     };
     if !keep_classification {
         super::ird::clear_ird_classification(stmt);
+    } else if sweep == Sweep::Close
+        && kept_through_ending
+        && let Some(spared) = spared
+        && let Some(id) = super::ird::ird_classification_id(stmt)
+    {
+        spared.push(id);
     }
 
     let outcome = abandon_and_release(stmt, handle);
@@ -1313,7 +1319,7 @@ mod tests {
             .wire
             .put_client_for_test(tds_client_from_tokens(vec![]));
 
-        let ret = close_cursor_for_connection_op(stmt, h.stmt, Sweep::Close, &mut None);
+        let ret = close_cursor_for_connection_op(stmt, h.stmt, Sweep::Close, None);
 
         assert_eq!(ret, SQL_SUCCESS);
         let ss = stmt.inner.lock().unwrap();

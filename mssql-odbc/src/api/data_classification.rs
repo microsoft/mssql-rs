@@ -973,47 +973,67 @@ mod tests {
         }
     }
 
+    fn set_autocommit(dbc: SqlHandle, value: u32) -> SqlReturn {
+        use crate::api::odbc_types::SQL_ATTR_AUTOCOMMIT;
+        unsafe { sql_set_connect_attr_w(dbc, SQL_ATTR_AUTOCOMMIT, value as usize as SqlPointer, 0) }
+    }
+
+    fn prepare_and_run(stmt: SqlHandle, fetches: usize) {
+        let text: Vec<SqlWChar> = CLASSIFIED.encode_utf16().collect();
+        let len = SqlInteger::try_from(text.len()).unwrap();
+        unsafe {
+            assert_eq!(sql_prepare_w(stmt, text.as_ptr(), len), SQL_SUCCESS);
+            assert_eq!(sql_execute(stmt), SQL_SUCCESS);
+            for _ in 0..fetches {
+                crate::api::SQLFetch(stmt);
+            }
+        }
+    }
+
+    fn prepare_run_and_close(stmt: SqlHandle) {
+        prepare_and_run(stmt, 0);
+        assert_eq!(unsafe { sql_close_cursor(stmt) }, SQL_SUCCESS);
+    }
+
     /// Another statement can add user work to the driver-begun transaction
     /// after the switch's first snapshot and before it claims the client. The
     /// switch must still commit that work, not roll it back as an empty
     /// transaction, and leave each classification as one transaction-ending
     /// sweep would: a closed prepared statement drops it, a prepared result
-    /// the late work left unread or on its last row keeps it, even on a
-    /// statement the first sweep found closed, and one it read to
-    /// `SQL_NO_DATA` drops it, whether that happened before the sweep or after.
+    /// left unread or on its last row keeps it, and one read to `SQL_NO_DATA`
+    /// drops it, whichever side of the first sweep the statement last ran on.
     #[test]
     fn user_work_added_during_the_autocommit_switch_is_committed() {
-        use crate::api::odbc_types::{SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON};
+        use crate::api::odbc_types::{
+            SQL_ATTR_CONNECTION_TIMEOUT, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+        };
 
-        let autocommit = |dbc: SqlHandle, value: u32| unsafe {
-            sql_set_connect_attr_w(dbc, SQL_ATTR_AUTOCOMMIT, value as usize as SqlPointer, 0)
-        };
-        let prepare_and_run = |stmt: SqlHandle, fetches: usize| {
-            let text: Vec<SqlWChar> = CLASSIFIED.encode_utf16().collect();
-            let len = SqlInteger::try_from(text.len()).unwrap();
-            unsafe {
-                assert_eq!(sql_prepare_w(stmt, text.as_ptr(), len), SQL_SUCCESS);
-                assert_eq!(sql_execute(stmt), SQL_SUCCESS);
-                for _ in 0..fetches {
-                    crate::api::SQLFetch(stmt);
-                }
-            }
-        };
         let (server, payload) = classified_server();
+        // A rollback would time out; only the commit answers in time.
+        server.register(
+            mssql_mock_tds::TM_ROLLBACK_DELAY_KEY,
+            QueryResponse::select_one().with_delay(Duration::from_secs(4)),
+        );
         let mut h = TestHandles::with_env_dbc();
         server.connect(h.dbc);
+        let timeout = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_CONNECTION_TIMEOUT, 1usize as SqlPointer, 0)
+        };
+        assert_eq!(timeout, SQL_SUCCESS);
         let closed = prepare_and_execute(&mut h, CLASSIFIED);
         assert_eq!(unsafe { sql_close_cursor(closed) }, SQL_SUCCESS);
         let reused = h.alloc_extra_stmt();
-        prepare_and_run(reused, 0);
-        assert_eq!(unsafe { sql_close_cursor(reused) }, SQL_SUCCESS);
-        assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
+        prepare_run_and_close(reused);
+        assert_eq!(set_autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
         let dbc = h.dbc;
         let exhausted = h.alloc_extra_stmt();
+        let spared_then_closed = h.alloc_extra_stmt();
         let unread = h.alloc_extra_stmt();
         let late = h.alloc_extra_stmt();
+        let late_closed = h.alloc_extra_stmt();
         crate::api::txn::test_hooks::set_after_autocommit_snapshot(move || {
             prepare_and_run(exhausted, 2);
+            prepare_and_run(spared_then_closed, 1);
             prepare_and_run(unread, 0);
             assert!(
                 unsafe { handle_from_raw::<DbcHandle>(dbc) }
@@ -1025,28 +1045,130 @@ mod tests {
         });
         crate::api::txn::test_hooks::set_after_autocommit_sweep(move || {
             prepare_and_run(late, 2);
+            prepare_run_and_close(late_closed);
+            prepare_run_and_close(spared_then_closed);
             prepare_and_run(reused, 1);
         });
 
-        assert_eq!(autocommit(h.dbc, SQL_AUTOCOMMIT_ON), SQL_SUCCESS_WITH_INFO);
+        assert_eq!(
+            set_autocommit(h.dbc, SQL_AUTOCOMMIT_ON),
+            SQL_SUCCESS_WITH_INFO
+        );
         assert_last_diag(
             &dbc_diags(h.dbc),
             crate::api::sqlstate::WARN_TRANSACTION_COMMITTED,
         );
-        assert_eq!(classification(ird(closed)).0, SQL_ERROR, "closed");
-        assert_eq!(classification(ird(exhausted)).0, SQL_ERROR, "exhausted");
-        assert_eq!(
-            classification(ird(unread)),
-            (SQL_SUCCESS, payload.clone()),
-            "unread"
-        );
-        assert_eq!(
-            classification(ird(reused)),
-            (SQL_SUCCESS, payload),
-            "reused"
-        );
-        assert_eq!(classification(ird(late)).0, SQL_ERROR, "late");
+        for (stmt, case) in [
+            (closed, "closed"),
+            (exhausted, "exhausted"),
+            (spared_then_closed, "spared then closed"),
+            (late, "late"),
+            (late_closed, "late closed"),
+        ] {
+            assert_eq!(classification(ird(stmt)).0, SQL_ERROR, "{case}");
+        }
+        for (stmt, case) in [(unread, "unread"), (reused, "reused")] {
+            assert_eq!(
+                classification(ird(stmt)),
+                (SQL_SUCCESS, payload.clone()),
+                "{case}"
+            );
+        }
     }
+
+    /// A statement that runs as soon as the autocommit switch releases the
+    /// connection keeps its cursor and classification: the switch finishes
+    /// ending the transaction before anything else can run.
+    #[test]
+    fn the_autocommit_switch_ends_the_transaction_before_releasing_the_connection() {
+        use crate::api::odbc_types::{SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON};
+
+        let (server, payload) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        assert_eq!(set_autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
+        let late = h.alloc_extra_stmt();
+        let next = h.alloc_extra_stmt();
+        crate::api::txn::test_hooks::set_after_autocommit_sweep(move || prepare_and_run(late, 2));
+        crate::api::txn::test_hooks::set_after_autocommit_release(move || prepare_and_run(next, 0));
+
+        assert_eq!(
+            set_autocommit(h.dbc, SQL_AUTOCOMMIT_ON),
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(classification(ird(late)).0, SQL_ERROR);
+        assert_eq!(classification(ird(next)), (SQL_SUCCESS, payload));
+        assert_eq!(unsafe { crate::api::SQLFetch(next) }, SQL_SUCCESS);
+    }
+
+    /// A parameter array that sends no set holds its classification aside
+    /// until it returns. The autocommit switch waits for that call before
+    /// judging the statement, so the classification it puts back is still
+    /// dropped.
+    #[test]
+    fn the_autocommit_switch_waits_for_a_parameter_array_that_sends_nothing() {
+        use crate::api::odbc_types::{
+            SQL_ATTR_PARAMSET_SIZE, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_C_CHAR, SQL_INTEGER,
+            SQL_NTS, SQL_PARAM_INPUT,
+        };
+
+        let (server, _) = classified_server();
+        let mut h = TestHandles::with_env_dbc();
+        server.connect(h.dbc);
+        let (mut id, mut id_len) = (1, 0);
+        let stmt = prepared_with_parameter(&mut h, &mut id, &mut id_len);
+        let mut values = *b"not-an-int\0nope\0\0\0\0\0\0\0";
+        let mut lengths = [SqlLen::from(SQL_NTS); 2];
+        unsafe {
+            assert_eq!(
+                crate::api::SQLSetStmtAttrW(stmt, SQL_ATTR_PARAMSET_SIZE, 2 as SqlPointer, 0),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                crate::api::SQLBindParameter(
+                    stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    values.as_mut_ptr().cast(),
+                    12,
+                    lengths.as_mut_ptr(),
+                ),
+                SQL_SUCCESS
+            );
+        }
+        assert_eq!(set_autocommit(h.dbc, SQL_AUTOCOMMIT_OFF), SQL_SUCCESS);
+        let late = h.alloc_extra_stmt();
+        let stmt_addr = stmt as usize;
+        let worker = Arc::new(std::sync::Mutex::new(None));
+        let worker_slot = Arc::clone(&worker);
+        crate::api::txn::test_hooks::set_after_autocommit_sweep(move || {
+            prepare_and_run(late, 2);
+            let (paused, wait_for_pause) = std::sync::mpsc::channel();
+            *worker_slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                crate::api::txn::test_hooks::set_after_unsent_array_release(move || {
+                    paused.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                });
+                unsafe { sql_execute(stmt_addr as SqlHandle) }
+            }));
+            wait_for_pause
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the parameter array never paused");
+        });
+
+        assert_eq!(
+            set_autocommit(h.dbc, SQL_AUTOCOMMIT_ON),
+            SQL_SUCCESS_WITH_INFO
+        );
+        let worker = worker.lock().unwrap().take().unwrap();
+        assert_eq!(worker.join().unwrap(), SQL_ERROR);
+        assert_eq!(classification(ird(stmt)).0, SQL_ERROR);
+    }
+
     /// Preparing new text drops the classification before anything executes
     /// (measured on msodbcsql 18.07.0001).
     #[test]

@@ -611,6 +611,8 @@ fn sql_execute_operation(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                     write_params_processed(outputs.params_processed_ptr, outputs.paramset_size);
                 }
                 return_client_idle(dbc, statement_handle, client);
+                #[cfg(test)]
+                super::txn::test_hooks::after_unsent_array_release();
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.clear_exhaustion_state();
                     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);

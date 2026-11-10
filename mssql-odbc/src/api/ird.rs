@@ -83,7 +83,7 @@ pub(super) fn clear_ird_classification(stmt: &StmtHandle) {
 }
 
 /// Identifies the classification `stmt` reports now, for
-/// [`clear_ird_classification_if`]. Call without the STMT lock held.
+/// [`clear_ird_classification_unless`]. Call without the STMT lock held.
 pub(super) fn ird_classification_id(stmt: &StmtHandle) -> Option<u64> {
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
     desc.inner
@@ -92,12 +92,13 @@ pub(super) fn ird_classification_id(stmt: &StmtHandle) -> Option<u64> {
         .and_then(|desc_state| desc_state.data_classification.as_ref().map(|c| c.id))
 }
 
-/// [`clear_ird_classification`] only while `stmt` still reports the
-/// classification `id` names, not one a later execute replaced it with.
-pub(super) fn clear_ird_classification_if(stmt: &StmtHandle, id: u64) {
+/// [`clear_ird_classification`] unless `stmt` still reports a classification
+/// `spared` names, rather than one a later execute replaced it with.
+pub(super) fn clear_ird_classification_unless(stmt: &StmtHandle, spared: &[u64]) {
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
     if let Ok(mut desc_state) = desc.inner.lock()
-        && desc_state.data_classification.as_ref().map(|c| c.id) == Some(id)
+        && let Some(classification) = &desc_state.data_classification
+        && !spared.contains(&classification.id)
     {
         desc_state.data_classification = None;
     }
