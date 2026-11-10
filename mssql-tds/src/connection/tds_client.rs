@@ -21,7 +21,7 @@ use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
     RequestText, RpcParameter, StatusFlags, StreamedSqlType, build_parameter_list_string,
 };
-use crate::message::rpc::{RpcProcs, RpcType, SqlRpc, ValueBinding};
+use crate::message::rpc::{RpcProcs, RpcType, SqlRpc, ValueBinding, write_rpc_value};
 use crate::message::transaction_management::{
     CreateTxnParams, TransactionIsolationLevel, TransactionManagementRequest,
     TransactionManagementType,
@@ -528,12 +528,13 @@ struct StreamedWriteContext {
     /// field (the unknown-length opener, or `PLP_NULL`) and the value chunks are
     /// appended afterwards by the streaming driver.
     message: SuspendedMessage,
-    /// Streamed parameters whose headers have not yet been written, in order.
+    /// Values after the open one, in caller order. Materialized ones are
+    /// written when the streamed value before them closes, as msodbcsql's
+    /// `AddRPCUserParameters` resumes at the next ordinal.
     pending: std::collections::VecDeque<RpcParameter>,
-    /// Collation used to write `TYPE_INFO` for subsequent streamed parameters.
+    /// Collation used to write `TYPE_INFO` for subsequent values.
     db_collation: SqlCollation,
-    /// Whether streamed values are sent with their names, as the RPC's
-    /// materialized values were.
+    /// Whether the remaining values are sent with their names.
     value_binding: ValueBinding,
     /// `true` once the unknown-length PLP opener (`PLP_UNKNOWN_LEN`) has been
     /// written for the currently-open parameter — i.e. at least one value chunk
@@ -558,6 +559,29 @@ struct StreamedPreparedContext {
     /// Parameter names of the issued plan's declaration, in order.
     declaration: Box<[String]>,
     orphaned: Option<StatementId>,
+}
+
+/// A streamed RPC's values in caller order, split at the first
+/// data-at-execution one.
+#[derive(Debug)]
+struct StreamedParams {
+    /// The RPC prefix.
+    leading: Vec<RpcParameter>,
+    /// The first data-at-execution value and everything after it.
+    trailing: std::collections::VecDeque<RpcParameter>,
+}
+
+impl StreamedParams {
+    fn in_order(&self) -> impl Iterator<Item = &RpcParameter> {
+        self.leading.iter().chain(&self.trailing)
+    }
+
+    /// The `@params` declaration.
+    fn declaration(&self) -> TdsResult<String> {
+        let mut declaration = String::new();
+        build_parameter_list_string(self.in_order(), &mut declaration)?;
+        Ok(declaration)
+    }
 }
 
 /// Cached row-buffering eligibility paired with the exact metadata allocation it describes.
@@ -2455,6 +2479,9 @@ impl TdsClient {
     /// the final server result is returned as
     /// [`StreamedParamStatus::Complete`].
     ///
+    /// Values are sent and declared in the order given; materialized values
+    /// after a streamed one are written when it closes.
+    ///
     /// Streamed parameters must be named and must use one of the
     /// [`StreamedSqlType`] variants. Streaming is not supported when Always
     /// Encrypted is active. Chunk bytes must use the representation required by
@@ -2486,16 +2513,16 @@ impl TdsClient {
 
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
-        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+        let params = Self::split_and_validate_streamed_params(
             named_params,
             &self.negotiated_settings.database_collation,
         )?;
 
-        if streamed_params.is_empty() {
+        if params.trailing.is_empty() {
             let result = self
                 .execute_sp_executesql(
                     sql,
-                    materialized_params,
+                    params.leading,
                     ExecuteOptions {
                         timeout: timeout_sec,
                         cancel: cancel_handle,
@@ -2514,29 +2541,23 @@ impl TdsClient {
             ));
         }
 
-        let mut params_list_as_string = String::new();
-        build_parameter_list_string(
-            materialized_params.iter().chain(&streamed_params),
-            &mut params_list_as_string,
-        )?;
+        let params_list_as_string = params.declaration()?;
         let statement = RequestText::new(sql)?;
         let declaration = RequestText::new(params_list_as_string)?;
 
         let (timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
-        self.ensure_parameter_features_supported(
-            materialized_params.iter().chain(streamed_params.iter()),
-        )?;
+        self.ensure_parameter_features_supported(params.in_order())?;
         let rpc = self.build_sp_executesql_rpc(
             statement,
             declaration,
-            materialized_params,
+            params.leading,
             &database_collation,
         );
 
         self.start_streamed_rpc(
             rpc,
-            streamed_params,
+            params.trailing,
             timeout_sec,
             cancel_handle,
             database_collation,
@@ -2609,23 +2630,44 @@ impl TdsClient {
         .with_value_binding(ValueBinding::ByOrdinal)
     }
 
+    /// Splits the values at the first data-at-execution one and validates the
+    /// rest up front: they are written on later calls, after earlier packets
+    /// may have left. `serialize_prefix` validates the prefix.
     fn split_and_validate_streamed_params(
         named_params: Vec<RpcParameter>,
         db_collation: &SqlCollation,
-    ) -> TdsResult<(Vec<RpcParameter>, Vec<RpcParameter>)> {
-        let (streamed_params, materialized_params): (Vec<_>, Vec<_>) = named_params
-            .into_iter()
-            .partition(RpcParameter::is_data_at_exec);
+    ) -> TdsResult<StreamedParams> {
+        let mut named_params = named_params.into_iter();
+        let mut leading = Vec::new();
+        let mut trailing = std::collections::VecDeque::new();
+        for param in named_params.by_ref() {
+            if param.is_data_at_exec() {
+                trailing.push_back(param);
+                break;
+            }
+            leading.push(param);
+        }
+        trailing.extend(named_params);
 
-        for param in &streamed_params {
+        for param in &trailing {
+            let streamed = param.is_data_at_exec();
             if param.name.is_none() {
-                return Err(UsageError("Streamed parameters must be named.".to_string()));
+                return Err(UsageError(
+                    if streamed {
+                        "Streamed parameters must be named."
+                    } else {
+                        "Named RPC parameters must have a name."
+                    }
+                    .to_string(),
+                ));
             }
             param.validate_named_before_send(db_collation)?;
-            param.validate_streamed_configuration()?;
+            if streamed {
+                param.validate_streamed_configuration()?;
+            }
         }
 
-        Ok((streamed_params, materialized_params))
+        Ok(StreamedParams { leading, trailing })
     }
 
     /// Sends the RPC prefix plus the first streamed parameter's header, then
@@ -2633,24 +2675,22 @@ impl TdsClient {
     async fn start_streamed_rpc(
         &mut self,
         rpc: SqlRpc<'_>,
-        streamed_params: Vec<RpcParameter>,
+        mut pending: std::collections::VecDeque<RpcParameter>,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
         database_collation: SqlCollation,
     ) -> TdsResult<StreamedParamStatus> {
-        let mut pending: std::collections::VecDeque<RpcParameter> =
-            streamed_params.into_iter().collect();
+        self.output_names_by_ordinal = rpc.output_names_by_ordinal(&pending);
         let first = pending
             .pop_front()
-            .expect("streamed_params checked non-empty above");
+            .expect("a streamed RPC starts its trailing values with a streamed one");
+        debug_assert!(first.is_data_at_exec());
         let first_name = first
             .name
             .clone()
             .expect("streamed parameter names validated above");
         let xml_bom_state = StreamedXmlBomState::for_param(&first);
         let value_binding = rpc.value_binding();
-        self.output_names_by_ordinal =
-            rpc.output_names_by_ordinal(std::iter::once(&first).chain(&pending));
 
         let mut packet_writer =
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
@@ -3358,9 +3398,9 @@ impl TdsClient {
 
         let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
 
-        // Close the current value, then either open the next streamed parameter's
-        // header or (for the last one) finalize the send. Anything that fails
-        // mid-message aborts the whole streamed write.
+        // Close the current value, write the materialized values up to the next
+        // streamed one, then either open that one's header or finalize the
+        // send. Anything that fails mid-message aborts the whole streamed write.
         let write_outcome = async {
             if null_signaled {
                 // NULL: the length field is PLP_NULL and no chunks/terminator
@@ -3384,27 +3424,35 @@ impl TdsClient {
                 }
                 packet_writer.write_u32_async(PLP_TERMINATOR).await?;
             }
-            match pending.pop_front() {
-                Some(next) => {
-                    let next_name = next
-                        .name
-                        .clone()
-                        .expect("streamed parameter names validated at begin");
-                    let next_xml_bom_state = StreamedXmlBomState::for_param(&next);
-                    next.serialize(
+            let encoder = GenericEncoder::new();
+            while let Some(next) = pending.pop_front() {
+                if !next.is_data_at_exec() {
+                    write_rpc_value(
+                        &next,
                         &mut packet_writer,
                         &db_collation,
-                        value_binding == ValueBinding::ByOrdinal,
-                        &GenericEncoder::new(),
+                        value_binding,
+                        &encoder,
                     )
                     .await?;
-                    Ok(Some((next_name, next_xml_bom_state)))
+                    continue;
                 }
-                None => {
-                    packet_writer.finalize().await?;
-                    Ok(None)
-                }
+                let next_name = next
+                    .name
+                    .clone()
+                    .expect("streamed parameter names validated at begin");
+                let next_xml_bom_state = StreamedXmlBomState::for_param(&next);
+                next.serialize(
+                    &mut packet_writer,
+                    &db_collation,
+                    value_binding == ValueBinding::ByOrdinal,
+                    &encoder,
+                )
+                .await?;
+                return Ok(Some((next_name, next_xml_bom_state)));
             }
+            packet_writer.finalize().await?;
+            Ok(None)
         }
         .await;
 
@@ -3452,12 +3500,10 @@ impl TdsClient {
             // the response exactly like execute_sp_executesql does. An
             // acknowledged ATTENTION costs only this request, not the session.
             Ok(None) => {
-                // The materialized parameters in this message's prefix were
-                // serialized calls ago; the flag rode along on the suspended
-                // message, and this is the only point at which the whole
-                // message is known to be complete. OR rather than assign: the
-                // streamed chunks in between reported their own substitutions
-                // through `note_code_page_conversion_loss`.
+                // Values written in the prefix and after earlier resumes
+                // flagged the suspended message; this is the first point the
+                // whole message is complete. OR rather than assign: streamed
+                // chunks report through `note_code_page_conversion_loss`.
                 self.code_page_conversion_loss |= message.code_page_conversion_loss();
                 drop(message);
                 match self.position_on_first_result().await {
@@ -4501,6 +4547,9 @@ impl TdsClient {
     /// [`execute_prepared`](Self::execute_prepared) and reports
     /// [`StreamedParamStatus::Complete`].
     ///
+    /// Values are sent and declared in the order given, so a later execute
+    /// supplying them in that order binds by ordinal.
+    ///
     /// Close each parameter with
     /// [`end_execute_prepared_param`](Self::end_execute_prepared_param), passing
     /// the same statement and orphan slot. `sp_prepexec` carries the orphan in
@@ -4534,14 +4583,14 @@ impl TdsClient {
         self.current_command_ce_setting = opts.column_encryption;
         self.ensure_force_column_encryption_supported(named_params.iter())?;
 
-        let (streamed_params, materialized_params) = Self::split_and_validate_streamed_params(
+        let params = Self::split_and_validate_streamed_params(
             named_params,
             &self.negotiated_settings.database_collation,
         )?;
 
-        if streamed_params.is_empty() {
+        if params.trailing.is_empty() {
             let result = self
-                .execute_prepared(statement, materialized_params, orphaned, opts)
+                .execute_prepared(statement, params.leading, orphaned, opts)
                 .await?;
             return Ok(StreamedParamStatus::Complete(result));
         }
@@ -4559,9 +4608,7 @@ impl TdsClient {
         let (mut timeout_sec, _request_timeout, database_collation) =
             self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
 
-        self.ensure_parameter_features_supported(
-            materialized_params.iter().chain(streamed_params.iter()),
-        )?;
+        self.ensure_parameter_features_supported(params.in_order())?;
 
         if orphaned.is_some_and(|id| !self.prepared_handles.contains_key(&id)) {
             *orphaned = None;
@@ -4595,13 +4642,11 @@ impl TdsClient {
                 // `@params` string the streamed entries have to appear in.
                 let handle_parameter =
                     RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
-                // Streamed values follow the materialized ones on the wire.
-                let binding =
-                    statement.value_binding(materialized_params.iter().chain(&streamed_params));
+                let binding = statement.value_binding(params.in_order());
                 let rpc = SqlRpc::new(
                     RpcType::ProcId(RpcProcs::Execute),
                     Some(vec![handle_parameter]),
-                    Some(materialized_params),
+                    Some(params.leading),
                     &database_collation,
                     &self.execution_context,
                 )
@@ -4611,10 +4656,8 @@ impl TdsClient {
             None => {
                 // The `@params` declaration covers the streamed parameters too,
                 // even though their values arrive later.
-                let declaration_params = || materialized_params.iter().chain(&streamed_params);
-                let mut params_list_as_string = String::new();
-                build_parameter_list_string(declaration_params(), &mut params_list_as_string)?;
-                let declaration = declared_names(declaration_params());
+                let params_list_as_string = params.declaration()?;
+                let declaration = declared_names(params.in_order());
 
                 let statement_parameter =
                     RpcParameter::request_text(RequestText::new(statement.sql.clone())?);
@@ -4633,7 +4676,7 @@ impl TdsClient {
                         params_parameter,
                         statement_parameter,
                     ]),
-                    Some(materialized_params),
+                    Some(params.leading),
                     &database_collation,
                     &self.execution_context,
                 )
@@ -4655,7 +4698,7 @@ impl TdsClient {
         let status = self
             .start_streamed_rpc(
                 rpc,
-                streamed_params,
+                params.trailing,
                 timeout_sec,
                 opts.cancel,
                 database_collation,
@@ -9836,8 +9879,8 @@ impl PreparedStatement {
     }
 
     /// `sp_execute` binds `values` by ordinal only when they arrive in the
-    /// order the plan declared them. A plan prepared with streamed values
-    /// declares those last, and a caller may supply names in another order.
+    /// order the plan declared them. A caller may supply names in another
+    /// order, and a plan of unknown origin has no recorded declaration.
     fn value_binding<'p>(
         &self,
         values: impl IntoIterator<Item = &'p RpcParameter>,
@@ -24830,85 +24873,6 @@ mod tests {
             assert!(contains(&bytes, &NAMED_INT_7));
         }
 
-        /// Streamed values follow the materialized ones on the wire, and the
-        /// declaration lists them in the same order.
-        #[tokio::test]
-        async fn streamed_sp_executesql_sends_every_value_unnamed_in_declaration_order() {
-            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
-            let status = client
-                .begin_sp_executesql(
-                    "SELECT @P1, @P2".to_string(),
-                    vec![
-                        streamed_varbinary("@P1"),
-                        int_param("@P2", Some(7), StatusFlags::NONE),
-                    ],
-                    (),
-                )
-                .await
-                .unwrap();
-            assert!(
-                matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@P1")
-            );
-            client.write_streamed_chunk(&[1, 2]).await.unwrap();
-            client.end_streamed_param().await.unwrap();
-            let bytes = take_sent(&sent);
-            assert!(contains(&bytes, &utf16le("@P2 int,@P1 varbinary(max)")));
-            let value = bytes.windows(9).position(|w| w == UNNAMED_INT_7).unwrap();
-            let streamed = bytes
-                .windows(5)
-                .position(|w| w == UNNAMED_STREAMED_VARBINARY)
-                .unwrap();
-            assert!(value < streamed, "materialized value first, as declared");
-            assert!(!contains(&bytes, &NAMED_P));
-        }
-
-        /// A plan prepared with a streamed value declares that value last, so a
-        /// later execute supplying the values in ordinal order stays named.
-        #[tokio::test]
-        async fn execute_of_a_streamed_prepexec_plan_sends_reordered_values_named() {
-            let (mut client, sent) =
-                create_capturing_client(vec![handle_token(55), done_no_more(), done_no_more()]);
-            let mut statement = PreparedStatement::new("SELECT @P1, @P2");
-            let mut orphan = None;
-            client
-                .begin_execute_prepared(
-                    &mut statement,
-                    vec![
-                        streamed_varbinary("@P1"),
-                        int_param("@P2", Some(7), StatusFlags::NONE),
-                    ],
-                    &mut orphan,
-                    (),
-                )
-                .await
-                .unwrap();
-            client.write_streamed_chunk(&[1, 2]).await.unwrap();
-            client
-                .end_execute_prepared_param(&mut statement, &mut orphan)
-                .await
-                .unwrap();
-            client.close_query().await.unwrap();
-            let bytes = take_sent(&sent);
-            assert!(contains(&bytes, &[0xFF, 0xFF, 13, 0]));
-            assert!(!contains(&bytes, &NAMED_P));
-
-            client
-                .execute_prepared(
-                    &mut statement,
-                    vec![
-                        int_param("@P1", Some(1), StatusFlags::NONE),
-                        int_param("@P2", Some(7), StatusFlags::NONE),
-                    ],
-                    &mut orphan,
-                    (),
-                )
-                .await
-                .unwrap();
-            let bytes = take_sent(&sent);
-            assert!(contains(&bytes, &[0xFF, 0xFF, 12, 0]));
-            assert!(contains(&bytes, &NAMED_P1));
-        }
-
         #[tokio::test]
         async fn materialized_tvp_is_sent_unnamed() {
             let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
@@ -25039,6 +25003,523 @@ mod tests {
             let values = client.get_return_values();
             assert_eq!(values.len(), 1);
             assert_eq!(values[0].param_name, "@P2");
+        }
+
+        /// UTF-16LE `@params` declaration of `params`, in the given order.
+        fn declaration(params: &[RpcParameter]) -> Vec<u8> {
+            let mut declaration = String::new();
+            build_parameter_list_string(&params.to_vec(), &mut declaration).unwrap();
+            utf16le(&declaration)
+        }
+
+        fn unnamed_int(value: i32) -> Vec<u8> {
+            let mut bytes = vec![0x00, 0x00, 0x26, 0x04, 0x04];
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes
+        }
+
+        fn position(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("{needle:02X?} was not sent"))
+        }
+
+        fn pending_names(client: &TdsClient) -> Vec<&str> {
+            match &client.streamed_write_state {
+                StreamedWriteState::Active(ctx) => ctx
+                    .pending
+                    .iter()
+                    .filter_map(|p| p.name.as_deref())
+                    .collect(),
+                StreamedWriteState::Idle => Vec::new(),
+            }
+        }
+
+        fn varbinary_value(name: &str, byte: u8) -> RpcParameter {
+            RpcParameter::new(
+                Some(name.to_string()),
+                StatusFlags::NONE,
+                SqlType::VarBinaryMax(Some(vec![byte])),
+            )
+        }
+
+        /// Drives every streamed parameter of a parked RPC with one chunk each,
+        /// returning the parameters in the order they were opened.
+        async fn stream_each(
+            client: &mut TdsClient,
+            mut status: StreamedParamStatus,
+            mut prepared: Option<(&mut PreparedStatement, &mut Option<StatementId>)>,
+        ) -> Vec<String> {
+            let mut opened = Vec::new();
+            while let StreamedParamStatus::NeedData { param_name } = status {
+                let marker = 0xA0 + param_name.as_bytes()[2] - b'0';
+                client.write_streamed_chunk(&[marker; 4]).await.unwrap();
+                opened.push(param_name);
+                status = match prepared.as_mut() {
+                    Some((statement, orphan)) => client
+                        .end_execute_prepared_param(statement, orphan)
+                        .await
+                        .unwrap(),
+                    None => client.end_streamed_param().await.unwrap(),
+                };
+            }
+            assert!(matches!(status, StreamedParamStatus::Complete(_)));
+            opened
+        }
+
+        /// Materialized values before, between and after streamed ones keep
+        /// their positions in the declaration and on the wire.
+        #[tokio::test]
+        async fn streamed_values_first_middle_and_last_are_sent_in_caller_order() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            let status = client
+                .begin_sp_executesql(
+                    "SELECT @P0, @P1, @P2, @P3, @P4, @P5".to_string(),
+                    vec![
+                        int_param("@P0", Some(77), StatusFlags::NONE),
+                        streamed_varbinary("@P1"),
+                        int_param("@P2", Some(2), StatusFlags::NONE),
+                        streamed_varbinary("@P3"),
+                        int_param("@P4", Some(4), StatusFlags::NONE),
+                        streamed_varbinary("@P5"),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(pending_names(&client), ["@P2", "@P3", "@P4", "@P5"]);
+            let opened = stream_each(&mut client, status, None).await;
+            assert_eq!(opened, ["@P1", "@P3", "@P5"]);
+
+            let bytes = take_sent(&sent);
+            assert!(contains(
+                &bytes,
+                &declaration(&[
+                    int_param("@P0", None, StatusFlags::NONE),
+                    streamed_varbinary("@P1"),
+                    int_param("@P2", None, StatusFlags::NONE),
+                    streamed_varbinary("@P3"),
+                    int_param("@P4", None, StatusFlags::NONE),
+                    streamed_varbinary("@P5"),
+                ])
+            ));
+            let order = [
+                position(&bytes, &unnamed_int(77)),
+                position(&bytes, &[0xA1; 4]),
+                position(&bytes, &unnamed_int(2)),
+                position(&bytes, &[0xA3; 4]),
+                position(&bytes, &unnamed_int(4)),
+                position(&bytes, &[0xA5; 4]),
+            ];
+            assert!(order.is_sorted(), "{order:?}");
+            assert!(!contains(&bytes, &NAMED_P));
+        }
+
+        /// ADO 50084: a scalar execute and a parameter array reuse the streamed
+        /// `sp_prepexec` plan by ordinal.
+        #[tokio::test]
+        async fn streamed_prepexec_plan_binds_later_scalar_and_array_values_in_order() {
+            let (mut client, sent) = create_capturing_client(vec![
+                handle_token(9),
+                done_no_more(),
+                done_no_more(),
+                batch_done_in_proc(1),
+                batch_done_proc(true, false),
+                batch_done_in_proc(1),
+                batch_done_proc(false, false),
+            ]);
+            let mut statement = PreparedStatement::new("INSERT INTO t(s, n) VALUES (@P1, @P2)");
+            let mut orphan = None;
+            let status = client
+                .begin_execute_prepared(
+                    &mut statement,
+                    vec![
+                        streamed_varbinary("@P1"),
+                        int_param("@P2", Some(1), StatusFlags::NONE),
+                    ],
+                    &mut orphan,
+                    (),
+                )
+                .await
+                .unwrap();
+            stream_each(&mut client, status, Some((&mut statement, &mut orphan))).await;
+            client.close_query().await.unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xFF, 0xFF, 13, 0]));
+            assert!(contains(
+                &bytes,
+                &declaration(&[
+                    streamed_varbinary("@P1"),
+                    int_param("@P2", None, StatusFlags::NONE)
+                ])
+            ));
+            assert!(position(&bytes, &[0xA1; 4]) < position(&bytes, &unnamed_int(1)));
+
+            let row = |byte: u8, n: i32| {
+                vec![
+                    varbinary_value("@P1", byte),
+                    int_param("@P2", Some(n), StatusFlags::NONE),
+                ]
+            };
+            client
+                .execute_prepared(&mut statement, row(0xBB, 2), &mut orphan, ())
+                .await
+                .unwrap();
+            client.close_query().await.unwrap();
+            let bytes = take_sent(&sent);
+            assert!(contains(&bytes, &[0xFF, 0xFF, 12, 0]));
+            assert!(contains(&bytes, &unnamed_int(2)));
+            assert!(!contains(&bytes, &NAMED_P), "binds by ordinal");
+
+            let result = client
+                .execute_prepared_batch(
+                    &mut statement,
+                    vec![Ok((0, row(42, 7))), Ok((1, row(43, 8)))],
+                    &mut orphan,
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.rows.len(), 2);
+            let bytes = take_sent(&sent);
+            assert!(
+                !contains(&bytes, &[0xFF, 0xFF, 11, 0]),
+                "the array reuses the streamed plan rather than sp_prepare"
+            );
+            assert!(contains(
+                &bytes,
+                &[0x00, 0x00, 0x26, 0x04, 0x04, 9, 0, 0, 0]
+            ));
+            let varbinary = position(&bytes, &UNNAMED_STREAMED_VARBINARY);
+            assert!(varbinary < position(&bytes, &unnamed_int(7)));
+        }
+
+        /// An output after a streamed value takes its caller-position ordinal.
+        #[tokio::test]
+        async fn output_after_a_streamed_value_is_reported_under_its_declared_name() {
+            let (mut client, _sent) =
+                create_capturing_client(vec![output_token(3, 8), done_no_more()]);
+            client
+                .begin_sp_executesql(
+                    "SET @P2 = 8".to_string(),
+                    vec![
+                        streamed_varbinary("@P1"),
+                        int_param("@P2", None, StatusFlags::BY_REF_VALUE),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.output_names_by_ordinal, [(3, "@P2".to_string())]);
+            client.end_streamed_param().await.unwrap();
+            client.close_query().await.unwrap();
+            let values = client.get_return_values();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].param_name, "@P2");
+            assert_eq!(values[0].value, ColumnValues::Int(8));
+        }
+
+        /// An output between two streamed values keeps its caller ordinal on the
+        /// `sp_prepexec` and on the `sp_execute` that reuses the plan.
+        #[tokio::test]
+        async fn prepared_output_between_streamed_values_keeps_its_ordinal() {
+            let (mut client, sent) = create_capturing_client(vec![
+                handle_token(55),
+                output_token(4, 8),
+                done_no_more(),
+                output_token(2, 9),
+                done_no_more(),
+            ]);
+            let mut statement = PreparedStatement::new("SET @P2 = 8");
+            let mut orphan = None;
+            for (proc_id, ordinal, value) in [(13u8, 4u16, 8), (12, 2, 9)] {
+                let status = client
+                    .begin_execute_prepared(
+                        &mut statement,
+                        vec![
+                            streamed_varbinary("@P1"),
+                            int_param("@P2", None, StatusFlags::BY_REF_VALUE),
+                            streamed_varbinary("@P3"),
+                        ],
+                        &mut orphan,
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    client.output_names_by_ordinal,
+                    [(ordinal, "@P2".to_string())],
+                    "proc {proc_id}"
+                );
+                let opened =
+                    stream_each(&mut client, status, Some((&mut statement, &mut orphan))).await;
+                assert_eq!(opened, ["@P1", "@P3"]);
+                client.close_query().await.unwrap();
+                let bytes = take_sent(&sent);
+                assert!(
+                    contains(&bytes, &[0xFF, 0xFF, proc_id, 0]),
+                    "proc {proc_id}"
+                );
+                assert!(!contains(&bytes, &NAMED_P), "proc {proc_id}");
+                let values = client.get_return_values();
+                assert_eq!(values.len(), 1, "proc {proc_id}");
+                assert_eq!(values[0].param_name, "@P2", "proc {proc_id}");
+                assert_eq!(values[0].value, ColumnValues::Int(value));
+            }
+        }
+
+        /// Values after the first streamed one are validated before anything is
+        /// sent, including one that only fails once encoded.
+        #[tokio::test]
+        async fn invalid_value_after_a_streamed_one_is_rejected_before_anything_is_sent() {
+            let (mut client, sent) = create_capturing_client(vec![]);
+            let long_name = format!("@{}", "x".repeat(300));
+            let over_encoded = RpcParameter::new(
+                Some("@P2".to_string()),
+                StatusFlags::NONE,
+                SqlType::Variant(Box::new(SqlType::Varchar(
+                    Some(SqlString::new(
+                        "\u{65E5}".repeat(8001).into_bytes(),
+                        crate::datatypes::sql_string::EncodingType::Utf8,
+                    )),
+                    8000,
+                ))),
+            );
+            for trailing in [
+                RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(7))),
+                int_param(&long_name, Some(7), StatusFlags::NONE),
+                over_encoded,
+            ] {
+                let error = client
+                    .begin_sp_executesql(
+                        "SELECT 1".to_string(),
+                        vec![streamed_varbinary("@P1"), trailing],
+                        (),
+                    )
+                    .await
+                    .expect_err("an invalid value is refused at begin");
+                assert!(
+                    matches!(error, UsageError(_) | Error::EncodedValueTooLong { .. }),
+                    "{error}"
+                );
+                assert!(sent.lock().unwrap().is_empty());
+                assert!(matches!(
+                    client.streamed_write_state,
+                    StreamedWriteState::Idle
+                ));
+            }
+        }
+
+        /// A lossy narrow value written after a resume still marks the message.
+        #[tokio::test]
+        async fn code_page_loss_after_a_streamed_value_is_reported() {
+            for (text, lossy) in [("abc", false), ("\u{65E5}", true)] {
+                let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+                client
+                    .begin_sp_executesql(
+                        "SELECT @P1, @P2".to_string(),
+                        vec![
+                            streamed_varbinary("@P1"),
+                            RpcParameter::new(
+                                Some("@P2".to_string()),
+                                StatusFlags::NONE,
+                                SqlType::Varchar(
+                                    Some(SqlString::from_utf8_string(text.to_string())),
+                                    10,
+                                ),
+                            ),
+                        ],
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                client.end_streamed_param().await.unwrap();
+                assert_eq!(client.take_code_page_conversion_loss(), lossy, "{text}");
+            }
+        }
+
+        /// Cancelling mid-stream never sends the values after the open one.
+        #[tokio::test]
+        async fn cancel_with_values_after_the_open_stream_withdraws_them() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more(), done_no_more()]);
+            client
+                .begin_sp_executesql(
+                    "SELECT @P1, @P2".to_string(),
+                    vec![
+                        streamed_varbinary("@P1"),
+                        int_param("@P2", Some(0x5A5A_5A5A), StatusFlags::NONE),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            client
+                .write_streamed_chunk(&vec![0xABu8; 10_000])
+                .await
+                .unwrap();
+            client.cancel_streamed_write().await;
+            assert!(matches!(
+                client.streamed_write_state,
+                StreamedWriteState::Idle
+            ));
+            assert!(!client.is_connection_dead());
+            let wire = sent.lock().unwrap().clone();
+            assert!(!contains(&wire, &unnamed_int(0x5A5A_5A5A)));
+
+            client
+                .execute_sp_executesql(
+                    "SELECT @P1".to_string(),
+                    vec![int_param("@P1", Some(7), StatusFlags::NONE)],
+                    (),
+                )
+                .await
+                .unwrap();
+            let wire = sent.lock().unwrap().clone();
+            assert!(!contains(&wire, &unnamed_int(0x5A5A_5A5A)));
+        }
+
+        /// A value written after a resume can span packets.
+        #[tokio::test]
+        async fn values_after_a_resume_survive_packet_boundaries() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            let text: String = (0..3000)
+                .map(|i| char::from(b'a' + (i % 26) as u8))
+                .collect();
+            let status = client
+                .begin_sp_executesql(
+                    "SELECT @P1, @P2, @P3".to_string(),
+                    vec![
+                        streamed_varbinary("@P1"),
+                        RpcParameter::new(
+                            Some("@P2".to_string()),
+                            StatusFlags::NONE,
+                            SqlType::NVarchar(
+                                Some(SqlString::from_utf8_string(text.clone())),
+                                4000,
+                            ),
+                        ),
+                        streamed_varbinary("@P3"),
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+            let first = vec![0xA1u8; 9_000];
+            let last = vec![0xA3u8; 9_000];
+            client.write_streamed_chunk(&first).await.unwrap();
+            client.end_streamed_param().await.unwrap();
+            let packets_after_resume = sent.lock().unwrap().len();
+            assert!(packets_after_resume > 0, "earlier packets already left");
+            client.write_streamed_chunk(&last).await.unwrap();
+            client.end_streamed_param().await.unwrap();
+
+            let bytes = take_sent(&sent);
+            let order = [
+                position(&bytes, &first),
+                position(&bytes, &utf16le(&text)),
+                position(&bytes, &last),
+            ];
+            assert!(order.is_sorted(), "{order:?}");
+        }
+
+        /// Every way of closing a streamed value (empty XML, NULL) is followed
+        /// directly by the next value, including a TVP.
+        #[tokio::test]
+        async fn every_streamed_close_is_followed_by_the_next_value() {
+            let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+            let tvp = RpcParameter::new(
+                Some("@P4".to_string()),
+                StatusFlags::NONE,
+                SqlType::Table(
+                    TvpTypeName::new(Some("dbo".to_string()), "IntList".to_string()),
+                    Some(TvpTableData::new(
+                        vec![TvpColumnDef::new(SqlType::Int(None))],
+                        vec![vec![SqlType::Int(Some(5))]],
+                    )),
+                ),
+            );
+            let status = client
+                .begin_sp_executesql(
+                    "SELECT @P1, @P2, @P3, @P4".to_string(),
+                    vec![
+                        streamed_xml("@P1"),
+                        int_param("@P2", Some(2), StatusFlags::NONE),
+                        streamed_varbinary("@P3"),
+                        tvp,
+                    ],
+                    (),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@P1")
+            );
+            let status = client.end_streamed_param().await.unwrap();
+            assert!(
+                matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@P3")
+            );
+            client.write_streamed_null().unwrap();
+            assert!(matches!(
+                client.end_streamed_param().await.unwrap(),
+                StreamedParamStatus::Complete(_)
+            ));
+
+            let bytes = take_sent(&sent);
+            let mut empty_xml = PLP_UNKNOWN_LEN_BYTES.to_vec();
+            empty_xml.extend_from_slice(&[2, 0, 0, 0, 0xFF, 0xFE]);
+            empty_xml.extend_from_slice(&PLP_TERMINATOR_BYTES);
+            empty_xml.extend_from_slice(&unnamed_int(2));
+            assert!(contains(&bytes, &empty_xml), "XML closes, then @P2");
+            let mut null_then_tvp = PLP_NULL_BYTES.to_vec();
+            null_then_tvp.extend_from_slice(&[0x00, 0x00, 0xF3]);
+            assert!(
+                contains(&bytes, &null_then_tvp),
+                "NULL closes, then the TVP"
+            );
+            assert!(!contains(&bytes, &NAMED_P));
+        }
+
+        /// A streamed RPC with an encrypted output is refused before it is built.
+        #[tokio::test]
+        async fn streamed_rpc_with_an_encrypted_output_is_refused() {
+            use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+            use crate::message::login::Feature;
+
+            let mut negotiated_settings =
+                crate::handler::handler_factory::create_test_negotiated_settings_internal();
+            let mut feature = AlwaysEncryptedFeature::default();
+            feature.set_acknowledged(true);
+            negotiated_settings
+                .session_settings
+                .supported_features
+                .push(Box::new(feature));
+            let mut client = TdsClient::new(
+                AnyTransport::dynamic(TestTransport::new()),
+                negotiated_settings,
+                crate::connection::execution_context::ExecutionContext::new(),
+                ClientContext::with_data_source("tcp:localhost,1433"),
+                Vec::new(),
+            );
+            let error = client
+                .begin_sp_executesql(
+                    "SET @P2 = 1".to_string(),
+                    vec![
+                        streamed_varbinary("@P1"),
+                        encrypted(int_param("@P2", None, StatusFlags::BY_REF_VALUE)),
+                    ],
+                    ExecuteOptions::new()
+                        .column_encryption(ExecutionColumnEncryptionSetting::Enabled),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, UsageError(_)), "{error}");
+            assert!(client.output_names_by_ordinal.is_empty());
+            assert!(matches!(
+                client.streamed_write_state,
+                StreamedWriteState::Idle
+            ));
         }
 
         /// The CEK of an encrypted output is retained under its name, so the

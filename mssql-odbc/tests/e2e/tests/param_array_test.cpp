@@ -77,6 +77,7 @@
 //  36.  RowReturningArrayWithoutStatusReportsErrors - no lost next rowset
 //  37.  RowReturningArrayDrainsPartialLobOnAdvance - streaming cleanup
 //  38.  RowReturningArrayTimeoutDuringNavigation - cancel and reuse
+//  39.  ArrayAfterDataAtExecutionKeepsParameterOrder - AB#50084: plan reuse
 
 #include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
@@ -3049,4 +3050,53 @@ ODBC_TEST_F_MODES(ParamArrayTest, RunUniqueParameterSetsAnswerInOrder,
     for (SQLULEN i = 0; i < kSets; ++i) {
         EXPECT_EQ(SQL_PARAM_SUCCESS, status[i]) << "set " << i;
     }
+}
+
+// -------------------------------------------------------------------
+// 39. AB#50084: a parameter array reusing the plan of a data-at-execution
+// SQLExecute. mssql-odbc declared the streamed parameter last, so every set
+// swapped its values.
+//
+// Benefits-from-mock-tds: would assert the @params order and handle reuse,
+// pinned meanwhile by
+// streamed_prepexec_plan_binds_later_scalar_and_array_values_in_order.
+// -------------------------------------------------------------------
+ODBC_TEST_F(ParamArrayTest, ArrayAfterDataAtExecutionKeepsParameterOrder) {
+    ExecDirect("CREATE TABLE #pa_dae_order (s varchar(50), n int)");
+    Prepare("INSERT INTO #pa_dae_order (s, n) VALUES (?, ?)");
+
+    SQLINTEGER token = 1;
+    SQLLEN dae_ind = SQL_LEN_DATA_AT_EXEC(0);
+    SQLINTEGER one = 1;
+    SQLLEN one_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 50, 0,
+                                   &token, 0, &dae_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   &one, 0, &one_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER needed = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &needed));
+    EXPECT_EQ(static_cast<SQLPOINTER>(&token), needed);
+    char dae[] = "dae";
+    ASSERT_SQL_OK(SQLPutData(stmt_, dae, 3), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &needed), SQL_HANDLE_STMT, stmt_);
+
+    char text[2][50] = {"42", "43"};
+    SQLLEN text_ind[2] = {SQL_NTS, SQL_NTS};
+    SQLINTEGER nums[2] = {7, 8};
+    SQLLEN num_ind[2] = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 50, 0,
+                                   text, sizeof(text[0]), text_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                                   nums, 0, num_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 2));
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ("dae:1,42:7,43:8",
+              ScalarString("SELECT STRING_AGG(s + ':' + CONVERT(varchar(11), n), ',') "
+                           "WITHIN GROUP (ORDER BY n) FROM #pa_dae_order"));
 }

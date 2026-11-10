@@ -129,7 +129,7 @@ async fn sp_prepare_sends_declaration_then_statement() {
 }
 
 #[tokio::test]
-async fn streamed_prepexec_declares_the_streamed_value_last() {
+async fn streamed_prepexec_declares_values_in_bound_order() {
     let (mut client, sent) = create_capturing_client(vec![handle_token(55), done_no_more()]);
     let mut statement = PreparedStatement::new(UNICODE_SQL);
     let mut orphan = None;
@@ -151,7 +151,7 @@ async fn streamed_prepexec_declares_the_streamed_value_last() {
         .await
         .unwrap();
     let expected = [
-        text_param(&client, "@P2 int,@P1 varbinary(max)"),
+        text_param(&client, "@P1 varbinary(max),@P2 int"),
         text_param(&client, UNICODE_SQL),
     ]
     .concat();
