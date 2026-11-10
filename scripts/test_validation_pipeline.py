@@ -586,6 +586,13 @@ def test_pipeline_tests_run_in_shared_validation(selector):
     assert not step.get("continueOnError", False)
 
 
+def test_windows_validation_has_room_for_driver_test_suite():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    windows = next(job for job in build["jobs"] if job.get("job") == "Build_Windows")
+    assert windows["timeoutInMinutes"] == 90
+
+
 def test_release_automation_bash_oracles_run_on_linux():
     stages = load_template("validation-stages.yml")["stages"]
     build = next(stage for stage in stages if stage["stage"] == "Build")

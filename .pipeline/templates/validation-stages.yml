@@ -133,6 +133,8 @@ stages:
       jobCondition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'))
   - job: Build_Windows
     displayName: Build Windows
+    # Driver tests push this job beyond the default 60-minute limit.
+    timeoutInMinutes: 90
     pool:
       name: ${{ parameters.poolName }}
       demands:
