@@ -522,6 +522,7 @@ fn sql_exec_direct_w_operation(
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
     // STMT lock is held during I/O. `query_timeout` (already deducted above)
     // bounds either call; `0` means unlimited, matching the ODBC default.
+    let pending = super::ird::clear_for_send(stmt, &client);
     let exec_result: Result<(), mssql_tds::error::Error> = if let Some(call) = call.as_ref() {
         // A statement that is nothing but `{call proc(?)}` goes out as a TDS
         // RPC rather than as text, which is what makes output parameters and
@@ -571,6 +572,7 @@ fn sql_exec_direct_w_operation(
     };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
+        pending.restore_if_unsent(stmt, &client);
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

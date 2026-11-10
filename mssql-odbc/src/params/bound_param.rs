@@ -488,6 +488,7 @@ mod tests {
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
+            data_classification: None,
         }
     }
 

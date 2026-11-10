@@ -1429,7 +1429,7 @@ fn publish_lookup(
         return String::new();
     }
 
-    state.wire.restore(client, LeaseReturn::Release);
+    dbc.restore_lease(&mut state, client, LeaseReturn::Release);
     match cache {
         Some(value) => {
             state.database_user_name = Some(CachedDatabaseUserName {

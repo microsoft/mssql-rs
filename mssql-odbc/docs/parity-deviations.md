@@ -1384,3 +1384,57 @@ msodbcsql build is measured.
     leg, keeping the reference behavior measured. No existing call sequence is
     changed. The runtime evidence was collected with the C++ test against the
     local SQL Server and ODBC Driver 18.07.0001. Tracked in AB#49353.
+
+41. **A truncated `SQL_CA_SS_DATA_CLASSIFICATION` read reports `01004`.**
+    msodbcsql's `SQLGetDescFieldW` copies the prefix, reports the full length,
+    and returns `SQL_SUCCESS_WITH_INFO`, but posts `IDS_S1_004`
+    (`sqlcdesc.cpp:5240-5256`), which surfaces as `HY004` "Invalid SQL data
+    type". This driver returns the same prefix, length and return code with
+    `01004`, the state ODBC defines for truncated output, so an application
+    that tests for truncation finds it. A negative `BufferLength` is treated
+    as no room and reported the same way, as the driver's other string fields
+    do; msodbcsql faults on it with an access violation (the Driver Manager
+    does not check this driver-specific field). Measured on Windows msodbcsql
+    18.07.0001 against SQL Server 2022; `ShortBufferSqlState` asserts each
+    driver's state. Chosen by the change author; maintainer sign-off is
+    pending review.
+
+42. **DATACLASSIFICATION data is validated rather than passed through.**
+    msodbcsql copies the token payload without checking it (`Parse.cpp`
+    `ProcessDataClassification`, `sqlctokn.cpp` `OnDataClassification`).
+    mssql-tds validates the token before the IRD sees it, and the IRD payload
+    is rebuilt from that metadata in the [MS-TDS] 2.2.7.5 layout. Four cases
+    differ from msodbcsql:
+    - An out-of-range dictionary index or an undefined rank is a protocol
+      error that retires the connection; only a non-compliant server sends
+      either.
+    - A token that classifies more columns than the result set has is
+      dropped with a warning, so the IRD reports `HY091` where msodbcsql
+      returns the bytes.
+    - An unpaired UTF-16 surrogate in a label or information-type name is
+      returned as U+FFFD where msodbcsql returns the original code unit.
+      SQL Server stores these names as `nvarchar`, so a compliant server can
+      send one.
+    - A name of 128 UTF-16 units, the longest SQL Server accepts for a label
+      or information type, is returned verbatim. msodbcsql 18.07.0001 handles
+      127 units but returns `HYT00` once the query timeout expires for 128,
+      against SQL Server 2022 (270 and 272-byte payloads for a one-character
+      label ID). This driver keeps the correct behavior rather than
+      reproducing the failure; `LabelsUpTo128CharactersAreReturned` asserts
+      each driver's outcome with a five-second timeout, and
+      `names_up_to_255_units_are_returned_verbatim` covers every length a
+      `B_VARCHAR` can encode.
+
+    For well-formed names shorter than 128 UTF-16 units the payload is
+    byte-identical to msodbcsql's;
+    measured at versions 1 and 2 on msodbcsql 18.07.0001 and SQL Server 2022.
+
+    Block cursors also differ. With `SQL_ATTR_ROW_ARRAY_SIZE` above 1,
+    msodbcsql reads the result through a server cursor, whose results carry no
+    classification, so its IRD reports `HY091` from the execute on. This
+    driver streams the result for every rowset size and reports the
+    classification. When a started transaction ends, the classification goes
+    once the driver has read the last row, which for a block cursor is the
+    fetch of the last rowset rather than the `SQL_NO_DATA` after it; msodbcsql
+    has no equivalent to match. `BlockCursorsReportTheClassificationOnlyInThisDriver`
+    asserts each driver's outcome.

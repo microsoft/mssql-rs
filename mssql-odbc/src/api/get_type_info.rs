@@ -238,6 +238,7 @@ fn sql_get_type_info_w_operation(
         }
     };
 
+    let pending = super::ird::clear_for_send(stmt, &client);
     let exec_result = dbc.runtime.block_on(
         client.execute_stored_procedure(
             DATATYPE_INFO_PROC.to_string(),
@@ -250,6 +251,7 @@ fn sql_get_type_info_w_operation(
     );
     if let Err(e) = exec_result {
         error!(%e, "SQLGetTypeInfoW: execution failed");
+        pending.restore_if_unsent(stmt, &client);
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
