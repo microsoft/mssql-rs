@@ -619,6 +619,25 @@ mod tests {
         assert_eq!(buffer, payload[..8]);
         assert_last_diag(&desc_diags(ird(stmt)), WARN_STRING_TRUNCATION);
 
+        // msodbcsql 18.07.0001 faults on a negative length; this field treats
+        // it as no room, as the driver's other string fields do.
+        let mut untouched = [0xABu8; 8];
+        let mut length: SqlInteger = -1;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                ird(stmt),
+                0,
+                DATA_CLASSIFICATION,
+                untouched.as_mut_ptr().cast(),
+                -1,
+                &mut length,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(length, full);
+        assert_eq!(untouched, [0xAB; 8]);
+        assert_last_diag(&desc_diags(ird(stmt)), WARN_STRING_TRUNCATION);
+
         let mut length: SqlInteger = -1;
         let ret = unsafe {
             sql_get_desc_field_w(
@@ -1090,7 +1109,7 @@ mod tests {
         let late = h.alloc_extra_stmt();
         let next = h.alloc_extra_stmt();
         crate::api::txn::test_hooks::set_after_autocommit_sweep(move || prepare_and_run(late, 2));
-        crate::api::txn::test_hooks::set_after_autocommit_release(move || prepare_and_run(next, 0));
+        crate::api::txn::test_hooks::set_after_connection_release(move || prepare_and_run(next, 0));
 
         assert_eq!(
             set_autocommit(h.dbc, SQL_AUTOCOMMIT_ON),

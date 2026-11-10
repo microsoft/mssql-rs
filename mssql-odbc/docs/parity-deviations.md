@@ -1391,7 +1391,10 @@ msodbcsql build is measured.
     (`sqlcdesc.cpp:5240-5256`), which surfaces as `HY004` "Invalid SQL data
     type". This driver returns the same prefix, length and return code with
     `01004`, the state ODBC defines for truncated output, so an application
-    that tests for truncation finds it. Measured on Windows msodbcsql
+    that tests for truncation finds it. A negative `BufferLength` is treated
+    as no room and reported the same way, as the driver's other string fields
+    do; msodbcsql faults on it with an access violation (the Driver Manager
+    does not check this driver-specific field). Measured on Windows msodbcsql
     18.07.0001 against SQL Server 2022; `ShortBufferSqlState` asserts each
     driver's state. Chosen by the change author; maintainer sign-off is
     pending review.

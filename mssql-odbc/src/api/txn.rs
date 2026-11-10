@@ -156,8 +156,12 @@ pub(super) fn release_dbc_client_and_publish<R>(
     op: &str,
     publish: impl FnOnce(&mut DbcState) -> R,
 ) -> Result<R, SqlReturn> {
-    dbc.return_lease_and_publish(client, LeaseReturn::Release, publish)
-        .ok_or_else(|| fail_lost_session(dbc, op))
+    let published = dbc
+        .return_lease_and_publish(client, LeaseReturn::Release, publish)
+        .ok_or_else(|| fail_lost_session(dbc, op));
+    #[cfg(test)]
+    test_hooks::after_connection_release();
+    published
 }
 
 /// Fails a connection-scoped operation whose lease could not be returned. Its
@@ -749,7 +753,7 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     {
         error!("{op}: ending the transaction for cursors opened during the switch failed");
     }
-    let rc = release_dbc_client_and_publish(dbc, client, op, |state| {
+    release_dbc_client_and_publish(dbc, client, op, |state| {
         if had_user_txn {
             // A failed commit has an unknown server outcome, but retaining this
             // flag would make SQLDisconnect reject the connection with 25000.
@@ -775,10 +779,7 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
             SQL_SUCCESS
         }
     })
-    .unwrap_or_else(|ret| ret);
-    #[cfg(test)]
-    test_hooks::after_autocommit_release();
-    rc
+    .unwrap_or_else(|ret| ret)
 }
 
 #[cfg(test)]
@@ -791,7 +792,7 @@ pub(super) mod test_hooks {
     std::thread_local! {
         static AFTER_AUTOCOMMIT_SNAPSHOT: Hook = const { RefCell::new(None) };
         static AFTER_AUTOCOMMIT_SWEEP: Hook = const { RefCell::new(None) };
-        static AFTER_AUTOCOMMIT_RELEASE: Hook = const { RefCell::new(None) };
+        static AFTER_CONNECTION_RELEASE: Hook = const { RefCell::new(None) };
         static AFTER_UNSENT_ARRAY_RELEASE: Hook = const { RefCell::new(None) };
     }
 
@@ -817,10 +818,10 @@ pub(super) mod test_hooks {
         set(&AFTER_AUTOCOMMIT_SWEEP, hook);
     }
 
-    /// Runs `hook` once, right after `switch_to_autocommit` releases the
-    /// client, on this thread.
-    pub(in crate::api) fn set_after_autocommit_release(hook: impl FnOnce() + 'static) {
-        set(&AFTER_AUTOCOMMIT_RELEASE, hook);
+    /// Runs `hook` once, as soon as a connection-scoped operation releases the
+    /// client and before it does anything else, on this thread.
+    pub(in crate::api) fn set_after_connection_release(hook: impl FnOnce() + 'static) {
+        set(&AFTER_CONNECTION_RELEASE, hook);
     }
 
     /// Runs `hook` once, after a parameter array that sent no set returns the
@@ -841,8 +842,8 @@ pub(super) mod test_hooks {
         run(&AFTER_AUTOCOMMIT_SWEEP);
     }
 
-    pub(super) fn after_autocommit_release() {
-        run(&AFTER_AUTOCOMMIT_RELEASE);
+    pub(super) fn after_connection_release() {
+        run(&AFTER_CONNECTION_RELEASE);
     }
 }
 /// Autocommit → manual-commit. Opens a transaction immediately so `@@TRANCOUNT`
