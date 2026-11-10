@@ -556,14 +556,18 @@ single-threaded tests and `<name>_mt` (label `mt`) the concurrent variants, so
 a concurrency failure never hides a parity verdict. Nothing to add in
 `CMakeLists.txt`; reconfigure after converting a file. Both entries pass
 `--gtest_filter`, which overrides a `GTEST_FILTER` environment variable.
+Scenarios with no single-threaded form, such as `handle_lifecycle_test`, live
+in `tests/multithreaded_tests/` and register with `add_odbc_mt_only_test`,
+which creates only the `<name>_mt` entry, labelled `mt_weekly`: only the weekly
+profile runs it.
 
 ```bash
 ctest --test-dir build -L mt                            # every concurrent variant, 2 x 1
-./run_e2e.sh --mt-profile=nightly                       # 8 x 20, only <name>_mt, gdb stacks
+./run_e2e.sh --mt-profile=weekly                        # 16 x 25, only <name>_mt, gdb stacks
 ```
 
 ```powershell
-.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 50, minidumps in build\mt-dumps
+.\run_e2e.ps1 -MtProfile weekly -CompareWithMsodbcsql   # 16 x 25, minidumps in build\mt-dumps
 ```
 
 ```bash
@@ -628,7 +632,7 @@ Compilation and execution have separate job budgets.
 ```powershell
 pwsh -File .\mssql-odbc\tests\e2e\run_e2e.ps1 -BuildOnly -OutDir C:\artifacts\odbc-e2e
 # Download/copy the drop's build\ directory into the consumer's tests\e2e\.
-.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile nightly -CompareWithMsodbcsql
+.\mssql-odbc\tests\e2e\run_e2e.ps1 -SkipBuild -MtProfile weekly -CompareWithMsodbcsql
 ```
 
 `-BuildOnly` requires PowerShell 7 or later (`pwsh`) and rejects Windows

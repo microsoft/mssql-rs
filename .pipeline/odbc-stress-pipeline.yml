@@ -1,20 +1,20 @@
-# Scheduled multithreaded stress runs of the mssql-odbc C++ e2e suite (AB#49263).
+# Weekly multithreaded stress run of the mssql-odbc C++ e2e suite (AB#49263).
 #
 # PR validation runs the ODBC_TEST_F concurrent variants once at 2 threads x 1
 # iteration, in /SharedDbc only and only on Windows, which catches tests unfit
 # for concurrency but rarely a race. This pipeline reruns only those variants
-# (the <name>_mt ctest entries) in every mode at stress size, without retries,
-# so an intermittent failure is reported rather than retried away:
+# (the <name>_mt ctest entries) and the multithreaded-only (mt_weekly) entries
+# at 16 threads x 25 iterations, in every mode (Windows) / every mode but
+# /SharedStmt (unixODBC), without retries, so an intermittent failure is
+# reported rather than retried away. A manual run uses the same profile.
 #
-#   nightly  8 x 20, every mode (Windows) / every mode but /SharedStmt (unixODBC)
-#   weekly  16 x 50, the same modes
-#
-# Legs: Windows x64 (one shared build, four parallel suite groups, debug driver,
-# Windows Driver Manager, msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21
-# (musl), both running the release drops through unixODBC. /SharedStmt is left
-# out on unixODBC because its releases up to 2.3.14 corrupt their own diagnostic
-# list when two threads use one statement (unixODBC #243, fixed on master in
-# ea454e49); see mssql-odbc/tests/e2e/run_e2e.sh.
+# Legs: Windows x64 (one shared build, debug driver, Windows Driver Manager,
+# msodbcsql parity leg at 2 x 1), Ubuntu 24.04 (glibc) and Alpine 3.21 (musl),
+# both running the release drops through unixODBC. Each leg runs as four
+# parallel jobs, one per suite group (Fetch, Parameters, Metadata, Other).
+# /SharedStmt is left out on unixODBC because its releases up to 2.3.14 corrupt
+# their own diagnostic list when two threads use one statement (unixODBC #243,
+# fixed on master in ea454e49); see mssql-odbc/tests/e2e/run_e2e.sh.
 #
 # Evidence: Windows hangs and crashes leave minidumps, with the matching driver,
 # test executables and PDBs, in the OdbcMtDumps_Windows_* artifacts; Linux legs run
@@ -35,16 +35,6 @@ trigger: none
 pr: none
 
 schedules:
-# Temporary: the nightly run is there to flush out the obvious races while the
-# converted suites settle. Remove this entry once the bugs it finds are fixed
-# (planned for two to three weeks after it starts); the weekly run and PR
-# validation remain.
-- cron: '0 2 * * 1-6'
-  displayName: Nightly ODBC stress
-  branches:
-    include:
-    - main
-  always: true
 - cron: '0 2 * * 0'
   displayName: Weekly ODBC stress
   branches:
@@ -53,15 +43,6 @@ schedules:
   always: true
 
 parameters:
-- name: profile
-  displayName: Stress profile (auto takes it from the schedule; a manual run gets nightly)
-  type: string
-  values:
-  - auto
-  - nightly
-  - weekly
-  default: auto
-
 - name: linuxImage
   displayName: Agent image for x64 Linux jobs
   type: string
@@ -83,16 +64,24 @@ parameters:
 variables:
   # Same pinned reference driver as validation-pipeline.yml.
   msodbcsqlVersion: '18.6.2.1'
-  # Resolved when the run starts: the schedule that fired it, or the manual choice.
-  odbcMtProfile: $[ iif(eq('${{ parameters.profile }}', 'auto'), iif(eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'), 'weekly', 'nightly'), '${{ parameters.profile }}') ]
+  # Scheduled and manual runs both use the weekly profile; PR validation runs
+  # the PR profile.
+  odbcMtProfile: weekly
   # Linux builds compile the <name>_mt entries only when asked (CMakeLists.txt);
   # the build templates forward this into their containers.
   ODBC_E2E_CONCURRENT: 'ON'
-  # Job timeouts must be resolved during template expansion.
-  ${{ if or(eq(parameters.profile, 'weekly'), and(eq(parameters.profile, 'auto'), eq(variables['Build.CronSchedule.DisplayName'], 'Weekly ODBC stress'))) }}:
-    odbcMtJobTimeoutInMinutes: 240
-  ${{ else }}:
-    odbcMtJobTimeoutInMinutes: 120
+  # Read during template expansion by the job timeouts. Each ctest entry has 180
+  # minutes (run_e2e.ps1 / run_e2e.sh), so one slow suite still leaves room for
+  # the rest of its group as more suites gain <name>_mt entries.
+  odbcMtJobTimeoutInMinutes: 360
+  # Suite groups, run as parallel jobs on every leg (ctest -R / -E regexes over
+  # the <name>_mt entries). Other is the complement of the named groups, so a
+  # newly converted suite is still covered. Weekly 16 x 50 run serially on one
+  # Linux agent took more than 240 minutes (build 188696).
+  odbcMtFetchTests: '^(get_data|fetch_scroll|binary_fetch|bin_to_char|fetch_error_semantics)_test_mt$'
+  odbcMtParameterTests: '^(param_.*|long_params|describe_param|output_params)_test_mt$'
+  odbcMtMetadataTests: '^(describe_col|col_attribute|get_diag_.*|get_desc_.*|set_desc_.*|num_result_cols|get_type_info|get_info|catalog)_test_mt$'
+  odbcMtNamedGroupTests: '^(get_data|fetch_scroll|binary_fetch|bin_to_char|fetch_error_semantics|param_.*|long_params|describe_param|output_params|describe_col|col_attribute|get_diag_.*|get_desc_.*|set_desc_.*|num_result_cols|get_type_info|get_info|catalog)_test_mt$'
 
 stages:
 - stage: Build_Linux_Drops
@@ -161,10 +150,24 @@ stages:
       driverTrace: ${{ parameters.driverTrace }}
       driverTraceLevel: ${{ parameters.driverTraceLevel }}
       collectLoad: true
+      testRunTitleWithRow: true
       matrix:
-        Ubuntu24:
+        Ubuntu24_Fetch:
           container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
           entry: odbc-e2e-deb.sh
+          filterTests: ${{ variables.odbcMtFetchTests }}
+        Ubuntu24_Parameters:
+          container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+          entry: odbc-e2e-deb.sh
+          filterTests: ${{ variables.odbcMtParameterTests }}
+        Ubuntu24_Metadata:
+          container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+          entry: odbc-e2e-deb.sh
+          filterTests: ${{ variables.odbcMtMetadataTests }}
+        Ubuntu24_Other:
+          container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+          entry: odbc-e2e-deb.sh
+          excludeTests: ${{ variables.odbcMtNamedGroupTests }}
   - template: templates/test-matrix-odbc-template.yml
     parameters:
       poolName: RUST-X64-WUS3
@@ -178,10 +181,24 @@ stages:
       driverTrace: ${{ parameters.driverTrace }}
       driverTraceLevel: ${{ parameters.driverTraceLevel }}
       collectLoad: true
+      testRunTitleWithRow: true
       matrix:
-        Alpine3_21:
+        Alpine3_21_Fetch:
           container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
           entry: odbc-e2e-alpine.sh
+          filterTests: ${{ variables.odbcMtFetchTests }}
+        Alpine3_21_Parameters:
+          container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+          entry: odbc-e2e-alpine.sh
+          filterTests: ${{ variables.odbcMtParameterTests }}
+        Alpine3_21_Metadata:
+          container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+          entry: odbc-e2e-alpine.sh
+          filterTests: ${{ variables.odbcMtMetadataTests }}
+        Alpine3_21_Other:
+          container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+          entry: odbc-e2e-alpine.sh
+          excludeTests: ${{ variables.odbcMtNamedGroupTests }}
 
 - stage: Stress_Windows
   displayName: Stress Windows
@@ -231,21 +248,20 @@ stages:
       matrix:
         Fetch:
           suiteGroup: Fetch
-          filterTests: '^(get_data|fetch_scroll|binary_fetch|bin_to_char|fetch_error_semantics)_test_mt$'
+          filterTests: ${{ variables.odbcMtFetchTests }}
           excludeTests: ''
         Parameters:
           suiteGroup: Parameters
-          filterTests: '^(param_.*|long_params|describe_param|output_params)_test_mt$'
+          filterTests: ${{ variables.odbcMtParameterTests }}
           excludeTests: ''
         Metadata:
           suiteGroup: Metadata
-          filterTests: '^(describe_col|col_attribute|get_diag_.*|get_desc_.*|set_desc_.*|num_result_cols|get_type_info|get_info|catalog)_test_mt$'
+          filterTests: ${{ variables.odbcMtMetadataTests }}
           excludeTests: ''
         Other:
           suiteGroup: Other
           filterTests: ''
-          # Complement of the named groups: newly converted suites stay covered.
-          excludeTests: '^(get_data|fetch_scroll|binary_fetch|bin_to_char|fetch_error_semantics|param_.*|long_params|describe_param|output_params|describe_col|col_attribute|get_diag_.*|get_desc_.*|set_desc_.*|num_result_cols|get_type_info|get_info|catalog)_test_mt$'
+          excludeTests: ${{ variables.odbcMtNamedGroupTests }}
     pool:
       name: RUST-X64-WUS3
       demands:
