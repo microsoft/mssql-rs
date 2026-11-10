@@ -1425,3 +1425,13 @@ msodbcsql build is measured.
     For well-formed names shorter than 128 UTF-16 units the payload is
     byte-identical to msodbcsql's;
     measured at versions 1 and 2 on msodbcsql 18.07.0001 and SQL Server 2022.
+
+    Block cursors also differ. With `SQL_ATTR_ROW_ARRAY_SIZE` above 1,
+    msodbcsql reads the result through a server cursor, whose results carry no
+    classification, so its IRD reports `HY091` from the execute on. This
+    driver streams the result for every rowset size and reports the
+    classification. When a started transaction ends, the classification goes
+    once the driver has read the last row, which for a block cursor is the
+    fetch of the last rowset rather than the `SQL_NO_DATA` after it; msodbcsql
+    has no equivalent to match. `BlockCursorsReportTheClassificationOnlyInThisDriver`
+    asserts each driver's outcome.

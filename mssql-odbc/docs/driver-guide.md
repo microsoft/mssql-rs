@@ -116,7 +116,9 @@ A result set's classification is read from its IRD header (`RecNumber` 0):
   well-formed names shorter than 128 UTF-16 units. A 128-unit name, the
   longest SQL Server accepts, is returned where msodbcsql 18.07.0001 times
   out, and an unpaired UTF-16 surrogate is returned as U+FFFD (see
-  [parity deviation 42](parity-deviations.md)). A short
+  [parity deviation 42](parity-deviations.md)). A block cursor
+  (`SQL_ATTR_ROW_ARRAY_SIZE` above 1) also reports it, where msodbcsql's
+  server cursor reports none (same entry). A short
   buffer receives a prefix with `01004` (msodbcsql reports `HY004`; see
   [parity deviation 41](parity-deviations.md)), and a result set
   without classification returns `HY091`.

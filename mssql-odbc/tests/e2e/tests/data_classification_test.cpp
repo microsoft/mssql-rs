@@ -697,6 +697,50 @@ TEST_F(DataClassificationTest, EndingATransactionDropsAClassificationWithNoRowsL
     ASSERT_SQL_OK(autocommit(true), SQL_HANDLE_DBC, dbc_);
     EXPECT_TRUE(IrdPayload().has_value()) << "autocommit on with no user work";
 }
+// With SQL_ATTR_ROW_ARRAY_SIZE above 1, msodbcsql opens a server cursor, whose
+// results carry no classification (HY091). This driver streams the result and
+// reports it, then drops it when a started transaction ends once the driver
+// has read the last rowset (parity deviation 42; measured on 18.07.0001).
+TEST_F(DataClassificationTest, BlockCursorsReportTheClassificationOnlyInThisDriver) {
+    ConnectDbc();
+    ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
+    if (IsSkipped()) return;
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    bool reference = target != nullptr && std::string(target) == "msodbcsql";
+
+    auto sql = ODBCTestUtils::ToSqlTStr(ClassifiedSelect());
+    SQLINTEGER ids[2] = {};
+    SQLLEN lens[2] = {};
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, reinterpret_cast<SQLPOINTER>(2),
+                                 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetConnectAttrW(dbc_, SQL_ATTR_AUTOCOMMIT,
+                                     reinterpret_cast<SQLPOINTER>(
+                                         static_cast<SQLULEN>(SQL_AUTOCOMMIT_OFF)),
+                                     0),
+                  SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, ids, 0, lens), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    if (reference) {
+        EXPECT_FALSE(IrdPayload().has_value());
+    } else {
+        ExpectClassifiedPayload(false);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        ExpectClassifiedPayload(false);
+        ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT), SQL_HANDLE_DBC, dbc_);
+        EXPECT_FALSE(IrdPayload().has_value());
+    }
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, reinterpret_cast<SQLPOINTER>(1), 0);
+    ASSERT_SQL_OK(SQLSetConnectAttrW(dbc_, SQL_ATTR_AUTOCOMMIT,
+                                     reinterpret_cast<SQLPOINTER>(
+                                         static_cast<SQLULEN>(SQL_AUTOCOMMIT_ON)),
+                                     0),
+                  SQL_HANDLE_DBC, dbc_);
+}
 TEST_F(DataClassificationTest, ParameterArrayReportsEachSetsClassification) {
     ConnectDbc();
     ASSERT_NO_FATAL_FAILURE(CreateClassifiedTable());
