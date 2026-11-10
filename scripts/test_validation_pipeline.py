@@ -16,8 +16,6 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from test_release_pipeline import evaluate
-
 _ROOT = Path(__file__).parents[1]
 _TEMPLATES = _ROOT / ".pipeline" / "templates"
 _NON_PR = "and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))"
@@ -41,37 +39,39 @@ def stress_pipeline():
     )
 
 
+_VARIABLE_REF = re.compile(r"^\$\{\{ variables\.(\w+) \}\}$")
+
+
+def resolve_matrix(pipeline, matrix):
+    """Expands compile-time ${{ variables.X }} references in matrix values."""
+    def resolve(value):
+        match = _VARIABLE_REF.match(value) if isinstance(value, str) else None
+        return pipeline["variables"][match.group(1)] if match else value
+
+    return {row: {key: resolve(value) for key, value in values.items()}
+            for row, values in matrix.items()}
+
+
 @pytest.fixture
 def windows_stress_job(stress_pipeline):
     stage = next(
         stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
     )
     assert stage["dependsOn"] == []
-    return next(job for job in stage["jobs"] if job["job"] == "Stress_Windows")
+    job = next(job for job in stage["jobs"] if job["job"] == "Stress_Windows")
+    job["strategy"]["matrix"] = resolve_matrix(stress_pipeline, job["strategy"]["matrix"])
+    return job
 
 
-@pytest.mark.parametrize(
-    ("profile", "schedule", "expected"),
-    [
-        ("auto", None, 120),
-        ("auto", "", 120),
-        ("auto", "Nightly ODBC stress", 120),
-        ("auto", "Weekly ODBC stress", 240),
-        ("weekly", None, 240),
-        ("weekly", "Nightly ODBC stress", 240),
-        ("nightly", "Weekly ODBC stress", 120),
-    ],
-)
-def test_stress_job_timeout_follows_profile(stress_pipeline, profile, schedule, expected):
+def test_stress_pipeline_runs_only_the_weekly_profile(stress_pipeline):
+    schedules = stress_pipeline["schedules"]
+    assert [s["displayName"] for s in schedules] == ["Weekly ODBC stress"]
+    assert schedules[0]["cron"] == "0 2 * * 0"
+    assert "profile" not in {p["name"] for p in stress_pipeline["parameters"]}
     variables = stress_pipeline["variables"]
-    conditional = next(key for key in variables if key.startswith("${{ if "))
-    condition = conditional.removeprefix("${{ if ").removesuffix(" }}")
-    weekly = evaluate(
-        condition, {"profile": profile},
-        variables={"Build.CronSchedule.DisplayName": schedule},
-    )
-    selected = variables[conditional if weekly else "${{ else }}"]
-    assert selected["odbcMtJobTimeoutInMinutes"] == expected
+    assert variables["odbcMtProfile"] == "weekly"
+    assert variables["odbcMtJobTimeoutInMinutes"] == 360
+    assert not any(key.startswith("${{") for key in variables)
     timeout = "${{ variables.odbcMtJobTimeoutInMinutes }}"
     windows = next(
         stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Windows"
@@ -84,7 +84,7 @@ def test_stress_job_timeout_follows_profile(stress_pipeline, profile, schedule, 
     assert len(linux["jobs"]) == 2
     for job in linux["jobs"]:
         assert job["parameters"]["timeoutInMinutes"] == timeout
-        assert len(job["parameters"]["matrix"]) == 1
+        assert len(job["parameters"]["matrix"]) == 4
     build = next(
         stage for stage in stress_pipeline["stages"] if stage["stage"] == "Build_Linux_Drops"
     )
@@ -268,7 +268,10 @@ def test_e2e_ctest_registration_protects_shared_resources(tmp_path):
     assert "escape_sequence_test_mt" in tests
     for name, props in tests.items():
         base = name.removesuffix("_mt")
-        assert props["RESOURCE_LOCK"] == [base]
+        if name.endswith("_mt") and base not in tests:
+            assert "mt_weekly" in props["LABELS"]
+        else:
+            assert props["RESOURCE_LOCK"] == [base]
         assert props.get("RUN_SERIAL", False) == (base == "col_attribute_test")
 
 
@@ -595,7 +598,7 @@ function Get-MsodbcsqlDriverPath { return "$PSScriptRoot\reference.dll" }
 $source = [IO.File]::ReadAllText($env:RUNNER).Insert($main.Extent.StartOffset, $mocks + "`n")
 $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
 [IO.File]::WriteAllText($runner, $source)
-& $runner -SkipBuild -MtProfile nightly -CompareWithMsodbcsql -TestJobs 2 -FilterTests $env:FIXTURE_FILTER
+& $runner -SkipBuild -MtProfile weekly -CompareWithMsodbcsql -TestJobs 2 -FilterTests $env:FIXTURE_FILTER
 """
     (consumer / "reference.dll").write_bytes(b"reference")
     dumps = consumer / "build" / "mt-dumps"
@@ -615,7 +618,7 @@ $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
         assert expected in result.stdout + result.stderr
         return
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "MT profile: nightly (threads=8 iterations=20" in result.stdout
+    assert "MT profile: weekly (threads=8 iterations=20" in result.stdout
     for leg in ("mssql-odbc", "msodbcsql"):
         junit = (consumer / "build" / f"junit-{leg}.xml").read_text(encoding="utf-8")
         assert 'name="smoke_test_mt"' in junit
@@ -692,7 +695,8 @@ def test_windows_stress_ctest_groups_are_exhaustive_and_disjoint(tmp_path, windo
         encoding="utf-8"
     )
     # Model every suite as converted, including ones not converted yet.
-    suites = set(re.findall(r"^add_odbc_(?:direct_load_)?test\((\w+)", cmake, re.M))
+    suites = set(re.findall(r"^add_odbc_(?:direct_load_|mt_only_)?test\((\w+)", cmake, re.M))
+    assert {"handle_lifecycle_test", "fault_recovery_test"} <= suites
     suites.add("future_suite_test")
     entries = {f"{suite}_mt" for suite in suites}
     testfile = tmp_path / "CTestTestfile.cmake"
@@ -719,6 +723,32 @@ def test_windows_stress_ctest_groups_are_exhaustive_and_disjoint(tmp_path, windo
         assert not seen & selected, f"{name} duplicates {seen & selected}"
         seen.update(selected)
     assert seen == entries
+
+
+def test_linux_stress_rows_run_the_windows_suite_groups(stress_pipeline, windows_stress_job):
+    windows = {
+        group["suiteGroup"]: (group["filterTests"], group["excludeTests"])
+        for group in windows_stress_job["strategy"]["matrix"].values()
+    }
+    linux = next(
+        stage for stage in stress_pipeline["stages"] if stage["stage"] == "Stress_Linux"
+    )
+    for job in linux["jobs"]:
+        params = job["parameters"]
+        # Four rows publish under one job, so their titles need the row name.
+        assert params["testRunTitleWithRow"] is True
+        groups = {
+            row.rsplit("_", 1)[1]: (values.get("filterTests", ""),
+                                    values.get("excludeTests", ""))
+            for row, values in resolve_matrix(stress_pipeline, params["matrix"]).items()
+        }
+        assert groups == windows
+    template = (_TEMPLATES / "test-matrix-odbc-template.yml").read_text(encoding="utf-8")
+    assert '-e "ODBC_E2E_FILTER=${FILTERTESTS:-}"' in template
+    assert '-e "ODBC_E2E_EXCLUDE=${EXCLUDETESTS:-}"' in template
+    for entry in ("odbc-e2e-deb.sh", "odbc-e2e-alpine.sh"):
+        script = (_ROOT / "scripts" / "dockerentry" / entry).read_text(encoding="utf-8")
+        assert '--filter="${ODBC_E2E_FILTER:-}" --exclude="${ODBC_E2E_EXCLUDE:-}"' in script
 
 
 def test_windows_stress_results_and_artifacts_are_group_scoped(windows_stress_job):
@@ -749,7 +779,7 @@ def test_windows_stress_results_and_artifacts_are_group_scoped(windows_stress_jo
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize(
     ("profile", "threads", "iterations"),
-    [("pr", "2", "1"), ("nightly", "8", "20"), ("weekly", "16", "50")],
+    [("pr", "2", "1"), ("weekly", "16", "25")],
 )
 @pytest.mark.parametrize(
     ("override", "expected"),

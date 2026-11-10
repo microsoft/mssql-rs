@@ -304,16 +304,45 @@ fn encrypted_text(report: &Report, encrypted: bool, locale: &str) -> String {
     tr(locale, id, &[])
 }
 
-fn certificate_trusted_text(locale: &str) -> String {
-    tr(locale, "diagnose.depth.certificate_trusted", &[])
+fn certificate_trusted_text(locale: &str, dsn: Option<&str>) -> String {
+    match dsn {
+        Some(dsn) => tr(
+            locale,
+            "diagnose.depth.certificate_trusted_dsn",
+            &[("dsn", &dsn)],
+        ),
+        None => tr(locale, "diagnose.depth.certificate_trusted", &[]),
+    }
 }
 
-fn certificate_name_text(locale: &str, name: &str) -> String {
-    tr(
-        locale,
-        "diagnose.depth.certificate_name",
-        &[("name", &name)],
-    )
+fn certificate_trust_ignored_strict_text(locale: &str, dsn: Option<&str>) -> String {
+    match dsn {
+        Some(dsn) => tr(
+            locale,
+            "diagnose.depth.certificate_trust_ignored_strict_dsn",
+            &[("dsn", &dsn)],
+        ),
+        None => tr(
+            locale,
+            "diagnose.depth.certificate_trust_ignored_strict",
+            &[],
+        ),
+    }
+}
+
+fn certificate_name_text(locale: &str, name: &str, dsn: Option<&str>) -> String {
+    match dsn {
+        Some(dsn) => tr(
+            locale,
+            "diagnose.depth.certificate_name_dsn",
+            &[("name", &name), ("dsn", &dsn)],
+        ),
+        None => tr(
+            locale,
+            "diagnose.depth.certificate_name",
+            &[("name", &name)],
+        ),
+    }
 }
 
 fn field_label(locale: &str, id: &str) -> String {
@@ -401,18 +430,23 @@ fn settings_text(sources: &SettingSources, locale: &str) -> Option<String> {
     let mut add = |label_id: &str, origin: &Option<SettingOrigin>| {
         if let Some(origin) = origin {
             let label = tr(locale, label_id, &[]);
-            if origin.source == super::SettingSource::Default {
-                parts.push(tr(
+            match origin.source {
+                super::SettingSource::Default => parts.push(tr(
                     locale,
                     "diagnose.settings.item.default",
                     &[("setting", &label)],
-                ));
-            } else {
-                parts.push(tr(
+                )),
+                super::SettingSource::Dsn => parts.push(tr(
                     locale,
-                    "diagnose.settings.item.source",
-                    &[("setting", &label), ("source", &origin.text_name())],
-                ));
+                    "diagnose.settings.item.dsn",
+                    &[("setting", &label), ("dsn", &origin.text_name())],
+                )),
+                super::SettingSource::CommandLine | super::SettingSource::Environment => parts
+                    .push(tr(
+                        locale,
+                        "diagnose.settings.item.source",
+                        &[("setting", &label), ("source", &origin.text_name())],
+                    )),
             }
         }
     };
@@ -691,15 +725,19 @@ pub fn text_in(report: &Report, locale: &str) -> String {
         );
         out.push('\n');
     } else {
-        let _ = writeln!(
-            out,
-            "{}",
-            tr(
+        // A data source (-D) that was not found leaves no server to name: the
+        // header names the data source instead.
+        let header = match &request.dsn {
+            Some(dsn) if request.server.is_empty() => {
+                tr(locale, "diagnose.header.dsn", &[("dsn", &dsn.name)])
+            }
+            _ => tr(
                 locale,
                 "diagnose.header.server",
-                &[("server", &r.name(Category::Server, &request.server))]
-            )
-        );
+                &[("server", &r.name(Category::Server, &request.server))],
+            ),
+        };
+        let _ = writeln!(out, "{header}");
         let depth = request.depth.title_in(locale);
         let default_suffix = if request.depth_selected {
             String::new()
@@ -708,7 +746,7 @@ pub fn text_in(report: &Report, locale: &str) -> String {
         };
         // The user name goes inside the sentence, so a translation can place it.
         let mut depth_line = match &request.authentication {
-            super::Authentication::SqlPassword { user, .. } => tr(
+            super::Authentication::SqlPassword { user, .. } if !user.is_empty() => tr(
                 locale,
                 "diagnose.depth.line_with_user",
                 &[
@@ -718,7 +756,8 @@ pub fn text_in(report: &Report, locale: &str) -> String {
                     ("user", &r.name(Category::User, user)),
                 ],
             ),
-            super::Authentication::Integrated => tr(
+            // Integrated, or a SQL login with no name (as with -D and neither -U nor -E).
+            _ => tr(
                 locale,
                 "diagnose.depth.line",
                 &[
@@ -742,20 +781,21 @@ pub fn text_in(report: &Report, locale: &str) -> String {
             ));
         }
         if request.trust_server_certificate {
+            let dsn = request.sources.dsn_name(|s| &s.trust_server_certificate);
             depth_line.push_str(&if request.encrypt == super::Encrypt::Strict {
-                tr(
-                    locale,
-                    "diagnose.depth.certificate_trust_ignored_strict",
-                    &[],
-                )
+                certificate_trust_ignored_strict_text(locale, dsn.as_deref())
             } else {
-                certificate_trusted_text(locale)
+                certificate_trusted_text(locale, dsn.as_deref())
             });
         }
         if let Some(name) = &request.host_name_in_certificate {
             depth_line.push_str(&certificate_name_text(
                 locale,
                 &r.name(Category::Host, name),
+                request
+                    .sources
+                    .dsn_name(|s| &s.host_name_in_certificate)
+                    .as_deref(),
             ));
         }
         let _ = writeln!(out, "{depth_line}");
@@ -2857,7 +2897,7 @@ Limitations:
         }
         let json = json(&report, "v").unwrap();
         assert!(
-            json.contains("\"coverageMatrixVersion\": \"1.2\""),
+            json.contains("\"coverageMatrixVersion\": \"1.3\""),
             "{json}"
         );
         assert!(
