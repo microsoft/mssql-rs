@@ -15,19 +15,38 @@
 
 pub mod common;
 
+#[path = "common/dotenv_test.rs"]
+mod dotenv_test;
+
 use mssql_rs::{Client, Config, EncryptionLevel};
 
 fn strict_config() -> Option<Config> {
-    if common::trust_server_certificate() {
-        eprintln!("skipping Strict tests: TRUST_SERVER_CERTIFICATE is ignored in Strict mode");
-        return None;
-    }
     let Some(mut cfg) = common::live_config() else {
         eprintln!("skipping Strict tests: SQL_PASSWORD not set");
         return None;
     };
+    if common::trust_server_certificate() {
+        eprintln!("skipping Strict tests: TRUST_SERVER_CERTIFICATE is ignored in Strict mode");
+        return None;
+    }
     cfg.encryption(EncryptionLevel::Strict);
     Some(cfg)
+}
+
+#[test]
+fn strict_config_loads_dotenv_before_trust_check() {
+    if dotenv_test::in_child() {
+        assert!(strict_config().is_none());
+        assert!(common::trust_server_certificate());
+        assert!(std::env::var_os("SQL_PASSWORD").is_some());
+    } else {
+        let password = uuid::Uuid::new_v4();
+        dotenv_test::run(
+            "strict_config_loads_dotenv_before_trust_check",
+            &format!("SQL_PASSWORD={password}\nTRUST_SERVER_CERTIFICATE=true\n"),
+            &[],
+        );
+    }
 }
 
 #[tokio::test]

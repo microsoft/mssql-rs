@@ -203,12 +203,13 @@ impl PreparedStatement {
 
     fn sql_declaration(value: &SqlType) -> Result<String> {
         if let SqlType::Table(name, _) = value {
-            let schema = name.schema_name.as_deref().unwrap_or("dbo");
-            return Ok(format!(
-                "{}.{} READONLY",
-                quote_identifier(schema),
-                quote_identifier(&name.type_name)
-            ));
+            let type_name = quote_identifier(&name.type_name);
+            return Ok(
+                match name.schema_name.as_deref().filter(|name| !name.is_empty()) {
+                    Some(schema) => format!("{}.{type_name} READONLY", quote_identifier(schema)),
+                    None => format!("{type_name} READONLY"),
+                },
+            );
         }
         if let SqlType::Udt(name, _) = value {
             let db_name = name.db_name.as_deref().filter(|part| !part.is_empty());
@@ -360,6 +361,43 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(
                 PreparedStatement::sql_declaration(&value).expect("supported SQL type"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_declarations_preserve_and_quote_tvp_names() {
+        use mssql_tds::datatypes::sql_tvp::TvpTypeName;
+
+        let cases = [
+            (TvpTypeName::new(None, "items".into()), "[items] READONLY"),
+            (
+                TvpTypeName::new(Some(String::new()), "items".into()),
+                "[items] READONLY",
+            ),
+            (
+                TvpTypeName::new(Some("types".into()), "items".into()),
+                "[types].[items] READONLY",
+            ),
+            (
+                TvpTypeName::new(Some("ty]pes".into()), "it]ems".into()),
+                "[ty]]pes].[it]]ems] READONLY",
+            ),
+            (
+                TvpTypeName {
+                    db_name: Some("catalog".into()),
+                    schema_name: Some("types".into()),
+                    type_name: "items".into(),
+                },
+                "[types].[items] READONLY",
+            ),
+        ];
+
+        for (name, expected) in cases {
+            assert_eq!(
+                PreparedStatement::sql_declaration(&SqlType::Table(name, None))
+                    .expect("TVP declarations are supported"),
                 expected
             );
         }

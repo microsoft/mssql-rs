@@ -84,7 +84,7 @@ pub enum EncryptionLevel {
     ///   required by the TDS 8.0 specification.
     /// - Server certificate validation is **always enforced**; calling
     ///   [`Config::trust_cert`] is ignored under `Strict` mode.
-    /// - [`Config::trust_cert_ca`] (custom CA bundle) and
+    /// - [`Config::trust_cert_ca`] (pinned server certificate) and
     ///   [`Config::host_name_in_certificate`] (SNI override) still apply.
     Strict,
 }
@@ -276,7 +276,8 @@ impl Config {
     ///
     /// When set, the driver bypasses standard CA chain validation and
     /// performs an exact binary match between the file and the certificate
-    /// presented by the server. Mirrors tiberius' `Config::trust_cert_ca`.
+    /// presented by the server. Unlike tiberius' `Config::trust_cert_ca`, this
+    /// pins the leaf certificate rather than adding a CA to the trust store.
     ///
     /// # Interaction with [`trust_cert`](Self::trust_cert)
     ///
@@ -298,7 +299,7 @@ impl Config {
     /// use mssql_rs::Config;
     ///
     /// let mut cfg = Config::new();
-    /// cfg.host("db.internal").trust_cert_ca("/etc/ssl/private-ca.pem");
+    /// cfg.host("db.internal").trust_cert_ca("/etc/ssl/sql-server.pem");
     /// ```
     pub fn trust_cert_ca(&mut self, path: impl Into<PathBuf>) -> &mut Self {
         self.server_certificate = Some(path.into());

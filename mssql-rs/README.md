@@ -18,7 +18,7 @@ This crate is based on [saurabh500/mssql-tiberius-bridge](https://github.com/sau
 - `client.reset_session()` — native TDS session reset with `READ COMMITTED` isolation
 - `conn.query(sql, &[&param])` — positional `@P1, @P2` parameters
 - `Config::new().host().port().trust_cert()` — fluent builder
-- `Config::trust_cert_ca("ca.pem")` — pin a CA certificate (mirrors tiberius)
+- `Config::trust_cert_ca("server.pem")` — pin the server's leaf certificate
 - `AuthMethod::aad_token(jwt)` — Microsoft Entra ID / AAD federated auth
 - deadpool connection pooling with native session reset and validation before reuse
 
@@ -152,6 +152,10 @@ The driver uses `mssql-tds` and its platform TLS backend. Linux builds require
 OpenSSL development libraries, and dynamically linked binaries need compatible
 OpenSSL libraries at runtime. Integrated authentication also loads a system
 security library at runtime.
+
+By default, the driver enables `mssql-tds`'s default features, including its
+platform TLS backends. Disabling the driver's default features opts out unless
+another dependency enables them.
 
 ### SQL authentication (`AuthMethod::sql_server`)
 

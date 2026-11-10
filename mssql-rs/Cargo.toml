@@ -64,7 +64,7 @@ allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 
 [features]
-default = []
+default = ["mssql-tds/default"]
 time = ["dep:time"]
 jiff = ["dep:jiff"]
 serde = ["dep:serde"]

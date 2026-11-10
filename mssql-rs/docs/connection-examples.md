@@ -192,7 +192,7 @@ async fn example() -> mssql_rs::Result<()> {
     cfg.host("sql.example.com")
         .authentication(AuthMethod::sql_server("app", std::env::var("SQL_PASSWORD").expect("set SQL_PASSWORD")))
         .encryption(EncryptionLevel::Strict)
-        .trust_cert_ca("/etc/ssl/sql-ca.pem");
+        .trust_cert_ca("/etc/ssl/sql-server.pem");
     let mut client = Client::connect(&cfg).await?;
     Ok(())
 }
@@ -248,7 +248,7 @@ async fn example() -> mssql_rs::Result<()> {
 
 ### `trust_cert_ca(...)`
 
-Default is no pinned certificate or CA path. Set `trust_cert_ca(path)` to provide a PEM or DER X.509 file for private PKI or self-signed SQL Server certificates; it sets `server_certificate` in the underlying TLS options.
+Default is no pinned certificate. Set `trust_cert_ca(path)` to a PEM or DER file containing the exact server/leaf certificate; it sets `server_certificate` in the underlying TLS options. Unlike tiberius' CA-trust option, this does not add an issuing CA to the trust store. The driver checks the leaf certificate's expiry and compares it with the file instead of validating its CA chain.
 
 **Supersedes `trust_cert()`**: if you call both, `mssql-tds` logs a warning and uses the pinned certificate (`ServerCertificate takes precedence`); `trust_cert()` becomes a no-op.
 
@@ -261,7 +261,7 @@ async fn example() -> mssql_rs::Result<()> {
     cfg.host("db.internal")
         .authentication(AuthMethod::sql_server("app", std::env::var("SQL_PASSWORD").expect("set SQL_PASSWORD")))
         .encryption(EncryptionLevel::Required)
-        .trust_cert_ca("/etc/ssl/private-sql-ca.pem");
+        .trust_cert_ca("/etc/ssl/sql-server.pem");
     let mut client = Client::connect(&cfg).await?;
     Ok(())
 }
@@ -584,7 +584,7 @@ Use this table when migrating code that already builds a `tiberius::Config`.
 | `encryption(EncryptionLevel::Off)` | `tiberius::Config::encryption(tiberius::EncryptionLevel::Off)` |
 | `encryption(EncryptionLevel::NotSupported)` | `tiberius::Config::encryption(tiberius::EncryptionLevel::NotSupported)` |
 | `trust_cert()` | `tiberius::Config::trust_cert()` |
-| `trust_cert_ca(...)` | `tiberius::Config::trust_cert_ca(...)` |
+| `trust_cert_ca(...)` | Same method name as `tiberius::Config::trust_cert_ca(...)`, but pins the server leaf instead of trusting a CA |
 | `host_name_in_certificate(...)` | `tiberius::Config::host_name_in_certificate(...)` |
 | `application_name(...)` | `tiberius::Config::application_name(...)` |
 | `client_name(...)` | `tiberius::Config::client_name(...)` |

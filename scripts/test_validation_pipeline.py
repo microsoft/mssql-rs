@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -945,6 +946,39 @@ def test_rust_driver_is_included_in_ci_archives_and_pr_tests(
         else:
             for feature in ("arrow", "jiff", "serde", "time"):
                 assert f"mssql-rs/{feature}" in selected
+        if command == "cargo nextest archive":
+            # Archive filtersets require a newer nextest than the pipeline pins.
+            assert not re.search(r"(?:^|\s)(?:-E|--filterset)(?:\s|=)", selected)
+
+
+@pytest.mark.parametrize(
+    "entrypoint", ["alpine.sh", "azlinux3.sh", "deb-bookworm.sh", "rhel.sh", "sles.sh"]
+)
+def test_archive_consumers_exclude_compile_fixtures(entrypoint):
+    script = (_ROOT / "scripts" / "dockerentry" / entrypoint).read_text(encoding="utf-8")
+    command = next(line for line in script.splitlines() if "cargo nextest run" in line)
+    assert '--archive-file "$ARCHIVE_NAME"' in command
+    assert "-E 'not (test(connectivity) | (package(mssql-rs) & binary(data_api_compile)))'" in command
+
+
+def test_compile_fixtures_run_in_build_container_for_non_pr_builds():
+    script = (_ROOT / ".pipeline" / "scripts" / "containerized-build.sh").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r'if \[ "\$IS_PR_BUILD" != "true" \]; then\n(.*?)\nfi', script, re.S)
+    assert match
+    command = match.group(1)
+    assert "cargo nextest run" in command
+    assert "--package mssql-rs" in command
+    assert "--test data_api_compile" in command
+    for feature in ("arrow", "jiff", "serde", "time"):
+        assert f"mssql-rs/{feature}" in command
+
+
+def test_standalone_driver_forwards_core_default_features():
+    manifest = tomllib.loads((_ROOT / "mssql-rs" / "Cargo.toml").read_text(encoding="utf-8"))
+    assert manifest["dependencies"]["mssql-tds"]["default-features"] is False
+    assert "mssql-tds/default" in manifest["features"]["default"]
 
 
 def test_mssql_python_odbc_failures_are_advisory_only_in_ci():

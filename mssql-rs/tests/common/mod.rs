@@ -13,10 +13,14 @@ use std::env;
 
 use mssql_rs::{AuthMethod, Config};
 
-pub fn password() -> Option<String> {
+pub fn load_env() {
     if let Err(err) = dotenv::dotenv() {
         assert!(err.not_found(), "invalid .env file: {err}");
     }
+}
+
+pub fn password() -> Option<String> {
+    load_env();
     env::var("SQL_PASSWORD").ok().or_else(|| {
         std::fs::read_to_string("/tmp/password")
             .ok()
