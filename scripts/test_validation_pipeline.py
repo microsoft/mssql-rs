@@ -1093,28 +1093,45 @@ def test_background_step_timeout_stops_nested_run_bounded(tmp_path):
                     tmp_path / "run-bounded.sh")
     started = _background_step(
         tmp_path, "start", "state", "bash", "-c",
-        ". ./run-bounded.sh; run_bounded 30 bash -c "
-        "\"trap '' TERM; echo ready > child-ready; sleep 6; echo escaped > escaped\"",
+        "set -euo pipefail; . ./run-bounded.sh; run_bounded 60 bash -c "
+        "'trap \"\" TERM; echo $$ > child-pid.tmp; mv child-pid.tmp child-pid; "
+        "sleep 30; echo escaped > escaped'",
     )
     assert started.returncode == 0, started.stdout + started.stderr
+    pid_file = tmp_path / "child-pid"
     deadline = time.monotonic() + 10
-    while not (tmp_path / "child-ready").exists() and time.monotonic() < deadline:
+    while not pid_file.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert (tmp_path / "child-ready").exists()
+    assert pid_file.exists()
+    child_pid = pid_file.read_text(encoding="utf-8").strip()
+    assert child_pid.isdecimal()
     joined = _background_step(tmp_path, "wait", "state", "1")
+    probe = subprocess.run(
+        [_BASH, "-c", 'kill -0 "$1" 2>/dev/null', "_", child_pid],
+        capture_output=True, text=True, timeout=10,
+    )
+    if probe.returncode == 0:
+        cleanup = subprocess.run(
+            [_BASH, "-c", 'kill -KILL -- "-$1"', "_", child_pid],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert cleanup.returncode == 0, cleanup.stderr
     assert joined.returncode == 1
     assert "did not finish within 1s of starting" in joined.stdout
-    time.sleep(5)
+    assert probe.returncode != 0, "Nested bounded process survived the timeout"
     assert not (tmp_path / "escaped").exists()
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize("exit_code", [0, 7])
-def test_run_bounded_preserves_exit_code_and_term_trap(tmp_path, exit_code):
+@pytest.mark.parametrize("prior_job", [False, True])
+def test_run_bounded_preserves_exit_code_and_term_trap(tmp_path, exit_code, prior_job):
     shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
                     tmp_path / "run-bounded.sh")
     command = (
-        ". ./run-bounded.sh; trap 'echo prior-trap' TERM; "
+        "set -euo pipefail; "
+        + ('true & wait "$!"; ' if prior_job else "")
+        + ". ./run-bounded.sh; trap 'echo prior-trap' TERM; "
         f"if run_bounded 10 bash -c 'exit {exit_code}'; then rc=0; else rc=$?; fi; "
         'kill -TERM "$$"; exit "$rc"'
     )
@@ -1130,7 +1147,7 @@ def test_run_bounded_still_returns_timeout_status(tmp_path):
     shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
                     tmp_path / "run-bounded.sh")
     command = (
-        ". ./run-bounded.sh; trap 'echo prior-trap' TERM; "
+        "set -euo pipefail; . ./run-bounded.sh; trap 'echo prior-trap' TERM; "
         "if run_bounded 1 sleep 30; then exit 1; else rc=$?; fi; "
         'kill -TERM "$$"; run_bounded 10 true || exit 1; exit "$rc"'
     )

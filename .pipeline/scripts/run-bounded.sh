@@ -5,14 +5,19 @@
 # Returns 124 when the limit was hit, otherwise the command's own exit status.
 
 run_bounded() {
-  local limit=$1 pid='' waited=0 result='' previous_term previous_job=${!:-} cleanup_attempt
+  local limit=$1 pid='' waited=0 result='' previous_term previous_job last_job cleanup_attempt
   shift
   previous_term=$(trap -p TERM)
+  # Bash 3.2 treats an unset $! as an error under nounset, even with :-.
+  previous_job=$(set +u; printf '%s' "$!")
   # A parent may cancel this shell while the bounded command is in a separate
   # process group. Stop that group before exiting instead of orphaning it.
   trap '
-    if [ -z "$pid" ] && [ "${!:-}" != "$previous_job" ]; then
-      pid=${!:-}
+    if [ -z "$pid" ]; then
+      last_job=$(set +u; printf "%s" "$!")
+      if [ "$last_job" != "$previous_job" ]; then
+        pid=$last_job
+      fi
     fi
     if [ -n "$pid" ]; then
       kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
