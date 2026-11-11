@@ -355,6 +355,7 @@ impl<C: Send + 'static> PerKeyPool<C> {
 
 pub(super) struct Retirement<C: Send + 'static> {
     pool: Arc<PerKeyPool<C>>,
+    generation: u64,
     clients: Vec<Cached<C>>,
     slots: Vec<OwnedSlot<C>>,
     cancel: Option<CancellationToken>,
@@ -371,12 +372,47 @@ impl<C: Send + 'static> Retirement<C> {
         }
         Ok(Self {
             pool,
+            generation: state.generation,
             clients: Vec::new(),
             slots: Vec::new(),
             cancel: None,
             failed: false,
             armed: false,
         })
+    }
+
+    fn return_slots(&mut self) -> PoolResult<()> {
+        let mut state = lock(&self.pool.state)?;
+        if !state.accepting || state.generation != self.generation {
+            let mut poisoned = false;
+            for slot in &mut self.slots {
+                let cached = match slot.cached.get_mut() {
+                    Ok(cached) => cached,
+                    Err(error) => {
+                        poisoned = true;
+                        error.into_inner()
+                    }
+                };
+                self.clients.extend(cached.take());
+            }
+            drop(state);
+            if poisoned {
+                tracing::error!("pool retirement discarded a poisoned cached client");
+            }
+            drop(std::mem::take(&mut self.clients));
+            state = lock(&self.pool.state)?;
+        }
+        state.demand -= self.slots.len();
+        drop(std::mem::take(&mut self.slots));
+        if self.armed {
+            state.retiring -= 1;
+        }
+        if self.armed && state.retiring == 0 {
+            for record in state.pending.values() {
+                self.pool.wakes.push(record.waker.clone());
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn finish(self) -> PoolResult<()> {
@@ -398,23 +434,9 @@ impl<C: Send + 'static> Drop for Retirement<C> {
             cancel.cancel();
         }
         drop(std::mem::take(&mut self.clients));
-        match lock(&self.pool.state) {
-            Ok(mut state) => {
-                state.demand -= self.slots.len();
-                drop(std::mem::take(&mut self.slots));
-                if self.armed {
-                    state.retiring -= 1;
-                }
-                if self.armed && state.retiring == 0 {
-                    for record in state.pending.values() {
-                        self.pool.wakes.push(record.waker.clone());
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::error!(%error, "pool retirement could not settle bookkeeping");
-                drop(std::mem::take(&mut self.slots));
-            }
+        if let Err(error) = self.return_slots() {
+            tracing::error!(%error, "pool retirement could not settle bookkeeping");
+            drop(std::mem::take(&mut self.slots));
         }
         self.pool.activity.settled.notify_waiters();
         self.pool.wakes.flush();

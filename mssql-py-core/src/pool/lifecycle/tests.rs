@@ -176,6 +176,144 @@ async fn assigned_reclamation_preserves_idle_age_or_destroys_ineligible_payloads
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn assigned_retirement_discards_cached_clients_before_shutdown_settles() {
+    assigned_retirement_after_closure(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn assigned_retirement_discards_old_generation_clients_after_reenable() {
+    assigned_retirement_after_closure(true).await;
+}
+
+async fn assigned_retirement_after_closure(reenable: bool) {
+    struct Client {
+        dropped: Arc<AtomicUsize>,
+        on_drop: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            if let Some(on_drop) = self.on_drop.take()
+                && !std::thread::panicking()
+            {
+                on_drop();
+            }
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let budget = Duration::from_secs(30);
+    let config = PoolConfig::new(budget, budget, budget)
+        .unwrap()
+        .with_max_size(2)
+        .unwrap()
+        .with_idle_timeout(Duration::from_secs(10))
+        .unwrap();
+    let manager = AsyncPoolManager::<Client>::new(config.clone()).unwrap();
+    manager.enable(config.clone()).unwrap();
+    let key = PoolKey::new(vec![1].into_boxed_slice()).unwrap();
+    let mut first = manager
+        .reserve(key.clone(), control())
+        .await
+        .unwrap()
+        .unwrap();
+    let pool = first.pool.clone();
+    let mut held = pool.request(control()).unwrap().await.unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    first
+        .install(Client {
+            dropped: dropped.clone(),
+            on_drop: None,
+        })
+        .unwrap();
+    first.return_quiescent().unwrap();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let barrier = pool.maintain(Instant::now(), false).unwrap();
+    let mut empty = pool.request(control()).unwrap();
+    assert!(
+        Pin::new(&mut empty)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let weak = Arc::downgrade(&pool);
+    held.install(Client {
+        dropped: dropped.clone(),
+        on_drop: Some(Box::new(move || {
+            let pool = weak.upgrade().unwrap();
+            let state = pool.state.try_lock().expect("off-lock client destruction");
+            assert_eq!((state.demand, state.retiring), (1, 1));
+            drop(state);
+            assert!(!pool.settled().unwrap());
+            let mut available = Box::pin(pool.slots.get());
+            let Poll::Ready(Ok(slot)) = available
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("the other empty slot must be available");
+            };
+            let mut extra = Box::pin(pool.slots.get());
+            assert!(
+                extra
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(extra);
+            drop(slot);
+        })),
+    })
+    .unwrap();
+    held.return_quiescent().unwrap();
+    let cancel = CancellationToken::new();
+    let mut assigned = pool
+        .request(AcquireControl::new(Instant::now() + budget, cancel.clone()))
+        .unwrap();
+    assert!(
+        Pin::new(&mut assigned)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    cancel.cancel();
+    let retirement = pool.refresh(Instant::now(), false, false).unwrap();
+    assert_eq!(retirement.slots.len(), 1);
+    assert!(retirement.clients.is_empty());
+    barrier.finish().unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    manager.disable();
+    let mut shutdown = if reenable {
+        manager.enable(config).unwrap();
+        None
+    } else {
+        let mut shutdown = Box::pin(manager.shutdown());
+        assert!(
+            shutdown
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        Some(shutdown)
+    };
+    retirement.finish().unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    assert!(pool.settled().unwrap());
+    assert!(matches!(assigned.await, Err(PoolError::Closed)));
+    assert!(matches!(empty.await, Err(PoolError::Closed)));
+    pool.slots.retain(|slot, _| {
+        assert!(lock(&slot.cached).unwrap().is_none());
+        true
+    });
+    assert_eq!(pool.counts(), (0, 0, 0));
+    if let Some(shutdown) = shutdown.take() {
+        shutdown.await.unwrap();
+    } else {
+        let mut next = manager.reserve(key, control()).await.unwrap().unwrap();
+        assert!(next.value_mut().is_none());
+        drop(next);
+        manager.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn poisoned_idle_slots_stop_reuse_and_report_maintenance_failure() {
     let pool = pool();

@@ -59,6 +59,9 @@ owns key construction, logical connection/cursor ownership and result delivery.
 - Never release capacity while the associated client or partial-open future can
   still live. The slot adaptation requires local client destruction before
   returning an empty slot; bare Drop is not successful clean return.
+- Detached assigned-slot retirement rechecks acceptance and its original
+  generation before return. Closure discards cached clients off-lock while
+  retaining their capacity and shutdown-settlement accounting.
 - `AcquireControl::run` checks interruption before work and again after work
   completes. A completed result is not permission to skip the manager's
   generation/publication check or the AQE close barrier.
