@@ -350,7 +350,8 @@ Enables Named Pipes and Shared Memory protocols for SQL Server via registry modi
 ### run-bounded.sh
 Sourced helper providing `run_bounded <seconds> <command...>`. macOS ships no
 coreutils `timeout`, so long-running commands are bounded by running them in the
-background and killing them on overrun. Returns 124 on timeout.
+background and killing them on overrun. Returns 124 on timeout. On external
+SIGTERM, it stops the bounded process group before exiting.
 
 ### start-colima-macos.sh
 Boots a Colima VM on a hosted macOS agent from the packaged toolchain, retrying

@@ -1088,6 +1088,60 @@ def test_background_step_timeout_counts_from_start(tmp_path, ignore_term):
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_timeout_stops_nested_run_bounded(tmp_path):
+    shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
+                    tmp_path / "run-bounded.sh")
+    started = _background_step(
+        tmp_path, "start", "state", "bash", "-c",
+        ". ./run-bounded.sh; run_bounded 30 bash -c "
+        "\"trap '' TERM; echo ready > child-ready; sleep 6; echo escaped > escaped\"",
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "child-ready").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert (tmp_path / "child-ready").exists()
+    joined = _background_step(tmp_path, "wait", "state", "1")
+    assert joined.returncode == 1
+    assert "did not finish within 1s of starting" in joined.stdout
+    time.sleep(5)
+    assert not (tmp_path / "escaped").exists()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_run_bounded_preserves_exit_code_and_term_trap(tmp_path, exit_code):
+    shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
+                    tmp_path / "run-bounded.sh")
+    command = (
+        ". ./run-bounded.sh; trap 'echo prior-trap' TERM; "
+        f"if run_bounded 10 bash -c 'exit {exit_code}'; then rc=0; else rc=$?; fi; "
+        'kill -TERM "$$"; exit "$rc"'
+    )
+    result = subprocess.run(
+        [_BASH, "-c", command], cwd=tmp_path, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == exit_code, result.stdout + result.stderr
+    assert "prior-trap" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_run_bounded_still_returns_timeout_status(tmp_path):
+    shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
+                    tmp_path / "run-bounded.sh")
+    command = (
+        ". ./run-bounded.sh; trap 'echo prior-trap' TERM; "
+        "if run_bounded 1 sleep 30; then exit 1; else rc=$?; fi; "
+        'kill -TERM "$$"; run_bounded 10 true || exit 1; exit "$rc"'
+    )
+    result = subprocess.run(
+        [_BASH, "-c", command], cwd=tmp_path, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert "prior-trap" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
 def test_background_step_rejects_late_completion_before_wait(tmp_path):
     started = _background_step(tmp_path, "start", "state", "bash", "-c", "echo finished")
     assert started.returncode == 0, started.stdout + started.stderr
