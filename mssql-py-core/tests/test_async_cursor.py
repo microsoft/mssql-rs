@@ -19,7 +19,10 @@ async def connect(client_context, *, autocommit=True):
         )
 
 
-@pytest.mark.parametrize("context_fixture", ["mock_client_context", "client_context"])
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
 def test_retained_cursor_survives_connection_wrapper_collection(
     request, context_fixture
 ):
@@ -38,7 +41,10 @@ def test_retained_cursor_survives_connection_wrapper_collection(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("context_fixture", ["mock_client_context", "client_context"])
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
 def test_cursor_close_preserves_parent_and_sibling(request, context_fixture):
     async def run():
         conn = await connect(request.getfixturevalue(context_fixture))
@@ -59,7 +65,10 @@ def test_cursor_close_preserves_parent_and_sibling(request, context_fixture):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("context_fixture", ["mock_client_context", "client_context"])
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
 @pytest.mark.parametrize(
     "operation", ["execute", "executemany", "fetchone", "fetchmany", "fetchall", "nextset"]
 )
@@ -82,7 +91,10 @@ def test_retained_cursor_rejects_work_after_connection_close(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("context_fixture", ["mock_client_context", "client_context"])
+@pytest.mark.parametrize(
+    "context_fixture",
+    ["mock_client_context", pytest.param("client_context", marks=pytest.mark.integration)],
+)
 @pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall", "nextset"])
 def test_buffered_cursor_rejects_work_after_connection_close(
     request, context_fixture, operation
