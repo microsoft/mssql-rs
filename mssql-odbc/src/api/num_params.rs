@@ -170,7 +170,7 @@ mod tests {
             ("SELECT 1", 0),
         ] {
             assert_eq!(
-                unsafe { sql_prepare_w(h.stmt, wide(sql).as_ptr(), SQL_NTS) },
+                unsafe { sql_prepare_w(h.stmt, wide(sql).as_ptr(), SQL_NTS.into()) },
                 SQL_SUCCESS
             );
             assert_count(&h, expected);
@@ -187,7 +187,7 @@ mod tests {
         let mut value = 7;
         bind_integer(&h, &mut value);
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT ? /* ? */").as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT ? /* ? */").as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
         assert_count(&h, 1);
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_SUCCESS);
         assert_count(&h, 1);
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT 1").as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT 1").as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
         assert_count(&h, 0);
@@ -210,17 +210,17 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
         assert_eq!(
-            unsafe { sql_prepare_w(h.stmt, wide("SELECT ?, ?").as_ptr(), SQL_NTS) },
+            unsafe { sql_prepare_w(h.stmt, wide("SELECT ?, ?").as_ptr(), SQL_NTS.into()) },
             SQL_SUCCESS
         );
         assert_count(&h, 2);
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT 1").as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT 1").as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
         assert_count(&h, 0);
         assert_eq!(
-            unsafe { sql_prepare_w(h.stmt, wide("SELECT ?").as_ptr(), SQL_NTS) },
+            unsafe { sql_prepare_w(h.stmt, wide("SELECT ?").as_ptr(), SQL_NTS.into()) },
             SQL_SUCCESS
         );
         assert_count(&h, 1);
@@ -233,18 +233,18 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT 1").as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, wide("SELECT 1").as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
         for sql in ["SELECT {bogus 1}", "SELECT ?"] {
             assert_eq!(
-                unsafe { sql_exec_direct_w(h.stmt, wide(sql).as_ptr(), SQL_NTS) },
+                unsafe { sql_exec_direct_w(h.stmt, wide(sql).as_ptr(), SQL_NTS.into()) },
                 SQL_ERROR
             );
             assert_count(&h, 0);
         }
         assert_eq!(
-            unsafe { sql_prepare_w(h.stmt, wide("SELECT {bogus 1}").as_ptr(), SQL_NTS) },
+            unsafe { sql_prepare_w(h.stmt, wide("SELECT {bogus 1}").as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
         assert_count(&h, 0);

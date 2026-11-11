@@ -29,9 +29,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(target_pointer_width = "64")]
 use crate::diagnostics::SettingOrigin;
 #[cfg(target_pointer_width = "64")]
-use crate::diagnostics::{self, Authentication, Depth, Encrypt, Request, SettingSources};
+use crate::diagnostics::{
+    self, Authentication, Depth, Dsn, DsnStatus, Encrypt, Request, SettingSources,
+};
 use crate::formatter::json::{Column, Connection, JsonDocument, Message, RunEnd};
 use crate::telemetry::{self, FlushOutcome};
+use crate::i18n;
 
 /// The call succeeded.
 pub const MSSQL_SQLCMD_OK: i32 = 0;
@@ -101,6 +104,49 @@ pub extern "C" fn mssql_sqlcmd_telemetry_shutdown(timeout_ms: u32) -> i32 {
         Ok(FlushOutcome::TimedOut) => MSSQL_SQLCMD_TELEMETRY_TIMEOUT,
         Ok(FlushOutcome::Failed) | Err(_) => MSSQL_SQLCMD_INTERNAL_ERROR,
     }
+}
+
+/// Sets the locale used by Rust-generated human text: the diagnose reports'
+/// prose, text and JSON. The JSON report's keys and the values tools match on
+/// (ids, names, codes, statuses) are the same in every locale.
+///
+/// Native sqlcmd calls this once at startup with the language it resolved for
+/// SQLCMD.rll. On Windows that may be an LCID as decimal text, for example
+/// `1031`. If this is never called, the library resolves the locale from the
+/// environment and, on Windows, the user default UI language.
+/// The reports are translated into the 10 languages sqlcmd's Windows
+/// installer ships SQLCMD.rll in (German, Spanish, French, Italian, Japanese,
+/// Korean, Brazilian Portuguese, Russian, Simplified and Traditional Chinese).
+/// Any other language, such as `1030` for Danish, is not recognized: it
+/// selects English, as sqlcmd is English there, and returns
+/// [`MSSQL_SQLCMD_INVALID_ARGUMENT`].
+/// A null pointer with zero length resets the locale to the English fallback
+/// and returns [`MSSQL_SQLCMD_INVALID_ARGUMENT`] because an empty locale is not
+/// recognized. A null pointer with a nonzero length returns
+/// [`MSSQL_SQLCMD_NULL_ARGUMENT`] and leaves the locale unchanged.
+///
+/// # Safety
+/// A non-null `locale.data` must point to `locale.len` readable `u16` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mssql_sqlcmd_set_locale(locale: MssqlSqlcmdText) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if locale.data.is_null() {
+            if locale.len != 0 {
+                return MSSQL_SQLCMD_NULL_ARGUMENT;
+            }
+            i18n::set_locale("");
+            return MSSQL_SQLCMD_INVALID_ARGUMENT;
+        }
+        // SAFETY: forwarded from the caller's guarantees. `read_text` fails
+        // only for a null pointer, which is handled above.
+        let locale = unsafe { read_text(locale) }.unwrap_or_default();
+        if i18n::set_locale(&locale) {
+            MSSQL_SQLCMD_OK
+        } else {
+            MSSQL_SQLCMD_INVALID_ARGUMENT
+        }
+    }))
+    .unwrap_or(MSSQL_SQLCMD_INTERNAL_ERROR)
 }
 
 /// A UTF-16 string with an explicit length. It need not be NUL-terminated and
@@ -206,29 +252,40 @@ fn source_value_valid(source: i32) -> bool {
             | MSSQL_SQLCMD_SOURCE_COMMAND_LINE
             | MSSQL_SQLCMD_SOURCE_ENVIRONMENT
             | MSSQL_SQLCMD_SOURCE_DEFAULT
+            | MSSQL_SQLCMD_SOURCE_DSN
     )
 }
 
 #[cfg(target_pointer_width = "64")]
 /// Converts the C source fields for one setting into a reportable origin.
+/// `source_name` names the environment variable or the data source; a
+/// data source without one is `dsn`, the one `-D` gave.
 ///
 /// # Safety
-/// `environment_name`, when non-null, must satisfy [`read_optional_text`]'s
+/// `source_name`, when non-null, must satisfy [`read_optional_text`]'s
 /// pointer and length requirements.
 unsafe fn setting_origin(
     source: i32,
     command_name: &str,
-    environment_name: MssqlSqlcmdText,
+    source_name: MssqlSqlcmdText,
     fallback_environment_name: Option<&str>,
+    dsn: Option<&str>,
 ) -> Option<SettingOrigin> {
     match source {
         MSSQL_SQLCMD_SOURCE_COMMAND_LINE => Some(SettingOrigin::command_line(command_name)),
         MSSQL_SQLCMD_SOURCE_ENVIRONMENT => {
             // SAFETY: forwarded from the diagnostics request's text guarantees.
-            let name = unsafe { read_optional_text(environment_name) }
+            let name = unsafe { read_optional_text(source_name) }
                 .or_else(|| fallback_environment_name.map(ToString::to_string))
                 .unwrap_or_default();
             Some(SettingOrigin::environment(name))
+        }
+        MSSQL_SQLCMD_SOURCE_DSN => {
+            // SAFETY: forwarded from the diagnostics request's text guarantees.
+            let name = unsafe { read_optional_text(source_name) }
+                .or_else(|| dsn.map(ToString::to_string))
+                .unwrap_or_default();
+            Some(SettingOrigin::dsn(name))
         }
         MSSQL_SQLCMD_SOURCE_DEFAULT => Some(SettingOrigin::default_source()),
         _ => None,
@@ -644,6 +701,23 @@ pub const MSSQL_SQLCMD_SOURCE_UNKNOWN: i32 = 0;
 pub const MSSQL_SQLCMD_SOURCE_COMMAND_LINE: i32 = 1;
 pub const MSSQL_SQLCMD_SOURCE_ENVIRONMENT: i32 = 2;
 pub const MSSQL_SQLCMD_SOURCE_DEFAULT: i32 = 3;
+/// The ODBC data source (DSN) given with `-D` supplied the setting; its
+/// `*_source_name` names the data source (or, when empty, `dsn` does).
+pub const MSSQL_SQLCMD_SOURCE_DSN: i32 = 4;
+
+/// `dsn_status` of [`MssqlSqlcmdDiagnosticsRequest`]: what sqlcmd found for the
+/// data source `-D` names (Linux and macOS).
+pub const MSSQL_SQLCMD_DSN_NONE: i32 = 0;
+/// Found: the settings it supplied carry [`MSSQL_SQLCMD_SOURCE_DSN`], and
+/// `server` is the server it names.
+pub const MSSQL_SQLCMD_DSN_FOUND: i32 = 1;
+/// No data source of that name, with a driver, in the user or system
+/// `odbc.ini`; `server` may be empty.
+pub const MSSQL_SQLCMD_DSN_NOT_FOUND: i32 = 2;
+/// Found, but it names no server: as the driver does then, `server` is the
+/// data source name (from [`MSSQL_SQLCMD_SOURCE_DEFAULT`]). The other settings
+/// it supplied carry [`MSSQL_SQLCMD_SOURCE_DSN`].
+pub const MSSQL_SQLCMD_DSN_NO_SERVER: i32 = 3;
 
 /// What `sqlcmd diagnose` checks.
 #[repr(C)]
@@ -693,6 +767,10 @@ pub struct MssqlSqlcmdDiagnosticsRequest {
     pub trust_server_certificate_source_name: MssqlSqlcmdText,
     pub host_name_in_certificate_source_name: MssqlSqlcmdText,
     pub login_timeout_source_name: MssqlSqlcmdText,
+    /// `-D`: the data source name given to `-S`; null or empty without `-D`.
+    pub dsn: MssqlSqlcmdText,
+    /// An `MSSQL_SQLCMD_DSN_*` value: what sqlcmd found for `dsn`.
+    pub dsn_status: i32,
 }
 
 /// Diagnoses the connection `request` describes, up to its depth, and renders
@@ -741,6 +819,16 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
     }
     // SAFETY: a non-null request is valid, per the caller.
     let request = unsafe { *request };
+    let sources = [
+        request.server_source,
+        request.database_source,
+        request.user_source,
+        request.authentication_source,
+        request.encrypt_source,
+        request.trust_server_certificate_source,
+        request.host_name_in_certificate_source,
+        request.login_timeout_source,
+    ];
     let valid = matches!(
         request.authentication,
         MSSQL_SQLCMD_AUTH_SQL_PASSWORD | MSSQL_SQLCMD_AUTH_INTEGRATED
@@ -752,26 +840,30 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
     ) && matches!(format, MSSQL_SQLCMD_REPORT_TEXT | MSSQL_SQLCMD_REPORT_JSON)
         && (MSSQL_SQLCMD_DEPTH_DEFAULT..=MSSQL_SQLCMD_DEPTH_SESSION_VALIDATION)
             .contains(&request.depth)
-        && [
-            request.server_source,
-            request.database_source,
-            request.user_source,
-            request.authentication_source,
-            request.encrypt_source,
-            request.trust_server_certificate_source,
-            request.host_name_in_certificate_source,
-            request.login_timeout_source,
-        ]
-        .into_iter()
-        .all(source_value_valid);
+        && sources.into_iter().all(source_value_valid)
+        && (MSSQL_SQLCMD_DSN_NONE..=MSSQL_SQLCMD_DSN_NO_SERVER).contains(&request.dsn_status)
+        // Only a data source that was found supplies settings.
+        && (matches!(
+            request.dsn_status,
+            MSSQL_SQLCMD_DSN_FOUND | MSSQL_SQLCMD_DSN_NO_SERVER
+        ) || !sources.contains(&MSSQL_SQLCMD_SOURCE_DSN));
     if !valid {
         return MSSQL_SQLCMD_INVALID_ARGUMENT;
     }
+    // A data source that was not found leaves no server: connection input
+    // reports it, and nothing after it runs.
+    let dsn_unusable = request.dsn_status == MSSQL_SQLCMD_DSN_NOT_FOUND;
     // SAFETY: the texts follow the caller's guarantees.
     let input = unsafe {
         let invalid_reason = read_optional_text(request.invalid_reason);
+        let dsn = read_optional_text(request.dsn);
+        if request.dsn_status != MSSQL_SQLCMD_DSN_NONE && dsn.is_none() {
+            return MSSQL_SQLCMD_NULL_ARGUMENT;
+        }
         let server = read_optional_text(request.server);
-        let Some(server) = server.or_else(|| invalid_reason.as_ref().map(|_| String::new())) else {
+        let Some(server) =
+            server.or_else(|| (invalid_reason.is_some() || dsn_unusable).then(String::new))
+        else {
             return MSSQL_SQLCMD_NULL_ARGUMENT;
         };
         let Some(version) = read_text(version) else {
@@ -782,6 +874,7 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
         // A SQL login that will run needs both; an empty password is a value.
         if request.authentication == MSSQL_SQLCMD_AUTH_SQL_PASSWORD
             && invalid_reason.is_none()
+            && !dsn_unusable
             && (user.is_none() || password.is_none())
         {
             return MSSQL_SQLCMD_NULL_ARGUMENT;
@@ -794,54 +887,64 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
             "-U"
         };
         #[cfg(target_pointer_width = "64")]
+        let dsn_name = dsn.as_deref();
+        #[cfg(target_pointer_width = "64")]
         let sources = SettingSources {
             server: setting_origin(
                 request.server_source,
                 "-S",
                 request.server_source_name,
                 Some("SQLCMDSERVER"),
+                dsn_name,
             ),
             database: setting_origin(
                 request.database_source,
                 "-d",
                 request.database_source_name,
                 Some("SQLCMDDBNAME"),
+                dsn_name,
             ),
             user: setting_origin(
                 request.user_source,
                 "-U",
                 request.user_source_name,
                 Some("SQLCMDUSER"),
+                dsn_name,
             ),
             authentication: setting_origin(
                 request.authentication_source,
                 authentication_command_name,
                 request.authentication_source_name,
                 Some("SQLCMDUSER"),
+                dsn_name,
             ),
             encrypt: setting_origin(
                 request.encrypt_source,
                 "-N",
                 request.encrypt_source_name,
                 None,
+                dsn_name,
             ),
             trust_server_certificate: setting_origin(
                 request.trust_server_certificate_source,
                 "-C",
                 request.trust_server_certificate_source_name,
                 None,
+                dsn_name,
             ),
             host_name_in_certificate: setting_origin(
                 request.host_name_in_certificate_source,
                 "-F",
                 request.host_name_in_certificate_source_name,
                 None,
+                dsn_name,
             ),
             login_timeout: setting_origin(
                 request.login_timeout_source,
                 "-l",
                 request.login_timeout_source_name,
                 Some("SQLCMDLOGINTIMEOUT"),
+                dsn_name,
             ),
         };
         DiagnosticsInput {
@@ -861,6 +964,8 @@ pub unsafe extern "C" fn mssql_sqlcmd_diagnostics_run(
             json: format == MSSQL_SQLCMD_REPORT_JSON,
             #[cfg(target_pointer_width = "64")]
             sources,
+            dsn: dsn.filter(|_| request.dsn_status != MSSQL_SQLCMD_DSN_NONE),
+            dsn_status: request.dsn_status,
         }
     };
 
@@ -900,6 +1005,10 @@ struct DiagnosticsInput {
     json: bool,
     #[cfg(target_pointer_width = "64")]
     sources: SettingSources,
+    /// The data source `-D` named; `None` without `-D`.
+    dsn: Option<String>,
+    /// An `MSSQL_SQLCMD_DSN_*` value.
+    dsn_status: i32,
 }
 
 /// Runs the diagnosis and renders the report, with sqlcmd's exit code.
@@ -935,6 +1044,14 @@ fn diagnose(input: DiagnosticsInput) -> Option<(String, i32)> {
         local_detail: input.local_detail,
         invalid: input.invalid_reason,
         sources: input.sources,
+        dsn: input.dsn.map(|name| Dsn {
+            name,
+            status: match input.dsn_status {
+                MSSQL_SQLCMD_DSN_FOUND => DsnStatus::Found,
+                MSSQL_SQLCMD_DSN_NOT_FOUND => DsnStatus::NotFound,
+                _ => DsnStatus::NoServer,
+            },
+        }),
     };
     let report = diagnostics::run(request);
     let text = if input.json {
@@ -1689,6 +1806,8 @@ mod tests {
             trust_server_certificate_source_name: NULL_TEXT,
             host_name_in_certificate_source_name: NULL_TEXT,
             login_timeout_source_name: NULL_TEXT,
+            dsn: NULL_TEXT,
+            dsn_status: MSSQL_SQLCMD_DSN_NONE,
         }
     }
 
@@ -1830,6 +1949,53 @@ mod tests {
             "{rendered}"
         );
     }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn diagnose_invalid_target_renders_in_the_selected_locale() {
+        let pseudo = utf16("qps-ploc");
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&pseudo)) },
+            MSSQL_SQLCMD_OK
+        );
+
+        let (server, user, password) = (utf16("tcp:127.0.0.1,99999"), utf16("sa"), utf16("x"));
+        let mut request = diagnostics_request(&server, &user, &password);
+        request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        // The text report follows the locale.
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_TEXT);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert_eq!(exit_code, 1);
+        assert!(rendered.starts_with("[!!!"), "{rendered}");
+        assert!(
+            !rendered.contains("is not a port number from 0 to 65535"),
+            "{rendered}"
+        );
+        // So does the JSON document's prose; its contract values do not.
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!(status, MSSQL_SQLCMD_OK);
+        assert_eq!(exit_code, 1);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert!(
+            value["sharingWarning"]
+                .as_str()
+                .unwrap()
+                .starts_with("[!!!"),
+            "{rendered}"
+        );
+        assert!(
+            !value["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("is not a port number from 0 to 65535"),
+            "{rendered}"
+        );
+        assert_eq!(value["executionStatus"], "completed");
+        assert_eq!(value["errors"][0]["code"], "invalidPort");
+        assert!(crate::i18n::set_locale("en-US"));
+    }
+
     #[cfg(not(target_pointer_width = "64"))]
     #[test]
     fn diagnostics_are_unsupported_in_a_32_bit_build() {
@@ -1839,6 +2005,72 @@ mod tests {
         assert_eq!(status, MSSQL_SQLCMD_UNSUPPORTED);
         assert_eq!(rendered, "");
         assert_eq!(exit_code, 5);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn diagnose_reports_a_dsn_and_the_settings_it_supplied() {
+        let (server, user, password) = (utf16("tcp:127.0.0.1,1"), utf16("sa"), utf16("x"));
+        let dsn = utf16("SalesDsn");
+        let mut request = diagnostics_request(&server, &user, &password);
+        request.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        request.dsn = text(&dsn);
+        request.dsn_status = MSSQL_SQLCMD_DSN_FOUND;
+        // Without a source name, a setting from the data source names `dsn`.
+        request.server_source = MSSQL_SQLCMD_SOURCE_DSN;
+        request.user_source = MSSQL_SQLCMD_SOURCE_COMMAND_LINE;
+        let (status, rendered, exit_code) = run_diagnostics(&request, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!((status, exit_code), (MSSQL_SQLCMD_OK, 0), "{rendered}");
+        assert!(rendered.contains("\"dsn\": \"SalesDsn\""), "{rendered}");
+        assert!(
+            rendered.contains("\"server\": { \"source\": \"dsn\", \"name\": \"SalesDsn\" }"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"user\": { \"source\": \"commandLine\", \"name\": \"-U\" }"),
+            "{rendered}"
+        );
+
+        // A data source that was not found has no server, and nothing runs
+        // that needs credentials.
+        let mut missing = diagnostics_request(&[], &user, &password);
+        missing.server = NULL_TEXT;
+        missing.user = NULL_TEXT;
+        missing.password = NULL_TEXT;
+        missing.dsn = text(&dsn);
+        missing.dsn_status = MSSQL_SQLCMD_DSN_NOT_FOUND;
+        let (status, rendered, exit_code) = run_diagnostics(&missing, MSSQL_SQLCMD_REPORT_TEXT);
+        assert_eq!((status, exit_code), (MSSQL_SQLCMD_OK, 1), "{rendered}");
+        assert!(
+            rendered.contains("sqlcmd diagnose: DSN SalesDsn\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("was not found in the user or system odbc.ini"),
+            "{rendered}"
+        );
+
+        // A data source that names no server is its own server, from the
+        // default, and still supplies its other settings.
+        let mut no_server = diagnostics_request(&dsn, &user, &password);
+        no_server.depth = MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT;
+        no_server.dsn = text(&dsn);
+        no_server.dsn_status = MSSQL_SQLCMD_DSN_NO_SERVER;
+        no_server.server_source = MSSQL_SQLCMD_SOURCE_DEFAULT;
+        no_server.trust_server_certificate_source = MSSQL_SQLCMD_SOURCE_DSN;
+        let (status, rendered, exit_code) = run_diagnostics(&no_server, MSSQL_SQLCMD_REPORT_JSON);
+        assert_eq!((status, exit_code), (MSSQL_SQLCMD_OK, 0), "{rendered}");
+        assert!(rendered.contains("\"host\": \"SalesDsn\""), "{rendered}");
+        assert!(
+            rendered.contains("names no server, so sqlcmd uses the DSN name as the server"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "\"trustServerCertificate\": { \"source\": \"dsn\", \"name\": \"SalesDsn\" }"
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1860,6 +2092,24 @@ mod tests {
         let mut bad = diagnostics_request(&server, &user, &password);
         bad.server_source = 99;
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.dsn_status = MSSQL_SQLCMD_DSN_NO_SERVER + 1;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        // Only a data source that was found supplies settings.
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.server_source = MSSQL_SQLCMD_SOURCE_DSN;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_INVALID_ARGUMENT));
+        // -D needs the data source's name.
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.dsn_status = MSSQL_SQLCMD_DSN_FOUND;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_NULL_ARGUMENT));
+        // A data source that names no server still needs the server: its name.
+        let dsn = utf16("SalesDsn");
+        let mut bad = diagnostics_request(&server, &user, &password);
+        bad.server = NULL_TEXT;
+        bad.dsn = text(&dsn);
+        bad.dsn_status = MSSQL_SQLCMD_DSN_NO_SERVER;
+        cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_NULL_ARGUMENT));
         let mut bad = diagnostics_request(&server, &user, &password);
         bad.server = text(&empty);
         cases.push((bad, MSSQL_SQLCMD_REPORT_TEXT, MSSQL_SQLCMD_NULL_ARGUMENT));
@@ -1955,6 +2205,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn set_locale_reports_status() {
+        let german = utf16("1031");
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&german)) },
+            MSSQL_SQLCMD_OK
+        );
+        assert_eq!(crate::i18n::locale(), "de-DE");
+
+        // SAFETY: null with zero length is the documented empty-locale reset.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(NULL_TEXT) },
+            MSSQL_SQLCMD_INVALID_ARGUMENT
+        );
+        assert_eq!(crate::i18n::locale(), "en-US");
+
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&german)) },
+            MSSQL_SQLCMD_OK
+        );
+
+        let invalid = utf16("not-a-locale");
+        // SAFETY: test text points to readable UTF-16 data.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(text(&invalid)) },
+            MSSQL_SQLCMD_INVALID_ARGUMENT
+        );
+        assert_eq!(crate::i18n::locale(), "en-US");
+
+        let null_with_len = MssqlSqlcmdText {
+            data: std::ptr::null(),
+            len: 1,
+        };
+        // SAFETY: null data is passed to validate the FFI error path.
+        assert_eq!(
+            unsafe { mssql_sqlcmd_set_locale(null_with_len) },
+            MSSQL_SQLCMD_NULL_ARGUMENT
+        );
+    }
+
     /// The header declares exactly the functions this module exports, and its
     /// constants have the values of the Rust ones.
     #[test]
@@ -2042,6 +2334,11 @@ mod tests {
                 MSSQL_SQLCMD_SOURCE_ENVIRONMENT,
             ),
             ("MSSQL_SQLCMD_SOURCE_DEFAULT", MSSQL_SQLCMD_SOURCE_DEFAULT),
+            ("MSSQL_SQLCMD_SOURCE_DSN", MSSQL_SQLCMD_SOURCE_DSN),
+            ("MSSQL_SQLCMD_DSN_NONE", MSSQL_SQLCMD_DSN_NONE),
+            ("MSSQL_SQLCMD_DSN_FOUND", MSSQL_SQLCMD_DSN_FOUND),
+            ("MSSQL_SQLCMD_DSN_NOT_FOUND", MSSQL_SQLCMD_DSN_NOT_FOUND),
+            ("MSSQL_SQLCMD_DSN_NO_SERVER", MSSQL_SQLCMD_DSN_NO_SERVER),
         ];
         let defines: Vec<(&str, i32)> = header
             .lines()

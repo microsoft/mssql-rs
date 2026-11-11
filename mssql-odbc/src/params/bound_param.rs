@@ -28,7 +28,7 @@ use crate::handles::desc::{DescRecord, DescState, UdtNames};
 /// snapshot from those records immediately before each execute (see
 /// [`Self::all_from_descriptor_states`]) — the shape `build_named_params` and
 /// the data-at-execution lookups already expect.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct BoundParam {
     /// `SQL_PARAM_INPUT` / `SQL_PARAM_INPUT_OUTPUT` / `SQL_PARAM_OUTPUT`.
@@ -38,10 +38,15 @@ pub(crate) struct BoundParam {
     pub(crate) c_type: SqlSmallInt,
     /// SQL data type of the column/expression (ODBC `ParameterType`, `SQL_*`).
     pub(crate) sql_type: SqlSmallInt,
+    /// Explicit IPD subtype, if set independently of the concise SQL type.
+    pub(crate) sql_datetime_interval_code: Option<SqlSmallInt>,
     /// Column size (precision) as passed by the application.
     pub(crate) column_size: SqlULen,
     /// Decimal digits (scale) as passed by the application.
     pub(crate) decimal_digits: SqlSmallInt,
+    /// Application descriptor subtype, which can be set before its datetime
+    /// family type. `None` uses the subtype implied by `c_type`.
+    pub(crate) app_datetime_interval_code: Option<SqlSmallInt>,
     pub(crate) app_precision: SqlSmallInt,
     pub(crate) app_scale: SqlSmallInt,
     /// Pointer to the application's value buffer (read at execute time).
@@ -192,7 +197,9 @@ impl BoundParam {
         ipd_record: &mut DescRecord,
     ) {
         apd_record.concise_type = self.c_type;
-        apd_record.datetime_interval_code = datetime_interval_code_for(self.c_type);
+        apd_record.datetime_interval_code = self
+            .app_datetime_interval_code
+            .unwrap_or_else(|| datetime_interval_code_for(self.c_type));
         apd_record.reset_app_type_defaults(self.c_type);
         apd_record.data_ptr = self.parameter_value_ptr;
         apd_record.data_bound = true;
@@ -202,7 +209,9 @@ impl BoundParam {
 
         ipd_record.parameter_type = self.input_output_type;
         ipd_record.concise_type = self.sql_type;
-        ipd_record.datetime_interval_code = datetime_interval_code_for(self.sql_type);
+        ipd_record.datetime_interval_code = self
+            .sql_datetime_interval_code
+            .unwrap_or_else(|| datetime_interval_code_for(self.sql_type));
         ipd_record.scale = self.decimal_digits;
         if parameter_size_is_precision(self.sql_type) {
             ipd_record.precision =
@@ -256,19 +265,21 @@ impl BoundParam {
         if !apd_record.data_bound {
             return None;
         }
-        let (input_output_type, sql_type, column_size, decimal_digits) = match ipd_record {
-            Some(ipd) => (
-                ipd.parameter_type,
-                ipd.concise_type,
-                if parameter_size_is_precision(ipd.concise_type) {
-                    SqlULen::try_from(ipd.precision.max(0)).unwrap_or(0)
-                } else {
-                    ipd.length
-                },
-                ipd.scale,
-            ),
-            None => (SQL_PARAM_INPUT, 0, 0, 0),
-        };
+        let (input_output_type, sql_type, sql_datetime_interval_code, column_size, decimal_digits) =
+            match ipd_record {
+                Some(ipd) => (
+                    ipd.parameter_type,
+                    ipd.concise_type,
+                    Some(ipd.datetime_interval_code),
+                    if parameter_size_is_precision(ipd.concise_type) {
+                        SqlULen::try_from(ipd.precision.max(0)).unwrap_or(0)
+                    } else {
+                        ipd.length
+                    },
+                    ipd.scale,
+                ),
+                None => (SQL_PARAM_INPUT, 0, None, 0, 0),
+            };
         let c_type = if apd_record.concise_type == SQL_C_DEFAULT {
             resolve_default_c_type(sql_type, odbc_version).unwrap_or(apd_record.concise_type)
         } else {
@@ -278,8 +289,10 @@ impl BoundParam {
             input_output_type,
             c_type,
             sql_type,
+            sql_datetime_interval_code,
             column_size,
             decimal_digits,
+            app_datetime_interval_code: Some(apd_record.datetime_interval_code),
             app_precision: apd_record.precision,
             app_scale: apd_record.scale,
             parameter_value_ptr: apd_record.data_ptr,
@@ -314,11 +327,15 @@ impl BoundParam {
                     long_as_max,
                     // Filtered to match the doc on the field, and for the same
                     // reason `parameter_definition` filters: `classify_field`
-                    // gates the `SQL_CA_SS_UDT_*` fields on `DescKind::ImpParam`
-                    // alone, so an application can leave an identity on a
-                    // record it later rebinds to a scalar type.
+                    // gates the `SQL_CA_SS_*` name fields on `DescKind::ImpParam`
+                    // alone, so an application can leave an identity on a record
+                    // it later rebinds to a scalar type. Both `SQL_SS_UDT` and
+                    // `SQL_SS_TABLE` carry a server type name in this storage.
                     udt_names: ipd_record
-                        .filter(|ipd| ipd.concise_type == crate::api::odbc_types::SQL_SS_UDT)
+                        .filter(|ipd| {
+                            ipd.concise_type == crate::api::odbc_types::SQL_SS_UDT
+                                || ipd.concise_type == crate::api::odbc_types::SQL_SS_TABLE
+                        })
                         .and_then(|ipd| ipd.udt_names.clone()),
                 })
             })
@@ -343,6 +360,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 8,
             decimal_digits: 0,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: value,
@@ -469,6 +488,7 @@ mod tests {
             diag_records: Vec::new(),
             header: DescHeader::default(),
             records: Vec::new(),
+            data_classification: None,
         }
     }
 
@@ -503,6 +523,8 @@ mod tests {
             sql_type: crate::api::odbc_types::SQL_DECIMAL,
             column_size,
             decimal_digits,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: std::ptr::null_mut(),
@@ -600,6 +622,8 @@ mod tests {
             sql_type: crate::api::odbc_types::SQL_TYPE_TIMESTAMP,
             column_size: 27,
             decimal_digits: 7,
+            app_datetime_interval_code: None,
+            sql_datetime_interval_code: None,
             app_precision: 0,
             app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr().cast(),

@@ -340,6 +340,65 @@ mod mock_server_tests {
         Ok(())
     }
 
+    /// A batch larger than the packet size arrives as several packets with EOM
+    /// only on the last; the mock must answer once, for the whole text.
+    #[tokio::test]
+    async fn test_multi_packet_batch_is_reassembled() -> Result<(), Box<dyn std::error::Error>> {
+        use mssql_mock_tds::QueryResponse;
+
+        init_tracing();
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        let long_query = format!("SELECT 1 /*{}*/", "x".repeat(10_000));
+        server
+            .query_registry()
+            .lock()
+            .await
+            .register(&long_query, QueryResponse::select_one());
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        // The single-packet query afterwards proves no partial batch lingers.
+        for query in [long_query.as_str(), "SELECT 1"] {
+            client.execute(query.to_string(), ()).await?;
+            let mut row_count = 0;
+            if client.on_rows() {
+                while client.next_row().await?.is_some() {
+                    row_count += 1;
+                }
+            }
+            assert_eq!(row_count, 1, "query of {} chars", query.len());
+            client.close_query().await?;
+        }
+
+        client.close_connection().await?;
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
     /// Repro for https://github.com/microsoft/mssql-rs/issues/587: a series
     /// of plain autocommit queries, each fully drained before the next is
     /// sent, used to carry a growing `OutstandingRequestCount` on the wire —
@@ -1286,6 +1345,144 @@ mod mock_server_tests {
         let _ = shutdown_tx.send(());
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
 
+        Ok(())
+    }
+
+    async fn check_delayed_transaction_completion(
+        commit: bool,
+        timeout_secs: Option<u32>,
+        cancel_request: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use mssql_mock_tds::{QueryResponse, TM_COMMIT_DELAY_KEY, TM_ROLLBACK_DELAY_KEY};
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use mssql_tds::core::CancelHandle;
+        use mssql_tds::error::Error;
+        use mssql_tds::message::transaction_management::TransactionIsolationLevel;
+        use std::time::{Duration, Instant};
+
+        let bounded = timeout_secs == Some(1) || cancel_request;
+        let delay = if bounded {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_millis(200)
+        };
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+        server.query_registry().lock().await.register(
+            if commit {
+                TM_COMMIT_DELAY_KEY
+            } else {
+                TM_ROLLBACK_DELAY_KEY
+            },
+            QueryResponse::new(vec![], vec![]).with_delay(delay),
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+        let mut client = TdsConnectionProvider {}
+            .create_client(context, &datasource, None)
+            .await?;
+        client
+            .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+            .await?;
+        assert!(client.has_active_transaction());
+
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(timeout_secs.filter(|seconds| *seconds != 0).unwrap_or(120));
+        let request_cancel = cancel.child_handle();
+        let cancel_task = cancel_request.then(|| {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancel.cancel();
+            })
+        });
+        let mut options = ExecuteOptions::new().cancel(&request_cancel);
+        if let Some(seconds) = timeout_secs {
+            options = options.timeout_secs(seconds);
+        }
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            if commit {
+                client
+                    .commit_transaction_with_options(None, None, options)
+                    .await
+            } else {
+                client
+                    .rollback_transaction_with_options(None, None, options)
+                    .await
+            }
+        })
+        .await
+        .expect("transaction completion must honor its timeout or cancellation");
+        let elapsed = started.elapsed();
+        if let Some(task) = cancel_task {
+            task.await?;
+        }
+        if cancel_request {
+            assert!(matches!(outcome, Err(Error::OperationCancelledError(_))));
+        } else if bounded {
+            assert!(matches!(outcome, Err(Error::TimeoutError(_))));
+            assert!(elapsed >= Duration::from_secs(1));
+        } else {
+            outcome?;
+            assert!(elapsed >= delay);
+            assert!(!client.has_active_transaction());
+        }
+        if bounded {
+            assert!(elapsed < delay, "the request waited out the server delay");
+            assert!(
+                client.has_active_transaction(),
+                "no transaction completion was acknowledged"
+            );
+        }
+        assert!(!client.has_open_batch());
+        assert!(
+            !client.is_connection_dead(),
+            "the mock acknowledges attention"
+        );
+        drop(client);
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transaction_completion_timeout_interrupts_delayed_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for commit in [true, false] {
+            check_delayed_transaction_completion(commit, Some(1), false).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transaction_completion_zero_and_none_wait_for_delayed_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for commit in [true, false] {
+            for timeout in [Some(0), None] {
+                check_delayed_transaction_completion(commit, timeout, false).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transaction_completion_cancellation_interrupts_delayed_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for commit in [true, false] {
+            check_delayed_transaction_completion(commit, Some(0), true).await?;
+        }
         Ok(())
     }
 

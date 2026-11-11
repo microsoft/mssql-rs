@@ -16,7 +16,9 @@ use crate::datatypes::sql_tvp::{
 };
 use crate::datatypes::sql_udt::{UdtTypeName, write_udt_type_name};
 use crate::datatypes::sql_vector::SqlVector;
-use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
+use crate::datatypes::tds_value_serializer::{
+    NULL_LENGTH, TdsTypeContext, TdsValueSerializer, VARNULL,
+};
 use crate::{
     core::TdsResult,
     datatypes::{
@@ -154,6 +156,93 @@ pub(crate) const SQL_VARIANT_MAX_LENGTH: u32 = 8009u32;
 
 // The length of a NULL value in TDS is 65535 bytes for variable length types.
 pub(crate) const MAX_U16_LENGTH: u16 = 65535u16;
+
+// NVARCHAR(n) above this many characters is sent as nvarchar(max).
+const NVARCHAR_MAX_INLINE_CHARS: u16 = 4000;
+
+/// `TYPE_INFO` max length, in bytes, of an `NVARCHAR(chars)` parameter, or
+/// `None` when the declaration is too long for inline framing and is sent as
+/// `nvarchar(max)` (PLP).
+pub(crate) const fn nvarchar_inline_max_bytes(chars: u16) -> Option<u16> {
+    if chars > NVARCHAR_MAX_INLINE_CHARS {
+        None
+    } else {
+        Some(chars * 2)
+    }
+}
+
+/// An RPC parameter `TYPE_INFO` and value that the batched `sp_execute` fast
+/// path writes without awaiting. Produced only by [`SqlType::rpc_inline`] for
+/// values whose async serialization cannot fail.
+pub(crate) enum RpcInlineValue<'a> {
+    Int(Option<i32>),
+    BigInt(Option<i64>),
+    NVarchar {
+        max_bytes: u16,
+        value: Option<&'a [u8]>,
+    },
+}
+
+impl RpcInlineValue<'_> {
+    pub(crate) fn encoded_len(&self) -> usize {
+        match self {
+            Self::Int(value) => 2 + value.map_or(1, |_| 5),
+            Self::BigInt(value) => 2 + value.map_or(1, |_| 9),
+            Self::NVarchar { value, .. } => 8 + 2 + value.map_or(0, <[u8]>::len),
+        }
+    }
+
+    /// Must emit exactly the bytes `serialize_with_narrow_string_byte_limit`
+    /// writes for the same value.
+    pub(crate) fn write(&self, packet_writer: &mut PacketWriter<'_>, db_collation: &SqlCollation) {
+        const INTN: u8 = TdsDataType::IntN as u8;
+        match *self {
+            Self::Int(value) => {
+                packet_writer.write_bytes_within_packet(&[INTN, 4]);
+                match value {
+                    Some(value) => {
+                        let [b0, b1, b2, b3] = value.to_le_bytes();
+                        packet_writer.write_bytes_within_packet(&[4, b0, b1, b2, b3]);
+                    }
+                    None => packet_writer.write_bytes_within_packet(&[NULL_LENGTH]),
+                }
+            }
+            Self::BigInt(value) => {
+                packet_writer.write_bytes_within_packet(&[INTN, 8]);
+                match value {
+                    Some(value) => {
+                        let [b0, b1, b2, b3, b4, b5, b6, b7] = value.to_le_bytes();
+                        packet_writer
+                            .write_bytes_within_packet(&[8, b0, b1, b2, b3, b4, b5, b6, b7]);
+                    }
+                    None => packet_writer.write_bytes_within_packet(&[NULL_LENGTH]),
+                }
+            }
+            Self::NVarchar { max_bytes, value } => {
+                packet_writer.write_bytes_within_packet(&SqlType::collated_type_info_bytes(
+                    TdsDataType::NVarChar as u8,
+                    max_bytes,
+                    db_collation,
+                ));
+                match value {
+                    Some(bytes) => {
+                        // Casts cannot truncate: `rpc_inline` bounds the value by `max_bytes`.
+                        let length = bytes.len() as u16;
+                        TdsValueSerializer::trace_variable_length_string(
+                            true,
+                            TdsDataType::NVarChar as u8,
+                            bytes.len() / 2,
+                            bytes.len(),
+                        );
+                        packet_writer.write_bytes_within_packet(&length.to_le_bytes());
+                        packet_writer.write_bytes_within_packet(bytes);
+                    }
+                    None => packet_writer.write_bytes_within_packet(&VARNULL.to_le_bytes()),
+                }
+            }
+        }
+    }
+}
 
 // The fixed size for Decimal in TDS is 17 bytes.
 pub(crate) const DECIMAL_FIXED_SIZE: u8 = 17;
@@ -433,12 +522,7 @@ impl SqlType {
 
             // String types - NVarchar
             SqlType::NVarchar(opt, param_len) => {
-                let max_size = 4000u16;
-                let param_len = if *param_len > max_size {
-                    MAX_U16_LENGTH
-                } else {
-                    *param_len * 2
-                };
+                let param_len = nvarchar_inline_max_bytes(*param_len).unwrap_or(MAX_U16_LENGTH);
                 let is_plp = param_len == MAX_U16_LENGTH;
                 let cv = match opt {
                     Some(v) => ColumnValues::String(v.clone()),
@@ -745,6 +829,8 @@ impl SqlType {
         // RPC LOBs carry lengths, not the textptr/timestamp used by bulk ROWs.
         // Resolve encoding once so MaxLen, ActualLen, and the payload agree.
         if matches!(self, Self::Text(_) | Self::NText(_) | Self::Image(_)) {
+            let narrow_string_byte_limit =
+                self.effective_narrow_string_byte_limit(narrow_string_byte_limit);
             let (encoded, had_loss) = self.legacy_lob_wire_bytes(db_collation)?;
             let fitted = encoded
                 .as_deref()
@@ -807,20 +893,54 @@ impl SqlType {
         length: u16,
         collation: &SqlCollation,
     ) -> TdsResult<()> {
+        packet_writer
+            .write_fixed_bytes(&Self::collated_type_info_bytes(tds_type, length, collation))
+            .await
+    }
+
+    fn collated_type_info_bytes(tds_type: u8, length: u16, collation: &SqlCollation) -> [u8; 8] {
         let length = length.to_le_bytes();
         let info = collation.info.to_le_bytes();
-        packet_writer
-            .write_fixed_bytes(&[
-                tds_type,
-                length[0],
-                length[1],
-                info[0],
-                info[1],
-                info[2],
-                info[3],
-                collation.sort_id,
-            ])
-            .await
+        [
+            tds_type,
+            length[0],
+            length[1],
+            info[0],
+            info[1],
+            info[2],
+            info[3],
+            collation.sort_id,
+        ]
+    }
+
+    /// Describes this value for [`RpcInlineValue::write`] when its async
+    /// serialization is plain buffer writes that cannot fail. `None` keeps the
+    /// value on [`Self::serialize_with_narrow_string_byte_limit`], which owns
+    /// every error: transcoding, odd UTF-16 length, over-length values and all
+    /// other types.
+    pub(crate) fn rpc_inline(&self) -> Option<RpcInlineValue<'_>> {
+        match self {
+            SqlType::Int(value) => Some(RpcInlineValue::Int(*value)),
+            SqlType::BigInt(value) => Some(RpcInlineValue::BigInt(*value)),
+            SqlType::NVarchar(value, chars) => {
+                let max_bytes = nvarchar_inline_max_bytes(*chars)?;
+                let value = match value {
+                    // Same source order as `serialize_string`; other encodings transcode there.
+                    Some(value) => {
+                        let bytes = value
+                            .as_utf16_bytes()
+                            .or_else(|| value.as_raw_wire_bytes())?;
+                        if bytes.len() % 2 != 0 || bytes.len() > usize::from(max_bytes) {
+                            return None;
+                        }
+                        Some(bytes)
+                    }
+                    None => None,
+                };
+                Some(RpcInlineValue::NVarchar { max_bytes, value })
+            }
+            _ => None,
+        }
     }
 
     /// Write the TDS `TYPE_INFO` for this type: the type byte followed by its
@@ -936,12 +1056,7 @@ impl SqlType {
 
             // NVarchar: type byte + param_len(u16) + collation(5 bytes)
             SqlType::NVarchar(_, param_len) => {
-                let max_size = 4000u16;
-                let param_len = if *param_len > max_size {
-                    MAX_U16_LENGTH
-                } else {
-                    *param_len * 2
-                };
+                let param_len = nvarchar_inline_max_bytes(*param_len).unwrap_or(MAX_U16_LENGTH);
                 Self::write_collated_type_info(
                     packet_writer,
                     nullable_type as u8,
@@ -1133,6 +1248,10 @@ impl SqlType {
         db_collation: &SqlCollation,
         narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()> {
+        let narrow_string_byte_limit =
+            self.effective_narrow_string_byte_limit(narrow_string_byte_limit);
+        let has_narrow_string_byte_limit = narrow_string_byte_limit.is_some();
+
         match self {
             SqlType::Udt(type_name, _) => type_name.validate(),
             SqlType::NText(Some(value)) => {
@@ -1144,15 +1263,15 @@ impl SqlType {
             }
             SqlType::Variant(inner) => {
                 Self::validate_variant_inner(inner)?;
-                inner.validate_for_send(db_collation, None)
+                inner.validate_for_send(db_collation, narrow_string_byte_limit)
             }
             SqlType::Varchar(_, length)
-                if narrow_string_byte_limit.is_none() && *length > VAR_TDS_MAX_LENGTH =>
+                if !has_narrow_string_byte_limit && *length > VAR_TDS_MAX_LENGTH =>
             {
                 Ok(())
             }
-            SqlType::VarcharMax(_) if narrow_string_byte_limit.is_none() => Ok(()),
-            SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
+            SqlType::VarcharMax(_) if !has_narrow_string_byte_limit => Ok(()),
+            SqlType::Text(_) if !has_narrow_string_byte_limit => {
                 self.validate_legacy_lob_length(db_collation, None)
             }
             SqlType::Vector(vector, dimensions, base_type) => {
@@ -1171,6 +1290,21 @@ impl SqlType {
                 self.validate_legacy_lob_length(db_collation, narrow_string_byte_limit)
             }
             _ => Ok(()),
+        }
+    }
+
+    fn effective_narrow_string_byte_limit(&self, column_limit: Option<usize>) -> Option<usize> {
+        let value_limit = match self {
+            Self::Char(Some(value), _)
+            | Self::Varchar(Some(value), _)
+            | Self::VarcharMax(Some(value))
+            | Self::Text(Some(value)) => value.narrow_string_byte_limit(),
+            _ => None,
+        };
+        match (value_limit, column_limit) {
+            (Some(value_limit), Some(column_limit)) => Some(value_limit.min(column_limit)),
+            (Some(value_limit), None) => Some(value_limit),
+            (None, column_limit) => column_limit,
         }
     }
 
@@ -1216,9 +1350,6 @@ impl SqlType {
     /// are promoted to MAX/PLP by the type-info paths. Returns [`Error::UsageError`] for
     /// any of these.
     fn validate_variant_inner(inner: &SqlType) -> TdsResult<()> {
-        // nvarchar tops out at 4000 characters before promotion to nvarchar(max).
-        const NVARCHAR_MAX_CHARS: u16 = 4000;
-
         let unsupported = match inner {
             SqlType::NVarcharMax(_) => Some("nvarchar(max)"),
             SqlType::VarcharMax(_) => Some("varchar(max)"),
@@ -1234,7 +1365,9 @@ impl SqlType {
             SqlType::Table(_, _) => Some("table-valued parameter (TVP)"),
             // Sized string/binary types whose declared length exceeds the non-MAX limit
             // are promoted to MAX/PLP, which sql_variant cannot hold.
-            SqlType::NVarchar(_, len) if *len > NVARCHAR_MAX_CHARS => Some("nvarchar(max)"),
+            SqlType::NVarchar(_, len) if nvarchar_inline_max_bytes(*len).is_none() => {
+                Some("nvarchar(max)")
+            }
             SqlType::Varchar(_, len) if *len > VAR_TDS_MAX_LENGTH => Some("varchar(max)"),
             SqlType::VarBinary(_, len) if *len > VAR_TDS_MAX_LENGTH => Some("varbinary(max)"),
             _ => None,
@@ -1584,6 +1717,48 @@ mod legacy_lob_tests {
                     assert!(writer.get_payload().into_inner().is_empty());
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_rpc_applies_value_level_narrow_byte_limit() {
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        for (text, value_limit, parameter_limit) in
+            [(b"a ".as_slice(), 1, None), (b"a  ".as_slice(), 2, Some(1))]
+        {
+            let mut text = SqlString::new(text.to_vec(), EncodingType::Utf8);
+            text.set_narrow_string_byte_limit(value_limit);
+            let value = SqlType::Text(Some(text));
+            value
+                .validate_for_send(&collation, parameter_limit)
+                .unwrap();
+
+            let mut mock = MockNetworkWriter::new(64);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            value
+                .serialize_with_narrow_string_byte_limit(
+                    &mut writer,
+                    &collation,
+                    None,
+                    parameter_limit,
+                )
+                .await
+                .unwrap();
+
+            let mut expected = vec![0x23];
+            expected.extend_from_slice(&1u32.to_le_bytes());
+            expected.extend_from_slice(&[0; 5]);
+            expected.extend_from_slice(&1u32.to_le_bytes());
+            expected.push(b'a');
+            assert_eq!(
+                &writer.get_payload().into_inner()[PacketWriter::PACKET_HEADER_SIZE..],
+                expected
+            );
         }
     }
 

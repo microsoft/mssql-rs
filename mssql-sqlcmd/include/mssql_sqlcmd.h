@@ -46,6 +46,21 @@ typedef struct MssqlSqlcmdText {
     const uint16_t* data;
     size_t len; /* in UTF-16 code units, not bytes */
 } MssqlSqlcmdText;
+/* Sets the locale used by Rust-generated human text: the diagnose reports'
+   prose, text and JSON. The JSON report's keys and the values tools match on
+   (ids, names, codes, statuses) are the same in every locale. Native sqlcmd
+   calls this once at startup with the language it resolved for SQLCMD.rll; on
+   Windows this may be an LCID as decimal text, for example "1031". If never
+   called, the library resolves the locale from the environment and then the
+   user default UI language on Windows. The reports are translated into the
+   10 languages sqlcmd's Windows installer ships SQLCMD.rll in; any other
+   language, such as "1030" (Danish), is not recognized. Returns MSSQL_SQLCMD_INVALID_ARGUMENT
+   when the locale is not recognized; English fallback is still selected. A
+   NULL pointer with zero length is treated as an empty locale: it resets to
+   English fallback and returns MSSQL_SQLCMD_INVALID_ARGUMENT. A NULL pointer
+   with a nonzero length returns MSSQL_SQLCMD_NULL_ARGUMENT and leaves the
+   locale unchanged. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_set_locale(MssqlSqlcmdText locale);
 
 /* Privacy-safe product telemetry. The usage call lazily configures the direct
    Application Insights exporter from APPLICATIONINSIGHTS_CONNECTION_STRING.
@@ -197,6 +212,24 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 #define MSSQL_SQLCMD_SOURCE_COMMAND_LINE 1
 #define MSSQL_SQLCMD_SOURCE_ENVIRONMENT 2
 #define MSSQL_SQLCMD_SOURCE_DEFAULT 3
+#define MSSQL_SQLCMD_SOURCE_DSN 4 /* the ODBC data source given with -D; its
+                                     *_source_name names it (or, when empty,
+                                     dsn does) */
+
+/* dsn_status: what sqlcmd found for the data source -D names (Linux and
+   macOS; sqlcmd on Windows treats -D as obsolete). */
+#define MSSQL_SQLCMD_DSN_NONE 0      /* no -D */
+#define MSSQL_SQLCMD_DSN_FOUND 1     /* found: the settings it supplied carry
+                                        MSSQL_SQLCMD_SOURCE_DSN, and server is
+                                        the server it names */
+#define MSSQL_SQLCMD_DSN_NOT_FOUND 2 /* not in the user or system odbc.ini,
+                                        or names no driver; server may be
+                                        empty */
+#define MSSQL_SQLCMD_DSN_NO_SERVER 3 /* found, but names no server: as the
+                                        driver does then, server is the data
+                                        source name (MSSQL_SQLCMD_SOURCE_DEFAULT);
+                                        the other settings it supplied carry
+                                        MSSQL_SQLCMD_SOURCE_DSN */
 
 typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText server;   /* -S; required unless invalid_reason is given */
@@ -228,6 +261,9 @@ typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText trust_server_certificate_source_name;
     MssqlSqlcmdText host_name_in_certificate_source_name;
     MssqlSqlcmdText login_timeout_source_name;
+    MssqlSqlcmdText dsn;      /* -D: the data source name given to -S; NULL or
+                                 empty without -D */
+    int32_t dsn_status;       /* MSSQL_SQLCMD_DSN_* */
 } MssqlSqlcmdDiagnosticsRequest;
 
 /* Diagnoses the connection up to request->depth (name resolution, SQL Server

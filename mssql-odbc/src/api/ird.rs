@@ -13,13 +13,14 @@
 
 use tracing::error;
 
+use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use crate::api::col_attribute::{desc_length, octet_length, precision};
 use crate::api::describe_col::{decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{SQL_NO_NULLS, SQL_NULLABLE, SqlSmallInt, SqlULen};
 use crate::api::set_desc_field::datetime_interval_code_for;
-use crate::handles::desc::DescRecord;
+use crate::handles::desc::{DataClassification, DescRecord};
 use crate::handles::{DescHandle, StmtHandle, handle_from_raw};
 
 /// Rewrites `stmt`'s IRD to describe `metadata`, growing or shrinking its
@@ -49,7 +50,11 @@ use crate::handles::{DescHandle, StmtHandle, handle_from_raw};
 /// inconsistency this driver did not have when the IRD was permanently
 /// empty. The caller posts a diagnostic against the statement and fails the
 /// call outright.
-pub(super) fn populate_ird(stmt: &StmtHandle, metadata: &[ColumnMetadata]) -> Result<(), ()> {
+pub(super) fn populate_ird(
+    stmt: &StmtHandle,
+    metadata: &[ColumnMetadata],
+    data_classification: Option<Box<[u8]>>,
+) -> Result<(), ()> {
     let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
     let Ok(mut desc_state) = desc.inner.lock() else {
         error!("populating IRD: mutex poisoned");
@@ -62,7 +67,91 @@ pub(super) fn populate_ird(stmt: &StmtHandle, metadata: &[ColumnMetadata]) -> Re
             *record = ird_record_from_metadata(meta);
         }
     }
+    desc_state.data_classification = data_classification.map(DataClassification::new);
     Ok(())
+}
+
+/// Drops the IRD's `SQL_CA_SS_DATA_CLASSIFICATION` once its result set is gone:
+/// when the request that runs a statement is sent, at batch end, and when a
+/// statement that is not prepared closes its cursor. Matches where msodbcsql
+/// clears it (`ClearColinfo`, `sqlcfunc.cpp:641`), measured on 18.07.0001: a
+/// call that sends nothing, such as one refused as busy, keeps it. Call without
+/// the STMT lock held. A poisoned IRD is left alone: `SQLGetDescField` already
+/// fails on it.
+pub(super) fn clear_ird_classification(stmt: &StmtHandle) {
+    take_ird_classification(stmt);
+}
+
+/// Identifies the classification `stmt` reports now, for
+/// [`clear_ird_classification_unless`]. Call without the STMT lock held.
+pub(super) fn ird_classification_id(stmt: &StmtHandle) -> Option<u64> {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+    desc.inner
+        .lock()
+        .ok()
+        .and_then(|desc_state| desc_state.data_classification.as_ref().map(|c| c.id))
+}
+
+/// [`clear_ird_classification`] unless `stmt` still reports a classification
+/// `spared` names, rather than one a later execute replaced it with.
+pub(super) fn clear_ird_classification_unless(stmt: &StmtHandle, spared: &[u64]) {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+    if let Ok(mut desc_state) = desc.inner.lock()
+        && let Some(classification) = &desc_state.data_classification
+        && !spared.contains(&classification.id)
+    {
+        desc_state.data_classification = None;
+    }
+}
+
+fn take_ird_classification(stmt: &StmtHandle) -> Option<DataClassification> {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+    desc.inner
+        .lock()
+        .ok()
+        .and_then(|mut desc_state| desc_state.data_classification.take())
+}
+
+/// The classification taken off the IRD just before the request that runs its
+/// statement, held until that request is known to have been sent.
+pub(super) struct PendingClassification {
+    payload: Option<DataClassification>,
+    requests_admitted: u64,
+}
+
+/// [`clear_ird_classification`] for the moment the request that runs `stmt`
+/// is handed to `client`. Call without the STMT lock held.
+pub(super) fn clear_for_send(stmt: &StmtHandle, client: &TdsClient) -> PendingClassification {
+    PendingClassification {
+        requests_admitted: client.requests_admitted(),
+        payload: take_ird_classification(stmt),
+    }
+}
+
+impl PendingClassification {
+    /// Puts the classification back after a request that failed without
+    /// reaching the server: mssql-tds rejected it while checking or recovering
+    /// the connection, so it never admitted the request. msodbcsql likewise
+    /// fails `GetBatchCtxOrRecover` before it reaches `ClearColinfo`
+    /// (`sqlccmd.cpp:1870`, `sqlccmd.cpp:2893`).
+    pub(super) fn restore_if_unsent(self, stmt: &StmtHandle, client: &TdsClient) {
+        if client.requests_admitted() == self.requests_admitted {
+            self.restore(stmt);
+        }
+    }
+
+    /// Puts the classification back after a call that sent nothing.
+    pub(super) fn restore(self, stmt: &StmtHandle) {
+        let Some(payload) = self.payload else {
+            return;
+        };
+        let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ird) };
+        if let Ok(mut desc_state) = desc.inner.lock()
+            && desc_state.data_classification.is_none()
+        {
+            desc_state.data_classification = Some(payload);
+        }
+    }
 }
 
 fn ird_record_from_metadata(meta: &ColumnMetadata) -> DescRecord {
@@ -111,7 +200,12 @@ mod tests {
     fn populate_ird_writes_records_consistent_with_describe_col() {
         let h = TestHandles::with_env_dbc_stmt();
         let metadata = int_columns(2);
-        populate_ird(unsafe { handle_from_raw::<StmtHandle>(h.stmt) }, &metadata).unwrap();
+        populate_ird(
+            unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
+            &metadata,
+            None,
+        )
+        .unwrap();
 
         let records = ird_records(&h);
         assert_eq!(records.len(), 2);
@@ -129,10 +223,10 @@ mod tests {
     fn populate_ird_shrinks_to_a_narrower_later_result_set() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        populate_ird(stmt, &int_columns(3)).unwrap();
+        populate_ird(stmt, &int_columns(3), None).unwrap();
         assert_eq!(ird_records(&h).len(), 3);
 
-        populate_ird(stmt, &int_columns(1)).unwrap();
+        populate_ird(stmt, &int_columns(1), None).unwrap();
         assert_eq!(ird_records(&h).len(), 1);
     }
 
@@ -143,10 +237,10 @@ mod tests {
     fn populate_ird_with_empty_metadata_empties_the_ird() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        populate_ird(stmt, &int_columns(2)).unwrap();
+        populate_ird(stmt, &int_columns(2), None).unwrap();
         assert_eq!(ird_records(&h).len(), 2);
 
-        populate_ird(stmt, &[]).unwrap();
+        populate_ird(stmt, &[], None).unwrap();
         assert!(ird_records(&h).is_empty());
     }
 
@@ -168,6 +262,6 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         poison_ird(h.ird());
-        assert!(populate_ird(stmt, &int_columns(1)).is_err());
+        assert!(populate_ird(stmt, &int_columns(1), None).is_err());
     }
 }

@@ -15,7 +15,7 @@ use crate::api::alloc_handle::sql_alloc_handle;
 use crate::api::free_handle::sql_free_handle;
 use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
-    SQL_NULL_HANDLE, SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlReturn,
+    SQL_NULL_HANDLE, SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlReturn, SqlWChar,
 };
 use crate::api::set_env_attr::sql_set_env_attr;
 use crate::api::sqlstate::DiagMsg;
@@ -40,6 +40,24 @@ pub(crate) fn assert_last_diag(records: &[DiagRecord], expected: DiagMsg) {
 /// Known alignment for tests that deliberately displace application pointers.
 #[repr(align(8))]
 pub(crate) struct AlignedBuffer<T, const N: usize>(pub(crate) [T; N]);
+
+/// Deterministic generator for differential tests: reproducible from a seed,
+/// no dependency.
+pub(crate) struct SplitMix64(pub(crate) u64);
+
+impl SplitMix64 {
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
 
 /// Rebuild an ODBC connection string from a template, expanding the credential
 /// placeholders `<PW>` → `PWD` and `<PASS>` → `PASSWORD`.
@@ -389,6 +407,18 @@ impl MockServer {
         });
     }
 
+    pub(crate) fn set_tm_end_delay(&self, commit: bool, delay: std::time::Duration) {
+        let key = if commit {
+            mssql_mock_tds::TM_COMMIT_DELAY_KEY
+        } else {
+            mssql_mock_tds::TM_ROLLBACK_DELAY_KEY
+        };
+        self.register_query(
+            key,
+            mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+        );
+    }
+
     /// Registers a delay for the server's answer to any RPC request that
     /// matched no specific registration.
     ///
@@ -458,6 +488,22 @@ impl Drop for MockServer {
             });
         }
     }
+}
+
+/// A `SELECT 1` padded with a comment to exactly `len` UTF-16 units, and a
+/// buffer holding it followed by a different statement and a terminator. A
+/// driver that reads anything other than exactly `len` units sees different
+/// text; the terminator keeps a mistaken `SQL_NTS` scan in bounds.
+pub(crate) fn padded_statement_text(len: usize) -> (String, Vec<SqlWChar>) {
+    const PREFIX: &str = "SELECT 1 /*";
+    const SUFFIX: &str = "*/";
+    let fill = len - PREFIX.len() - SUFFIX.len();
+    let text = format!("{PREFIX}{}{SUFFIX}", "x".repeat(fill));
+    let buffer = text
+        .encode_utf16()
+        .chain(" SELECT 2\0".encode_utf16())
+        .collect();
+    (text, buffer)
 }
 
 /// Starts a mock TDS server registered to answer `query` with `response`,

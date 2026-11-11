@@ -358,17 +358,18 @@ on; these guarantees were verified against msodbcsql's behavior.
   walks DBC → STMT to clear a freed descriptor's association from every
   statement that had it active, so the STMT lock and a DESC lock must never
   nest the other way: **never hold a STMT lock while acquiring a DESC lock**.
-  Every entry point that both validates STMT state and writes to a
-  descriptor (`SQLBindCol`, `SQLBindParameter`, `SQLFetchScroll`,
-  `SQLFreeStmt(SQL_UNBIND | SQL_RESET_PARAMS)`, execute's parameter
-  snapshot) follows the same two-phase shape: lock STMT, validate and
-  resolve the target descriptor handle (`effective_ard`/`effective_apd`),
-  drop the STMT lock, *then* lock the descriptor. A descriptor pointer
-  resolved this way can be freed by a concurrent `SQLFreeHandle` before it
-  is dereferenced. Existing `handles::live_type` rechecks narrow that window,
-  but are not a complete lifetime guarantee. Establish the supported concurrent
-  call sequence before treating [#441](https://github.com/microsoft/mssql-rs/issues/441)
-  as a requirement for a broader ownership redesign.
+  Binding, fetch, execution snapshots, unbinding, and statement-header aliases
+  validate and resolve under STMT, then drop STMT before accessing DESC.
+  Use `StmtHandle::access_descriptor` for these resolved pointers. Implicit
+  descriptors borrow the statement's lifetime without another lock. An explicit
+  association is re-resolved under DBC -> STMT, and only DBC remains locked
+  through descriptor access; a completed free therefore selects the implicit
+  descriptor instead of dereferencing the old pointer. Release this guard before
+  network I/O. Its reader check reuses the parent guard rather than relocking it.
+  A `live_type` check alone is not a lifetime guarantee
+  ([#441](https://github.com/microsoft/mssql-rs/issues/441)). unixODBC's
+  `Threading=1` locks STMT and DESC independently, so Windows DM serialization
+  is not a portable substitute for this guard.
 - **APD before IPD**: `SQLBindParameter`'s `bind_param_records` and
   `exec_common::snapshot_bound_params` are the only places in this crate that
   hold two DESC locks at once. Both lock APD before IPD, and that must stay the
@@ -410,13 +411,19 @@ on; these guarantees were verified against msodbcsql's behavior.
   precision/scale. A `SQL_NUMERIC_STRUCT` header is not the prepared declaration.
 - No descriptor identity, lifetime counter, or persistent metadata snapshot is
   needed for this sequential cache-invalidation policy.
-- Do not extend that sequential claim to IPD mutation overlapping synchronous
-  execute. The existing snapshot/stage/restore sequence can lose invalidation;
-  a pending flag only while the plan is absent does not close every window.
-  Treat this as a separate concurrency gap, not application misuse or an
-  assumed Driver Manager serialization guarantee. ODBC's
-  [multithreading contract](https://learn.microsoft.com/sql/odbc/reference/develop-app/multithreading)
-  is distinct from the Need Data rule below.
+- Preserve IPD invalidation across synchronous execution's snapshot/stage/restore
+  sequence ([#767](https://github.com/microsoft/mssql-rs/issues/767)). Record the
+  earliest changed ordinal even while `prepared` is present, and consume it
+  before the next execution snapshots bindings. The current execution may
+  materialize its old snapshot after a successful edit; clearing invalidation
+  during staging or restoration would let that stale declaration survive.
+  Apply the marker-count filter to both immediate and deferred invalidation.
+  Keep success, failed connection claims, partial descriptor writes, scalar
+  staging, and array staging covered without holding locks across network I/O.
+  This follows classic `SetIPDRec`'s `ParamInfoSnapshot` / `RE_PREPARE` policy
+  (`sqlcdesc.cpp:3341-3374`). Retail 18.7.1.1 (`SQL_DRIVER_VER=18.07.0001`)
+  applies an overlapping `SQLSetDescRec` edit to the next execution: measured
+  through its direct DLL and Windows DM, which serializes the calls.
 - A DAE binding snapshot is not permission to change the live definition while
   the statement is in Need Data. `SQLBindParameter` and associated descriptor
   setters are DM-enforced `HY010` errors in that state (see their
@@ -552,7 +559,9 @@ on; these guarantees were verified against msodbcsql's behavior.
   `-DODBC_E2E_CONCURRENT=ON`) when CMake configures.
   - Before review, run the `<name>_mt` entry of a test you add or convert in
     every mode (`MSSQL_ODBC_MT_SKIP_MODES=none`, plus `ODBC_E2E_CONCURRENT=ON`
-    on Unix, or `--mt-profile=nightly` / `-MtProfile nightly`):
+    on Unix, or the weekly profile filtered to that entry, e.g.
+    `--mt-profile=weekly --filter='^<name>_mt$'` /
+    `-MtProfile weekly -FilterTests '^<name>_mt$'`):
     PR validation does not cover a test that keeps out of `/SharedDbc`, nor
     any concurrent variant on unixODBC.
   - Keep `TEST_F`, or pick the safe modes with `ODBC_TEST_F_MODES`, for tests
@@ -575,7 +584,10 @@ on; these guarantees were verified against msodbcsql's behavior.
     `stmt_` must stream that statement's diagnostic, so a busy connection is
     retried rather than failed. PR and stress runs execute the mode.
   - Scenarios with no single-threaded meaning (races on one STMT, handle churn,
-    connect races) go under `tests/e2e/tests/multithreaded_tests/`.
+    faults under load) go under `tests/e2e/tests/multithreaded_tests/`. Size
+    them with the harness's `LoadConfig()` and register them with
+    `add_odbc_mt_only_test`, which labels them `mt_weekly`: only the weekly
+    stress profile runs them.
   - A concurrent failure that msodbcsql passes is a driver bug: file it rather
     than loosen the assertion or the mode.
   - For idle `SQLCancel`, use `CancelIdleStatement()` so `SharedStmt` diagnostic
@@ -644,8 +656,9 @@ For ODBC hot paths:
     descriptor-liveness lookup, and only by exact pointer equality
     (`StmtHandle::owns_implicit_desc`): they are allocated in
     `StmtHandle::new`, never reassigned, rejected by `free_desc` with `HY017`,
-    and freed only when the statement drops. Explicit descriptors keep the
-    lookup.
+    and freed only when the statement drops. Explicit descriptors use
+    `StmtHandle::access_descriptor` to retain the DBC lock through re-resolution
+    and descriptor access instead of relying on a check-then-use lookup.
     Keep `RowIssue` and `RowOutcome` within two bytes: converters return the
     compact `ConvError`, mapped to a canonical diagnostic only on failure.
     Carrying a full diagnostic enlarges every successful column conversion

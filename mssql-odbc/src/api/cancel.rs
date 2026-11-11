@@ -185,7 +185,7 @@ mod tests {
                     crate::api::SQLExecDirectW(
                         handle,
                         sql.as_ptr(),
-                        i16::try_from(sql.len()).unwrap(),
+                        i32::try_from(sql.len()).unwrap(),
                     )
                 };
                 assert_eq!(SQL_SUCCESS, exec(h.stmt));
@@ -265,7 +265,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             if deferred {
                 assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -323,7 +323,7 @@ mod tests {
             ));
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
             crate::api::SQLCancel(h.stmt)
@@ -355,7 +355,7 @@ mod tests {
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         for handle in [h.stmt, other] {
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(handle, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             if handle == h.stmt {
                 for _ in 0..3 {
@@ -406,7 +406,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             let exec = || unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             };
             assert_eq!(SQL_SUCCESS, exec());
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -552,7 +552,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         let exec = |handle| unsafe {
-            crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(handle, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         };
         assert_eq!(SQL_SUCCESS, exec(h.stmt));
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -637,7 +637,7 @@ mod tests {
             );
             let sql: Vec<u16> = "SELECT ? + ?".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             let mut indicators = [SQL_DATA_AT_EXEC; 2];
             let mut tokens = [0u8; 2];
@@ -717,7 +717,7 @@ mod tests {
             });
             let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         }
@@ -740,6 +740,49 @@ mod tests {
     }
 
     fn cancel_cursor_phase(phase: CursorPhase, acknowledge: bool, stall: bool) {
+        cancel_cursor_phase_with(phase, acknowledge, stall, false);
+    }
+
+    /// `SQL_CA_SS_DATA_CLASSIFICATION` on `ird`: `SQL_SUCCESS` with a payload,
+    /// `SQL_ERROR` (`HY091`) without one.
+    fn ird_classification(ird: SqlHandle) -> SqlReturn {
+        let mut buffer = [0u8; 256];
+        let mut length = 0;
+        unsafe {
+            crate::api::get_desc_field::sql_get_desc_field_w(
+                ird,
+                0,
+                i16::try_from(crate::api::odbc_types::SQL_CA_SS_DATA_CLASSIFICATION).unwrap(),
+                buffer.as_mut_ptr().cast(),
+                256,
+                &mut length,
+            )
+        }
+    }
+
+    /// A cancellation discovered mid-`SQLFetch`, mid-`SQLGetData` or during
+    /// the read-ahead after a row fails the call, so it drops the result
+    /// set's classification with the cursor.
+    #[test]
+    fn a_cancelled_row_read_drops_the_classification() {
+        for phase in [
+            CursorPhase::Fetch,
+            CursorPhase::ReadAhead,
+            CursorPhase::GetData,
+        ] {
+            cancel_cursor_phase_with(phase, true, false, true);
+        }
+    }
+
+    /// `classified` negotiates Data Classification and sends a
+    /// DATACLASSIFICATION token with the result set, so the cancelled call
+    /// must also drop the IRD's classification.
+    fn cancel_cursor_phase_with(
+        phase: CursorPhase,
+        acknowledge: bool,
+        stall: bool,
+        classified: bool,
+    ) {
         use crate::api::odbc_types::*;
         use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
         use mssql_mock_tds::protocol::{build_attention_ack_packet, build_query_result};
@@ -777,7 +820,15 @@ mod tests {
         } else {
             QueryResponse::select_one()
         };
-        let full = build_query_result(&response);
+        // One label, "L"/"1", on the first column, in the v1 layout.
+        let classification: &[u8] = &[
+            0xA3, 1, 0, 1, b'L', 0, 1, b'1', 0, 0, 0, 1, 0, 1, 0, 0, 0, 0xFF, 0xFF,
+        ];
+        let full = if classified {
+            mssql_mock_tds::protocol::build_query_result_with_extras(&response, classification, &[])
+        } else {
+            build_query_result(&response)
+        };
         // Hold back part of a value, a PLP read-ahead, or the final DONE.
         let held = match phase {
             CursorPhase::Fetch | CursorPhase::GetData => 13 + 5,
@@ -870,6 +921,10 @@ mod tests {
         context.user_name = "sa".to_string();
         context.password = "unused-by-the-mock-server".to_string();
         context.database = "master".to_string();
+        if classified {
+            context.requested_data_classification_version =
+                Some(mssql_tds::token::data_classification::DataClassificationVersion::Version1);
+        }
         context.encryption_options = EncryptionOptions {
             mode: EncryptionSetting::PreferOff,
             trust_server_certificate: true,
@@ -906,7 +961,7 @@ mod tests {
         assert_eq!(
             SQL_SUCCESS,
             unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             },
             "{:?}",
             stmt.inner.lock().unwrap().diag_records
@@ -973,6 +1028,9 @@ mod tests {
                     0,
                 )
             });
+        }
+        if classified {
+            assert_eq!(ird_classification(h.ird()), SQL_SUCCESS, "{phase:?}");
         }
         std::thread::scope(|scope| {
             let idle = matches!(
@@ -1115,6 +1173,9 @@ mod tests {
                     assert_eq!(state.diag_records[0].sql_state, *b"HY008");
                 }
             }
+            if classified {
+                assert_eq!(ird_classification(h.ird()), SQL_ERROR, "{phase:?}");
+            }
             {
                 let state = dbc.inner.lock().unwrap();
                 assert!(state.wire.owner().is_none());
@@ -1161,7 +1222,7 @@ mod tests {
         });
         if acknowledge {
             assert_eq!(SQL_SUCCESS, unsafe {
-                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
             });
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         }
@@ -1267,7 +1328,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         let exec = || unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         };
         assert_eq!(SQL_SUCCESS, exec());
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
@@ -1315,7 +1376,7 @@ mod tests {
         );
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         assert!(dbc.inner.lock().unwrap().wire.owner().is_none());
@@ -1330,7 +1391,7 @@ mod tests {
             crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
         });
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         assert_eq!(SQL_SUCCESS, unsafe {
@@ -1421,7 +1482,7 @@ mod tests {
         before_reuse();
         let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
         assert_eq!(SQL_SUCCESS, unsafe {
-            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i32::try_from(sql.len()).unwrap())
         });
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
         let mut value = 0i32;
@@ -1503,7 +1564,7 @@ mod tests {
             }
             .encode_utf16()
             .collect();
-            let sql_len = i16::try_from(sql.len()).unwrap();
+            let sql_len = i32::try_from(sql.len()).unwrap();
             let mut values = [7i32, 8];
             let mut indicator = SQL_DATA_AT_EXEC;
             if matches!(path, "streamed" | "deferred") {
@@ -1663,7 +1724,7 @@ mod tests {
             }
             .encode_utf16()
             .collect();
-            let sql_len = i16::try_from(sql.len()).unwrap();
+            let sql_len = i32::try_from(sql.len()).unwrap();
             if prepared {
                 assert_eq!(SQL_SUCCESS, unsafe {
                     crate::api::SQLPrepareW(h.stmt, sql.as_ptr(), sql_len)

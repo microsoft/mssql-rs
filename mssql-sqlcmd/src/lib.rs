@@ -19,3 +19,4 @@ pub mod diagnostics;
 pub mod ffi;
 pub mod formatter;
 pub mod telemetry;
+pub mod i18n;

@@ -7,8 +7,9 @@
 //! pre-acquired Entra access token), `SQL_ATTR_LOGIN_TIMEOUT` (the login
 //! deadline applied at connect time), `SQL_ATTR_CURRENT_CATALOG` (the current
 //! database, which sends `USE` when connected), and `SQL_ATTR_QUERY_TIMEOUT`
-//! (the statement option in its connection-wide form). Other standard
-//! attributes are accepted as no-ops for now.
+//! (the statement option in its connection-wide form).
+//! `SQL_ATTR_CONNECTION_TIMEOUT` bounds connection-owned network requests and
+//! supplies the separate cancellation settlement budget.
 
 use tracing::{debug, error};
 
@@ -19,9 +20,10 @@ use super::sqlstate::*;
 use super::txn::{reset_connection, set_autocommit, set_txn_isolation};
 use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
-    SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
-    SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
-    SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
+    DATACLASSIFICATION_VERSION_MAX, SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT,
+    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
+    SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_RESET_CONNECTION,
+    SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN, SQL_COPT_SS_DATACLASSIFICATION_VERSION,
     SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_LONGASMAX,
     SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TNIR,
     SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
@@ -342,6 +344,28 @@ unsafe fn sql_set_connect_attr_w_impl(
             );
             SQL_SUCCESS
         }
+        // msodbcsql (`sqlcmisc.cpp:2871`) takes the low DWORD, accepts
+        // 1..=DATACLASSIFICATION_VERSION_MAX and answers HY024 otherwise, with
+        // no connection-state gate: a value set while connected is stored and
+        // requested at the next login.
+        SQL_COPT_SS_DATACLASSIFICATION_VERSION => {
+            // Deliberate truncation, as msodbcsql's static_cast<DWORD>.
+            let version = value_ptr.addr() as u32;
+            match u8::try_from(version) {
+                Ok(version @ 1..=DATACLASSIFICATION_VERSION_MAX) => {
+                    state.data_classification_version = version;
+                    SQL_SUCCESS
+                }
+                _ => {
+                    error!(
+                        version,
+                        "SQLSetConnectAttrW: invalid SQL_COPT_SS_DATACLASSIFICATION_VERSION"
+                    );
+                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                    SQL_ERROR
+                }
+            }
+        }
         SQL_COPT_SS_LONGASMAX => {
             let value = value_ptr.addr();
             state.vendor_overrides.long_as_max = Some(value);
@@ -418,10 +442,10 @@ unsafe fn sql_set_connect_attr_w_impl(
             }
         }
         SQL_ATTR_CONNECTION_TIMEOUT => {
+            // Connection-owned requests use this for request I/O; statement
+            // execution keeps its query timeout. Zero leaves requests unbounded
+            // and selects the 120-second cancellation settlement default.
             // Publish to execution children here, not on every fetch/GetData call.
-            // Connection operations also use this for request I/O and cancellation.
-            // Zero leaves requests unlimited and selects the native driver's
-            // 120-second default for explicit statement cancellation.
             // Shares msodbcsql's clamp with SQL_ATTR_LOGIN_TIMEOUT
             // (`sqlcmisc.cpp:1733-1741`), but names this attribute in the
             // warning rather than reusing msodbcsql's "Login timeout changed".

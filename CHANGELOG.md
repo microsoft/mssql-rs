@@ -214,6 +214,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds`: a piggybacked prepexec orphan is now retained when cancellation,
+  a timeout, or a serialization failure prevents any send, so its release can
+  be retried. Before, `execute_prepared` dropped the orphan and its cached
+  handle before the first packet, leaking the server plan (#647).
+
+- `mssql-odbc`: `SQLPrepareW` and `SQLExecDirectW` now take `TextLength` as
+  `SQLINTEGER`, as the ODBC headers and msodbcsql declare it. Before, only its
+  low 16 bits were kept on Windows x64: a length of 32768 or more ran empty or
+  truncated text, and 65533 was read as `SQL_NTS` (AB#50015).
+
+- `mssql-mock-tds`: a SQL batch spanning several packets is matched and
+  answered once, after its last packet. Before, each packet was answered as
+  its own batch (AB#50015).
+
 - `mssql-tds`: a parallel TCP connect now aborts its remaining attempts when it is cancelled
   or the login deadline expires. Before, those attempts kept their sockets
   open until the OS connect timeout (AB#49293).

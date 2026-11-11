@@ -18,10 +18,10 @@ use super::exec_common::{
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use super::util::read_utf16;
+use super::util::read_utf16_long;
 use crate::api::odbc_types::{
-    SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn,
-    SqlSmallInt, SqlWChar,
+    SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SQL_NTS, SqlHandle,
+    SqlInteger, SqlReturn, SqlWChar,
 };
 use crate::conversion::param_convert::{data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
@@ -50,7 +50,7 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 pub(crate) unsafe fn sql_exec_direct_w(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     crate::ffi_entry!(
         "SQLExecDirectW",
@@ -79,7 +79,7 @@ pub(crate) unsafe fn sql_exec_direct_w(
 unsafe fn sql_exec_direct_w_impl(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
-    text_length: SqlSmallInt,
+    text_length: SqlInteger,
 ) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLExecDirectW: statement_handle is null");
@@ -99,7 +99,12 @@ unsafe fn sql_exec_direct_w_impl(
         "SQLExecDirectW: statement_text is null — DM should have rejected this"
     );
 
-    let sql = unsafe { read_utf16(statement_text, text_length) };
+    debug_assert!(
+        text_length == SqlInteger::from(SQL_NTS) || text_length >= 0,
+        "SQLExecDirectW: invalid text_length ({text_length}) — DM should have rejected this"
+    );
+
+    let sql = unsafe { read_utf16_long(statement_text, text_length) };
     sql_exec_direct_w_safe(statement_handle, stmt, sql)
 }
 
@@ -152,6 +157,11 @@ fn sql_exec_direct_w_operation(
             error!("SQLExecDirectW: statement has an active execute or open cursor");
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
+        }
+        if let Err(rc) =
+            super::exec_common::validate_parameter_focus(&mut stmt_state, "SQLExecDirectW")
+        {
+            return rc;
         }
         let cancel_handle = match stmt.new_execution_cancel() {
             Ok(handle) => handle,
@@ -260,6 +270,52 @@ fn sql_exec_direct_w_operation(
                     return Err(SQL_ERROR);
                 };
                 has_dae |= unsafe { data_at_exec_indicator(&positioned) }.is_some();
+                if positioned.sql_type == crate::api::odbc_types::SQL_SS_TABLE
+                    && !has_dae
+                    && call.as_ref().is_some_and(CallSite::is_rpc_eligible)
+                {
+                    let ordinal = index + 1;
+                    let layout = stmt_state
+                        .tvp_column_layouts
+                        .get(&ordinal)
+                        .copied()
+                        .unwrap_or_default();
+                    let columns = stmt_state
+                        .tvp_column_bindings
+                        .get(&ordinal)
+                        .map_or(&[][..], Vec::as_slice);
+                    let column_offset = if layout.bind_offset_ptr.is_null() {
+                        0
+                    } else {
+                        unsafe {
+                            layout
+                                .bind_offset_ptr
+                                .cast::<crate::api::odbc_types::SqlLen>()
+                                .read_unaligned()
+                        }
+                    };
+                    let mut tvp = positioned;
+                    if stmt_state.tvp_column_layouts.contains_key(&ordinal) {
+                        tvp.column_size = layout.array_size;
+                    }
+                    has_dae = unsafe {
+                        super::exec_common::tvp_dae_cell_rows(
+                            &tvp,
+                            columns,
+                            column_offset,
+                            layout.bind_type,
+                        )
+                    }
+                    .map_err(|source| {
+                        let error = super::exec_common::ParamRowBuildError::Conversion {
+                            parameter: ordinal,
+                            source,
+                        };
+                        super::exec_common::post_param_row_build_error(&mut stmt_state, &error, 0);
+                        SQL_ERROR
+                    })?
+                    .is_some();
+                }
             }
             // Both streaming implementations execute text, so they need every named
             // variable, including a return assignment, rather than RPC arguments.
@@ -325,6 +381,7 @@ fn sql_exec_direct_w_operation(
     let ParamsWithDae {
         params,
         dae_params,
+        tvp_row_counts,
         fractional_truncated,
     } = named_params;
 
@@ -410,6 +467,7 @@ fn sql_exec_direct_w_operation(
                 None,
                 None,
                 dae_params,
+                tvp_row_counts,
                 params,
                 Some(rewritten_sql),
                 query_timeout,
@@ -449,6 +507,7 @@ fn sql_exec_direct_w_operation(
                 None,
                 None,
                 dae_params,
+                tvp_row_counts,
                 fractional_truncated,
                 "SQLExecDirectW",
             ),
@@ -463,6 +522,7 @@ fn sql_exec_direct_w_operation(
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
     // STMT lock is held during I/O. `query_timeout` (already deducted above)
     // bounds either call; `0` means unlimited, matching the ODBC default.
+    let pending = super::ird::clear_for_send(stmt, &client);
     let exec_result: Result<(), mssql_tds::error::Error> = if let Some(call) = call.as_ref() {
         // A statement that is nothing but `{call proc(?)}` goes out as a TDS
         // RPC rather than as text, which is what makes output parameters and
@@ -512,6 +572,7 @@ fn sql_exec_direct_w_operation(
     };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
+        pending.restore_if_unsent(stmt, &client);
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
@@ -533,12 +594,142 @@ mod tests {
     use crate::test_support::TestHandles;
 
     #[test]
+    fn canonical_call_with_child_dae_parks_complete_named_parameters() {
+        use crate::api::exports::{SQLBindParameter, SQLParamData, SQLPutData};
+        use crate::api::odbc_types::*;
+        use crate::handles::DbcHandle;
+        for returns_status in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().wire.put_client_for_test(
+                mssql_tds::test_client_support::tds_client_from_tokens(vec![
+                    mssql_tds::test_client_support::done_no_more(),
+                ]),
+            );
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let ordinal = if returns_status { 2 } else { 1 };
+            let mut rows = 1;
+            let mut type_name: Vec<u16> = "dbo.test_table\0".encode_utf16().collect();
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        ordinal,
+                        SQL_PARAM_INPUT,
+                        SQL_C_DEFAULT,
+                        SQL_SS_TABLE,
+                        1,
+                        0,
+                        type_name.as_mut_ptr().cast(),
+                        SQL_NTS as SqlLen,
+                        &mut rows,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let mut scalar = 42i32;
+            let mut scalar_length = 0;
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        ordinal + 1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        (&mut scalar as *mut i32).cast(),
+                        4,
+                        &mut scalar_length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let mut status = 0i32;
+            let mut status_length = 0;
+            if returns_status {
+                assert_eq!(
+                    unsafe {
+                        SQLBindParameter(
+                            h.stmt,
+                            1,
+                            SQL_PARAM_OUTPUT,
+                            SQL_C_SLONG,
+                            SQL_INTEGER,
+                            0,
+                            0,
+                            (&mut status as *mut i32).cast(),
+                            4,
+                            &mut status_length,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+            }
+            stmt.inner
+                .lock()
+                .unwrap()
+                .vendor_attrs
+                .store_param_focus(ordinal as usize);
+            let mut value = [b'x'];
+            let mut length = SQL_DATA_AT_EXEC;
+            assert_eq!(
+                unsafe {
+                    SQLBindParameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_CHAR,
+                        SQL_VARCHAR,
+                        1,
+                        0,
+                        value.as_mut_ptr().cast(),
+                        1,
+                        &mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            stmt.inner.lock().unwrap().vendor_attrs.store_param_focus(0);
+            let sql: Vec<u16> = if returns_status {
+                "{? = call dbo.p(?, ?)}"
+            } else {
+                "{call dbo.p(?, ?)}"
+            }
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+            assert_eq!(
+                unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
+                SQL_NEED_DATA
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                let dae = state.dae.as_ref().unwrap();
+                assert_eq!(dae.prebuilt.len(), if returns_status { 3 } else { 2 });
+                assert!(dae.deferred);
+                assert_eq!(dae.tvp_row_counts.get(&(ordinal as usize - 1)), Some(&1));
+            }
+            let mut token = std::ptr::null_mut();
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_NEED_DATA);
+            assert_eq!(token, value.as_mut_ptr().cast());
+            assert_eq!(
+                unsafe { SQLPutData(h.stmt, value.as_mut_ptr().cast(), 1) },
+                SQL_SUCCESS
+            );
+            assert_eq!(unsafe { SQLParamData(h.stmt, &mut token) }, SQL_SUCCESS);
+        }
+    }
+
+    #[test]
     fn null_handle_returns_invalid_handle() {
         let sql: Vec<u16> = "SELECT 1"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(SQL_NULL_HANDLE, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(SQL_NULL_HANDLE, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
     }
 
@@ -546,7 +737,7 @@ mod tests {
     fn null_statement_text_returns_error() {
         let h = TestHandles::with_env_dbc_stmt();
 
-        let ret = unsafe { sql_exec_direct_w(h.stmt, std::ptr::null(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, std::ptr::null(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_ERROR);
     }
 
@@ -558,7 +749,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
     }
@@ -582,7 +773,7 @@ mod tests {
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
 
@@ -608,7 +799,7 @@ mod tests {
         // Fails (not connected), but the stale row-count state must be cleared
         // at execute start so a later SQLMoreResults can't surface it.
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
 
@@ -644,7 +835,7 @@ mod tests {
             .collect();
         // Fails (not connected), but the prepared plan must already be reset.
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
 
@@ -715,7 +906,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let _ = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let _ = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         helper.join().unwrap();
 
         assert_eq!(
@@ -749,7 +940,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
@@ -797,7 +988,7 @@ mod tests {
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(
-            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) },
             SQL_ERROR
         );
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -807,6 +998,39 @@ mod tests {
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
         assert_eq!(status, -1);
         assert_eq!(status_ind, 0);
+    }
+
+    #[test]
+    fn execution_entry_points_reject_nonzero_tvp_focus_before_reading_buffers() {
+        use crate::handles::stmt::PreparedPlan;
+        use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.vendor_attrs.store_param_focus(1);
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test(
+                    "SELECT @P1",
+                    StatementId::from_raw_for_test(42),
+                ),
+                marker_count: 1,
+                original_sql: String::new(),
+            });
+        }
+        let sql: Vec<u16> = "SELECT ?".encode_utf16().chain(Some(0)).collect();
+        for direct in [true, false] {
+            let rc = if direct {
+                unsafe { crate::api::exports::SQLExecDirectW(h.stmt, sql.as_ptr(), SQL_NTS.into()) }
+            } else {
+                unsafe { crate::api::exports::SQLExecute(h.stmt) }
+            };
+            assert_eq!(rc, SQL_ERROR);
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY024);
+            assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        }
     }
 
     #[test]
@@ -848,7 +1072,7 @@ mod tests {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS.into()) };
         assert_eq!(ret, SQL_ERROR);
 
         let state = stmt.inner.lock().unwrap();
@@ -898,7 +1122,7 @@ mod tests {
                 let sql: Vec<u16> = "SELECT 1\0".encode_utf16().collect();
                 for _ in 0..3 {
                     assert_eq!(
-                        unsafe { SQLExecDirectW(stmt, sql.as_ptr(), SQL_NTS) },
+                        unsafe { SQLExecDirectW(stmt, sql.as_ptr(), SQL_NTS.into()) },
                         SQL_SUCCESS
                     );
                     assert_eq!(unsafe { SQLFetch(stmt) }, SQL_SUCCESS);
@@ -926,6 +1150,89 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// `TextLength` is a `SQLINTEGER`. Read as 16 bits, 40000 and 65536 became
+    /// empty text, 70000 a 4464-unit prefix, and 65533 `SQL_NTS`. Only the
+    /// exact text matches the mock's registered row-returning response.
+    #[test]
+    fn exec_direct_reads_text_length_beyond_i16() {
+        use crate::api::exports::{SQLExecDirectW, SQLFetch, SQLFreeStmt, SQLGetData};
+        use crate::api::odbc_types::{SQL_C_LONG, SQL_CLOSE, SQL_SUCCESS, SqlLen};
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+
+        for len in [32_767, 32_768, 40_000, 65_533, 65_536, 70_000] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let (text, buffer) = crate::test_support::padded_statement_text(len);
+            let _server =
+                crate::test_support::connect_mock_server(dbc, &text, QueryResponse::select_one());
+
+            let text_length = SqlInteger::try_from(len).unwrap();
+            assert_eq!(
+                unsafe { SQLExecDirectW(h.stmt, buffer.as_ptr(), text_length) },
+                SQL_SUCCESS,
+                "TextLength {len}"
+            );
+            assert_eq!(unsafe { SQLFetch(h.stmt) }, SQL_SUCCESS, "TextLength {len}");
+            let mut value = 0i32;
+            let mut indicator: SqlLen = 0;
+            assert_eq!(
+                unsafe {
+                    SQLGetData(
+                        h.stmt,
+                        1,
+                        SQL_C_LONG,
+                        std::ptr::from_mut(&mut value).cast(),
+                        SqlLen::try_from(size_of::<i32>()).unwrap(),
+                        &mut indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, 1, "TextLength {len}");
+            assert_eq!(unsafe { SQLFreeStmt(h.stmt, SQL_CLOSE) }, SQL_SUCCESS);
+        }
+    }
+
+    /// The DM rejects these with HY090 before the driver sees them, so the
+    /// driver only asserts the contract, as msodbcsql relies on it too. The
+    /// mock answers any batch, so only the assert keeps this an error.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn negative_text_length_other_than_nts_violates_dm_contract() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+
+        for text_length in [-1, -2, -4, -32_768, SqlInteger::MIN] {
+            assert_eq!(
+                unsafe { crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), text_length) },
+                SQL_ERROR,
+                "TextLength {text_length}"
+            );
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.diag_records.is_empty(), "TextLength {text_length}");
+            assert!(!state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN));
+            drop(state);
+            assert!(dbc.inner.lock().unwrap().wire.owner().is_none());
+        }
+
+        assert_eq!(
+            unsafe { crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), 8) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { crate::api::SQLFreeStmt(h.stmt, crate::api::odbc_types::SQL_CLOSE) },
+            crate::api::odbc_types::SQL_SUCCESS
+        );
     }
 
     /// A plain batch whose first statement is a no-row result (DML row count)
@@ -1242,5 +1549,183 @@ mod tests {
             "must not fast-path this new query's SQLMoreResults to SQL_NO_DATA"
         );
         assert!(ss.pending_fetch_error.is_none());
+    }
+
+    mod value_binding {
+        use super::*;
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::odbc_types::{
+            SQL_C_BINARY, SQL_C_SLONG, SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NEED_DATA, SQL_NO_DATA,
+            SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_SUCCESS, SQL_VARBINARY, SqlLen, SqlSmallInt,
+        };
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::{
+            ScriptedToken, done_no_more, int_columns, return_value,
+            tds_client_from_tokens_capturing,
+        };
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+        use std::sync::{Arc, Mutex};
+
+        /// Zero-length name, status NONE, INTN(4).
+        const UNNAMED_INT_7: [u8; 9] = [0x00, 0x00, 0x26, 0x04, 0x04, 7, 0, 0, 0];
+        const UNNAMED_INT_8: [u8; 9] = [0x00, 0x00, 0x26, 0x04, 0x04, 8, 0, 0, 0];
+        /// Length byte of a B_VARCHAR `@P` name, then `@P` in UTF-16LE.
+        const NAMED_P: [u8; 5] = [0x03, b'@', 0, b'P', 0];
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        fn bind_int(
+            stmt: SqlHandle,
+            ordinal: u16,
+            io_type: SqlSmallInt,
+            value: &mut i32,
+            length: &mut SqlLen,
+        ) {
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        stmt,
+                        ordinal,
+                        io_type,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        std::ptr::from_mut(value).cast(),
+                        4,
+                        length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+
+        fn connect(h: &TestHandles, tokens: Vec<ScriptedToken>) -> Arc<Mutex<Vec<u8>>> {
+            h.mark_dbc_connected();
+            let (client, sent) = tds_client_from_tokens_capturing(tokens);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().wire.put_client_for_test(client);
+            sent
+        }
+
+        /// msodbcsql sends `sp_executesql` user values unnamed
+        /// (`AddRPCUserParameters`); the declaration keeps `@P1..@Pn`.
+        #[test]
+        fn exec_direct_sends_parameter_values_unnamed() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let sent = connect(&h, vec![done_no_more()]);
+            let (mut first, mut second) = (7, 8);
+            let (mut first_length, mut second_length) = (4, 4);
+            bind_int(h.stmt, 1, SQL_PARAM_INPUT, &mut first, &mut first_length);
+            bind_int(h.stmt, 2, SQL_PARAM_INPUT, &mut second, &mut second_length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT ?, ?".to_string());
+
+            assert_eq!(ret, SQL_SUCCESS);
+            let bytes = sent.lock().unwrap();
+            assert!(contains(&bytes, &[0xFF, 0xFF, 10, 0]), "sp_executesql");
+            assert!(contains(&bytes, &UNNAMED_INT_7));
+            assert!(contains(&bytes, &UNNAMED_INT_8));
+            assert!(!contains(&bytes, &NAMED_P));
+        }
+
+        /// SQL Server returns an unnamed output with an empty name and its RPC
+        /// ordinal (`@stmt` and `@params` are 0 and 1). It must still reach the
+        /// application's buffer.
+        #[test]
+        fn exec_direct_binds_an_unnamed_output_value() {
+            let h = TestHandles::with_env_dbc_stmt();
+            connect(
+                &h,
+                vec![
+                    return_value(ReturnValue {
+                        param_ordinal: 2,
+                        param_name: String::new(),
+                        value: ColumnValues::Int(73),
+                        column_metadata: Box::new(int_columns(1).remove(0)),
+                        status: ReturnValueStatus::OutputParam,
+                    }),
+                    done_no_more(),
+                ],
+            );
+            let (mut output, mut input) = (-1, 7);
+            let (mut output_length, mut input_length) = (-1, 4);
+            bind_int(h.stmt, 1, SQL_PARAM_OUTPUT, &mut output, &mut output_length);
+            bind_int(h.stmt, 2, SQL_PARAM_INPUT, &mut input, &mut input_length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SET ? = ? + 66".to_string());
+
+            assert_eq!(ret, SQL_SUCCESS);
+            while unsafe { crate::api::more_results::sql_more_results(h.stmt) } != SQL_NO_DATA {}
+            assert_eq!(output, 73);
+            assert_eq!(output_length, 4);
+        }
+
+        /// Values are sent and declared in bound order, unnamed.
+        #[test]
+        fn exec_direct_with_data_at_execution_sends_values_unnamed_in_bound_order() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let sent = connect(&h, vec![done_no_more()]);
+            let mut token = 1_i32;
+            let mut streamed_length = SQL_DATA_AT_EXEC;
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_INPUT,
+                        SQL_C_BINARY,
+                        SQL_VARBINARY,
+                        0,
+                        0,
+                        std::ptr::from_mut(&mut token).cast(),
+                        0,
+                        &mut streamed_length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            let mut second = 7;
+            let mut second_length = 4;
+            bind_int(h.stmt, 2, SQL_PARAM_INPUT, &mut second, &mut second_length);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT ?, ?".to_string());
+            assert_eq!(ret, SQL_NEED_DATA);
+            let mut value_ptr = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { crate::api::param_data::sql_param_data(h.stmt, &mut value_ptr) },
+                SQL_NEED_DATA
+            );
+            let mut chunk = [1u8, 2];
+            assert_eq!(
+                unsafe { crate::api::put_data::sql_put_data(h.stmt, chunk.as_mut_ptr().cast(), 2) },
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                unsafe { crate::api::param_data::sql_param_data(h.stmt, &mut value_ptr) },
+                SQL_SUCCESS
+            );
+
+            let bytes = sent.lock().unwrap();
+            let position = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+            let utf16 = |text: &str| -> Vec<u8> {
+                text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            };
+            let first = position(&utf16("@P1 ")).expect("@P1 declared");
+            let second = position(&utf16(",@P2 int")).expect("@P2 declared");
+            assert!(first < second, "declared in bound order");
+            let streamed =
+                position(&[0x00, 0x00, 0xA5, 0xFF, 0xFF]).expect("unnamed streamed header");
+            let value = position(&UNNAMED_INT_7).expect("unnamed @P2 value");
+            assert!(streamed < value, "sent in bound order");
+            assert!(!contains(&bytes, &NAMED_P));
+        }
     }
 }

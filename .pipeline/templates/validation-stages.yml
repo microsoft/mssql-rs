@@ -531,35 +531,47 @@ stages:
       ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
       TRUST_SERVER_CERTIFICATE: 'true'
     steps:
+      # Colima and SQL Server come up in the background while the Rust tests
+      # compile; beforeTestSteps joins them once the binaries are built.
       - template: sql-setup-template.yml
         parameters:
           buildTarget: MacOS
+          startMacOSSqlInBackground: true
       - template: cargo-authenticate-template.yml
         parameters:
           osType: MacOS
       - template: install-dependencies.yml
         parameters:
           osType: MacOS
-      - script: |
-          set -euo pipefail
-          colima status
-          docker ps -a
-          docker inspect sqlserver --format \
-            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
-          docker exec sqlserver \
-            /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost -U SA -P "$SQL_PASSWORD" \
-            -C -b -Q "SELECT 1"
-          nc -z -v 127.0.0.1 1433
-        displayName: 'Verify macOS SQL Server before tests'
-        env:
-          SQL_PASSWORD: $(SQL_PASSWORD)
       - template: build-template.yml
         parameters:
           osType: MacOS
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
           enableClippy: false
+          prebuildTests: true
+          # The report takes ~12 minutes here and needs only the Rust test
+          # data, so it runs alongside the ODBC e2e suite below.
+          backgroundCoverageReport: true
+          beforeTestSteps:
+            # Covers the former per-step backstops (15m Colima + 22m SQL).
+            - script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 2400
+              displayName: 'Wait for Colima and SQL Server'
+              timeoutInMinutes: 45
+            - script: |
+                set -euo pipefail
+                colima status
+                docker ps -a
+                docker inspect sqlserver --format \
+                  'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
+                docker exec sqlserver \
+                  /opt/mssql-tools18/bin/sqlcmd \
+                  -S localhost -U SA -P "$SQL_PASSWORD" \
+                  -C -b -Q "SELECT 1"
+                nc -z -v 127.0.0.1 1433
+              displayName: 'Verify macOS SQL Server before tests'
+              env:
+                SQL_PASSWORD: $(SQL_PASSWORD)
       - script: |
           set -euo pipefail
           if ! command -v cmake >/dev/null 2>&1; then
@@ -572,7 +584,9 @@ stages:
           set -euo pipefail
           CMAKE_PREFIX_PATH="$(brew --prefix unixodbc)${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
           export CMAKE_PREFIX_PATH
-          bash mssql-odbc/tests/e2e/run_e2e.sh --retries=3
+          cpus="$(sysctl -n hw.ncpu)"
+          bash mssql-odbc/tests/e2e/run_e2e.sh --retries=3 \
+            --test-jobs="$(( cpus < 4 ? cpus : 4 ))"
         displayName: 'Run ODBC C++ e2e tests (macOS)'
         condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
         env:
@@ -590,6 +604,18 @@ stages:
           testRunTitle: $(System.PhaseName)-OdbcE2E
           failTaskOnFailedTests: true
           failTaskOnMissingResultsFile: true
+      - script: |
+          set -euo pipefail
+          bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/rust-cobertura" 2400
+          echo "##vso[task.setvariable variable=rustCoverageReady]true"
+        displayName: Wait for Cobertura coverage report (mssql-tds and mssqlodbc)
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+      - task: PublishPipelineArtifact@1
+        displayName: Publish Cobertura coverage artifact
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['rustCoverageReady'], 'true'))
+        inputs:
+          targetPath: $(Build.SourcesDirectory)/target/cobertura.xml
+          artifactName: CoberturaCoverageRust_MacOS
       - script: |
           set +e
           echo "=== Colima status ==="

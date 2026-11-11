@@ -1,13 +1,13 @@
 # sqlcmd diagnose
 
-`sqlcmd diagnose [-S <server>] [-U <login> -P <password> | -E] [-d <database>] [-N[s|m|o]] [-C] [-F <certificate-name>] [-l <seconds>] [--depth <depth>] [--local-detail] [--format json]`
+`sqlcmd diagnose [-S <server> | -D -S <dsn>] [-U <login> -P <password> | -E] [-d <database>] [-N[s|m|o]] [-C] [-F <certificate-name>] [-l <seconds>] [--depth <depth>] [--local-detail] [--format json]`
 checks, from the bottom up, that a connection can be made, and when it cannot,
 where and why. It follows the diagnostic depths of the sqlcmd specification;
 each includes the ones before it, and the deepest is the default:
 
 | Depth (`--depth`) | Checks |
 |---|---|
-| `connectionInput` | the settings sqlcmd resolved and where each came from (a command-line option, an environment variable, or the default); the server given to `-S`, checked with the client's rules; local findings for an instance name with a port and for `-F` with `-C`; no external call |
+| `connectionInput` | the settings sqlcmd resolved and where each came from (a command-line option, an environment variable, an ODBC data source (DSN) given with `-D`, or the default); the server given to `-S`, or the one the DSN names, checked with the client's rules; local findings for an instance name with a port, for `-F` with `-C`, for a DSN that names no server, and for a login that a DSN's `Trusted_Connection=yes` leaves unused; no external call |
 | `endpointResolution` | the client resolves the host name and asks SQL Server Browser for a named instance's port (never guessing 1433), then stops |
 | `networkReachability` | the client also opens its transport: a TCP connection to the first resolved address that accepts, and to every address after it, or a pipe; then it stops |
 | `connectionAttempt` | the client also logs in, with its pre-login, TLS and login phases |
@@ -18,6 +18,35 @@ each skipped check names what blocked it. In the JSON report a skipped check
 gives its `reason` (`blockedByPrerequisite`, `explicitPortRequired`,
 `notApplicable`, `canceled`), the check that blocked it as `blockedBy`, and a
 `detail` in words (none for `blockedByPrerequisite`).
+
+With `-D` (Linux and macOS; sqlcmd on Windows treats `-D` as obsolete), `-S`
+names an ODBC data source (DSN). Native sqlcmd reads the DSN from the user and
+system `odbc.ini` with the same calls and rules as the driver, and passes the
+settings a normal run takes from it: its server, and its database,
+authentication (`Trusted_Connection`) and certificate settings
+(`TrustServerCertificate`, `HostNameInCertificate`) unless the command line or
+an environment variable sets them. Without `-U` or `-E`, sqlcmd gives the
+driver no login: unless the DSN sets `Trusted_Connection=yes`, the driver logs
+in as a SQL login with no name (it does not prompt, so it takes no `LastUser`
+from the DSN). sqlcmd always sets encryption itself, so a DSN's `Encrypt` is
+not used. Each setting the DSN supplied has the source `dsn` (in JSON
+`"source": "dsn", "name": "<dsn>"`; in text, `server from DSN <dsn>`, and in
+the depth line `server certificate trusted (DSN <dsn>)` rather than `(-C)`),
+and `connectionInput` names the DSN (`dsn`). `-C` and `-F` override the DSN's
+`TrustServerCertificate` and `HostNameInCertificate` each on its own, so the
+finding about a certificate name that trust leaves unvalidated names where each
+of the two came from, the DSN or the option. A
+DSN that was not found, or names no driver (`dsnNotFound`), is `diagnosed` at
+`connectionInput`, with `client.inputConfiguration`, and the checks after it,
+which need a server, are skipped. A DSN that names no server is its own server,
+as the driver makes it: connection input says so in an informational finding,
+and the checks go on with it. When a DSN sets `Trusted_Connection=yes`, the
+driver logs in with integrated authentication and does not use a login given
+with `-U` or `SQLCMDUSER`; connection input reports that as an informational
+finding. Native sqlcmd refuses, as an invalid invocation, a DSN with settings
+diagnose does not model yet (`Authentication`, `ServerCertificate`, a
+read-only `ApplicationIntent`, `MultiSubnetFailover=Yes`, or `RegPrecedence`),
+as it refuses `-G`, `-J`, `-K` and `-M`.
 
 A named instance whose port SQL Server Browser does not give (no usable port
 in its answer, for `tcp:host\instance` an answer that lists only a pipe
@@ -67,9 +96,28 @@ addresses, and `tcpConnect` is still checked with those addresses. The report ad
   skipped as `canceled`;
 - findings marked `confirmed`, `suspected` or `informational`, and no
   remediation advice beyond the request for a named instance's port above;
-- the ordered error chain with its identifiers (SQL Server error, state and
-  class, operating-system error, symbolic code), noting where a classification
-  relied on message text;
+- the ordered error chain, with SQL Server's errors in the order the ODBC
+  driver lists them: an error with its own SQLSTATE (18456 is 28000) before
+  one given its class's (42000 for classes 11 to 18, then HY000, then 01000),
+  otherwise as received, not by class. In text, an error the driver has a
+  wording for is printed as sqlcmd prints it
+  (`Sqlcmd: Error: mssql-tds : ...`), once when several addresses give the
+  same line; any other error is printed with its
+  identifiers (SQL Server error, state and class, operating-system error,
+  symbolic code). The JSON report keeps every error with its identifiers, the
+  driver's wording as `errors[].text`, and `fromMessageText` where a
+  classification relied on message text. After a failed connection the chain
+  ends with the driver's summaries, as `client` errors:
+  `networkRelatedError` when the transport did not open,
+  `preloginFailure` or `communicationLinkFailure` when a pre-login or login
+  read failed after it opened, or `clientUnableToEstablishConnection` after a
+  failed TLS handshake (with the driver's link to its encryption guide only
+  for `-N` mandatory without `-C`, as the driver decides it, whatever the TLS
+  error), and `loginTimeoutExpired` only when a time limit ran out
+  (outside Windows it comes before the errors it sums up, where the driver
+  prints it). When the client's own time limit runs out, its error has the
+  code `timedOut`; when the server closed the connection, `connectionClosed`
+  (a read that failed, summarized as such in pre-login and login);
 - the specialist domain for a support handoff (`connectivity.network`,
   `security.tlsCertificate`, `security.authentication.sql`, ..., or
   `undetermined` with candidates), never presented as a root cause; unless a
@@ -83,8 +131,19 @@ addresses, and `tcpConnect` is still checked with those addresses. The report ad
 - `coverageMatrixVersion`, the version of
   [the diagnostic coverage matrix](diagnose-coverage.md) the checks follow.
 
+Both reports follow sqlcmd's locale (see [localization](localization.md)). In
+JSON only sqlcmd's own prose is translated: `sharingWarning`,
+`exitCategory.meaning`, `checks[].detail`, `findings[].text`, `limitations`,
+`specialistDomain.note`, `client.osVersion`'s wording and sqlcmd's own
+`errors[].message`. Keys, ids, names, codes, statuses, exit codes and
+`contractVersion` are the same in every locale, as are texts sqlcmd does not
+own: SQL Server's, the operating system's and `mssql-tds`'s messages as
+received, and the driver's wording in `errors[].text`.
+
 Diagnose output is for review before sharing; it is never share-safe. Every
-report begins with this warning (in JSON, the top-level `sharingWarning`):
+report begins with this warning, in the report's locale
+(`diagnose.sharing.warning`; in JSON, the top-level `sharingWarning`); in
+English:
 "Diagnostic output may contain unobfuscated server names, host names, and IP
 addresses. Review the output before sharing it." Server, instance and host
 names (the `-F` certificate name included), IP addresses, named pipe paths and
@@ -93,10 +152,10 @@ user names are replaced with labels (`database-1`, `user-1`) that are stable
 within one run only, in the text and JSON report alike, and in error text
 where they appear as whole words. `--local-detail` shows them as they are
 (JSON `localDetail: true`). Text sqlcmd cannot classify, such as error
-messages, is flagged for review before sharing (JSON `reviewBeforeSharing`),
-with or without local detail. No check reports certificate subject or SAN
-names or file paths; they would be labelled the same way. The password is
-never part of the report.
+messages, is flagged for review before sharing (`errors[].message` and
+`errors[].text` in `reviewBeforeSharing`), with or without local detail. No
+check reports certificate subject or SAN names or file paths; they would be
+labelled the same way. The password is never part of the report.
 
 The checks observe the client's real connection: sqlcmd makes no network call
 of its own. `mssql-tds` makes one connection attempt, as a normal run does,
@@ -119,8 +178,11 @@ abandoned, which is not a failure.
 
 Strict (TDS 8.0) transport diagnostics include TLS negotiation. On macOS,
 Network.framework combines TCP connection and TLS negotiation in one attempt.
-If that attempt times out, `tcpConnect` is inconclusive: the report does not
-claim that no server accepted TCP, because the peer may have stalled during TLS.
+If that attempt times out, `tcpConnect` is inconclusive, with
+`"tcpAcceptance": "unknown"`: the report does not claim that no server accepted
+TCP, because the peer may have stalled during TLS, and its errors end with
+`loginTimeoutExpired` but not the network-related summary for a transport that
+did not open.
 Successful attempts and explicit TCP refusals retain their usual results.
 
 A server given without a protocol prefix or port on Windows follows the

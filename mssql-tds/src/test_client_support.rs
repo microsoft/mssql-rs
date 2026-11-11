@@ -56,6 +56,13 @@ pub fn rpc_parameter_declaration(
     parameter.sql_declaration()
 }
 
+/// Returns the materialized value of an RPC parameter for downstream tests.
+pub fn rpc_parameter_value(
+    parameter: &crate::message::parameters::rpc_parameters::RpcParameter,
+) -> TdsResult<&crate::datatypes::sqltypes::SqlType> {
+    parameter.value()
+}
+
 /// The per-value serialization context [`serialized_value_wire_bytes`] needs.
 ///
 /// Re-exported rather than made public on `datatypes`: the module itself stays
@@ -203,6 +210,8 @@ pub(crate) struct TokenReplayTransport {
     reset_mode: ResetConnectionMode,
     reset_dispatched: bool,
     known_dead: bool,
+    /// Packets written to the wire, headers included, when capture is on.
+    sent: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
 }
 
 impl TokenReplayTransport {
@@ -216,6 +225,7 @@ impl TokenReplayTransport {
             reset_mode: ResetConnectionMode::None,
             reset_dispatched: false,
             known_dead: false,
+            sent: None,
         }
     }
 
@@ -389,7 +399,12 @@ impl TransportSslHandler for TokenReplayTransport {
 
 #[async_trait]
 impl NetworkWriter for TokenReplayTransport {
-    async fn send(&mut self, _data: &[u8]) -> TdsResult<()> {
+    async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+        if let Some(sent) = &self.sent {
+            sent.lock()
+                .map_err(|_| crate::error::Error::UsageError("capture poisoned".to_string()))?
+                .extend_from_slice(data);
+        }
         Ok(())
     }
     fn packet_size(&self) -> u32 {
@@ -464,8 +479,24 @@ impl TdsTransport for TokenReplayTransport {
 /// to position the client on a scripted result before handing it to a
 /// consumer under test.
 pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
-    let tokens: Vec<Tokens> = tokens.into_iter().map(|t| t.0).collect();
-    let transport = AnyTransport::dynamic(TokenReplayTransport::new(tokens));
+    client_over(TokenReplayTransport::new(
+        tokens.into_iter().map(|t| t.0).collect(),
+    ))
+}
+
+/// [`tds_client_from_tokens`] that also returns every byte the client sends,
+/// packet headers included, so a consumer can assert the request it built.
+pub fn tds_client_from_tokens_capturing(
+    tokens: Vec<ScriptedToken>,
+) -> (TdsClient, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    let sent = std::sync::Arc::default();
+    let mut transport = TokenReplayTransport::new(tokens.into_iter().map(|t| t.0).collect());
+    transport.sent = Some(std::sync::Arc::clone(&sent));
+    (client_over(transport), sent)
+}
+
+fn client_over(transport: TokenReplayTransport) -> TdsClient {
+    let transport = AnyTransport::dynamic(transport);
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");

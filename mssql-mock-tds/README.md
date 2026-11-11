@@ -6,10 +6,10 @@ absolute. The docs.rs API reference is generated from Rust source separately.
 
 # mssql-mock-tds
 
-A library and CLI for testing SQL Server clients without a SQL Server instance.
-Returns configured TDS responses; it does not execute SQL or validate database
-semantics. Use only in test environments, not as a database or authentication
-service.
+A mock TDS server, available as a Rust library and CLI, for testing SQL Server
+clients without a SQL Server instance. Returns configured TDS responses; it does
+not execute SQL or validate database semantics. Use only in test environments,
+not as a database or authentication service.
 
 ## Features
 
@@ -67,11 +67,16 @@ overrides the verbosity flags.
 
 ## Library
 
+These examples target version 0.4 of both the mock and TDS client. If that version
+is not yet available on crates.io,
+[use a source checkout](https://github.com/microsoft/mssql-rs/blob/main/mssql-tds/docs/client-guide.md#using-a-source-checkout)
+instead of registry dependencies.
+
 Add these dependencies:
 
 ```toml
 [dependencies]
-mssql-mock-tds = "0.3"
+mssql-mock-tds = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -126,7 +131,7 @@ represents an empty value.
 
 ### Testing with TdsClient and controlled shutdown
 
-For this example, also add `mssql-tds = "0.3"` under `[dev-dependencies]` and
+For this example, also add `mssql-tds = "0.4"` under `[dev-dependencies]` and
 place the test in your project's `tests/` directory. It uses the default
 `SELECT 1` response and an unencrypted loopback connection:
 
@@ -237,7 +242,7 @@ recovery.
 | RPC | Matches registered text as uppercase UTF-16LE bytes within the raw request; send uppercase SQL on this path. No general parameter decoder, stored-procedure execution, or cursor engine. |
 | Transactions | Begin/commit/rollback messages are acknowledged; isolation and data changes are not enforced. |
 | Types and metadata | Only the types above are exposed; metadata is simplified, not a full SQL Server schema model. |
-| Packet sizes | Responses are not fragmented. Keep each complete response within the advertised 4096-byte packet size, including the 8-byte header and all tokens; clients such as `TdsClient` reject larger packets. |
+| Packet sizes | Responses are not fragmented. Keep each complete response within the advertised 4096-byte packet size, including the 8-byte header and all tokens; clients such as `TdsClient` reject larger packets. SQL batch requests spanning several packets are reassembled before matching; other multi-packet requests are not. |
 | Authentication | Login flows and token inspection are test aids, not credential verification. |
 | TLS redirection | CLI redirection is ignored in TLS modes; public constructors do not combine TLS with redirection. |
 
