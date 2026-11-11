@@ -36,15 +36,16 @@ fn b_varchar(bytes: &mut Vec<u8>, value: &str) {
 }
 
 /// A V2 payload with `distinct` labels and as many information types, every
-/// name and id `length` ASCII characters, and `columns` columns with one
-/// property each, column `i` pointing at entry `i % distinct`.
-fn token(columns: usize, distinct: usize, length: usize) -> Vec<u8> {
+/// name and id `length` UTF-16 units of `fill` after a short ASCII prefix, and
+/// `columns` columns with one property each, column `i` pointing at entry
+/// `i % distinct`.
+fn token(columns: usize, distinct: usize, length: usize, fill: char) -> Vec<u8> {
     let mut bytes = Vec::new();
     for kind in ["L", "T"] {
         bytes.extend_from_slice(&u16::try_from(distinct).unwrap().to_le_bytes());
         for index in 0..distinct {
             let prefix = format!("{kind}{index:05}");
-            let value = format!("{prefix}{}", "x".repeat(length - prefix.len()));
+            let value = format!("{prefix}{}", fill.to_string().repeat(length - prefix.len()));
             b_varchar(&mut bytes, &value);
             b_varchar(&mut bytes, &value);
         }
@@ -81,21 +82,24 @@ fn bench_parse(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    // (name, columns, distinct classifications, string length)
+    // (name, columns, distinct classifications, string length, fill)
     let shapes = [
         // A handful of classified columns sharing one label.
-        ("typical", 3, 1, 12),
+        ("typical", 3, 1, 12, 'x'),
         // 252 distinctly classified columns with sysname-length strings: the
         // largest shape measured against SQL Server 2022.
-        ("distinct_252", 252, 252, 128),
+        ("distinct_252", 252, 252, 128, 'x'),
+        // The same with non-ASCII labels and ids, which skip the ASCII
+        // shortcut and are decoded as UTF-16.
+        ("distinct_252_non_ascii", 252, 252, 128, '機'),
         // The same at the 4096-column result-set maximum.
-        ("distinct_4096", 4096, 4096, 128),
+        ("distinct_4096", 4096, 4096, 128, 'x'),
         // Every column shares one classification, so strings are a small
         // part of the token and this change should not matter.
-        ("shared_4096", 4096, 1, 128),
+        ("shared_4096", 4096, 1, 128, 'x'),
     ];
-    for (name, columns, distinct, length) in shapes {
-        let bytes = token(columns, distinct, length);
+    for (name, columns, distinct, length, fill) in shapes {
+        let bytes = token(columns, distinct, length, fill);
         check(&runtime, &bytes, columns);
 
         let mut group = c.benchmark_group(format!("data_classification_parse/{name}"));
