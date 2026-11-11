@@ -210,7 +210,8 @@ on the `master` branch.
   whole token at a time, within `PROCEDURE_TAIL_WAIT` (1 s, uncharged to the
   query timeout), and otherwise leaves the batch open, so a later statement
   still running neither holds the error back nor lets the timeout abandon the
-  batch.
+  batch. The failed statement's result reports no affected-row count (`-1`),
+  never the previous statement's, as msodbcsql's `OnMessage` resets it.
 - A SQL Server error that ends a row set after a fetch delivered rows belongs
   to the next fetch, as in msodbcsql: the block fetch or read-ahead that finds
   it returns its rows and defers it in `pending_fetch_error`. While a

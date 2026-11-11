@@ -1588,7 +1588,8 @@ impl TdsClient {
     /// Returns the row count from the last DONE token that carried the
     /// `DONE_COUNT` flag **and** was not tagged with the `SQLSELECT` command,
     /// or `-1` when no such count is available (DDL, `SET NOCOUNT ON`, a
-    /// forward-only SELECT whose trailing DONE has not been read, or before any
+    /// forward-only SELECT whose trailing DONE has not been read, a statement
+    /// error returned under [`BatchErrorMode::Continue`], or before any
     /// statement has executed). This maps directly to the value ODBC
     /// `SQLRowCount` reports.
     ///
@@ -9080,11 +9081,13 @@ impl TdsClient {
         // nothing from it may still describe the current position. The metadata
         // would let `on_rows` report the old row set and `advance` drain it again;
         // the DONEINPROC flag would let `complete_current_result` settle an RPC
-        // terminator over the failed statement's own completion tokens.
+        // terminator over the failed statement's own completion tokens. The
+        // failed statement has no count, as msodbcsql's `OnMessage` resets it.
         self.current_metadata = None;
         self.current_result_set_has_been_read_till_end = true;
         self.current_result_ended_with_done_in_proc = false;
         self.last_result_row_count = None;
+        self.last_rows_affected = -1;
         crate::error::Error::from_sql_errors(errors)
     }
 
@@ -13499,6 +13502,38 @@ mod tests {
 
         assert!(client.complete_failed_statement().await.unwrap());
         assert!(client.has_open_batch());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+    }
+
+    /// The failed statement is the current result, and it has no count: the
+    /// previous statement's no longer applies (msodbcsql 18.07.0001 reports -1).
+    #[tokio::test]
+    async fn a_statement_error_clears_the_previous_statement_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_more_with_count(2),
+            Tokens::Error(error_token_with_severity(16)),
+            done_more(),
+            int_col_metadata(1),
+            done_no_more(),
+        ]);
+        assert_eq!(
+            client
+                .execute(
+                    "INSERT t VALUES (1), (2); RAISERROR('e', 16, 1); SELECT 1".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::NoRows {
+                rows_affected: Some(2)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 2);
+
+        assert!(client.advance().await.is_err());
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert_eq!(client.last_rows_affected(), -1);
         assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
     }
 

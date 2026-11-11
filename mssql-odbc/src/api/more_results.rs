@@ -418,14 +418,15 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         Err(e) => {
             error!(%e, "SQLMoreResults: advance failed");
             // As in `fail_with_tds`: a failed last statement ends the batch.
-            let completion = if is_continued_statement_error(&client, &e) {
+            let continued = is_continued_statement_error(&client, &e);
+            let completion = if continued {
                 dbc.runtime.block_on(client.complete_failed_statement())
             } else {
                 Ok(false)
             };
             let info_messages = client.take_info_messages();
+            let row_count = client.last_rows_affected();
             if matches!(completion, Ok(true)) {
-                let row_count = client.last_rows_affected();
                 let ird_ok = populate_ird(stmt, &[], None).is_ok();
                 if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
                     return SQL_ERROR;
@@ -458,6 +459,11 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
+                if continued {
+                    // The failed last statement is the current result, so the
+                    // previous one's count no longer applies.
+                    stmt_state.row_count = row_count;
+                }
                 post_tds_error_with_info(&mut stmt_state, &e, SQLSTATE_HY000, &info_messages);
                 if let Err(completion_error) = &completion {
                     post_tds_error(&mut stmt_state, completion_error, SQLSTATE_HY000);
@@ -629,6 +635,58 @@ mod tests {
                 unsafe { sql_exec_direct_w(handles.stmt, sql.as_ptr(), sql.len() as SqlInteger) },
                 SQL_SUCCESS
             );
+        }
+    }
+
+    /// A failed statement's result reports no affected-row count rather than
+    /// the previous statement's, whether later statements follow or it ends the
+    /// batch (msodbcsql 18.07.0001 reports -1 for both).
+    #[test]
+    fn a_failed_statement_result_reports_no_row_count() {
+        use crate::api::exec_direct::sql_exec_direct_w;
+        use crate::api::odbc_types::{SqlInteger, SqlLen};
+        use crate::api::row_count::sql_row_count;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_more_with_count, int_columns, sql_error,
+            tds_client_from_tokens_with_int_rowsets,
+        };
+
+        let row_count = |h: &TestHandles| {
+            let mut count: SqlLen = 0;
+            assert_eq!(unsafe { sql_row_count(h.stmt, &mut count) }, SQL_SUCCESS);
+            count
+        };
+        for later_result in [true, false] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let mut tokens = vec![
+                done_more_with_count(2),
+                sql_error(50000, 16, "failed after the INSERT"),
+            ];
+            if later_result {
+                tokens.extend([done_more(), col_metadata(int_columns(1)), done_no_more()]);
+            } else {
+                tokens.push(done_no_more());
+            }
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            dbc.inner.lock().unwrap().wire.put_client_for_test(
+                tds_client_from_tokens_with_int_rowsets(tokens, vec![vec![vec![42]]]),
+            );
+            let sql: Vec<u16> = "INSERT t VALUES (1), (2); RAISERROR('e', 16, 1); SELECT 42"
+                .encode_utf16()
+                .collect();
+
+            assert_eq!(
+                unsafe { sql_exec_direct_w(handles.stmt, sql.as_ptr(), sql.len() as SqlInteger) },
+                SQL_SUCCESS
+            );
+            assert_eq!(row_count(&handles), 2);
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+            assert_eq!(row_count(&handles), -1, "later result: {later_result}");
+            if later_result {
+                assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+            }
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
         }
     }
 

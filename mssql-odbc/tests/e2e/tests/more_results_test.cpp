@@ -319,6 +319,36 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, DelayedProcedureTailKeepsTheBatch,
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
 }
 
+// A failed statement's result reports no affected-row count rather than the
+// previous statement's, whether later statements follow or it ends the batch
+// (msodbcsql 18.07.0001).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedStatementResultReportsNoRowCount,
+                  odbc_concurrency::kAllModes) {
+    for (const char* rest : {"RAISERROR('row_count_probe',16,1); SELECT 42 AS v;",
+                             "INSERT @t VALUES (1);"}) {
+        SCOPED_TRACE(rest);
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(
+            std::string("SET NOCOUNT OFF; DECLARE @t TABLE(v int PRIMARY KEY); "
+                        "INSERT @t VALUES (1),(2); ") +
+            rest);
+        ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        SQLLEN count = 0;
+        ASSERT_SQL_OK(SQLRowCount(stmt_, &count), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2, count);
+
+        ASSERT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+        count = 0;
+        ASSERT_SQL_OK(SQLRowCount(stmt_, &count), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(-1, count);
+        SQLRETURN rc;
+        while ((rc = SQLMoreResults(stmt_)) == SQL_SUCCESS) {
+        }
+        EXPECT_EQ(SQL_NO_DATA, rc);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
 // For diagnostics returned by one execution call, a mapped server warning
 // precedes the subsequent unmapped server error.
 ODBC_TEST_F_MODES(MoreResultsLiveTest, ServerDiagnosticsUseMsodbcsqlPriorityOrder,
