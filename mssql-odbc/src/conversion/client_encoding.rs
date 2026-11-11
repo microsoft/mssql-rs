@@ -12,7 +12,7 @@ use super::error::ConvError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClientEncoding(u32);
 
-#[cfg(feature = "e2e-test-client-code-page")]
+#[cfg(any(test, feature = "e2e-test-client-code-page"))]
 const E2E_TEST_CLIENT_CODE_PAGE: &str = "MSSQL_ODBC_TEST_CLIENT_CODE_PAGE";
 
 #[derive(Debug)]
@@ -179,7 +179,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "e2e-test-client-code-page")]
     #[test]
     fn e2e_test_override_reports_invalid_values_instead_of_panicking() {
         use std::ffi::OsStr;
@@ -245,7 +244,7 @@ impl ClientEncoding {
         Ok(Self::system_default())
     }
 
-    #[cfg(feature = "e2e-test-client-code-page")]
+    #[cfg(any(test, feature = "e2e-test-client-code-page"))]
     fn e2e_test_override(value: Option<&std::ffi::OsStr>) -> Result<Option<Self>, String> {
         let Some(value) = value else {
             return Ok(None);
