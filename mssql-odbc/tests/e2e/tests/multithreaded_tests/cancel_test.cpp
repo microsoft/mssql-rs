@@ -468,9 +468,14 @@ TEST_F(CancelLiveTest, CancelInterruptsAGetDataBlockedMidPlpValue) {
 // A statement inside EXEC fails while a later one runs, and the cancellation
 // lands during the one-second look-ahead for the procedure's tail. Both
 // drivers end the look-ahead and return the statement's error without HY008,
-// and the rest of the batch is abandoned. msodbcsql's next SQLMoreResults
-// reports HY008; this driver settled the response in the interrupted call
-// (registry entry 27), so it finds no more results.
+// and the rest of the batch is abandoned. Through the Windows Driver Manager,
+// msodbcsql's next SQLMoreResults reports HY008; this driver settled the
+// response in the interrupted call (registry entry 27), so it finds no more
+// results. unixODBC answers SQLMoreResults after a failed SQLExecDirect
+// without calling either driver.
+// Benefits-from-mock-tds: assert ATTENTION and its DONE_ATTN acknowledgement
+// before SQLCancel returns; a_cancellation_ends_the_procedure_tail_wait pins
+// that the look-ahead itself leaves the cancellation to the caller.
 TEST_F(CancelLiveTest, CancelDuringTheProcedureTailLookAheadAbandonsTheBatch) {
     using namespace std::chrono_literals;
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT,
@@ -495,6 +500,7 @@ TEST_F(CancelLiveTest, CancelDuringTheProcedureTailLookAheadAbandonsTheBatch) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
     EXPECT_FALSE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "HY008"));
 
+#ifdef _WIN32
     const auto* target = std::getenv("ODBC_TEST_TARGET");
     if (target && std::string(target) == "msodbcsql") {
         EXPECT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
@@ -502,6 +508,9 @@ TEST_F(CancelLiveTest, CancelDuringTheProcedureTailLookAheadAbandonsTheBatch) {
     } else {
         EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
     }
+#else
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+#endif
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
     AssertReusable();
 }

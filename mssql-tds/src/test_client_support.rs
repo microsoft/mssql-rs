@@ -281,6 +281,17 @@ impl TokenReplayTransport {
     }
 }
 
+/// The wire type of a scripted token. DONEPROC and DONEINPROC share
+/// [`DoneToken`], whose own type is DONE.
+pub(crate) fn scripted_token_type(token: &Tokens) -> u8 {
+    use crate::token::tokens::{Token, TokenType};
+    match token {
+        Tokens::DoneProc(_) => TokenType::DoneProc as u8,
+        Tokens::DoneInProc(_) => TokenType::DoneInProc as u8,
+        other => other.token_type() as u8,
+    }
+}
+
 #[async_trait]
 impl TdsTokenStreamReader for TokenReplayTransport {
     fn try_receive_row_header(
@@ -475,16 +486,20 @@ impl TdsTransport for TokenReplayTransport {
     fn abort_transport(&mut self) {
         self.known_dead = true;
     }
-    async fn response_data_within(
+    async fn wanted_token_within(
         &mut self,
         _wait: Duration,
         _cancel_handle: Option<&CancelHandle>,
+        wanted: fn(u8) -> bool,
     ) -> TdsResult<bool> {
         if self.stalled() {
             self.pause_at = None;
             return Ok(false);
         }
-        Ok(true)
+        Ok(self
+            .pending_tokens
+            .front()
+            .is_none_or(|token| wanted(scripted_token_type(token))))
     }
     async fn send_attention_with_timeout(
         &mut self,

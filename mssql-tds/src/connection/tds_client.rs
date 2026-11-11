@@ -91,6 +91,21 @@ const MAX_TOKENS_AFTER_STATEMENT_ERROR: u32 = 100_000;
 /// look-ahead (`OnDone` in `sqlctokn.cpp`, `TdsParser.h`).
 const PROCEDURE_TAIL_WAIT: Duration = Duration::from_secs(1);
 
+/// The tokens that end a procedure after one of its statements failed, and the
+/// connection state that can arrive among them.
+fn is_procedure_tail_token(kind: u8) -> bool {
+    use crate::token::tokens::TokenType;
+    [
+        TokenType::ReturnStatus,
+        TokenType::DoneProc,
+        TokenType::Done,
+        TokenType::EnvChange,
+        TokenType::SessionState,
+    ]
+    .into_iter()
+    .any(|tail| tail as u8 == kind)
+}
+
 /// Statement errors skipped by a [`TdsClient::close_query`] drain under
 /// [`BatchErrorMode::Continue`]. A batch can hold any number of failing
 /// statements, so the errors kept for the caller are bounded like one failed
@@ -6552,14 +6567,15 @@ impl TdsClient {
     /// from a row set comes after the row set's own DONE, so only the procedure
     /// tail after a DONEINPROC is left to read.
     ///
-    /// The procedure's tail is read only if more of the response arrives within
-    /// [`PROCEDURE_TAIL_WAIT`]. A later statement of the procedure may still be
-    /// running, and waiting for it would hold the error back, or let the
-    /// request's timeout abandon a batch that is still valid. Like msodbcsql's
-    /// look-ahead, the wait neither fails the request nor counts against its
-    /// timeout, and when nothing arrives the batch stays open for `advance`. A
-    /// cancellation ends the wait the same way and is left to the caller, as
-    /// msodbcsql returns the error and settles the cancellation afterwards.
+    /// The procedure's tail is read only as far as it arrives within
+    /// [`PROCEDURE_TAIL_WAIT`], one whole token at a time. A later statement of
+    /// the procedure may still be running, and waiting for it would hold the
+    /// error back, or let the request's timeout abandon a batch that is still
+    /// valid. Like msodbcsql's look-ahead, the wait neither fails the request
+    /// nor counts against its timeout; whatever has not arrived whole when it
+    /// ends stays unread, with the batch open for `advance`. A cancellation ends
+    /// the wait the same way and is left to the caller, as msodbcsql returns
+    /// the error and settles the cancellation afterwards.
     pub async fn complete_failed_statement(&mut self) -> TdsResult<bool> {
         let in_procedure_tail = if self.failed_statement_done_pending {
             false
@@ -6586,24 +6602,20 @@ impl TdsClient {
             && self.has_open_batch()
     }
 
-    /// Whether more of the response arrives within [`PROCEDURE_TAIL_WAIT`],
-    /// bounded by the request's remaining timeout. Nothing is read, and the
-    /// time waited is not charged to that timeout.
-    async fn response_continues_soon(&mut self) -> TdsResult<bool> {
+    /// Whether the next token is a whole token of the failed statement's
+    /// procedure tail, waiting for one until `deadline` at most. Nothing is
+    /// read, and the time waited is not charged to the request's timeout.
+    async fn procedure_tail_token_by(&mut self, deadline: Instant) -> TdsResult<bool> {
         if self.parked_token.is_some() {
             return Ok(true);
         }
-        let wait = self
-            .remaining_request_timeout
-            .map_or(PROCEDURE_TAIL_WAIT, |remaining| {
-                remaining.min(PROCEDURE_TAIL_WAIT)
-            });
+        let wait = deadline.saturating_duration_since(Instant::now());
         match self
             .transport
-            .response_data_within(wait, self.cancel_handle.as_ref())
+            .wanted_token_within(wait, self.cancel_handle.as_ref(), is_procedure_tail_token)
             .await
         {
-            Ok(arrived) => Ok(arrived),
+            Ok(ready) => Ok(ready),
             Err(error) => Err(self.fail_read(error)),
         }
     }
@@ -6615,13 +6627,18 @@ impl TdsClient {
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
-        let mut tail_awaited = false;
+        let mut tail_deadline = None;
         loop {
-            if in_procedure_tail
-                && !std::mem::replace(&mut tail_awaited, true)
-                && !self.response_continues_soon().await?
-            {
-                return Ok(true);
+            if in_procedure_tail {
+                let wait = self
+                    .remaining_request_timeout
+                    .map_or(PROCEDURE_TAIL_WAIT, |remaining| {
+                        remaining.min(PROCEDURE_TAIL_WAIT)
+                    });
+                let deadline = *tail_deadline.get_or_insert_with(|| Instant::now() + wait);
+                if !self.procedure_tail_token_by(deadline).await? {
+                    return Ok(true);
+                }
             }
             let token = self.next_response_token(&parser_context).await?;
             match token {
@@ -10509,7 +10526,7 @@ mod tests {
         /// timeout: a read there times out, while a short wait for more of it
         /// finds nothing, after which the rest has arrived.
         response_pause_at: Option<usize>,
-        /// Every wait `response_data_within` was given.
+        /// Every wait `wanted_token_within` was given.
         response_waits: Arc<std::sync::Mutex<Vec<Duration>>>,
     }
 
@@ -10908,17 +10925,23 @@ mod tests {
             self.closed = true;
             self.known_dead = true;
         }
-        async fn response_data_within(
+        async fn wanted_token_within(
             &mut self,
             wait: Duration,
-            _cancel_handle: Option<&CancelHandle>,
+            cancel_handle: Option<&CancelHandle>,
+            wanted: fn(u8) -> bool,
         ) -> TdsResult<bool> {
             self.response_waits.lock().unwrap().push(wait);
             if self.response_pause_at != Some(self.pending_tokens.len()) {
-                return Ok(true);
+                return Ok(self.pending_tokens.front().is_none_or(|token| {
+                    wanted(crate::test_client_support::scripted_token_type(token))
+                }));
             }
-            // Some real time passes, so a test can see whether it is charged.
-            tokio::time::sleep(wait.min(Duration::from_millis(50))).await;
+            // Some real time passes, so a test can see whether it is charged;
+            // a cancellation ends the wait at once, as on the network.
+            if !cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+                tokio::time::sleep(wait.min(Duration::from_millis(50))).await;
+            }
             self.response_pause_at = None;
             Ok(false)
         }
@@ -13822,7 +13845,11 @@ mod tests {
 
             assert!(client.complete_failed_statement().await.unwrap());
             assert!(client.has_open_batch());
-            assert_eq!(*waits.lock().unwrap(), [wait]);
+            let waited = waits.lock().unwrap().clone();
+            assert!(
+                matches!(waited[..], [given] if given <= wait && wait - given < Duration::from_millis(40)),
+                "expected one wait of about {wait:?}, got {waited:?}"
+            );
             assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
             let read_budget = *budgets.lock().unwrap().last().unwrap();
             if let Some(budget) = budget {
@@ -13853,6 +13880,79 @@ mod tests {
         assert!(client.complete_failed_statement().await.unwrap());
         assert!(client.has_open_batch());
         assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+    }
+
+    /// The look-ahead covers the whole tail, not just its first token: once
+    /// RETURNSTATUS is read, a DONEPROC that has not arrived within what is left
+    /// of the same wait is left for `advance`, with the batch open.
+    #[tokio::test]
+    async fn completing_a_failed_statement_leaves_a_tail_stalled_after_its_return_status() {
+        let transport = TestTransport::with_tokens_pausing_before(
+            vec![
+                Tokens::Error(error_token_with_severity(16)),
+                done_in_proc_more(),
+                return_status(5),
+                done_proc_no_more(),
+            ],
+            3,
+        );
+        let waits = Arc::clone(&transport.response_waits);
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(client.has_open_batch());
+        assert_eq!(client.get_return_status(), Some(5));
+        let waits = waits.lock().unwrap().clone();
+        assert_eq!(waits.len(), 2);
+        assert!(waits[1] <= waits[0], "one wait covers the tail: {waits:?}");
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert!(!client.has_open_batch());
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A cancellation ends the look-ahead the way its timeout does: the error
+    /// is returned with the batch open and no ATTENTION sent, and the
+    /// cancellation is left for the caller to settle, as msodbcsql returns
+    /// the error before settling it (measured on 18.07.0001).
+    #[tokio::test]
+    async fn a_cancellation_ends_the_procedure_tail_wait() {
+        let transport = TestTransport::with_tokens_pausing_before(
+            vec![
+                Tokens::Error(error_token_with_severity(16)),
+                done_in_proc_more(),
+                int_col_metadata(1),
+                done_no_more(),
+            ],
+            2,
+        );
+        let attentions = Arc::clone(&transport.attentions);
+        let mut client = create_test_client_with_transport(transport);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(client.has_open_batch());
+        assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
     }
 
     /// The same inside a row set: the errors collected there are dropped with

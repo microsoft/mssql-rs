@@ -287,21 +287,32 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedProcedureRowSetReleasesTheConnectio
 // A statement inside EXEC fails while a later one is still running. The error
 // is reported after a short look-ahead rather than once the procedure's tail
 // arrives, so the query timeout does not abandon the batch, and SQLMoreResults
-// reaches the later result (msodbcsql 18.07.0001).
+// reaches the later result (msodbcsql 18.07.0001). The batch starts with a
+// result, so the failure comes from SQLMoreResults: unixODBC answers
+// SQLMoreResults after a failed SQLExecDirect without calling the driver.
+// Benefits-from-mock-tds: assert that the look-ahead sends no ATTENTION and
+// leaves the later statement's tokens unread; tds_client.rs's
+// completing_a_failed_statement_leaves_a_delayed_procedure_tail pins that.
 ODBC_TEST_F_MODES(MoreResultsLiveTest, DelayedProcedureTailKeepsTheBatch,
                   odbc_concurrency::kAllModes) {
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(2), 0),
                   SQL_HANDLE_STMT, stmt_);
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
-        "SET NOCOUNT ON; EXEC(N'RAISERROR(''delayed_tail'',16,1) WITH NOWAIT; "
+        "SET NOCOUNT ON; SELECT 841 AS u; EXEC(N'RAISERROR(''delayed_tail'',16,1) WITH NOWAIT; "
         "WAITFOR DELAY ''00:00:02.500''; SELECT 842 AS v;');");
-    ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+    SQLINTEGER v = 0;
+    SQLLEN v_ind = 0;
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &v, 0, &v_ind), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(841, v);
+
+    ASSERT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
     EXPECT_FALSE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "HYT00"));
 
     ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
-    SQLINTEGER v = 0;
-    SQLLEN v_ind = 0;
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &v, 0, &v_ind), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(842, v);

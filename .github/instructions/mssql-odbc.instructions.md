@@ -206,10 +206,11 @@ on the `master` branch.
   procedure is returned from its DONEINPROC, so call
   `TdsClient::complete_failed_statement` before keeping the connection: a
   failed last statement must release it, as msodbcsql does. Like msodbcsql's
-  look-ahead, it waits at most `PROCEDURE_TAIL_WAIT` (1 s, uncharged to the
-  query timeout) for the procedure's tail and otherwise leaves the batch open,
-  so a later statement still running neither holds the error back nor lets
-  the timeout abandon the batch.
+  look-ahead, it reads the procedure's tail only as far as it arrives, one
+  whole token at a time, within `PROCEDURE_TAIL_WAIT` (1 s, uncharged to the
+  query timeout), and otherwise leaves the batch open, so a later statement
+  still running neither holds the error back nor lets the timeout abandon the
+  batch.
 - A SQL Server error that ends a row set after a fetch delivered rows belongs
   to the next fetch, as in msodbcsql: the block fetch or read-ahead that finds
   it returns its rows and defers it in `pending_fetch_error`. While a

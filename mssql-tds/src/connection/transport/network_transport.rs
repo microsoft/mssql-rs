@@ -29,10 +29,10 @@ use crate::io::packet_reader::{LENGTH_NULL, TdsPacketReader};
 use crate::io::packet_writer::PacketWriter;
 use crate::io::reader_writer::{NetworkReader, NetworkReaderWriter, NetworkWriter};
 use crate::io::token_stream::{
-    ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
-    TdsTokenStreamReader, log_received_token, read_active_plp_bytes_internal,
-    receive_row_header_internal, receive_row_into_internal, receive_token_internal,
-    resume_row_into_internal,
+    BufferedToken, ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState,
+    RowReadResult, TdsTokenStreamReader, log_received_token, measure_buffered_token,
+    read_active_plp_bytes_internal, receive_row_header_internal, receive_row_into_internal,
+    receive_token_internal, resume_row_into_internal,
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
@@ -1861,19 +1861,49 @@ impl NetworkTransport {
         Ok(true)
     }
 
-    /// Waits at most `wait` for the next packet of the current response and
-    /// leaves it unread. A packet that arrives only in part is parked, so ending
-    /// the wait, or a cancellation, loses nothing and needs no ATTENTION.
-    /// Returns whether any of the response is buffered.
-    pub(crate) async fn response_data_within(
+    /// Waits at most `wait` for the response's next token to be buffered whole,
+    /// reading none of it, and returns whether it is one `wanted` accepts.
+    /// Another type ends the wait at once. Packets are appended as they arrive,
+    /// so a token split across them is measured whole; a packet that arrives
+    /// only in part is parked, so ending the wait, or a cancellation, loses
+    /// nothing and needs no ATTENTION.
+    pub(crate) async fn wanted_token_within(
         &mut self,
         wait: Duration,
         cancel_handle: Option<&CancelHandle>,
+        wanted: fn(u8) -> bool,
     ) -> TdsResult<bool> {
-        if self.tds_read_buffer.get_remaining_byte_count() > 0
-            || self.tds_read_buffer.end_of_message
-        {
-            return Ok(true);
+        let deadline = Instant::now() + wait;
+        loop {
+            match measure_buffered_token(self.tds_read_buffer.get_buffered_slice()) {
+                BufferedToken::Whole(kind) => return Ok(wanted(kind)),
+                BufferedToken::Partial(kind) if wanted(kind) => {}
+                BufferedToken::Absent => {}
+                BufferedToken::Partial(_) | BufferedToken::Unsized(_) => return Ok(false),
+            }
+            let has_room = self.tds_read_buffer.get_remaining_byte_count()
+                + self.tds_read_buffer.max_packet_size
+                <= self.tds_read_buffer.working_buffer.len();
+            if self.tds_read_buffer.end_of_message
+                || !has_room
+                || !self.next_packet_by(deadline, cancel_handle).await?
+            {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Appends the response's next packet to the unread bytes, if it arrives
+    /// by `deadline` and before any cancellation.
+    async fn next_packet_by(
+        &mut self,
+        deadline: Instant,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<bool> {
+        if self.tds_read_buffer.get_remaining_byte_count() > 0 {
+            self.tds_read_buffer.shift_data_to_front();
+        } else {
+            self.tds_read_buffer.reset_to_length(0);
         }
         let cancelled = async {
             match cancel_handle {
@@ -1881,19 +1911,16 @@ impl NetworkTransport {
                 None => std::future::pending().await,
             }
         };
-        let arrival = poll_fn(|context| {
-            self.tds_read_buffer.reset_to_length(0);
-            match self.poll_new_tds_packet(context) {
-                Ok(Some(packet_size)) => {
-                    self.tds_read_buffer.remove_header_from_packet(packet_size);
-                    Poll::Ready(Ok(true))
-                }
-                Ok(None) => Poll::Pending,
-                Err(error) => Poll::Ready(Err(error)),
+        let arrival = poll_fn(|context| match self.poll_new_tds_packet(context) {
+            Ok(Some(packet_size)) => {
+                self.tds_read_buffer.remove_header_from_packet(packet_size);
+                Poll::Ready(Ok(true))
             }
+            Ok(None) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
         });
         tokio::select! {
-            arrived = timeout(wait, arrival) => arrived.unwrap_or(Ok(false)),
+            arrived = timeout_at(deadline, arrival) => arrived.unwrap_or(Ok(false)),
             () = cancelled => Ok(false),
         }
     }
@@ -3845,12 +3872,13 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         Self::abort_transport(self);
     }
 
-    async fn response_data_within(
+    async fn wanted_token_within(
         &mut self,
         wait: Duration,
         cancel_handle: Option<&CancelHandle>,
+        wanted: fn(u8) -> bool,
     ) -> TdsResult<bool> {
-        NetworkTransport::response_data_within(self, wait, cancel_handle).await
+        NetworkTransport::wanted_token_within(self, wait, cancel_handle, wanted).await
     }
 
     /// Send an attention packet and wait for acknowledgment with a timeout.
@@ -5270,56 +5298,69 @@ pub(crate) mod tests {
         assert!(!TdsTransport::response_fully_received(&transport));
     }
 
-    /// Waiting for more of the response reads none of it, and ending the wait
-    /// loses nothing: a packet that arrived only in part is parked and is
-    /// whole once the rest arrives.
+    /// Waiting for a token reads none of the response, and ending the wait
+    /// loses nothing: a DONEPROC split across two packets, the second arriving
+    /// only in part, is measured whole once the rest arrives, and the read that
+    /// follows gets it.
     #[tokio::test]
-    async fn response_data_within_parks_a_partial_packet() {
+    async fn waiting_for_a_wanted_token_resumes_across_packets() {
         let context = ClientContext {
             packet_size: 512,
             ..Default::default()
         };
         let (mut transport, mut server) = create_readable_network_transport(&context);
-        let packet = tabular_packet(b"tail", true);
-        server.write_all(&packet[..5]).await.unwrap();
+        let done_proc = [vec![TokenType::DoneProc as u8], vec![0; 12]].concat();
+        let second = tabular_packet(&done_proc[5..], true);
+        let wanted = |kind: u8| kind == TokenType::DoneProc as u8;
+        server
+            .write_all(&tabular_packet(&done_proc[..5], false))
+            .await
+            .unwrap();
+        server.write_all(&second[..4]).await.unwrap();
 
         assert!(
             !transport
-                .response_data_within(Duration::from_millis(20), None)
+                .wanted_token_within(Duration::from_millis(20), None, wanted)
                 .await
                 .unwrap()
         );
-        server.write_all(&packet[5..]).await.unwrap();
+        server.write_all(&second[4..]).await.unwrap();
         assert!(
             transport
-                .response_data_within(Duration::from_secs(5), None)
+                .wanted_token_within(Duration::from_secs(5), None, wanted)
                 .await
                 .unwrap()
         );
-        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"tail");
         assert!(
-            transport
-                .response_data_within(Duration::ZERO, None)
+            !transport
+                .wanted_token_within(Duration::ZERO, None, |_| false)
                 .await
                 .unwrap(),
-            "buffered bytes answer at once"
+            "another type ends the wait at once"
         );
+        assert!(matches!(
+            transport
+                .receive_token(&ParserContext::None(()), None, None)
+                .await
+                .unwrap(),
+            Tokens::DoneProc(_)
+        ));
     }
 
     /// A cancellation ends the wait without failing it or the connection.
     #[tokio::test]
-    async fn response_data_within_ends_when_cancelled() {
+    async fn waiting_for_a_wanted_token_ends_when_cancelled() {
         let (mut transport, _server) = create_readable_network_transport(&ClientContext::default());
         let handle = cancelled_handle();
 
-        let arrived = timeout(
+        let wanted = timeout(
             Duration::from_secs(60),
-            transport.response_data_within(Duration::from_secs(600), Some(&handle)),
+            transport.wanted_token_within(Duration::from_secs(600), Some(&handle), |_| true),
         )
         .await
         .expect("a cancelled wait must return");
 
-        assert!(!arrived.unwrap());
+        assert!(!wanted.unwrap());
         assert!(!is_known_dead(&transport));
     }
 

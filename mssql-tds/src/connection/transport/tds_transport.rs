@@ -111,14 +111,16 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
         false
     }
 
-    /// Waits at most `wait` for more of the current response without reading
-    /// any of it, and reports whether some is available. The wait ending, or a
-    /// cancellation, is not a failure and interrupts nothing. Scripted
-    /// transports have their next token ready unless they say otherwise.
-    async fn response_data_within(
+    /// Waits at most `wait` for the next token of the current response to be
+    /// buffered whole, reading none of it, and returns whether it is one
+    /// `wanted` accepts. The wait ending, or a cancellation, is not a failure
+    /// and interrupts nothing. A transport that cannot tell returns `true`, so
+    /// the caller reads on.
+    async fn wanted_token_within(
         &mut self,
         _wait: Duration,
         _cancel_handle: Option<&CancelHandle>,
+        _wanted: fn(u8) -> bool,
     ) -> TdsResult<bool> {
         Ok(true)
     }

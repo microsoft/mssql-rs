@@ -77,18 +77,23 @@ impl AnyTransport {
         }
     }
 
-    /// See [`TdsTransport::response_data_within`].
-    pub(crate) async fn response_data_within(
+    /// See [`TdsTransport::wanted_token_within`].
+    pub(crate) async fn wanted_token_within(
         &mut self,
         wait: Duration,
         cancel_handle: Option<&CancelHandle>,
+        wanted: fn(u8) -> bool,
     ) -> TdsResult<bool> {
         match self {
             Self::Network(transport) => {
-                TdsTransport::response_data_within(transport, wait, cancel_handle).await
+                TdsTransport::wanted_token_within(transport, wait, cancel_handle, wanted).await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
-            Self::Dynamic(transport) => transport.response_data_within(wait, cancel_handle).await,
+            Self::Dynamic(transport) => {
+                transport
+                    .wanted_token_within(wait, cancel_handle, wanted)
+                    .await
+            }
         }
     }
 
