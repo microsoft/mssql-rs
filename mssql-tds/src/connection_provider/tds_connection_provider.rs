@@ -215,11 +215,8 @@ impl TdsConnectionProvider {
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<TdsClient> {
         let action_chain = Self::action_chain(&mut context, datasource)?;
-
-        // ODBC polls this on the application's stack. Keep the connection
-        // state out of its block_on frames, leaving room for native TLS and
-        // client construction on musl's 128 KiB threads.
-        Box::pin(self.execute_action_chain(&context, action_chain, cancel_handle, None)).await
+        self.execute_action_chain(&context, action_chain, cancel_handle, None)
+            .await
     }
 
     /// [`create_client`](Self::create_client) for connection diagnostics: the
@@ -265,9 +262,9 @@ impl TdsConnectionProvider {
         }
         let diagnosis = Diagnosis::new(stop_after);
         let bound_ms = u64::from(context.connect_timeout) * 1000;
-        let result =
-            Box::pin(self.execute_action_chain(&context, action_chain, None, Some(&diagnosis)))
-                .await;
+        let result = self
+            .execute_action_chain(&context, action_chain, None, Some(&diagnosis))
+            .await;
         diagnosis.finish_extra_connects(bound_ms).await;
         if diagnosis.stopped() {
             return Ok(None);
@@ -313,7 +310,11 @@ impl TdsConnectionProvider {
         cancel_handle: Option<&CancelHandle>,
         diagnosis: Option<&Diagnosis>,
     ) -> TdsResult<TdsClient> {
-        CancelHandle::run_until_cancelled(cancel_handle, async move {
+        // ODBC polls connections on the application's stack (128 KiB on musl).
+        // Box the body before the cancellation wrapper so an outlined wrapper
+        // poll cannot copy the in-flight transport/TLS/login state through a
+        // stack temporary; this must not depend on LTO inlining decisions.
+        CancelHandle::run_until_cancelled(cancel_handle, Box::pin(async move {
             // Resolve SSRP (SQL Browser) if the action chain requires it.
             // Check the instance cache first to avoid a redundant UDP round-trip.
             let mut exec_context = ExecutionContext::new();
@@ -593,7 +594,7 @@ impl TdsConnectionProvider {
                     "All connection attempts from action chain failed.".to_string(),
                 )
             }))
-        })
+        }))
         .await
     }
 
