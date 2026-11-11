@@ -11,11 +11,14 @@
 # Usage:
 #   ./run_e2e.sh [--release] [--verbose] [--retries=N] [--coverage[=OUTPUT]]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
-#                [--skip-build] [--driver=PATH]
-#                [--filter=REGEX] [--exclude=REGEX]
-#                [--mt-profile=pr|weekly]
+#                [--skip-build] [--driver=PATH] [--test-jobs=N]
+#                [--filter=REGEX] [--exclude=REGEX] [--mt-profile=pr|weekly]
 #
 # Default: runs the e2e suite against mssql-odbc only.
+#
+# --test-jobs=N (1-64, default 1) bounds parallel ctest entries within each
+# driver leg. The legs stay sequential, and the CMake resource locks keep an
+# executable's entries, and RUN_SERIAL entries, from overlapping.
 #
 # --filter and --exclude select ctest entries by name (ctest -R and -E), like
 # run_e2e.ps1 -FilterTests and -ExcludeTests. The stress pipeline uses them to
@@ -168,6 +171,7 @@ DRIVER_OVERRIDE=""
 TEST_FILTER=""
 TEST_EXCLUDE=""
 MT_PROFILE="pr"
+TEST_JOBS=1
 # Extra environment for the msodbcsql leg only (see apply_mt_profile).
 MS_LEG_ENV=()
 
@@ -204,10 +208,15 @@ parse_args() {
             --filter=*) TEST_FILTER="${arg#--filter=}" ;;
             --exclude=*) TEST_EXCLUDE="${arg#--exclude=}" ;;
             --mt-profile=*) MT_PROFILE="${arg#--mt-profile=}" ;;
+            --test-jobs=*) TEST_JOBS="${arg#--test-jobs=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
     done
+    if [[ ! $TEST_JOBS =~ ^0*([1-9]|[1-5][0-9]|6[0-4])$ ]]; then
+        echo "--test-jobs must be an integer from 1 to 64" >&2
+        exit 2
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -586,6 +595,7 @@ generate_coverage_report() {
 main() {
     parse_args "$@"
     apply_mt_profile
+    CTEST_ARGS+=(--parallel "$TEST_JOBS")
     if [ -n "$TEST_FILTER" ]; then
         CTEST_ARGS+=(-R "$TEST_FILTER")
     fi

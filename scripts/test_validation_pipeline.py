@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,6 +155,246 @@ def test_windows_stress_builds_once_and_shares_attempt_scoped_artifact(
 
 
 _WINDOWS_E2E = _ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.ps1"
+
+
+def test_windows_pr_e2e_bounds_build_and_test_workers():
+    branch = next(
+        value for step in load_template("build-template.yml")["steps"]
+        for key, value in step.items()
+        if key.startswith("${{ if ") and "parameters.enableOdbcE2E" in key
+    )
+    command = next(step["pwsh"] for step in branch if "pwsh" in step)
+    assert "$buildJobs = [Environment]::ProcessorCount" in command
+    assert "$testJobs = [Math]::Min(8, [Environment]::ProcessorCount)" in command
+    assert "-BuildJobs $buildJobs -TestJobs $testJobs" in command
+    assert "-Retries 3 -Coverage" in command
+    assert "-CompareWithMsodbcsql" in command
+
+
+def test_windows_arm_e2e_bounds_build_and_test_workers():
+    steps = load_template("odbc-e2e-windows-remote-sql-template.yml")["steps"]
+    command = next(s["pwsh"] for s in steps if s.get("displayName") == "Run ODBC C++ e2e tests")
+    assert "$buildJobs = [Environment]::ProcessorCount" in command
+    assert "$testJobs = [Math]::Min(4, [Environment]::ProcessorCount)" in command
+    assert "-BuildJobs $buildJobs -TestJobs $testJobs" in command
+
+
+def test_unix_pr_e2e_bounds_test_workers():
+    container = (_TEMPLATES / "build-template-container.yml").read_text(encoding="utf-8")
+    assert '-e ODBC_E2E_TEST_JOBS="$(( $(nproc) < 4 ? $(nproc) : 4 ))"' in container
+    wrapper = (_ROOT / ".pipeline" / "scripts" / "containerized-odbc-e2e.sh").read_text(
+        encoding="utf-8"
+    )
+    assert '--test-jobs="${ODBC_E2E_TEST_JOBS:-1}"' in wrapper
+    stages = (_TEMPLATES / "validation-stages.yml").read_text(encoding="utf-8")
+    assert '--test-jobs="$(( cpus < 4 ? cpus : 4 ))"' in stages
+
+
+def test_rust_coverage_publishes_only_cobertura():
+    for path in (
+        _TEMPLATES / "build-template.yml",
+        _ROOT / ".pipeline" / "scripts" / "containerized-test.sh",
+    ):
+        content = path.read_text(encoding="utf-8")
+        assert "--lcov" not in content, path
+        assert "--cobertura" in content, path
+
+
+def test_kerberos_archive_flag_matches_bash_comparison():
+    template = (_TEMPLATES / "kerberos-test-template.yml").read_text(encoding="utf-8")
+    # Template expressions render booleans as True/False.
+    assert "USE_ARCHIVE: '${{ lower(parameters.useArchive) }}'" in template
+    assert 'if [ "$USE_ARCHIVE" = "true" ]; then' in template
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [("", "1"), ("--test-jobs=4", "4"), ("--test-jobs=0004", "0004"),
+     ("--test-jobs=64", "64"), ("--test-jobs=0", None), ("--test-jobs=65", None),
+     ("--test-jobs=9223372036854775808", None), ("--test-jobs=x", None),
+     ("--test-jobs=", None)],
+)
+def test_unix_e2e_validates_test_jobs(tmp_path, args, expected):
+    runner = (_ROOT / "mssql-odbc" / "tests" / "e2e" / "run_e2e.sh").read_text(
+        encoding="utf-8"
+    )
+    function = re.search(r"^parse_args\(\) \{\n.*?^\}", runner, re.M | re.S)
+    assert function, "parse_args not found"
+    script = f"""
+set -euo pipefail
+TEST_JOBS=1
+CTEST_ARGS=()
+usage() {{ :; }}
+{function.group()}
+parse_args {args}
+printf "jobs:%s\\n" "$TEST_JOBS"
+"""
+    script_path = tmp_path / "parse.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_BASH, script_path.name], cwd=tmp_path, capture_output=True, text=True,
+    )
+    if expected is None:
+        assert result.returncode == 2
+        assert "--test-jobs must be an integer from 1 to 64" in result.stderr
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"jobs:{expected}" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("cmake", "ctest")),
+    reason="needs CMake and CTest",
+)
+def test_e2e_ctest_registration_protects_shared_resources(tmp_path):
+    # Configure the real project without downloading or compiling Google Test.
+    gtest = tmp_path / "googletest"
+    gtest.mkdir()
+    (gtest / "CMakeLists.txt").write_text(
+        "add_library(gtest INTERFACE)\nadd_library(gtest_main INTERFACE)\n",
+        encoding="utf-8",
+    )
+    build = tmp_path / "build"
+    result = subprocess.run(
+        ["cmake", "-S", str(_WINDOWS_E2E.parent), "-B", str(build),
+         f"-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST={gtest}",
+         "-DODBC_E2E_CONCURRENT=ON"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    result = subprocess.run(
+        ["ctest", "--show-only=json-v1", "-C", "Debug"], cwd=build,
+        capture_output=True, text=True, check=True,
+    )
+    tests = {
+        test["name"]: {prop["name"]: prop["value"] for prop in test["properties"]}
+        for test in json.loads(result.stdout)["tests"]
+    }
+    assert "escape_sequence_test_mt" in tests
+    for name, props in tests.items():
+        base = name.removesuffix("_mt")
+        if name.endswith("_mt") and base not in tests:
+            assert "mt_weekly" in props["LABELS"]
+        else:
+            assert props["RESOURCE_LOCK"] == [base]
+        assert props.get("RUN_SERIAL", False) == (base == "col_attribute_test")
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("pwsh", "ctest")),
+    reason="needs PowerShell and CTest",
+)
+@pytest.mark.parametrize("test_jobs", [1, 2, 4])
+def test_windows_ctest_workers_preserve_isolation_retries_and_results(tmp_path, test_jobs):
+    build = tmp_path / "build"
+    build.mkdir()
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import json, os, sys, time\n"
+        "from pathlib import Path\n"
+        "name = sys.argv[1]\n"
+        "target = os.environ['ODBC_TEST_TARGET']\n"
+        "path = Path(f'{target}-{name}.json')\n"
+        "failed = Path(f'{target}-{name}-failed.json')\n"
+        "retry = name == 'retry' and not failed.exists()\n"
+        "if retry: path = failed\n"
+        "start = time.monotonic()\n"
+        "time.sleep(0.3)\n"
+        "path.write_text(json.dumps(dict(start=start, end=time.monotonic(),\n"
+        "    target=target, driver=os.environ['ODBC_TEST_DRIVER'],\n"
+        "    dll=os.environ.get('MSSQL_ODBC_DLL', ''),\n"
+        "    threads=os.environ['MSSQL_ODBC_MT_THREADS'])))\n"
+        "sys.exit(1 if retry else 0)\n",
+        encoding="utf-8",
+    )
+    names = ("one", "one_mt", "two", "exclusive", "retry")
+    (build / "CTestTestfile.cmake").write_text(
+        "\n".join(
+            f'add_test({name} "{Path(sys.executable).as_posix()}" '
+            f'"{worker.as_posix()}" {name})'
+            for name in names
+        ) + '\nset_tests_properties(one one_mt PROPERTIES RESOURCE_LOCK one)\n'
+        'set_tests_properties(exclusive PROPERTIES RUN_SERIAL TRUE)\n',
+        encoding="utf-8",
+    )
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:RUNNER, [ref]$null, [ref]$null)
+foreach ($name in @('Invoke-CtestRun', 'Assert-TestsExecuted')) {
+    $function = $ast.Find({ param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $n.Name -eq $name
+    }, $true)
+    . ([scriptblock]::Create($function.Extent.Text))
+}
+$ScriptDir = $env:FIXTURE
+$TestJobs = [int]$env:TEST_JOBS
+$Retries = 1
+$FilterTests = ''
+$ExcludeTests = ''
+$script:MtStress = $false
+$env:ODBC_TEST_TARGET = 'outer'
+$env:ODBC_TEST_DRIVER = 'outer'
+$env:MSSQL_ODBC_DLL = 'outer'
+$env:MSSQL_ODBC_MT_THREADS = '8'
+foreach ($leg in @('mssql-odbc', 'msodbcsql')) {
+    $dll = if ($leg -eq 'mssql-odbc') { 'fixture.dll' } else { '' }
+    $rc = Invoke-CtestRun $leg "junit-$leg.xml" "$leg driver" $dll @{ MSSQL_ODBC_MT_THREADS = '2' }
+    if ($rc -ne 0) { throw "CTest failed: $rc" }
+    Assert-TestsExecuted "$ScriptDir\build\junit-$leg.xml" $leg
+    if ($env:ODBC_TEST_TARGET -ne 'outer' -or $env:ODBC_TEST_DRIVER -ne 'outer' -or
+        $env:MSSQL_ODBC_DLL -ne 'outer' -or $env:MSSQL_ODBC_MT_THREADS -ne '8') {
+        throw 'Leg environment was not restored'
+    }
+}
+"""
+    env = {**os.environ, "RUNNER": str(_WINDOWS_E2E), "FIXTURE": str(tmp_path),
+           "TEST_JOBS": str(test_jobs), "CTEST_PARALLEL_LEVEL": "64"}
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command], env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    legs = {}
+    for leg in ("mssql-odbc", "msodbcsql"):
+        assert f"{leg} leg executed 5 test(s)" in result.stdout
+        assert (build / f"junit-{leg}.xml").is_file()
+        records = {
+            name: json.loads((build / f"{leg}-{name}.json").read_text(encoding="utf-8"))
+            for name in names
+        }
+        records["retry-failed"] = json.loads(
+            (build / f"{leg}-retry-failed.json").read_text(encoding="utf-8")
+        )
+        legs[leg] = records
+        for record in records.values():
+            assert record["driver"] == f"{leg} driver"
+            assert record["dll"] == ("fixture.dll" if leg == "mssql-odbc" else "")
+            assert record["threads"] == "2"
+
+        def overlap(a, b):
+            return a["start"] < b["end"] and b["start"] < a["end"]
+
+        assert not overlap(records["one"], records["one_mt"])
+        assert not any(
+            overlap(records["exclusive"], record)
+            for name, record in records.items() if name != "exclusive"
+        )
+        events = sorted(
+            (record[key], delta) for record in records.values()
+            for key, delta in (("start", 1), ("end", -1))
+        )
+        active = peak = 0
+        for _, delta in events:
+            active += delta
+            peak = max(peak, active)
+        assert peak <= test_jobs
+        if test_jobs > 1:
+            assert peak > 1
+    assert max(record["end"] for record in legs["mssql-odbc"].values()) <= min(
+        record["start"] for record in legs["msodbcsql"].values()
+    )
 
 
 def _require_windows_cpp_toolchain():
@@ -363,7 +604,7 @@ function Get-MsodbcsqlDriverPath { return "$PSScriptRoot\reference.dll" }
 $source = [IO.File]::ReadAllText($env:RUNNER).Insert($main.Extent.StartOffset, $mocks + "`n")
 $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
 [IO.File]::WriteAllText($runner, $source)
-& $runner -SkipBuild -MtProfile weekly -CompareWithMsodbcsql -FilterTests $env:FIXTURE_FILTER
+& $runner -SkipBuild -MtProfile weekly -CompareWithMsodbcsql -TestJobs 2 -FilterTests $env:FIXTURE_FILTER
 """
     (consumer / "reference.dll").write_bytes(b"reference")
     dumps = consumer / "build" / "mt-dumps"
@@ -403,6 +644,8 @@ $runner = Join-Path $env:CONSUMER 'run_e2e.ps1'
         (["-SkipBuild", "-Coverage"], "-SkipBuild cannot be combined"),
         (["-SkipBuild", "-Release"], "-SkipBuild cannot be combined with -Release"),
         (["-BuildJobs", "0"], "BuildJobs"),
+        (["-TestJobs", "0"], "TestJobs"),
+        (["-TestJobs", "65"], "TestJobs"),
     ],
 )
 def test_windows_e2e_rejects_incompatible_build_options(args, error):
@@ -747,19 +990,254 @@ def test_macos_docker_condition_preserves_other_callers():
     template = load_template("macos-docker-steps.yml")
     condition = next(p for p in template["parameters"] if p["name"] == "condition")
     assert condition == {"name": "condition", "type": "string", "default": "succeeded()"}
+    start_colima = "${{ if eq(parameters.startColima, true) }}"
+    steps = []
     for step in template["steps"]:
+        steps.extend(step.get(start_colima, [step]))
+    assert any("start-colima-macos.sh" in step.get("script", "") for step in steps)
+    for step in steps:
         assert step["condition"] == "${{ parameters.condition }}"
         assert not step.get("continueOnError", False)
 
     sql_steps = load_template("sql-setup-template.yml")["steps"]
-    macos = next(
-        step["${{ if eq(parameters.buildTarget, 'MacOS') }}"]
-        for step in sql_steps if "${{ if eq(parameters.buildTarget, 'MacOS') }}" in step
+    foreground = (
+        "${{ if and(eq(parameters.buildTarget, 'MacOS'), "
+        "eq(parameters.startMacOSSqlInBackground, false)) }}"
     )
+    macos = next(step[foreground] for step in sql_steps if foreground in step)
     docker = next(step for step in macos if step.get("template") == "macos-docker-steps.yml")
     assert "condition" not in docker.get("parameters", {})
     sql = next(step for step in macos if "start-sql-server-macos.sh" in step.get("script", ""))
     assert sql.get("condition", "succeeded()") == "succeeded()"
+
+
+def test_macos_sql_setup_can_start_in_the_background():
+    template = load_template("sql-setup-template.yml")
+    parameter = next(
+        p for p in template["parameters"] if p["name"] == "startMacOSSqlInBackground"
+    )
+    assert parameter == {
+        "name": "startMacOSSqlInBackground", "type": "boolean", "default": False,
+    }
+    background = (
+        "${{ if and(eq(parameters.buildTarget, 'MacOS'), "
+        "eq(parameters.startMacOSSqlInBackground, true)) }}"
+    )
+    steps = next(step[background] for step in template["steps"] if background in step)
+    docker, start = steps
+    assert docker == {
+        "template": "macos-docker-steps.yml", "parameters": {"startColima": False},
+    }
+    script = start["script"]
+    assert script.startswith(
+        'bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/macos-sql"'
+    )
+    colima = script.index("start-colima-macos.sh &&")
+    assert script.index('PATH="$TOOLCHAIN_DIR/bin:$PATH" bash .pipeline/scripts/'
+                        "start-sql-server-macos.sh") > colima
+    assert start["env"] == {
+        "TOOLCHAIN_DIR": "$(Agent.TempDirectory)/docker-toolchain",
+        "SQL_PASSWORD": "$(SQL_PASSWORD)",
+    }
+    assert start.get("condition", "succeeded()") == "succeeded()"
+
+
+def _background_step(tmp_path, *args, timeout=30):
+    script = tmp_path / "background-step.sh"
+    if not script.exists():
+        shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "background-step.sh", script)
+    return subprocess.run(
+        [_BASH, script.name, *args], cwd=tmp_path, capture_output=True, text=True,
+        timeout=timeout,
+    )
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("code", [0, 3])
+def test_background_step_replays_output_and_exit_code(tmp_path, code):
+    started = _background_step(
+        tmp_path, "start", "state", "bash", "-c",
+        f'echo "##vso[task.prependpath]/opt/tool"; echo "arg:$0"; exit {code}', "x y",
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    assert "Started in the background" in started.stdout
+    joined = _background_step(tmp_path, "wait", "state", "20")
+    assert joined.returncode == code, joined.stdout + joined.stderr
+    lines = joined.stdout.splitlines()
+    assert lines[:2] == ["##vso[task.prependpath]/opt/tool", "arg:x y"]
+    assert re.fullmatch(
+        r"The background command ran for \d+s; this step waited \d+s\.", lines[-1]
+    )
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_background_step_timeout_counts_from_start(tmp_path, ignore_term):
+    trap = "trap '' TERM; " if ignore_term else ""
+    started = _background_step(
+        tmp_path, "start", "state", "bash", "-c",
+        f'bash -c "{trap}sleep 6; echo escaped > escaped" & wait',
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    joined = _background_step(tmp_path, "wait", "state", "1")
+    assert joined.returncode == 1
+    assert "did not finish within 1s of starting" in joined.stdout
+    assert "Could not stop background process group" not in joined.stdout
+    time.sleep(5)
+    assert not (tmp_path / "escaped").exists()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_timeout_stops_nested_run_bounded(tmp_path):
+    shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
+                    tmp_path / "run-bounded.sh")
+    started = _background_step(
+        tmp_path, "start", "state", "bash", "-c",
+        "set -euo pipefail; . ./run-bounded.sh; run_bounded 60 bash -c "
+        "'trap \"\" TERM; echo $$ > child-pid.tmp; mv child-pid.tmp child-pid; "
+        "sleep 30; echo escaped > escaped'",
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    pid_file = tmp_path / "child-pid"
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert pid_file.exists()
+    child_pid = pid_file.read_text(encoding="utf-8").strip()
+    assert child_pid.isdecimal()
+    joined = _background_step(tmp_path, "wait", "state", "1")
+    probe = subprocess.run(
+        [_BASH, "-c", 'kill -0 "$1" 2>/dev/null', "_", child_pid],
+        capture_output=True, text=True, timeout=10,
+    )
+    if probe.returncode == 0:
+        cleanup = subprocess.run(
+            [_BASH, "-c", 'kill -KILL -- "-$1"', "_", child_pid],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert cleanup.returncode == 0, cleanup.stderr
+    assert joined.returncode == 1
+    assert "did not finish within 1s of starting" in joined.stdout
+    assert probe.returncode != 0, "Nested bounded process survived the timeout"
+    assert not (tmp_path / "escaped").exists()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("exit_code", [0, 7])
+@pytest.mark.parametrize("prior_job", [False, True])
+def test_run_bounded_preserves_exit_code_and_term_trap(tmp_path, exit_code, prior_job):
+    shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
+                    tmp_path / "run-bounded.sh")
+    command = (
+        "set -euo pipefail; "
+        + ('true & wait "$!"; ' if prior_job else "")
+        + ". ./run-bounded.sh; trap 'echo prior-trap' TERM; "
+        f"if run_bounded 10 bash -c 'exit {exit_code}'; then rc=0; else rc=$?; fi; "
+        'kill -TERM "$$"; exit "$rc"'
+    )
+    result = subprocess.run(
+        [_BASH, "-c", command], cwd=tmp_path, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == exit_code, result.stdout + result.stderr
+    assert "prior-trap" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_run_bounded_still_returns_timeout_status(tmp_path):
+    shutil.copyfile(_ROOT / ".pipeline" / "scripts" / "run-bounded.sh",
+                    tmp_path / "run-bounded.sh")
+    command = (
+        "set -euo pipefail; . ./run-bounded.sh; trap 'echo prior-trap' TERM; "
+        "if run_bounded 1 sleep 30; then exit 1; else rc=$?; fi; "
+        'kill -TERM "$$"; run_bounded 10 true || exit 1; exit "$rc"'
+    )
+    result = subprocess.run(
+        [_BASH, "-c", command], cwd=tmp_path, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert "prior-trap" in result.stdout.splitlines()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_rejects_late_completion_before_wait(tmp_path):
+    started = _background_step(tmp_path, "start", "state", "bash", "-c", "echo finished")
+    assert started.returncode == 0, started.stdout + started.stderr
+    joined = _background_step(tmp_path, "wait", "state", "20")
+    assert joined.returncode == 0, joined.stdout + joined.stderr
+    _, finished = (tmp_path / "state" / "status").read_text(encoding="utf-8").split()
+    (tmp_path / "state" / "started").write_text(str(int(finished) - 2), encoding="utf-8")
+    joined = _background_step(tmp_path, "wait", "state", "1")
+    assert joined.returncode == 1
+    assert "did not finish within 1s of starting" in joined.stdout
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize(
+    "args",
+    [(), ("start",), ("start", "state"), ("wait", "state"), ("wait", "state", "x"),
+     ("join", "state", "1")],
+)
+def test_background_step_rejects_bad_usage(tmp_path, args):
+    result = _background_step(tmp_path, *args)
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_wait_requires_a_started_command(tmp_path):
+    result = _background_step(tmp_path, "wait", "missing", "5")
+    assert result.returncode == 1
+    assert "No background command was started in missing" in result.stdout
+
+
+def test_build_template_test_overlap_parameters():
+    template = load_template("build-template.yml")
+    params = {p["name"]: p for p in template["parameters"]}
+    assert params["prebuildTests"] == {
+        "name": "prebuildTests", "type": "boolean", "default": False,
+    }
+    assert params["beforeTestSteps"] == {
+        "name": "beforeTestSteps", "type": "stepList", "default": [],
+    }
+    assert params["backgroundCoverageReport"] == {
+        "name": "backgroundCoverageReport", "type": "boolean", "default": False,
+    }
+    steps = next(
+        step["${{ if eq(parameters.enableTests, true) }}"] for step in template["steps"]
+        if isinstance(step, dict) and "${{ if eq(parameters.enableTests, true) }}" in step
+    )
+    keys = [
+        step if isinstance(step, str) else next(iter(step)) if len(step) == 1 else None
+        for step in steps
+    ]
+    prebuild_key = "${{ if eq(parameters.prebuildTests, true) }}"
+    prebuild = steps[keys.index(prebuild_key)][prebuild_key][0]
+    assert prebuild["script"] == (
+        "cargo llvm-cov nextest -E 'none()' --no-tests=pass --frozen --no-report "
+        "--all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd "
+        "--profile ci"
+    )
+    assert prebuild["condition"] == _PR
+    run = next(
+        step for step in steps if isinstance(step, dict)
+        and step.get("displayName") == "Run tests (mssql-tds and mssqlodbc packages)"
+    )
+    before = keys.index("${{ parameters.beforeTestSteps }}")
+    assert keys.index(prebuild_key) < before < steps.index(run)
+    assert "--no-clean" not in run["script"]
+
+    foreground = steps[keys.index("${{ if eq(parameters.backgroundCoverageReport, false) }}")]
+    foreground = next(iter(foreground.values()))
+    assert [step.get("task") for step in foreground] == [None, "PublishPipelineArtifact@1"]
+    report = foreground[0]["script"]
+    background = steps[keys.index("${{ if eq(parameters.backgroundCoverageReport, true) }}")]
+    (start,) = next(iter(background.values()))
+    assert start["script"] == (
+        'bash .pipeline/scripts/background-step.sh start '
+        '"$(Agent.TempDirectory)/rust-cobertura" ' + report
+    )
+    assert start["condition"] == foreground[0]["condition"]
+    assert start["workingDirectory"] == "$(Build.SourcesDirectory)"
 
 
 def test_mssql_python_macos_readiness_gates_provisioning():
@@ -1262,13 +1740,17 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
     assert job["pool"]["vmImage"] == "macOS-latest"
     steps = job["steps"]
     sql = next(step for step in steps if step.get("template") == "sql-setup-template.yml")
-    assert sql["parameters"]["buildTarget"] == "MacOS"
-    verify = next(
-        step for step in steps
-        if step.get("displayName") == "Verify macOS SQL Server before tests"
-    )
+    assert sql["parameters"] == {"buildTarget": "MacOS", "startMacOSSqlInBackground": True}
     rust = next(step for step in steps if step.get("template") == "build-template.yml")
     assert rust["parameters"].get("enableTests", True) is True
+    assert rust["parameters"]["prebuildTests"] is True
+    assert rust["parameters"]["backgroundCoverageReport"] is True
+    join_sql, verify = rust["parameters"]["beforeTestSteps"]
+    assert join_sql["script"] == (
+        'bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/macos-sql" 2400'
+    )
+    assert join_sql["timeoutInMinutes"] * 60 > 2400
+    assert verify["displayName"] == "Verify macOS SQL Server before tests"
     install = next(
         step for step in steps
         if step.get("displayName") == "Install ODBC C++ e2e dependencies (macOS)"
@@ -1281,8 +1763,33 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
         step for step in steps
         if step.get("displayName") == "Publish ODBC e2e test results (macOS)"
     )
-    order = [steps.index(step) for step in (sql, verify, rust, install, run, publish)]
+    join_report = next(
+        step for step in steps
+        if step.get("displayName") == "Wait for Cobertura coverage report (mssql-tds and mssqlodbc)"
+    )
+    coverage = next(
+        step for step in steps
+        if step.get("displayName") == "Publish Cobertura coverage artifact"
+    )
+    order = [steps.index(step) for step in (sql, rust, install, run, publish, join_report,
+                                            coverage)]
     assert order == sorted(order)
+    assert join_report["script"] == (
+        "set -euo pipefail\n"
+        "bash .pipeline/scripts/background-step.sh wait "
+        '"$(Agent.TempDirectory)/rust-cobertura" 2400\n'
+        'echo "##vso[task.setvariable variable=rustCoverageReady]true"\n'
+    )
+    assert join_report["condition"] == _PR.replace("succeeded()", "succeededOrFailed()")
+    assert coverage["condition"] == (
+        "and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), "
+        "eq(variables['rustCoverageReady'], 'true'))"
+    )
+    assert coverage["task"] == "PublishPipelineArtifact@1"
+    assert coverage["inputs"] == {
+        "targetPath": "$(Build.SourcesDirectory)/target/cobertura.xml",
+        "artifactName": "CoberturaCoverageRust_MacOS",
+    }
     for step in (install, run):
         assert step["condition"] == _PR
         assert "set -euo pipefail" in step["script"]

@@ -17,9 +17,12 @@
 #                      [-CompareWithMsodbcsql] [-MsodbcsqlDll PATH]
 #                      [-FilterTests REGEX] [-MtProfile pr|weekly]
 #                      [-MtDumpDir PATH]
-#                      [-BuildJobs N] [-BuildOnly -OutDir PATH | -SkipBuild]
+#                      [-BuildJobs N] [-TestJobs N]
+#                      [-BuildOnly -OutDir PATH | -SkipBuild]
 #
 # -BuildJobs bounds parallel C++ build processes (default: 1).
+# -TestJobs bounds parallel CTest entries per driver leg (default: 1).
+# The driver legs remain sequential; CTest enforces shared-resource exclusions.
 # -BuildOnly -OutDir PATH stages a relocatable build/ drop without running tests
 # or registering drivers. Download its contents into this directory and run
 # -SkipBuild to reuse the driver and tests without Cargo or a C++ compiler.
@@ -95,6 +98,8 @@ param(
     [string]$MtDumpDir = '',
     [ValidateRange(1, 64)]
     [int]$BuildJobs = 1,
+    [ValidateRange(1, 64)]
+    [int]$TestJobs = 1,
     [switch]$BuildOnly,
     [string]$OutDir = '',
     [switch]$SkipBuild
@@ -445,7 +450,8 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         Write-Host "Leg environment: $(($LegEnv.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')"
     }
     try {
-        $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
+        $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--parallel', "$TestJobs",
+                       '--output-junit', $JunitName)
         if ($script:MtStress) {
             # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
             # this only bounds an entry whose many phases all progress slowly.
