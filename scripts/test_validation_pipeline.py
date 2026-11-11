@@ -868,7 +868,7 @@ def test_windows_image_version_override_is_limited_to_public_pr839():
         "name": "${{ parameters.poolName }}",
         "demands": [
             "imageOverride -equals RUST-W22-SQL25",
-            {gate: ["ImageVersionOverride -equals 20.0.0"]},
+            {gate: ["ImageVersionOverride -equals 21.0.0"]},
         ],
     }
     assert (
