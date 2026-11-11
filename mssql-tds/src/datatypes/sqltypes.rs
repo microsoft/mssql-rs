@@ -177,6 +177,16 @@ const MAX_FIXED_TYPE_INFO_LEN: usize = 4;
 const MAX_FIXED_VALUE_LEN: usize = 17;
 const MAX_FIXED_INLINE_LEN: usize = MAX_FIXED_TYPE_INFO_LEN + 1 + MAX_FIXED_VALUE_LEN;
 
+/// What [`SqlType::write_fixed_value`] wrote.
+enum FixedValue {
+    /// Not a fixed-size type, or an encoding the async path rejects (a time
+    /// scale above 7); nothing usable was written.
+    Ineligible,
+    Null,
+    /// The value's length in bytes.
+    Bytes(usize),
+}
+
 /// An RPC parameter `TYPE_INFO` and value that the synchronous RPC fast paths
 /// write without awaiting. Produced only by [`SqlType::rpc_inline`] for values
 /// whose async serialization cannot fail.
@@ -966,14 +976,15 @@ impl SqlType {
         let mut bytes = [0u8; MAX_FIXED_INLINE_LEN];
         bytes[..MAX_FIXED_TYPE_INFO_LEN].copy_from_slice(&type_info);
         let value_at = type_info_len + 1;
-        let len = match self.write_fixed_value(&mut bytes[value_at..])? {
-            Some(value_len) => {
-                bytes[type_info_len] = value_len as u8;
-                value_at + value_len
-            }
-            None => {
+        let len = match self.write_fixed_value(&mut bytes[value_at..]) {
+            FixedValue::Ineligible => return None,
+            FixedValue::Null => {
                 bytes[type_info_len] = NULL_LENGTH;
                 value_at
+            }
+            FixedValue::Bytes(value_len) => {
+                bytes[type_info_len] = value_len as u8;
+                value_at + value_len
             }
         };
         Some(RpcInlineValue::Fixed {
@@ -983,10 +994,8 @@ impl SqlType {
     }
 
     /// Writes a fixed-size value as `TdsValueSerializer` does for its RPC
-    /// context, little-endian, and returns its length; `Some(None)` for NULL.
-    /// `None` when the type is not fixed-size or its encoding can fail (a time
-    /// scale above 7). `out` may be written past the returned length.
-    fn write_fixed_value(&self, out: &mut [u8]) -> Option<Option<usize>> {
+    /// context, little-endian. `out` may be written past the returned length.
+    fn write_fixed_value(&self, out: &mut [u8]) -> FixedValue {
         fn le<const N: usize>(out: &mut [u8], bytes: [u8; N]) -> usize {
             out[..N].copy_from_slice(&bytes);
             N
@@ -1041,24 +1050,37 @@ impl SqlType {
             }),
             SqlType::Uuid(value) => value.map(|value| le(out, value.to_bytes_le())),
             SqlType::Time(value) => match value {
-                Some(value) => Some(time_then_days(out, value, None)?),
+                Some(value) => {
+                    let Some(len) = time_then_days(out, value, None) else {
+                        return FixedValue::Ineligible;
+                    };
+                    Some(len)
+                }
                 None => None,
             },
             SqlType::DateTime2(value) => match value {
-                Some(value) => Some(time_then_days(out, &value.time, Some(value.days))?),
+                Some(value) => {
+                    let Some(len) = time_then_days(out, &value.time, Some(value.days)) else {
+                        return FixedValue::Ineligible;
+                    };
+                    Some(len)
+                }
                 None => None,
             },
             SqlType::DateTimeOffset(value) => match value {
                 Some(value) => {
-                    let len =
-                        time_then_days(out, &value.datetime2.time, Some(value.datetime2.days))?;
+                    let Some(len) =
+                        time_then_days(out, &value.datetime2.time, Some(value.datetime2.days))
+                    else {
+                        return FixedValue::Ineligible;
+                    };
                     Some(le(&mut out[len..], value.offset.to_le_bytes()) + len)
                 }
                 None => None,
             },
-            _ => return None,
+            _ => return FixedValue::Ineligible,
         };
-        Some(len)
+        len.map_or(FixedValue::Null, FixedValue::Bytes)
     }
     /// `TYPE_INFO` of a fixed-size type and its length, or `None` for any
     /// other type. The single source for both `write_type_info` and
@@ -1171,7 +1193,11 @@ impl SqlType {
             | SqlType::Date(_)
             | SqlType::Time(_)
             | SqlType::DateTime2(_)
-            | SqlType::DateTimeOffset(_) => unreachable!("written from fixed_type_info"),
+            | SqlType::DateTimeOffset(_) => {
+                return Err(Error::ProtocolError(
+                    "fixed-size type has no TYPE_INFO".to_string(),
+                ));
+            }
             // NVarchar: type byte + param_len(u16) + collation(5 bytes)
             SqlType::NVarchar(_, param_len) => {
                 let param_len = nvarchar_inline_max_bytes(*param_len).unwrap_or(MAX_U16_LENGTH);

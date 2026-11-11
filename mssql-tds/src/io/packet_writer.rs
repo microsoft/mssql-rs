@@ -413,6 +413,16 @@ impl<'a> PacketWriter<'a> {
         let _ = std::io::Write::write_all(&mut self.payload_cursor, bytes);
     }
 
+    /// Discards what [`Self::write_bytes_within_packet`] appended since
+    /// `position`. Those writes cannot flush, so the buffer is the only state
+    /// they changed.
+    pub(crate) fn rewind_within_packet(&mut self, position: i32) {
+        debug_assert!((0..=self.position()).contains(&position));
+        let at = Self::PACKET_HEADER_SIZE + position as usize;
+        self.payload_cursor.get_mut().truncate(at);
+        self.payload_cursor.set_position(at as u64);
+    }
+
     pub(crate) async fn write_fixed_bytes(&mut self, bytes: &[u8]) -> TdsResult<()> {
         // Keep exact-boundary sends on the ordinary overflow/cancellation path.
         if self.has_space(bytes.len() + 1) {

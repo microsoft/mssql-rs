@@ -321,7 +321,9 @@ impl<'a> SqlRpc<'a> {
     /// Below the boundary the async path cannot flush, so it changes only
     /// buffer bytes. The bound is strict because an exact fill is flushed at
     /// different points by different async primitives, which decides whether
-    /// `finalize` sends a header-only EOM.
+    /// `finalize` sends a header-only EOM. Each parameter is encoded once and
+    /// written while checking that bound; a parameter that is ineligible or
+    /// would reach the boundary rewinds the whole command.
     pub(crate) fn try_write_batch_command_within_packet(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -341,25 +343,24 @@ impl<'a> SqlRpc<'a> {
         {
             return Ok(false);
         }
-        let mut length = 1 + PROC_ID_LEN;
-        for parameter in parameters {
-            let Some(parameter_length) = parameter.positional_inline_len() else {
-                return Ok(false);
-            };
-            length += parameter_length;
-        }
-        if !packet_writer.has_space(length + 1) {
+        if !packet_writer.has_space(1 + PROC_ID_LEN + 1) {
             return Ok(false);
         }
-        self.validate_parameters()?;
-
         let start = packet_writer.position();
         packet_writer.write_bytes_within_packet(&[RPC_BATCH_DELIMITER]);
         packet_writer.write_bytes_within_packet(&self.proc_id_bytes(proc));
         for parameter in parameters {
-            parameter.write_positional_inline(packet_writer, self.db_collation);
+            if !parameter.try_write_positional_within_packet(packet_writer, self.db_collation) {
+                packet_writer.rewind_within_packet(start);
+                return Ok(false);
+            }
         }
-        debug_assert_eq!((packet_writer.position() - start) as usize, length);
+        // Run only for commands that fit, as before; ineligible ones are
+        // validated by the async path they fall back to.
+        if let Err(error) = self.validate_parameters() {
+            packet_writer.rewind_within_packet(start);
+            return Err(error);
+        }
         debug_assert!(packet_writer.has_space(1));
         Ok(true)
     }
