@@ -7,7 +7,7 @@
 //! execution paths stay in lockstep. None of these helpers hold a lock across
 //! network I/O.
 
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::MutexGuard;
@@ -520,8 +520,14 @@ pub(super) fn try_claim_idle_client(
 /// `BatchErrorMode::Continue` a statement error ends only its own row set:
 /// it is deferred the same way, but the batch stays reserved, so the call
 /// that reports it keeps the cursor for `SQLMoreResults` (msodbcsql answers
-/// the next fetch with the error, then `SQL_NO_DATA`). A failure that does
-/// *not* end the row set (a raw transport error) is left unposted entirely:
+/// the next fetch with the error, then `SQL_NO_DATA`). Inside a procedure that
+/// row set ends on DONEINPROC, and the procedure's RETURNSTATUS and DONEPROC
+/// after it can still end the batch: [`TdsClient::complete_failed_statement`]
+/// reads them first, and a finished batch is released as above. That is one
+/// call earlier than msodbcsql, which leaves the ERROR token unread until the
+/// next fetch, as it already is for an error that aborts the batch (parity
+/// deviation 44). A failure that does *not* end the row set (a raw transport
+/// error) is left unposted entirely:
 /// `release` is false in that case, so nothing about this statement's state
 /// changes, and the caller's very next real operation on this connection
 /// takes the normal, non-fast-path route and organically rediscovers and
@@ -608,18 +614,31 @@ pub(super) fn release_busy_if_row_exhausted(
     } else {
         None
     };
+    // After a failed row set that tail belongs to the failed statement, whose
+    // completion also accounts for the error flags it carries.
+    let failed_completion =
+        continued_error.then(|| dbc.runtime.block_on(client.complete_failed_statement()));
     let array_update = if completion_result.is_some() {
         super::execute::take_parameter_array_update(stmt, &mut client)
     } else {
         Ok(None)
     };
-    let batch_done = match &completion_result {
-        Some(Ok(done)) => *done,
+    let batch_done = match (&completion_result, &failed_completion) {
+        (Some(Ok(done)), _) => *done,
+        (_, Some(Ok(continues))) => !continues,
         _ => !client.has_open_batch(),
     };
     let mut read_error = peek_result.err();
     if let Some(Err(error)) = completion_result {
         read_error = Some(error);
+    }
+    // Reading the rest of the failed statement failed and ended the batch. That
+    // failure decides whether the connection survives, so it is the one kept,
+    // as when collecting the statement's errors fails (`abandon_failed_statement`).
+    if let Some(Err(error)) = failed_completion
+        && let Some(statement_error) = read_error.replace(error)
+    {
+        warn!(%statement_error, "Completing the failed statement failed; its error is superseded");
     }
     let cancelled = matches!(read_error, Some(TdsError::OperationCancelledError(_)));
     let release = cancelled || (result_set_exhausted && batch_done);
@@ -3335,6 +3354,7 @@ mod tests {
         let client = dbc.inner.lock().unwrap().wire.take_lease_for_test(h.stmt);
         let earlier = [SqlInfoMessage {
             diagnostic_ordinal: 0,
+            parameter_set: None,
             message: "row loop message".to_string(),
             state: 1,
             class: 10,

@@ -193,24 +193,30 @@ on the `master` branch.
   Mapped SQL Server messages use priority 0; unmapped messages use the
   severity fallback priorities 40136, 40146, or 40401. Do not infer exact
   driver resource IDs from SQLSTATE; unmeasured driver diagnostics retain
-  stable posting order.
+  stable posting order. A parameter array's server messages take their row
+  key from the 1-based parameter set the TDS client stamps on each ERROR and
+  INFO as it arrives (`parameter_set`), so they sort set by set before
+  priority.
 - Plain, unparameterized `SQLExecDirect` batches use statement-wise error
   continuation. An error result remains on the statement with the connection
   reserved, and `SQLMoreResults` continues to later statements. Prepared and
   parameterized execution paths retain their existing abort behavior. A
-  statement error is returned before its DONE, so call
+  statement error is returned before its DONE, and a row set's error inside a
+  procedure is returned from its DONEINPROC, so call
   `TdsClient::complete_failed_statement` before keeping the connection: a
   failed last statement must release it, as msodbcsql does.
 - A SQL Server error that ends a row set after a fetch delivered rows belongs
   to the next fetch, as in msodbcsql: the block fetch or read-ahead that finds
   it returns its rows and defers it in `pending_fetch_error`. While a
-  continued batch remains, keep the connection reserved and the cursor open, so
-  the next fetch reports the error, the one after returns `SQL_NO_DATA`, and
-  `SQLMoreResults` reaches the next statement. `SQLMoreResults` reports an
-  unread deferred error as the statement's error result (parity deviation
-  43). Treat only `SqlServerError` with an open batch as continuable
-  (`is_continued_statement_error`); a usage error can coincide with another
-  command's open batch.
+  continued batch remains, keep the connection reserved; once the batch is
+  over, release it then (parity deviation 44). Either way the cursor stays
+  open after a SQL Server error, so the next fetch reports the error, the one
+  after returns `SQL_NO_DATA`, and `SQLMoreResults` reaches the next statement.
+  Only a transport, protocol, or cancellation failure closes the cursor.
+  `SQLMoreResults` reports an unread deferred error as the statement's error
+  result (parity deviation 43). Treat only `SqlServerError` with an open batch
+  as continuable (`is_continued_statement_error`); a usage error can coincide
+  with another command's open batch.
 - Every ODBC entry point must clear the handle's diagnostic records at API
   entry by calling `free_errors(...)` after acquiring the handle lock, so a
   fresh call starts without stale diagnostics.

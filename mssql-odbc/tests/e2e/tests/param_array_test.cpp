@@ -2398,6 +2398,42 @@ ODBC_TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
 }
 
 // -------------------------------------------------------------------
+// A parameter array's diagnostics are ordered set by set, and by message
+// priority within a set: set 1's unmapped error comes before set 2's mapped
+// error and the message that follows it (measured on msodbcsql 18.07.0001).
+// -------------------------------------------------------------------
+ODBC_TEST_F(ParamArrayTest, DiagnosticsAreOrderedBySetBeforePriority) {
+    ExecDirect("CREATE TABLE #pa_order (id int PRIMARY KEY); INSERT INTO #pa_order VALUES (1)");
+    Prepare("DECLARE @v int = ?; IF @v = 1 RAISERROR ('unmapped failure', 16, 1); "
+            "ELSE INSERT INTO #pa_order VALUES (1)");
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    SQLUSMALLINT status[2] = {SQL_PARAM_UNUSED, SQL_PARAM_UNUSED};
+    SQLULEN processed = 0;
+    BindIntArray(values, indicators, 2, status, &processed);
+
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+    std::vector<SQLINTEGER> natives;
+    for (SQLSMALLINT record = 1;; ++record) {
+        SQLTCHAR state[6] = {};
+        SQLINTEGER native = 0;
+        SQLTCHAR message[512] = {};
+        SQLSMALLINT length = 0;
+        const SQLRETURN rc = SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, record, state, &native,
+                                           message, 512, &length);
+        if (rc == SQL_NO_DATA) {
+            break;
+        }
+        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        natives.push_back(native);
+    }
+    EXPECT_EQ((std::vector<SQLINTEGER>{50000, 2627, 3621}), natives);
+    EXPECT_EQ(2u, processed);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[0]);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+}
+
+// -------------------------------------------------------------------
 // 30. SQLMoreResults skips unread rows, and closing before the final result
 // abandons the rest of the batch without executing any parameter set twice.
 // Every set here completes before the close, so all three rows exist.

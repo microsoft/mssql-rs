@@ -3,6 +3,7 @@
 
 //! SQLSTATE constants and the SQL Server error-number → SQLSTATE map.
 
+use crate::api::odbc_types::{SQL_NO_ROW_NUMBER, SqlLen};
 use crate::error::diag::post_prefixed;
 use crate::error::{DiagRecord, HasDiagnostics, post_sql_error};
 use crate::handles::wire::ClaimError;
@@ -410,10 +411,10 @@ fn post_server_message(
     state: &mut impl HasDiagnostics,
     sql_state: [u8; 5],
     native_error: i32,
+    row_number: SqlLen,
     priority: u16,
     message: &str,
 ) {
-    let row_number = state.server_row_number();
     post_prefixed(
         state,
         sql_state,
@@ -424,6 +425,15 @@ fn post_server_message(
         record.row_number = row_number;
         record.priority = priority;
     }
+}
+
+/// msodbcsql's row key for a server message: the 1-based parameter set whose
+/// RPC raised it, so a parameter array's records sort set by set (measured on
+/// 18.07.0001).
+fn server_message_row(parameter_set: Option<usize>) -> SqlLen {
+    parameter_set.map_or(SQL_NO_ROW_NUMBER, |set| {
+        SqlLen::try_from(set).map_or(SqlLen::MAX, |set| set.saturating_add(1))
+    })
 }
 
 fn server_message_priority(number: u32, severity: i32) -> u16 {
@@ -472,17 +482,19 @@ fn post_server_diagnostics(
     ordered.sort_by_key(|(ordinal, _)| *ordinal);
 
     for (_, diagnostic) in ordered {
-        let (number, severity, message, forced) = match diagnostic {
+        let (number, severity, message, parameter_set, forced) = match diagnostic {
             ServerDiagnosticRef::Error(error) => (
                 error.number,
                 error.class,
                 error.message.as_str(),
+                error.parameter_set,
                 forced_error_state,
             ),
             ServerDiagnosticRef::Info(message) => (
                 message.number,
                 message.class,
                 message.message.as_str(),
+                message.parameter_set,
                 None,
             ),
         };
@@ -494,6 +506,7 @@ fn post_server_diagnostics(
             state,
             sqlstate,
             native,
+            server_message_row(parameter_set),
             server_message_priority(number, severity),
             message,
         );
@@ -826,6 +839,7 @@ mod tests {
     fn sql_error(number: u32, message: &str) -> SqlErrorInfo {
         SqlErrorInfo {
             diagnostic_ordinal: 0,
+            parameter_set: None,
             message: message.into(),
             state: 1,
             class: 14,
@@ -961,6 +975,7 @@ mod tests {
             vec![sql_error(18456, "Login failed.")],
             vec![SqlInfoMessage {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -985,6 +1000,7 @@ mod tests {
 
         let error = SqlErrorInfo {
             diagnostic_ordinal: 1,
+            parameter_set: None,
             message: "unmapped server error".into(),
             state: 1,
             class: 16,
@@ -995,6 +1011,7 @@ mod tests {
         };
         let info = SqlInfoMessage {
             diagnostic_ordinal: 0,
+            parameter_set: None,
             message: "truncated value".into(),
             state: 1,
             class: 10,
@@ -1024,6 +1041,7 @@ mod tests {
         error.diagnostic_ordinal = 1;
         let info = SqlInfoMessage {
             diagnostic_ordinal: 0,
+            parameter_set: None,
             message: "first warning".into(),
             state: 1,
             class: 10,
@@ -1043,6 +1061,51 @@ mod tests {
         assert_eq!(state.records[1].native_error, 207);
     }
 
+    /// A parameter array's server messages sort set by set, then by priority:
+    /// set 1's unmapped error stays ahead of set 2's mapped one, and each set's
+    /// message follows its error (msodbcsql 18.07.0001, executed and prepared).
+    #[test]
+    fn server_diagnostics_sort_by_parameter_set_before_priority() {
+        let message = |ordinal, set, number, class: i32| SqlInfoMessage {
+            diagnostic_ordinal: ordinal,
+            parameter_set: Some(set),
+            message: "message".into(),
+            state: 1,
+            class,
+            number,
+            server_name: None,
+            proc_name: None,
+            line_number: Some(1),
+        };
+        let error = |ordinal, set, number| SqlErrorInfo {
+            diagnostic_ordinal: ordinal,
+            parameter_set: Some(set),
+            class: 16,
+            ..sql_error(number, "failure")
+        };
+        let mut state = FakeState::default();
+
+        for errors in [vec![error(1, 0, 50000)], vec![error(2, 1, 2627)]] {
+            post_tds_error(
+                &mut state,
+                &TdsError::from_sql_errors(errors),
+                SQLSTATE_HY000,
+            );
+        }
+        post_tds_info_messages(
+            &mut state,
+            &[message(0, 0, 50001, 10), message(3, 1, 3621, 0)],
+        );
+        crate::error::sort_diagnostics(&mut state);
+
+        let order: Vec<_> = state
+            .records
+            .iter()
+            .map(|record| (record.row_number, record.native_error))
+            .collect();
+        assert_eq!(order, [(1, 50000), (1, 50001), (2, 2627), (2, 3621)]);
+    }
+
     #[test]
     fn post_tds_error_info_only_diagnostics_still_posts_primary_error() {
         // A SqlServerError that unexpectedly carries only INFO messages (no
@@ -1054,6 +1117,7 @@ mod tests {
             vec![],
             vec![SqlInfoMessage {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "info only".into(),
                 state: 1,
                 class: 10,
@@ -1171,6 +1235,7 @@ mod tests {
             vec![sql_error(911, "no such db"), sql_error(5701, "context")],
             vec![SqlInfoMessage {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -1220,6 +1285,7 @@ mod tests {
         let messages = vec![
             SqlInfoMessage {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "Changed database context to 'master'.".into(),
                 state: 1,
                 class: 10,
@@ -1230,6 +1296,7 @@ mod tests {
             },
             SqlInfoMessage {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "hello from PRINT".into(),
                 state: 1,
                 class: 0,

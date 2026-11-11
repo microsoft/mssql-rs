@@ -243,6 +243,47 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedLastStatementReleasesTheConnection,
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
 }
 
+// Inside sp_executesql a failed row set ends on DONEINPROC, and the
+// procedure's RETURNSTATUS and DONEPROC still end the batch. Once the error is
+// reported the connection is free and the cursor stays open, so the next fetch
+// returns SQL_NO_DATA. A row set failing before its first row fails
+// SQLExecDirect and leaves no cursor (msodbcsql 18.07.0001).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedProcedureRowSetReleasesTheConnection,
+                  odbc_concurrency::kAllModes) {
+    const SqlTString reuse = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    SQLHSTMT other = AllocStmt();
+    ASSERT_NE(nullptr, other);
+    SqlTString after_row = ODBCTestUtils::ToSqlTStr(
+        "EXEC sp_executesql N'SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n)';");
+    SQLINTEGER n = 0;
+    SQLINTEGER q = 0;
+    SQLLEN n_ind = 0;
+    SQLLEN q_ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &n, 0, &n_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &q, 0, &q_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(after_row.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1, n);
+    ASSERT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    ASSERT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLCloseCursor(other), SQL_HANDLE_STMT, other);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+
+    SqlTString first_row = ODBCTestUtils::ToSqlTStr(
+        "EXEC sp_executesql N'SELECT n, 1/(1-n) AS q FROM (VALUES(1),(2)) t(n)';");
+    ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(first_row.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // For diagnostics returned by one execution call, a mapped server warning
 // precedes the subsequent unmapped server error.
 ODBC_TEST_F_MODES(MoreResultsLiveTest, ServerDiagnosticsUseMsodbcsqlPriorityOrder,

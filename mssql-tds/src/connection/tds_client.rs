@@ -1375,6 +1375,7 @@ impl TdsClient {
         if let Some(batch) = self.prepared_batch.as_mut()
             && let Some(row) = batch.current.as_mut()
         {
+            error.parameter_set = Some(row.row_index);
             row.errors.push(error.clone());
         }
         error
@@ -2372,6 +2373,7 @@ impl TdsClient {
                         .drain_result_set_rows(Arc::new(metadata), &mut errors)
                         .await?
                     {
+                        self.file_under_parameter_set(&mut errors, info_count, current_index);
                         results.push(PreparedBatchRowResult {
                             row_index: current_index,
                             rows_affected,
@@ -2430,6 +2432,7 @@ impl TdsClient {
                     // only to say another command follows (:2413). So every DONE
                     // reaching here reports its set; the flag decides whether to
                     // expect another, never whether this one counts.
+                    self.file_under_parameter_set(&mut errors, info_count, current_index);
                     results.push(PreparedBatchRowResult {
                         row_index: current_index,
                         rows_affected,
@@ -2487,6 +2490,23 @@ impl TdsClient {
         };
         self.last_rows_affected = result.total_rows_affected().unwrap_or(-1);
         Ok(result)
+    }
+
+    /// Stamps the diagnostics a drained batch read for one parameter set with
+    /// that set, as the row-preserving reader does when each token arrives:
+    /// `errors`, and the messages captured from `first_message` on.
+    fn file_under_parameter_set(
+        &mut self,
+        errors: &mut [SqlErrorInfo],
+        first_message: usize,
+        parameter_set: usize,
+    ) {
+        for error in errors {
+            error.parameter_set = Some(parameter_set);
+        }
+        for message in self.info_messages.iter_mut().skip(first_message) {
+            message.parameter_set = Some(parameter_set);
+        }
     }
 
     /// Starts a parameterized `sp_executesql` whose MAX parameter values are
@@ -6524,22 +6544,41 @@ impl TdsClient {
     /// to the same completion. Nothing of the next statement is read: any other
     /// token, or a DONE carrying its own update count, is left for
     /// [`advance`](Self::advance) with the batch kept open. An error returned
-    /// from a row set's DONE needs nothing more.
+    /// from a row set comes after the row set's own DONE, so only the procedure
+    /// tail after a DONEINPROC is left to read.
     pub async fn complete_failed_statement(&mut self) -> TdsResult<bool> {
-        if !self.failed_statement_done_pending {
+        let in_procedure_tail = if self.failed_statement_done_pending {
+            false
+        } else if self.failed_row_set_ended_in_procedure() {
+            true
+        } else {
             return Ok(self.has_open_batch());
-        }
-        match self.complete_failed_statement_inner().await {
+        };
+        match self
+            .complete_failed_statement_inner(in_procedure_tail)
+            .await
+        {
             Err(error) => Err(self.end_walk_on_read_error(error)),
             ok => ok,
         }
     }
 
-    async fn complete_failed_statement_inner(&mut self) -> TdsResult<bool> {
+    /// Whether the error just returned came from a row set that ended on a
+    /// DONEINPROC: the error chain that DONEINPROC left open is still pending,
+    /// and the enclosing procedure's tail is unread.
+    fn failed_row_set_ended_in_procedure(&self) -> bool {
+        self.statement_error_completion_pending
+            && self.current_result_ended_with_done_in_proc
+            && self.has_open_batch()
+    }
+
+    async fn complete_failed_statement_inner(
+        &mut self,
+        mut in_procedure_tail: bool,
+    ) -> TdsResult<bool> {
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
-        let mut in_procedure_tail = false;
         loop {
             let token = self.next_response_token(&parser_context).await?;
             match token {
@@ -9275,12 +9314,13 @@ impl TdsClient {
         let mut message = SqlInfoMessage::from(token);
         message.diagnostic_ordinal = self.next_diagnostic_ordinal;
         self.next_diagnostic_ordinal = self.next_diagnostic_ordinal.saturating_add(1);
-        self.info_messages.push(message);
         if let Some(batch) = self.prepared_batch.as_mut()
             && let Some(row) = batch.current.as_mut()
         {
+            message.parameter_set = Some(row.row_index);
             row.has_info = true;
         }
+        self.info_messages.push(message);
     }
 
     /// Drops the previous request's output values together with the output
@@ -13472,6 +13512,195 @@ mod tests {
         assert!(!client.has_open_batch());
     }
 
+    /// The DONEINPROC that ends a statement failing inside a procedure.
+    fn failed_done_in_proc() -> Tokens {
+        Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::MORE | DoneStatus::ERROR,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        })
+    }
+
+    /// Executes `tokens` under `Continue`, positions on their first row set and
+    /// reads it into its error.
+    async fn failed_row_set_client(tokens: Vec<Tokens>) -> TdsClient {
+        let mut client = create_test_client_with_tokens(tokens);
+        assert_eq!(
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap(),
+            StatementResult::Rows
+        );
+        assert!(matches!(
+            client.next_row().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(client.has_open_batch());
+        client
+    }
+
+    /// A row set returns its error from the DONE that ends it, so inside a
+    /// procedure the DONEINPROC is read already and only the procedure's tail
+    /// is left. The order is SQL Server's for
+    /// `EXEC sp_executesql N'SELECT n, 1/(2-n) FROM t'`.
+    #[tokio::test]
+    async fn completing_a_failed_row_set_reads_its_procedure_tail() {
+        let mut client = failed_row_set_client(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+            failed_done_in_proc(),
+            return_status(8134),
+            done_proc_no_more(),
+        ])
+        .await;
+
+        assert!(!client.complete_failed_statement().await.unwrap());
+        assert!(!client.has_open_batch());
+        assert_eq!(client.get_return_status(), Some(8134));
+        assert!(!client.statement_error_completion_pending);
+        assert!(!client.complete_failed_statement().await.unwrap());
+    }
+
+    /// One error can flag the DONEPROC that closes the procedure as well; the
+    /// returned error accounts for it.
+    #[tokio::test]
+    async fn completing_a_failed_row_set_accepts_an_error_flagged_done_proc() {
+        let mut client = failed_row_set_client(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+            failed_done_in_proc(),
+            return_status(-6),
+            Tokens::DoneProc(DoneToken {
+                status: DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::None,
+                row_count: 0,
+            }),
+        ])
+        .await;
+
+        assert!(!client.complete_failed_statement().await.unwrap());
+        assert!(!client.has_open_batch());
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Whatever follows the procedure, or the failed statement inside it, is
+    /// left for `advance`. A SELECT failing in a T-SQL procedure gets a second,
+    /// counted DONEINPROC before RETURNSTATUS; msodbcsql 18.07.0001 stops there
+    /// too and keeps the connection busy until SQLMoreResults.
+    #[tokio::test]
+    async fn completing_a_failed_row_set_leaves_the_next_statement() {
+        let procedure_continues = Tokens::DoneProc(DoneToken {
+            status: DoneStatus::MORE,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        });
+        let counted_select = Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::MORE | DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 1,
+        });
+        let cases = [
+            (
+                vec![return_status(8134), procedure_continues],
+                vec![int_col_metadata(1), done_no_more()],
+                StatementResult::Rows,
+            ),
+            (
+                Vec::new(),
+                vec![int_col_metadata(1), done_in_proc_more()],
+                StatementResult::Rows,
+            ),
+            (
+                Vec::new(),
+                vec![counted_select, return_status(5), done_proc_no_more()],
+                StatementResult::End,
+            ),
+        ];
+        for (tail, next, expected) in cases {
+            let mut tokens = vec![
+                int_col_metadata(1),
+                Tokens::Error(error_token_with_severity(16)),
+                failed_done_in_proc(),
+            ];
+            tokens.extend(tail);
+            tokens.extend(next);
+            let mut client = failed_row_set_client(tokens).await;
+
+            assert!(client.complete_failed_statement().await.unwrap());
+            assert!(client.has_open_batch());
+            assert_eq!(client.advance().await.unwrap(), expected);
+        }
+    }
+
+    /// Outside a procedure a failed row set ends on a plain DONE, whose MORE
+    /// flag already tells whether the batch goes on: nothing more is read.
+    #[tokio::test]
+    async fn completing_a_failed_row_set_outside_a_procedure_reads_nothing() {
+        let mut client = failed_row_set_client(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::MORE | DoneStatus::ERROR,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            int_col_metadata(1),
+            done_no_more(),
+        ])
+        .await;
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+    }
+
+    /// A row set that ended cleanly on a DONEINPROC has no failed statement to
+    /// complete; its RPC tail is `complete_current_result`'s.
+    #[tokio::test]
+    async fn completing_after_a_clean_row_set_reads_nothing() {
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            done_in_proc_more(),
+            return_status(0),
+            done_proc_no_more(),
+        ]);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap();
+        assert!(client.next_row().await.unwrap().is_none());
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert_eq!(client.get_return_status(), None);
+        assert!(client.complete_current_result().await.unwrap());
+    }
+
+    /// A transport failure while reading a failed row set's procedure tail
+    /// cannot be resumed from: it closes the batch and retires the connection.
+    #[tokio::test]
+    async fn a_transport_failure_in_a_failed_row_sets_procedure_tail_closes_the_batch() {
+        let mut client = failed_row_set_client(vec![
+            int_col_metadata(1),
+            Tokens::Error(error_token_with_severity(16)),
+            failed_done_in_proc(),
+        ])
+        .await;
+
+        assert!(matches!(
+            client.complete_failed_statement().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(!client.statement_error_completion_pending);
+    }
+
     /// The same inside a row set: the errors collected there are dropped with
     /// the batch, and the batch does not stay open.
     #[tokio::test]
@@ -14428,6 +14657,7 @@ mod tests {
     fn skipped_errors_keep_a_prefix() {
         let error = |message: String| SqlErrorInfo {
             diagnostic_ordinal: 0,
+            parameter_set: None,
             message,
             state: 1,
             class: 16,
@@ -16738,6 +16968,7 @@ mod tests {
         // Stale message left over from an earlier command / login.
         client.extend_info_messages(vec![SqlInfoMessage {
             diagnostic_ordinal: 0,
+            parameter_set: None,
             message: "stale from previous command".to_string(),
             state: 1,
             class: 10,
@@ -20523,6 +20754,56 @@ mod tests {
         assert_eq!(result.rows[1].errors.len(), 1);
         assert_eq!(result.rows[1].errors[0].number, 2627);
         assert!(result.complete);
+    }
+
+    /// msodbcsql files a parameter array's diagnostics under the set whose RPC
+    /// raised them, so each ERROR and INFO carries the application's set index,
+    /// whether the batch is drained or read set by set.
+    #[tokio::test]
+    async fn prepared_batch_diagnostics_carry_their_parameter_set() {
+        let error = |number| {
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number,
+                state: 1,
+                severity: 16,
+                message: "failed".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            })
+        };
+        let tokens = || {
+            vec![
+                error(50000),
+                batch_done_proc(true, true),
+                error(2627),
+                info_token(3621, 0, "The statement has been terminated."),
+                batch_done_proc(false, true),
+            ]
+        };
+        let rows = || vec![Ok((3, Vec::new())), Ok((7, Vec::new()))];
+
+        let (mut drained, _) = create_capturing_client(tokens());
+        let statement_id = drained.register_prepared_handle_for_test(42);
+        let result = drained
+            .execute_sp_execute_batch_for_test(statement_id, rows())
+            .await
+            .unwrap();
+        let (mut preserved, _) = create_capturing_client(tokens());
+        let statement_id = preserved.register_prepared_handle_for_test(42);
+        let mut statement = PreparedStatement::materialized_for_test("q", statement_id);
+        let streamed = preserved
+            .begin_execute_prepared_batch(&mut statement, rows(), &mut None, ())
+            .await
+            .unwrap();
+
+        for (result, client) in [(result, &mut drained), (streamed, &mut preserved)] {
+            assert_eq!(result.rows[0].errors[0].parameter_set, Some(3));
+            assert_eq!(result.rows[1].errors[0].parameter_set, Some(7));
+            let messages = client.take_info_messages();
+            assert_eq!(messages[0].number, 3621);
+            assert_eq!(messages[0].parameter_set, Some(7));
+        }
     }
 
     #[tokio::test]

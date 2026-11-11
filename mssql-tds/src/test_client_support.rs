@@ -770,6 +770,25 @@ pub fn done_in_proc_more() -> ScriptedToken {
     }))
 }
 
+/// The `DONEINPROC` ending a statement that failed inside `EXEC` or
+/// `sp_executesql`; the procedure's RETURNSTATUS and DONEPROC still follow.
+pub fn done_in_proc_more_error() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneInProc(DoneToken {
+        status: DoneStatus::MORE | DoneStatus::ERROR,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
+/// A `DONEPROC` closing a procedure called from a batch that goes on.
+pub fn done_proc_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneProc(DoneToken {
+        status: DoneStatus::MORE,
+        cur_cmd: CurrentCommand::None,
+        row_count: 0,
+    }))
+}
+
 /// A terminal `DONEPROC` token ending an RPC response.
 pub fn done_proc_no_more() -> ScriptedToken {
     ScriptedToken(Tokens::DoneProc(DoneToken {

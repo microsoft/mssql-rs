@@ -1457,12 +1457,61 @@ msodbcsql build is measured.
     reads the error first behaves as in msodbcsql: `SQL_ERROR`, then
     `SQL_NO_DATA`, then `SQLMoreResults` reaches the next statement.
 
+    With nothing after the failed statement, including a row set that fails
+    inside `EXEC sp_executesql`, msodbcsql's `SQLMoreResults` still returns
+    `SQL_NO_DATA` with no diagnostic, and the connection stays busy until the
+    statement is freed. This driver returns `SQL_ERROR` with the error and
+    ends the batch, so the connection is free.
+
     **Evidence level: measured.** Windows msodbcsql 18.07.0001, loaded
     directly without a Driver Manager, against SQL Server 2025
     (`17.00.4025`). The batch was `SET NOCOUNT ON; SELECT n, 1/(2-n) AS q FROM
     (VALUES(1),(2),(3)) t(n); SELECT 42 AS v;`, read by a single-row bound
-    fetch and by a block fetch sized before or after execution.
-    `more_results_reports_a_deferred_continued_error_then_continues` pins this
-    driver's sequence. Chosen by the change author for
+    fetch and by a block fetch sized before or after execution, and
+    `EXEC sp_executesql N'SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n)'`
+    with nothing after it, read by a single-row bound fetch.
+    `more_results_reports_a_deferred_continued_error_then_continues` and
+    `more_results_reports_a_deferred_error_that_ends_the_batch` pin this
+    driver's sequences. Chosen by the change author for
     [AB#45309](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/45309);
     maintainer sign-off is pending review.
+
+44. **A row set's trailing error that ends the batch frees the connection one
+    fetch earlier.** A fetch can deliver the last row before a SQL Server
+    error when nothing in the response follows that error but its
+    completion. Examples are a batch-aborting error (`XACT_ABORT`, a
+    conversion error), the batch's last statement, and a statement inside
+    `EXEC` or `sp_executesql` whose procedure then returns. msodbcsql caches
+    an ERROR token that follows a processed row for the next fetch
+    (`Sql/Ntdbms/sqlncli/odbc/sqlctokn.cpp`, `OnMessage`, lines 3157-3183,
+    `TDS_DELAYERROR`), so its read-ahead stops there and the connection stays
+    busy until that fetch: in between, another statement's execute fails with
+    "Connection is busy with results for another command".
+
+    This driver's read-ahead reads past the error to the end of the response,
+    so the connection is free as soon as the fetch that delivered the row
+    returns. The error is still reported by the next fetch, and the fetches
+    return what msodbcsql's do: the rows, then `SQL_ERROR`, then
+    `SQL_NO_DATA` from the open cursor. A batch with more statements after
+    the error keeps the connection busy in both drivers, and so does a T-SQL
+    procedure whose failing SELECT is followed by its own count DONEINPROC.
+    The connection is held only while part of its response is unread
+    (AB#47508); holding it longer would refuse other statements without
+    changing what any call on this one returns. The batch-aborting and
+    last-statement cases predate
+    [AB#45309](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/45309).
+
+    **Evidence level: measured.** Windows msodbcsql 18.07.0001, loaded
+    directly without a Driver Manager, against SQL Server 2025
+    (`17.00.4025`). The statement was `SELECT n, 1/(2-n) AS q FROM
+    (VALUES(1),(2),(3)) t(n)` as a plain batch's last statement, through
+    `EXEC sp_executesql` and `EXEC('...')`, under `SET XACT_ABORT ON`, and
+    with a conversion error in place of the division, each read by a
+    single-row bound fetch. The `sp_executesql` form was also read by a block
+    fetch sized after execution and by unbound fetches with and without
+    `SQLGetData`.
+    `bound_fetch_releases_a_procedure_its_failed_row_set_ends` and
+    `block_fetch_releases_a_procedure_its_failed_row_set_ends` pin this
+    driver's sequence; `FailedProcedureRowSetReleasesTheConnection` checks
+    the behavior both drivers share. Chosen by the change author for
+    AB#45309; maintainer sign-off is pending review.

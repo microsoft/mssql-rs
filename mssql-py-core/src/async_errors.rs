@@ -243,6 +243,7 @@ mod tests {
         let diagnostics = SqlServerDiagnostics::new(
             vec![SqlErrorInfo {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "test failure".to_string(),
                 state: 2,
                 class: 16,
@@ -253,6 +254,7 @@ mod tests {
             }],
             vec![SqlInfoMessage {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "existing info".to_string(),
                 state: 1,
                 class: 0,
@@ -267,6 +269,7 @@ mod tests {
             TdsError::SqlServerError { diagnostics },
             vec![SqlInfoMessage {
                 diagnostic_ordinal: 0,
+                parameter_set: None,
                 message: "statement info".to_string(),
                 state: 1,
                 class: 10,

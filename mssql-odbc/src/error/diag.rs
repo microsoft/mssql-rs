@@ -35,10 +35,6 @@ pub(crate) const DRIVER_DIAG_PREFIX: &str = driver_diag_prefix!();
 pub(crate) trait HasDiagnostics {
     fn diag_records(&self) -> &[DiagRecord];
     fn diag_records_mut(&mut self) -> &mut DiagRecords;
-
-    fn server_row_number(&self) -> SqlLen {
-        SQL_NO_ROW_NUMBER
-    }
 }
 
 // If T implements HasDiagnostics, then MutexGuard<T> does too by delegation.
@@ -50,10 +46,6 @@ impl<T: HasDiagnostics + ?Sized> HasDiagnostics for MutexGuard<'_, T> {
 
     fn diag_records_mut(&mut self) -> &mut DiagRecords {
         self.deref_mut().diag_records_mut()
-    }
-
-    fn server_row_number(&self) -> SqlLen {
-        self.deref().server_row_number()
     }
 }
 
@@ -85,7 +77,9 @@ impl DerefMut for DiagRecords {
 pub(crate) struct DiagRecord {
     pub(crate) sql_state: SqlState,
     pub(crate) native_error: i32,
-    /// Internal row key used by msodbcsql's diagnostic comparator.
+    /// Internal row key used by msodbcsql's diagnostic comparator: the 1-based
+    /// parameter set of a server message from a parameter array, otherwise
+    /// `SQL_NO_ROW_NUMBER`. `SQL_DIAG_ROW_NUMBER` does not report it.
     pub(crate) row_number: SqlLen,
     /// msodbcsql's internal message-resource ID (or the matching server
     /// fallback tier). Equal keys retain posting order.

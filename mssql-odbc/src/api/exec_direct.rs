@@ -1334,25 +1334,44 @@ mod tests {
     /// that DONE shows nothing follows, so the connection is free and the
     /// statement can run again, as with msodbcsql. The completion may carry an
     /// XACT_ABORT rollback, or close an `EXEC` with RETURNSTATUS and DONEPROC.
+    /// A row set failing before its first row inside `sp_executesql` returns
+    /// its error from its DONEINPROC, and the procedure's tail still ends the
+    /// batch (msodbcsql 18.07.0001).
     #[test]
     fn exec_direct_releases_the_connection_when_the_failed_statement_ends_the_batch() {
         use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS};
         use crate::handles::dbc::DbcHandle;
         use mssql_tds::test_client_support::{
-            col_metadata_empty, done_in_proc_more, done_no_more, done_proc_no_more,
-            env_change_rollback_transaction, return_status, sql_error, tds_client_from_tokens,
+            col_metadata, col_metadata_empty, done_in_proc_more, done_in_proc_more_error,
+            done_no_more, done_proc_no_more, env_change_rollback_transaction, int_columns,
+            return_status, sql_error, tds_client_from_tokens,
         };
 
-        let completions = [
-            vec![env_change_rollback_transaction(), done_no_more()],
-            vec![done_in_proc_more(), return_status(-6), done_proc_no_more()],
+        let divide_by_zero = || sql_error(8134, 16, "Divide by zero error encountered.");
+        let failures = [
+            vec![
+                divide_by_zero(),
+                env_change_rollback_transaction(),
+                done_no_more(),
+            ],
+            vec![
+                divide_by_zero(),
+                done_in_proc_more(),
+                return_status(-6),
+                done_proc_no_more(),
+            ],
+            vec![
+                col_metadata(int_columns(1)),
+                divide_by_zero(),
+                done_in_proc_more_error(),
+                return_status(8134),
+                done_proc_no_more(),
+            ],
         ];
-        for completion in completions {
+        for mut tokens in failures {
             let handles = TestHandles::with_env_dbc_stmt();
             handles.mark_dbc_connected();
             let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
-            let mut tokens = vec![sql_error(8134, 16, "Divide by zero error encountered.")];
-            tokens.extend(completion);
             tokens.extend([col_metadata_empty(), done_no_more()]);
             dbc.inner
                 .lock()
