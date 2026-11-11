@@ -156,10 +156,19 @@ docker exec "$CONTAINER_NAME" mkdir -p /workspace
 # archive mode's --workspace-remap requires its Cargo.toml and reads the `ci`
 # profile from .config/nextest.toml.
 copy_workspace() {
-    # Copy source code (excluding target, .git, and other build artifacts)
+    # Cargo.lock is gitignored, so CI checkouts have none.
+    local paths=(Cargo.toml .config mssql-tds mssql-tds-cli mssql-mock-tds)
+    if [ -f "$REPO_ROOT/Cargo.lock" ]; then
+        paths+=(Cargo.lock)
+    fi
+
+    # Copy source code (excluding target, .git, and other build artifacts).
+    # pipefail (scoped to this subshell) makes a failed tar fail the run instead
+    # of being masked by the extracting docker exec.
     (
-        cd "$REPO_ROOT"
-        tar --exclude='target' \
+        set -o pipefail
+        tar -C "$REPO_ROOT" \
+            --exclude='target' \
             --exclude='.git' \
             --exclude='node_modules' \
             --exclude='__pycache__' \
@@ -167,14 +176,9 @@ copy_workspace() {
             --exclude='mssql-js' \
             --exclude='mssql-mock-tds-py' \
             --exclude='mssql-py-core' \
-            -cf - \
-            Cargo.toml \
-            Cargo.lock \
-            .config \
-            mssql-tds \
-            mssql-tds-cli \
-            mssql-mock-tds
-    ) | docker exec -i "$CONTAINER_NAME" tar -xf - -C /workspace
+            -cf - "${paths[@]}" \
+            | docker exec -i "$CONTAINER_NAME" tar -xf - -C /workspace
+    )
 
     # Create simplified workspace Cargo.toml (excludes mssql-js which isn't copied).
     # Must include [workspace.lints] since member crates use lints.workspace = true.
@@ -199,9 +203,6 @@ if [ "$ARCHIVE_MODE" = true ]; then
     echo ""
     echo "Step 3: Copy workspace and nextest archive to container..."
     echo "----------------------------------------------"
-
-    copy_workspace
-    echo "✓ Workspace copied"
     
     # Archive should be in repo root (downloaded by CI)
     ARCHIVE_PATH="$REPO_ROOT/$ARCHIVE_NAME"
@@ -211,6 +212,9 @@ if [ "$ARCHIVE_MODE" = true ]; then
         echo "For local: run 'cargo nextest archive --archive-file $ARCHIVE_NAME' first"
         exit 1
     fi
+
+    copy_workspace
+    echo "✓ Workspace copied"
     
     docker cp "$ARCHIVE_PATH" "$CONTAINER_NAME:/workspace/$ARCHIVE_NAME"
     echo "✓ Archive copied: $ARCHIVE_NAME"
