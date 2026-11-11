@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::OnceLock;
+use std::sync::TryLockError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,7 +25,10 @@ use opentelemetry::trace::{Span, Tracer, TracerProvider as _};
 use opentelemetry::{KeyValue, Value};
 use opentelemetry_application_insights::{Exporter, HttpClient};
 use opentelemetry_http::HttpError;
-use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{
+    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
+};
 use serde_json::Value as JsonValue;
 use tracing::debug;
 
@@ -46,6 +50,8 @@ const CUSTOM_EVENT_OTEL_NAME: &str = "ai.custom";
 const CUSTOM_EVENT_NAME_ATTRIBUTE: &str = "ai.customEvent.name";
 const APPLICATION_INSIGHTS_EVENT_ENVELOPE: &str = "Microsoft.ApplicationInsights.Event";
 const MAX_VERSION_LEN: usize = 64;
+/// The event is one span with one span event; a little room beyond that.
+const MAX_EVENTS_PER_SPAN: u32 = 8;
 pub const MAX_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const EXPORT_SCHEDULE_DELAY: Duration = Duration::from_secs(60 * 60);
@@ -204,7 +210,13 @@ where
             original_indices,
             original_count,
         } = filtered;
-        let response = self.inner.send_bytes(request).await?;
+        let response = match self.inner.send_bytes(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.internal_failure.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
         match translate_partial_response(response, &original_indices, original_count) {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -317,6 +329,9 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
     Ok(())
 }
 
+/// Translates a partial-ingestion response about the filtered request back to
+/// the exporter's original batch. The response is checked against what was
+/// sent first, so a malformed one is an error and never an apparent success.
 fn translate_partial_response(
     response: Response<Bytes>,
     original_indices: &[usize],
@@ -328,22 +343,59 @@ fn translate_partial_response(
 
     let (parts, body) = response.into_parts();
     let mut payload: JsonValue = serde_json::from_slice(&body).map_err(filter_error)?;
-    let dropped_count = original_count.saturating_sub(original_indices.len());
-    payload["itemsReceived"] = JsonValue::from(original_count);
-    if let Some(items_accepted) = payload.get("itemsAccepted").and_then(JsonValue::as_u64) {
-        payload["itemsAccepted"] = JsonValue::from(items_accepted + dropped_count as u64);
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| filter_error("Application Insights response was not an object"))?;
+    let sent = original_indices.len() as u64;
+    let received = object.get("itemsReceived").and_then(JsonValue::as_u64);
+    let accepted = object.get("itemsAccepted").and_then(JsonValue::as_u64);
+    let (Some(received), Some(accepted)) = (received, accepted) else {
+        return Err(filter_error(
+            "Application Insights response had no item counts",
+        ));
+    };
+    if received != sent || accepted > received {
+        return Err(filter_error(
+            "Application Insights response counts do not match the request",
+        ));
     }
-    if let Some(errors) = payload.get_mut("errors").and_then(JsonValue::as_array_mut) {
+
+    let mut seen = BTreeSet::new();
+    let mut error_count = 0u64;
+    if let Some(errors) = object.get_mut("errors") {
+        let errors = errors
+            .as_array_mut()
+            .ok_or_else(|| filter_error("Application Insights response errors were not a list"))?;
         for error in errors {
-            let Some(filtered_index) = error.get("index").and_then(JsonValue::as_u64) else {
-                continue;
-            };
-            let Some(original_index) = original_indices.get(filtered_index as usize) else {
-                return Err(filter_error("invalid Application Insights response index"));
-            };
+            let filtered_index = error
+                .get("index")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| filter_error("Application Insights response error had no index"))?;
+            let original_index = usize::try_from(filtered_index)
+                .ok()
+                .and_then(|index| original_indices.get(index))
+                .ok_or_else(|| filter_error("invalid Application Insights response index"))?;
+            if !seen.insert(filtered_index) {
+                return Err(filter_error(
+                    "duplicate Application Insights response index",
+                ));
+            }
+            error_count += 1;
             error["index"] = JsonValue::from(*original_index);
         }
     }
+    if accepted + error_count > received {
+        return Err(filter_error(
+            "Application Insights response counts are inconsistent",
+        ));
+    }
+
+    let dropped_count = original_count.saturating_sub(original_indices.len()) as u64;
+    object.insert("itemsReceived".to_owned(), JsonValue::from(original_count));
+    object.insert(
+        "itemsAccepted".to_owned(),
+        JsonValue::from(accepted + dropped_count),
+    );
     let body = serde_json::to_vec(&payload).map_err(filter_error)?;
     Ok(Response::from_parts(parts, Bytes::from(body)))
 }
@@ -364,18 +416,38 @@ fn opted_out() -> bool {
         .unwrap_or(false)
 }
 
-/// The connection string telemetry would use: the variable, else the one built in.
-fn connection_string() -> Option<String> {
-    std::env::var(CONNECTION_STRING_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| BUILT_IN_CONNECTION_STRING.map(str::to_owned))
+/// A client that only lets the exporter parse a connection string.
+#[derive(Debug)]
+struct ValidationClient;
+
+#[async_trait]
+impl HttpClient for ValidationClient {
+    async fn send_bytes(&self, _request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        Err(filter_error("the validation client sends nothing"))
+    }
 }
 
-/// Whether this run reports telemetry: not opted out, and a destination exists.
-/// Native sqlcmd reads the server properties only when this is true.
+/// Whether the exporter accepts `connection_string`.
+fn connection_string_is_valid(connection_string: &str) -> bool {
+    Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
+}
+
+/// The destination this run would send to: the variable, else the built-in
+/// connection string, and only if the exporter accepts it. An explicitly set
+/// variable that is not valid turns telemetry off; it does not fall back.
+fn destination() -> Option<String> {
+    let explicit = std::env::var(CONNECTION_STRING_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let candidate = explicit.or_else(|| BUILT_IN_CONNECTION_STRING.map(str::to_owned))?;
+    connection_string_is_valid(&candidate).then_some(candidate)
+}
+
+/// Whether this run reports telemetry: not opted out, and a valid destination
+/// exists. Everything with a side effect (the device ID, the server query) waits
+/// for this, so an invalid configuration is a no-op.
 pub fn enabled() -> bool {
-    !opted_out() && connection_string().is_some()
+    !opted_out() && destination().is_some()
 }
 
 fn os_value() -> &'static str {
@@ -457,11 +529,16 @@ fn device_id_value() -> Option<String> {
     device_id::get_or_create()
 }
 
-/// Unit tests must not read or write the developer's real shared ID.
+/// Unit tests must not read or write the developer's real shared ID. They count
+/// the reads, to show where the ID is not touched.
 #[cfg(test)]
 fn device_id_value() -> Option<String> {
+    DEVICE_ID_READS.fetch_add(1, Ordering::AcqRel);
     Some(TEST_DEVICE_ID.to_owned())
 }
+
+#[cfg(test)]
+static DEVICE_ID_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 const TEST_DEVICE_ID: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
@@ -470,18 +547,23 @@ const TEST_DEVICE_ID: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
 ///
 /// Does nothing unless [`enabled`]. Never fails, and never affects sqlcmd.
 pub fn record_usage(invocation: Invocation<'_>) {
-    if SHUTDOWN_STARTED.load(Ordering::Acquire) || !enabled() {
+    if !enabled() {
         return;
     }
+    // Built before the lock is taken: it can read the device ID's store.
+    let base = base_properties(&invocation);
     let Ok(mut session) = SESSION.lock() else {
         debug!("sqlcmd telemetry session lock is poisoned");
         return;
     };
-    if session.is_some() {
+    // Checked under the lock, which shutdown also holds when it sets the flag,
+    // so a call that is admitted here is seen by shutdown, and one that comes
+    // after it is not recorded.
+    if SHUTDOWN_STARTED.load(Ordering::Acquire) || session.is_some() {
         return;
     }
     *session = Some(Session {
-        base: base_properties(&invocation),
+        base,
         server: None,
         export: None,
     });
@@ -491,12 +573,12 @@ pub fn record_usage(invocation: Invocation<'_>) {
 /// the event now, so the network work overlaps what sqlcmd does next. Later
 /// connections are ignored.
 pub fn record_server_info(raw: &RawServerInfo) {
-    if SHUTDOWN_STARTED.load(Ordering::Acquire) {
-        return;
-    }
     let Ok(mut guard) = SESSION.lock() else {
         return;
     };
+    if SHUTDOWN_STARTED.load(Ordering::Acquire) {
+        return;
+    }
     let Some(session) = guard.as_mut() else {
         return;
     };
@@ -510,6 +592,9 @@ pub fn record_server_info(raw: &RawServerInfo) {
 }
 
 /// Starts sending the event on its own thread, once.
+///
+/// The thread sends the one event and shuts its own provider down, so nothing is
+/// queued behind a timer: the batch processor's schedule delay never fires.
 fn start_export(session: &mut Session) {
     if session.export.is_some() {
         return;
@@ -530,7 +615,7 @@ fn start_export(session: &mut Session) {
 }
 
 fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
-    let Some(connection_string) = connection_string() else {
+    let Some(connection_string) = destination() else {
         return FlushOutcome::Failed;
     };
     let Ok(provider) = production_provider(&connection_string) else {
@@ -552,13 +637,28 @@ fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
 
 /// Sends the event if it has not been sent, and waits for it within `timeout`
 /// (capped at [`MAX_FLUSH_TIMEOUT`]).
+///
+/// The session lock is taken with a bounded wait, never a blocking one: this can
+/// run from a console control or signal handler on a thread that interrupted a
+/// holder of the lock.
 pub fn shutdown(timeout: Duration) -> FlushOutcome {
+    let timeout = timeout.min(MAX_FLUSH_TIMEOUT);
+    let deadline = Instant::now() + timeout;
+    let mut guard = loop {
+        match SESSION.try_lock() {
+            Ok(guard) => break guard,
+            Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return FlushOutcome::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    };
     if SHUTDOWN_STARTED.swap(true, Ordering::AcqRel) {
         return FlushOutcome::Completed;
     }
-    let Ok(mut guard) = SESSION.try_lock() else {
-        return FlushOutcome::Failed;
-    };
     let Some(mut session) = guard.take() else {
         return FlushOutcome::Completed;
     };
@@ -567,7 +667,7 @@ pub fn shutdown(timeout: Duration) -> FlushOutcome {
     let Some(receiver) = session.export else {
         return FlushOutcome::Failed;
     };
-    match receiver.recv_timeout(timeout.min(MAX_FLUSH_TIMEOUT)) {
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(outcome) => outcome,
         Err(mpsc::RecvTimeoutError::Timeout) => FlushOutcome::TimedOut,
         Err(mpsc::RecvTimeoutError::Disconnected) => FlushOutcome::Failed,
@@ -615,9 +715,15 @@ where
                 .build(),
         )
         .build();
+    // The SDK reads OTEL_* variables for its defaults. The resource, the sampler
+    // and the event limit are set here so that ambient tracing configuration can
+    // neither add identifiers to the event nor switch it off.
     Ok(TelemetryProvider {
         provider: SdkTracerProvider::builder()
             .with_span_processor(batch)
+            .with_resource(Resource::builder_empty().build())
+            .with_sampler(Sampler::AlwaysOn)
+            .with_max_events_per_span(MAX_EVENTS_PER_SPAN)
             .build(),
         internal_failure,
     })
@@ -640,12 +746,29 @@ fn emit_usage(
     span.end_with_timestamp(timestamp);
 }
 
+/// A native sqlcmd version: two to four numeric parts, then optionally a `-` or
+/// `+` suffix of letters, digits, `.`, `-` and `+` (`18.7.0001.1`,
+/// `18.5.1-preview.2`). Anything else, such as a free-form label, is not sent.
 fn version_is_safe(version: &str) -> bool {
-    !version.is_empty()
-        && version.len() <= MAX_VERSION_LEN
-        && version
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
+    if version.is_empty() || version.len() > MAX_VERSION_LEN {
+        return false;
+    }
+    let (core, suffix) = match version.find(['-', '+']) {
+        Some(at) => (&version[..at], Some(&version[at + 1..])),
+        None => (version, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    let core_ok = (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    let suffix_ok = suffix.is_none_or(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+    });
+    core_ok && suffix_ok
 }
 
 #[cfg(test)]
@@ -900,6 +1023,13 @@ mod tests {
                 // SAFETY: serialized by the test environment lock.
                 unsafe { std::env::set_var(OPTOUT_ENV, "1") };
             }
+            // A build with a compiled-in destination keeps it when the variable
+            // is not set, so there the "missing destination" case is enabled.
+            let built_in = BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid);
+            if !opt_out && built_in {
+                assert!(enabled());
+                continue;
+            }
             assert!(!enabled());
             record_usage(Invocation {
                 version: Some("18.5"),
@@ -910,7 +1040,17 @@ mod tests {
             assert!(SESSION.lock().expect("session lock").is_none());
             assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
             assert!(requests.try_recv().is_err());
+            assert_eq!(DEVICE_ID_READS.load(Ordering::Acquire), 0);
         }
+    }
+
+    #[test]
+    fn a_compiled_in_destination_is_used_when_the_variable_is_not_set() {
+        let _guard = TestEnv::new(None);
+        assert_eq!(
+            enabled(),
+            BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid)
+        );
     }
 
     #[test]
@@ -930,16 +1070,157 @@ mod tests {
     }
 
     #[test]
-    fn invalid_connection_string_stays_off() {
-        let guard = TestEnv::new(Some("InstrumentationKey=DO-NOT-LOG-THIS;broken"));
+    fn an_invalid_connection_string_is_a_no_op_with_no_side_effects() {
+        for invalid in [
+            "InstrumentationKey=DO-NOT-LOG-THIS;broken",
+            "not a connection string",
+            "   x   ",
+        ] {
+            let guard = TestEnv::new(Some(invalid));
+            let requests = guard.capture_requests();
+            assert!(!enabled(), "{invalid:?}");
+            record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Diagnose,
+                format: FormatUse::Json,
+            });
+            record_server_info(&server_info_fixture().parsed);
+            assert!(SESSION.lock().expect("session lock").is_none());
+            assert_eq!(DEVICE_ID_READS.load(Ordering::Acquire), 0, "{invalid:?}");
+            assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn a_valid_connection_string_is_enabled() {
+        let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        assert!(enabled());
+    }
+
+    /// A call that is admitted before shutdown is sent by it, and one that comes
+    /// after is not recorded: never a recorded session that nobody sends.
+    #[test]
+    fn recording_racing_shutdown_never_leaves_an_unsent_session() {
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
         let requests = guard.capture_requests();
+        let mut sent = 0;
+        let mut dropped = 0;
+        for _ in 0..40 {
+            *SESSION.lock().expect("session lock") = None;
+            SHUTDOWN_STARTED.store(false, Ordering::Release);
+            while requests.try_recv().is_ok() {}
+
+            // Both callers wait on the session lock; which goes first is up to
+            // the scheduler, and either order must be consistent.
+            let held = SESSION.lock().expect("session lock");
+            let recorder = std::thread::spawn(|| {
+                record_usage(Invocation {
+                    version: Some("18.5"),
+                    command: Command::Unspecified,
+                    format: FormatUse::Absent,
+                });
+            });
+            let closer = std::thread::spawn(|| shutdown(Duration::from_secs(1)));
+            std::thread::sleep(Duration::from_millis(5));
+            drop(held);
+            recorder.join().expect("recorder");
+            let outcome = closer.join().expect("closer");
+
+            assert!(SESSION.lock().expect("session lock").is_none());
+            match requests.recv_timeout(Duration::from_millis(50)) {
+                Ok(_) => {
+                    assert_eq!(outcome, FlushOutcome::Completed);
+                    sent += 1;
+                }
+                Err(_) => dropped += 1,
+            }
+            assert!(requests.try_recv().is_err(), "at most one event");
+        }
+        assert_eq!(sent + dropped, 40);
+    }
+
+    #[test]
+    fn nothing_is_recorded_after_shutdown() {
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = guard.capture_requests();
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
         record_usage(Invocation {
             version: Some("18.5"),
             command: Command::Unspecified,
             format: FormatUse::Absent,
         });
-        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Failed);
+        record_server_info(&server_info_fixture().parsed);
+        assert!(SESSION.lock().expect("session lock").is_none());
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn shutdown_does_not_block_forever_when_the_session_lock_is_held() {
+        let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let held = SESSION.lock().expect("session lock");
+        let started = Instant::now();
+
+        let outcome = shutdown(Duration::from_millis(200));
+
+        assert_eq!(outcome, FlushOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert!(!SHUTDOWN_STARTED.load(Ordering::Acquire));
+        drop(held);
+    }
+
+    /// Ambient tracing configuration must neither switch the event off nor add
+    /// identifiers to it.
+    #[test]
+    fn ambient_opentelemetry_settings_do_not_change_the_event() {
+        let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let vars = [
+            ("OTEL_TRACES_SAMPLER", "always_off"),
+            ("OTEL_SPAN_EVENT_COUNT_LIMIT", "0"),
+            ("OTEL_SERVICE_NAME", "someone-elses-service"),
+            (
+                "OTEL_RESOURCE_ATTRIBUTES",
+                "device.id=abc,ai.user.id=someone",
+            ),
+        ];
+        for (name, value) in vars {
+            // SAFETY: serialized by the test environment lock.
+            unsafe { std::env::set_var(name, value) };
+        }
+        let client = InMemoryClient::succeeding();
+        let provider = provider_with_client(TEST_CONNECTION_STRING, client.clone())
+            .expect("valid test configuration");
+        emit_usage(
+            &provider.provider,
+            &[
+                (KEY_OS, "windows".to_owned()),
+                (KEY_ARCH, "x86_64".to_owned()),
+            ],
+            UNIX_EPOCH + Duration::from_secs(1_730_736_000),
+        );
+        provider
+            .provider
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .expect("bounded shutdown");
+        for (name, _) in vars {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(name) };
+        }
+
+        let envelopes = client.0.envelopes();
+        assert_eq!(envelopes.len(), 1, "the event was not switched off");
+        assert!(envelopes[0].get("tags").is_none());
+        let text = serde_json::to_string(&envelopes[0]).expect("envelope text");
+        for leaked in [
+            "someone-elses-service",
+            "device.id",
+            "ai.user.id",
+            "someone",
+        ] {
+            assert!(!text.contains(leaked), "{leaked}");
+        }
+        assert!(!provider.internal_failure.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1014,8 +1295,9 @@ mod tests {
                     None => std::env::remove_var(CONNECTION_STRING_ENV),
                 }
             }
-            *SESSION.lock().expect("session lock") = None;
+            *SESSION.lock().unwrap_or_else(|p| p.into_inner()) = None;
             SHUTDOWN_STARTED.store(false, Ordering::Release);
+            DEVICE_ID_READS.store(0, Ordering::Release);
             *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
             Self { _lock: lock }
         }
@@ -1118,11 +1400,31 @@ mod tests {
             "18.4 user@example.com",
             "18.4/server",
             "18.4\\path",
+            "not-a-version",
+            "---",
+            "abc",
+            "18",
+            "v18.5",
+            "18..5",
+            ".18.5",
+            "18.5.",
+            "18.5-",
+            "-18.5",
+            "18.5.1.2.3",
+            "18.5_beta",
             "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
         ] {
-            assert!(!version_is_safe(version));
+            assert!(!version_is_safe(version), "{version:?}");
         }
-        assert!(version_is_safe("18.5.1-preview.2"));
+        for version in [
+            "18.5",
+            "18.7.0001.1",
+            "18.5.1-preview.2",
+            "18.5.1+build.7",
+            "18.5.1-rc-1",
+        ] {
+            assert!(version_is_safe(version), "{version:?}");
+        }
     }
 
     #[test]
@@ -1182,12 +1484,31 @@ mod tests {
         let internal_failure = Arc::new(AtomicBool::new(false));
         let client =
             EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&internal_failure));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("test runtime");
 
-        assert!(runtime.block_on(client.send_bytes(request)).is_err());
+        assert!(poll_ready(client.send_bytes(request)).is_err());
         assert!(internal_failure.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn client_records_a_transport_failure_as_an_internal_failure() {
+        let inner = InMemoryClient::succeeding();
+        *inner.0.responses.lock().expect("response lock") =
+            VecDeque::from([Err(filter_error("connection refused"))]);
+        let internal_failure = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+        let request = Request::post("https://example.test/v2/track")
+            .body(Bytes::from(gzip_json(&[event_envelope()])))
+            .expect("valid request");
+
+        assert!(poll_ready(client.send_bytes(request)).is_err());
+        assert!(internal_failure.load(Ordering::Acquire));
+    }
+
+    fn gzip_json(envelopes: &[JsonValue]) -> Vec<u8> {
+        let body = serde_json::to_vec(envelopes).expect("serialize envelopes");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&body).expect("compress envelopes");
+        encoder.finish().expect("finish gzip")
     }
 
     #[test]
@@ -1289,6 +1610,51 @@ mod tests {
             .expect("valid response");
 
         assert!(translate_partial_response(response, &[1], 2).is_err());
+    }
+
+    #[test]
+    fn a_partial_response_that_does_not_match_the_request_is_an_error_not_a_success() {
+        // One event was retained out of two envelopes (index 1 of the original).
+        for body in [
+            r#"{"itemsReceived":0,"itemsAccepted":1,"errors":[]}"#,
+            r#"{"itemsReceived":2,"itemsAccepted":2,"errors":[]}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":2,"errors":[]}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[{"index":0}]}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":5}]}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0},{"index":0}]}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"statusCode":429}]}"#,
+            r#"{"itemsReceived":1,"itemsAccepted":0,"errors":"none"}"#,
+            r#"{"itemsAccepted":0,"errors":[]}"#,
+            r#"{"itemsReceived":"1","itemsAccepted":0}"#,
+            r#"[]"#,
+            r#""text""#,
+            r#"7"#,
+            r#"null"#,
+        ] {
+            let response = Response::builder()
+                .status(206)
+                .body(Bytes::from(body))
+                .expect("valid response");
+            assert!(
+                translate_partial_response(response, &[1], 2).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_consistent_partial_response_without_errors_is_translated() {
+        let response = Response::builder()
+            .status(206)
+            .body(Bytes::from_static(
+                br#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#,
+            ))
+            .expect("valid response");
+
+        let translated = translate_partial_response(response, &[1], 2).expect("consistent");
+        let payload: JsonValue = serde_json::from_slice(translated.body()).expect("JSON");
+        assert_eq!(payload["itemsReceived"], 2);
+        assert_eq!(payload["itemsAccepted"], 2);
     }
 
     #[test]

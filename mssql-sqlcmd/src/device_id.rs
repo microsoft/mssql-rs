@@ -23,7 +23,12 @@ use std::io;
 pub trait Store {
     /// The stored text, or `None` when nothing is stored yet.
     fn read(&self) -> io::Result<Option<String>>;
-    fn write(&self, id: &str) -> io::Result<()>;
+
+    /// Stores `id` only if nothing is stored, and returns what is stored
+    /// afterwards: `id`, or the value another process stored first. A store must
+    /// make this safe against concurrent first runs, so that all of them report
+    /// the one ID that survives.
+    fn create_if_absent(&self, id: &str) -> io::Result<String>;
 }
 
 /// The device ID of this user on this device, created if it does not exist.
@@ -39,8 +44,8 @@ pub fn get_or_create_in(store: &dyn Store, generate: impl FnOnce() -> String) ->
         Ok(Some(text)) => normalize(&text),
         Ok(None) => {
             let id = normalize(&generate())?;
-            store.write(&id).ok()?;
-            Some(id)
+            // The winner of a concurrent first run, which may not be `id`.
+            normalize(&store.create_if_absent(&id).ok()?)
         }
         Err(_) => None,
     }
@@ -79,11 +84,29 @@ impl Store for FileStore {
         }
     }
 
-    fn write(&self, id: &str) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// The ID is written to a file of its own and then linked into place, which
+    /// fails if the ID file exists. So a first run either installs a complete
+    /// file or finds the one another run installed, and a reader never sees a
+    /// partly written ID.
+    fn create_if_absent(&self, id: &str) -> io::Result<String> {
+        let parent = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let staged = parent.join(format!(
+            ".deviceid.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&staged, id)?;
+        let linked = std::fs::hard_link(&staged, &self.path);
+        let _ = std::fs::remove_file(&staged);
+        match linked {
+            Ok(()) => Ok(id.to_owned()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self.read()?.ok_or(error),
+            Err(error) => Err(error),
         }
-        std::fs::write(&self.path, id)
     }
 }
 
@@ -121,12 +144,14 @@ mod registry {
     use super::{RegistryStore, Store};
     use std::io;
     use windows_sys::Win32::Foundation::{
-        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE,
+        WAIT_ABANDONED, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE, REG_OPTION_NON_VOLATILE,
         REG_SZ, RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -138,6 +163,41 @@ mod registry {
 
     fn os_error(code: u32) -> io::Error {
         io::Error::from_raw_os_error(code as i32)
+    }
+
+    /// A named mutex that serializes first runs of sqlcmd on this user's session.
+    /// Taking it is best effort: if it cannot be taken the caller goes on
+    /// without it, and the read-back after writing still reports what is stored.
+    struct FirstRunLock(HANDLE);
+
+    impl FirstRunLock {
+        fn acquire() -> Option<Self> {
+            let name = wide("Local\\Microsoft.Sqlcmd.DeviceIdFirstRun");
+            // SAFETY: `name` is NUL-terminated; null security attributes.
+            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if handle.is_null() {
+                return None;
+            }
+            // SAFETY: `handle` is a mutex handle owned by this function.
+            let waited = unsafe { WaitForSingleObject(handle, 2000) };
+            if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
+                Some(Self(handle))
+            } else {
+                // SAFETY: `handle` was created above and is closed once.
+                unsafe { CloseHandle(handle) };
+                None
+            }
+        }
+    }
+
+    impl Drop for FirstRunLock {
+        fn drop(&mut self) {
+            // SAFETY: the mutex is owned by this thread and the handle is open.
+            unsafe {
+                ReleaseMutex(self.0);
+                CloseHandle(self.0);
+            }
+        }
     }
 
     impl Store for RegistryStore {
@@ -215,7 +275,22 @@ mod registry {
             result
         }
 
-        fn write(&self, id: &str) -> io::Result<()> {
+        /// Under the first-run lock: reuse a value that is there, else store `id`,
+        /// and report what is stored. A tool that stores the shared ID without the
+        /// lock can still overwrite between the write and the read-back; the
+        /// read-back narrows that to the one value that survives.
+        fn create_if_absent(&self, id: &str) -> io::Result<String> {
+            let _lock = FirstRunLock::acquire();
+            if let Some(existing) = self.read()? {
+                return Ok(existing);
+            }
+            self.set_value(id)?;
+            Ok(self.read()?.unwrap_or_else(|| id.to_owned()))
+        }
+    }
+
+    impl RegistryStore {
+        fn set_value(&self, id: &str) -> io::Result<()> {
             let path = key_path();
             let name = wide("deviceid");
             let value = wide(id);
@@ -271,6 +346,8 @@ mod tests {
         fail_read: bool,
         fail_write: bool,
         writes: RefCell<u32>,
+        /// Another process stores this just before ours would.
+        racing_winner: RefCell<Option<String>>,
     }
 
     impl Store for Memory {
@@ -281,14 +358,75 @@ mod tests {
             Ok(self.value.borrow().clone())
         }
 
-        fn write(&self, id: &str) -> io::Result<()> {
+        fn create_if_absent(&self, id: &str) -> io::Result<String> {
             if self.fail_write {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
             }
+            if let Some(winner) = self.racing_winner.borrow_mut().take() {
+                *self.value.borrow_mut() = Some(winner);
+            }
+            let mut value = self.value.borrow_mut();
+            if let Some(existing) = value.as_ref() {
+                return Ok(existing.clone());
+            }
             *self.writes.borrow_mut() += 1;
-            *self.value.borrow_mut() = Some(id.to_string());
-            Ok(())
+            *value = Some(id.to_string());
+            Ok(id.to_string())
         }
+    }
+
+    #[test]
+    fn a_first_run_that_loses_a_race_reports_the_id_that_survives() {
+        let store = Memory::default();
+        *store.racing_winner.borrow_mut() = Some(ID.to_string());
+        let other = "11111111-2222-4333-8444-555555555555";
+        let id = get_or_create_in(&store, || other.to_string());
+        assert_eq!(id.as_deref(), Some(ID));
+        assert_eq!(store.value.borrow().as_deref(), Some(ID));
+        assert_eq!(*store.writes.borrow(), 0);
+    }
+
+    #[test]
+    fn a_racing_winner_that_is_not_an_id_means_no_id() {
+        let store = Memory::default();
+        *store.racing_winner.borrow_mut() = Some("garbage".to_string());
+        assert_eq!(get_or_create_in(&store, || ID.to_string()), None);
+        assert_eq!(store.value.borrow().as_deref(), Some("garbage"));
+    }
+
+    #[test]
+    fn concurrent_first_runs_on_files_all_report_one_id() {
+        let dir = std::env::temp_dir().join(format!("sqlcmd-deviceid-race-{}", std::process::id()));
+        let path = dir
+            .join("Microsoft")
+            .join("DeveloperTools")
+            .join("deviceid");
+        let ids: Vec<String> = (0..16)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = FileStore { path };
+                    get_or_create_in(&store, || uuid::Uuid::new_v4().hyphenated().to_string())
+                        .expect("an id")
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+        assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+        let stored = std::fs::read_to_string(&path).expect("stored id");
+        assert_eq!(normalize(&stored).as_deref(), Some(ids[0].as_str()));
+        let leftovers = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("dir")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

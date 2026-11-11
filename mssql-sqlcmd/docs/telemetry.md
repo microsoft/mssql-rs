@@ -16,7 +16,7 @@ below are done.
 | Setting | Effect |
 |---|---|
 | `SQLCMD_TELEMETRY_OPTOUT=1` (or `true`, `yes`) | No event, no server query, and the device ID is neither read nor created. |
-| `SQLCMD_TELEMETRY_CONNECTION_STRING` | The Application Insights connection string. Overrides the built-in one. |
+| `SQLCMD_TELEMETRY_CONNECTION_STRING` | The Application Insights connection string. Overrides the built-in one. A value the exporter does not accept turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
 | `SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT` (build time) | A connection string compiled into the library. Without it, and without the variable, telemetry is off. |
 | `SQLCMD_CALLER_TYPE` | The caller declares itself: `human`, `agent`, `pipeline` or `other_automation`. Not a telemetry switch; it only sets the caller category. |
 
@@ -70,7 +70,7 @@ The event timestamp is the standard one.
 
 | Property | Values | Source |
 |---|---|---|
-| `sqlcmdcli_version` | validated product version, e.g. `18.7.0001.1` | native sqlcmd's version |
+| `sqlcmdcli_version` | native sqlcmd's version: two to four numeric parts and an optional `-` or `+` suffix, e.g. `18.7.0001.1`, `18.5.1-preview.2`; anything else is omitted | native sqlcmd's version |
 | `sqlcmdcli_os` | `windows`, `linux`, `macos`, `other` | client OS |
 | `sqlcmdcli_arch` | `x86`, `x86_64`, `aarch64`, `other` | the sqlcmd binary's architecture |
 | `sqlcmdcli_command` | `diagnose`; omitted for any other run | parsed command |
@@ -145,8 +145,13 @@ macOS and Linux a file in the user's home. An existing recognized ID is reused;
 a missing one is generated (a random version 4 UUID) and stored. A value that is
 present but unreadable or unrecognized is never overwritten. If it cannot be
 read or stored, the property is omitted. When telemetry is off, the ID is not
-touched. The ID is end-user pseudonymized information and is sent as the GUID,
-not hashed.
+touched. Two first runs at the same moment end up with the same ID: on macOS and
+Linux the ID is written to a file of its own and linked into place, which fails
+if the ID file exists, and the loser reads the winner's; on Windows first runs
+take a named mutex, and the value is read back after it is written. A tool that
+writes the shared ID without that mutex can still race on Windows; the
+read-back reports the value that survives. The ID is end-user pseudonymized
+information and is sent as the GUID, not hashed.
 
 ## Privacy contract
 
@@ -176,9 +181,26 @@ On Windows the console control handler (Ctrl+C in non-interactive mode, console
 close) sends the event before ending the process. On Linux and macOS the signal
 handlers do not flush: an event for a run ended by a signal is lost.
 
-The queue and export batch are bounded at two items. An all-filtered or
-malformed request is an error, not a synthetic success; for partial-ingestion
-responses, filtered indices are translated back to the original batch.
+The queue and export batch are bounded at two items, and the event is exported
+at once by its own thread, which shuts its provider down after the one event, so
+nothing waits on the batch processor's timer in a long interactive session. A
+transport failure, a failure in the filter, or a response that does not match
+what was sent is an error and is reflected in the result of the export. An
+all-filtered or malformed request is an error, not a synthetic success. A
+partial-ingestion response is checked against the request first (item counts,
+and that every error index is present, unique and in range) before its indices
+are translated back to the original batch; a response that does not add up is
+an error and is never taken as an acceptance.
+
+Recording and shutdown are ordered by one lock: a call admitted before shutdown
+is sent by it, and a call after it is not recorded. Shutdown takes that lock
+with a bounded wait, because it can run from a console control or signal handler
+on a thread that interrupted a holder of it.
+
+The SDK reads `OTEL_*` environment variables for its defaults. The provider sets
+an empty resource, an always-on sampler and an event limit itself, so ambient
+tracing configuration can neither add identifiers to the event nor switch it
+off.
 
 ## C ABI
 
