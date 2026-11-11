@@ -413,12 +413,9 @@ impl<'a> PacketWriter<'a> {
         let _ = std::io::Write::write_all(&mut self.payload_cursor, bytes);
     }
 
-    pub(crate) async fn write_fixed_bytes<const N: usize>(
-        &mut self,
-        bytes: &[u8; N],
-    ) -> TdsResult<()> {
+    pub(crate) async fn write_fixed_bytes(&mut self, bytes: &[u8]) -> TdsResult<()> {
         // Keep exact-boundary sends on the ordinary overflow/cancellation path.
-        if self.has_space(N + 1) {
+        if self.has_space(bytes.len() + 1) {
             std::io::Write::write_all(&mut self.payload_cursor, bytes)?;
         } else {
             for &byte in bytes {

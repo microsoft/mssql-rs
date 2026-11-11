@@ -462,6 +462,7 @@ impl Request for SqlRpc<'_> {
 mod tests {
     use super::*;
     use crate::core::CancelHandle;
+    use crate::datatypes::decoder::DecimalParts;
     use crate::datatypes::{sql_string::SqlString, sqltypes::SqlType};
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::parameters::rpc_parameters::StatusFlags;
@@ -1306,6 +1307,82 @@ mod tests {
         }
     }
 
+    /// TYPE_INFO for fixed-size types has one source shared by both paths, so
+    /// equality tests cannot catch a wrong byte there; pin the bytes instead.
+    #[test]
+    fn fixed_type_info_bytes_are_pinned() {
+        use crate::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        let decimal = Some(DecimalParts::new(true, 5, 2, 1));
+        type Case = (SqlType, Option<u8>, Option<u8>, &'static [u8]);
+        let cases: Vec<Case> = vec![
+            (SqlType::Bit(None), None, None, &[0x26, 1]),
+            (SqlType::TinyInt(Some(1)), None, None, &[0x26, 1]),
+            (SqlType::SmallInt(None), None, None, &[0x26, 2]),
+            (SqlType::Int(None), None, None, &[0x26, 4]),
+            (SqlType::BigInt(None), Some(9), Some(9), &[0x26, 8]),
+            (SqlType::Real(None), None, None, &[0x6D, 4]),
+            (SqlType::Float(None), None, None, &[0x6D, 8]),
+            (SqlType::Decimal(decimal), None, None, &[0x6C, 17, 5, 2]),
+            (
+                SqlType::Decimal(decimal),
+                Some(18),
+                Some(4),
+                &[0x6C, 17, 18, 4],
+            ),
+            (
+                SqlType::Numeric(decimal),
+                Some(18),
+                None,
+                &[0x6C, 17, 18, 2],
+            ),
+            (SqlType::Numeric(None), None, None, &[0x6C, 17, 1, 0]),
+            (SqlType::Money(None), None, None, &[0x6E, 8]),
+            (SqlType::SmallMoney(None), None, None, &[0x6E, 4]),
+            (SqlType::DateTime(None), None, None, &[0x6F, 8]),
+            (SqlType::SmallDateTime(None), None, None, &[0x6F, 4]),
+            (SqlType::Uuid(None), None, None, &[0x24, 16]),
+            (SqlType::Date(None), Some(9), Some(9), &[0x28]),
+            (
+                time_value::<SqlTime>(SqlType::Time, 3),
+                None,
+                None,
+                &[0x29, 3],
+            ),
+            (
+                time_value::<SqlTime>(SqlType::Time, 3),
+                None,
+                Some(5),
+                &[0x29, 5],
+            ),
+            (SqlType::Time(None), None, None, &[0x29, 7]),
+            (
+                time_value::<SqlDateTime2>(SqlType::DateTime2, 0),
+                Some(9),
+                None,
+                &[0x2A, 0],
+            ),
+            (SqlType::DateTime2(None), None, Some(2), &[0x2A, 2]),
+            (
+                time_value::<SqlDateTimeOffset>(SqlType::DateTimeOffset, 6),
+                None,
+                None,
+                &[0x2B, 6],
+            ),
+            (SqlType::DateTimeOffset(None), None, None, &[0x2B, 7]),
+        ];
+        let collation = db_collation();
+        for (value, precision, scale, expected) in cases {
+            let mut mock = MockNetworkWriter::new(4096);
+            let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+            block_on(value.write_type_info(&mut writer, &collation, precision, scale)).unwrap();
+            assert_eq!(
+                &writer.get_payload().into_inner()[8..],
+                expected,
+                "{value:?} {precision:?} {scale:?}"
+            );
+        }
+    }
+
     #[test]
     fn batch_fast_path_eligibility_and_lengths() {
         use crate::datatypes::sql_string::EncodingType;
@@ -1318,6 +1395,18 @@ mod tests {
         assert_eq!(inline(SqlType::Int(None)), Some(5));
         assert_eq!(inline(SqlType::BigInt(Some(1))), Some(13));
         assert_eq!(inline(SqlType::BigInt(None)), Some(5));
+        assert_eq!(inline(SqlType::Bit(Some(true))), Some(6));
+        assert_eq!(inline(SqlType::Real(Some(1.0))), Some(9));
+        assert_eq!(inline(SqlType::Float(None)), Some(5));
+        assert_eq!(inline(SqlType::Decimal(None)), Some(7));
+        assert_eq!(
+            inline(SqlType::Numeric(Some(DecimalParts::new(true, 5, 2, 1)))),
+            Some(24)
+        );
+        assert_eq!(inline(SqlType::Date(None)), Some(4));
+        assert_eq!(inline(SqlType::Uuid(Some(uuid::Uuid::nil()))), Some(21));
+        assert_eq!(inline(time_value(SqlType::Time, 7)), Some(10));
+        assert_eq!(inline(time_value(SqlType::DateTimeOffset, 0)), Some(13));
         assert_eq!(inline(SqlType::NVarchar(None, 4000)), Some(12));
         assert_eq!(inline(SqlType::NVarchar(Some(utf16("ab")), 2)), Some(16));
         assert_eq!(
@@ -1331,10 +1420,11 @@ mod tests {
             SqlType::NVarchar(Some(SqlString::new(vec![1], EncodingType::DelayedSet)), 10),
             SqlType::NVarcharMax(None),
             SqlType::Varchar(None, 10),
-            SqlType::Bit(Some(true)),
-            SqlType::Real(Some(1.0)),
-            SqlType::Float(Some(1.0)),
             SqlType::VarBinary(Some(vec![1]), 10),
+            // Scale 8 is an async-path error.
+            time_value(SqlType::Time, 8),
+            time_value(SqlType::DateTime2, 8),
+            time_value(SqlType::DateTimeOffset, 8),
         ] {
             assert_eq!(inline(ineligible.clone()), None, "{ineligible:?}");
         }
@@ -1601,7 +1691,7 @@ mod tests {
             StatusFlags::NONE
         };
         let bits = rng.next();
-        let value = match rng.below(20) {
+        let value = match rng.below(24) {
             0 | 1 => SqlType::TinyInt(Some(bits as u8)),
             2 => SqlType::TinyInt(None),
             3 | 4 => SqlType::SmallInt(Some(bits as i16)),
@@ -1615,11 +1705,37 @@ mod tests {
             14 => SqlType::NVarcharMax(Some(utf16("plp"))),
             15 => SqlType::Varchar(Some(utf16("abc")), 10),
             16 => SqlType::NVarchar(Some(SqlString::new(b"ab".to_vec(), EncodingType::Utf8)), 10),
-            17 => SqlType::Float(Some(1.5)),
-            18 => {
+            17..=20 => {
+                // Every fixed-size type and time scale, including the
+                // invalid scale the async path rejects.
+                let values = fixed_values(bits);
+                let value = values[rng.below(values.len())].clone();
+                if matches!(
+                    value,
+                    SqlType::Time(Some(ref time)) if time.scale > 7
+                ) || matches!(
+                    value,
+                    SqlType::DateTime2(Some(ref value)) if value.time.scale > 7
+                ) || matches!(
+                    value,
+                    SqlType::DateTimeOffset(Some(ref value)) if value.datetime2.time.scale > 7
+                ) {
+                    SqlType::Float(Some(1.5))
+                } else {
+                    value
+                }
+            }
+            21 => {
                 let mut parameter = encrypted_param();
                 parameter.name = Some(format!("@P{index}"));
                 return parameter;
+            }
+            22 => {
+                return with_metadata(
+                    named(index, flags, SqlType::Decimal(None)),
+                    (bits % 38) as u8 + 1,
+                    0,
+                );
             }
             _ => {
                 return named(
@@ -1637,6 +1753,176 @@ mod tests {
         (1..=count)
             .map(|index| ordinal_value(&mut rng, index))
             .collect()
+    }
+
+    /// A TIME, DATETIME2 or DATETIMEOFFSET at `scale`.
+    fn time_value<T: TimeLike>(wrap: fn(Option<T>) -> SqlType, scale: u8) -> SqlType {
+        wrap(Some(T::at(crate::datatypes::column_values::SqlTime {
+            time_nanoseconds: 863_999_999_999 - u64::from(scale) * 7_654_321,
+            scale,
+        })))
+    }
+
+    trait TimeLike {
+        fn at(time: crate::datatypes::column_values::SqlTime) -> Self;
+    }
+
+    impl TimeLike for crate::datatypes::column_values::SqlTime {
+        fn at(time: Self) -> Self {
+            time
+        }
+    }
+
+    impl TimeLike for crate::datatypes::column_values::SqlDateTime2 {
+        fn at(time: crate::datatypes::column_values::SqlTime) -> Self {
+            Self {
+                days: 3_652_058,
+                time,
+            }
+        }
+    }
+
+    impl TimeLike for crate::datatypes::column_values::SqlDateTimeOffset {
+        fn at(time: crate::datatypes::column_values::SqlTime) -> Self {
+            Self {
+                datetime2: crate::datatypes::column_values::SqlDateTime2::at(time),
+                offset: -840,
+            }
+        }
+    }
+
+    /// Every fixed-size type, non-NULL and NULL, with extreme values, every
+    /// time scale and the edge scales the async path rejects.
+    fn fixed_values(bits: u64) -> Vec<SqlType> {
+        use crate::datatypes::column_values::{
+            SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney, SqlSmallDateTime,
+            SqlSmallMoney, SqlTime,
+        };
+        let mut values = vec![
+            SqlType::Bit(Some(bits & 1 == 1)),
+            SqlType::Bit(None),
+            SqlType::TinyInt(Some(bits as u8)),
+            SqlType::SmallInt(Some(bits as i16)),
+            SqlType::Int(Some(bits as i32)),
+            SqlType::BigInt(Some(bits as i64)),
+            SqlType::Real(Some(f32::from_bits(bits as u32))),
+            SqlType::Real(Some(f32::NAN)),
+            SqlType::Real(None),
+            SqlType::Float(Some(f64::from_bits(bits))),
+            SqlType::Float(Some(f64::NEG_INFINITY)),
+            SqlType::Float(None),
+            SqlType::Decimal(Some(DecimalParts::new(
+                false,
+                38,
+                10,
+                u128::from(bits) << 61,
+            ))),
+            SqlType::Numeric(Some(DecimalParts::new(
+                true,
+                5,
+                0,
+                u128::from(bits % 99_999),
+            ))),
+            SqlType::Decimal(None),
+            SqlType::Numeric(None),
+            SqlType::Money(Some(SqlMoney {
+                lsb_part: bits as i32,
+                msb_part: (bits >> 32) as i32,
+            })),
+            SqlType::Money(None),
+            SqlType::SmallMoney(Some(SqlSmallMoney {
+                int_val: bits as i32,
+            })),
+            SqlType::SmallMoney(None),
+            SqlType::Date(Some(SqlDate::unchecked_create(bits as u32 % 3_652_059))),
+            SqlType::Date(None),
+            SqlType::DateTime(Some(SqlDateTime {
+                days: bits as i32 % 2_958_464,
+                time: (bits >> 32) as u32 % 25_920_000,
+            })),
+            SqlType::DateTime(None),
+            SqlType::SmallDateTime(Some(SqlSmallDateTime {
+                days: bits as u16,
+                time: (bits >> 16) as u16 % 1440,
+            })),
+            SqlType::SmallDateTime(None),
+            SqlType::Uuid(Some(uuid::Uuid::from_u128(u128::from(bits) * 0x9E37_79B9))),
+            SqlType::Uuid(None),
+            SqlType::Time(None),
+            SqlType::DateTime2(None),
+            SqlType::DateTimeOffset(None),
+        ];
+        for scale in 0..=8 {
+            values.push(time_value::<SqlTime>(SqlType::Time, scale));
+            values.push(time_value::<SqlDateTime2>(SqlType::DateTime2, scale));
+            values.push(time_value::<SqlDateTimeOffset>(
+                SqlType::DateTimeOffset,
+                scale,
+            ));
+        }
+        values
+    }
+
+    /// TYPE_INFO overrides the parameter's metadata supplies, as for a typed
+    /// NULL decimal or time.
+    fn with_metadata(parameter: RpcParameter, precision: u8, scale: u8) -> RpcParameter {
+        use crate::message::parameters::rpc_parameters::RpcTypeMetadata;
+        parameter.with_type_metadata(RpcTypeMetadata {
+            precision: Some(precision),
+            scale: Some(scale),
+        })
+    }
+
+    /// Each fixed-size value, alone in a packet large enough not to flush,
+    /// encodes the same through `rpc_inline` as through the async serializer,
+    /// with and without metadata overrides.
+    #[test]
+    fn fixed_inline_values_match_the_async_serializer() {
+        let mut rng = crate::io::packet_writer::tests::SplitMix64(0x6669_7865_6432);
+        let mut inline_count = 0;
+        for _ in 0..64 {
+            for value in fixed_values(rng.next()) {
+                for parameter in [
+                    param(value.clone()),
+                    with_metadata(param(value.clone()), 18, 4),
+                    with_metadata(
+                        RpcParameter::new(None, StatusFlags::BY_REF_VALUE, value.clone()),
+                        38,
+                        7,
+                    ),
+                ] {
+                    let collation = db_collation();
+                    let mut mock = MockNetworkWriter::new(4096);
+                    let mut writer =
+                        PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+                    let result = block_on(write_rpc_value(
+                        &parameter,
+                        &mut writer,
+                        &collation,
+                        ValueBinding::ByOrdinal,
+                        &GenericEncoder::new(),
+                    ));
+                    let slow = writer.get_payload().into_inner().split_off(8);
+                    drop(writer);
+                    let mut mock = MockNetworkWriter::new(4096);
+                    let mut writer =
+                        PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+                    let fast =
+                        parameter.try_write_positional_within_packet(&mut writer, &collation);
+                    let mut inline = writer.get_payload().into_inner();
+                    let inline = inline.split_off(inline.len().min(8));
+                    assert_eq!(fast, result.is_ok(), "{value:?}: {result:?}");
+                    if fast {
+                        assert_eq!(inline, slow, "{value:?}");
+                        assert_eq!(Some(inline.len()), parameter.positional_inline_len());
+                        inline_count += 1;
+                    } else {
+                        assert!(inline.is_empty());
+                    }
+                }
+            }
+        }
+        assert!(inline_count > 64 * 30 * 3, "{inline_count}");
     }
 
     /// The `sp_execute` handle, then a pad that shifts every value by one byte
@@ -1718,6 +2004,16 @@ mod tests {
             (StatusFlags::NONE, SqlType::BigInt(Some(-9))),
             (StatusFlags::NONE, SqlType::NVarchar(Some(utf16("abc")), 3)),
             (StatusFlags::NONE, SqlType::NVarchar(None, 3)),
+            (StatusFlags::NONE, SqlType::Bit(Some(true))),
+            (StatusFlags::BY_REF_VALUE, SqlType::Real(Some(-0.5))),
+            (StatusFlags::NONE, SqlType::Float(None)),
+            (
+                StatusFlags::NONE,
+                SqlType::Decimal(Some(DecimalParts::new(false, 20, 4, 12_345))),
+            ),
+            (StatusFlags::NONE, SqlType::Uuid(Some(uuid::Uuid::max()))),
+            (StatusFlags::NONE, time_value(SqlType::DateTimeOffset, 7)),
+            (StatusFlags::BY_REF_VALUE, time_value(SqlType::Time, 2)),
         ];
         for (flags, last) in lasts {
             let values = vec![

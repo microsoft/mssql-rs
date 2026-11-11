@@ -836,7 +836,9 @@ impl RpcParameter {
 
     fn inline_value(&self) -> Option<RpcInlineValue<'_>> {
         match &self.value {
-            RpcValue::Materialized(value) if self.encrypted.is_none() => value.rpc_inline(),
+            RpcValue::Materialized(value) if self.encrypted.is_none() => {
+                value.rpc_inline(self.type_metadata)
+            }
             _ => None,
         }
     }
