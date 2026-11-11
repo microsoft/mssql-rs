@@ -7,9 +7,11 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -26,21 +28,115 @@ use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracer
 use serde_json::Value as JsonValue;
 use tracing::debug;
 
+use crate::caller::{self, AiAgentSource};
+use crate::device_id;
+use crate::server_info::{self, RawServerInfo, ServerInfo};
+
 pub const USAGE_EVENT_NAME: &str = "sqlcmdcli_usage";
-pub const CONNECTION_STRING_ENV: &str = "APPLICATIONINSIGHTS_CONNECTION_STRING";
+/// The Application Insights connection string for the sqlcmd telemetry
+/// resource. A build can embed one in `SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT`;
+/// this variable overrides it. Telemetry is off when there is neither.
+pub const CONNECTION_STRING_ENV: &str = "SQLCMD_TELEMETRY_CONNECTION_STRING";
+/// Set to `1`, `true` or `yes` to turn telemetry off.
+pub const OPTOUT_ENV: &str = "SQLCMD_TELEMETRY_OPTOUT";
+const BUILT_IN_CONNECTION_STRING: Option<&str> =
+    option_env!("SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT");
 
 const CUSTOM_EVENT_OTEL_NAME: &str = "ai.custom";
 const CUSTOM_EVENT_NAME_ATTRIBUTE: &str = "ai.customEvent.name";
 const APPLICATION_INSIGHTS_EVENT_ENVELOPE: &str = "Microsoft.ApplicationInsights.Event";
-const SCHEMA_VERSION: &str = "1";
-const IMPLEMENTATION: &str = "mssql-sqlcmd-rust";
-const RUNTIME: &str = "native";
 const MAX_VERSION_LEN: usize = 64;
 pub const MAX_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const EXPORT_SCHEDULE_DELAY: Duration = Duration::from_secs(60 * 60);
+/// How long the export thread may take; the process waits for it only as long as
+/// the bound `shutdown` is given.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
-static PROVIDER: OnceLock<Mutex<Option<TelemetryProvider>>> = OnceLock::new();
+pub const KEY_VERSION: &str = "sqlcmdcli_version";
+pub const KEY_OS: &str = "sqlcmdcli_os";
+pub const KEY_ARCH: &str = "sqlcmdcli_arch";
+pub const KEY_COMMAND: &str = "sqlcmdcli_command";
+pub const KEY_FORMAT: &str = "sqlcmdcli_format";
+pub const KEY_DEVICE_ID: &str = "sqlcmdcli_devdeviceid";
+pub const KEY_CALLER_TYPE: &str = "sqlcmdcli_caller_type";
+pub const KEY_AI_AGENT_SOURCE: &str = "sqlcmdcli_ai_agent_source";
+
+/// The properties an event may carry. Anything else fails the event.
+const APPROVED_KEYS: [&str; 12] = [
+    KEY_VERSION,
+    KEY_OS,
+    KEY_ARCH,
+    KEY_COMMAND,
+    KEY_FORMAT,
+    KEY_DEVICE_ID,
+    KEY_CALLER_TYPE,
+    KEY_AI_AGENT_SOURCE,
+    server_info::KEY_ENGINE_EDITION,
+    server_info::KEY_SERVER_VERSION,
+    server_info::KEY_SERVER_OS,
+    server_info::KEY_SERVER_PLATFORM,
+];
+/// Present on every event.
+const REQUIRED_KEYS: [&str; 2] = [KEY_OS, KEY_ARCH];
+
+/// What the invocation asked for, as native sqlcmd reports it. Closed sets, so no
+/// raw argument can come through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Command {
+    /// Not a command sqlcmd measures by name; the property is omitted.
+    Unspecified,
+    Diagnose,
+}
+
+impl Command {
+    pub fn from_abi(value: i32) -> Self {
+        match value {
+            1 => Self::Diagnose,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+/// How `--format` was given.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FormatUse {
+    /// The option was not given: no property, and no "not used" value.
+    Absent,
+    Json,
+    Unrecognized,
+    Missing,
+}
+
+impl FormatUse {
+    pub fn from_abi(value: i32) -> Self {
+        match value {
+            1 => Self::Json,
+            2 => Self::Unrecognized,
+            3 => Self::Missing,
+            _ => Self::Absent,
+        }
+    }
+}
+
+/// One invocation, from native sqlcmd.
+#[derive(Clone, Copy, Debug)]
+pub struct Invocation<'a> {
+    pub version: Option<&'a str>,
+    pub command: Command,
+    pub format: FormatUse,
+}
+
+/// One process's event, assembled as the run goes: the invocation first, the
+/// server's properties when a connection succeeds. The first connection's
+/// properties are the ones kept.
+struct Session {
+    base: Vec<(&'static str, String)>,
+    server: Option<Vec<(&'static str, String)>>,
+    export: Option<mpsc::Receiver<FlushOutcome>>,
+}
+
+static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static ABI_TEST_CLIENT: OnceLock<Mutex<Option<mpsc::Sender<Request<Bytes>>>>> = OnceLock::new();
@@ -63,9 +159,14 @@ struct EventOnlyClient<C> {
 struct AbiTestClient(mpsc::Sender<Request<Bytes>>);
 
 #[cfg(test)]
+static ABI_TEST_DELAY: Mutex<Duration> = Mutex::new(Duration::ZERO);
+
+#[cfg(test)]
 #[async_trait]
 impl HttpClient for AbiTestClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        let delay = *ABI_TEST_DELAY.lock().expect("delay lock");
+        std::thread::sleep(delay);
         self.0
             .send(request)
             .map_err(|error| filter_error(error.to_string()))?;
@@ -194,21 +295,15 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
             "Application Insights usage event had no properties",
         ));
     };
-    let required: BTreeSet<&str> = [
-        "sqlcmdcli_schema_version",
-        "sqlcmdcli_os",
-        "sqlcmdcli_arch",
-        "sqlcmdcli_implementation",
-        "sqlcmdcli_runtime",
-    ]
-    .into_iter()
-    .collect();
-    let mut approved = required.clone();
-    approved.insert("sqlcmdcli_version");
-    if properties
-        .keys()
-        .any(|key| !approved.contains(key.as_str()))
-        || required.iter().any(|key| !properties.contains_key(*key))
+    let approved: BTreeSet<&str> = APPROVED_KEYS.into_iter().collect();
+    if properties.iter().any(|(key, value)| {
+        !approved.contains(key.as_str())
+            || !value
+                .as_str()
+                .is_some_and(|value| property_is_valid(key, value))
+    }) || REQUIRED_KEYS
+        .iter()
+        .any(|key| !properties.contains_key(*key))
     {
         return Err(filter_error(
             "Application Insights usage event had unexpected properties",
@@ -257,77 +352,222 @@ fn filter_error(error: impl fmt::Display) -> HttpError {
     Box::new(FilterError(error.to_string()))
 }
 
-/// Records the single usage event for one native sqlcmd run.
-///
-/// The exporter is initialized lazily from
-/// [`APPLICATIONINSIGHTS_CONNECTION_STRING`](CONNECTION_STRING_ENV). Missing or
-/// invalid configuration is a no-op. Telemetry failures never affect sqlcmd.
-pub fn record_usage(sqlcmd_version: Option<&str>) {
-    if SHUTDOWN_STARTED.load(Ordering::Acquire) {
-        return;
-    }
-    let provider = PROVIDER.get_or_init(|| Mutex::new(None));
-    let Ok(mut provider) = provider.lock() else {
-        debug!("sqlcmd telemetry provider lock is poisoned");
-        return;
-    };
+/// Whether the user turned telemetry off.
+fn opted_out() -> bool {
+    std::env::var(OPTOUT_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
 
-    if provider.is_none() {
-        let Ok(connection_string) = std::env::var(CONNECTION_STRING_ENV) else {
-            return;
-        };
-        match production_provider(&connection_string) {
-            Ok(configured) => *provider = Some(configured),
-            Err(_) => {
-                debug!("sqlcmd telemetry configuration is invalid");
-                return;
-            }
-        }
-    }
+/// The connection string telemetry would use: the variable, else the one built in.
+fn connection_string() -> Option<String> {
+    std::env::var(CONNECTION_STRING_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| BUILT_IN_CONNECTION_STRING.map(str::to_owned))
+}
 
-    let configured = provider.clone();
-    drop(provider);
-    if let Some(provider) = configured {
-        emit_usage(&provider.provider, sqlcmd_version, SystemTime::now());
+/// Whether this run reports telemetry: not opted out, and a destination exists.
+/// Native sqlcmd reads the server properties only when this is true.
+pub fn enabled() -> bool {
+    !opted_out() && connection_string().is_some()
+}
+
+fn os_value() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "windows",
+        "linux" => "linux",
+        "macos" => "macos",
+        _ => "other",
     }
 }
 
-/// Flushes and shuts down telemetry within the requested bounded interval.
+fn arch_value() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86" => "x86",
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => "other",
+    }
+}
+
+/// Whether `value` is one `key` may carry. Applied to every property before an
+/// event is built and again when the request is filtered.
+fn property_is_valid(key: &str, value: &str) -> bool {
+    match key {
+        KEY_VERSION => version_is_safe(value),
+        KEY_OS => matches!(value, "windows" | "linux" | "macos" | "other"),
+        KEY_ARCH => matches!(value, "x86" | "x86_64" | "aarch64" | "other"),
+        KEY_COMMAND => value == "diagnose",
+        KEY_FORMAT => matches!(value, "json" | "unrecognized" | "missing"),
+        KEY_DEVICE_ID => device_id::normalize(value).as_deref() == Some(value),
+        KEY_CALLER_TYPE => matches!(
+            value,
+            "human" | "agent" | "pipeline" | "other_automation" | "unknown"
+        ),
+        KEY_AI_AGENT_SOURCE => matches!(
+            value,
+            "GitHubCopilotVsCode" | "ClaudeCode" | "OpenAICodex" | "GeminiCli"
+        ),
+        other => server_info::value_is_valid(other, value),
+    }
+}
+
+/// The properties known when the invocation starts.
+fn base_properties(invocation: &Invocation<'_>) -> Vec<(&'static str, String)> {
+    let mut properties: Vec<(&'static str, String)> = Vec::new();
+    if let Some(version) = invocation
+        .version
+        .filter(|version| version_is_safe(version))
+    {
+        properties.push((KEY_VERSION, version.to_owned()));
+    }
+    properties.push((KEY_OS, os_value().to_owned()));
+    properties.push((KEY_ARCH, arch_value().to_owned()));
+    if invocation.command == Command::Diagnose {
+        properties.push((KEY_COMMAND, "diagnose".to_owned()));
+    }
+    match invocation.format {
+        FormatUse::Absent => {}
+        FormatUse::Json => properties.push((KEY_FORMAT, "json".to_owned())),
+        FormatUse::Unrecognized => properties.push((KEY_FORMAT, "unrecognized".to_owned())),
+        FormatUse::Missing => properties.push((KEY_FORMAT, "missing".to_owned())),
+    }
+    let found = caller::detect();
+    properties.push((KEY_CALLER_TYPE, found.caller_type.as_str().to_owned()));
+    if found.agent != AiAgentSource::None {
+        properties.push((KEY_AI_AGENT_SOURCE, found.agent.as_str().to_owned()));
+    }
+    // Last, so nothing above reads the device ID's store before it is known that
+    // this run reports at all.
+    if let Some(id) = device_id_value() {
+        properties.push((KEY_DEVICE_ID, id));
+    }
+    properties.retain(|(key, value)| property_is_valid(key, value));
+    properties
+}
+
+#[cfg(not(test))]
+fn device_id_value() -> Option<String> {
+    device_id::get_or_create()
+}
+
+/// Unit tests must not read or write the developer's real shared ID.
+#[cfg(test)]
+fn device_id_value() -> Option<String> {
+    Some(TEST_DEVICE_ID.to_owned())
+}
+
+#[cfg(test)]
+const TEST_DEVICE_ID: &str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
+/// Records what this run is, for its one usage event.
+///
+/// Does nothing unless [`enabled`]. Never fails, and never affects sqlcmd.
+pub fn record_usage(invocation: Invocation<'_>) {
+    if SHUTDOWN_STARTED.load(Ordering::Acquire) || !enabled() {
+        return;
+    }
+    let Ok(mut session) = SESSION.lock() else {
+        debug!("sqlcmd telemetry session lock is poisoned");
+        return;
+    };
+    if session.is_some() {
+        return;
+    }
+    *session = Some(Session {
+        base: base_properties(&invocation),
+        server: None,
+        export: None,
+    });
+}
+
+/// Adds the server's properties from the first successful connection and sends
+/// the event now, so the network work overlaps what sqlcmd does next. Later
+/// connections are ignored.
+pub fn record_server_info(raw: &RawServerInfo) {
+    if SHUTDOWN_STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(mut guard) = SESSION.lock() else {
+        return;
+    };
+    let Some(session) = guard.as_mut() else {
+        return;
+    };
+    if session.server.is_some() {
+        return;
+    }
+    let mut properties = ServerInfo::classify(raw).properties();
+    properties.retain(|(key, value)| property_is_valid(key, value));
+    session.server = Some(properties);
+    start_export(session);
+}
+
+/// Starts sending the event on its own thread, once.
+fn start_export(session: &mut Session) {
+    if session.export.is_some() {
+        return;
+    }
+    let mut properties = session.base.clone();
+    if let Some(server) = &session.server {
+        properties.extend(server.iter().cloned());
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("sqlcmd-telemetry".to_owned())
+        .spawn(move || {
+            let _ = sender.send(export_once(&properties));
+        });
+    if spawned.is_ok() {
+        session.export = Some(receiver);
+    }
+}
+
+fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
+    let Some(connection_string) = connection_string() else {
+        return FlushOutcome::Failed;
+    };
+    let Ok(provider) = production_provider(&connection_string) else {
+        debug!("sqlcmd telemetry configuration is invalid");
+        return FlushOutcome::Failed;
+    };
+    emit_usage(&provider.provider, properties, SystemTime::now());
+    if provider
+        .provider
+        .shutdown_with_timeout(EXPORT_TIMEOUT)
+        .is_err()
+        || provider.internal_failure.load(Ordering::Acquire)
+    {
+        FlushOutcome::Failed
+    } else {
+        FlushOutcome::Completed
+    }
+}
+
+/// Sends the event if it has not been sent, and waits for it within `timeout`
+/// (capped at [`MAX_FLUSH_TIMEOUT`]).
 pub fn shutdown(timeout: Duration) -> FlushOutcome {
     if SHUTDOWN_STARTED.swap(true, Ordering::AcqRel) {
         return FlushOutcome::Completed;
     }
-    let Some(provider) = PROVIDER.get() else {
-        return FlushOutcome::Completed;
-    };
-    let Ok(mut provider) = provider.try_lock() else {
+    let Ok(mut guard) = SESSION.try_lock() else {
         return FlushOutcome::Failed;
     };
-    let Some(provider) = provider.take() else {
+    let Some(mut session) = guard.take() else {
         return FlushOutcome::Completed;
     };
-    let timeout = timeout.min(MAX_FLUSH_TIMEOUT);
-    shutdown_provider(provider, timeout)
-}
-
-fn shutdown_provider(provider: TelemetryProvider, timeout: Duration) -> FlushOutcome {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = std::thread::Builder::new()
-        .name("sqlcmd-telemetry-shutdown".to_owned())
-        .spawn(move || {
-            let outcome = if provider.provider.shutdown_with_timeout(timeout).is_err()
-                || provider.internal_failure.load(Ordering::Acquire)
-            {
-                FlushOutcome::Failed
-            } else {
-                FlushOutcome::Completed
-            };
-            let _ = sender.send(outcome);
-        });
-    if worker.is_err() {
+    drop(guard);
+    start_export(&mut session);
+    let Some(receiver) = session.export else {
         return FlushOutcome::Failed;
-    }
-    match receiver.recv_timeout(timeout) {
+    };
+    match receiver.recv_timeout(timeout.min(MAX_FLUSH_TIMEOUT)) {
         Ok(outcome) => outcome,
         Err(mpsc::RecvTimeoutError::Timeout) => FlushOutcome::TimedOut,
         Err(mpsc::RecvTimeoutError::Disconnected) => FlushOutcome::Failed,
@@ -383,23 +623,19 @@ where
     })
 }
 
-fn emit_usage(provider: &SdkTracerProvider, sqlcmd_version: Option<&str>, timestamp: SystemTime) {
+fn emit_usage(
+    provider: &SdkTracerProvider,
+    properties: &[(&'static str, String)],
+    timestamp: SystemTime,
+) {
     let tracer = provider.tracer("mssql-sqlcmd");
     let mut span = tracer.start("sqlcmd.telemetry");
-    let mut attributes = vec![
-        KeyValue::new(CUSTOM_EVENT_NAME_ATTRIBUTE, USAGE_EVENT_NAME),
-        KeyValue::new("sqlcmdcli_schema_version", SCHEMA_VERSION),
-        KeyValue::new("sqlcmdcli_os", std::env::consts::OS),
-        KeyValue::new("sqlcmdcli_arch", std::env::consts::ARCH),
-        KeyValue::new("sqlcmdcli_implementation", IMPLEMENTATION),
-        KeyValue::new("sqlcmdcli_runtime", RUNTIME),
-    ];
-    if let Some(version) = sqlcmd_version.filter(|version| version_is_safe(version)) {
-        attributes.push(KeyValue::new(
-            "sqlcmdcli_version",
-            Value::String(version.to_owned().into()),
-        ));
-    }
+    let mut attributes = vec![KeyValue::new(CUSTOM_EVENT_NAME_ATTRIBUTE, USAGE_EVENT_NAME)];
+    attributes.extend(
+        properties
+            .iter()
+            .map(|(key, value)| KeyValue::new(*key, Value::String(value.clone().into()))),
+    );
     span.add_event_with_timestamp(CUSTOM_EVENT_OTEL_NAME, timestamp, attributes);
     span.end_with_timestamp(timestamp);
 }
@@ -429,11 +665,6 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct SharedClient(Arc<InMemoryClient>);
-
-    #[derive(Debug)]
-    struct SlowClient {
-        delay: Duration,
-    }
 
     struct NoopWake;
 
@@ -480,17 +711,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl HttpClient for SlowClient {
-        async fn send_bytes(&self, _request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-            std::thread::sleep(self.delay);
-            Ok(Response::builder()
-                .status(200)
-                .body(Bytes::new())
-                .expect("valid response"))
-        }
-    }
-
     const TEST_CONNECTION_STRING: &str = "InstrumentationKey=00000000-0000-0000-0000-000000000000;\
          IngestionEndpoint=https://example.test";
 
@@ -515,12 +735,11 @@ mod tests {
                 "baseData": {
                     "name": USAGE_EVENT_NAME,
                     "properties": {
-                        "sqlcmdcli_schema_version": "1",
                         "sqlcmdcli_version": "18.5",
                         "sqlcmdcli_os": "windows",
                         "sqlcmdcli_arch": "x86_64",
-                        "sqlcmdcli_implementation": "mssql-sqlcmd-rust",
-                        "sqlcmdcli_runtime": "native"
+                        "sqlcmdcli_command": "diagnose",
+                        "sqlcmdcli_caller_type": "unknown"
                     }
                 }
             }
@@ -535,7 +754,11 @@ mod tests {
 
         emit_usage(
             &provider.provider,
-            Some("18.5.1-preview.2"),
+            &[
+                (KEY_VERSION, "18.5.1-preview.2".to_owned()),
+                (KEY_OS, "windows".to_owned()),
+                (KEY_ARCH, "x86_64".to_owned()),
+            ],
             UNIX_EPOCH + Duration::from_secs(1_730_736_000),
         );
         provider
@@ -571,16 +794,9 @@ mod tests {
             .collect();
         assert_eq!(
             property_keys,
-            [
-                "sqlcmdcli_arch",
-                "sqlcmdcli_implementation",
-                "sqlcmdcli_os",
-                "sqlcmdcli_runtime",
-                "sqlcmdcli_schema_version",
-                "sqlcmdcli_version",
-            ]
-            .into_iter()
-            .collect()
+            ["sqlcmdcli_arch", "sqlcmdcli_os", "sqlcmdcli_version",]
+                .into_iter()
+                .collect()
         );
         assert!(
             envelopes
@@ -591,79 +807,282 @@ mod tests {
     }
 
     #[test]
-    fn native_abi_initializes_from_environment_and_absence_stays_off() {
-        // SAFETY: this is the only test that mutates this process-wide variable,
-        // and no other test exercises the global telemetry provider.
-        unsafe { std::env::remove_var(CONNECTION_STRING_ENV) };
-        // SAFETY: a null optional text is valid for this ABI.
-        unsafe {
-            crate::ffi::mssql_sqlcmd_telemetry_record_usage(crate::ffi::MssqlSqlcmdText {
-                data: std::ptr::null(),
-                len: 0,
-            });
-        }
-        assert!(
-            PROVIDER
-                .get()
-                .expect("provider slot")
-                .lock()
-                .expect("provider lock")
-                .is_none()
-        );
-
-        // Invalid configuration remains off. The implementation logs only a
-        // fixed diagnostic and never formats this value.
-        // SAFETY: see the process-wide environment synchronization above.
-        unsafe {
-            std::env::set_var(
-                CONNECTION_STRING_ENV,
-                "InstrumentationKey=DO-NOT-LOG-THIS;broken",
-            )
-        };
+    fn native_abi_flow_sends_one_event_with_the_server_properties_early() {
+        let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = _guard.capture_requests();
         let version: Vec<u16> = "18.5".encode_utf16().collect();
         // SAFETY: the UTF-16 buffer remains valid for the duration of the call.
         unsafe {
-            crate::ffi::mssql_sqlcmd_telemetry_record_usage(crate::ffi::MssqlSqlcmdText {
-                data: version.as_ptr(),
-                len: version.len(),
-            });
+            crate::ffi::mssql_sqlcmd_telemetry_record_usage(
+                crate::ffi::MssqlSqlcmdText {
+                    data: version.as_ptr(),
+                    len: version.len(),
+                },
+                1,
+                1,
+            );
         }
-        assert!(
-            PROVIDER
-                .get()
-                .expect("provider slot")
+        let info = server_info_fixture();
+        // SAFETY: the fixture's texts outlive the call.
+        let status = unsafe { crate::ffi::mssql_sqlcmd_telemetry_record_connection(&info.raw) };
+        assert_eq!(status, 0);
+
+        // The event goes out when the connection is recorded, before shutdown.
+        let request = requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event sent after the connection was recorded");
+        assert_eq!(crate::ffi::mssql_sqlcmd_telemetry_shutdown(1_000), 0);
+
+        let properties = event_properties(&request);
+        assert_eq!(properties["sqlcmdcli_version"], "18.5");
+        assert_eq!(properties[KEY_COMMAND], "diagnose");
+        assert_eq!(properties[KEY_FORMAT], "json");
+        assert_eq!(properties[KEY_DEVICE_ID], TEST_DEVICE_ID);
+        assert!(matches!(
+            properties[KEY_CALLER_TYPE].as_str(),
+            "agent" | "pipeline" | "unknown"
+        ));
+        assert_eq!(properties[server_info::KEY_ENGINE_EDITION], "2");
+        assert_eq!(properties[server_info::KEY_SERVER_OS], "windows");
+        assert_eq!(properties[server_info::KEY_SERVER_PLATFORM], "NT x64");
+        assert!(requests.try_recv().is_err(), "exactly one request");
+    }
+
+    #[test]
+    fn shutdown_without_a_connection_still_sends_the_invocation_event() {
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = guard.capture_requests();
+        record_usage(Invocation {
+            version: Some("18.5"),
+            command: Command::Unspecified,
+            format: FormatUse::Absent,
+        });
+
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
+
+        let properties = event_properties(&requests.try_recv().expect("one request"));
+        assert!(!properties.contains_key(KEY_COMMAND));
+        assert!(!properties.contains_key(KEY_FORMAT));
+        assert!(!properties.contains_key(server_info::KEY_ENGINE_EDITION));
+        assert!(properties.contains_key(KEY_OS) && properties.contains_key(KEY_ARCH));
+    }
+
+    #[test]
+    fn the_first_connection_wins() {
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = guard.capture_requests();
+        record_usage(Invocation {
+            version: None,
+            command: Command::Unspecified,
+            format: FormatUse::Absent,
+        });
+        record_server_info(&RawServerInfo {
+            engine_edition: 5,
+            ..RawServerInfo::default()
+        });
+        record_server_info(&RawServerInfo {
+            engine_edition: 2,
+            ..RawServerInfo::default()
+        });
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
+
+        let properties = event_properties(&requests.try_recv().expect("one request"));
+        assert_eq!(properties[server_info::KEY_ENGINE_EDITION], "5");
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn opt_out_and_a_missing_destination_send_nothing_and_read_no_device_id() {
+        for (connection_string, opt_out) in [(Some(TEST_CONNECTION_STRING), true), (None, false)] {
+            let guard = TestEnv::new(connection_string);
+            let requests = guard.capture_requests();
+            if opt_out {
+                // SAFETY: serialized by the test environment lock.
+                unsafe { std::env::set_var(OPTOUT_ENV, "1") };
+            }
+            assert!(!enabled());
+            record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Diagnose,
+                format: FormatUse::Json,
+            });
+            record_server_info(&server_info_fixture().parsed);
+            assert!(SESSION.lock().expect("session lock").is_none());
+            assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn opt_out_values() {
+        let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("YES", true),
+            ("0", false),
+            ("", false),
+        ] {
+            // SAFETY: serialized by the test environment lock.
+            unsafe { std::env::set_var(OPTOUT_ENV, value) };
+            assert_eq!(opted_out(), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_connection_string_stays_off() {
+        let guard = TestEnv::new(Some("InstrumentationKey=DO-NOT-LOG-THIS;broken"));
+        let requests = guard.capture_requests();
+        record_usage(Invocation {
+            version: Some("18.5"),
+            command: Command::Unspecified,
+            format: FormatUse::Absent,
+        });
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Failed);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn shutdown_times_out_while_the_http_request_is_still_running() {
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let _requests = guard.capture_requests();
+        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::from_secs(2);
+        record_usage(Invocation {
+            version: Some("18.5"),
+            command: Command::Unspecified,
+            format: FormatUse::Absent,
+        });
+        let started = std::time::Instant::now();
+
+        let outcome = shutdown(MAX_FLUSH_TIMEOUT);
+        *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
+
+        assert_eq!(outcome, FlushOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn values_outside_the_approved_sets_are_rejected() {
+        for (key, value) in [
+            (KEY_OS, "plan9"),
+            (KEY_ARCH, "mips"),
+            (KEY_COMMAND, "query"),
+            (KEY_FORMAT, "xml"),
+            (KEY_DEVICE_ID, "not-a-uuid"),
+            (KEY_DEVICE_ID, "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D"),
+            (KEY_CALLER_TYPE, "robot"),
+            (KEY_AI_AGENT_SOURCE, "SomethingElse"),
+            (server_info::KEY_ENGINE_EDITION, "999999"),
+            (KEY_VERSION, "18.4 user@example.com"),
+        ] {
+            assert!(!property_is_valid(key, value), "{key}={value}");
+        }
+        for (key, value) in [
+            (KEY_OS, "macos"),
+            (KEY_ARCH, "aarch64"),
+            (KEY_COMMAND, "diagnose"),
+            (KEY_FORMAT, "missing"),
+            (KEY_DEVICE_ID, TEST_DEVICE_ID),
+            (KEY_CALLER_TYPE, "pipeline"),
+            (KEY_CALLER_TYPE, "human"),
+            (KEY_CALLER_TYPE, "other_automation"),
+            (KEY_AI_AGENT_SOURCE, "ClaudeCode"),
+        ] {
+            assert!(property_is_valid(key, value), "{key}={value}");
+        }
+    }
+
+    /// Serializes the tests that use the process-wide session and environment,
+    /// and puts both back as they were.
+    struct TestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    impl TestEnv {
+        fn new(connection_string: Option<&str>) -> Self {
+            let lock = ENV_LOCK
                 .lock()
-                .expect("provider lock")
-                .is_none()
-        );
-
-        let (request_sender, request_receiver) = mpsc::channel();
-        *ABI_TEST_CLIENT
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .expect("ABI test client lock") = Some(request_sender);
-        // SAFETY: see the process-wide environment synchronization above.
-        unsafe { std::env::set_var(CONNECTION_STRING_ENV, TEST_CONNECTION_STRING) };
-        // SAFETY: the UTF-16 buffer remains valid for the duration of the call.
-        unsafe {
-            crate::ffi::mssql_sqlcmd_telemetry_record_usage(crate::ffi::MssqlSqlcmdText {
-                data: version.as_ptr(),
-                len: version.len(),
-            });
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: serialized by ENV_LOCK; these variables are read only by
+            // the telemetry module.
+            unsafe {
+                std::env::remove_var(OPTOUT_ENV);
+                match connection_string {
+                    Some(value) => std::env::set_var(CONNECTION_STRING_ENV, value),
+                    None => std::env::remove_var(CONNECTION_STRING_ENV),
+                }
+            }
+            *SESSION.lock().expect("session lock") = None;
+            SHUTDOWN_STARTED.store(false, Ordering::Release);
+            *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
+            Self { _lock: lock }
         }
-        let shutdown_status = crate::ffi::mssql_sqlcmd_telemetry_shutdown(1_000);
-        // SAFETY: see the process-wide environment synchronization above.
-        unsafe { std::env::remove_var(CONNECTION_STRING_ENV) };
-        *ABI_TEST_CLIENT
-            .get()
-            .expect("ABI test client slot")
-            .lock()
-            .expect("ABI test client lock") = None;
 
-        assert_eq!(shutdown_status, 0);
-        let request = request_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("exporter request through native ABI");
+        /// Sends what the exporter would post to the returned channel instead.
+        fn capture_requests(&self) -> mpsc::Receiver<Request<Bytes>> {
+            let (sender, receiver) = mpsc::channel();
+            *ABI_TEST_CLIENT
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("ABI test client lock") = Some(sender);
+            receiver
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            // SAFETY: still holding ENV_LOCK.
+            unsafe {
+                std::env::remove_var(OPTOUT_ENV);
+                std::env::remove_var(CONNECTION_STRING_ENV);
+            }
+            *SESSION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            if let Some(slot) = ABI_TEST_CLIENT.get() {
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+        }
+    }
+
+    struct ServerInfoFixture {
+        raw: crate::ffi::MssqlSqlcmdServerInfo,
+        parsed: RawServerInfo,
+        _buffers: Vec<Vec<u16>>,
+    }
+
+    /// A local SQL Server 2025 on Windows, as the metadata query returns it.
+    fn server_info_fixture() -> ServerInfoFixture {
+        let texts: Vec<Vec<u16>> = ["17.0.5015.4", "windows", "x64"]
+            .iter()
+            .map(|text| text.encode_utf16().collect())
+            .collect();
+        let text = |index: usize| crate::ffi::MssqlSqlcmdText {
+            data: texts[index].as_ptr(),
+            len: texts[index].len(),
+        };
+        let raw = crate::ffi::MssqlSqlcmdServerInfo {
+            engine_edition: 2,
+            product_version: text(0),
+            os: text(1),
+            arch: text(2),
+        };
+        let parsed = RawServerInfo {
+            engine_edition: 2,
+            product_version: Some("17.0.5015.4".into()),
+            os: Some("windows".into()),
+            arch: Some("x64".into()),
+        };
+        ServerInfoFixture {
+            raw,
+            parsed,
+            _buffers: texts,
+        }
+    }
+
+    fn event_properties(request: &Request<Bytes>) -> std::collections::BTreeMap<String, String> {
         let mut decompressed = Vec::new();
         GzDecoder::new(request.body().as_ref())
             .read_to_end(&mut decompressed)
@@ -677,6 +1096,13 @@ mod tests {
                 .and_then(JsonValue::as_str),
             Some(USAGE_EVENT_NAME)
         );
+        envelopes[0]
+            .pointer("/data/baseData/properties")
+            .and_then(JsonValue::as_object)
+            .expect("event properties")
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_str().expect("string").to_owned()))
+            .collect()
     }
 
     #[test]
@@ -802,7 +1228,13 @@ mod tests {
                 envelope["data"]["baseData"]["properties"]
                     .as_object_mut()
                     .expect("properties")
-                    .remove("sqlcmdcli_runtime");
+                    .remove("sqlcmdcli_os");
+                envelope
+            },
+            {
+                let mut envelope = event_envelope();
+                envelope["data"]["baseData"]["properties"]["sqlcmdcli_format"] =
+                    JsonValue::from("xml");
                 envelope
             },
         ] {
@@ -883,23 +1315,5 @@ mod tests {
 
         assert!(poll_ready(client.send_bytes(request)).is_err());
         assert!(internal_failure.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn shutdown_times_out_while_the_http_request_is_still_running() {
-        let provider = provider_with_client(
-            TEST_CONNECTION_STRING,
-            SlowClient {
-                delay: Duration::from_secs(2),
-            },
-        )
-        .expect("valid test configuration");
-        emit_usage(&provider.provider, Some("18.5"), UNIX_EPOCH);
-        let started = std::time::Instant::now();
-
-        let outcome = shutdown_provider(provider, MAX_FLUSH_TIMEOUT);
-
-        assert_eq!(outcome, FlushOutcome::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(1_500));
     }
 }

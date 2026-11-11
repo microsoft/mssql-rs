@@ -62,18 +62,54 @@ typedef struct MssqlSqlcmdText {
    locale unchanged. */
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_set_locale(MssqlSqlcmdText locale);
 
-/* Privacy-safe product telemetry. The usage call lazily configures the direct
-   Application Insights exporter from APPLICATIONINSIGHTS_CONNECTION_STRING.
-   Missing or invalid configuration is a no-op. sqlcmd_version is included only
-   when it is a bounded version-like value. Failures are ignored and never
+/* Product usage telemetry: one privacy-safe Application Insights event per run.
+   Off unless a destination is configured (the build's default, or
+   SQLCMD_TELEMETRY_CONNECTION_STRING) and SQLCMD_TELEMETRY_OPTOUT is not 1,
+   true or yes. Every function here is fail-open: failures are ignored and never
    affect sqlcmd. */
-void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
-    MssqlSqlcmdText sqlcmd_version);
 
-/* Stops new telemetry capture and flushes once. timeout_ms is capped at 1000.
-   Returns 0 when completed, unconfigured, or already started; 6 on timeout;
-   or 3 on provider failure or panic. Callers must treat every result as
-   fail-open and preserve sqlcmd behavior. */
+/* mssql_sqlcmd_telemetry_record_usage's command and format arguments. */
+#define MSSQL_SQLCMD_COMMAND_NONE 0     /* not a command that is measured by name */
+#define MSSQL_SQLCMD_COMMAND_DIAGNOSE 1
+#define MSSQL_SQLCMD_FORMAT_ABSENT 0    /* --format was not given */
+#define MSSQL_SQLCMD_FORMAT_JSON 1
+#define MSSQL_SQLCMD_FORMAT_UNRECOGNIZED 2 /* given with a value that is not supported */
+#define MSSQL_SQLCMD_FORMAT_MISSING 3   /* given with no value */
+
+/* Records what this run is. Call once after the command line is parsed.
+   sqlcmd_version is included only when it is a bounded version-like value. */
+void MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_usage(
+    MssqlSqlcmdText sqlcmd_version,
+    int32_t command,
+    int32_t format);
+
+/* Nonzero when this run reports telemetry. Read the server properties only
+   when it is. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_enabled(void);
+
+/* The SELECT that reads the server properties: four columns, in the order of
+   MssqlSqlcmdServerInfo. A static NUL-terminated UTF-8 string; do not free it.
+   Append it to a batch sqlcmd already sends, so no round trip is added. */
+const char* MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_server_info_query(void);
+
+/* The row of that SELECT. A NULL column is data == NULL with len == 0. Each text
+   is at most 128 UTF-16 code units. engine_edition is negative when not read. */
+typedef struct MssqlSqlcmdServerInfo {
+   int32_t engine_edition;
+   MssqlSqlcmdText product_version;
+   MssqlSqlcmdText os;
+   MssqlSqlcmdText arch;
+} MssqlSqlcmdServerInfo;
+
+/* Records the server properties of the first successful connection, which
+   completes the event and starts sending it. Later connections are ignored.
+   Returns 0, 1 for a null pointer, or 3 on an internal error. */
+int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_record_connection(
+    const MssqlSqlcmdServerInfo* info);
+
+/* Sends the event if it has not been sent, and waits for it for timeout_ms,
+   capped at 1000. Returns 0 when completed, off, or already started; 6 on
+   timeout; or 3 on failure or panic. */
 int32_t MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_shutdown(uint32_t timeout_ms);
 
 /* A result-set column, as the driver describes it. Only the name is always

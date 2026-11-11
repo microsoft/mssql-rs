@@ -4307,13 +4307,22 @@ struct SessionProbe {
 /// clock, in one query. The clock is read as days plus milliseconds, which
 /// every supported version can compute (`DATEDIFF_BIG` needs 2016).
 async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
+    // The server properties for usage telemetry ride in this query, so they cost
+    // no round trip; without telemetry the query is unchanged.
+    let collect = crate::telemetry::enabled();
+    let extra = if collect {
+        format!(", {}", crate::server_info::EXTRA_COLUMNS)
+    } else {
+        String::new()
+    };
     let mut result = client
         .execute(
-            "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
-             DATEDIFF(day, '19700101', t.now), \
-             DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now) \
-             FROM (SELECT SYSUTCDATETIME() AS now) AS t"
-                .to_string(),
+            format!(
+                "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
+                 DATEDIFF(day, '19700101', t.now), \
+                 DATEDIFF(millisecond, CONVERT(datetime2, CONVERT(date, t.now)), t.now){extra} \
+                 FROM (SELECT SYSUTCDATETIME() AS now) AS t"
+            ),
             (),
         )
         .await?;
@@ -4324,6 +4333,9 @@ async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
                 while let Some(row) = client.next_row().await? {
                     if probe.is_none() {
                         probe = probe_from_row(&row);
+                        if collect {
+                            record_server_info_from_row(&row);
+                        }
                     }
                 }
             }
@@ -4335,6 +4347,27 @@ async fn session_probe(client: &mut TdsClient) -> Result<SessionProbe, Error> {
     probe.ok_or_else(|| {
         Error::ProtocolError("the session validation query returned no row".to_string())
     })
+}
+
+/// The text of a string column, or `None` for `NULL` or another type.
+fn text_column(value: Option<&ColumnValues>) -> Option<String> {
+    match value {
+        Some(ColumnValues::String(text)) => Some(text.to_utf8_string()),
+        _ => None,
+    }
+}
+
+/// Hands the server properties that follow the clock columns to telemetry.
+fn record_server_info_from_row(row: &[ColumnValues]) {
+    let Some(ColumnValues::Int(edition)) = row.first() else {
+        return;
+    };
+    crate::telemetry::record_server_info(&crate::server_info::RawServerInfo {
+        engine_edition: *edition,
+        product_version: text_column(row.get(3)),
+        os: text_column(row.get(4)),
+        arch: text_column(row.get(5)),
+    });
 }
 
 /// The probe from the query's row: the engine edition, and the server's

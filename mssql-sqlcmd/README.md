@@ -60,14 +60,6 @@ returns `MSSQL_SQLCMD_UNSUPPORTED`.
 See the [diagnose reference](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/diagnose.md)
 for the depths, the report, the exit codes and what is shown or labelled.
 
-## Telemetry
-
-The library can export one privacy-safe usage event per run directly to
-Application Insights when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set.
-Missing or invalid configuration is a no-op. See the
-[telemetry architecture](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
-for the C ABI, stable schema, privacy rules, bounded shutdown, and exact
-Application Insights envelope behavior.
 ## Localization
 
 The diagnose reports, text and JSON, follow the locale native sqlcmd resolved
@@ -78,6 +70,16 @@ its keys, ids, codes and statuses are the same in every locale.
 
 See the [localization guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/localization.md)
 for how sqlcmd's text is translated end to end: the message catalogs, how translations reach the package and native sqlcmd, how the language is chosen, and what is not localized.
+
+## Telemetry
+
+The library can send one privacy-safe usage event per run directly to
+Application Insights when `SQLCMD_TELEMETRY_CONNECTION_STRING` (or a built-in
+connection string) is set and `SQLCMD_TELEMETRY_OPTOUT` is not `1`. Otherwise it
+does nothing. See the
+[telemetry architecture](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
+for the C ABI, stable schema, privacy rules, bounded shutdown, and exact
+Application Insights envelope behavior.
 
 ## Build from source
 
