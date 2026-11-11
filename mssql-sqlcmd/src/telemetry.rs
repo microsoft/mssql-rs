@@ -32,7 +32,7 @@ use opentelemetry_sdk::trace::{
 use serde_json::Value as JsonValue;
 use tracing::debug;
 
-use crate::caller::{self, AiAgentSource};
+use crate::caller;
 use crate::device_id;
 use crate::server_info::{self, RawServerInfo, ServerInfo};
 
@@ -66,10 +66,9 @@ pub const KEY_COMMAND: &str = "sqlcmdcli_command";
 pub const KEY_FORMAT: &str = "sqlcmdcli_format";
 pub const KEY_DEVICE_ID: &str = "sqlcmdcli_devdeviceid";
 pub const KEY_CALLER_TYPE: &str = "sqlcmdcli_caller_type";
-pub const KEY_AI_AGENT_SOURCE: &str = "sqlcmdcli_ai_agent_source";
 
 /// The properties an event may carry. Anything else fails the event.
-const APPROVED_KEYS: [&str; 12] = [
+const APPROVED_KEYS: [&str; 11] = [
     KEY_VERSION,
     KEY_OS,
     KEY_ARCH,
@@ -77,7 +76,6 @@ const APPROVED_KEYS: [&str; 12] = [
     KEY_FORMAT,
     KEY_DEVICE_ID,
     KEY_CALLER_TYPE,
-    KEY_AI_AGENT_SOURCE,
     server_info::KEY_ENGINE_EDITION,
     server_info::KEY_SERVER_VERSION,
     server_info::KEY_SERVER_OS,
@@ -482,10 +480,6 @@ fn property_is_valid(key: &str, value: &str) -> bool {
             value,
             "human" | "agent" | "pipeline" | "other_automation" | "unknown"
         ),
-        KEY_AI_AGENT_SOURCE => matches!(
-            value,
-            "GitHubCopilotVsCode" | "ClaudeCode" | "OpenAICodex" | "GeminiCli"
-        ),
         other => server_info::value_is_valid(other, value),
     }
 }
@@ -512,9 +506,6 @@ fn base_properties(invocation: &Invocation<'_>) -> Vec<(&'static str, String)> {
     }
     let found = caller::detect();
     properties.push((KEY_CALLER_TYPE, found.caller_type.as_str().to_owned()));
-    if found.agent != AiAgentSource::None {
-        properties.push((KEY_AI_AGENT_SOURCE, found.agent.as_str().to_owned()));
-    }
     // Last, so nothing above reads the device ID's store before it is known that
     // this run reports at all.
     if let Some(id) = device_id_value() {
@@ -1252,7 +1243,7 @@ mod tests {
             (KEY_DEVICE_ID, "not-a-uuid"),
             (KEY_DEVICE_ID, "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D"),
             (KEY_CALLER_TYPE, "robot"),
-            (KEY_AI_AGENT_SOURCE, "SomethingElse"),
+            ("sqlcmdcli_ai_agent_source", "ClaudeCode"),
             (server_info::KEY_ENGINE_EDITION, "999999"),
             (KEY_VERSION, "18.4 user@example.com"),
         ] {
@@ -1267,7 +1258,6 @@ mod tests {
             (KEY_CALLER_TYPE, "pipeline"),
             (KEY_CALLER_TYPE, "human"),
             (KEY_CALLER_TYPE, "other_automation"),
-            (KEY_AI_AGENT_SOURCE, "ClaudeCode"),
         ] {
             assert!(property_is_valid(key, value), "{key}={value}");
         }

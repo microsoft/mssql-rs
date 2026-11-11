@@ -77,7 +77,6 @@ The event timestamp is the standard one.
 | `sqlcmdcli_format` | `json`, `unrecognized`, `missing`; omitted when `--format` was not given | parsed option |
 | `sqlcmdcli_devdeviceid` | lowercase `8-4-4-4-12` GUID; omitted if it cannot be read or stored | shared Microsoft DeveloperTools ID |
 | `sqlcmdcli_caller_type` | `human`, `agent`, `pipeline`, `other_automation`, `unknown` | the caller's declaration, else environment markers, below |
-| `sqlcmdcli_ai_agent_source` | `GitHubCopilotVsCode`, `ClaudeCode`, `OpenAICodex`, `GeminiCli`; present only for an agent inferred from a marker | the marker that matched |
 | `sqlcmdcli_engine_edition` | the documented integer, e.g. `2` Standard, `3` Enterprise, `4` Express, `5` SQL Database, `8` Managed Instance | `SERVERPROPERTY('EngineEdition')` |
 | `sqlcmdcli_server_version` | e.g. `17.0.5015.4` | `SERVERPROPERTY('ProductVersion')` |
 | `sqlcmdcli_server_os` | `windows`, `linux` | `@@VERSION` |
@@ -113,9 +112,7 @@ which would need `sys.dm_os_host_info` and a server permission.
 
 A caller can declare what it is with `SQLCMD_CALLER_TYPE` set to `human`,
 `agent`, `pipeline` or `other_automation` (any case). A declaration wins over
-everything below; any other value is ignored. A declared caller carries no
-`sqlcmdcli_ai_agent_source`, so an `agent` with a source was inferred and an
-`agent` without one was declared.
+everything below; any other value is ignored.
 
 Without a declaration, detection follows DacFx's AI-agent marker list and
 precedence exactly, so a caller DacFx or SqlPackage sees as an agent is one here:
@@ -134,8 +131,8 @@ and anything else is `unknown`. DacFx also counts `AWS_REGION` and
 `AWS_DEFAULT_REGION` as AWS CodeBuild; they are left out here because they are
 set on most AWS machines, not only in builds.
 The absence of a marker does not mean a human: without a declaration sqlcmd
-never reports `human`. Only the category (and the source name above) is sent,
-never a raw environment value.
+never reports `human`. Only the category is sent, never a raw environment
+value or which agent it is.
 
 ### Device ID
 

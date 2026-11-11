@@ -73,8 +73,8 @@ impl CallerType {
 /// is ignored, so a typo falls back to detection.
 pub const DECLARED_CALLER_ENV: &str = "SQLCMD_CALLER_TYPE";
 
-/// What detection found. An `agent` with a source was inferred from a marker;
-/// without one it was declared, so the two stay distinguishable.
+/// What detection found. `agent` names the marker that matched an inferred AI
+/// agent; it is not reported, and is `None` for a declared caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Caller {
     pub caller_type: CallerType,
