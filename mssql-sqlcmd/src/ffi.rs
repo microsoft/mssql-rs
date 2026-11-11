@@ -171,20 +171,13 @@ pub extern "C" fn mssql_sqlcmd_telemetry_enabled() -> i32 {
 /// The SQL that reads the server properties: one `SELECT` of four columns, in
 /// the order of [`MssqlSqlcmdServerInfo`]'s fields. A static, NUL-terminated
 /// UTF-8 string the caller must not free. Native sqlcmd appends it to a batch it
-/// already sends, so no round trip is added.
+/// already sends, so no round trip is added. It is
+/// [`crate::server_info::QUERY`], the one definition the diagnose path's
+/// columns come from too.
 #[unsafe(no_mangle)]
 pub extern "C" fn mssql_sqlcmd_telemetry_server_info_query() -> *const std::ffi::c_char {
-    SERVER_INFO_QUERY.as_ptr().cast()
+    crate::server_info::QUERY.as_ptr().cast()
 }
-
-/// Kept equal to [`crate::server_info::STANDALONE_QUERY`] by a test.
-static SERVER_INFO_QUERY: &str = concat!(
-    "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), ",
-    "CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')), ",
-    "CASE WHEN @@VERSION LIKE '%on Linux%' THEN N'linux' WHEN @@VERSION LIKE '%on Windows%' THEN N'windows' END, ",
-    "CASE WHEN @@VERSION LIKE '%<X64>%' THEN N'x64' WHEN @@VERSION LIKE '%<X86>%' THEN N'x86' WHEN @@VERSION LIKE '%<ARM64>%' THEN N'arm64' END",
-    "\0"
-);
 
 /// The row [`mssql_sqlcmd_telemetry_server_info_query`] returns, as native sqlcmd
 /// read it. A `NULL` column is a null `data` with zero length. Every text is at
@@ -2344,14 +2337,16 @@ mod tests {
         );
     }
 
-    /// The query native sqlcmd runs is the one `server_info` documents and tests.
+    /// The exported query is the NUL-terminated one `server_info` defines.
     #[test]
-    fn the_server_info_query_matches_server_info() {
+    fn the_exported_server_info_query_is_the_one_server_info_defines() {
+        // SAFETY: the function returns a pointer to a static NUL-terminated string.
+        let exported =
+            unsafe { std::ffi::CStr::from_ptr(mssql_sqlcmd_telemetry_server_info_query()) };
         assert_eq!(
-            SERVER_INFO_QUERY.trim_end_matches('\0'),
-            crate::server_info::STANDALONE_QUERY
+            exported.to_str().expect("UTF-8"),
+            crate::server_info::QUERY.trim_end_matches('\0')
         );
-        assert!(SERVER_INFO_QUERY.ends_with('\0'));
     }
 
     /// The header declares exactly the functions this module exports, and its

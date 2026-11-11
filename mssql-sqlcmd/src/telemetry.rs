@@ -8,8 +8,6 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::TryLockError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -26,9 +24,7 @@ use opentelemetry::{KeyValue, Value};
 use opentelemetry_application_insights::{Exporter, HttpClient};
 use opentelemetry_http::HttpError;
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::{
-    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
-};
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use serde_json::Value as JsonValue;
 use tracing::debug;
 
@@ -54,7 +50,6 @@ const MAX_VERSION_LEN: usize = 64;
 const MAX_EVENTS_PER_SPAN: u32 = 8;
 pub const MAX_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
-const EXPORT_SCHEDULE_DELAY: Duration = Duration::from_secs(60 * 60);
 /// How long the export thread may take; the process waits for it only as long as
 /// the bound `shutdown` is given.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,7 +91,7 @@ pub enum Command {
 impl Command {
     pub fn from_abi(value: i32) -> Self {
         match value {
-            1 => Self::Diagnose,
+            crate::ffi::MSSQL_SQLCMD_COMMAND_DIAGNOSE => Self::Diagnose,
             _ => Self::Unspecified,
         }
     }
@@ -115,9 +110,9 @@ pub enum FormatUse {
 impl FormatUse {
     pub fn from_abi(value: i32) -> Self {
         match value {
-            1 => Self::Json,
-            2 => Self::Unrecognized,
-            3 => Self::Missing,
+            crate::ffi::MSSQL_SQLCMD_FORMAT_JSON => Self::Json,
+            crate::ffi::MSSQL_SQLCMD_FORMAT_UNRECOGNIZED => Self::Unrecognized,
+            crate::ffi::MSSQL_SQLCMD_FORMAT_MISSING => Self::Missing,
             _ => Self::Absent,
         }
     }
@@ -143,7 +138,7 @@ struct Session {
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
-static ABI_TEST_CLIENT: OnceLock<Mutex<Option<mpsc::Sender<Request<Bytes>>>>> = OnceLock::new();
+static ABI_TEST_CLIENT: Mutex<Option<mpsc::Sender<Request<Bytes>>>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlushOutcome {
@@ -165,6 +160,10 @@ struct AbiTestClient(mpsc::Sender<Request<Bytes>>);
 #[cfg(test)]
 static ABI_TEST_DELAY: Mutex<Duration> = Mutex::new(Duration::ZERO);
 
+/// The status and body the test client answers with.
+#[cfg(test)]
+static ABI_TEST_RESPONSE: Mutex<(u16, &'static str)> = Mutex::new((200, ""));
+
 #[cfg(test)]
 #[async_trait]
 impl HttpClient for AbiTestClient {
@@ -174,9 +173,10 @@ impl HttpClient for AbiTestClient {
         self.0
             .send(request)
             .map_err(|error| filter_error(error.to_string()))?;
+        let (status, body) = *ABI_TEST_RESPONSE.lock().expect("response lock");
         Ok(Response::builder()
-            .status(200)
-            .body(Bytes::new())
+            .status(status)
+            .body(Bytes::from_static(body.as_bytes()))
             .expect("valid test response"))
     }
 }
@@ -215,6 +215,11 @@ where
                 return Err(error);
             }
         };
+        // The exporter retries or drops a rejected batch on its own, and its
+        // shutdown does not hand the result back, so a rejection is recorded here.
+        if !ingestion_accepted(&response) {
+            self.internal_failure.store(true, Ordering::Release);
+        }
         match translate_partial_response(response, &original_indices, original_count) {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -305,9 +310,8 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
             "Application Insights usage event had no properties",
         ));
     };
-    let approved: BTreeSet<&str> = APPROVED_KEYS.into_iter().collect();
     if properties.iter().any(|(key, value)| {
-        !approved.contains(key.as_str())
+        !APPROVED_KEYS.contains(&key.as_str())
             || !value
                 .as_str()
                 .is_some_and(|value| property_is_valid(key, value))
@@ -325,6 +329,29 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
         .ok_or_else(|| filter_error("Application Insights event envelope was not an object"))?
         .remove("tags");
     Ok(())
+}
+
+/// Whether the service accepted the event: a 2xx response, and for a 206
+/// partial response none rejected. A 4xx or 5xx rejection (403, 429, 500...) is
+/// not accepted.
+fn ingestion_accepted(response: &Response<Bytes>) -> bool {
+    match response.status().as_u16() {
+        206 => serde_json::from_slice::<JsonValue>(response.body())
+            .ok()
+            .is_some_and(|payload| {
+                let counts = (
+                    payload.get("itemsReceived").and_then(JsonValue::as_u64),
+                    payload.get("itemsAccepted").and_then(JsonValue::as_u64),
+                );
+                let no_errors = payload
+                    .get("errors")
+                    .and_then(JsonValue::as_array)
+                    .is_none_or(Vec::is_empty);
+                no_errors
+                    && matches!(counts, (Some(received), Some(accepted)) if received == accepted)
+            }),
+        status => (200..300).contains(&status),
+    }
 }
 
 /// Translates a partial-ingestion response about the filtered request back to
@@ -430,14 +457,16 @@ fn connection_string_is_valid(connection_string: &str) -> bool {
     Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
 }
 
-/// The destination this run would send to: the variable, else the built-in
-/// connection string, and only if the exporter accepts it. An explicitly set
-/// variable that is not valid turns telemetry off; it does not fall back.
+/// The destination this run would send to, and only if the exporter accepts it.
+/// The built-in connection string is used only when the variable is absent: a
+/// variable that is set, even to an empty or invalid value (or one that is not
+/// valid text), turns telemetry off and does not fall back.
 fn destination() -> Option<String> {
-    let explicit = std::env::var(CONNECTION_STRING_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let candidate = explicit.or_else(|| BUILT_IN_CONNECTION_STRING.map(str::to_owned))?;
+    let candidate = match std::env::var(CONNECTION_STRING_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => BUILT_IN_CONNECTION_STRING?.to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => return None,
+    };
     connection_string_is_valid(&candidate).then_some(candidate)
 }
 
@@ -485,6 +514,9 @@ fn property_is_valid(key: &str, value: &str) -> bool {
 }
 
 /// The properties known when the invocation starts.
+///
+/// This reads or creates the shared device ID, so it must only be called once
+/// [`enabled`] is true; [`record_usage`] checks that first.
 fn base_properties(invocation: &Invocation<'_>) -> Vec<(&'static str, String)> {
     let mut properties: Vec<(&'static str, String)> = Vec::new();
     if let Some(version) = invocation
@@ -504,10 +536,8 @@ fn base_properties(invocation: &Invocation<'_>) -> Vec<(&'static str, String)> {
         FormatUse::Unrecognized => properties.push((KEY_FORMAT, "unrecognized".to_owned())),
         FormatUse::Missing => properties.push((KEY_FORMAT, "missing".to_owned())),
     }
-    let found = caller::detect();
-    properties.push((KEY_CALLER_TYPE, found.caller_type.as_str().to_owned()));
-    // Last, so nothing above reads the device ID's store before it is known that
-    // this run reports at all.
+    properties.push((KEY_CALLER_TYPE, caller::detect().as_str().to_owned()));
+    // Last, after everything that needs no stored state.
     if let Some(id) = device_id_value() {
         properties.push((KEY_DEVICE_ID, id));
     }
@@ -629,9 +659,10 @@ fn export_once(properties: &[(&'static str, String)]) -> FlushOutcome {
 /// Sends the event if it has not been sent, and waits for it within `timeout`
 /// (capped at [`MAX_FLUSH_TIMEOUT`]).
 ///
-/// The session lock is taken with a bounded wait, never a blocking one: this can
-/// run from a console control or signal handler on a thread that interrupted a
-/// holder of the lock.
+/// The session lock is taken with a bounded wait, never a blocking one, because
+/// this can run on the Windows console-control thread while another thread holds
+/// the lock. It is not async-signal-safe (it takes locks, allocates and spawns a
+/// thread): never call it from a POSIX signal handler.
 pub fn shutdown(timeout: Duration) -> FlushOutcome {
     let timeout = timeout.min(MAX_FLUSH_TIMEOUT);
     let deadline = Instant::now() + timeout;
@@ -670,7 +701,6 @@ fn production_provider(
 ) -> Result<TelemetryProvider, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(test)]
     if let Some(client) = ABI_TEST_CLIENT
-        .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("ABI test client lock")
         .clone()
@@ -697,21 +727,14 @@ where
         connection_string,
         EventOnlyClient::new(client, Arc::clone(&internal_failure)),
     )?;
-    let batch = BatchSpanProcessor::builder(exporter)
-        .with_batch_config(
-            BatchConfigBuilder::default()
-                .with_max_queue_size(2)
-                .with_max_export_batch_size(2)
-                .with_scheduled_delay(EXPORT_SCHEDULE_DELAY)
-                .build(),
-        )
-        .build();
-    // The SDK reads OTEL_* variables for its defaults. The resource, the sampler
-    // and the event limit are set here so that ambient tracing configuration can
-    // neither add identifiers to the event nor switch it off.
+    // One event, exported when its span ends, on this thread: nothing is queued
+    // behind a timer. The SDK reads OTEL_* variables for its defaults, so the
+    // resource, the sampler and the event limit are set here so that ambient
+    // tracing configuration can neither add identifiers to the event nor switch
+    // it off.
     Ok(TelemetryProvider {
         provider: SdkTracerProvider::builder()
-            .with_span_processor(batch)
+            .with_simple_exporter(exporter)
             .with_resource(Resource::builder_empty().build())
             .with_sampler(Sampler::AlwaysOn)
             .with_max_events_per_span(MAX_EVENTS_PER_SPAN)
@@ -767,7 +790,6 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::future::Future;
-    use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
     use std::time::UNIX_EPOCH;
 
@@ -922,8 +944,8 @@ mod tests {
 
     #[test]
     fn native_abi_flow_sends_one_event_with_the_server_properties_early() {
-        let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
-        let requests = _guard.capture_requests();
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = guard.capture_requests();
         let version: Vec<u16> = "18.5".encode_utf16().collect();
         // SAFETY: the UTF-16 buffer remains valid for the duration of the call.
         unsafe {
@@ -1036,12 +1058,18 @@ mod tests {
     }
 
     #[test]
-    fn a_compiled_in_destination_is_used_when_the_variable_is_not_set() {
+    fn a_compiled_in_destination_is_used_only_when_the_variable_is_absent() {
         let _guard = TestEnv::new(None);
-        assert_eq!(
-            enabled(),
-            BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid)
-        );
+        let built_in = BUILT_IN_CONNECTION_STRING.is_some_and(connection_string_is_valid);
+        assert_eq!(enabled(), built_in);
+
+        // A variable that is set, even to nothing, is an override: it does not
+        // fall back to the built-in destination.
+        for explicit in ["", "   ", "\t", "not a connection string"] {
+            // SAFETY: serialized by the test environment lock.
+            unsafe { std::env::set_var(CONNECTION_STRING_ENV, explicit) };
+            assert!(!enabled(), "{explicit:?}");
+        }
     }
 
     #[test]
@@ -1066,6 +1094,8 @@ mod tests {
             "InstrumentationKey=DO-NOT-LOG-THIS;broken",
             "not a connection string",
             "   x   ",
+            "",
+            "   ",
         ] {
             let guard = TestEnv::new(Some(invalid));
             let requests = guard.capture_requests();
@@ -1089,14 +1119,90 @@ mod tests {
         assert!(enabled());
     }
 
+    /// The service's answer decides the outcome the C ABI reports: a rejection is
+    /// a failure even though the SDK's shutdown does not hand the result back.
+    #[test]
+    fn a_rejected_event_is_reported_as_a_failure() {
+        // The exporter retries throttling and server errors with a backoff, so
+        // for those the bounded wait may end first: not a success either way.
+        let accepted = FlushOutcome::Completed;
+        for (status, body, rejected_outright) in [
+            (200, "", false),
+            (
+                206,
+                r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#,
+                false,
+            ),
+            (403, "", true),
+            (400, r#"{"errors":[]}"#, true),
+            (429, "", false),
+            (500, "", false),
+            (503, "", false),
+            (
+                206,
+                r#"{"itemsReceived":1,"itemsAccepted":0,"errors":[{"index":0,"statusCode":429}]}"#,
+                false,
+            ),
+            (206, "not json", false),
+        ] {
+            let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+            let requests = guard.capture_requests();
+            guard.respond_with(status, body);
+            record_usage(Invocation {
+                version: Some("18.5"),
+                command: Command::Unspecified,
+                format: FormatUse::Absent,
+            });
+
+            // A retried rejection is still backing off when a short wait ends.
+            let wait = if rejected_outright || status == 200 {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(300)
+            };
+            let outcome = shutdown(wait);
+
+            assert!(requests.try_recv().is_ok(), "the event was sent: {status}");
+            let is_success = matches!(status, 200) || body.contains(r#""itemsAccepted":1"#);
+            if is_success {
+                assert_eq!(outcome, accepted, "{status} {body}");
+            } else if rejected_outright {
+                assert_eq!(outcome, FlushOutcome::Failed, "{status} {body}");
+            } else {
+                assert_ne!(outcome, accepted, "{status} {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn ingestion_is_accepted_only_for_a_success_status() {
+        let response = |status: u16, body: &'static str| {
+            Response::builder()
+                .status(status)
+                .body(Bytes::from_static(body.as_bytes()))
+                .expect("valid response")
+        };
+        assert!(ingestion_accepted(&response(200, "")));
+        assert!(ingestion_accepted(&response(
+            206,
+            r#"{"itemsReceived":2,"itemsAccepted":2,"errors":[]}"#
+        )));
+        for rejected in [301, 400, 401, 403, 408, 429, 500, 503] {
+            assert!(!ingestion_accepted(&response(rejected, "")), "{rejected}");
+        }
+        assert!(!ingestion_accepted(&response(
+            206,
+            r#"{"itemsReceived":2,"itemsAccepted":1,"errors":[{"index":1}]}"#
+        )));
+        assert!(!ingestion_accepted(&response(206, "[]")));
+    }
+
     /// A call that is admitted before shutdown is sent by it, and one that comes
     /// after is not recorded: never a recorded session that nobody sends.
     #[test]
     fn recording_racing_shutdown_never_leaves_an_unsent_session() {
         let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
         let requests = guard.capture_requests();
-        let mut sent = 0;
-        let mut dropped = 0;
         for _ in 0..40 {
             *SESSION.lock().expect("session lock") = None;
             SHUTDOWN_STARTED.store(false, Ordering::Release);
@@ -1119,16 +1225,13 @@ mod tests {
             let outcome = closer.join().expect("closer");
 
             assert!(SESSION.lock().expect("session lock").is_none());
-            match requests.recv_timeout(Duration::from_millis(50)) {
-                Ok(_) => {
-                    assert_eq!(outcome, FlushOutcome::Completed);
-                    sent += 1;
-                }
-                Err(_) => dropped += 1,
+            // Recorded first: shutdown sent it. Shutdown first: it was not
+            // recorded. Either way at most one event, and none left over.
+            if requests.recv_timeout(Duration::from_millis(50)).is_ok() {
+                assert_eq!(outcome, FlushOutcome::Completed);
             }
             assert!(requests.try_recv().is_err(), "at most one event");
         }
-        assert_eq!(sent + dropped, 40);
     }
 
     #[test]
@@ -1289,17 +1392,20 @@ mod tests {
             SHUTDOWN_STARTED.store(false, Ordering::Release);
             DEVICE_ID_READS.store(0, Ordering::Release);
             *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
+            *ABI_TEST_RESPONSE.lock().expect("response lock") = (200, "");
             Self { _lock: lock }
         }
 
         /// Sends what the exporter would post to the returned channel instead.
         fn capture_requests(&self) -> mpsc::Receiver<Request<Bytes>> {
             let (sender, receiver) = mpsc::channel();
-            *ABI_TEST_CLIENT
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .expect("ABI test client lock") = Some(sender);
+            *ABI_TEST_CLIENT.lock().expect("ABI test client lock") = Some(sender);
             receiver
+        }
+
+        /// What the service answers with, for the next requests.
+        fn respond_with(&self, status: u16, body: &'static str) {
+            *ABI_TEST_RESPONSE.lock().expect("response lock") = (status, body);
         }
     }
 
@@ -1313,9 +1419,12 @@ mod tests {
             *SESSION
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            if let Some(slot) = ABI_TEST_CLIENT.get() {
-                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            }
+            *ABI_TEST_CLIENT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *ABI_TEST_RESPONSE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = (200, "");
         }
     }
 
@@ -1417,18 +1526,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn event_filter_drops_the_enclosing_dependency() {
-        let body = serde_json::to_vec(&vec![
-            serde_json::json!({"name": "Microsoft.ApplicationInsights.RemoteDependency"}),
-            event_envelope(),
-        ])
-        .expect("serialize envelopes");
+    fn gzip_json(envelopes: &[JsonValue]) -> Vec<u8> {
+        let body = serde_json::to_vec(envelopes).expect("serialize envelopes");
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&body).expect("compress envelopes");
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from(encoder.finish().expect("finish gzip")))
-            .expect("valid request");
+        encoder.finish().expect("finish gzip")
+    }
+
+    /// A request to the track endpoint with the given body.
+    fn track_request_with(body: Bytes) -> Request<Bytes> {
+        Request::post("https://example.test/v2/track")
+            .body(body)
+            .expect("valid request")
+    }
+
+    /// A request to the track endpoint carrying `envelopes`, compressed as the
+    /// exporter sends them.
+    fn track_request(envelopes: &[JsonValue]) -> Request<Bytes> {
+        track_request_with(Bytes::from(gzip_json(envelopes)))
+    }
+
+    /// The envelope of the span the exporter always adds around the event.
+    fn dependency_envelope() -> JsonValue {
+        serde_json::json!({"name": "Microsoft.ApplicationInsights.RemoteDependency"})
+    }
+
+    #[test]
+    fn event_filter_drops_the_enclosing_dependency() {
+        let request = track_request(&[dependency_envelope(), event_envelope()]);
 
         let filtered = filter_event_request(request).expect("filter succeeds");
         let mut decompressed = Vec::new();
@@ -1447,30 +1572,12 @@ mod tests {
 
     #[test]
     fn event_filter_rejects_an_all_filtered_payload() {
-        let body = serde_json::to_vec(&vec![serde_json::json!({
-            "name": "Microsoft.ApplicationInsights.RemoteDependency"
-        })])
-        .expect("serialize dependency");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&body).expect("compress dependency");
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from(encoder.finish().expect("finish gzip")))
-            .expect("valid request");
-
-        assert!(filter_event_request(request).is_err());
+        assert!(filter_event_request(track_request(&[dependency_envelope()])).is_err());
     }
 
     #[test]
     fn client_records_all_filtered_payload_as_an_internal_failure() {
-        let body = serde_json::to_vec(&vec![serde_json::json!({
-            "name": "Microsoft.ApplicationInsights.RemoteDependency"
-        })])
-        .expect("serialize dependency");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&body).expect("compress dependency");
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from(encoder.finish().expect("finish gzip")))
-            .expect("valid request");
+        let request = track_request(&[dependency_envelope()]);
         let internal_failure = Arc::new(AtomicBool::new(false));
         let client =
             EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&internal_failure));
@@ -1486,27 +1593,31 @@ mod tests {
             VecDeque::from([Err(filter_error("connection refused"))]);
         let internal_failure = Arc::new(AtomicBool::new(false));
         let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from(gzip_json(&[event_envelope()])))
-            .expect("valid request");
 
-        assert!(poll_ready(client.send_bytes(request)).is_err());
+        assert!(poll_ready(client.send_bytes(track_request(&[event_envelope()]))).is_err());
         assert!(internal_failure.load(Ordering::Acquire));
     }
 
-    fn gzip_json(envelopes: &[JsonValue]) -> Vec<u8> {
-        let body = serde_json::to_vec(envelopes).expect("serialize envelopes");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&body).expect("compress envelopes");
-        encoder.finish().expect("finish gzip")
+    #[test]
+    fn client_records_a_rejection_as_an_internal_failure_but_passes_the_response_on() {
+        let inner = InMemoryClient::succeeding();
+        *inner.0.responses.lock().expect("response lock") =
+            VecDeque::from([Ok(Response::builder()
+                .status(403)
+                .body(Bytes::new())
+                .expect("valid response"))]);
+        let internal_failure = Arc::new(AtomicBool::new(false));
+        let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
+
+        let response = poll_ready(client.send_bytes(track_request(&[event_envelope()])))
+            .expect("the exporter still sees the response");
+        assert_eq!(response.status().as_u16(), 403);
+        assert!(internal_failure.load(Ordering::Acquire));
     }
 
     #[test]
     fn event_filter_rejects_malformed_compressed_payload() {
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from_static(b"not gzip"))
-            .expect("valid request");
-        assert!(filter_event_request(request).is_err());
+        assert!(filter_event_request(track_request_with(Bytes::from_static(b"not gzip"))).is_err());
     }
 
     #[test]
@@ -1514,9 +1625,7 @@ mod tests {
         let internal_failure = Arc::new(AtomicBool::new(false));
         let client =
             EventOnlyClient::new(InMemoryClient::succeeding(), Arc::clone(&internal_failure));
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from_static(b"not gzip"))
-            .expect("valid request");
+        let request = track_request_with(Bytes::from_static(b"not gzip"));
         assert!(poll_ready(client.send_bytes(request)).is_err());
         assert!(internal_failure.load(Ordering::Acquire));
     }
@@ -1549,28 +1658,13 @@ mod tests {
                 envelope
             },
         ] {
-            let body = serde_json::to_vec(&vec![envelope]).expect("serialize event");
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&body).expect("compress event");
-            let request = Request::post("https://example.test/v2/track")
-                .body(Bytes::from(encoder.finish().expect("finish gzip")))
-                .expect("valid request");
-            assert!(filter_event_request(request).is_err());
+            assert!(filter_event_request(track_request(&[envelope])).is_err());
         }
     }
 
     #[test]
     fn partial_response_indices_are_mapped_to_the_original_exporter_batch() {
-        let body = serde_json::to_vec(&vec![
-            serde_json::json!({"name": "Microsoft.ApplicationInsights.RemoteDependency"}),
-            event_envelope(),
-        ])
-        .expect("serialize envelopes");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&body).expect("compress envelopes");
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from(encoder.finish().expect("finish gzip")))
-            .expect("valid request");
+        let request = track_request(&[dependency_envelope(), event_envelope()]);
         let filtered = filter_event_request(request).expect("filter succeeds");
         let response = Response::builder()
             .status(206)
@@ -1658,16 +1752,7 @@ mod tests {
         let internal_failure = Arc::new(AtomicBool::new(false));
         let client = EventOnlyClient::new(inner, Arc::clone(&internal_failure));
 
-        let body = serde_json::to_vec(&vec![
-            serde_json::json!({"name": "Microsoft.ApplicationInsights.RemoteDependency"}),
-            event_envelope(),
-        ])
-        .expect("serialize envelopes");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&body).expect("compress envelopes");
-        let request = Request::post("https://example.test/v2/track")
-            .body(Bytes::from(encoder.finish().expect("finish gzip")))
-            .expect("valid request");
+        let request = track_request(&[dependency_envelope(), event_envelope()]);
 
         assert!(poll_ready(client.send_bytes(request)).is_err());
         assert!(internal_failure.load(Ordering::Acquire));

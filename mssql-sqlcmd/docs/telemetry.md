@@ -16,7 +16,7 @@ below are done.
 | Setting | Effect |
 |---|---|
 | `SQLCMD_TELEMETRY_OPTOUT=1` (or `true`, `yes`) | No event, no server query, and the device ID is neither read nor created. |
-| `SQLCMD_TELEMETRY_CONNECTION_STRING` | The Application Insights connection string. Overrides the built-in one. A value the exporter does not accept turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
+| `SQLCMD_TELEMETRY_CONNECTION_STRING` | The Application Insights connection string. Overrides the built-in one, which is used only when the variable is absent. A variable that is set to an empty, invalid or non-text value turns telemetry off; it does not fall back to the built-in one, and nothing else (the device ID, the server query) runs. |
 | `SQLCMD_TELEMETRY_CONNECTION_STRING_DEFAULT` (build time) | A connection string compiled into the library. Without it, and without the variable, telemetry is off. |
 | `SQLCMD_CALLER_TYPE` | The caller declares itself: `human`, `agent`, `pipeline` or `other_automation`. Not a telemetry switch; it only sets the caller category. |
 
@@ -100,13 +100,20 @@ server platform) come from one `SELECT`, returned by
 and only when telemetry is enabled, so it adds no round trip (measured about
 2 ms against Azure SQL Database; a separate batch added about 196 ms). If the
 combined batch fails, the plain `SET TEXTSIZE` is sent, as it would have been.
-The Rust `diagnose` path adds the columns to its existing session probe. The
-query needs no permission beyond a connection.
+The Rust `diagnose` path adds the columns to its existing session probe, and
+records the row after that check's timing is taken, so telemetry cannot change
+the reported duration or clock offset. The query needs no permission beyond a
+connection. The query text is defined once, in `server_info.rs`, and both
+paths use it.
 
 Platform and OS are read from `@@VERSION` because `xp_msver` is unavailable on
 Azure SQL Database and `sys.dm_os_host_info` fails there; both stay omitted on
-Azure SQL Database, as in DacFx. Only the OS family is sent, not its version,
-which would need `sys.dm_os_host_info` and a server permission.
+Azure SQL Database, as in DacFx. The architecture is the build's, the
+parenthesized marker after the version number (`(X64)`, `(Intel X86)`,
+`(ARM64)`), not the `<X64>` after the OS name, so a 32-bit instance on 64-bit
+Windows reads as `NT INTEL X86`, as `xp_msver` reports it. Only the OS family is
+sent, not its version, which would need `sys.dm_os_host_info` and a server
+permission.
 
 ### Caller category
 
@@ -114,8 +121,9 @@ A caller can declare what it is with `SQLCMD_CALLER_TYPE` set to `human`,
 `agent`, `pipeline` or `other_automation` (any case). A declaration wins over
 everything below; any other value is ignored.
 
-Without a declaration, detection follows DacFx's AI-agent marker list and
-precedence exactly, so a caller DacFx or SqlPackage sees as an agent is one here:
+Without a declaration, detection uses DacFx's AI-agent environment markers, so
+a caller DacFx or SqlPackage sees as an agent is one here. Any one of them is
+enough:
 
 1. `AI_AGENT=github_copilot_vscode_agent`
 2. `CLAUDE_CODE_CHILD_SESSION=1`
@@ -137,15 +145,20 @@ value or which agent it is.
 ### Device ID
 
 The ID is the shared Microsoft DeveloperTools device ID: on Windows the
-`deviceid` value of `HKCU\SOFTWARE\Microsoft\DeveloperTools` (64-bit view), on
-macOS and Linux a file in the user's home. An existing recognized ID is reused;
+`deviceid` value of `HKCU\SOFTWARE\Microsoft\DeveloperTools` (64-bit view); on
+macOS `~/Library/Application Support/Microsoft/DeveloperTools/deviceid`; on
+Linux `$XDG_CACHE_HOME/Microsoft/DeveloperTools/deviceid` when `XDG_CACHE_HOME`
+is set, else `~/.cache/Microsoft/DeveloperTools/deviceid`. An existing
+recognized ID is reused;
 a missing one is generated (a random version 4 UUID) and stored. A value that is
 present but unreadable or unrecognized is never overwritten. If it cannot be
 read or stored, the property is omitted. When telemetry is off, the ID is not
 touched. Two first runs at the same moment end up with the same ID: on macOS and
 Linux the ID is written to a file of its own and linked into place, which fails
 if the ID file exists, and the loser reads the winner's; on Windows first runs
-take a named mutex, and the value is read back after it is written. A tool that
+take a named mutex, and the value is read back after it is written. A first run
+that cannot take the mutex within two seconds does not create the ID, and the
+event goes without it. A tool that
 writes the shared ID without that mutex can still race on Windows; the
 read-back reports the value that survives. The ID is end-user pseudonymized
 information and is sent as the GUID, not hashed.
@@ -178,12 +191,16 @@ On Windows the console control handler (Ctrl+C in non-interactive mode, console
 close) sends the event before ending the process. On Linux and macOS the signal
 handlers do not flush: an event for a run ended by a signal is lost.
 
-The queue and export batch are bounded at two items, and the event is exported
-at once by its own thread, which shuts its provider down after the one event, so
-nothing waits on the batch processor's timer in a long interactive session. A
-transport failure, a failure in the filter, or a response that does not match
-what was sent is an error and is reflected in the result of the export. An
-all-filtered or malformed request is an error, not a synthetic success. A
+The event is exported at once by its own thread, using a simple exporter: the
+span ends, the event is sent on that thread, and the provider is shut down, so
+nothing waits on a batch timer in a long interactive session. A transport
+failure, a failure in the filter, a response that does not match what was sent,
+and a rejection by the service (a 4xx or 5xx status, or a partial response that
+rejected the event) are all recorded as a failure, because the SDK's shutdown
+does not hand the export result back. The exporter retries throttling and server
+errors with a backoff; the bounded wait then ends first, and that is reported as
+a timeout, not as success. An all-filtered or malformed request is an error, not
+a synthetic success. A
 partial-ingestion response is checked against the request first (item counts,
 and that every error index is present, unique and in range) before its indices
 are translated back to the original batch; a response that does not add up is
@@ -191,8 +208,10 @@ an error and is never taken as an acceptance.
 
 Recording and shutdown are ordered by one lock: a call admitted before shutdown
 is sent by it, and a call after it is not recorded. Shutdown takes that lock
-with a bounded wait, because it can run from a console control or signal handler
-on a thread that interrupted a holder of it.
+with a bounded wait, because it can run on the Windows console-control thread
+while another thread holds it. It is not async-signal-safe (it takes locks,
+allocates and spawns a thread), so it must never be called from a POSIX signal
+handler, which is why the Linux and macOS handlers do not flush.
 
 The SDK reads `OTEL_*` environment variables for its defaults. The provider sets
 an empty resource, an always-on sampler and an event limit itself, so ambient

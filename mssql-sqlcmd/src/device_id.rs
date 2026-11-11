@@ -166,8 +166,9 @@ mod registry {
     }
 
     /// A named mutex that serializes first runs of sqlcmd on this user's session.
-    /// Taking it is best effort: if it cannot be taken the caller goes on
-    /// without it, and the read-back after writing still reports what is stored.
+    /// A first run that cannot take it, because of an error or the wait timing
+    /// out, does not create the ID: it would race with the lock's owner, so the
+    /// event goes without the property instead.
     struct FirstRunLock(HANDLE);
 
     impl FirstRunLock {
@@ -200,10 +201,13 @@ mod registry {
         }
     }
 
-    impl Store for RegistryStore {
-        fn read(&self) -> io::Result<Option<String>> {
+    /// An open registry key, closed when it goes out of scope.
+    struct OpenKey(HKEY);
+
+    impl OpenKey {
+        /// The key for reading, or `None` when it does not exist.
+        fn open_read() -> io::Result<Option<Self>> {
             let path = key_path();
-            let name = wide("deviceid");
             let mut key: HKEY = std::ptr::null_mut();
             // SAFETY: `path` is NUL-terminated and `key` is a valid out pointer.
             let status = unsafe {
@@ -221,79 +225,12 @@ mod registry {
             if status != ERROR_SUCCESS {
                 return Err(os_error(status));
             }
-            let result = (|| {
-                let mut kind = 0u32;
-                let mut size = 0u32;
-                // SAFETY: `key` is open; a null data pointer asks for the size.
-                let status = unsafe {
-                    RegQueryValueExW(
-                        key,
-                        name.as_ptr(),
-                        std::ptr::null(),
-                        &mut kind,
-                        std::ptr::null_mut(),
-                        &mut size,
-                    )
-                };
-                if status == ERROR_FILE_NOT_FOUND {
-                    return Ok(None);
-                }
-                if status != ERROR_SUCCESS {
-                    return Err(os_error(status));
-                }
-                if kind != REG_SZ || size == 0 || size > 4096 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected value",
-                    ));
-                }
-                let mut data = vec![0u16; (size as usize).div_ceil(2)];
-                let mut capacity = (data.len() * 2) as u32;
-                // SAFETY: `data` holds `capacity` bytes.
-                let status = unsafe {
-                    RegQueryValueExW(
-                        key,
-                        name.as_ptr(),
-                        std::ptr::null(),
-                        &mut kind,
-                        data.as_mut_ptr().cast(),
-                        &mut capacity,
-                    )
-                };
-                if status != ERROR_SUCCESS {
-                    return Err(os_error(status));
-                }
-                let units = (capacity as usize / 2).min(data.len());
-                let end = data[..units]
-                    .iter()
-                    .position(|&unit| unit == 0)
-                    .unwrap_or(units);
-                Ok(Some(String::from_utf16_lossy(&data[..end])))
-            })();
-            // SAFETY: `key` was opened above and is closed once.
-            unsafe { RegCloseKey(key) };
-            result
+            Ok(Some(Self(key)))
         }
 
-        /// Under the first-run lock: reuse a value that is there, else store `id`,
-        /// and report what is stored. A tool that stores the shared ID without the
-        /// lock can still overwrite between the write and the read-back; the
-        /// read-back narrows that to the one value that survives.
-        fn create_if_absent(&self, id: &str) -> io::Result<String> {
-            let _lock = FirstRunLock::acquire();
-            if let Some(existing) = self.read()? {
-                return Ok(existing);
-            }
-            self.set_value(id)?;
-            Ok(self.read()?.unwrap_or_else(|| id.to_owned()))
-        }
-    }
-
-    impl RegistryStore {
-        fn set_value(&self, id: &str) -> io::Result<()> {
+        /// The key for writing, created if it does not exist.
+        fn create() -> io::Result<Self> {
             let path = key_path();
-            let name = wide("deviceid");
-            let value = wide(id);
             let mut key: HKEY = std::ptr::null_mut();
             // SAFETY: `path` is NUL-terminated and `key` is a valid out pointer.
             let status = unsafe {
@@ -312,10 +249,103 @@ mod registry {
             if status != ERROR_SUCCESS {
                 return Err(os_error(status));
             }
+            Ok(Self(key))
+        }
+    }
+
+    impl Drop for OpenKey {
+        fn drop(&mut self) {
+            // SAFETY: the key was opened by `RegOpenKeyExW` or `RegCreateKeyExW`
+            // and is closed once, here.
+            unsafe { RegCloseKey(self.0) };
+        }
+    }
+
+    impl Store for RegistryStore {
+        fn read(&self) -> io::Result<Option<String>> {
+            let Some(key) = OpenKey::open_read()? else {
+                return Ok(None);
+            };
+            let key = key.0;
+            let name = wide("deviceid");
+            let mut kind = 0u32;
+            let mut size = 0u32;
+            // SAFETY: `key` is open; a null data pointer asks for the size.
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    std::ptr::null(),
+                    &mut kind,
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            if status != ERROR_SUCCESS {
+                return Err(os_error(status));
+            }
+            if kind != REG_SZ || size == 0 || size > 4096 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected value",
+                ));
+            }
+            let mut data = vec![0u16; (size as usize).div_ceil(2)];
+            let mut capacity = (data.len() * 2) as u32;
+            // SAFETY: `data` holds `capacity` bytes.
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    std::ptr::null(),
+                    &mut kind,
+                    data.as_mut_ptr().cast(),
+                    &mut capacity,
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(os_error(status));
+            }
+            let units = (capacity as usize / 2).min(data.len());
+            let end = data[..units]
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(units);
+            Ok(Some(String::from_utf16_lossy(&data[..end])))
+        }
+
+        /// Under the first-run lock: reuse a value that is there, else store `id`,
+        /// and report what is stored. If the lock cannot be taken this is an
+        /// error, not an unlocked write. A tool that stores the shared ID without
+        /// the lock can still overwrite between the write and the read-back; the
+        /// read-back narrows that to the one value that survives.
+        fn create_if_absent(&self, id: &str) -> io::Result<String> {
+            let _lock = FirstRunLock::acquire().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the device ID first-run lock could not be taken",
+                )
+            })?;
+            if let Some(existing) = self.read()? {
+                return Ok(existing);
+            }
+            self.set_value(id)?;
+            Ok(self.read()?.unwrap_or_else(|| id.to_owned()))
+        }
+    }
+
+    impl RegistryStore {
+        fn set_value(&self, id: &str) -> io::Result<()> {
+            let key = OpenKey::create()?;
+            let name = wide("deviceid");
+            let value = wide(id);
             // SAFETY: `value` is NUL-terminated and its byte length is passed.
             let status = unsafe {
                 RegSetValueExW(
-                    key,
+                    key.0,
                     name.as_ptr(),
                     0,
                     REG_SZ,
@@ -323,8 +353,6 @@ mod registry {
                     (value.len() * 2) as u32,
                 )
             };
-            // SAFETY: `key` was opened above and is closed once.
-            unsafe { RegCloseKey(key) };
             if status != ERROR_SUCCESS {
                 return Err(os_error(status));
             }

@@ -5,25 +5,42 @@
 //! successful connection: engine edition, SQL Server version, server operating
 //! system and server platform.
 //!
-//! The raw values are read from the server with one read-only query
-//! ([`EXTRA_COLUMNS`] / [`STANDALONE_QUERY`]). They never leave this module as
-//! read: each is validated against a fixed set or shape, and a value that is
-//! unavailable or does not validate is omitted, so no server-controlled free
-//! text can reach an event.
+//! The raw values are read from the server with one read-only query, defined
+//! once in [`server_info_columns!`]: [`EXTRA_COLUMNS`] is what a query that
+//! already selects the engine edition appends, and [`QUERY`] is the whole query
+//! for native sqlcmd. They never leave this module as read: each is validated
+//! against a fixed set or shape, and a value that is unavailable or does not
+//! validate is omitted, so no server-controlled free text can reach an event.
 
-/// The columns after `EngineEdition` for a query that already selects it, in the
-/// order [`RawServerInfo`] is filled from a row. The OS and architecture come
-/// from `@@VERSION` because `xp_msver` and `sys.dm_os_host_info` are not
-/// available on Azure SQL Database.
-pub const EXTRA_COLUMNS: &str = "CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')), \
-     CASE WHEN @@VERSION LIKE '%on Linux%' THEN N'linux' WHEN @@VERSION LIKE '%on Windows%' THEN N'windows' END, \
-     CASE WHEN @@VERSION LIKE '%<X64>%' THEN N'x64' WHEN @@VERSION LIKE '%<X86>%' THEN N'x86' WHEN @@VERSION LIKE '%<ARM64>%' THEN N'arm64' END";
+/// The columns after `EngineEdition`, in the order [`RawServerInfo`] is filled
+/// from a row: the version, the OS and the architecture of the SQL Server
+/// build. The OS and architecture come from `@@VERSION` because `xp_msver` and
+/// `sys.dm_os_host_info` are not available on Azure SQL Database. The build's
+/// architecture is the parenthesized marker after the version number (`(X64)`,
+/// `(Intel X86)`, `(ARM64)`); the `<X64>` after the OS name is the OS's, which
+/// differs for a 32-bit instance under WOW64.
+macro_rules! server_info_columns {
+    () => {
+        concat!(
+            "CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')), ",
+            "CASE WHEN @@VERSION LIKE '%on Linux%' THEN N'linux' ",
+            "WHEN @@VERSION LIKE '%on Windows%' THEN N'windows' END, ",
+            "CASE WHEN @@VERSION LIKE '%(X64)%' THEN N'x64' ",
+            "WHEN @@VERSION LIKE '%(Intel X86)%' THEN N'x86' ",
+            "WHEN @@VERSION LIKE '%(ARM64)%' THEN N'arm64' END"
+        )
+    };
+}
 
-/// The whole query, for a connection that has no query of its own.
-pub const STANDALONE_QUERY: &str = "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
-     CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')), \
-     CASE WHEN @@VERSION LIKE '%on Linux%' THEN N'linux' WHEN @@VERSION LIKE '%on Windows%' THEN N'windows' END, \
-     CASE WHEN @@VERSION LIKE '%<X64>%' THEN N'x64' WHEN @@VERSION LIKE '%<X86>%' THEN N'x86' WHEN @@VERSION LIKE '%<ARM64>%' THEN N'arm64' END";
+/// What a query that already selects the engine edition appends.
+pub const EXTRA_COLUMNS: &str = server_info_columns!();
+
+/// The whole query for native sqlcmd, NUL-terminated for the C ABI.
+pub const QUERY: &str = concat!(
+    "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), ",
+    server_info_columns!(),
+    "\0"
+);
 
 pub const KEY_ENGINE_EDITION: &str = "sqlcmdcli_engine_edition";
 pub const KEY_SERVER_VERSION: &str = "sqlcmdcli_server_version";
@@ -227,6 +244,27 @@ mod tests {
         assert_eq!(server_version("17"), None);
         assert_eq!(server_version("17.0.x"), None);
         assert_eq!(server_version("17.0.5015.4.1"), None);
+    }
+
+    #[test]
+    fn the_query_and_the_appended_columns_are_one_definition() {
+        assert!(QUERY.ends_with('\0'));
+        let query = QUERY.trim_end_matches('\0');
+        assert!(query.starts_with("SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), "));
+        assert!(query.ends_with(EXTRA_COLUMNS));
+        // Four columns in all: edition, version, OS and architecture.
+        assert_eq!(query.matches("SERVERPROPERTY(").count(), 2);
+        assert_eq!(query.matches("CASE WHEN").count(), 2);
+    }
+
+    /// The architecture is the build's `(X64)`, not the OS's `<X64>`, so a 32-bit
+    /// instance under WOW64 reads as x86.
+    #[test]
+    fn the_architecture_is_the_builds_not_the_operating_systems() {
+        assert!(EXTRA_COLUMNS.contains("'%(X64)%'"));
+        assert!(EXTRA_COLUMNS.contains("'%(Intel X86)%'"));
+        assert!(EXTRA_COLUMNS.contains("'%(ARM64)%'"));
+        assert!(!EXTRA_COLUMNS.contains("<X"));
     }
 
     #[test]

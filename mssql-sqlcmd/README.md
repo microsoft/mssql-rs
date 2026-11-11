@@ -75,10 +75,11 @@ for how sqlcmd's text is translated end to end: the message catalogs, how transl
 
 The library can send one privacy-safe usage event per run directly to
 Application Insights when `SQLCMD_TELEMETRY_CONNECTION_STRING` (or a built-in
-connection string) is set and `SQLCMD_TELEMETRY_OPTOUT` is not `1`. Otherwise it
-does nothing. See the
+connection string) is set and `SQLCMD_TELEMETRY_OPTOUT` is not `1`, `true` or
+`yes`. Otherwise it does nothing. The fields are a proposal until the privacy
+review is done. See the
 [telemetry architecture](https://github.com/microsoft/mssql-rs/blob/main/mssql-sqlcmd/docs/telemetry.md)
-for the C ABI, stable schema, privacy rules, bounded shutdown, and exact
+for the C ABI, the proposed schema, privacy rules, bounded shutdown, and exact
 Application Insights envelope behavior.
 
 ## Build from source

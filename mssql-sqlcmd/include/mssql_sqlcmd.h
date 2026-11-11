@@ -95,10 +95,10 @@ const char* MSSQL_SQLCMD_CALL mssql_sqlcmd_telemetry_server_info_query(void);
 /* The row of that SELECT. A NULL column is data == NULL with len == 0. Each text
    is at most 128 UTF-16 code units. engine_edition is negative when not read. */
 typedef struct MssqlSqlcmdServerInfo {
-   int32_t engine_edition;
-   MssqlSqlcmdText product_version;
-   MssqlSqlcmdText os;
-   MssqlSqlcmdText arch;
+    int32_t engine_edition;
+    MssqlSqlcmdText product_version;
+    MssqlSqlcmdText os;
+    MssqlSqlcmdText arch;
 } MssqlSqlcmdServerInfo;
 
 /* Records the server properties of the first successful connection, which
