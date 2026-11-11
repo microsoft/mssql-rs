@@ -16,7 +16,7 @@ use crate::api::output_params::write_back_output_params;
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
 use super::close_cursor::reset_cursor_state;
-use super::ird::populate_ird;
+use super::ird::{clear_ird_classification, populate_ird};
 use crate::api::exec_common::post_claim_error;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
@@ -114,6 +114,8 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             // call's own success return.
             reset_cursor_state(&mut stmt_state);
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            drop(stmt_state);
+            clear_ird_classification(stmt);
             return SQL_ERROR;
         }
         if stmt_state.batch_exhausted && stmt_state.pending_row_counts.is_empty() {
@@ -145,6 +147,8 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             };
             reset_cursor_state(&mut stmt_state);
+            drop(stmt_state);
+            clear_ird_classification(stmt);
             debug!("SQLMoreResults: batch already known exhausted; returning SQL_NO_DATA");
             return if output_rc == SQL_SUCCESS {
                 SQL_NO_DATA
@@ -162,7 +166,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             stmt_state.row_count = next;
             debug!("SQLMoreResults: advanced to next DML result set");
             drop(stmt_state);
-            if populate_ird(stmt, &[]).is_err() {
+            if populate_ird(stmt, &[], None).is_err() {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     post_sql_error(
                         &mut stmt_state,
@@ -208,9 +212,11 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
     let result = dbc.runtime.block_on(async {
         let result = client.advance().await?;
         let mut metadata = None;
+        let mut data_classification = None;
         let mut settled = None;
         if matches!(result, StatementResult::Rows) {
             metadata = Some(client.get_metadata().clone());
+            data_classification = super::data_classification::capture(&client);
             // msodbcsql's navigation reads an empty parameter set through its
             // DONE (OnDone), reporting that set's status and any error now
             // rather than on the next fetch (measured on 18.6.2.1).
@@ -218,13 +224,13 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 settled = Some(client.complete_current_result().await?);
             }
         }
-        Ok((result, metadata, settled))
+        Ok((result, metadata, data_classification, settled))
     });
     let quiet_set = client.quietly_discarded_parameter_set();
     let array_update = super::execute::take_parameter_array_update(stmt, &mut client)
         .map(|update| update.map(|update| update.quiet(quiet_set)));
     match result {
-        Ok((StatementResult::Rows, metadata, settled)) => {
+        Ok((StatementResult::Rows, metadata, data_classification, settled)) => {
             // Positioned on a new row-returning result set. Refresh metadata,
             // clear row state, keep CURSOR_OPEN, and keep the wire reserved
             // unless settling an empty final set ended the batch.
@@ -248,8 +254,12 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             // with no status array is an error result with no columns, as
             // msodbcsql presents it, whichever set failed.
             let error_result = settled.is_some() && array_rc == SQL_ERROR;
-            let metadata = if error_result { Vec::new() } else { metadata };
-            let ird_ok = populate_ird(stmt, &metadata).is_ok();
+            let (metadata, data_classification) = if error_result {
+                (Vec::new(), None)
+            } else {
+                (metadata, data_classification)
+            };
+            let ird_ok = populate_ird(stmt, &metadata, data_classification).is_ok();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned advancing result set");
                 return SQL_ERROR;
@@ -283,7 +293,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             }
         }
-        Ok((StatementResult::NoRows { .. }, _, _)) => {
+        Ok((StatementResult::NoRows { .. }, _, _, _)) => {
             // Positioned on a no-row statement result (PRINT / low-severity
             // RAISERROR / DDL / DML): zero columns, so it is not fetchable
             // (SQLFetch returns 24000), but it is a navigable result and may
@@ -298,7 +308,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 Ok(update) => super::execute::apply_parameter_array_update(stmt, update),
                 Err(rc) => rc,
             };
-            let ird_ok = populate_ird(stmt, &[]).is_ok();
+            let ird_ok = populate_ird(stmt, &[], None).is_ok();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned on no-row result");
                 return SQL_ERROR;
@@ -338,7 +348,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 SQL_SUCCESS
             }
         }
-        Ok((StatementResult::End, _, _)) => {
+        Ok((StatementResult::End, _, _, _)) => {
             // Batch exhausted. Close cursor state and release the connection.
             let info_messages = client.take_info_messages();
             let return_values = client.get_return_values();
@@ -370,6 +380,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 )
             };
             drop(stmt_state);
+            clear_ird_classification(stmt);
             debug!("SQLMoreResults: no more result sets");
             if array_rc == SQL_ERROR || output_rc == SQL_ERROR {
                 SQL_ERROR
@@ -397,6 +408,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 post_tds_info_messages(&mut stmt_state, &info_messages);
             }
+            clear_ird_classification(stmt);
             SQL_ERROR
         }
     }

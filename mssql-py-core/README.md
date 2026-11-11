@@ -167,6 +167,9 @@ Provider cancellation during session recovery remains a known limitation: it may
 be retried or surface as `OperationalError`. The example disables recovery with
 `connect_retry_count=0`; preserving recovery-time cancellation requires a separate
 TDS and py-core change.
+For contributors, the
+[async pool context guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/src/pool/README.md)
+maps internal types and ownership; it does not describe an enabled pooling API.
 
 ## License
 

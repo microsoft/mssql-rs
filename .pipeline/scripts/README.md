@@ -350,7 +350,8 @@ Enables Named Pipes and Shared Memory protocols for SQL Server via registry modi
 ### run-bounded.sh
 Sourced helper providing `run_bounded <seconds> <command...>`. macOS ships no
 coreutils `timeout`, so long-running commands are bounded by running them in the
-background and killing them on overrun. Returns 124 on timeout.
+background and killing them on overrun. Returns 124 on timeout. On external
+SIGTERM, it stops the bounded process group before exiting.
 
 ### start-colima-macos.sh
 Boots a Colima VM on a hosted macOS agent from the packaged toolchain, retrying
@@ -499,6 +500,32 @@ runs, and a healthy readiness wait maxes out at 157s over 97 runs. An earlier
 `SQL_CONTAINER`, `SETUP_BUDGET_SECONDS` (1200), `PULL_BUDGET_SECONDS` (900),
 `READY_TIMEOUT_SECONDS` (240), `MAX_START_ATTEMPTS` (3),
 `PROBE_LOGIN_TIMEOUT_SECONDS` (5), `PROBE_INTERVAL_SECONDS` (3).
+
+### background-step.sh
+Runs a command detached from one pipeline step and joins it in a later one:
+
+```bash
+background-step.sh start <state-dir> <command> [args...]
+background-step.sh wait  <state-dir> <timeout-seconds>
+```
+
+`wait` replays the command's output and exits with its status. The agent parses
+`##vso` and `##[error]` lines only from the running step, so commands such as
+`task.prependpath` take effect when replayed by `wait`. The timeout counts from
+`start` and bounds the command's total runtime, including when it finishes
+before `wait`. On timeout, the command's process group is terminated before
+`wait` returns. `wait` fails at once if the command exits without recording a
+status. The command must not depend on a later step's output.
+
+The macOS Test job uses it to hide two serial phases:
+
+- `sql-setup-template.yml` with `startMacOSSqlInBackground: true` boots Colima
+  and SQL Server while the Rust test binaries compile. The job joins them
+  before the tests run, through `build-template.yml`'s `prebuildTests` and
+  `beforeTestSteps`.
+- `build-template.yml` with `backgroundCoverageReport: true` generates the Rust
+  Cobertura report while the ODBC e2e suite runs. The job then joins and
+  publishes it.
 
 ## Pipeline Integration
 

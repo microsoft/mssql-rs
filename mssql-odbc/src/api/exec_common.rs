@@ -220,6 +220,8 @@ fn settle_late_cancellation(
             return SQL_ERROR;
         }
     }
+    // The call now fails, so its classification goes with it, prepared or not.
+    super::ird::clear_ird_classification(stmt);
     let drained = !matches!(
         super::close_cursor::abandon_and_release(stmt, statement_handle),
         super::close_cursor::DrainOutcome::Failed
@@ -674,6 +676,9 @@ pub(super) fn release_busy_if_row_exhausted(
             stmt_state.batch_exhausted = true;
         }
     }
+    if cancelled {
+        super::ird::clear_ird_classification(stmt);
+    }
     // msodbcsql's OnDone writes a set's status when its RPC DONE is read, so a
     // later close or cancel cannot discard it. Published after the STMT lock is
     // released: the IPD is read first and must not nest beneath it. An
@@ -720,6 +725,8 @@ pub(super) fn finish_cancelled_cursor(
     };
     super::close_cursor::reset_cursor_state(&mut state);
     post_tds_error(&mut state, err, SQLSTATE_HY000);
+    drop(state);
+    super::ird::clear_ird_classification(stmt);
     SQL_ERROR
 }
 
@@ -1762,6 +1769,7 @@ pub(super) fn finish_execute(
     op: &str,
 ) -> SqlReturn {
     let metadata = client.get_metadata().clone();
+    let data_classification = super::data_classification::capture(&client);
     let has_result_set = !metadata.is_empty();
 
     if !has_result_set && client.has_open_batch() {
@@ -1777,7 +1785,7 @@ pub(super) fn finish_execute(
         if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
             return SQL_ERROR;
         }
-        let ird_ok = populate_ird(stmt, &metadata).is_ok();
+        let ird_ok = populate_ird(stmt, &metadata, None).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned on no-row result");
             return SQL_ERROR;
@@ -1832,7 +1840,7 @@ pub(super) fn finish_execute(
         if !dbc.return_lease(client, LeaseReturn::Release) {
             return SQL_ERROR;
         }
-        let ird_ok = populate_ird(stmt, &metadata).is_ok();
+        let ird_ok = populate_ird(stmt, &metadata, None).is_ok();
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
             return SQL_ERROR;
@@ -1928,7 +1936,7 @@ pub(super) fn finish_execute(
     if !dbc.return_lease(client, lease_return) {
         return SQL_ERROR;
     }
-    let ird_ok = populate_ird(stmt, &metadata).is_ok();
+    let ird_ok = populate_ird(stmt, &metadata, data_classification).is_ok();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("{op}: stmt mutex poisoned");
         return SQL_ERROR;
@@ -4438,28 +4446,28 @@ mod tests {
                 SQL_C_CHAR,
                 SQL_LONGVARCHAR,
                 "text",
-                "varchar(MAX)",
+                "varchar(max)",
                 "VarcharMax",
             ),
             (
                 SQL_C_CHAR,
                 SQL_WLONGVARCHAR,
                 "ntext",
-                "nvarchar(MAX)",
+                "nvarchar(max)",
                 "NVarcharMax",
             ),
             (
                 SQL_C_BINARY,
                 SQL_LONGVARBINARY,
                 "image",
-                "varbinary(MAX)",
+                "varbinary(max)",
                 "VarBinaryMax",
             ),
             (
                 SQL_C_BINARY,
                 SQL_LONGVARCHAR,
                 "text",
-                "varchar(MAX)",
+                "varchar(max)",
                 "VarcharMax",
             ),
         ] {

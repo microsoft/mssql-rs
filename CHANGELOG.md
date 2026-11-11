@@ -214,6 +214,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds`: a piggybacked prepexec orphan is now retained when cancellation,
+  a timeout, or a serialization failure prevents any send, so its release can
+  be retried. Before, `execute_prepared` dropped the orphan and its cached
+  handle before the first packet, leaking the server plan (#647).
+
 - `mssql-odbc`: `SQLPrepareW` and `SQLExecDirectW` now take `TextLength` as
   `SQLINTEGER`, as the ODBC headers and msodbcsql declare it. Before, only its
   low 16 bits were kept on Windows x64: a length of 32768 or more ran empty or

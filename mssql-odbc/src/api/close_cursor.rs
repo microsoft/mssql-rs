@@ -16,7 +16,9 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, StmtState};
+use crate::handles::stmt::{
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_PREPARED, StmtState,
+};
 use crate::handles::wire::{ClaimError, ClaimPolicy, LeaseReturn, WireOwner};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
@@ -81,6 +83,13 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) || stmt_state.error_result {
         error!("SQLCloseCursor: no cursor is open — SQLSTATE 24000");
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
+        // A fetch error closes the cursor but keeps the classification, which
+        // msodbcsql drops on this close for a statement that is not prepared.
+        let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
+        drop(stmt_state);
+        if !prepared {
+            super::ird::clear_ird_classification(stmt);
+        }
         return SQL_ERROR;
     }
 
@@ -92,8 +101,12 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     // longer discover it there — take it now and surface it below instead
     // of silently closing as if the batch had never errored.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
+    let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
+    if !prepared {
+        super::ird::clear_ird_classification(stmt);
+    }
 
     let outcome = abandon_and_release(stmt, statement_handle);
     if let Some(e) = pending_fetch_error {
@@ -151,8 +164,15 @@ pub(super) fn free_stmt_close_locked(
     mut stmt_state: MutexGuard<'_, StmtState>,
 ) -> SqlReturn {
     free_errors(&mut stmt_state);
-    // No-op if cursor is already closed.
+    // No-op if cursor is already closed, except that a fetch error closes the
+    // cursor but keeps the classification, which closing still drops for a
+    // statement that is not prepared, as in msodbcsql.
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
+        let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
+        drop(stmt_state);
+        if !prepared {
+            super::ird::clear_ird_classification(stmt);
+        }
         return SQL_SUCCESS;
     }
 
@@ -160,8 +180,12 @@ pub(super) fn free_stmt_close_locked(
     let needs_drain = !stmt_state.batch_exhausted;
     // See the identical comment in sql_close_cursor_safe.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
+    let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
+    if !prepared {
+        super::ird::clear_ird_classification(stmt);
+    }
 
     let outcome = if needs_drain {
         abandon_and_release_inner(stmt, statement_handle, process_is_shutting_down())
@@ -191,6 +215,25 @@ pub(super) fn free_stmt_close_locked(
     }
 }
 
+/// How a connection-wide cursor sweep treats each statement's Data
+/// Classification; see [`close_cursor_for_connection_op`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Sweep {
+    /// Closes cursors as `SQLFreeStmt(SQL_CLOSE)` does.
+    Close,
+    /// msodbcsql's commit/rollback sweep, which strips `KEEP_COLUMN_INFO`
+    /// before closing (`sqlctran.cpp:308`): a statement with no open cursor
+    /// then loses its classification even when prepared, and so does a
+    /// prepared one whose result has no rows left, since `FreeStmt` keeps it
+    /// only while the cursor is on (`sqlcfunc.cpp:494-500`).
+    EndTransaction,
+    /// [`Sweep::EndTransaction`] for what other statements ran since an
+    /// earlier sweep of the same connection, once that transaction has ended.
+    /// A statement whose cursor is already closed keeps only a classification
+    /// that sweep spared; its diagnostics are left alone.
+    EndTransactionForLateWork,
+}
+
 /// Closes the cursor on a statement as part of a *connection*-scoped operation
 /// (`SQLEndTran`, an autocommit switch, connection reset, disconnect).
 ///
@@ -213,24 +256,60 @@ pub(super) fn free_stmt_close_locked(
 /// caller the stream failed to drain, so sending a transaction-manager
 /// request next is unsafe, which an already-closed batch's stale diagnostic
 /// does not make true.
-pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
+///
+/// With `spared`, [`Sweep::Close`] and [`Sweep::EndTransaction`] record each
+/// classification they keep that ending the transaction keeps too, for a later
+/// [`Sweep::EndTransactionForLateWork`] to leave in place.
+pub(super) fn close_cursor_for_connection_op(
+    stmt: &StmtHandle,
+    handle: SqlHandle,
+    sweep: Sweep,
+    spared: Option<&mut Vec<u64>>,
+) -> SqlReturn {
     let _operation = match stmt.begin_operation() {
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
-    let pending_fetch_error = {
+    let (pending_fetch_error, keep_classification, kept_through_ending) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
         };
+        let cursor_open = stmt_state.has_state(STMT_STATE_CURSOR_OPEN);
+        if sweep == Sweep::EndTransactionForLateWork && !cursor_open {
+            drop(stmt_state);
+            super::ird::clear_ird_classification_unless(
+                stmt,
+                spared.as_deref().map_or(&[], Vec::as_slice),
+            );
+            return SQL_SUCCESS;
+        }
         free_errors(&mut stmt_state);
-        if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
+        if !cursor_open {
+            drop(stmt_state);
+            if sweep != Sweep::Close {
+                super::ird::clear_ird_classification(stmt);
+            }
             return SQL_SUCCESS;
         }
         let pending_fetch_error = stmt_state.pending_fetch_error.take();
+        // Read-ahead can find the end while the caller is still on the last
+        // row, which msodbcsql has not looked past yet.
+        let no_rows_left = stmt_state.result_set_exhausted && !stmt_state.row_positioned;
+        let prepared = stmt_state.has_state(STMT_STATE_PREPARED);
+        let keep = prepared && (sweep == Sweep::Close || !no_rows_left);
         reset_cursor_state(&mut stmt_state);
-        pending_fetch_error
+        (pending_fetch_error, keep, prepared && !no_rows_left)
     };
+    if !keep_classification {
+        super::ird::clear_ird_classification(stmt);
+    } else if sweep != Sweep::EndTransactionForLateWork
+        && kept_through_ending
+        && let Some(spared) = spared
+        && let Some(id) = super::ird::ird_classification_id(stmt)
+    {
+        spared.push(id);
+    }
 
     let outcome = abandon_and_release(stmt, handle);
     if let Some(e) = pending_fetch_error
@@ -1240,7 +1319,7 @@ mod tests {
             .wire
             .put_client_for_test(tds_client_from_tokens(vec![]));
 
-        let ret = close_cursor_for_connection_op(stmt, h.stmt);
+        let ret = close_cursor_for_connection_op(stmt, h.stmt, Sweep::Close, None);
 
         assert_eq!(ret, SQL_SUCCESS);
         let ss = stmt.inner.lock().unwrap();
