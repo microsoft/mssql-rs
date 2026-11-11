@@ -14,6 +14,8 @@
 # the ctest until-pass retry count (default 3). ODBC_E2E_MT_PROFILE selects
 # run_e2e.sh --mt-profile (default pr); the stress profiles also install gdb so
 # a crash or watchdog abort in a <name>_mt entry prints every thread's stack.
+# ODBC_E2E_FILTER and ODBC_E2E_EXCLUDE pass through as --filter and --exclude
+# (ctest -R and -E), which the stress pipeline uses to split suite groups.
 
 set -e
 
@@ -37,4 +39,4 @@ apk add --no-cache \
 
 cd /workspace
 exec bash /workspace/mssql-odbc/tests/e2e/run_e2e.sh --skip-build --retries="${ODBC_E2E_RETRIES:-3}" \
-    --mt-profile="$MT_PROFILE"
+    --mt-profile="$MT_PROFILE" --filter="${ODBC_E2E_FILTER:-}" --exclude="${ODBC_E2E_EXCLUDE:-}"

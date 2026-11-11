@@ -36,6 +36,26 @@ parameters:
   type: boolean
   default: true
 
+# Compiles the test binaries in their own step so beforeTestSteps can run
+# between compiling and executing them; the test run then reuses the build.
+- name: prebuildTests
+  type: boolean
+  default: false
+
+# Steps to run after the test binaries are built and before they run, for
+# example joining a SQL Server that was started in the background.
+- name: beforeTestSteps
+  type: stepList
+  default: []
+
+# Starts the Cobertura report detached instead of waiting for it, and skips
+# publishing it. The caller must join it with `background-step.sh wait
+# "$(Agent.TempDirectory)/rust-cobertura"` and publish target/cobertura.xml as
+# CoberturaCoverageRust_<osType>.
+- name: backgroundCoverageReport
+  type: boolean
+  default: false
+
 - name: enableClippy
   displayName: Enable Rust Clippy lint step
   type: boolean
@@ -150,6 +170,15 @@ steps:
     displayName: Clean up old coverage files
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
+  # `none()` builds and lists every test binary without running any. With
+  # --no-report, cargo-llvm-cov keeps the build for the run step.
+  - ${{ if eq(parameters.prebuildTests, true) }}:
+    - script: cargo llvm-cov nextest -E 'none()' --no-tests=pass --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --profile ci
+      displayName: Build tests (mssql-tds and mssqlodbc packages)
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ parameters.beforeTestSteps }}
+
   - script: |
         export CERT_HOST_NAME="sql1"
         cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --no-fail-fast --profile ci --success-output immediate
@@ -168,14 +197,6 @@ steps:
       testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
       testRunTitle: $(System.PhaseName)
 
-  # `test_client_support.rs` is test-only scaffolding (gated behind the
-  # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
-  # unit tests; it is not product code, so it is excluded from coverage.
-  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
-    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-    workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in lcov format (mssql-tds and mssqlodbc)
-
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |
         echo "Running Python tests for mssql-py-core..."
@@ -191,17 +212,27 @@ steps:
   # with the mssql-py-core Python report and publishes the single combined
   # report to the ADO coverage tab, because ADO does not merge coverage across
   # stages/jobs. The merged report is what the GitHub diff-cover workflow uses.
-  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
-    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-    workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in Cobertura format (mssql-tds and mssqlodbc)
+  # `test_client_support.rs` is test-only scaffolding (gated behind the
+  # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
+  # unit tests; it is not product code, so it is excluded from coverage.
+  - ${{ if eq(parameters.backgroundCoverageReport, false) }}:
+    - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+      workingDirectory: "$(Build.SourcesDirectory)"
+      displayName: Save code coverage in Cobertura format (mssql-tds and mssqlodbc)
 
-  - task: PublishPipelineArtifact@1
-    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
-    displayName: "Publish Cobertura coverage artifact"
-    inputs:
-      targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
-      artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
+    - task: PublishPipelineArtifact@1
+      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+      displayName: "Publish Cobertura coverage artifact"
+      inputs:
+        targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
+        artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
+
+  - ${{ if eq(parameters.backgroundCoverageReport, true) }}:
+    - script: bash .pipeline/scripts/background-step.sh start "$(Agent.TempDirectory)/rust-cobertura" cargo llvm-cov report --package mssql-tds --package mssqlodbc --package mssql-sqlcmd --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+      workingDirectory: "$(Build.SourcesDirectory)"
+      displayName: Start Cobertura coverage report in the background (mssql-tds and mssqlodbc)
 
 # ODBC C++ e2e suite (Windows only). The gtest suite loads the Rust ODBC driver
 # DLL through the Windows Driver Manager as separate processes, so its execution
@@ -231,10 +262,12 @@ steps:
       $env:ODBC_TEST_TRUST_CERT = 'Yes'
       # Explicit -CoverageOutput under $(Build.SourcesDirectory)/target keeps the
       # publish path deterministic regardless of the job's CARGO_TARGET_DIR.
-      # -CompareWithMsodbcsql reruns the suite against the driver installed
-      # above; the script fails on any parity divergence.
+      # Bound build/test workers independently of CTest's environment defaults.
+      # The legs remain sequential, with CTest enforcing resource exclusions.
+      $buildJobs = [Environment]::ProcessorCount
+      $testJobs = [Math]::Min(8, [Environment]::ProcessorCount)
       ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries 3 -Coverage `
-        -CompareWithMsodbcsql `
+        -CompareWithMsodbcsql -BuildJobs $buildJobs -TestJobs $testJobs `
         -CoverageOutput "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
     displayName: Run ODBC C++ e2e tests (Windows) with coverage and msodbcsql parity comparison
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))

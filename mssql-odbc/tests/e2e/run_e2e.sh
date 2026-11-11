@@ -11,21 +11,30 @@
 # Usage:
 #   ./run_e2e.sh [--release] [--verbose] [--retries=N] [--coverage[=OUTPUT]]
 #                [--compare-with-msodbcsql] [--msodbcsql-ini=PATH]
-#                [--skip-build] [--driver=PATH]
-#                [--filter=REGEX] [--mt-profile=pr|nightly|weekly]
+#                [--skip-build] [--driver=PATH] [--test-jobs=N]
+#                [--filter=REGEX] [--exclude=REGEX] [--mt-profile=pr|weekly]
 #
 # Default: runs the e2e suite against mssql-odbc only.
 #
+# --test-jobs=N (1-64, default 1) bounds parallel ctest entries within each
+# driver leg. The legs stay sequential, and the CMake resource locks keep an
+# executable's entries, and RUN_SERIAL entries, from overlapping.
+#
+# --filter and --exclude select ctest entries by name (ctest -R and -E), like
+# run_e2e.ps1 -FilterTests and -ExcludeTests. The stress pipeline uses them to
+# split the <name>_mt entries into suite groups that run as parallel jobs.
+#
 # --mt-profile selects how the ODBC_TEST_F concurrent variants run (ctest
 # registers them as a separate <name>_mt entry per converted executable):
-#   pr       (default) every ctest entry; every mode except /SharedStmt, at the
-#            harness default of 2 threads x 1 iteration. Linux and macOS build
-#            no <name>_mt entries unless ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
-#   nightly  only the <name>_mt entries, 8 x 20, every mode except /SharedStmt.
-#   weekly   only the <name>_mt entries, 16 x 50, the same modes as nightly.
-#            Both build with ODBC_E2E_CONCURRENT=ON.
-# nightly and weekly ignore --retries (an intermittent failure is what they
-# look for) and run each entry under gdb through run_mt_test.sh when gdb is
+#   pr       (default) every ctest entry except those labelled mt_weekly; every
+#            mode except /SharedStmt, at the harness default of 2 threads x 1
+#            iteration. Linux and macOS build no <name>_mt entries unless
+#            ODBC_E2E_CONCURRENT=ON (CMakeLists.txt).
+#   weekly   only the <name>_mt entries, 16 x 25, every mode except /SharedStmt;
+#            the only profile that runs mt_weekly entries. It builds with
+#            ODBC_E2E_CONCURRENT=ON.
+# weekly ignores --retries (an intermittent failure is what it looks for) and
+# runs each entry under gdb through run_mt_test.sh when gdb is
 # installed, so a crash or a watchdog abort prints every thread's stack. With
 # --compare-with-msodbcsql the msodbcsql leg runs at 2 x 1: it checks that the
 # tests suit the modes, not msodbcsql's thread safety. /SharedStmt is left out
@@ -160,7 +169,9 @@ MSODBCSQL_INI="/etc/odbcinst.ini"
 SKIP_BUILD=0
 DRIVER_OVERRIDE=""
 TEST_FILTER=""
+TEST_EXCLUDE=""
 MT_PROFILE="pr"
+TEST_JOBS=1
 # Extra environment for the msodbcsql leg only (see apply_mt_profile).
 MS_LEG_ENV=()
 
@@ -195,11 +206,17 @@ parse_args() {
             --skip-build) SKIP_BUILD=1 ;;
             --driver=*) DRIVER_OVERRIDE="${arg#--driver=}" ;;
             --filter=*) TEST_FILTER="${arg#--filter=}" ;;
+            --exclude=*) TEST_EXCLUDE="${arg#--exclude=}" ;;
             --mt-profile=*) MT_PROFILE="${arg#--mt-profile=}" ;;
+            --test-jobs=*) TEST_JOBS="${arg#--test-jobs=}" ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
     done
+    if [[ ! $TEST_JOBS =~ ^0*([1-9]|[1-5][0-9]|6[0-4])$ ]]; then
+        echo "--test-jobs must be an integer from 1 to 64" >&2
+        exit 2
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -207,17 +224,15 @@ parse_args() {
 # header). Settings already in the environment win over the profile.
 # ----------------------------------------------------------------------------
 apply_mt_profile() {
-    local threads iters
     # AB#49575: restore SharedStmt after CI adopts the diagnostic-list fix.
     export MSSQL_ODBC_MT_SKIP_MODES="${MSSQL_ODBC_MT_SKIP_MODES:-SharedStmt}"
     case "$MT_PROFILE" in
         pr)
             ;;
-        nightly|weekly)
+        weekly)
             export ODBC_E2E_CONCURRENT=ON
-            if [ "$MT_PROFILE" = nightly ]; then threads=8; iters=20; else threads=16; iters=50; fi
-            export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-$threads}"
-            export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-$iters}"
+            export MSSQL_ODBC_MT_THREADS="${MSSQL_ODBC_MT_THREADS:-16}"
+            export MSSQL_ODBC_MT_ITERS="${MSSQL_ODBC_MT_ITERS:-25}"
             # run_mt_test.sh runs each <name>_mt entry under gdb; the watchdog must
             # still end a hang inside the traced process.
             export MSSQL_ODBC_MT_GDB="${MSSQL_ODBC_MT_GDB:-1}"
@@ -227,7 +242,7 @@ apply_mt_profile() {
             fi
             # The watchdog ends a hung phase after MSSQL_ODBC_MT_TIMEOUT_SECONDS;
             # this only bounds an entry whose many phases all progress slowly.
-            CTEST_ARGS+=(-L mt --timeout 3600)
+            CTEST_ARGS+=(-L mt --timeout 10800)
             if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
                 echo "--mt-profile=$MT_PROFILE ignores --retries=$RETRIES: an intermittent failure is the signal."
                 RETRIES=0
@@ -235,10 +250,13 @@ apply_mt_profile() {
             MS_LEG_ENV=(MSSQL_ODBC_MT_THREADS=2 MSSQL_ODBC_MT_ITERS=1)
             ;;
         *)
-            echo "Unknown --mt-profile '$MT_PROFILE' (expected pr, nightly, or weekly)" >&2
+            echo "Unknown --mt-profile '$MT_PROFILE' (expected pr or weekly)" >&2
             exit 2
             ;;
     esac
+    if [ "$MT_PROFILE" != weekly ]; then
+        CTEST_ARGS+=(-LE mt_weekly)
+    fi
     echo "MT profile: $MT_PROFILE (threads=${MSSQL_ODBC_MT_THREADS:-2} iterations=${MSSQL_ODBC_MT_ITERS:-1} skip_modes='${MSSQL_ODBC_MT_SKIP_MODES:-}')"
 }
 
@@ -577,8 +595,12 @@ generate_coverage_report() {
 main() {
     parse_args "$@"
     apply_mt_profile
+    CTEST_ARGS+=(--parallel "$TEST_JOBS")
     if [ -n "$TEST_FILTER" ]; then
         CTEST_ARGS+=(-R "$TEST_FILTER")
+    fi
+    if [ -n "$TEST_EXCLUDE" ]; then
+        CTEST_ARGS+=(-E "$TEST_EXCLUDE")
     fi
     if [ "$RETRIES" -gt 0 ] 2>/dev/null; then
         # until-pass:N runs a failing test up to N times total, so N retries = N+1.

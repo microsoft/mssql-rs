@@ -208,11 +208,14 @@ function(odbc_register_ctest TEST_NAME)
             add_test(NAME ${TEST_NAME}_mt
                      COMMAND ${TEST_NAME} "--gtest_filter=${ODBC_MT_MODE_FILTER}")
         endif()
-        set_tests_properties(${TEST_NAME}_mt PROPERTIES SKIP_RETURN_CODE 77 LABELS mt)
+        # The two entries share fixture naming and must not run together.
+        set_tests_properties(${TEST_NAME}_mt PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS mt RESOURCE_LOCK ${TEST_NAME})
     else()
         add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
     endif()
-    set_tests_properties(${TEST_NAME} PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        SKIP_RETURN_CODE 77 RESOURCE_LOCK ${TEST_NAME})
 endfunction()
 
 # ---------------------------------------------------------------------------
@@ -245,6 +248,31 @@ function(add_odbc_direct_load_test TEST_NAME)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# Helper function: a multithreaded-only test (tests/multithreaded_tests/) that
+# reads the MSSQL_ODBC_MT_* settings itself rather than through ODBC_TEST_F.
+# It has no single-threaded form, so it registers only <name>_mt, labelled "mt"
+# and "mt_weekly": only the weekly profile runs it (PR excludes mt_weekly).
+# It is built only with ODBC_E2E_CONCURRENT. The explicit --gtest_filter keeps an
+# inherited GTEST_FILTER from selecting none of its tests, which would pass.
+# Usage:  add_odbc_mt_only_test(name sources...)
+# ---------------------------------------------------------------------------
+function(add_odbc_mt_only_test TEST_NAME)
+    if(NOT ODBC_E2E_CONCURRENT)
+        return()
+    endif()
+    add_executable(${TEST_NAME} ${ARGN} lib/odbc_skip_aware_main.cpp)
+    target_link_libraries(${TEST_NAME} PRIVATE odbc_test_lib)
+    if(UNIX)
+        add_test(NAME ${TEST_NAME}_mt
+                 COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/run_mt_test.sh" $<TARGET_FILE:${TEST_NAME}>
+                         "--gtest_filter=*")
+    else()
+        add_test(NAME ${TEST_NAME}_mt COMMAND ${TEST_NAME} "--gtest_filter=*")
+    endif()
+    set_tests_properties(${TEST_NAME}_mt PROPERTIES SKIP_RETURN_CODE 77 LABELS "mt;mt_weekly")
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 enable_testing()
@@ -261,6 +289,12 @@ add_odbc_test(set_env_attr_test  tests/set_env_attr_test.cpp)
 add_odbc_test(get_diag_rec_test  tests/get_diag_rec_test.cpp)
 add_odbc_test(describe_col_test  tests/describe_col_test.cpp)
 add_odbc_test(col_attribute_test tests/col_attribute_test.cpp)
+# Alias-type name lookups can deadlock with other suites' schema changes.
+foreach(entry col_attribute_test col_attribute_test_mt)
+    if(TEST ${entry})
+        set_tests_properties(${entry} PROPERTIES RUN_SERIAL TRUE)
+    endif()
+endforeach()
 add_odbc_test(fetch_scroll_test tests/fetch_scroll_test.cpp)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(get_data_iso88591_test
@@ -296,6 +330,15 @@ endif()
 set_tests_properties(cancel_test PROPERTIES TIMEOUT 30)
 add_odbc_test(shared_connection_busy_test tests/multithreaded_tests/shared_connection_busy_test.cpp)
 add_odbc_test(concurrent_harness_test tests/multithreaded_tests/concurrent_harness_test.cpp)
+add_odbc_mt_only_test(handle_lifecycle_test tests/multithreaded_tests/handle_lifecycle_test.cpp)
+add_odbc_mt_only_test(fault_recovery_test tests/multithreaded_tests/fault_recovery_test.cpp)
+if(WIN32)
+    foreach(mt_socket_test handle_lifecycle_test fault_recovery_test)
+        if(TARGET ${mt_socket_test})
+            target_link_libraries(${mt_socket_test} PRIVATE ws2_32)
+        endif()
+    endforeach()
+endif()
 add_odbc_test(more_results_test  tests/more_results_test.cpp)
 add_odbc_test(output_params_test tests/output_params_test.cpp)
 add_odbc_test(dml_output_test    tests/dml_output_test.cpp)
@@ -358,3 +401,15 @@ add_odbc_test(text_money_types_test tests/text_money_types_test.cpp)
 add_odbc_test(fetch_error_semantics_test tests/fetch_error_semantics_test.cpp)
 add_odbc_direct_load_test(dll_unload_stress_test tests/dll_unload_stress_test.cpp)
 add_odbc_direct_load_test(trace_rotation_test tests/trace_rotation_test.cpp)
+
+# Fresh CI agents have no CTest cost history; start the longest entries first
+# so they do not form the tail of a parallel run.
+foreach(entry_cost get_data_test_mt:75 param_conversions_test_mt:75
+                   execute_test_mt:45 fetch_scroll_test_mt:42 param_array_test_mt:30)
+    string(REPLACE ":" ";" entry_cost "${entry_cost}")
+    list(GET entry_cost 0 entry)
+    list(GET entry_cost 1 cost)
+    if(TEST ${entry})
+        set_tests_properties(${entry} PROPERTIES COST ${cost})
+    endif()
+endforeach()
