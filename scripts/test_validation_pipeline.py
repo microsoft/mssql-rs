@@ -855,6 +855,29 @@ def test_pipeline_tests_run_in_shared_validation(selector):
     assert not step.get("continueOnError", False)
 
 
+def test_windows_image_version_override_is_limited_to_public_pr839():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    windows = next(job for job in build["jobs"] if job.get("job") == "Build_Windows")
+    gate = (
+        "${{ if and(eq(variables['System.TeamProject'], 'public'), "
+        "eq(variables['Build.Reason'], 'PullRequest'), "
+        "eq(variables['Build.SourceBranch'], 'refs/pull/839/merge')) }}"
+    )
+    assert windows["pool"] == {
+        "name": "${{ parameters.poolName }}",
+        "demands": [
+            "imageOverride -equals RUST-W22-SQL25",
+            {gate: ["ImageVersionOverride -equals 20.0.0"]},
+        ],
+    }
+    assert (
+        (_TEMPLATES / "validation-stages.yml")
+        .read_text(encoding="utf-8")
+        .count("ImageVersionOverride")
+    ) == 1
+
+
 def test_release_automation_bash_oracles_run_on_linux():
     stages = load_template("validation-stages.yml")["stages"]
     build = next(stage for stage in stages if stage["stage"] == "Build")
