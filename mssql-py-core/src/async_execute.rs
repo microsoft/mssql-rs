@@ -26,6 +26,7 @@ use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::{InternalError, map_tds_error};
 use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatus};
+use crate::async_handle::LogicalConnection;
 use crate::async_parameters::{
     ParameterBindingPlan, ParameterMetadata, bind_parameters, parse_input_sizes,
 };
@@ -80,6 +81,7 @@ impl PreparedState {
     }
 }
 
+/// Release cursor-local server handles through an already validated client borrow.
 pub(crate) async fn release_prepared_statements(
     client: &mut TdsClient,
     prepared_state: &Mutex<PreparedState>,
@@ -144,8 +146,9 @@ fn accumulate_rowcount(total: &mut Option<i64>, count: i64) {
     }
 }
 
+/// Execution snapshot retaining the logical parent until protocol work settles.
 pub(crate) struct ExecuteResources {
-    client: Arc<Mutex<TdsClient>>,
+    client: Arc<LogicalConnection>,
     dispatch: Option<tracing::Dispatch>,
     prepared_state: Arc<Mutex<PreparedState>>,
     autocommit: bool,
@@ -165,7 +168,7 @@ pub(crate) struct ExecuteResources {
 impl ExecuteResources {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: Arc<Mutex<TdsClient>>,
+        client: Arc<LogicalConnection>,
         dispatch: Option<tracing::Dispatch>,
         prepared_state: Arc<Mutex<PreparedState>>,
         autocommit: bool,
@@ -754,7 +757,10 @@ pub(crate) fn execute<'py>(
         );
 
         let (result, info_messages, has_open_batch) = {
-            let mut client = client.lock().await;
+            let mut client = client.lock_operation(operation_id).await.map_err(|error| {
+                operation_guard.settle(false);
+                map_claim_error(error)
+            })?;
             let result = execute_on_client(&mut client, &prepared_state, &claim, request).await;
             let info_messages = if matches!(
                 result,
@@ -928,7 +934,11 @@ pub(crate) fn executemany<'py>(
 
             let execution_started = Instant::now();
             let (result, info_messages, has_open_batch) = {
-                let mut client = client.lock().await;
+                let mut client = client.lock_operation(operation_id).await.map_err(|error| {
+                    operation_guard.settle(false);
+                    interruption_guard.complete();
+                    map_claim_error(error)
+                })?;
                 let result =
                     execute_many_on_client(&mut client, &prepared_state, &claim, request).await;
                 let info_messages = if result.is_err() {

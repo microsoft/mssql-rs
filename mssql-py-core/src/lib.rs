@@ -13,6 +13,7 @@ mod async_description;
 mod async_errors;
 mod async_execute;
 mod async_fetch;
+mod async_handle;
 mod async_parameters;
 mod async_runtime;
 mod async_session;
