@@ -110,24 +110,47 @@ impl Store for FileStore {
     }
 }
 
-#[cfg(not(windows))]
-fn default_store() -> Option<Box<dyn Store>> {
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    let home = std::path::PathBuf::from(home);
-    let base = if cfg!(target_os = "macos") {
-        home.join("Library").join("Application Support")
+/// Where the ID file is, for the given `HOME` and `XDG_CACHE_HOME` (macOS
+/// ignores the latter). `XDG_CACHE_HOME` is used by itself when it is an absolute
+/// path, as the XDG specification requires, so a service or container that sets
+/// only it keeps working without `HOME`; `HOME` is needed for the `~/.cache`
+/// fallback and on macOS.
+#[cfg_attr(windows, allow(dead_code))]
+fn file_store_path(
+    home: Option<std::ffi::OsString>,
+    xdg_cache_home: Option<std::ffi::OsString>,
+    macos: bool,
+) -> Option<std::path::PathBuf> {
+    let home = home.filter(|home| !home.is_empty());
+    let base = if macos {
+        std::path::PathBuf::from(home?)
+            .join("Library")
+            .join("Application Support")
     } else {
-        match std::env::var_os("XDG_CACHE_HOME").filter(|dir| !dir.is_empty()) {
-            Some(dir) => std::path::PathBuf::from(dir),
-            None => home.join(".cache"),
+        let xdg = xdg_cache_home
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from)
+            .filter(|dir| dir.is_absolute());
+        match xdg {
+            Some(dir) => dir,
+            None => std::path::PathBuf::from(home?).join(".cache"),
         }
     };
-    Some(Box::new(FileStore {
-        path: base
-            .join("Microsoft")
+    Some(
+        base.join("Microsoft")
             .join("DeveloperTools")
             .join("deviceid"),
-    }))
+    )
+}
+
+#[cfg(not(windows))]
+fn default_store() -> Option<Box<dyn Store>> {
+    let path = file_store_path(
+        std::env::var_os("HOME"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        cfg!(target_os = "macos"),
+    )?;
+    Some(Box::new(FileStore { path }))
 }
 
 #[cfg(windows)]
@@ -144,14 +167,18 @@ mod registry {
     use super::{RegistryStore, Store};
     use std::io;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE, LocalFree,
         WAIT_ABANDONED, WAIT_OBJECT_0,
     };
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE, REG_OPTION_NON_VOLATILE,
         REG_SZ, RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
-    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+    use windows_sys::Win32::System::Threading::{
+        CreateMutexW, GetCurrentProcess, OpenProcessToken, ReleaseMutex, WaitForSingleObject,
+    };
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -165,39 +192,108 @@ mod registry {
         io::Error::from_raw_os_error(code as i32)
     }
 
-    /// A named mutex that serializes first runs of sqlcmd on this user's session.
-    /// A first run that cannot take it, because of an error or the wait timing
-    /// out, does not create the ID: it would race with the lock's owner, so the
-    /// event goes without the property instead.
-    struct FirstRunLock(HANDLE);
+    /// An open handle, closed when it goes out of scope.
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is open and closed once, here.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// The current user's SID as text (`S-1-5-21-...`), or `None` when it cannot
+    /// be read.
+    fn user_sid_string() -> Option<String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `token` is a valid out pointer for the current process's token.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let token = OwnedHandle(token);
+        let mut needed = 0u32;
+        // SAFETY: a null buffer of length 0 asks for the size.
+        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 || needed > 4096 {
+            return None;
+        }
+        // 8-byte aligned storage for the TOKEN_USER the call writes.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: `buffer` holds at least `needed` bytes.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        // SAFETY: the call filled `buffer` with a TOKEN_USER, which is aligned.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` is a valid SID in `buffer`; `text` is a valid out pointer.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 || text.is_null() {
+            return None;
+        }
+        let mut length = 0;
+        // SAFETY: `text` is NUL-terminated, allocated by the call above.
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: `text` points to `length` valid UTF-16 units.
+        let sid_text =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        // SAFETY: the string was allocated by `ConvertSidToStringSidW` with
+        // `LocalAlloc` and is freed once.
+        unsafe { LocalFree(text.cast()) };
+        Some(sid_text)
+    }
+
+    /// The first-run mutex's name. `Global\` makes it span the user's logon
+    /// sessions, as the HKCU value does, and the SID keeps different users from
+    /// contending for one name.
+    fn first_run_lock_name() -> Option<String> {
+        Some(format!(
+            "Global\\Microsoft.Sqlcmd.DeviceIdFirstRun.{}",
+            user_sid_string()?
+        ))
+    }
+
+    /// A named mutex that serializes first runs of sqlcmd for this user across
+    /// all their sessions. A first run that cannot take it, because of an error
+    /// or the wait timing out, does not create the ID: it would race with the
+    /// lock's owner, so the event goes without the property instead. (Another
+    /// user could keep a first run from creating the ID by creating this
+    /// SID-qualified name first; that only omits the property.)
+    struct FirstRunLock(OwnedHandle);
 
     impl FirstRunLock {
         fn acquire() -> Option<Self> {
-            let name = wide("Local\\Microsoft.Sqlcmd.DeviceIdFirstRun");
+            Self::acquire_with(2000)
+        }
+
+        fn acquire_with(wait_ms: u32) -> Option<Self> {
+            let name = wide(&first_run_lock_name()?);
             // SAFETY: `name` is NUL-terminated; null security attributes.
             let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
             if handle.is_null() {
                 return None;
             }
+            let handle = OwnedHandle(handle);
             // SAFETY: `handle` is a mutex handle owned by this function.
-            let waited = unsafe { WaitForSingleObject(handle, 2000) };
-            if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
-                Some(Self(handle))
-            } else {
-                // SAFETY: `handle` was created above and is closed once.
-                unsafe { CloseHandle(handle) };
-                None
-            }
+            let waited = unsafe { WaitForSingleObject(handle.0, wait_ms) };
+            (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED).then_some(Self(handle))
         }
     }
 
     impl Drop for FirstRunLock {
         fn drop(&mut self) {
-            // SAFETY: the mutex is owned by this thread and the handle is open.
-            unsafe {
-                ReleaseMutex(self.0);
-                CloseHandle(self.0);
-            }
+            // SAFETY: the mutex is owned by this thread; the handle closes after.
+            unsafe { ReleaseMutex((self.0).0) };
         }
     }
 
@@ -357,6 +453,37 @@ mod registry {
                 return Err(os_error(status));
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod lock_tests {
+        use super::*;
+
+        #[test]
+        fn the_lock_name_spans_sessions_and_is_per_user() {
+            let name = first_run_lock_name().expect("the process token has a user");
+            assert!(name.starts_with("Global\\Microsoft.Sqlcmd.DeviceIdFirstRun.S-1-"));
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'\\' | b'.' | b'-'))
+            );
+        }
+
+        #[test]
+        fn a_second_first_run_cannot_take_the_lock_while_it_is_held() {
+            let first = FirstRunLock::acquire_with(1000).expect("the lock is free");
+            // The mutex is owned by the thread that took it, so another thread
+            // stands in for another process.
+            let waited = std::thread::spawn(|| FirstRunLock::acquire_with(150).is_some())
+                .join()
+                .expect("thread");
+            assert!(!waited, "taken while held");
+            drop(first);
+            let again = std::thread::spawn(|| FirstRunLock::acquire_with(1000).is_some())
+                .join()
+                .expect("thread");
+            assert!(again, "free again after release");
         }
     }
 }
@@ -530,6 +657,73 @@ mod tests {
         let id = uuid::Uuid::new_v4().hyphenated().to_string();
         assert_eq!(normalize(&id).as_deref(), Some(id.as_str()));
         assert_eq!(id.as_bytes()[14], b'4');
+    }
+
+    #[test]
+    fn xdg_cache_home_alone_is_enough_on_linux() {
+        use std::ffi::OsString;
+        let abs = std::env::temp_dir().join("xdg-cache");
+        let expected = abs
+            .join("Microsoft")
+            .join("DeveloperTools")
+            .join("deviceid");
+        // No HOME at all, or an empty one: a service or container that sets only
+        // XDG_CACHE_HOME still has its ID.
+        for home in [None, Some(OsString::new())] {
+            assert_eq!(
+                file_store_path(home, Some(abs.clone().into_os_string()), false),
+                Some(expected.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn home_is_the_linux_fallback_and_the_macos_base() {
+        use std::ffi::OsString;
+        let home = std::env::temp_dir().join("a-home");
+        let tail = std::path::Path::new("Microsoft")
+            .join("DeveloperTools")
+            .join("deviceid");
+        // No XDG_CACHE_HOME, an empty one, or a relative one (the XDG
+        // specification says to ignore it): ~/.cache.
+        for xdg in [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("relative/cache")),
+        ] {
+            assert_eq!(
+                file_store_path(Some(home.clone().into_os_string()), xdg, false),
+                Some(home.join(".cache").join(&tail))
+            );
+        }
+        // macOS ignores XDG_CACHE_HOME.
+        assert_eq!(
+            file_store_path(
+                Some(home.clone().into_os_string()),
+                Some(OsString::from("/ignored")),
+                true
+            ),
+            Some(home.join("Library").join("Application Support").join(&tail))
+        );
+    }
+
+    #[test]
+    fn without_a_usable_base_there_is_no_store() {
+        use std::ffi::OsString;
+        assert_eq!(file_store_path(None, None, false), None);
+        assert_eq!(file_store_path(Some(OsString::new()), None, false), None);
+        assert_eq!(
+            file_store_path(
+                Some(OsString::new()),
+                Some(OsString::from("relative")),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            file_store_path(None, Some(OsString::from("/abs")), true),
+            None
+        );
     }
 
     #[test]

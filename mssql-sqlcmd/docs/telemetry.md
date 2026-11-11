@@ -148,7 +148,8 @@ The ID is the shared Microsoft DeveloperTools device ID: on Windows the
 `deviceid` value of `HKCU\SOFTWARE\Microsoft\DeveloperTools` (64-bit view); on
 macOS `~/Library/Application Support/Microsoft/DeveloperTools/deviceid`; on
 Linux `$XDG_CACHE_HOME/Microsoft/DeveloperTools/deviceid` when `XDG_CACHE_HOME`
-is set, else `~/.cache/Microsoft/DeveloperTools/deviceid`. An existing
+is set to an absolute path (it works without `HOME`, for services and
+containers), else `~/.cache/Microsoft/DeveloperTools/deviceid`. An existing
 recognized ID is reused;
 a missing one is generated (a random version 4 UUID) and stored. A value that is
 present but unreadable or unrecognized is never overwritten. If it cannot be
@@ -156,9 +157,13 @@ read or stored, the property is omitted. When telemetry is off, the ID is not
 touched. Two first runs at the same moment end up with the same ID: on macOS and
 Linux the ID is written to a file of its own and linked into place, which fails
 if the ID file exists, and the loser reads the winner's; on Windows first runs
-take a named mutex, and the value is read back after it is written. A first run
-that cannot take the mutex within two seconds does not create the ID, and the
-event goes without it. A tool that
+take a named mutex that spans all of the user's logon sessions (`Global\` plus
+the user's SID, as the HKCU value is shared across sessions), and the value is
+read back after it is written. A first run that cannot take the mutex within two
+seconds, or cannot read the user's SID, does not create the ID, and the event
+goes without it. Another user can keep a first run from creating the ID only by
+creating that SID-qualified name first, which just omits the property. A tool
+that
 writes the shared ID without that mutex can still race on Windows; the
 read-back reports the value that survives. The ID is end-user pseudonymized
 information and is sent as the GUID, not hashed.
