@@ -116,6 +116,80 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchContinuesAfterInitialStatementError,
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
 }
 
+// A statement that fails after returning a row keeps the batch: the next fetch
+// reports the error, the one after returns SQL_NO_DATA, and SQLMoreResults
+// reaches the next statement (msodbcsql 18.7.1.1).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BoundFetchReportsAStatementErrorAfterItsRow,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n); SELECT 42 AS v;");
+    SQLINTEGER n = 0;
+    SQLINTEGER q = 0;
+    SQLLEN n_ind = 0;
+    SQLLEN q_ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &n, 0, &n_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &q, 0, &q_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1, n);
+    ASSERT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(42, n);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+}
+
+// A block fetch returns the rows before a statement's error with SQL_SUCCESS
+// and leaves the error for the next fetch, which fetches no rows; the batch
+// continues (msodbcsql 18.7.1.1). The rowset is sized after execution so
+// msodbcsql streams the result, as this driver does.
+ODBC_TEST_F_MODES(MoreResultsLiveTest, BlockFetchReturnsRowsBeforeAStatementError,
+                  odbc_concurrency::kAllModes) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; SELECT n, 1/(2-n) AS q FROM (VALUES(1),(2),(3)) t(n); SELECT 42 AS v;");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    constexpr SQLULEN rowset = 10;
+    SQLINTEGER n[rowset] = {};
+    SQLINTEGER q[rowset] = {};
+    SQLLEN n_ind[rowset] = {};
+    SQLLEN q_ind[rowset] = {};
+    SQLUSMALLINT status[rowset] = {};
+    SQLULEN fetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(rowset), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, n, 0, n_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, q, 0, q_ind), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1u, fetched);
+    EXPECT_EQ(1, n[0]);
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_ROW_NOROW, status[1]);
+    ASSERT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
+    EXPECT_EQ(0u, fetched);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(1u, fetched);
+    EXPECT_EQ(42, n[0]);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+}
+
 // For diagnostics returned by one execution call, a mapped server warning
 // precedes the subsequent unmapped server error.
 ODBC_TEST_F_MODES(MoreResultsLiveTest, ServerDiagnosticsUseMsodbcsqlPriorityOrder,

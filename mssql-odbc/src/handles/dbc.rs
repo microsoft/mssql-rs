@@ -17,7 +17,7 @@ use crate::api::odbc_types::{
     SQL_TXN_READ_COMMITTED,
 };
 use crate::conversion::client_encoding::ClientEncoding;
-use crate::error::{DiagRecord, HasDiagnostics};
+use crate::error::{DiagRecord, DiagRecords, HasDiagnostics};
 
 /// Connection state machine — tracks whether the DBC is connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +110,7 @@ pub(crate) struct VendorConnOverrides {
 
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
-    pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) diag_records: DiagRecords,
     pub(crate) client_encoding: ClientEncoding,
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
@@ -408,7 +408,7 @@ impl HasDiagnostics for DbcState {
     fn diag_records(&self) -> &[DiagRecord] {
         &self.diag_records
     }
-    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+    fn diag_records_mut(&mut self) -> &mut DiagRecords {
         &mut self.diag_records
     }
 }
@@ -457,7 +457,7 @@ impl DbcHandle {
             connection_timeout: AtomicU32::new(0),
             data_classification_version: AtomicU8::new(0),
             inner: Mutex::new(DbcState {
-                diag_records: Vec::new(),
+                diag_records: Default::default(),
                 client_encoding: ClientEncoding::system_default(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),

@@ -34,7 +34,7 @@ pub(crate) const DRIVER_DIAG_PREFIX: &str = driver_diag_prefix!();
 /// Implemented by state structs that store ODBC diagnostic records.
 pub(crate) trait HasDiagnostics {
     fn diag_records(&self) -> &[DiagRecord];
-    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord>;
+    fn diag_records_mut(&mut self) -> &mut DiagRecords;
 
     fn server_row_number(&self) -> SqlLen {
         SQL_NO_ROW_NUMBER
@@ -48,12 +48,36 @@ impl<T: HasDiagnostics + ?Sized> HasDiagnostics for MutexGuard<'_, T> {
         self.deref().diag_records()
     }
 
-    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+    fn diag_records_mut(&mut self) -> &mut DiagRecords {
         self.deref_mut().diag_records_mut()
     }
 
     fn server_row_number(&self) -> SqlLen {
         self.deref().server_row_number()
+    }
+}
+
+/// A handle's diagnostic records, in posting order until a record read sorts
+/// them. Mutable access can add or reorder records, so it marks the list for
+/// sorting again, and a run of record reads sorts it once.
+#[derive(Debug, Default)]
+pub(crate) struct DiagRecords {
+    records: Vec<DiagRecord>,
+    sorted: bool,
+}
+
+impl Deref for DiagRecords {
+    type Target = Vec<DiagRecord>;
+
+    fn deref(&self) -> &Vec<DiagRecord> {
+        &self.records
+    }
+}
+
+impl DerefMut for DiagRecords {
+    fn deref_mut(&mut self) -> &mut Vec<DiagRecord> {
+        self.sorted = false;
+        &mut self.records
     }
 }
 
@@ -98,12 +122,15 @@ impl DiagRecord {
     }
 }
 
-/// Sort records in place once, matching msodbcsql's stable
-/// `(row number, resource ID, posting ordinal)` order.
+/// Sorts records into msodbcsql's stable `(row number, resource ID, posting
+/// ordinal)` order, unless nothing changed since the last sort.
 pub(crate) fn sort_diagnostics<T: HasDiagnostics + ?Sized>(state: &mut T) {
-    state
-        .diag_records_mut()
-        .sort_by_key(|record| (record.row_number, record.priority));
+    let list = state.diag_records_mut();
+    if !list.sorted {
+        list.records
+            .sort_by_key(|record| (record.row_number, record.priority));
+        list.sorted = true;
+    }
 }
 
 /// Post an ODBC diagnostic record onto a handle-local diagnostic list.
@@ -148,4 +175,53 @@ pub(crate) fn post_prefixed(
 /// new work that may post fresh diagnostics.
 pub(crate) fn free_errors(state: &mut impl HasDiagnostics) {
     state.diag_records_mut().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct State(DiagRecords);
+
+    impl HasDiagnostics for State {
+        fn diag_records(&self) -> &[DiagRecord] {
+            &self.0
+        }
+
+        fn diag_records_mut(&mut self) -> &mut DiagRecords {
+            &mut self.0
+        }
+    }
+
+    fn post(state: &mut State, native_error: i32, priority: u16) {
+        state.0.push(DiagRecord::with_sort_key(
+            *b"01000",
+            native_error,
+            SQL_NO_ROW_NUMBER,
+            priority,
+            "message",
+        ));
+    }
+
+    fn natives(state: &State) -> Vec<i32> {
+        state.0.iter().map(|record| record.native_error).collect()
+    }
+
+    #[test]
+    fn records_are_sorted_once_per_change() {
+        let mut state = State::default();
+        post(&mut state, 1, 40401);
+        post(&mut state, 2, 0);
+        sort_diagnostics(&mut state);
+        assert_eq!(natives(&state), [2, 1]);
+        assert!(state.0.sorted);
+        assert_eq!(state.diag_records().len(), 2);
+        assert!(state.0.sorted, "reading records keeps them sorted");
+
+        post(&mut state, 3, 0);
+        assert!(!state.0.sorted);
+        sort_diagnostics(&mut state);
+        assert_eq!(natives(&state), [2, 3, 1]);
+    }
 }

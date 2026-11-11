@@ -92,7 +92,7 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{ERR_FUNCTION_SEQUENCE, SQLSTATE_HY000, post_diag};
-use crate::error::{DiagRecord, HasDiagnostics, free_errors, post_sql_error};
+use crate::error::{DiagRecord, DiagRecords, HasDiagnostics, free_errors, post_sql_error};
 use tracing::error;
 
 /// The five descriptor shapes this driver constructs: the four
@@ -573,7 +573,7 @@ impl DescRecord {
 
 #[derive(Debug)]
 pub(crate) struct DescState {
-    pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) diag_records: DiagRecords,
     pub(crate) header: DescHeader,
     /// 1-based descriptor records: `records[0]` is record number 1.
     pub(crate) records: Vec<DescRecord>,
@@ -1376,7 +1376,7 @@ impl DescHandle {
             alloc_type,
             parent_dbc,
             inner: Mutex::new(DescState {
-                diag_records: Vec::new(),
+                diag_records: Default::default(),
                 header: DescHeader {
                     alloc_type,
                     ..DescHeader::default()
@@ -1405,7 +1405,7 @@ impl HasDiagnostics for DescState {
     fn diag_records(&self) -> &[DiagRecord] {
         &self.diag_records
     }
-    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+    fn diag_records_mut(&mut self) -> &mut DiagRecords {
         &mut self.diag_records
     }
 }
@@ -2343,7 +2343,7 @@ mod tests {
     #[test]
     fn set_record_count_grows_with_kind_defaults() {
         let mut state = DescState {
-            diag_records: Vec::new(),
+            diag_records: Default::default(),
             header: DescHeader::default(),
             records: Vec::new(),
             data_classification: None,
@@ -2358,7 +2358,7 @@ mod tests {
         // (mixing kinds on one growing state isn't a real scenario — a
         // descriptor's kind never changes after creation).
         let mut ipd_state = DescState {
-            diag_records: Vec::new(),
+            diag_records: Default::default(),
             header: DescHeader::default(),
             records: Vec::new(),
             data_classification: None,
@@ -2372,7 +2372,7 @@ mod tests {
     #[test]
     fn set_record_count_shrink_discards_trailing_records_and_preserves_the_rest() {
         let mut state = DescState {
-            diag_records: Vec::new(),
+            diag_records: Default::default(),
             header: DescHeader::default(),
             records: Vec::new(),
             data_classification: None,
@@ -2390,7 +2390,7 @@ mod tests {
     #[test]
     fn record_and_record_mut_reject_zero_and_negative() {
         let mut state = DescState {
-            diag_records: Vec::new(),
+            diag_records: Default::default(),
             header: DescHeader::default(),
             records: Vec::new(),
             data_classification: None,

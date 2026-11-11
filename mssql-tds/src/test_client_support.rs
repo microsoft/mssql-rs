@@ -570,6 +570,18 @@ pub fn tds_client_from_int_rowsets_with_trailing_tokens(
     )
 }
 
+/// Replays `tokens`, serving the next entry of `rowsets` as the integer rows of
+/// each COLMETADATA. No DONE is added, so a row set can end with any tokens,
+/// such as a failed statement's ERROR.
+pub fn tds_client_from_tokens_with_int_rowsets(
+    tokens: Vec<ScriptedToken>,
+    rowsets: Vec<Vec<Vec<i32>>>,
+) -> TdsClient {
+    let mut transport = TokenReplayTransport::new(tokens.into_iter().map(|t| t.0).collect());
+    transport.pending_rowsets = rowsets.into();
+    client_over(transport)
+}
+
 /// Builds an integer-row client whose buffered whole-row attempt writes only
 /// `buffered_prefix_columns` before forcing async continuation.
 pub fn tds_client_from_partial_int_rows(

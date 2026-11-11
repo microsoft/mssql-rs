@@ -6512,6 +6512,73 @@ impl TdsClient {
         }
     }
 
+    /// Reads the rest of a statement whose error was just returned under
+    /// [`BatchErrorMode::Continue`] — environment changes and messages up to the
+    /// DONE that ends it — and returns whether later results follow.
+    ///
+    /// The error is returned before that DONE, so until it is read
+    /// [`has_open_batch`](Self::has_open_batch) reports `true` even when the
+    /// failed statement was the batch's last, and the connection cannot take
+    /// another request. Reading stops at that DONE, so nothing of the next
+    /// statement is read; any other token is left for [`advance`](Self::advance)
+    /// with the batch kept open. An error returned from a row set's DONE needs
+    /// nothing more.
+    pub async fn complete_failed_statement(&mut self) -> TdsResult<bool> {
+        if !self.failed_statement_done_pending {
+            return Ok(self.has_open_batch());
+        }
+        match self.complete_failed_statement_inner().await {
+            Err(error) => Err(self.end_walk_on_read_error(error)),
+            ok => ok,
+        }
+    }
+
+    async fn complete_failed_statement_inner(&mut self) -> TdsResult<bool> {
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
+        loop {
+            let token = self.next_response_token(&parser_context).await?;
+            let is_done_in_proc = matches!(token, Tokens::DoneInProc(_));
+            match token {
+                Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                    info!(?done, "Completed the failed statement");
+                    self.failed_statement_done_pending = false;
+                    self.validate_done_error(&done, is_done_in_proc)?;
+                    let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                    *count = count.saturating_add(done.row_count);
+                    self.last_result_row_count = None;
+                    self.current_result_set_has_been_read_till_end = true;
+                    self.current_result_ended_with_done_in_proc = is_done_in_proc;
+                    if !done.has_more() {
+                        self.execution_context.set_has_open_batch(false);
+                    }
+                    return Ok(done.has_more());
+                }
+                Tokens::EnvChange(env_change) => {
+                    info!(?env_change);
+                    if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.on_reset_connection_ack();
+                    }
+                    self.execution_context
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+                }
+                Tokens::SessionState(session_state) => {
+                    self.recovery_context
+                        .process_session_state(&session_state)?;
+                }
+                Tokens::Info(info_token) => {
+                    info!(?info_token);
+                    self.capture_info_message(&info_token);
+                }
+                other => {
+                    self.parked_token = Some(Box::new(other));
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     /// Settles the protocol-only tail after an exhausted RPC row set.
     ///
     /// SQL Server RPC responses can end a row set with `DONE_MORE`, then emit
@@ -13197,6 +13264,83 @@ mod tests {
         assert!(!client.has_open_batch());
         assert!(client.is_connection_dead());
         assert!(!client.statement_error_completion_pending);
+    }
+
+    /// A statement error is returned before its DONE. Completing the statement
+    /// reads the rollback an XACT_ABORT error sends and the final DONE, so the
+    /// batch is over and the transaction has ended.
+    #[tokio::test]
+    async fn completing_a_failed_last_statement_closes_the_batch() {
+        use crate::token::tokens::{EnvChangeToken, EnvChangeTokenSubType};
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::RollbackTransaction,
+                change_type: (42u64, 0u64).into(),
+            }),
+            done_no_more(),
+        ]);
+        client.execution_context.set_transaction_descriptor(42);
+        let error = client
+            .execute(
+                "INSERT t VALUES (1/0)".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, crate::error::Error::SqlServerError { .. }));
+        assert!(client.has_open_batch());
+
+        assert!(!client.complete_failed_statement().await.unwrap());
+        assert!(!client.has_open_batch());
+        assert_eq!(client.execution_context.get_transaction_descriptor(), 0);
+        assert!(!client.complete_failed_statement().await.unwrap());
+    }
+
+    /// With more statements after it, completing the failed statement stops at
+    /// its DONE, and the next result is reached as usual.
+    #[tokio::test]
+    async fn completing_a_failed_statement_keeps_a_batch_that_goes_on() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_more(),
+            int_col_metadata(1),
+            done_no_more(),
+        ]);
+        client
+            .execute(
+                "RAISERROR('e', 16, 1); SELECT 1".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(client.has_open_batch());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+    }
+
+    /// A token that cannot belong to the failed statement is left for `advance`
+    /// with the batch open.
+    #[tokio::test]
+    async fn completing_a_failed_statement_leaves_a_result_for_advance() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            int_col_metadata(1),
+            done_no_more(),
+        ]);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(client.has_open_batch());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
     }
 
     /// The same inside a row set: the errors collected there are dropped with

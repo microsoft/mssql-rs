@@ -1438,3 +1438,31 @@ msodbcsql build is measured.
     fetch of the last rowset rather than the `SQL_NO_DATA` after it; msodbcsql
     has no equivalent to match. `BlockCursorsReportTheClassificationOnlyInThisDriver`
     asserts each driver's outcome.
+
+43. **`SQLMoreResults` reports a statement's unread trailing error and keeps
+    the batch.** After a fetch delivers a row from a plain batch, the
+    statement's row set can still end in a SQL Server error, with more
+    statements after it. msodbcsql's `SQLMoreResults` closes the open cursor
+    first (`Sql/Ntdbms/sqlncli/odbc/sqlcresl.cpp`, `ExportImp::SQLMoreResults`,
+    lines 196-199). It then returns `SQL_NO_DATA` once no result is pending
+    (lines 239-246), with no diagnostic. The later statements' results stay
+    unread, and the connection stays busy: another statement's execute fails
+    with "Connection is busy with results for another command" until this
+    statement is freed.
+
+    This driver returns `SQL_ERROR` with the error and positions on the
+    failed statement's error result. The next `SQLMoreResults` continues with
+    the batch. Both drivers already report a statement that fails between
+    results that way, and the rest of the batch stays reachable. A fetch that
+    reads the error first behaves as in msodbcsql: `SQL_ERROR`, then
+    `SQL_NO_DATA`, then `SQLMoreResults` reaches the next statement.
+
+    **Evidence level: measured.** Windows msodbcsql 18.07.0001, loaded
+    directly without a Driver Manager, against SQL Server 2025
+    (`17.00.4025`). The batch was `SET NOCOUNT ON; SELECT n, 1/(2-n) AS q FROM
+    (VALUES(1),(2),(3)) t(n); SELECT 42 AS v;`, read by a single-row bound
+    fetch and by a block fetch sized before or after execution.
+    `more_results_reports_a_deferred_continued_error_then_continues` pins this
+    driver's sequence. Chosen by the change author for
+    [AB#45309](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/45309);
+    maintainer sign-off is pending review.

@@ -188,6 +188,8 @@ on the `master` branch.
 - `SQLGetDiagRec` and record-scoped `SQLGetDiagField` read diagnostics in
   msodbcsql order: row number, message-resource priority, then stable posting
   order. Sort only when a record is read; header fields do not trigger it.
+  `DiagRecords` marks itself unsorted on any mutable access, so a run of
+  record reads sorts once per change.
   Mapped SQL Server messages use priority 0; unmapped messages use the
   severity fallback priorities 40136, 40146, or 40401. Do not infer exact
   driver resource IDs from SQLSTATE; unmeasured driver diagnostics retain
@@ -195,7 +197,20 @@ on the `master` branch.
 - Plain, unparameterized `SQLExecDirect` batches use statement-wise error
   continuation. An error result remains on the statement with the connection
   reserved, and `SQLMoreResults` continues to later statements. Prepared and
-  parameterized execution paths retain their existing abort behavior.
+  parameterized execution paths retain their existing abort behavior. A
+  statement error is returned before its DONE, so call
+  `TdsClient::complete_failed_statement` before keeping the connection: a
+  failed last statement must release it, as msodbcsql does.
+- A SQL Server error that ends a row set after a fetch delivered rows belongs
+  to the next fetch, as in msodbcsql: the block fetch or read-ahead that finds
+  it returns its rows and defers it in `pending_fetch_error`. While a
+  continued batch remains, keep the connection reserved and the cursor open, so
+  the next fetch reports the error, the one after returns `SQL_NO_DATA`, and
+  `SQLMoreResults` reaches the next statement. `SQLMoreResults` reports an
+  unread deferred error as the statement's error result (parity deviation
+  43). Treat only `SqlServerError` with an open batch as continuable
+  (`is_continued_statement_error`); a usage error can coincide with another
+  command's open batch.
 - Every ODBC entry point must clear the handle's diagnostic records at API
   entry by calling `free_errors(...)` after acquiring the handle lock, so a
   fresh call starts without stale diagnostics.

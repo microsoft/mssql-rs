@@ -4974,6 +4974,7 @@ pub(crate) mod tests {
     fn server_error(number: u32, message: &str) -> Error {
         let mut diagnostics = SqlServerDiagnostics::default();
         diagnostics.errors.push(SqlErrorInfo {
+            diagnostic_ordinal: 0,
             message: message.to_string(),
             state: 1,
             class: 14,

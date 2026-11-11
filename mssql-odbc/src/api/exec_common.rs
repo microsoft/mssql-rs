@@ -516,8 +516,12 @@ pub(super) fn try_claim_idle_client(
 /// delivered, so posting now would never reach the caller. The next call
 /// that would otherwise short-circuit past the wire believing there is
 /// nothing left (`SQLFetch`'s `result_set_exhausted` fast path,
-/// `SQLMoreResults`) drains and reports it instead. A failure that does
-/// *not* end the batch (a raw transport error) is left unposted entirely:
+/// `SQLMoreResults`) drains and reports it instead. Under
+/// `BatchErrorMode::Continue` a statement error ends only its own row set:
+/// it is deferred the same way, but the batch stays reserved, so the call
+/// that reports it keeps the cursor for `SQLMoreResults` (msodbcsql answers
+/// the next fetch with the error, then `SQL_NO_DATA`). A failure that does
+/// *not* end the row set (a raw transport error) is left unposted entirely:
 /// `release` is false in that case, so nothing about this statement's state
 /// changes, and the caller's very next real operation on this connection
 /// takes the normal, non-fast-path route and organically rediscovers and
@@ -584,11 +588,14 @@ pub(super) fn release_busy_if_row_exhausted(
     // reached cleanly — always exhausted, regardless of whether a further
     // result set remains pending elsewhere in the batch (`SQLFetch` never
     // auto-advances across result sets, so reporting `SQL_NO_DATA` for a
-    // fully-read one is correct on its own terms). `Err`: only exhausted if
-    // the wire itself has given up on the whole batch (see doc comment).
+    // fully-read one is correct on its own terms). `Err`: exhausted if it
+    // failed only this statement, or if the wire has given up on the whole
+    // batch (see doc comment).
+    let continued_error =
+        matches!(&peek_result, Err(error) if is_continued_statement_error(&client, error));
     let result_set_exhausted = match &peek_result {
         Ok(has_more) => !has_more,
-        Err(_) => !client.has_open_batch(),
+        Err(_) => continued_error || !client.has_open_batch(),
     };
 
     // A row-returning RPC can end its visible row set with DONEINPROC MORE because
@@ -665,7 +672,7 @@ pub(super) fn release_busy_if_row_exhausted(
             if cancelled {
                 super::close_cursor::reset_cursor_state(&mut stmt_state);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
-            } else if batch_done {
+            } else if batch_done || continued_error {
                 stmt_state.pending_fetch_error = Some(e);
             }
         }
@@ -730,6 +737,17 @@ pub(super) fn finish_cancelled_cursor(
     SQL_ERROR
 }
 
+/// Whether `error` failed one statement of a plain batch whose later results
+/// stay readable under `BatchErrorMode::Continue`. Only a SQL Server error
+/// qualifies: a usage error is raised before the response is read, so it can
+/// coincide with an earlier command's open batch, which this statement must not
+/// adopt.
+pub(super) fn is_continued_statement_error(client: &TdsClient, error: &TdsError) -> bool {
+    matches!(error, TdsError::SqlServerError { .. })
+        && client.continues_batch_on_error()
+        && client.has_open_batch()
+}
+
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
 /// `EXEC_STARTED`, and returns `SQL_ERROR`. The common failure tail for an
 /// execution I/O error.
@@ -740,14 +758,21 @@ pub(super) fn fail_with_tds(
     mut client: WireLease,
     err: &TdsError,
 ) -> SqlReturn {
+    // Only reading the failed statement's DONE shows whether the batch goes on;
+    // a failed last statement must not keep the connection.
+    let completion = if is_continued_statement_error(&client, err) {
+        dbc.runtime.block_on(client.complete_failed_statement())
+    } else {
+        Ok(false)
+    };
     let info_messages = client.take_info_messages();
-    if client.continues_batch_on_error() && client.has_open_batch() {
+    if matches!(completion, Ok(true)) {
         let warn_cp_loss = take_code_page_conversion_loss(dbc, &mut client);
         let row_count = client.last_rows_affected();
         if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
             return SQL_ERROR;
         }
-        let ird_ok = populate_ird(stmt, &[]).is_ok();
+        let ird_ok = populate_ird(stmt, &[], None).is_ok();
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             stmt_state.begin_batch(Vec::new());
             stmt_state.reset_row_stream();
@@ -775,6 +800,9 @@ pub(super) fn fail_with_tds(
     return_client_idle(dbc, statement_handle, client);
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         post_tds_error_with_info(&mut stmt_state, err, SQLSTATE_HY000, &info_messages);
+        if let Err(completion_error) = &completion {
+            post_tds_error(&mut stmt_state, completion_error, SQLSTATE_HY000);
+        }
     } else {
         error!("stmt mutex poisoned — could not post TDS error");
     }
@@ -3064,6 +3092,37 @@ mod tests {
     // transport in `test_client_support` cannot reach from outside the crate
     // (see its module docs — there are no real row bytes to manufacture one
     // through a fresh read either).
+
+    /// Only a SQL Server error continues a batch. A usage error is raised
+    /// before the response is read, so it can coincide with an earlier
+    /// command's open batch, which `fail_with_tds` must not adopt for this
+    /// statement.
+    #[test]
+    fn only_a_server_error_continues_an_open_batch() {
+        use mssql_tds::connection::tds_client::{BatchErrorMode, ExecuteOptions};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_tokens(vec![
+            sql_error(50000, 16, "first statement failed"),
+            done_more(),
+            col_metadata_empty(),
+            done_no_more(),
+        ]);
+        let error = dbc
+            .runtime
+            .block_on(client.execute(
+                "RAISERROR('e16', 16, 1); SELECT 1;".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            ))
+            .unwrap_err();
+
+        assert!(is_continued_statement_error(&client, &error));
+        assert!(!is_continued_statement_error(
+            &client,
+            &TdsError::UsageError("already executing".to_string())
+        ));
+    }
 
     #[test]
     fn release_busy_if_row_exhausted_swallows_peek_failure_and_stays_busy() {

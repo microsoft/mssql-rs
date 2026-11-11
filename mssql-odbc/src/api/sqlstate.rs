@@ -838,13 +838,13 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
-        records: Vec<crate::error::DiagRecord>,
+        records: crate::error::DiagRecords,
     }
     impl HasDiagnostics for FakeState {
         fn diag_records(&self) -> &[crate::error::DiagRecord] {
             &self.records
         }
-        fn diag_records_mut(&mut self) -> &mut Vec<crate::error::DiagRecord> {
+        fn diag_records_mut(&mut self) -> &mut crate::error::DiagRecords {
             &mut self.records
         }
     }

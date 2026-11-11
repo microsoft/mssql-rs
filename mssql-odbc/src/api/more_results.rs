@@ -17,7 +17,7 @@ use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
 use super::close_cursor::reset_cursor_state;
 use super::ird::{clear_ird_classification, populate_ird};
-use crate::api::exec_common::post_claim_error;
+use crate::api::exec_common::{is_continued_statement_error, post_claim_error};
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlReturn,
@@ -27,7 +27,7 @@ use crate::api::sqlstate::{
 };
 use crate::error::free_errors;
 use crate::error::post_sql_error;
-use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::wire::{ClaimPolicy, LeaseReturn, WireOwner};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -114,6 +114,27 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
             // committed to delivering its own row successfully, so the
             // diagnostic was deferred here instead of being lost under that
             // call's own success return.
+            if !stmt_state.batch_exhausted {
+                // Only that statement failed and the batch is still reserved,
+                // so report it as the statement's result and let the next call
+                // continue. msodbcsql returns SQL_NO_DATA here and leaves the
+                // rest of the batch unread (docs/parity-deviations.md).
+                let row_count = stmt_state.row_count;
+                begin_error_result(&mut stmt_state, row_count);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+                drop(stmt_state);
+                if populate_ird(stmt, &[], None).is_err()
+                    && let Ok(mut stmt_state) = stmt.inner.lock()
+                {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
+            }
             reset_cursor_state(&mut stmt_state);
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
             drop(stmt_state);
@@ -396,10 +417,16 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
         Err(e) => {
             error!(%e, "SQLMoreResults: advance failed");
+            // As in `fail_with_tds`: a failed last statement ends the batch.
+            let completion = if is_continued_statement_error(&client, &e) {
+                dbc.runtime.block_on(client.complete_failed_statement())
+            } else {
+                Ok(false)
+            };
             let info_messages = client.take_info_messages();
-            if client.continues_batch_on_error() && client.has_open_batch() {
+            if matches!(completion, Ok(true)) {
                 let row_count = client.last_rows_affected();
-                let ird_ok = populate_ird(stmt, &[]).is_ok();
+                let ird_ok = populate_ird(stmt, &[], None).is_ok();
                 if !dbc.return_lease(client, LeaseReturn::KeepReservation) {
                     return SQL_ERROR;
                 }
@@ -408,12 +435,7 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                     Err(rc) => rc,
                 };
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
-                    stmt_state.begin_result_set(Vec::new());
-                    stmt_state.reset_row_stream();
-                    stmt_state.row_count = row_count;
-                    stmt_state.result_set_exhausted = false;
-                    stmt_state.batch_exhausted = false;
-                    stmt_state.error_result = true;
+                    begin_error_result(&mut stmt_state, row_count);
                     post_tds_error_with_info(&mut stmt_state, &e, SQLSTATE_HY000, &info_messages);
                 }
                 if !ird_ok && let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -437,11 +459,26 @@ fn advance_results(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 // Treat as terminal: clear cursor state and post diagnostic.
                 reset_cursor_state(&mut stmt_state);
                 post_tds_error_with_info(&mut stmt_state, &e, SQLSTATE_HY000, &info_messages);
+                if let Err(completion_error) = &completion {
+                    post_tds_error(&mut stmt_state, completion_error, SQLSTATE_HY000);
+                }
             }
             clear_ird_classification(stmt);
             SQL_ERROR
         }
     }
+}
+
+/// Positions on the result of a statement that failed while the rest of its
+/// batch stays reserved: no columns and no cursor to fetch or close, as
+/// msodbcsql presents it, and the next `SQLMoreResults` continues the batch.
+fn begin_error_result(stmt_state: &mut StmtState, row_count: i64) {
+    stmt_state.begin_result_set(Vec::new());
+    stmt_state.reset_row_stream();
+    stmt_state.row_count = row_count;
+    stmt_state.result_set_exhausted = false;
+    stmt_state.batch_exhausted = false;
+    stmt_state.error_result = true;
 }
 
 #[cfg(test)]
@@ -546,6 +583,37 @@ mod tests {
             Some(handles.stmt)
         );
         assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+    }
+
+    /// A failed last statement ends the batch once its DONE is read: the
+    /// connection is released and the next call reports no more results.
+    #[test]
+    fn more_results_ends_the_batch_at_a_failed_last_statement() {
+        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject_with_continue(
+            &handles,
+            vec![
+                col_metadata(int_columns(1)),
+                done_more(),
+                sql_error(50000, 16, "last statement failed"),
+                done_no_more(),
+            ],
+            true,
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+            assert!(state.diag_records.iter().any(|d| d.native_error == 50000));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        assert_eq!(dbc.inner.lock().unwrap().wire.statement_owner(), None);
+        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
     }
 
     /// SQLMoreResults advances from one row set to the next, keeping the cursor
@@ -848,6 +916,7 @@ mod tests {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
             ss.result_set_exhausted = true;
+            ss.batch_exhausted = true;
             ss.pending_fetch_error = Some(TdsError::ProtocolError(
                 "simulated trailing SQL Server error".to_string(),
             ));
