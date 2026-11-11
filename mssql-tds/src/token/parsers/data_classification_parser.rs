@@ -212,15 +212,38 @@ async fn read_b_varchar<T: TdsPacketReader + Send + Sync>(
     // At most 255 UTF-16 code units, so the byte count cannot overflow.
     budget.claim(character_count * 2, field)?;
 
-    let mut units = Vec::with_capacity(character_count);
-    for _ in 0..character_count {
-        units.push(reader.read_uint16().await?);
-    }
     // SQL Server stores an unpaired surrogate in a label or information type
     // as given. The token is read whole either way, so replace it rather than
     // reject the token and the connection with it; SqlClient decodes it the
     // same way, and msodbcsql passes the raw bytes through.
+    if let Some(bytes) = reader.try_read_slice(character_count * 2) {
+        return Ok(decode_utf16_le_lossy(bytes));
+    }
+    let mut units = Vec::with_capacity(character_count);
+    for _ in 0..character_count {
+        units.push(reader.read_uint16().await?);
+    }
     Ok(String::from_utf16_lossy(&units))
+}
+
+/// [`String::from_utf16_lossy`] over little-endian bytes, without first
+/// collecting them into `u16`s. Labels and ids are usually ASCII, which skips
+/// UTF-16 decoding altogether.
+fn decode_utf16_le_lossy(bytes: &[u8]) -> String {
+    if bytes
+        .chunks_exact(2)
+        .all(|pair| pair[1] == 0 && pair[0].is_ascii())
+        && let Ok(ascii) = String::from_utf8(bytes.iter().step_by(2).copied().collect())
+    {
+        return ascii;
+    }
+    char::decode_utf16(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    )
+    .map(|decoded| decoded.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect()
 }
 
 /// Validates a dictionary index; `None` is the `0xFFFF` "unspecified" value.
@@ -452,22 +475,27 @@ mod tests {
         bytes: Vec<u8>,
         version: DataClassificationVersion,
     ) -> TdsResult<DataClassificationMetadata> {
-        DataClassificationTokenParser
-            .parse_with_version(&mut MockReader::new(bytes), version)
-            .await
+        parse_within(bytes, version, MAX_DATA_CLASSIFICATION_TOKEN_BYTES).await
     }
 
     /// Small enough that the limit tests do not build megabyte payloads.
     const TEST_LIMIT: usize = 256 * 1024;
 
+    /// Parses `bytes` with strings read both from resident bytes and unit by
+    /// unit, and requires the two to agree.
     async fn parse_within(
         bytes: Vec<u8>,
         version: DataClassificationVersion,
         limit: usize,
     ) -> TdsResult<DataClassificationMetadata> {
-        DataClassificationTokenParser
-            .parse_within(&mut MockReader::new(bytes), version, limit)
-            .await
+        let unbuffered = DataClassificationTokenParser
+            .parse_within(&mut MockReader::new(bytes.clone()), version, limit)
+            .await;
+        let buffered = DataClassificationTokenParser
+            .parse_within(&mut MockReader::new(bytes).buffered(), version, limit)
+            .await;
+        assert_eq!(format!("{buffered:?}"), format!("{unbuffered:?}"));
+        buffered
     }
 
     #[tokio::test]
@@ -631,15 +659,80 @@ mod tests {
         bytes.push(0); // empty id
         bytes.extend_from_slice(&0u16.to_le_bytes()); // information-type count
         bytes.extend_from_slice(&0u16.to_le_bytes()); // column count
-        let mut reader = MockReader::new(bytes);
 
-        let metadata = DataClassificationTokenParser
-            .parse_with_version(&mut reader, DataClassificationVersion::Version1)
-            .await
-            .unwrap();
+        for mut reader in [
+            MockReader::new(bytes.clone()),
+            MockReader::new(bytes).buffered(),
+        ] {
+            let metadata = DataClassificationTokenParser
+                .parse_with_version(&mut reader, DataClassificationVersion::Version1)
+                .await
+                .unwrap();
 
-        assert_eq!(metadata.sensitivity_labels[0].name, "A\u{FFFD}B");
-        assert_eq!(reader.remaining(), 0);
+            assert_eq!(metadata.sensitivity_labels[0].name, "A\u{FFFD}B");
+            assert_eq!(reader.remaining(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn resident_strings_are_read_in_one_run() {
+        let bytes = payload(
+            DataClassificationVersion::Version1,
+            &[("Confidential", "L1")],
+            &[],
+            -1,
+            &[vec![WireProperty {
+                label: 0,
+                information_type: NULL_DICTIONARY_INDEX,
+                rank: 0,
+            }]],
+        );
+        // Three counts, one property count and two indexes.
+        let fixed = 6;
+        let string_units = "Confidential".len() + "L1".len();
+
+        let mut unit_by_unit = MockReader::new(bytes.clone());
+        let mut resident = MockReader::new(bytes).buffered();
+        for reader in [&mut unit_by_unit, &mut resident] {
+            DataClassificationTokenParser
+                .parse_with_version(reader, DataClassificationVersion::Version1)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(unit_by_unit.uint16_reads(), fixed + string_units);
+        assert_eq!(resident.uint16_reads(), fixed);
+    }
+
+    #[tokio::test]
+    async fn decodes_non_ascii_labels_and_information_types() {
+        let labels = [("Données personnelles", "Ä-ü"), ("機密", "\u{1F512}")];
+        // "Ã©" is U+00C3 U+00A9: zero high bytes whose low bytes are the UTF-8 for "é".
+        let information_types = [("Ã©", "\u{7F}")];
+        let metadata = parse(
+            payload(
+                DataClassificationVersion::Version1,
+                &labels,
+                &information_types,
+                -1,
+                &[],
+            ),
+            DataClassificationVersion::Version1,
+        )
+        .await
+        .unwrap();
+
+        let decoded: Vec<_> = metadata
+            .sensitivity_labels()
+            .iter()
+            .map(|label| (label.name(), label.id()))
+            .collect();
+        assert_eq!(decoded, labels);
+        let information_type = &metadata.information_types()[0];
+        assert_eq!(
+            (information_type.name(), information_type.id()),
+            information_types[0]
+        );
     }
 
     #[tokio::test]
