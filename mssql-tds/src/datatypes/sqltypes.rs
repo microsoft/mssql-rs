@@ -190,6 +190,11 @@ pub(crate) enum RpcInlineValue<'a> {
         max_bytes: u16,
         value: Option<&'a [u8]>,
     },
+    /// `VARBINARY(max_len)`, `max_len <= 8000`, borrowing the value.
+    VarBinary {
+        max_len: u16,
+        value: Option<&'a [u8]>,
+    },
 }
 
 impl RpcInlineValue<'_> {
@@ -197,6 +202,7 @@ impl RpcInlineValue<'_> {
         match self {
             Self::Fixed { len, .. } => usize::from(*len),
             Self::NVarchar { value, .. } => 8 + 2 + value.map_or(0, <[u8]>::len),
+            Self::VarBinary { value, .. } => 3 + 2 + value.map_or(0, <[u8]>::len),
         }
     }
 
@@ -224,6 +230,23 @@ impl RpcInlineValue<'_> {
                             bytes.len(),
                         );
                         packet_writer.write_bytes_within_packet(&length.to_le_bytes());
+                        packet_writer.write_bytes_within_packet(bytes);
+                    }
+                    None => packet_writer.write_bytes_within_packet(&VARNULL.to_le_bytes()),
+                }
+            }
+            Self::VarBinary { max_len, value } => {
+                let [len_lo, len_hi] = max_len.to_le_bytes();
+                packet_writer.write_bytes_within_packet(&[
+                    TdsDataType::BigVarBinary as u8,
+                    len_lo,
+                    len_hi,
+                ]);
+                match value {
+                    Some(bytes) => {
+                        // Cannot truncate: `rpc_inline` bounds the value by `max_len`.
+                        packet_writer
+                            .write_bytes_within_packet(&(bytes.len() as u16).to_le_bytes());
                         packet_writer.write_bytes_within_packet(bytes);
                     }
                     None => packet_writer.write_bytes_within_packet(&VARNULL.to_le_bytes()),
@@ -897,7 +920,8 @@ impl SqlType {
     /// serialization is plain buffer writes that cannot fail. `None` keeps the
     /// value on [`Self::serialize_with_narrow_string_byte_limit`], which owns
     /// every error: transcoding, odd UTF-16 length, over-length values, an
-    /// invalid time scale and all variable-length types. `type_metadata` is the
+    /// invalid time scale, over-length VARBINARY data and all other
+    /// variable-length types. `type_metadata` is the
     /// parameter's, which that path passes to `write_type_info`.
     pub(crate) fn rpc_inline(
         &self,
@@ -919,6 +943,21 @@ impl SqlType {
                 None => None,
             };
             return Some(RpcInlineValue::NVarchar { max_bytes, value });
+        }
+        if let SqlType::VarBinary(value, max_len) = self {
+            if *max_len > VAR_TDS_MAX_LENGTH {
+                return None;
+            }
+            let value = match value {
+                // Longer data is a `serialize_bytes` error.
+                Some(bytes) if bytes.len() > usize::from(*max_len) => return None,
+                Some(bytes) => Some(bytes.as_slice()),
+                None => None,
+            };
+            return Some(RpcInlineValue::VarBinary {
+                max_len: *max_len,
+                value,
+            });
         }
         let (type_info, type_info_len) = self.fixed_type_info(
             type_metadata.and_then(|metadata| metadata.precision),

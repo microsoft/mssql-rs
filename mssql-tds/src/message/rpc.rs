@@ -1407,6 +1407,8 @@ mod tests {
         assert_eq!(inline(SqlType::Uuid(Some(uuid::Uuid::nil()))), Some(21));
         assert_eq!(inline(time_value(SqlType::Time, 7)), Some(10));
         assert_eq!(inline(time_value(SqlType::DateTimeOffset, 0)), Some(13));
+        assert_eq!(inline(SqlType::VarBinary(Some(vec![1]), 10)), Some(8));
+        assert_eq!(inline(SqlType::VarBinary(None, 8000)), Some(7));
         assert_eq!(inline(SqlType::NVarchar(None, 4000)), Some(12));
         assert_eq!(inline(SqlType::NVarchar(Some(utf16("ab")), 2)), Some(16));
         assert_eq!(
@@ -1420,7 +1422,9 @@ mod tests {
             SqlType::NVarchar(Some(SqlString::new(vec![1], EncodingType::DelayedSet)), 10),
             SqlType::NVarcharMax(None),
             SqlType::Varchar(None, 10),
-            SqlType::VarBinary(Some(vec![1]), 10),
+            SqlType::VarBinary(Some(vec![1; 11]), 10),
+            SqlType::VarBinary(Some(vec![1]), 8001),
+            SqlType::VarBinaryMax(Some(vec![1])),
             // Scale 8 is an async-path error.
             time_value(SqlType::Time, 8),
             time_value(SqlType::DateTime2, 8),
@@ -1700,9 +1704,12 @@ mod tests {
             8 => SqlType::Int(None),
             9 => SqlType::BigInt(Some(bits as i64)),
             10 => SqlType::BigInt(None),
-            11 | 12 => SqlType::NVarchar(Some(utf16(&"n".repeat(rng.below(12)))), 20),
-            13 => SqlType::NVarchar(None, 10),
-            14 => SqlType::NVarcharMax(Some(utf16("plp"))),
+            11 => SqlType::NVarchar(Some(utf16(&"n".repeat(rng.below(12)))), 20),
+            12 => SqlType::VarBinary(Some(vec![bits as u8; rng.below(21)]), 20),
+            13 if bits & 1 == 0 => SqlType::NVarchar(None, 10),
+            13 => SqlType::VarBinary(None, 8000),
+            14 if bits & 1 == 0 => SqlType::NVarcharMax(Some(utf16("plp"))),
+            14 => SqlType::VarBinary(Some(vec![7; 3]), 8001),
             15 => SqlType::Varchar(Some(utf16("abc")), 10),
             16 => SqlType::NVarchar(Some(SqlString::new(b"ab".to_vec(), EncodingType::Utf8)), 10),
             17..=20 => {
@@ -1891,38 +1898,96 @@ mod tests {
                         7,
                     ),
                 ] {
-                    let collation = db_collation();
-                    let mut mock = MockNetworkWriter::new(4096);
-                    let mut writer =
-                        PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-                    let result = block_on(write_rpc_value(
-                        &parameter,
-                        &mut writer,
-                        &collation,
-                        ValueBinding::ByOrdinal,
-                        &GenericEncoder::new(),
-                    ));
-                    let slow = writer.get_payload().into_inner().split_off(8);
-                    drop(writer);
-                    let mut mock = MockNetworkWriter::new(4096);
-                    let mut writer =
-                        PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
-                    let fast =
-                        parameter.try_write_positional_within_packet(&mut writer, &collation);
-                    let mut inline = writer.get_payload().into_inner();
-                    let inline = inline.split_off(inline.len().min(8));
-                    assert_eq!(fast, result.is_ok(), "{value:?}: {result:?}");
-                    if fast {
-                        assert_eq!(inline, slow, "{value:?}");
-                        assert_eq!(Some(inline.len()), parameter.positional_inline_len());
-                        inline_count += 1;
-                    } else {
-                        assert!(inline.is_empty());
-                    }
+                    let (fast, async_ok) = inline_matches_async(&parameter);
+                    assert_eq!(fast, async_ok, "{parameter:?}");
+                    inline_count += usize::from(fast);
                 }
             }
         }
         assert!(inline_count > 64 * 30 * 3, "{inline_count}");
+    }
+
+    /// Writes `parameter` alone, in a packet large enough not to flush,
+    /// through the async serializer and through the sync path. The sync path
+    /// may take only values the async one encodes without error, and must
+    /// emit the same bytes. Returns whether it took the value and whether the
+    /// async path succeeded.
+    fn inline_matches_async(parameter: &RpcParameter) -> (bool, bool) {
+        let collation = db_collation();
+        let mut mock = MockNetworkWriter::new(32767);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let result = block_on(write_rpc_value(
+            parameter,
+            &mut writer,
+            &collation,
+            ValueBinding::ByOrdinal,
+            &GenericEncoder::new(),
+        ));
+        let slow = writer.get_payload().into_inner().split_off(8);
+        drop(writer);
+        let mut mock = MockNetworkWriter::new(32767);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let fast = parameter.try_write_positional_within_packet(&mut writer, &collation);
+        let mut inline = writer.get_payload().into_inner();
+        let inline = inline.split_off(inline.len().min(8));
+        assert!(!fast || result.is_ok(), "{parameter:?}: {result:?}");
+        if fast {
+            assert_eq!(inline, slow, "{parameter:?}");
+            assert_eq!(Some(inline.len()), parameter.positional_inline_len());
+        } else {
+            assert!(inline.is_empty());
+        }
+        (fast, result.is_ok())
+    }
+
+    /// VARBINARY(n) at every declared-length class, every data length around
+    /// n, NULL, and the over-length and PLP values the sync path declines.
+    #[test]
+    fn varbinary_inline_values_match_the_async_serializer() {
+        let mut inline = 0;
+        let mut declined = 0;
+        for max_len in [0u16, 1, 2, 255, 256, 7999, 8000, 8001, u16::MAX] {
+            let lengths = [
+                0,
+                1,
+                2,
+                usize::from(max_len).saturating_sub(1),
+                usize::from(max_len),
+                usize::from(max_len) + 1,
+            ];
+            let mut values: Vec<SqlType> = lengths
+                .iter()
+                .map(|&len| {
+                    SqlType::VarBinary(Some((0..len).map(|i| (i * 7) as u8).collect()), max_len)
+                })
+                .collect();
+            values.push(SqlType::VarBinary(None, max_len));
+            for value in values {
+                for parameter in [
+                    param(value.clone()),
+                    RpcParameter::new(None, StatusFlags::BY_REF_VALUE, value.clone()),
+                ] {
+                    let (fast, async_ok) = inline_matches_async(&parameter);
+                    let over_length = matches!(
+                        &value,
+                        SqlType::VarBinary(Some(bytes), _) if bytes.len() > usize::from(max_len)
+                    );
+                    // Over-length data is an async error only below PLP.
+                    assert_eq!(async_ok, !(over_length && max_len <= 8000), "{value:?}");
+                    assert_eq!(fast, max_len <= 8000 && !over_length, "{value:?}");
+                    if fast {
+                        inline += 1;
+                    } else {
+                        declined += 1;
+                    }
+                }
+            }
+        }
+        assert!(inline > 0 && declined > 0);
+        assert_eq!(
+            inline_matches_async(&param(SqlType::VarBinaryMax(Some(vec![1])))),
+            (false, true)
+        );
     }
 
     /// The `sp_execute` handle, then a pad that shifts every value by one byte
@@ -2014,6 +2079,11 @@ mod tests {
             (StatusFlags::NONE, SqlType::Uuid(Some(uuid::Uuid::max()))),
             (StatusFlags::NONE, time_value(SqlType::DateTimeOffset, 7)),
             (StatusFlags::BY_REF_VALUE, time_value(SqlType::Time, 2)),
+            (
+                StatusFlags::NONE,
+                SqlType::VarBinary(Some(vec![0xcd; 3]), 3),
+            ),
+            (StatusFlags::BY_REF_VALUE, SqlType::VarBinary(None, 8000)),
         ];
         for (flags, last) in lasts {
             let values = vec![
