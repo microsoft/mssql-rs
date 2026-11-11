@@ -102,6 +102,9 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchInfoErrorInfoHaveSeparateBoundaries,
 
 // A batch whose failing first statement is followed by another server error
 // keeps that later error for the next SQLMoreResults call (msodbcsql B3 parity).
+// unixODBC answers SQLMoreResults after a failed SQLExecDirect with
+// SQL_NO_DATA without calling either driver (measured in CI); the Windows
+// Driver Manager passes it through.
 ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchContinuesAfterInitialStatementError,
                   odbc_concurrency::kAllModes) {
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
@@ -110,10 +113,15 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, BatchContinuesAfterInitialStatementError,
     ASSERT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
 
+#ifdef _WIN32
     rc = SQLMoreResults(stmt_);
     ASSERT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22012");
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+#else
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+#endif
 }
 
 // A statement that fails after returning a row keeps the batch: the next fetch
@@ -188,6 +196,51 @@ ODBC_TEST_F_MODES(MoreResultsLiveTest, BlockFetchReturnsRowsBeforeAStatementErro
     EXPECT_EQ(42, n[0]);
     EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
     SQLFreeStmt(stmt_, SQL_UNBIND);
+}
+
+// Once a failed last statement's completion is read, the connection is free,
+// including for a statement that failed inside EXEC or sp_executesql. A
+// statement whose SQLExecDirect failed runs again; after SQLMoreResults reports
+// the failure, another statement runs. A later statement still keeps the batch
+// (msodbcsql 18.7.1.1).
+ODBC_TEST_F_MODES(MoreResultsLiveTest, FailedLastStatementReleasesTheConnection,
+                  odbc_concurrency::kAllModes) {
+    const SqlTString reuse = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    for (const char* text : {"RAISERROR('reuse_probe',16,1);",
+                             "SET NOCOUNT ON; EXEC('RAISERROR(''reuse_probe'',16,1)');",
+                             "EXEC sp_executesql N'RAISERROR(''reuse_probe'',16,1)';"}) {
+        SCOPED_TRACE(text);
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(text);
+        ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+        ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+
+    // A Driver Manager may keep the statement's cursor state after
+    // SQLMoreResults fails, so the release is shown through another statement.
+    SQLHSTMT other = AllocStmt();
+    ASSERT_NE(nullptr, other);
+    for (const char* text : {"SELECT 1; RAISERROR('reuse_probe',16,1);",
+                             "SELECT 1; EXEC('RAISERROR(''reuse_probe'',16,1)');"}) {
+        SCOPED_TRACE(text);
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(text);
+        ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+        ASSERT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, other);
+        ASSERT_SQL_OK(SQLCloseCursor(other), SQL_HANDLE_STMT, other);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+
+    SqlTString pending = ODBCTestUtils::ToSqlTStr("RAISERROR('reuse_probe',16,1); SELECT 2;");
+    ASSERT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(pending.c_str()), SQL_NTS));
+    EXPECT_EQ(SQL_ERROR, SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(reuse.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
 }
 
 // For diagnostics returned by one execution call, a mapped server warning

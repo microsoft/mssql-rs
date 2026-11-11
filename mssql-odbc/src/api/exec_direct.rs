@@ -1332,48 +1332,51 @@ mod tests {
 
     /// The error of a batch's only statement arrives before its DONE. Reading
     /// that DONE shows nothing follows, so the connection is free and the
-    /// statement can run again, as with msodbcsql; an XACT_ABORT error also
-    /// sends its rollback there.
+    /// statement can run again, as with msodbcsql. The completion may carry an
+    /// XACT_ABORT rollback, or close an `EXEC` with RETURNSTATUS and DONEPROC.
     #[test]
     fn exec_direct_releases_the_connection_when_the_failed_statement_ends_the_batch() {
         use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS};
         use crate::handles::dbc::DbcHandle;
         use mssql_tds::test_client_support::{
-            col_metadata_empty, done_no_more, env_change_rollback_transaction, sql_error,
-            tds_client_from_tokens,
+            col_metadata_empty, done_in_proc_more, done_no_more, done_proc_no_more,
+            env_change_rollback_transaction, return_status, sql_error, tds_client_from_tokens,
         };
 
-        let handles = TestHandles::with_env_dbc_stmt();
-        handles.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
-        dbc.inner
-            .lock()
-            .unwrap()
-            .wire
-            .put_client_for_test(tds_client_from_tokens(vec![
-                sql_error(8134, 16, "Divide by zero error encountered."),
-                env_change_rollback_transaction(),
-                done_no_more(),
-                col_metadata_empty(),
-                done_no_more(),
-            ]));
+        let completions = [
+            vec![env_change_rollback_transaction(), done_no_more()],
+            vec![done_in_proc_more(), return_status(-6), done_proc_no_more()],
+        ];
+        for completion in completions {
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            let mut tokens = vec![sql_error(8134, 16, "Divide by zero error encountered.")];
+            tokens.extend(completion);
+            tokens.extend([col_metadata_empty(), done_no_more()]);
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(tds_client_from_tokens(tokens));
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
-        assert_eq!(
-            sql_exec_direct_w_safe(handles.stmt, stmt, "INSERT t VALUES (1/0)".to_string()),
-            SQL_ERROR
-        );
-        {
-            let state = stmt.inner.lock().unwrap();
-            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
-            assert!(!state.error_result);
-            assert!(state.diag_records.iter().any(|d| d.native_error == 8134));
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            assert_eq!(
+                sql_exec_direct_w_safe(handles.stmt, stmt, "SELECT 1/0".to_string()),
+                SQL_ERROR
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+                assert!(!state.error_result);
+                assert!(state.diag_records.iter().any(|d| d.native_error == 8134));
+            }
+            assert_eq!(dbc.inner.lock().unwrap().wire.statement_owner(), None);
+            assert_eq!(
+                sql_exec_direct_w_safe(handles.stmt, stmt, "SELECT 1".to_string()),
+                SQL_SUCCESS
+            );
         }
-        assert_eq!(dbc.inner.lock().unwrap().wire.statement_owner(), None);
-        assert_eq!(
-            sql_exec_direct_w_safe(handles.stmt, stmt, "SELECT 1".to_string()),
-            SQL_SUCCESS
-        );
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,

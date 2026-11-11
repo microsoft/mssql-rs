@@ -585,35 +585,51 @@ mod tests {
         assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
     }
 
-    /// A failed last statement ends the batch once its DONE is read: the
-    /// connection is released and the next call reports no more results.
+    /// A failed last statement ends the batch once its completion is read,
+    /// whether a plain DONE or an `EXEC`'s procedure tail: the connection is
+    /// released and the statement can run again, as with msodbcsql.
     #[test]
     fn more_results_ends_the_batch_at_a_failed_last_statement() {
-        use mssql_tds::test_client_support::{col_metadata, int_columns, sql_error};
+        use crate::api::exec_direct::sql_exec_direct_w;
+        use crate::api::odbc_types::SqlInteger;
+        use mssql_tds::test_client_support::{
+            col_metadata, col_metadata_empty, done_in_proc_more, done_proc_no_more, int_columns,
+            return_status, sql_error,
+        };
 
-        let handles = TestHandles::with_env_dbc_stmt();
-        let first = position_first_and_inject_with_continue(
-            &handles,
-            vec![
+        let completions = [
+            vec![done_no_more()],
+            vec![done_in_proc_more(), return_status(-6), done_proc_no_more()],
+        ];
+        for completion in completions {
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let mut tokens = vec![
                 col_metadata(int_columns(1)),
                 done_more(),
                 sql_error(50000, 16, "last statement failed"),
-                done_no_more(),
-            ],
-            true,
-        );
-        assert_eq!(first, StatementResult::Rows);
+            ];
+            tokens.extend(completion);
+            tokens.extend([col_metadata_empty(), done_no_more()]);
+            let first = position_first_and_inject_with_continue(&handles, tokens, true);
+            assert_eq!(first, StatementResult::Rows);
 
-        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
-        {
-            let state = stmt.inner.lock().unwrap();
-            assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
-            assert!(state.diag_records.iter().any(|d| d.native_error == 50000));
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+                assert!(state.diag_records.iter().any(|d| d.native_error == 50000));
+            }
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            assert_eq!(dbc.inner.lock().unwrap().wire.statement_owner(), None);
+
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            assert_eq!(
+                unsafe { sql_exec_direct_w(handles.stmt, sql.as_ptr(), sql.len() as SqlInteger) },
+                SQL_SUCCESS
+            );
         }
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
-        assert_eq!(dbc.inner.lock().unwrap().wire.statement_owner(), None);
-        assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
     }
 
     /// SQLMoreResults advances from one row set to the next, keeping the cursor

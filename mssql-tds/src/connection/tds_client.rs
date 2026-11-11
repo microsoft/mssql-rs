@@ -6519,10 +6519,12 @@ impl TdsClient {
     /// The error is returned before that DONE, so until it is read
     /// [`has_open_batch`](Self::has_open_batch) reports `true` even when the
     /// failed statement was the batch's last, and the connection cannot take
-    /// another request. Reading stops at that DONE, so nothing of the next
-    /// statement is read; any other token is left for [`advance`](Self::advance)
-    /// with the batch kept open. An error returned from a row set's DONE needs
-    /// nothing more.
+    /// another request. A statement inside `EXEC` or `sp_executesql` ends with
+    /// DONEINPROC, and the procedure's RETURNSTATUS and closing DONEPROC belong
+    /// to the same completion. Nothing of the next statement is read: any other
+    /// token, or a DONE carrying its own update count, is left for
+    /// [`advance`](Self::advance) with the batch kept open. An error returned
+    /// from a row set's DONE needs nothing more.
     pub async fn complete_failed_statement(&mut self) -> TdsResult<bool> {
         if !self.failed_statement_done_pending {
             return Ok(self.has_open_batch());
@@ -6537,24 +6539,28 @@ impl TdsClient {
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
+        let mut in_procedure_tail = false;
         loop {
             let token = self.next_response_token(&parser_context).await?;
-            let is_done_in_proc = matches!(token, Tokens::DoneInProc(_));
             match token {
-                Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                    info!(?done, "Completed the failed statement");
-                    self.failed_statement_done_pending = false;
-                    self.validate_done_error(&done, is_done_in_proc)?;
-                    let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                    *count = count.saturating_add(done.row_count);
-                    self.last_result_row_count = None;
-                    self.current_result_set_has_been_read_till_end = true;
-                    self.current_result_ended_with_done_in_proc = is_done_in_proc;
+                Tokens::DoneInProc(done) if !in_procedure_tail => {
+                    self.settle_failed_statement_done(&done, true)?;
                     if !done.has_more() {
-                        self.execution_context.set_has_open_batch(false);
+                        return Ok(false);
                     }
+                    in_procedure_tail = true;
+                }
+                Tokens::DoneProc(done) | Tokens::Done(done)
+                    if !in_procedure_tail || self.closes_procedure_tail(&done) =>
+                {
+                    self.settle_failed_statement_done(&done, false)?;
                     return Ok(done.has_more());
                 }
+                Tokens::ReturnStatus(return_status) if in_procedure_tail => {
+                    self.last_return_status = ReturnStatus::Received(return_status.value);
+                }
+                // Connection state, handled as `advance` would wherever it
+                // arrives; it reports no result.
                 Tokens::EnvChange(env_change) => {
                     info!(?env_change);
                     if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
@@ -6567,7 +6573,9 @@ impl TdsClient {
                     self.recovery_context
                         .process_session_state(&session_state)?;
                 }
-                Tokens::Info(info_token) => {
+                // A message after the procedure's DONEINPROC may start the next
+                // statement, which `advance` reports as a result of its own.
+                Tokens::Info(info_token) if !in_procedure_tail => {
                     info!(?info_token);
                     self.capture_info_message(&info_token);
                 }
@@ -6577,6 +6585,36 @@ impl TdsClient {
                 }
             }
         }
+    }
+
+    /// Whether a DONEPROC or DONE after the failed statement's DONEINPROC closes
+    /// its procedure rather than reporting a result of its own: `advance`
+    /// surfaces an update count unless the DONE closes the error chain.
+    fn closes_procedure_tail(&self, done: &DoneToken) -> bool {
+        let update_count =
+            done.status.contains(DoneStatus::COUNT) && done.cur_cmd != CurrentCommand::Select;
+        !update_count || (done.has_error() && self.statement_error_completion_pending)
+    }
+
+    /// Accounts for a DONE that completes the failed statement, as `advance`
+    /// would, without surfacing it as a result.
+    fn settle_failed_statement_done(
+        &mut self,
+        done: &DoneToken,
+        is_done_in_proc: bool,
+    ) -> TdsResult<()> {
+        info!(?done, is_done_in_proc, "Completed the failed statement");
+        self.failed_statement_done_pending = false;
+        self.validate_done_error(done, is_done_in_proc)?;
+        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+        *count = count.saturating_add(done.row_count);
+        self.last_result_row_count = None;
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_result_ended_with_done_in_proc = is_done_in_proc;
+        if !done.has_more() {
+            self.execution_context.set_has_open_batch(false);
+        }
+        Ok(())
     }
 
     /// Settles the protocol-only tail after an exhausted RPC row set.
@@ -13341,6 +13379,97 @@ mod tests {
         assert!(client.complete_failed_statement().await.unwrap());
         assert!(client.has_open_batch());
         assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+    }
+
+    /// A statement inside `EXEC` or `sp_executesql` ends with DONEINPROC, and
+    /// the procedure's RETURNSTATUS and DONEPROC complete it too. The order is
+    /// SQL Server's for `EXEC('RAISERROR(''e'', 16, 1)')`, including the
+    /// SESSIONSTATE a recoverable session receives before DONEPROC.
+    #[tokio::test]
+    async fn completing_a_failed_statement_reads_its_procedure_tail() {
+        use crate::token::tokens::SessionStateToken;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_in_proc_more(),
+            return_status(-6),
+            Tokens::SessionState(SessionStateToken {
+                sequence_number: 1,
+                status: 0,
+                states: Vec::new(),
+            }),
+            done_proc_no_more(),
+        ]);
+        client
+            .execute(
+                "EXEC('RAISERROR(''e'', 16, 1)')".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(!client.complete_failed_statement().await.unwrap());
+        assert!(!client.has_open_batch());
+    }
+
+    /// The procedure tail stops before the next statement, whether that follows
+    /// the procedure or runs inside it.
+    #[tokio::test]
+    async fn completing_a_failed_statement_stops_before_the_next_statement() {
+        let procedure_continues = Tokens::DoneProc(DoneToken {
+            status: DoneStatus::MORE,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        });
+        for tail in [vec![return_status(-6), procedure_continues], Vec::new()] {
+            let mut tokens = vec![
+                Tokens::Error(error_token_with_severity(16)),
+                done_in_proc_more(),
+            ];
+            tokens.extend(tail);
+            tokens.extend([int_col_metadata(1), done_no_more()]);
+            let mut client = create_test_client_with_tokens(tokens);
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(client.complete_failed_statement().await.unwrap());
+            assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        }
+    }
+
+    /// Two statements failing inside one `EXEC`: completing the first leaves
+    /// the second's error for `advance`, and completing that one reads the
+    /// procedure tail and ends the batch.
+    #[tokio::test]
+    async fn completing_a_failed_statement_leaves_the_next_failure_for_advance() {
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::Error(error_token_with_severity(16)),
+            done_in_proc_more(),
+            Tokens::Error(error_token_with_severity(16)),
+            done_in_proc_more(),
+            return_status(-6),
+            done_proc_no_more(),
+        ]);
+        client
+            .execute(
+                "q".to_string(),
+                ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::SqlServerError { .. })
+        ));
+        assert!(!client.complete_failed_statement().await.unwrap());
+        assert!(!client.has_open_batch());
     }
 
     /// The same inside a row set: the errors collected there are dropped with
