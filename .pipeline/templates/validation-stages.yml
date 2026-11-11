@@ -604,12 +604,15 @@ stages:
           testRunTitle: $(System.PhaseName)-OdbcE2E
           failTaskOnFailedTests: true
           failTaskOnMissingResultsFile: true
-      - script: bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/rust-cobertura" 2400
+      - script: |
+          set -euo pipefail
+          bash .pipeline/scripts/background-step.sh wait "$(Agent.TempDirectory)/rust-cobertura" 2400
+          echo "##vso[task.setvariable variable=rustCoverageReady]true"
         displayName: Wait for Cobertura coverage report (mssql-tds and mssqlodbc)
         condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
       - task: PublishPipelineArtifact@1
         displayName: Publish Cobertura coverage artifact
-        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['rustCoverageReady'], 'true'))
         inputs:
           targetPath: $(Build.SourcesDirectory)/target/cobertura.xml
           artifactName: CoberturaCoverageRust_MacOS

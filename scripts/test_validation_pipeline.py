@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -190,9 +191,13 @@ def test_unix_pr_e2e_bounds_test_workers():
 
 
 def test_rust_coverage_publishes_only_cobertura():
-    template = (_TEMPLATES / "build-template.yml").read_text(encoding="utf-8")
-    assert "--lcov" not in template
-    assert "--cobertura" in template
+    for path in (
+        _TEMPLATES / "build-template.yml",
+        _ROOT / ".pipeline" / "scripts" / "containerized-test.sh",
+    ):
+        content = path.read_text(encoding="utf-8")
+        assert "--lcov" not in content, path
+        assert "--cobertura" in content, path
 
 
 def test_kerberos_archive_flag_matches_bash_comparison():
@@ -205,8 +210,9 @@ def test_kerberos_archive_flag_matches_bash_comparison():
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize(
     ("args", "expected"),
-    [("", "1"), ("--test-jobs=4", "4"), ("--test-jobs=64", "64"),
-     ("--test-jobs=0", None), ("--test-jobs=65", None), ("--test-jobs=x", None),
+    [("", "1"), ("--test-jobs=4", "4"), ("--test-jobs=0004", "0004"),
+     ("--test-jobs=64", "64"), ("--test-jobs=0", None), ("--test-jobs=65", None),
+     ("--test-jobs=9223372036854775808", None), ("--test-jobs=x", None),
      ("--test-jobs=", None)],
 )
 def test_unix_e2e_validates_test_jobs(tmp_path, args, expected):
@@ -1065,14 +1071,33 @@ def test_background_step_replays_output_and_exit_code(tmp_path, code):
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
-def test_background_step_timeout_counts_from_start(tmp_path):
-    started = _background_step(tmp_path, "start", "state", "sleep", "30")
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_background_step_timeout_counts_from_start(tmp_path, ignore_term):
+    trap = "trap '' TERM; " if ignore_term else ""
+    started = _background_step(
+        tmp_path, "start", "state", "bash", "-c",
+        f'bash -c "{trap}sleep 6; echo escaped > escaped" & wait',
+    )
     assert started.returncode == 0, started.stdout + started.stderr
     joined = _background_step(tmp_path, "wait", "state", "1")
     assert joined.returncode == 1
     assert "did not finish within 1s of starting" in joined.stdout
-    pid = (tmp_path / "state" / "pid").read_text(encoding="utf-8").strip()
-    subprocess.run([_BASH, "-c", f"kill {pid}"], capture_output=True)
+    assert "Could not stop background process group" not in joined.stdout
+    time.sleep(5)
+    assert not (tmp_path / "escaped").exists()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_background_step_rejects_late_completion_before_wait(tmp_path):
+    started = _background_step(tmp_path, "start", "state", "bash", "-c", "echo finished")
+    assert started.returncode == 0, started.stdout + started.stderr
+    joined = _background_step(tmp_path, "wait", "state", "20")
+    assert joined.returncode == 0, joined.stdout + joined.stderr
+    _, finished = (tmp_path / "state" / "status").read_text(encoding="utf-8").split()
+    (tmp_path / "state" / "started").write_text(str(int(finished) - 2), encoding="utf-8")
+    joined = _background_step(tmp_path, "wait", "state", "1")
+    assert joined.returncode == 1
+    assert "did not finish within 1s of starting" in joined.stdout
 
 
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
@@ -1679,11 +1704,16 @@ def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
                                             coverage)]
     assert order == sorted(order)
     assert join_report["script"] == (
+        "set -euo pipefail\n"
         "bash .pipeline/scripts/background-step.sh wait "
-        '"$(Agent.TempDirectory)/rust-cobertura" 2400'
+        '"$(Agent.TempDirectory)/rust-cobertura" 2400\n'
+        'echo "##vso[task.setvariable variable=rustCoverageReady]true"\n'
     )
-    for step in (join_report, coverage):
-        assert step["condition"] == _PR.replace("succeeded()", "succeededOrFailed()")
+    assert join_report["condition"] == _PR.replace("succeeded()", "succeededOrFailed()")
+    assert coverage["condition"] == (
+        "and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), "
+        "eq(variables['rustCoverageReady'], 'true'))"
+    )
     assert coverage["task"] == "PublishPipelineArtifact@1"
     assert coverage["inputs"] == {
         "targetPath": "$(Build.SourcesDirectory)/target/cobertura.xml",

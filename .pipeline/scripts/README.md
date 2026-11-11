@@ -511,9 +511,10 @@ background-step.sh wait  <state-dir> <timeout-seconds>
 `wait` replays the command's output and exits with its status. The agent parses
 `##vso` and `##[error]` lines only from the running step, so commands such as
 `task.prependpath` take effect when replayed by `wait`. The timeout counts from
-`start` and bounds the command's total runtime. `wait` fails at once if the
-command exits without recording a status. The command must not depend on a
-later step's output.
+`start` and bounds the command's total runtime, including when it finishes
+before `wait`. On timeout, the command's process group is terminated before
+`wait` returns. `wait` fails at once if the command exits without recording a
+status. The command must not depend on a later step's output.
 
 The macOS Test job uses it to hide two serial phases:
 

@@ -213,10 +213,7 @@ parse_args() {
             *) echo "Unknown argument: $arg" >&2; usage >&2; exit 2 ;;
         esac
     done
-    case "$TEST_JOBS" in
-        ''|*[!0-9]*) TEST_JOBS=0 ;;
-    esac
-    if [ "$TEST_JOBS" -lt 1 ] || [ "$TEST_JOBS" -gt 64 ]; then
+    if [[ ! $TEST_JOBS =~ ^0*([1-9]|[1-5][0-9]|6[0-4])$ ]]; then
         echo "--test-jobs must be an integer from 1 to 64" >&2
         exit 2
     fi
