@@ -32,7 +32,7 @@ SCIPY_VERSION="1.15.3"
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
 # new scenario needs no other change here.
-SCENARIOS=(narrow wide rowset varwidth getdata write)
+SCENARIOS=(narrow wide rowset varwidth getdata write pywrite)
 
 BASELINE_TEMP_DIR=""
 BASELINE_TREE=""
@@ -442,6 +442,7 @@ fi
     echo "write_candidate_mode=parameter_array"
     echo "write_baseline_mode=sequential"
     echo "write_reference_mode=parameter_array"
+    echo "pywrite_mode=parameter_array (every driver)"
     echo "repetitions=$REPETITIONS"
     echo "regression_ratio=$REGRESSION_RATIO"
     echo "confirm_runs=$CONFIRM_RUNS"

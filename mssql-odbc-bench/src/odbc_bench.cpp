@@ -47,6 +47,31 @@ constexpr std::size_t kParameterArrayRows = 2000;
 constexpr std::size_t kParameterTextCapacity = 16;
 constexpr char kParameterArrayTable[] = "[dbo].[mssql_odbc_bench_param_array]";
 constexpr char kParameterArrayBenchmark[] = "write/insert_2000_c3/executemany";
+constexpr std::size_t kExecuteManyRows = 1000;
+
+// Insert targets of the pywrite scenario. The column types follow the r15 replay
+// of mssql-python executemany so local and lab numbers stay comparable; the
+// server-side conversion they imply is identical on every driver leg.
+struct ExecuteManyTarget {
+    const char* table;
+    const char* benchmark;
+    const char* columns_ddl;
+};
+
+constexpr ExecuteManyTarget kExecuteManyTargets[] = {
+    {"[dbo].[mssql_odbc_bench_pyshape_c3]", "write/insert_1000_c3_pyshape/executemany",
+     "[id] INT NOT NULL, [name] NVARCHAR(50) NOT NULL, [created] DATETIME2(6) NOT NULL"},
+    {"[dbo].[mssql_odbc_bench_pyshape_c10]", "write/insert_1000_c10_pyshape/executemany",
+     "[id] INT NOT NULL, [qty] INT NOT NULL, [ref] INT NOT NULL, "
+     "[name] NVARCHAR(50) NOT NULL, [city] NVARCHAR(30) NOT NULL, "
+     "[note] NVARCHAR(100) NOT NULL, [created] DATETIME2(6) NOT NULL, "
+     "[updated] DATETIME2(6) NOT NULL, [price] DECIMAL(18,4) NOT NULL, "
+     "[total] DECIMAL(18,4) NOT NULL"},
+};
+
+const ExecuteManyTarget& execute_many_target(ExecuteManyShape shape) {
+    return kExecuteManyTargets[shape == ExecuteManyShape::c3 ? 0 : 1];
+}
 // Repeating source text for every generated string. A pure function of position,
 // so a delivered value can be checked without storing an expected copy.
 constexpr std::string_view kTextCycle = "abcdefghij";
@@ -920,14 +945,15 @@ Config Config::from_environment() {
         // Reject an unknown scenario instead of silently registering nothing: a
         // leg that measures zero benchmarks would fail the comparator's
         // benchmark-set check much further downstream.
-        const bool known = config.scenario == "write" || std::any_of(
+        const bool known = config.scenario == "write" ||
+                           config.scenario == kExecuteManyScenario || std::any_of(
             workloads().begin(), workloads().end(), [&config](const WorkloadSpec& spec) {
                 return config.scenario == spec.scenario;
             });
         if (!known) {
             throw std::runtime_error(
                 "ODBC_BENCH_SCENARIO must be one of narrow, wide, rowset, varwidth, "
-                "getdata, write, or unset");
+                "getdata, write, pywrite, or unset");
         }
     }
     if (config.write_mode != "parameter_array" && config.write_mode != "sequential") {
@@ -1032,6 +1058,10 @@ void OdbcSession::release() noexcept {
     }
 }
 
+SQLHDBC OdbcSession::connection() const {
+    return dbc_;
+}
+
 // The runner owns statement state transitions; other code receives no ownership.
 SQLHSTMT OdbcSession::statement() const {
     return stmt_;
@@ -1122,6 +1152,9 @@ std::uint64_t OdbcSession::query_count(const std::string& table) {
 
 // Drop in reverse catalog order to keep cleanup safe if dependencies are added later.
 void cleanup_benchmark_tables(OdbcSession& session) {
+    for (const auto& target : kExecuteManyTargets) {
+        session.execute_non_query("DROP TABLE IF EXISTS " + std::string(target.table));
+    }
     session.execute_non_query("DROP TABLE IF EXISTS " +
                               std::string(kParameterArrayTable));
     for (auto iterator = tables().rbegin(); iterator != tables().rend(); ++iterator) {
@@ -1137,6 +1170,10 @@ void setup_benchmark_tables(OdbcSession& session) {
         "CREATE TABLE " + std::string(kParameterArrayTable) +
         " ([id] INT NOT NULL PRIMARY KEY, [payload] NVARCHAR(15) NOT NULL, "
         "[value] BIGINT NOT NULL)");
+    for (const auto& target : kExecuteManyTargets) {
+        session.execute_non_query("CREATE TABLE " + std::string(target.table) + " (" +
+                                  target.columns_ddl + ")");
+    }
     for (const auto& table : tables()) {
         std::cout << "Creating " << qualified_table(table) << " with " << table.row_count
                   << " rows and " << table.column_count() << " columns\n";
@@ -1161,6 +1198,13 @@ void print_benchmark_sql(std::ostream& output) {
     output << "CREATE TABLE " << kParameterArrayTable
            << " ([id] INT NOT NULL PRIMARY KEY, [payload] NVARCHAR(15) NOT NULL, "
               "[value] BIGINT NOT NULL);\nGO\n";
+    for (const auto& target : kExecuteManyTargets) {
+        output << "-- executemany write target for " << target.benchmark
+               << ": initially empty\n";
+        output << "DROP TABLE IF EXISTS " << target.table << ";\nGO\n";
+        output << "CREATE TABLE " << target.table << " (" << target.columns_ddl
+               << ");\nGO\n";
+    }
     for (const auto& table : tables()) {
         output << "-- table " << table.table_name << ": " << table.row_count
                << " rows, " << table.column_count() << " columns\n";
@@ -2582,6 +2626,443 @@ private:
     SQLLEN sequential_offset_ = 0;
 };
 
+namespace {
+
+// One generated `datetime.datetime` value and its exact distance from the
+// validation epoch, so the stored DATETIME2(6) can be checked as an integer sum.
+struct GeneratedTimestamp {
+    SQL_TIMESTAMP_STRUCT value;
+    std::int64_t micros_since_2026;
+};
+
+GeneratedTimestamp generated_timestamp(std::size_t day_seed, std::size_t second_seed) {
+    static constexpr int kDaysBeforeMonth[] = {0,   31,  59,  90,  120, 151,
+                                               181, 212, 243, 273, 304, 334};
+    GeneratedTimestamp generated{};
+    auto& ts = generated.value;
+    ts.year = 2026;
+    ts.month = static_cast<SQLUSMALLINT>(1 + day_seed % 12);
+    ts.day = static_cast<SQLUSMALLINT>(1 + day_seed % 28);
+    ts.hour = static_cast<SQLUSMALLINT>(second_seed / 3600 % 24);
+    ts.minute = static_cast<SQLUSMALLINT>(second_seed / 60 % 60);
+    ts.second = static_cast<SQLUSMALLINT>(second_seed % 60);
+    const auto micros = static_cast<std::int64_t>(second_seed * 7919 % 1000000);
+    ts.fraction = static_cast<SQLUINTEGER>(micros * 1000);
+    const std::int64_t day_of_year = kDaysBeforeMonth[ts.month - 1] + ts.day - 1;
+    const std::int64_t seconds =
+        day_of_year * 86400 + ts.hour * 3600 + ts.minute * 60 + ts.second;
+    generated.micros_since_2026 = seconds * 1000000 + micros;
+    return generated;
+}
+
+}  // namespace
+
+// Replays mssql-python 8603956f `Cursor.executemany` -> `SQLExecuteMany_wrap`.
+// Every call frees and reallocates the statement (`_reset_cursor`), prepares,
+// binds freshly allocated column-wise arrays (`BindParameterArray`), sets only
+// SQL_ATTR_PARAMSET_SIZE, executes once, then reads diagnostics, the row count,
+// the result-column count, and the row count again. No status array, processed
+// pointer, or bind type is set. Binding types are chosen by the same rules as
+// `Cursor._map_sql_type` on the executemany path.
+class ExecuteManyWriteRunner::Impl {
+public:
+    Impl(OdbcSession& session, ExecuteManyShape shape)
+        : session_(session), target_(execute_many_target(shape)) {
+        const bool ten_columns = shape == ExecuteManyShape::c10;
+        std::vector<std::int64_t> ids(kExecuteManyRows);
+        std::vector<std::int64_t> quantities(kExecuteManyRows);
+        std::vector<std::int64_t> references(kExecuteManyRows);
+        std::vector<std::string> names(kExecuteManyRows);
+        std::vector<std::string> cities(kExecuteManyRows);
+        std::vector<std::string> notes(kExecuteManyRows);
+        std::vector<std::string> prices(kExecuteManyRows);
+        std::vector<std::string> totals(kExecuteManyRows);
+        std::vector<GeneratedTimestamp> created(kExecuteManyRows);
+        std::vector<GeneratedTimestamp> updated(kExecuteManyRows);
+        static constexpr const char* kCities[] = {"Seattle", "Bengaluru", "Dublin",
+                                                  "Redmond", "Hyderabad"};
+        for (std::size_t row = 0; row < kExecuteManyRows; ++row) {
+            ids[row] = static_cast<std::int64_t>(row + 1);
+            quantities[row] = static_cast<std::int64_t>(row % 100);
+            references[row] = static_cast<std::int64_t>(100000 + row);
+            names[row] = format_text("customer-%06zu", row + 1);
+            cities[row] = kCities[row % std::size(kCities)];
+            notes[row] = format_text("note for row %zu: lorem ipsum dolor sit amet %zu",
+                                     row + 1, row * 31 % 997);
+            // Money-range Decimal values, which executemany sends as format(d, "f").
+            prices[row] = format_text("%zu.%04zu", 10 + row * 37 % 9000, row * 13 % 10000);
+            totals[row] = format_text("%zu.%04zu", 100 + row * 53 % 90000, row * 17 % 10000);
+            created[row] = generated_timestamp(row, row * 17);
+            updated[row] = generated_timestamp(row + 3, row * 29);
+        }
+
+        columns_.reserve(10);
+        add_integer("id", ids);
+        if (ten_columns) {
+            add_integer("qty", quantities);
+            add_integer("ref", references);
+        }
+        add_text("name", names);
+        expect("SUM(CAST(SUBSTRING([name], 10, 6) AS BIGINT))", sum(ids));
+        if (ten_columns) {
+            add_text("city", cities);
+            add_text("note", notes);
+        }
+        add_timestamp("created", created);
+        if (ten_columns) {
+            add_timestamp("updated", updated);
+            add_decimal_text("price", prices);
+            add_decimal_text("total", totals);
+        }
+
+        std::string column_list;
+        std::string markers;
+        for (const auto& column : columns_) {
+            column_list += (column_list.empty() ? "[" : ", [") + column.name + "]";
+            markers += markers.empty() ? "?" : ", ?";
+        }
+        insert_sql_ = to_sql_string("INSERT INTO " + std::string(target_.table) + " (" +
+                                    column_list + ") VALUES (" + markers + ")");
+    }
+
+    ~Impl() {
+        if (stmt_ != SQL_NULL_HSTMT) {
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
+        }
+    }
+
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+
+    const char* name() const {
+        return target_.benchmark;
+    }
+
+    void preflight() {
+        const auto metrics = run();
+        std::cerr << "Preflight passed for " << name() << ": " << metrics.rows
+                  << " rows in one SQLExecute; binds";
+        for (const auto& column : columns_) {
+            std::cerr << ' ' << column.name << '=' << column.c_type << "->"
+                      << column.sql_type << '(' << column.column_size << ','
+                      << column.decimal_digits << ')';
+        }
+        std::cerr << '\n';
+    }
+
+    RetrievalMetrics execute() {
+        return run();
+    }
+
+private:
+    struct Column {
+        std::string name;
+        SQLSMALLINT c_type = 0;
+        SQLSMALLINT sql_type = 0;
+        SQLULEN column_size = 0;
+        SQLSMALLINT decimal_digits = 0;
+        SQLLEN buffer_length = 0;
+        std::size_t stride = 0;
+        // Two identical copies, alternated per call, so each call binds different
+        // addresses as mssql-python's freshly allocated buffers do.
+        std::array<std::vector<unsigned char>, 2> data;
+        std::array<std::vector<SQLLEN>, 2> indicators;
+    };
+
+    template <typename... Args>
+    static std::string format_text(const char* format, Args... args) {
+        char text[128] = {};
+        const int written = std::snprintf(text, sizeof(text), format, args...);
+        if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(text)) {
+            throw std::logic_error("failed to format executemany value");
+        }
+        return std::string(text, static_cast<std::size_t>(written));
+    }
+
+    static std::int64_t sum(const std::vector<std::int64_t>& values) {
+        std::int64_t total = 0;
+        for (const auto value : values) {
+            total += value;
+        }
+        return total;
+    }
+
+    void expect(std::string expression, std::int64_t value) {
+        expected_.emplace_back(std::move(expression), value);
+    }
+
+    Column& add_column(const char* name, SQLSMALLINT c_type, SQLSMALLINT sql_type,
+                       SQLULEN column_size, SQLSMALLINT decimal_digits,
+                       SQLLEN buffer_length, std::size_t stride) {
+        Column column;
+        column.name = name;
+        column.c_type = c_type;
+        column.sql_type = sql_type;
+        column.column_size = column_size;
+        column.decimal_digits = decimal_digits;
+        column.buffer_length = buffer_length;
+        column.stride = stride;
+        for (std::size_t set = 0; set < 2; ++set) {
+            column.data[set].assign(kExecuteManyRows * stride, 0);
+            column.indicators[set].assign(kExecuteManyRows, 0);
+        }
+        columns_.push_back(std::move(column));
+        return columns_.back();
+    }
+
+    void store(Column& column, std::size_t row, const void* value, std::size_t size,
+               SQLLEN indicator) {
+        for (std::size_t set = 0; set < 2; ++set) {
+            std::memcpy(column.data[set].data() + row * column.stride, value, size);
+            column.indicators[set][row] = indicator;
+        }
+        logical_bytes_ += size;
+    }
+
+    // `_map_sql_type` narrows a Python int column by its min/max; BindParameterArray
+    // leaves BufferLength 0 for SQL_C_LONG.
+    void add_integer(const char* name, const std::vector<std::int64_t>& values) {
+        const auto [low, high] = std::minmax_element(values.begin(), values.end());
+        Column* column = nullptr;
+        if (*low >= 0 && *high <= 255) {
+            column = &add_column(name, SQL_C_TINYINT, SQL_TINYINT, 3, 0, 1, 1);
+        } else if (*low >= -32768 && *high <= 32767) {
+            column = &add_column(name, SQL_C_SHORT, SQL_SMALLINT, 5, 0, sizeof(SQLSMALLINT),
+                                 sizeof(SQLSMALLINT));
+        } else if (*low >= std::numeric_limits<SQLINTEGER>::min() &&
+                   *high <= std::numeric_limits<SQLINTEGER>::max()) {
+            column = &add_column(name, SQL_C_LONG, SQL_INTEGER, 10, 0, 0, sizeof(SQLINTEGER));
+        } else {
+            throw std::logic_error("executemany integer column needs BIGINT");
+        }
+        for (std::size_t row = 0; row < values.size(); ++row) {
+            if (column->stride == 1) {
+                const auto value = static_cast<unsigned char>(values[row]);
+                store(*column, row, &value, sizeof(value), 0);
+            } else if (column->stride == sizeof(SQLSMALLINT)) {
+                const auto value = static_cast<SQLSMALLINT>(values[row]);
+                store(*column, row, &value, sizeof(value), 0);
+            } else {
+                const auto value = static_cast<SQLINTEGER>(values[row]);
+                store(*column, row, &value, sizeof(value), 0);
+            }
+        }
+        expect("SUM(CAST([" + std::string(name) + "] AS BIGINT))", sum(values));
+    }
+
+    // An ASCII `str` column binds SQL_C_CHAR -> SQL_VARCHAR sized to the longest
+    // value, with BufferLength size + 1 and a byte-length indicator.
+    Column& add_varchar(const char* name, const std::vector<std::string>& values) {
+        std::size_t longest = 0;
+        for (const auto& value : values) {
+            if (std::any_of(value.begin(), value.end(), [](char character) {
+                    return static_cast<unsigned char>(character) > 0x7F;
+                })) {
+                throw std::logic_error("non-ASCII text would bind as SQL_C_WCHAR");
+            }
+            longest = std::max(longest, value.size());
+        }
+        auto& column = add_column(name, SQL_C_CHAR, SQL_VARCHAR, longest, 0,
+                                  static_cast<SQLLEN>(longest + 1), longest + 1);
+        for (std::size_t row = 0; row < values.size(); ++row) {
+            store(column, row, values[row].data(), values[row].size(),
+                  static_cast<SQLLEN>(values[row].size()));
+        }
+        return column;
+    }
+
+    void add_text(const char* name, const std::vector<std::string>& values) {
+        add_varchar(name, values);
+        std::int64_t total_length = 0;
+        for (const auto& value : values) {
+            total_length += static_cast<std::int64_t>(value.size());
+        }
+        expect("SUM(CAST(LEN([" + std::string(name) + "]) AS BIGINT))", total_length);
+    }
+
+    // executemany string-binds money-range Decimal values as VARCHAR (GH-503).
+    void add_decimal_text(const char* name, const std::vector<std::string>& values) {
+        add_varchar(name, values);
+        std::int64_t scaled = 0;
+        for (const auto& value : values) {
+            const auto point = value.find('.');
+            scaled += std::stoll(value.substr(0, point)) * 10000 +
+                      std::stoll(value.substr(point + 1));
+        }
+        expect("SUM(CAST([" + std::string(name) + "] * 10000 AS BIGINT))", scaled);
+    }
+
+    // A naive `datetime.datetime` binds SQL_C_TYPE_TIMESTAMP -> SQL_TYPE_TIMESTAMP(26, 6).
+    void add_timestamp(const char* name, const std::vector<GeneratedTimestamp>& values) {
+        auto& column = add_column(name, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 26, 6,
+                                  sizeof(SQL_TIMESTAMP_STRUCT),
+                                  sizeof(SQL_TIMESTAMP_STRUCT));
+        std::int64_t total = 0;
+        for (std::size_t row = 0; row < values.size(); ++row) {
+            store(column, row, &values[row].value, sizeof(SQL_TIMESTAMP_STRUCT), 0);
+            total += values[row].micros_since_2026;
+        }
+        expect("SUM(DATEDIFF_BIG(MICROSECOND, CAST('2026-01-01' AS DATETIME2(6)), [" +
+                   std::string(name) + "]))",
+               total);
+    }
+
+    void validate_written_rows() {
+        const SQLHSTMT validation_stmt = session_.admin_statement();
+        std::string select = "SELECT COUNT_BIG(*)";
+        for (const auto& [expression, value] : expected_) {
+            (void)value;
+            select += ", " + expression;
+        }
+        auto query = to_sql_string(select + " FROM " + target_.table);
+        std::vector<SQLBIGINT> actual(expected_.size() + 1, -1);
+        std::vector<SQLLEN> indicators(actual.size(), kIndicatorSentinel);
+        try {
+            require_exact_success(SQLExecDirect(validation_stmt, query.data(), SQL_NTS),
+                                  "SQLExecDirect(executemany validation)", SQL_HANDLE_STMT,
+                                  validation_stmt);
+            for (std::size_t column = 0; column < actual.size(); ++column) {
+                require_exact_success(
+                    SQLBindCol(validation_stmt, static_cast<SQLUSMALLINT>(column + 1),
+                               SQL_C_SBIGINT, &actual[column], sizeof(SQLBIGINT),
+                               &indicators[column]),
+                    "SQLBindCol(executemany validation)", SQL_HANDLE_STMT, validation_stmt);
+            }
+            require_exact_success(SQLFetch(validation_stmt), "SQLFetch(executemany validation)",
+                                  SQL_HANDLE_STMT, validation_stmt);
+            if (SQLFetch(validation_stmt) != SQL_NO_DATA) {
+                throw std::runtime_error("executemany validation returned more than one row");
+            }
+            require_exact_success(SQLCloseCursor(validation_stmt),
+                                  "SQLCloseCursor(executemany validation)", SQL_HANDLE_STMT,
+                                  validation_stmt);
+            require_exact_success(SQLFreeStmt(validation_stmt, SQL_UNBIND),
+                                  "SQLFreeStmt(SQL_UNBIND executemany validation)",
+                                  SQL_HANDLE_STMT, validation_stmt);
+        } catch (...) {
+            SQLFreeStmt(validation_stmt, SQL_CLOSE);
+            SQLFreeStmt(validation_stmt, SQL_UNBIND);
+            throw;
+        }
+
+        std::ostringstream mismatches;
+        for (std::size_t column = 0; column < actual.size(); ++column) {
+            const auto& expression = column == 0 ? std::string("COUNT_BIG(*)")
+                                                 : expected_[column - 1].first;
+            const std::int64_t expected = column == 0
+                                              ? static_cast<std::int64_t>(kExecuteManyRows)
+                                              : expected_[column - 1].second;
+            if (indicators[column] != static_cast<SQLLEN>(sizeof(SQLBIGINT)) ||
+                actual[column] != expected) {
+                mismatches << ' ' << expression << '=' << actual[column] << " (expected "
+                           << expected << ')';
+            }
+        }
+        if (!mismatches.str().empty()) {
+            throw std::runtime_error(std::string(name()) +
+                                     " correctness check failed:" + mismatches.str());
+        }
+    }
+
+    RetrievalMetrics run() {
+        const AutocommitOffScope manual_commit(session_);
+        session_.execute_non_query("TRUNCATE TABLE " + std::string(target_.table));
+        session_.commit();
+        buffer_set_ ^= 1;
+
+        try {
+            const auto start = std::chrono::steady_clock::now();
+            // `_reset_cursor` frees the previous call's statement first; the
+            // preflight call guarantees every timed sample has one to free.
+            if (stmt_ != SQL_NULL_HSTMT) {
+                require_exact_success(SQLFreeHandle(SQL_HANDLE_STMT, stmt_),
+                                      "SQLFreeHandle(executemany statement)",
+                                      SQL_HANDLE_STMT, stmt_);
+                stmt_ = SQL_NULL_HSTMT;
+            }
+            require_exact_success(
+                SQLAllocHandle(SQL_HANDLE_STMT, session_.connection(), &stmt_),
+                "SQLAllocHandle(executemany statement)", SQL_HANDLE_DBC,
+                session_.connection());
+            require_exact_success(SQLPrepare(stmt_, insert_sql_.data(), SQL_NTS),
+                                  "SQLPrepare(executemany)", SQL_HANDLE_STMT, stmt_);
+            for (std::size_t index = 0; index < columns_.size(); ++index) {
+                auto& column = columns_[index];
+                require_exact_success(
+                    SQLBindParameter(stmt_, static_cast<SQLUSMALLINT>(index + 1),
+                                     SQL_PARAM_INPUT, column.c_type, column.sql_type,
+                                     column.column_size, column.decimal_digits,
+                                     column.data[buffer_set_].data(), column.buffer_length,
+                                     column.indicators[buffer_set_].data()),
+                    "SQLBindParameter(executemany)", SQL_HANDLE_STMT, stmt_);
+            }
+            require_exact_success(
+                SQLSetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE,
+                               attribute_value(kExecuteManyRows), 0),
+                "SQLSetStmtAttr(SQL_ATTR_PARAMSET_SIZE)", SQL_HANDLE_STMT, stmt_);
+            const auto execute_start = std::chrono::steady_clock::now();
+            require_exact_success(SQLExecute(stmt_), "SQLExecute(executemany)",
+                                  SQL_HANDLE_STMT, stmt_);
+            const auto execute_end = std::chrono::steady_clock::now();
+
+            SQLTCHAR state[8] = {};
+            SQLINTEGER native_error = 0;
+            SQLTCHAR message[512] = {};
+            SQLSMALLINT message_length = 0;
+            const SQLRETURN diagnostic =
+                SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message,
+                              static_cast<SQLSMALLINT>(std::size(message)), &message_length);
+            if (diagnostic != SQL_NO_DATA) {
+                throw std::runtime_error("executemany produced unexpected diagnostics: " +
+                                         diagnostics(SQL_HANDLE_STMT, stmt_));
+            }
+            SQLLEN affected = -1;
+            require_exact_success(SQLRowCount(stmt_, &affected), "SQLRowCount(executemany)",
+                                  SQL_HANDLE_STMT, stmt_);
+            SQLSMALLINT result_columns = -1;
+            require_exact_success(SQLNumResultCols(stmt_, &result_columns),
+                                  "SQLNumResultCols(executemany)", SQL_HANDLE_STMT, stmt_);
+            SQLLEN affected_again = -1;
+            require_exact_success(SQLRowCount(stmt_, &affected_again),
+                                  "SQLRowCount(executemany repeat)", SQL_HANDLE_STMT, stmt_);
+            const auto end = std::chrono::steady_clock::now();
+
+            if (affected != static_cast<SQLLEN>(kExecuteManyRows) ||
+                affected_again != affected || result_columns != 0) {
+                throw std::runtime_error(
+                    "executemany row count or result-column count was incorrect");
+            }
+            session_.commit();
+            validate_written_rows();
+            session_.commit();
+
+            RetrievalMetrics metrics;
+            metrics.rows = kExecuteManyRows;
+            metrics.cells = kExecuteManyRows * columns_.size();
+            metrics.logical_bytes = logical_bytes_;
+            metrics.total_seconds = seconds_between(start, end);
+            metrics.execute_seconds = seconds_between(execute_start, execute_end);
+            metrics.metadata_bind_seconds = -1.0;
+            metrics.fetch_seconds = 0.0;
+            metrics.execute_calls = 1;
+            return metrics;
+        } catch (...) {
+            session_.rollback_noexcept();
+            throw;
+        }
+    }
+
+    OdbcSession& session_;
+    const ExecuteManyTarget& target_;
+    std::vector<Column> columns_;
+    std::vector<std::pair<std::string, std::int64_t>> expected_;
+    SqlString insert_sql_;
+    // Both buffer sets hold identical values, so this counts one set.
+    std::uint64_t logical_bytes_ = 0;
+    std::size_t buffer_set_ = 0;
+    SQLHSTMT stmt_ = SQL_NULL_HSTMT;
+};
+
 // Allocate descriptors once per catalog workload; each iteration still rebinds.
 WorkloadRunner::WorkloadRunner(OdbcSession& session, const WorkloadSpec& spec)
     : impl_(std::make_unique<Impl>(session, spec)) {}
@@ -2618,6 +3099,23 @@ void ParameterArrayWriteRunner::preflight() {
 }
 
 RetrievalMetrics ParameterArrayWriteRunner::execute() {
+    return impl_->execute();
+}
+
+ExecuteManyWriteRunner::ExecuteManyWriteRunner(OdbcSession& session, ExecuteManyShape shape)
+    : impl_(std::make_unique<Impl>(session, shape)) {}
+
+ExecuteManyWriteRunner::~ExecuteManyWriteRunner() = default;
+
+const char* ExecuteManyWriteRunner::name() const {
+    return impl_->name();
+}
+
+void ExecuteManyWriteRunner::preflight() {
+    impl_->preflight();
+}
+
+RetrievalMetrics ExecuteManyWriteRunner::execute() {
     return impl_->execute();
 }
 
