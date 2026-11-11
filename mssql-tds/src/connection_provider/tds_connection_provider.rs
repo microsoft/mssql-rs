@@ -938,42 +938,31 @@ mod tests {
     fn connection_future_stays_small() {
         const MAX: usize = 4096;
         let provider = TdsConnectionProvider::new();
-        let cancel = CancelHandle::new();
-        for cancel_handle in [None, Some(&cancel)] {
-            let context = ClientContext::default();
-            let size =
-                std::mem::size_of_val(&provider.create_client(context, "localhost", cancel_handle));
-            assert!(
-                size <= MAX,
-                "create_client future is {size} B with cancel handle {:?}, expected <= {MAX} B",
-                cancel_handle.is_some()
-            );
-        }
+        let context = ClientContext::default();
+        let size = std::mem::size_of_val(&provider.create_client(context, "localhost", None));
+        assert!(
+            size <= MAX,
+            "create_client future is {size} B, expected <= {MAX} B"
+        );
     }
 
     // The cancellation wrapper moves the future it is given. An unboxed connect
     // body made that move a stack temporary the size of the body once LTO
     // stopped inlining the wrapper's poll (small_stack_connect_test overflow).
+    // The future's size is static, so one measurement covers both cancel-handle
+    // arms of the wrapper's `Either`.
     #[test]
     fn cancellation_wrapper_moves_only_a_boxed_connect_body() {
         const MAX: usize = 1024;
         let provider = TdsConnectionProvider::new();
-        let cancel = CancelHandle::new();
-        for cancel_handle in [None, Some(&cancel)] {
-            let mut context = ClientContext::default();
-            let chain = TdsConnectionProvider::action_chain(&mut context, "localhost").unwrap();
-            let size = std::mem::size_of_val(&provider.execute_action_chain(
-                &context,
-                chain,
-                cancel_handle,
-                None,
-            ));
-            assert!(
-                size <= MAX,
-                "execute_action_chain future is {size} B with cancel handle {:?}, expected <= {MAX} B",
-                cancel_handle.is_some()
-            );
-        }
+        let mut context = ClientContext::default();
+        let chain = TdsConnectionProvider::action_chain(&mut context, "localhost").unwrap();
+        let size =
+            std::mem::size_of_val(&provider.execute_action_chain(&context, chain, None, None));
+        assert!(
+            size <= MAX,
+            "execute_action_chain future is {size} B, expected <= {MAX} B"
+        );
     }
 
     #[tokio::test]
