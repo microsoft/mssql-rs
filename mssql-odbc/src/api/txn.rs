@@ -16,7 +16,7 @@ use mssql_tds::core::CancelHandle;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use tracing::{debug, error};
 
-use super::close_cursor::close_cursor_for_connection_op;
+use super::close_cursor::{Sweep, close_cursor_for_connection_op};
 use super::odbc_types::{
     SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_ERROR, SQL_RESET_CONNECTION_YES, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED,
@@ -156,8 +156,12 @@ pub(super) fn release_dbc_client_and_publish<R>(
     op: &str,
     publish: impl FnOnce(&mut DbcState) -> R,
 ) -> Result<R, SqlReturn> {
-    dbc.return_lease_and_publish(client, LeaseReturn::Release, publish)
-        .ok_or_else(|| fail_lost_session(dbc, op))
+    let published = dbc
+        .return_lease_and_publish(client, LeaseReturn::Release, publish)
+        .ok_or_else(|| fail_lost_session(dbc, op));
+    #[cfg(test)]
+    test_hooks::after_connection_release();
+    published
 }
 
 /// Fails a connection-scoped operation whose lease could not be returned. Its
@@ -229,6 +233,12 @@ pub(super) fn exec_batch(
 /// would fail with a usage error.
 #[must_use]
 pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
+    sweep_cursors(dbc, Sweep::Close, None)
+}
+
+/// Closes every statement's cursor under `sweep`; `spared` is passed to each
+/// [`close_cursor_for_connection_op`].
+fn sweep_cursors(dbc: &DbcHandle, sweep: Sweep, mut spared: Option<&mut Vec<u64>>) -> SqlReturn {
     let statements = match dbc.inner.lock() {
         Ok(state) => state.statements.clone(),
         Err(_) => {
@@ -245,7 +255,8 @@ pub(super) fn close_all_cursors(dbc: &DbcHandle) -> SqlReturn {
         // `SQLDisconnect` documents (see the TODO in `disconnect.rs`), which
         // refcounted handles will close for the whole driver at once.
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
-        if close_cursor_for_connection_op(stmt, stmt_ptr) == SQL_ERROR {
+        if close_cursor_for_connection_op(stmt, stmt_ptr, sweep, spared.as_deref_mut()) == SQL_ERROR
+        {
             error!(?stmt_ptr, "close_all_cursors: could not close cursor");
             worst = SQL_ERROR;
         }
@@ -287,7 +298,13 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     // `SQL_CB_PRESERVE`, so the DM never closes cursors on its behalf. Both
     // drivers are internally consistent; they just report different truths about
     // themselves.
-    if close_all_cursors(dbc) == SQL_ERROR {
+    let sweep = if started {
+        Sweep::EndTransaction
+    } else {
+        Sweep::Close
+    };
+    let mut spared = Vec::new();
+    if sweep_cursors(dbc, sweep, Some(&mut spared)) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
 
@@ -297,6 +314,8 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
         return SQL_SUCCESS;
     }
 
+    #[cfg(test)]
+    test_hooks::after_ending_sweep();
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -324,6 +343,7 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
         debug!("{op}: no server-side transaction active — clearing stale flag");
         Ok(())
     };
+    end_transaction_for_work_since_sweep(dbc, op, &mut spared);
 
     release_dbc_client_and_publish(dbc, client, op, |state| {
         // Cleared unconditionally, matching msodbcsql's `Return:` label, so a failed
@@ -670,11 +690,33 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
 
 /// Manual-commit → autocommit. Any transaction holding user work is **committed**
 /// with a `01000` warning; a driver-begun piggyback transaction is rolled back
-/// silently (`sqlcconn.cpp:3692-3741`).
+/// silently (`sqlcconn.cpp:3692-3741`). The cursor sweep is `CommitAbortTran`'s,
+/// so it ends a transaction exactly when user work started one.
 fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
-    if close_all_cursors(dbc) == SQL_ERROR {
+    // The sweep runs before the client is claimed, so another statement can
+    // still add user work after this snapshot. The commit decision re-reads
+    // the flag once the claim shuts that out, and work that ran after the
+    // sweep is swept before the claim is released.
+    let swept_as_ending = match dbc.inner.lock() {
+        Ok(state) => state.local_tran_started,
+        Err(_) => {
+            error!("{op}: dbc mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    #[cfg(test)]
+    test_hooks::after_autocommit_snapshot();
+    let mut spared = Vec::new();
+    let sweep = if swept_as_ending {
+        Sweep::EndTransaction
+    } else {
+        Sweep::Close
+    };
+    if sweep_cursors(dbc, sweep, Some(&mut spared)) == SQL_ERROR {
         return fail_cursor_close(dbc, op);
     }
+    #[cfg(test)]
+    test_hooks::after_ending_sweep();
     let mut client = match claim_dbc_client(dbc, op) {
         Ok(c) => c,
         Err(ret) => return ret,
@@ -707,6 +749,9 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     } else {
         Ok(())
     };
+    if had_user_txn {
+        end_transaction_for_work_since_sweep(dbc, op, &mut spared);
+    }
     release_dbc_client_and_publish(dbc, client, op, |state| {
         if had_user_txn {
             // A failed commit has an unknown server outcome, but retaining this
@@ -736,6 +781,82 @@ fn switch_to_autocommit(dbc: &DbcHandle, op: &str) -> SqlReturn {
     .unwrap_or_else(|ret| ret)
 }
 
+/// Applies the transaction-ending sweep to what other statements ran between
+/// the first sweep, which collected `spared`, and the client claim. Call
+/// holding the client: that keeps new executes out and leaves every open
+/// cursor with nothing to drain. A failure is logged rather than returned,
+/// because the transaction has already ended.
+fn end_transaction_for_work_since_sweep(dbc: &DbcHandle, op: &str, spared: &mut Vec<u64>) {
+    if sweep_cursors(dbc, Sweep::EndTransactionForLateWork, Some(spared)) == SQL_ERROR {
+        error!("{op}: ending the transaction for work since the sweep failed");
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_hooks {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+
+    type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+
+    std::thread_local! {
+        static AFTER_AUTOCOMMIT_SNAPSHOT: Hook = const { RefCell::new(None) };
+        static AFTER_ENDING_SWEEP: Hook = const { RefCell::new(None) };
+        static AFTER_CONNECTION_RELEASE: Hook = const { RefCell::new(None) };
+        static AFTER_UNSENT_ARRAY_RELEASE: Hook = const { RefCell::new(None) };
+    }
+
+    fn set(slot: &'static LocalKey<Hook>, hook: impl FnOnce() + 'static) {
+        slot.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    fn run(slot: &'static LocalKey<Hook>) {
+        if let Some(hook) = slot.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Runs `hook` once, between `switch_to_autocommit`'s snapshot and its
+    /// cursor sweep, on this thread.
+    pub(in crate::api) fn set_after_autocommit_snapshot(hook: impl FnOnce() + 'static) {
+        set(&AFTER_AUTOCOMMIT_SNAPSHOT, hook);
+    }
+
+    /// Runs `hook` once, between the cursor sweep of `switch_to_autocommit`, or
+    /// of `end_transaction` with a transaction started, and its client claim,
+    /// on this thread.
+    pub(in crate::api) fn set_after_ending_sweep(hook: impl FnOnce() + 'static) {
+        set(&AFTER_ENDING_SWEEP, hook);
+    }
+
+    /// Runs `hook` once, as soon as a connection-scoped operation releases the
+    /// client and before it does anything else, on this thread.
+    pub(in crate::api) fn set_after_connection_release(hook: impl FnOnce() + 'static) {
+        set(&AFTER_CONNECTION_RELEASE, hook);
+    }
+
+    /// Runs `hook` once, after a parameter array that sent no set returns the
+    /// client and before it restores the classification, on this thread.
+    pub(in crate::api) fn set_after_unsent_array_release(hook: impl FnOnce() + 'static) {
+        set(&AFTER_UNSENT_ARRAY_RELEASE, hook);
+    }
+
+    pub(in crate::api) fn after_unsent_array_release() {
+        run(&AFTER_UNSENT_ARRAY_RELEASE);
+    }
+
+    pub(super) fn after_autocommit_snapshot() {
+        run(&AFTER_AUTOCOMMIT_SNAPSHOT);
+    }
+
+    pub(super) fn after_ending_sweep() {
+        run(&AFTER_ENDING_SWEEP);
+    }
+
+    pub(super) fn after_connection_release() {
+        run(&AFTER_CONNECTION_RELEASE);
+    }
+}
 /// Autocommit → manual-commit. Opens a transaction immediately so `@@TRANCOUNT`
 /// reflects the new mode without waiting for a statement (`sqlcconn.cpp:3692`).
 /// The transaction carries no user work yet, so `local_tran_started` stays false.

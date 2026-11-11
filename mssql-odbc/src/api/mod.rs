@@ -12,6 +12,7 @@ mod close_cursor;
 mod col_attribute;
 mod connect;
 mod current_catalog;
+mod data_classification;
 mod database_read_only;
 mod describe_col;
 mod describe_param;

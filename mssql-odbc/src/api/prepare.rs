@@ -150,6 +150,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     stmt_state.set_state(STMT_STATE_PREPARED);
     drop(stmt_state);
     drop(dbc_state);
+    super::ird::clear_ird_classification(stmt);
 
     // These names describe the text this prepare just replaced, and a later
     // SQLBindParameter would mark the record explicitly bound - freezing the

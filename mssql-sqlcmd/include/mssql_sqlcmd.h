@@ -197,6 +197,24 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 #define MSSQL_SQLCMD_SOURCE_COMMAND_LINE 1
 #define MSSQL_SQLCMD_SOURCE_ENVIRONMENT 2
 #define MSSQL_SQLCMD_SOURCE_DEFAULT 3
+#define MSSQL_SQLCMD_SOURCE_DSN 4 /* the ODBC data source given with -D; its
+                                     *_source_name names it (or, when empty,
+                                     dsn does) */
+
+/* dsn_status: what sqlcmd found for the data source -D names (Linux and
+   macOS; sqlcmd on Windows treats -D as obsolete). */
+#define MSSQL_SQLCMD_DSN_NONE 0      /* no -D */
+#define MSSQL_SQLCMD_DSN_FOUND 1     /* found: the settings it supplied carry
+                                        MSSQL_SQLCMD_SOURCE_DSN, and server is
+                                        the server it names */
+#define MSSQL_SQLCMD_DSN_NOT_FOUND 2 /* not in the user or system odbc.ini,
+                                        or names no driver; server may be
+                                        empty */
+#define MSSQL_SQLCMD_DSN_NO_SERVER 3 /* found, but names no server: as the
+                                        driver does then, server is the data
+                                        source name (MSSQL_SQLCMD_SOURCE_DEFAULT);
+                                        the other settings it supplied carry
+                                        MSSQL_SQLCMD_SOURCE_DSN */
 
 typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText server;   /* -S; required unless invalid_reason is given */
@@ -228,6 +246,9 @@ typedef struct MssqlSqlcmdDiagnosticsRequest {
     MssqlSqlcmdText trust_server_certificate_source_name;
     MssqlSqlcmdText host_name_in_certificate_source_name;
     MssqlSqlcmdText login_timeout_source_name;
+    MssqlSqlcmdText dsn;      /* -D: the data source name given to -S; NULL or
+                                 empty without -D */
+    int32_t dsn_status;       /* MSSQL_SQLCMD_DSN_* */
 } MssqlSqlcmdDiagnosticsRequest;
 
 /* Diagnoses the connection up to request->depth (name resolution, SQL Server

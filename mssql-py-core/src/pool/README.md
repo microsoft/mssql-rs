@@ -10,6 +10,9 @@ behavior; the [slot adaptation](../../../docs/async-pool-core-build-vs-reuse.md#
 defines the Deadpool boundary. This guide maps those contracts to code, not a
 second specification.
 
+For the compiled manager and slot lifecycle, see the
+[lifecycle implementation](../../../docs/async-connection-pooling-mssql-rs.md#103-a2-compiled-lifecycle).
+
 ## Type map
 
 | Contract | Responsibility and boundary |
@@ -32,12 +35,12 @@ not a background cleanup task.
 
 ## How the contracts fit
 
-These are dependencies for later acquisition integration, not an enabled
-checkout path:
+These contracts support the private manager; physical SQL acquisition and AQE
+checkout remain unwired:
 
 ```text
 Caller adapter
-  |-- PoolConfig + PoolKey --> per-key slot admission (later manager)
+  |-- PoolConfig + PoolKey --> per-key slot admission (private manager)
   |-- AcquireControl -------> one deadline/cancellation across stages
   `-- ConnectSpec ----------> ConnectionFactory::open
                                 `--> OpenedConnection
@@ -45,7 +48,7 @@ Caller adapter
                                        `-- AuthMetadata
 ```
 
-The future production acquisition guard must own its capacity slot before
+A reserved acquisition guard must own its capacity slot before
 physical opening/reset begins. Per-call options stay explicit rather than
 being installed as shared "current request" state on the factory or scheduler.
 The [Python integration design](../../../docs/async-connection-pooling-mssql-python-integration.md)
@@ -57,7 +60,7 @@ owns key construction, logical connection/cursor ownership and result delivery.
   still live. The slot adaptation requires local client destruction before
   returning an empty slot; bare Drop is not successful clean return.
 - `AcquireControl::run` checks interruption before work and again after work
-  completes. A completed result is not permission to skip the later manager's
+  completes. A completed result is not permission to skip the manager's
   generation/publication check or the AQE close barrier.
 - An acquisition cancellation token and a TDS `CancelHandle` serve different
   layers. Operation owners still need cancellation/settlement guards for TDS I/O,

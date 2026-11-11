@@ -2666,6 +2666,256 @@
           "expr": "seconds"
         }
       ]
+    },
+    {
+      "id": "diagnose.settings.item.dsn",
+      "message": "{setting} from DSN {dsn}",
+      "translation": "{setting} from DSN {dsn}",
+      "placeholders": [
+        {
+          "id": "setting",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "setting"
+        },
+        {
+          "id": "dsn",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.header.dsn",
+      "message": "sqlcmd diagnose: DSN {dsn}",
+      "translation": "sqlcmd diagnose: DSN {dsn}",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_not_found",
+      "message": "The DSN {dsn} given with -D was not found in the user or system odbc.ini, or it names no driver.",
+      "translation": "The DSN {dsn} given with -D was not found in the user or system odbc.ini, or it names no driver.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_no_server",
+      "message": "The DSN {dsn} given with -D names no server, so sqlcmd uses the DSN name as the server.",
+      "translation": "The DSN {dsn} given with -D names no server, so sqlcmd uses the DSN name as the server.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_server_parse_failed",
+      "message": "The server in DSN {dsn} could not be parsed: {error}.",
+      "translation": "The server in DSN {dsn} could not be parsed: {error}.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        },
+        {
+          "id": "error",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_server_parse_failed_sentence",
+      "message": "The server in DSN {dsn} could not be parsed: {error}",
+      "translation": "The server in DSN {dsn} could not be parsed: {error}",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        },
+        {
+          "id": "error",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "error"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_trusted_connection_ignores_login",
+      "message": "The DSN {dsn} sets Trusted_Connection=yes, so sqlcmd logs in with integrated authentication and does not use the login from {source}.",
+      "translation": "The DSN {dsn} sets Trusted_Connection=yes, so sqlcmd logs in with integrated authentication and does not use the login from {source}.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        },
+        {
+          "id": "source",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "source"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.certificate_trusted_dsn",
+      "message": "; server certificate trusted (DSN {dsn})",
+      "translation": "; server certificate trusted (DSN {dsn})",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.certificate_trust_ignored_strict_dsn",
+      "message": "; TrustServerCertificate from DSN {dsn} ignored (strict encryption validates the certificate)",
+      "translation": "; TrustServerCertificate from DSN {dsn} ignored (strict encryption validates the certificate)",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.depth.certificate_name_dsn",
+      "message": "; certificate name {name} (DSN {dsn})",
+      "translation": "; certificate name {name} (DSN {dsn})",
+      "placeholders": [
+        {
+          "id": "name",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "name"
+        },
+        {
+          "id": "dsn",
+          "string": "%[2]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 2,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_trust_ignored_with_strict_encryption",
+      "message": "The DSN {dsn} sets TrustServerCertificate=yes, which is ignored with strict encryption (-Ns): the server certificate is validated.",
+      "translation": "The DSN {dsn} sets TrustServerCertificate=yes, which is ignored with strict encryption (-Ns): the server certificate is validated.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_certificate_name_not_validated_when_trusted",
+      "message": "The certificate host name is not validated when the server certificate is trusted (DSN {dsn}).",
+      "translation": "The certificate host name is not validated when the server certificate is trusted (DSN {dsn}).",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.dsn_certificate_name_not_validated_with_c",
+      "message": "The certificate host name from DSN {dsn} is not validated when -C trusts the server certificate.",
+      "translation": "The certificate host name from DSN {dsn} is not validated when -C trusts the server certificate.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
+    },
+    {
+      "id": "diagnose.finding.certificate_name_not_validated_with_dsn_trust",
+      "message": "The certificate host name from -F is not validated when the DSN {dsn} trusts the server certificate.",
+      "translation": "The certificate host name from -F is not validated when the DSN {dsn} trusts the server certificate.",
+      "placeholders": [
+        {
+          "id": "dsn",
+          "string": "%[1]s",
+          "type": "string",
+          "underlyingType": "string",
+          "argNum": 1,
+          "expr": "dsn"
+        }
+      ]
     }
   ]
 }

@@ -5,8 +5,10 @@ use std::fmt;
 
 use mssql_tds::error::Error as TdsError;
 
+/// Pool operation result before AQE/Python error mapping.
 pub(crate) type PoolResult<T> = Result<T, PoolError>;
 
+/// Timeout diagnostic labels, not independent stage budgets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AcquireStage {
     Admission,
@@ -17,6 +19,7 @@ pub(crate) enum AcquireStage {
     Delivery,
 }
 
+/// Physical-open failures with typed causes and redacted routine diagnostics.
 #[derive(thiserror::Error)]
 pub(crate) enum OpenError {
     #[error("TDS login failed")]
@@ -25,6 +28,7 @@ pub(crate) enum OpenError {
     Provider(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// Pool failures with typed causes and redacted routine diagnostics.
 #[derive(thiserror::Error)]
 pub(crate) enum PoolError {
     #[error("invalid pool configuration: {field}: {reason}")]

@@ -740,6 +740,49 @@ mod tests {
     }
 
     fn cancel_cursor_phase(phase: CursorPhase, acknowledge: bool, stall: bool) {
+        cancel_cursor_phase_with(phase, acknowledge, stall, false);
+    }
+
+    /// `SQL_CA_SS_DATA_CLASSIFICATION` on `ird`: `SQL_SUCCESS` with a payload,
+    /// `SQL_ERROR` (`HY091`) without one.
+    fn ird_classification(ird: SqlHandle) -> SqlReturn {
+        let mut buffer = [0u8; 256];
+        let mut length = 0;
+        unsafe {
+            crate::api::get_desc_field::sql_get_desc_field_w(
+                ird,
+                0,
+                i16::try_from(crate::api::odbc_types::SQL_CA_SS_DATA_CLASSIFICATION).unwrap(),
+                buffer.as_mut_ptr().cast(),
+                256,
+                &mut length,
+            )
+        }
+    }
+
+    /// A cancellation discovered mid-`SQLFetch`, mid-`SQLGetData` or during
+    /// the read-ahead after a row fails the call, so it drops the result
+    /// set's classification with the cursor.
+    #[test]
+    fn a_cancelled_row_read_drops_the_classification() {
+        for phase in [
+            CursorPhase::Fetch,
+            CursorPhase::ReadAhead,
+            CursorPhase::GetData,
+        ] {
+            cancel_cursor_phase_with(phase, true, false, true);
+        }
+    }
+
+    /// `classified` negotiates Data Classification and sends a
+    /// DATACLASSIFICATION token with the result set, so the cancelled call
+    /// must also drop the IRD's classification.
+    fn cancel_cursor_phase_with(
+        phase: CursorPhase,
+        acknowledge: bool,
+        stall: bool,
+        classified: bool,
+    ) {
         use crate::api::odbc_types::*;
         use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
         use mssql_mock_tds::protocol::{build_attention_ack_packet, build_query_result};
@@ -777,7 +820,15 @@ mod tests {
         } else {
             QueryResponse::select_one()
         };
-        let full = build_query_result(&response);
+        // One label, "L"/"1", on the first column, in the v1 layout.
+        let classification: &[u8] = &[
+            0xA3, 1, 0, 1, b'L', 0, 1, b'1', 0, 0, 0, 1, 0, 1, 0, 0, 0, 0xFF, 0xFF,
+        ];
+        let full = if classified {
+            mssql_mock_tds::protocol::build_query_result_with_extras(&response, classification, &[])
+        } else {
+            build_query_result(&response)
+        };
         // Hold back part of a value, a PLP read-ahead, or the final DONE.
         let held = match phase {
             CursorPhase::Fetch | CursorPhase::GetData => 13 + 5,
@@ -870,6 +921,10 @@ mod tests {
         context.user_name = "sa".to_string();
         context.password = "unused-by-the-mock-server".to_string();
         context.database = "master".to_string();
+        if classified {
+            context.requested_data_classification_version =
+                Some(mssql_tds::token::data_classification::DataClassificationVersion::Version1);
+        }
         context.encryption_options = EncryptionOptions {
             mode: EncryptionSetting::PreferOff,
             trust_server_certificate: true,
@@ -973,6 +1028,9 @@ mod tests {
                     0,
                 )
             });
+        }
+        if classified {
+            assert_eq!(ird_classification(h.ird()), SQL_SUCCESS, "{phase:?}");
         }
         std::thread::scope(|scope| {
             let idle = matches!(
@@ -1114,6 +1172,9 @@ mod tests {
                 } else {
                     assert_eq!(state.diag_records[0].sql_state, *b"HY008");
                 }
+            }
+            if classified {
+                assert_eq!(ird_classification(h.ird()), SQL_ERROR, "{phase:?}");
             }
             {
                 let state = dbc.inner.lock().unwrap();

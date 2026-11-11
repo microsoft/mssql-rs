@@ -20,11 +20,12 @@ use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
-    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_CLIENT_CONNECTION_ID, SQL_COPT_SS_ENCRYPT,
-    SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_LONGASMAX, SQL_COPT_SS_MULTISUBNET_FAILOVER,
-    SQL_COPT_SS_TNIR, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION,
-    SQL_COPT_SS_WARN_ON_CP_ERROR, SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
-    SQL_WARN_NO, SQL_WARN_YES, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_CLIENT_CONNECTION_ID,
+    SQL_COPT_SS_DATACLASSIFICATION_VERSION, SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY,
+    SQL_COPT_SS_LONGASMAX, SQL_COPT_SS_MULTISUBNET_FAILOVER, SQL_COPT_SS_TNIR,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_COPT_SS_WARN_ON_CP_ERROR,
+    SQL_EN_ON, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_WARN_NO, SQL_WARN_YES, SqlHandle,
+    SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -202,6 +203,18 @@ fn sql_get_connect_attr_w_safe(
                 write_if_some(
                     value_ptr.cast::<u32>(),
                     u32::from_le_bytes([b0, b1, b2, b3]),
+                );
+                write_if_some(string_length_ptr, 4);
+            }
+            SQL_SUCCESS
+        }
+        SQL_COPT_SS_DATACLASSIFICATION_VERSION => {
+            // The requested version, not the negotiated one: msodbcsql reads it
+            // from `dwOptions` through the same numeric tail as LongAsMax.
+            unsafe {
+                write_if_some(
+                    value_ptr.cast::<u32>(),
+                    u32::from(state.data_classification_version),
                 );
                 write_if_some(string_length_ptr, 4);
             }

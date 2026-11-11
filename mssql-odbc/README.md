@@ -94,8 +94,8 @@ workspace Cargo target directory.
 ## Configuration and compatibility
 
 The [driver guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/driver-guide.md)
-covers connection defaults, timeouts, parameter streaming, descriptors,
-character encoding, migration notes, and tracing. See the
+covers connection defaults, timeouts, parameter streaming, descriptors, data
+classification, character encoding, migration notes, and tracing. See the
 [parity registry](https://github.com/microsoft/mssql-rs/blob/main/mssql-odbc/docs/parity-deviations.md)
 for deliberate differences from Microsoft ODBC Driver for SQL Server.
 

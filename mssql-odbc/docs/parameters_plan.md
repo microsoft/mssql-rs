@@ -37,11 +37,13 @@ transparent reconnects.
   a separate orphan first, since that RPC has no drop slot.
 - **Materialized `sp_prepexec` failure ownership** - the pending handle remains in ODBC
   through reconnect, validation, parameter construction, and Always Encrypted
-  setup. `mssql-tds` consumes it only when the prepexec RPC is ready to
-  serialize, so definite pre-send failures restore it for a later cleanup.
-  Serialization, send, and response failures remain ambiguous: the server may
-  already have consumed the handle, so retrying cleanup could target an invalid
-  or reused id. This matches msodbcsql after its `ExecRPCImmediate` boundary.
+  setup. `mssql-tds` consumes it only once a send is attempted, so definite
+  pre-send failures restore it for a later cleanup: those above, a cancellation
+  or timeout before the first packet, and a serialization failure before any
+  write. Failures once sending has begun, and response failures, remain
+  ambiguous: the server may already have consumed the handle, so retrying
+  cleanup could target an invalid or reused id. This matches msodbcsql after its
+  `ExecRPCImmediate` boundary.
 - **Stale-handle invalidation after transparent reconnect** - the client's
   `StatementId -> handle` map is cleared on every reconnect, alongside the
   Always Encrypted describe cache. `TdsClient::execute_prepared` performs
