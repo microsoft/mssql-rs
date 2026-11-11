@@ -36,7 +36,8 @@ fn b_varchar(bytes: &mut Vec<u8>, value: &str) {
 }
 
 /// A V2 payload with `distinct` labels and as many information types, every
-/// name and id `length` UTF-16 units of `fill` after a short ASCII prefix, and
+/// name and id a short ASCII prefix padded with `fill` to `length` characters
+/// (`fill` must be in the BMP, so that is also `length` UTF-16 units), and
 /// `columns` columns with one property each, column `i` pointing at entry
 /// `i % distinct`.
 fn token(columns: usize, distinct: usize, length: usize, fill: char) -> Vec<u8> {

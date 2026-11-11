@@ -230,6 +230,9 @@ async fn read_b_varchar<T: TdsPacketReader + Send + Sync>(
 /// collecting them into `u16`s. Labels and ids are usually ASCII, which skips
 /// UTF-16 decoding altogether.
 fn decode_utf16_le_lossy(bytes: &[u8]) -> String {
+    // `from_utf8` cannot fail on bytes already checked as ASCII. Matching its
+    // `Ok` keeps this free of `unsafe` and panics, and copying the bytes then
+    // validating them in one pass is markedly faster than collecting `char`s.
     if bytes
         .chunks_exact(2)
         .all(|pair| pair[1] == 0 && pair[0].is_ascii())
