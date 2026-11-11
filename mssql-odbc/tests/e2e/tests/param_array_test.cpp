@@ -2398,39 +2398,53 @@ ODBC_TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
 }
 
 // -------------------------------------------------------------------
-// A parameter array's diagnostics are ordered set by set, and by message
-// priority within a set: set 1's unmapped error comes before set 2's mapped
-// error and the message that follows it (measured on msodbcsql 18.07.0001).
+// A parameter array's diagnostics are ordered set by set, then by message
+// priority, then in arrival order: set 1's unmapped error comes before set 2's
+// mapped error and the message that follows it, and a set's null-aggregate
+// warning keeps its place around that set's equally ranked mapped error
+// (measured on msodbcsql 18.07.0001).
 // -------------------------------------------------------------------
 ODBC_TEST_F(ParamArrayTest, DiagnosticsAreOrderedBySetBeforePriority) {
     ExecDirect("CREATE TABLE #pa_order (id int PRIMARY KEY); INSERT INTO #pa_order VALUES (1)");
-    Prepare("DECLARE @v int = ?; IF @v = 1 RAISERROR ('unmapped failure', 16, 1); "
+    Prepare("DECLARE @v int = ?; DECLARE @x int; "
+            "IF @v = 1 RAISERROR ('unmapped failure', 16, 1); "
+            "ELSE IF @v = 4 BEGIN SELECT @x = SUM(n) FROM (VALUES (CAST(NULL AS int)), (1)) t(n); "
+            "INSERT INTO #pa_order VALUES (1); END "
+            "ELSE IF @v = 5 BEGIN INSERT INTO #pa_order VALUES (1); "
+            "SELECT @x = SUM(n) FROM (VALUES (CAST(NULL AS int)), (1)) t(n); END "
             "ELSE INSERT INTO #pa_order VALUES (1)");
-    SQLINTEGER values[2] = {1, 2};
+    SQLINTEGER values[2] = {};
     SQLLEN indicators[2] = {};
     SQLUSMALLINT status[2] = {SQL_PARAM_UNUSED, SQL_PARAM_UNUSED};
     SQLULEN processed = 0;
     BindIntArray(values, indicators, 2, status, &processed);
 
-    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
-    std::vector<SQLINTEGER> natives;
-    for (SQLSMALLINT record = 1;; ++record) {
-        SQLTCHAR state[6] = {};
-        SQLINTEGER native = 0;
-        SQLTCHAR message[512] = {};
-        SQLSMALLINT length = 0;
-        const SQLRETURN rc = SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, record, state, &native,
-                                           message, 512, &length);
-        if (rc == SQL_NO_DATA) {
-            break;
+    const auto natives_for = [&](SQLINTEGER first, SQLINTEGER second) {
+        values[0] = first;
+        values[1] = second;
+        std::vector<SQLINTEGER> natives;
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+        for (SQLSMALLINT record = 1;; ++record) {
+            SQLTCHAR state[6] = {};
+            SQLINTEGER native = 0;
+            SQLTCHAR message[512] = {};
+            SQLSMALLINT length = 0;
+            const SQLRETURN rc = SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, record, state, &native,
+                                               message, 512, &length);
+            if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+                EXPECT_EQ(SQL_NO_DATA, rc);
+                break;
+            }
+            natives.push_back(native);
         }
-        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-        natives.push_back(native);
-    }
-    EXPECT_EQ((std::vector<SQLINTEGER>{50000, 2627, 3621}), natives);
-    EXPECT_EQ(2u, processed);
-    EXPECT_EQ(SQL_PARAM_ERROR, status[0]);
-    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+        EXPECT_EQ(2u, processed);
+        EXPECT_EQ(SQL_PARAM_ERROR, status[0]);
+        EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+        return natives;
+    };
+    EXPECT_EQ((std::vector<SQLINTEGER>{50000, 2627, 3621}), natives_for(1, 2));
+    EXPECT_EQ((std::vector<SQLINTEGER>{2627, 8153, 3621, 8153, 2627, 3621}), natives_for(5, 4));
 }
 
 // -------------------------------------------------------------------

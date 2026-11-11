@@ -1861,6 +1861,43 @@ impl NetworkTransport {
         Ok(true)
     }
 
+    /// Waits at most `wait` for the next packet of the current response and
+    /// leaves it unread. A packet that arrives only in part is parked, so ending
+    /// the wait, or a cancellation, loses nothing and needs no ATTENTION.
+    /// Returns whether any of the response is buffered.
+    pub(crate) async fn response_data_within(
+        &mut self,
+        wait: Duration,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<bool> {
+        if self.tds_read_buffer.get_remaining_byte_count() > 0
+            || self.tds_read_buffer.end_of_message
+        {
+            return Ok(true);
+        }
+        let cancelled = async {
+            match cancel_handle {
+                Some(handle) => handle.cancel_token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let arrival = poll_fn(|context| {
+            self.tds_read_buffer.reset_to_length(0);
+            match self.poll_new_tds_packet(context) {
+                Ok(Some(packet_size)) => {
+                    self.tds_read_buffer.remove_header_from_packet(packet_size);
+                    Poll::Ready(Ok(true))
+                }
+                Ok(None) => Poll::Pending,
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        });
+        tokio::select! {
+            arrived = timeout(wait, arrival) => arrived.unwrap_or(Ok(false)),
+            () = cancelled => Ok(false),
+        }
+    }
+
     /// Reads a complete TDS packet from the network into the working buffer.
     ///
     /// This method handles the case where a single `read()` call returns data for multiple
@@ -2065,10 +2102,15 @@ impl NetworkTransport {
     /// `get_new_tds_packet`, which registers a real waker. The `&mut self`
     /// receiver prevents this poll from replacing a parked async reader's waker.
     fn try_get_new_tds_packet(&mut self) -> TdsResult<Option<usize>> {
+        self.poll_new_tds_packet(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// Polls for a complete TDS packet. A packet only partly read is parked on
+    /// `Pending`, so the next poll or read resumes it and dropping the poller in
+    /// between loses nothing.
+    fn poll_new_tds_packet(&mut self, context: &mut Context<'_>) -> TdsResult<Option<usize>> {
         let base_offset = self.tds_read_buffer.buffer_length;
         let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
 
         loop {
             if let Some(packet_size) =
@@ -2085,7 +2127,7 @@ impl NetworkTransport {
             let mut read_buffer = ReadBuf::new(
                 &mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..],
             );
-            match Pin::new(stream).poll_read(&mut context, &mut read_buffer) {
+            match Pin::new(stream).poll_read(context, &mut read_buffer) {
                 Poll::Pending => {
                     self.park_partial_packet(base_offset, bytes_available);
                     return Ok(None);
@@ -3803,6 +3845,14 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         Self::abort_transport(self);
     }
 
+    async fn response_data_within(
+        &mut self,
+        wait: Duration,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<bool> {
+        NetworkTransport::response_data_within(self, wait, cancel_handle).await
+    }
+
     /// Send an attention packet and wait for acknowledgment with a timeout.
     ///
     /// This implements the attention sending flow with a configurable timeout:
@@ -5218,6 +5268,59 @@ pub(crate) mod tests {
         transport.tds_read_buffer.consume_bytes(9).unwrap();
         TdsTransport::reset_reader(&mut transport);
         assert!(!TdsTransport::response_fully_received(&transport));
+    }
+
+    /// Waiting for more of the response reads none of it, and ending the wait
+    /// loses nothing: a packet that arrived only in part is parked and is
+    /// whole once the rest arrives.
+    #[tokio::test]
+    async fn response_data_within_parks_a_partial_packet() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        let packet = tabular_packet(b"tail", true);
+        server.write_all(&packet[..5]).await.unwrap();
+
+        assert!(
+            !transport
+                .response_data_within(Duration::from_millis(20), None)
+                .await
+                .unwrap()
+        );
+        server.write_all(&packet[5..]).await.unwrap();
+        assert!(
+            transport
+                .response_data_within(Duration::from_secs(5), None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"tail");
+        assert!(
+            transport
+                .response_data_within(Duration::ZERO, None)
+                .await
+                .unwrap(),
+            "buffered bytes answer at once"
+        );
+    }
+
+    /// A cancellation ends the wait without failing it or the connection.
+    #[tokio::test]
+    async fn response_data_within_ends_when_cancelled() {
+        let (mut transport, _server) = create_readable_network_transport(&ClientContext::default());
+        let handle = cancelled_handle();
+
+        let arrived = timeout(
+            Duration::from_secs(60),
+            transport.response_data_within(Duration::from_secs(600), Some(&handle)),
+        )
+        .await
+        .expect("a cancelled wait must return");
+
+        assert!(!arrived.unwrap());
+        assert!(!is_known_dead(&transport));
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.

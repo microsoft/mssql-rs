@@ -464,3 +464,44 @@ TEST_F(CancelLiveTest, CancelInterruptsAGetDataBlockedMidPlpValue) {
     EXPECT_FALSE(proxy.Failed());
     DisconnectFromProxy();
 }
+
+// A statement inside EXEC fails while a later one runs, and the cancellation
+// lands during the one-second look-ahead for the procedure's tail. Both
+// drivers end the look-ahead and return the statement's error without HY008,
+// and the rest of the batch is abandoned. msodbcsql's next SQLMoreResults
+// reports HY008; this driver settled the response in the interrupted call
+// (registry entry 27), so it finds no more results.
+TEST_F(CancelLiveTest, CancelDuringTheProcedureTailLookAheadAbandonsTheBatch) {
+    using namespace std::chrono_literals;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT,
+                                reinterpret_cast<SQLPOINTER>(15), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    auto sql = ODBCTestUtils::ToSqlTStr(
+        "SET NOCOUNT ON; EXEC(N'RAISERROR(''look_ahead'',16,1) WITH NOWAIT; "
+        "WAITFOR DELAY ''00:00:10''; SELECT 2;');");
+    auto execution = std::async(std::launch::async, [&] {
+        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    });
+    const auto initial = execution.wait_for(400ms);
+    const auto started = std::chrono::steady_clock::now();
+    const auto cancelRc = SQLCancel(stmt_);
+    const auto settled = execution.wait_for(5s);
+    const auto executeRc = execution.get();
+    EXPECT_EQ(std::future_status::timeout, initial) << "the look-ahead ended early";
+    EXPECT_EQ(SQL_SUCCESS, cancelRc);
+    ASSERT_EQ(std::future_status::ready, settled);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 5s);
+    ASSERT_EQ(SQL_ERROR, executeRc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+    EXPECT_FALSE(ODBCTestUtils::HasDiagState(SQL_HANDLE_STMT, stmt_, "HY008"));
+
+    const auto* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        EXPECT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY008");
+    } else {
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    AssertReusable();
+}

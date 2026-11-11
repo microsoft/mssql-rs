@@ -86,6 +86,11 @@ const MAX_ERROR_TEXT_BYTES_PER_FAILED_STATEMENT: usize = 8 * 1024 * 1024;
 /// statement that also sends many messages is not rejected.
 const MAX_TOKENS_AFTER_STATEMENT_ERROR: u32 = 100_000;
 
+/// How long a failed statement's completion waits for the rest of its
+/// procedure before leaving it to `advance`: msodbcsql's `DEFAULT_ASYNC_TIMEOUT`
+/// look-ahead (`OnDone` in `sqlctokn.cpp`, `TdsParser.h`).
+const PROCEDURE_TAIL_WAIT: Duration = Duration::from_secs(1);
+
 /// Statement errors skipped by a [`TdsClient::close_query`] drain under
 /// [`BatchErrorMode::Continue`]. A batch can hold any number of failing
 /// statements, so the errors kept for the caller are bounded like one failed
@@ -6546,6 +6551,15 @@ impl TdsClient {
     /// [`advance`](Self::advance) with the batch kept open. An error returned
     /// from a row set comes after the row set's own DONE, so only the procedure
     /// tail after a DONEINPROC is left to read.
+    ///
+    /// The procedure's tail is read only if more of the response arrives within
+    /// [`PROCEDURE_TAIL_WAIT`]. A later statement of the procedure may still be
+    /// running, and waiting for it would hold the error back, or let the
+    /// request's timeout abandon a batch that is still valid. Like msodbcsql's
+    /// look-ahead, the wait neither fails the request nor counts against its
+    /// timeout, and when nothing arrives the batch stays open for `advance`. A
+    /// cancellation ends the wait the same way and is left to the caller, as
+    /// msodbcsql returns the error and settles the cancellation afterwards.
     pub async fn complete_failed_statement(&mut self) -> TdsResult<bool> {
         let in_procedure_tail = if self.failed_statement_done_pending {
             false
@@ -6572,6 +6586,28 @@ impl TdsClient {
             && self.has_open_batch()
     }
 
+    /// Whether more of the response arrives within [`PROCEDURE_TAIL_WAIT`],
+    /// bounded by the request's remaining timeout. Nothing is read, and the
+    /// time waited is not charged to that timeout.
+    async fn response_continues_soon(&mut self) -> TdsResult<bool> {
+        if self.parked_token.is_some() {
+            return Ok(true);
+        }
+        let wait = self
+            .remaining_request_timeout
+            .map_or(PROCEDURE_TAIL_WAIT, |remaining| {
+                remaining.min(PROCEDURE_TAIL_WAIT)
+            });
+        match self
+            .transport
+            .response_data_within(wait, self.cancel_handle.as_ref())
+            .await
+        {
+            Ok(arrived) => Ok(arrived),
+            Err(error) => Err(self.fail_read(error)),
+        }
+    }
+
     async fn complete_failed_statement_inner(
         &mut self,
         mut in_procedure_tail: bool,
@@ -6579,7 +6615,14 @@ impl TdsClient {
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
+        let mut tail_awaited = false;
         loop {
+            if in_procedure_tail
+                && !std::mem::replace(&mut tail_awaited, true)
+                && !self.response_continues_soon().await?
+            {
+                return Ok(true);
+            }
             let token = self.next_response_token(&parser_context).await?;
             match token {
                 Tokens::DoneInProc(done) if !in_procedure_tail => {
@@ -10462,6 +10505,12 @@ mod tests {
         /// Returned by `receive_row_into` once the queued tokens run out,
         /// instead of the default `ConnectionClosed`.
         row_read_error: Option<crate::error::Error>,
+        /// Queued-token count at which the response stalls past the request's
+        /// timeout: a read there times out, while a short wait for more of it
+        /// finds nothing, after which the rest has arrived.
+        response_pause_at: Option<usize>,
+        /// Every wait `response_data_within` was given.
+        response_waits: Arc<std::sync::Mutex<Vec<Duration>>>,
     }
 
     impl TestTransport {
@@ -10503,6 +10552,8 @@ mod tests {
                 classification_calls: 0,
                 classification_error: None,
                 row_read_error: None,
+                response_pause_at: None,
+                response_waits: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -10510,6 +10561,14 @@ mod tests {
             Self {
                 pending_tokens: VecDeque::from(tokens),
                 ..Self::new()
+            }
+        }
+
+        /// `tokens`, with the response stalling before `tokens[pause_before]`.
+        fn with_tokens_pausing_before(tokens: Vec<Tokens>, pause_before: usize) -> Self {
+            Self {
+                response_pause_at: Some(tokens.len() - pause_before),
+                ..Self::with_tokens(tokens)
             }
         }
 
@@ -10606,6 +10665,13 @@ mod tests {
                 } else {
                     response.await;
                 }
+            }
+            if self.response_pause_at == Some(self.pending_tokens.len()) {
+                return Err(crate::error::Error::TimeoutError(
+                    crate::error::TimeoutErrorType::String(
+                        "mock response stalled past the request timeout".to_string(),
+                    ),
+                ));
             }
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(tok);
@@ -10841,6 +10907,20 @@ mod tests {
         fn abort_transport(&mut self) {
             self.closed = true;
             self.known_dead = true;
+        }
+        async fn response_data_within(
+            &mut self,
+            wait: Duration,
+            _cancel_handle: Option<&CancelHandle>,
+        ) -> TdsResult<bool> {
+            self.response_waits.lock().unwrap().push(wait);
+            if self.response_pause_at != Some(self.pending_tokens.len()) {
+                return Ok(true);
+            }
+            // Some real time passes, so a test can see whether it is charged.
+            tokio::time::sleep(wait.min(Duration::from_millis(50))).await;
+            self.response_pause_at = None;
+            Ok(false)
         }
         async fn send_attention_with_timeout(
             &mut self,
@@ -13524,7 +13604,11 @@ mod tests {
     /// Executes `tokens` under `Continue`, positions on their first row set and
     /// reads it into its error.
     async fn failed_row_set_client(tokens: Vec<Tokens>) -> TdsClient {
-        let mut client = create_test_client_with_tokens(tokens);
+        failed_row_set_client_over(TestTransport::with_tokens(tokens)).await
+    }
+
+    async fn failed_row_set_client_over(transport: TestTransport) -> TdsClient {
+        let mut client = create_test_client_with_transport(transport);
         assert_eq!(
             client
                 .execute(
@@ -13699,6 +13783,76 @@ mod tests {
         assert!(!client.has_open_batch());
         assert!(client.is_connection_dead());
         assert!(!client.statement_error_completion_pending);
+    }
+
+    /// A later statement of the procedure can still be running when the failed
+    /// statement's DONEINPROC arrives. Completing it waits no longer than
+    /// msodbcsql's look-ahead, or what is left of the request's timeout, for the
+    /// procedure's tail. The wait is not charged to that timeout and interrupts
+    /// nothing: the batch stays open and `advance` reaches the later result.
+    #[tokio::test]
+    async fn completing_a_failed_statement_leaves_a_delayed_procedure_tail() {
+        let quick = Duration::from_millis(300);
+        for (budget, wait) in [
+            (None, PROCEDURE_TAIL_WAIT),
+            (Some(Duration::from_secs(30)), PROCEDURE_TAIL_WAIT),
+            (Some(quick), quick),
+        ] {
+            let transport = TestTransport::with_tokens_pausing_before(
+                vec![
+                    Tokens::Error(error_token_with_severity(16)),
+                    done_in_proc_more(),
+                    int_col_metadata(1),
+                    done_no_more(),
+                ],
+                2,
+            );
+            let waits = Arc::clone(&transport.response_waits);
+            let budgets = Arc::clone(&transport.receive_timeouts);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            client
+                .execute(
+                    "q".to_string(),
+                    ExecuteOptions::new().on_error(BatchErrorMode::Continue),
+                )
+                .await
+                .unwrap_err();
+            client.remaining_request_timeout = budget;
+
+            assert!(client.complete_failed_statement().await.unwrap());
+            assert!(client.has_open_batch());
+            assert_eq!(*waits.lock().unwrap(), [wait]);
+            assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+            let read_budget = *budgets.lock().unwrap().last().unwrap();
+            if let Some(budget) = budget {
+                assert!(
+                    budget - read_budget.unwrap() < Duration::from_millis(40),
+                    "the wait is not charged to the request"
+                );
+            }
+            assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    /// The same look-ahead guards a failed row set's procedure tail.
+    #[tokio::test]
+    async fn completing_a_failed_row_set_leaves_a_delayed_procedure_tail() {
+        let mut client = failed_row_set_client_over(TestTransport::with_tokens_pausing_before(
+            vec![
+                int_col_metadata(1),
+                Tokens::Error(error_token_with_severity(16)),
+                failed_done_in_proc(),
+                int_col_metadata(1),
+                done_no_more(),
+            ],
+            3,
+        ))
+        .await;
+
+        assert!(client.complete_failed_statement().await.unwrap());
+        assert!(client.has_open_batch());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
     }
 
     /// The same inside a row set: the errors collected there are dropped with

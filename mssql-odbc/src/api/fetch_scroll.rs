@@ -6664,18 +6664,33 @@ mod tests {
         h: &TestHandles,
         ending: Vec<mssql_tds::test_client_support::ScriptedToken>,
     ) {
+        position_on_failing_statement_pausing(h, ending, None);
+    }
+
+    /// [`position_on_failing_statement`], with the response pausing before
+    /// `ending[pause]` when given.
+    fn position_on_failing_statement_pausing(
+        h: &TestHandles,
+        ending: Vec<mssql_tds::test_client_support::ScriptedToken>,
+        pause: Option<usize>,
+    ) {
         use mssql_tds::connection::tds_client::{BatchErrorMode, ExecuteOptions};
         use mssql_tds::test_client_support::{
             col_metadata, sql_error, tds_client_from_tokens_with_int_rowsets,
+            tds_client_pausing_before,
         };
 
         let mut tokens = vec![
             col_metadata(int_columns(2)),
             sql_error(8134, 16, "Divide by zero error encountered."),
         ];
+        let lead = tokens.len();
         tokens.extend(ending);
-        let mut client =
-            tds_client_from_tokens_with_int_rowsets(tokens, vec![vec![vec![1, 1]], vec![vec![42]]]);
+        let rowsets = vec![vec![vec![1, 1]], vec![vec![42]]];
+        let mut client = match pause {
+            Some(index) => tds_client_pausing_before(tokens, rowsets, lead + index),
+            None => tds_client_from_tokens_with_int_rowsets(tokens, rowsets),
+        };
         h.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.runtime
@@ -7020,6 +7035,44 @@ mod tests {
         assert!(posted_native(&h, 8134));
         assert_eq!(fetch_next(&h), SQL_NO_DATA);
         assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(buffers.first[0], 42);
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(wire_owner(&h), None);
+    }
+
+    /// A later statement of the procedure can still be running when the failed
+    /// row set's DONEINPROC arrives. The read-ahead waits only briefly for the
+    /// procedure's tail, so the row comes back, the batch stays reserved, and
+    /// SQLMoreResults reaches the later result.
+    #[test]
+    fn a_delayed_procedure_tail_keeps_the_batch_for_more_results() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_in_proc_more_error, done_proc_no_more,
+            return_status,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_on_failing_statement_pausing(
+            &h,
+            vec![
+                done_in_proc_more_error(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ],
+            Some(1),
+        );
+        let buffers = bind_two_int_columns(&h);
+
+        assert_eq!(fetch_next(&h), SQL_SUCCESS);
+        assert_eq!(wire_owner(&h), Some(h.stmt));
+        assert_eq!(fetch_next(&h), SQL_ERROR);
+        assert!(posted_native(&h, 8134));
+        assert_eq!(fetch_next(&h), SQL_NO_DATA);
         assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
         assert_eq!(fetch_next(&h), SQL_SUCCESS);
         assert_eq!(buffers.first[0], 42);

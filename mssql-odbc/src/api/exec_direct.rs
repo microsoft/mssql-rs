@@ -1398,6 +1398,130 @@ mod tests {
         }
     }
 
+    /// A statement inside `EXEC` fails while a later one is still running.
+    /// msodbcsql 18.07.0001 reports the error after its short look-ahead, and
+    /// the next SQLMoreResults reaches the later result. The look-ahead must
+    /// neither wait for that statement nor abandon it, whether SQLExecDirect or
+    /// SQLMoreResults meets the failure.
+    #[test]
+    fn a_delayed_procedure_tail_is_left_for_more_results() {
+        use crate::api::more_results::sql_more_results;
+        use crate::api::odbc_types::{SQL_ERROR, SQL_NO_DATA, SQL_SUCCESS};
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_in_proc_more, done_more_select_with_count, done_proc_no_more,
+            int_columns, return_status, sql_error, tds_client_pausing_before,
+        };
+
+        for earlier_result in [false, true] {
+            let mut tokens = Vec::new();
+            let mut rowsets = Vec::new();
+            if earlier_result {
+                tokens.extend([col_metadata(int_columns(1)), done_more_select_with_count(1)]);
+                rowsets.push(vec![vec![841]]);
+            }
+            let pause_before = tokens.len() + 2;
+            tokens.extend([
+                sql_error(50000, 16, "review842_first"),
+                done_in_proc_more(),
+                col_metadata(int_columns(1)),
+                done_in_proc_more(),
+                return_status(0),
+                done_proc_no_more(),
+            ]);
+            rowsets.push(vec![vec![842]]);
+            let handles = TestHandles::with_env_dbc_stmt();
+            handles.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(tds_client_pausing_before(tokens, rowsets, pause_before));
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+
+            let rc = sql_exec_direct_w_safe(handles.stmt, stmt, "EXEC('...')".to_string());
+            if earlier_result {
+                assert_eq!(rc, SQL_SUCCESS);
+                assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_ERROR);
+            } else {
+                assert_eq!(rc, SQL_ERROR);
+            }
+            assert!(
+                stmt.inner
+                    .lock()
+                    .unwrap()
+                    .diag_records
+                    .iter()
+                    .any(|d| d.native_error == 50000)
+            );
+            assert_eq!(
+                dbc.inner.lock().unwrap().wire.statement_owner(),
+                Some(handles.stmt)
+            );
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_SUCCESS);
+            assert_eq!(unsafe { sql_more_results(handles.stmt) }, SQL_NO_DATA);
+            assert_eq!(dbc.inner.lock().unwrap().wire.statement_owner(), None);
+        }
+    }
+
+    /// A mapped warning that arrives before a mapped error has the same
+    /// priority, so only the arrival order the client records keeps it first,
+    /// as msodbcsql reports them.
+    #[test]
+    fn equal_priority_diagnostics_keep_their_arrival_order() {
+        use crate::api::get_diag::sql_get_diag_rec_w;
+        use crate::api::odbc_types::{SQL_ERROR, SQL_HANDLE_STMT, SQL_NO_DATA, SqlInteger};
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            done_no_more, info, sql_error, tds_client_from_tokens,
+        };
+
+        let handles = TestHandles::with_env_dbc_stmt();
+        handles.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(handles.dbc) };
+        dbc.inner
+            .lock()
+            .unwrap()
+            .wire
+            .put_client_for_test(tds_client_from_tokens(vec![
+                info(
+                    8153,
+                    10,
+                    "Warning: Null value is eliminated by an aggregate.",
+                ),
+                sql_error(8134, 16, "Divide by zero error encountered."),
+                done_no_more(),
+            ]));
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+        assert_eq!(
+            sql_exec_direct_w_safe(handles.stmt, stmt, "SELECT 1/0".to_string()),
+            SQL_ERROR
+        );
+
+        let mut natives = Vec::new();
+        for record in 1.. {
+            let mut native: SqlInteger = 0;
+            let rc = unsafe {
+                sql_get_diag_rec_w(
+                    SQL_HANDLE_STMT,
+                    handles.stmt,
+                    record,
+                    std::ptr::null_mut(),
+                    &mut native,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc == SQL_NO_DATA {
+                break;
+            }
+            natives.push(native);
+        }
+        assert_eq!(natives, [8153, 8134]);
+    }
+
     /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,
     /// not just reach `ExecuteOptions` — see mssql-rs#439, where the timeout
     /// was silently dropped on the floor instead of bounding a statement

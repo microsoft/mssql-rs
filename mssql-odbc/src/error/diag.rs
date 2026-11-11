@@ -84,6 +84,10 @@ pub(crate) struct DiagRecord {
     /// msodbcsql's internal message-resource ID (or the matching server
     /// fallback tier). Equal keys retain posting order.
     pub(crate) priority: u16,
+    /// Arrival order of a parameter array's server message: msodbcsql posts
+    /// each as its token is read, while this driver posts a set's errors and
+    /// messages separately. 0 for every other record, which keeps posting order.
+    pub(crate) arrival: u64,
     /// Borrowed for driver-raised `DiagMsg` text, so posting a fixed
     /// diagnostic (e.g. the `01004` of a `SQLGetData` length probe) does
     /// not allocate.
@@ -111,18 +115,20 @@ impl DiagRecord {
             native_error,
             row_number,
             priority,
+            arrival: 0,
             message: message.into(),
         }
     }
 }
 
-/// Sorts records into msodbcsql's stable `(row number, resource ID, posting
-/// ordinal)` order, unless nothing changed since the last sort.
+/// Sorts records into msodbcsql's stable `(row number, resource ID, arrival)`
+/// order, posting order breaking the remaining ties, unless nothing changed
+/// since the last sort.
 pub(crate) fn sort_diagnostics<T: HasDiagnostics + ?Sized>(state: &mut T) {
     let list = state.diag_records_mut();
     if !list.sorted {
         list.records
-            .sort_by_key(|record| (record.row_number, record.priority));
+            .sort_by_key(|record| (record.row_number, record.priority, record.arrival));
         list.sorted = true;
     }
 }

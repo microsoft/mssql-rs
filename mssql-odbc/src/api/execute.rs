@@ -4146,8 +4146,10 @@ mod tests {
     }
 
     /// Set 1's unmapped error is posted first and must stay first once the
-    /// records sort: msodbcsql orders a parameter array's diagnostics by set
-    /// before message priority, a set's messages included (18.07.0001).
+    /// records sort: msodbcsql orders a parameter array's diagnostics by set,
+    /// then priority, then arrival (18.07.0001). Set 2's mapped warning has the
+    /// priority of its mapped error and arrived before it, so it stays ahead
+    /// although the error is posted first.
     #[test]
     fn parameter_array_diagnostics_keep_their_set_order() {
         use crate::error::sort_diagnostics;
@@ -4169,10 +4171,10 @@ mod tests {
             rows_affected: None,
             processed: 0,
         };
-        let failed_row = |row_index: usize, number| {
+        let failed_row = |row_index: usize, number, ordinal| {
             let mut row = reported_row(row_index);
             row.errors.push(SqlErrorInfo {
-                diagnostic_ordinal: row_index as u64,
+                diagnostic_ordinal: ordinal,
                 parameter_set: Some(row_index),
                 message: "failed".into(),
                 state: 1,
@@ -4184,11 +4186,22 @@ mod tests {
             });
             row
         };
+        let message = |number, class, ordinal| SqlInfoMessage {
+            diagnostic_ordinal: ordinal,
+            parameter_set: Some(1),
+            message: "message".into(),
+            state: 1,
+            class,
+            number,
+            server_name: None,
+            proc_name: None,
+            line_number: Some(1),
+        };
 
         report_parameter_array(
             &mut state,
             PreparedBatchResult {
-                rows: vec![failed_row(0, 50000), failed_row(1, 2627)],
+                rows: vec![failed_row(0, 50000, 0), failed_row(1, 2627, 2)],
                 complete: true,
             },
             &mut batch,
@@ -4196,20 +4209,7 @@ mod tests {
             false,
             None,
         );
-        post_tds_info_messages(
-            &mut state,
-            &[SqlInfoMessage {
-                diagnostic_ordinal: 2,
-                parameter_set: Some(1),
-                message: "The statement has been terminated.".into(),
-                state: 1,
-                class: 0,
-                number: 3621,
-                server_name: None,
-                proc_name: None,
-                line_number: Some(1),
-            }],
-        );
+        post_tds_info_messages(&mut state, &[message(8153, 10, 1), message(3621, 0, 3)]);
         sort_diagnostics(&mut state);
 
         let natives: Vec<_> = state
@@ -4217,7 +4217,7 @@ mod tests {
             .iter()
             .map(|record| record.native_error)
             .collect();
-        assert_eq!(natives, [50000, 2627, 3621]);
+        assert_eq!(natives, [50000, 8153, 2627, 3621]);
         assert_eq!(statuses, [SQL_PARAM_ERROR; 2]);
     }
 

@@ -406,13 +406,12 @@ pub(crate) fn post_diag(state: &mut impl HasDiagnostics, msg: DiagMsg) {
 }
 
 /// Posts `[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]<message>`
-/// for a diagnostic the engine raised.
+/// for a diagnostic the engine raised, with its sort key.
 fn post_server_message(
     state: &mut impl HasDiagnostics,
     sql_state: [u8; 5],
     native_error: i32,
-    row_number: SqlLen,
-    priority: u16,
+    key: ServerMessageKey,
     message: &str,
 ) {
     post_prefixed(
@@ -422,18 +421,38 @@ fn post_server_message(
         &[SERVER_DIAG_SUBSOURCE, message],
     );
     if let Some(record) = state.diag_records_mut().last_mut() {
-        record.row_number = row_number;
-        record.priority = priority;
+        record.row_number = key.row_number;
+        record.priority = key.priority;
+        record.arrival = key.arrival;
     }
 }
 
-/// msodbcsql's row key for a server message: the 1-based parameter set whose
-/// RPC raised it, so a parameter array's records sort set by set (measured on
-/// 18.07.0001).
-fn server_message_row(parameter_set: Option<usize>) -> SqlLen {
-    parameter_set.map_or(SQL_NO_ROW_NUMBER, |set| {
-        SqlLen::try_from(set).map_or(SqlLen::MAX, |set| set.saturating_add(1))
-    })
+/// Where a server message sorts among a call's records.
+struct ServerMessageKey {
+    row_number: SqlLen,
+    priority: u16,
+    arrival: u64,
+}
+
+impl ServerMessageKey {
+    /// A parameter array's message sorts under its 1-based set, then by
+    /// priority, then in arrival order, as msodbcsql files it (measured on
+    /// 18.07.0001); any other keeps posting order within its priority.
+    fn new(number: u32, severity: i32, parameter_set: Option<usize>, ordinal: u64) -> Self {
+        let priority = server_message_priority(number, severity);
+        match parameter_set {
+            Some(set) => Self {
+                row_number: SqlLen::try_from(set).map_or(SqlLen::MAX, |set| set.saturating_add(1)),
+                priority,
+                arrival: ordinal,
+            },
+            None => Self {
+                row_number: SQL_NO_ROW_NUMBER,
+                priority,
+                arrival: 0,
+            },
+        }
+    }
 }
 
 fn server_message_priority(number: u32, severity: i32) -> u16 {
@@ -481,7 +500,7 @@ fn post_server_diagnostics(
     }));
     ordered.sort_by_key(|(ordinal, _)| *ordinal);
 
-    for (_, diagnostic) in ordered {
+    for (ordinal, diagnostic) in ordered {
         let (number, severity, message, parameter_set, forced) = match diagnostic {
             ServerDiagnosticRef::Error(error) => (
                 error.number,
@@ -506,8 +525,7 @@ fn post_server_diagnostics(
             state,
             sqlstate,
             native,
-            server_message_row(parameter_set),
-            server_message_priority(number, severity),
+            ServerMessageKey::new(number, severity, parameter_set, ordinal),
             message,
         );
     }
@@ -1061,9 +1079,10 @@ mod tests {
         assert_eq!(state.records[1].native_error, 207);
     }
 
-    /// A parameter array's server messages sort set by set, then by priority:
-    /// set 1's unmapped error stays ahead of set 2's mapped one, and each set's
-    /// message follows its error (msodbcsql 18.07.0001, executed and prepared).
+    /// A parameter array's server messages sort set by set, then by priority,
+    /// then in arrival order: set 1's unmapped error stays ahead of set 2's
+    /// mapped one, and set 2's mapped warning, which arrived first, stays ahead
+    /// of its error although the error is posted first (msodbcsql 18.07.0001).
     #[test]
     fn server_diagnostics_sort_by_parameter_set_before_priority() {
         let message = |ordinal, set, number, class: i32| SqlInfoMessage {
@@ -1085,7 +1104,7 @@ mod tests {
         };
         let mut state = FakeState::default();
 
-        for errors in [vec![error(1, 0, 50000)], vec![error(2, 1, 2627)]] {
+        for errors in [vec![error(1, 0, 50000)], vec![error(3, 1, 2627)]] {
             post_tds_error(
                 &mut state,
                 &TdsError::from_sql_errors(errors),
@@ -1094,7 +1113,11 @@ mod tests {
         }
         post_tds_info_messages(
             &mut state,
-            &[message(0, 0, 50001, 10), message(3, 1, 3621, 0)],
+            &[
+                message(0, 0, 50001, 10),
+                message(2, 1, 8153, 10),
+                message(4, 1, 3621, 0),
+            ],
         );
         crate::error::sort_diagnostics(&mut state);
 
@@ -1103,7 +1126,10 @@ mod tests {
             .iter()
             .map(|record| (record.row_number, record.native_error))
             .collect();
-        assert_eq!(order, [(1, 50000), (1, 50001), (2, 2627), (2, 3621)]);
+        assert_eq!(
+            order,
+            [(1, 50000), (1, 50001), (2, 8153), (2, 2627), (2, 3621)]
+        );
     }
 
     #[test]

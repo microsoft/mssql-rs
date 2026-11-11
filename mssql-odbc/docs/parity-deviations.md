@@ -922,12 +922,17 @@ msodbcsql build is measured.
     before it returns. msodbcsql's `SQLCancel` sends ATTN while that call still
     holds `csStmt` (`sqlcmisc.cpp:759`), and the next call to read the batch
     reports `HY008` (`sqlccmd.cpp:11821-11826`). This driver settles the
-    pending response in the call that was interrupted, so `HY008` is reported
-    one call earlier and a cancellation never reaches a later call or a
-    subsequent close. A response already fully received is left intact in both
-    drivers. This half is read from source and covered by Rust unit tests; it
-    has not been measured against native, because the window is not
-    reproducible from an application.
+    pending response in the call that was interrupted, so a cancellation never
+    reaches a later call or a subsequent close: a call that would otherwise
+    succeed reports `HY008` one call earlier, and a call that already failed
+    keeps its own error. A response already fully received is left intact in
+    both drivers. The look-ahead of up to one second for a procedure's tail,
+    after a statement inside `EXEC` fails, opens this window reproducibly:
+    both drivers' `SQLExecDirect` returns only the statement's `42000`, then
+    msodbcsql's `SQLMoreResults` reports `HY008` where this driver's returns
+    `SQL_NO_DATA`, and both leave the connection free. Outside that
+    look-ahead the window is not reproducible from an application; that half
+    is read from source and covered by Rust unit tests.
 
     **Evidence level: measured.** The `CancelLiveTest` MoreResults cases record
     `SQL_DRIVER_VER` and assert each driver's exact return code. Measured on
@@ -935,11 +940,18 @@ msodbcsql build is measured.
     `libmsodbcsql-18.6.so.1.1` / `SQL_DRIVER_VER=18.06.0001`, against SQL Server
     2025 CU9 (`17.0.5005.3`). The same sequence was also measured through
     Windows Driver Manager against native `SQL_DRIVER_VER=18.06.0001` with
-    the same result. Other native builds have not been measured.
+    the same result. Other native builds have not been measured. The
+    look-ahead case was measured on Windows msodbcsql 18.07.0001, loaded
+    directly and through the Driver Manager, against SQL Server 2025
+    (`17.00.4025`); `CancelDuringTheProcedureTailLookAheadAbandonsTheBatch`
+    asserts each driver's sequence.
 
     Explicitly approved by the requester on 2026-10-07 for
     [AB#49223](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/49223):
     retain HY008, document the difference, and match native teardown ordering.
+    The look-ahead case was added for
+    [AB#45309](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/45309);
+    maintainer sign-off is pending review.
 28. **Connection-scoped trace events carry the full client connection GUID.**
     Classic ODBC's `CConnection::SendPreloginPacket`
     (`Sql/Ntdbms/sqlncli/tds/prelogin.cpp`, TRACEID branch) logs the GUID at
