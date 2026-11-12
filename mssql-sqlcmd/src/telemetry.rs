@@ -332,9 +332,10 @@ fn validate_and_sanitize_event(envelope: &mut JsonValue) -> Result<(), HttpError
 
 /// Checks an ingestion response against what was sent, translates a partial
 /// one back to the exporter's original batch, and says whether the service
-/// accepted the event: a 2xx response, and for a 206 none rejected. A 4xx or
-/// 5xx rejection (403, 429, 500...) is not accepted. A malformed response is an
-/// error and never an apparent success.
+/// accepted the event, as the exporter judges it: only a 200, or a 206 in which
+/// every item was accepted. Any other status (a 201 or 204 as well as a 4xx or
+/// 5xx) is a failure to the exporter, so it is not accepted here. A malformed
+/// response is an error and never an apparent success.
 fn check_ingestion_response(
     response: Response<Bytes>,
     original_indices: &[usize],
@@ -342,7 +343,7 @@ fn check_ingestion_response(
 ) -> Result<(Response<Bytes>, bool), HttpError> {
     let status = response.status();
     if !matches!(status.as_u16(), 206 | 500) {
-        let accepted = status.is_success();
+        let accepted = status.as_u16() == 200;
         return Ok((response, accepted));
     }
     let (parts, body) = response.into_parts();
@@ -1168,6 +1169,7 @@ mod tests {
                 Completed,
             ),
             (403, "", Failed),
+            (204, "", Failed),
             (400, r#"{"errors":[]}"#, Failed),
             (429, "", NotCompleted),
             (500, "", NotCompleted),
@@ -1216,9 +1218,10 @@ mod tests {
             check_ingestion_response(response(status, body), &[0], 1).map(|(_, accepted)| accepted)
         };
         assert!(accepted(200, "").expect("ok"));
-        assert!(accepted(204, "").expect("ok"));
         assert!(accepted(206, r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#).expect("ok"));
-        for rejected in [301, 400, 401, 403, 408, 429, 503] {
+        // The exporter treats every status but 200 and 206 as a failure, so a
+        // 2xx other than those is not an acceptance either.
+        for rejected in [201, 202, 204, 301, 400, 401, 403, 408, 429, 503] {
             assert!(
                 !accepted(rejected, "").expect("passed through"),
                 "{rejected}"

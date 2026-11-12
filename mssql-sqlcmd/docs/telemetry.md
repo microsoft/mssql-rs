@@ -198,9 +198,9 @@ The event is exported at once by its own thread, using a simple exporter: the
 event is sent on that thread, inside the call that ends the span, and the
 provider is then shut down, so nothing waits on a batch timer in a long
 interactive session. A transport failure, a failure in the filter, a response
-that does not match what was sent, and a rejection by the service (a 4xx or 5xx
-status, or a partial response that rejected the event) are all recorded as a
-failure, because the SDK's shutdown does not hand the export result back. The
+that does not match what was sent, and a rejection by the service (any status
+other than 200, such as a 204 or a 4xx or 5xx, or a partial response that
+rejected the event) are all recorded as a failure, because the SDK's shutdown does not hand the export result back. The
 exporter retries throttling, server errors and every error the HTTP client
 returns: a transport failure and, because the filter reports through the same
 error, a filter failure or a response that does not add up. It backs off for up
