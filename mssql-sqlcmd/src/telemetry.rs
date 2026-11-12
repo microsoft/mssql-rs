@@ -437,9 +437,27 @@ impl HttpClient for ValidationClient {
     }
 }
 
-/// Whether the exporter accepts `connection_string`.
+/// Whether the exporter accepts `connection_string` and its instrumentation key
+/// is a GUID. The exporter does not check the key's format, so a mistyped key
+/// would otherwise enable collection that the service then rejects.
 fn connection_string_is_valid(connection_string: &str) -> bool {
-    Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
+    instrumentation_key_is_guid(connection_string)
+        && Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
+}
+
+fn instrumentation_key_is_guid(connection_string: &str) -> bool {
+    connection_string
+        .split(';')
+        .filter_map(|part| part.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("InstrumentationKey"))
+        .is_some_and(|(_, key)| {
+            let key = key.trim();
+            let groups: Vec<&str> = key.split('-').collect();
+            groups.len() == 5
+                && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, len)| {
+                    group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+        })
 }
 
 /// The destination this run would send to, and only if the exporter accepts it.
@@ -1115,6 +1133,10 @@ mod tests {
     fn an_invalid_connection_string_is_a_no_op_with_no_side_effects() {
         for invalid in [
             "InstrumentationKey=DO-NOT-LOG-THIS;broken",
+            "InstrumentationKey=broken",
+            "InstrumentationKey=00000000-0000-0000-0000-00000000000",
+            "InstrumentationKey=00000000-0000-0000-0000-00000000000g",
+            "IngestionEndpoint=https://example.invalid/",
             "not a connection string",
             "   x   ",
             "",
