@@ -142,9 +142,7 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
         sts_url: String,
         _auth_method: TdsAuthenticationMethod,
     ) -> TdsResult<Vec<u8>> {
-        // TODO: In mssql-tds TdsClient::reconnect, stop retrying terminal auth
-        // failures and propagate OperationCancelledError without wrapping it in
-        // SessionRecoveryFailed, so recovery preserves initial-login semantics.
+        // TODO: TdsClient::reconnect should also stop retrying terminal authentication failures.
         let result = self.acquire_token(&spn, &sts_url).await;
         // The caller loop can observe cancellation before Tokio drops this future.
         if self.connect_cancellation.cancelled.load(Ordering::Acquire) {
@@ -159,7 +157,7 @@ impl EntraIdTokenFactory for AsyncPythonEntraIdTokenFactory {
                     .is_ok_and(|class| error.is_instance(py, &class))
             });
             if cancelled {
-                Error::OperationCancelledError("Async Entra token acquisition cancelled".into())
+                Error::TokenAcquisitionCancelled
             } else {
                 // Provider messages can contain credentials or tokens.
                 Error::Security(SecurityError::AuthenticationDenied(

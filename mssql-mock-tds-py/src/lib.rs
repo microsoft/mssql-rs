@@ -68,6 +68,12 @@ pub struct PyConnectionInfo {
     /// User Agent sent by the client
     #[pyo3(get)]
     pub user_agent: Option<String>,
+    /// Number of SQL batch and RPC requests received.
+    #[pyo3(get)]
+    pub request_count: usize,
+    /// Whether Login7 carried session-recovery state.
+    #[pyo3(get)]
+    pub recovery_login: bool,
 }
 
 #[pymethods]
@@ -100,6 +106,7 @@ pub struct PyMockTdsServer {
     port: u16,
     /// Connection store for accessing received tokens
     connection_store: Arc<Mutex<mssql_mock_tds::server::ConnectionStore>>,
+    query_registry: Arc<Mutex<mssql_mock_tds::QueryRegistry>>,
 }
 
 #[pymethods]
@@ -141,6 +148,7 @@ impl PyMockTdsServer {
         let local_addr = server.local_addr();
         let actual_port = local_addr.port();
         let connection_store = server.connection_store();
+        let query_registry = server.query_registry();
 
         Ok(Self {
             runtime: Arc::new(runtime),
@@ -150,6 +158,7 @@ impl PyMockTdsServer {
             local_addr: local_addr.to_string(),
             port: actual_port,
             connection_store,
+            query_registry,
         })
     }
 
@@ -229,6 +238,25 @@ impl PyMockTdsServer {
         Ok(runtime.block_on(async { store.lock().await.count() }))
     }
 
+    /// Acknowledge session recovery in subsequent logins.
+    pub fn set_session_recovery(&self, enabled: bool) {
+        self.runtime.block_on(async {
+            self.query_registry
+                .lock()
+                .await
+                .set_session_recovery(enabled);
+        });
+    }
+
+    /// Return SELECT 1 for this batch, then close its connection.
+    pub fn close_connection_after(&self, query: &str) {
+        self.runtime.block_on(async {
+            let mut registry = self.query_registry.lock().await;
+            registry.register(query, mssql_mock_tds::QueryResponse::select_one());
+            registry.close_connection_after(query);
+        });
+    }
+
     /// Get all received connection info
     pub fn get_connections(&self) -> PyResult<Vec<PyConnectionInfo>> {
         let runtime = &self.runtime;
@@ -238,12 +266,16 @@ impl PyMockTdsServer {
             let store = store.lock().await;
             store
                 .all()
-                .values()
-                .map(|info| PyConnectionInfo {
+                .iter()
+                .map(|(id, info)| PyConnectionInfo {
                     addr: info.addr.to_string(),
                     access_token: info.received_token_as_string(),
                     authenticated: info.authenticated,
                     user_agent: info.user_agent.clone(),
+                    request_count: info.transaction_descriptor_headers.len(),
+                    recovery_login: store
+                        .login_details(*id)
+                        .is_some_and(|details| details.recovery_login),
                 })
                 .collect()
         }))

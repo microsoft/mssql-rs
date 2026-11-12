@@ -110,7 +110,6 @@ async def main():
         "encryption": "Mandatory",
         "trust_server_certificate": False,
         "connect_timeout": 30,
-        "connect_retry_count": 0,
     }
     connection = await PyAsyncConnection.connect(context, autocommit=True)
     try:
@@ -163,10 +162,13 @@ the extra unless their implementation uses its dependencies.
   until credential tasks settle. Cancellation is cooperative; a credential that
   suppresses it may continue running after the caller stops waiting.
 
-Provider cancellation during session recovery remains a known limitation: it may
-be retried or surface as `OperationalError`. The example disables recovery with
-`connect_retry_count=0`; preserving recovery-time cancellation requires a separate
-TDS and py-core change.
+If `get_token()` raises `asyncio.CancelledError` during initial login or session
+recovery, it reaches the caller as `asyncio.CancelledError`. Recovery stops that
+operation without another token acquisition or submission of the waiting SQL,
+including for `execute` and `executemany`. Driver-owned cleanup still runs;
+caller-owned credentials remain the caller's responsibility. Explicit cursor
+cancellation retains its existing behavior; it is not globally remapped to
+`asyncio.CancelledError`. Set `connect_retry_count=0` to disable session recovery.
 
 For contributors, the
 [async pool context guide](https://github.com/microsoft/mssql-rs/blob/main/mssql-py-core/src/pool/README.md)
