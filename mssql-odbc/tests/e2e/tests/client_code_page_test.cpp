@@ -53,9 +53,9 @@ const ServerText kServerCollations[] = {
     {65001, "Latin1_General_100_CI_AS_SC_UTF8", "NCHAR(8364)", "\xE2\x82\xAC", {0x20AC}},
 };
 
-std::string VarcharQuery(const ServerText& text) {
+std::string VarcharQuery(const ServerText& text, const char* type = "varchar(max)") {
     return "SELECT CAST((" + std::string(text.expression) + ") COLLATE " + text.collation +
-           " AS varchar(max))";
+           " AS " + type + ")";
 }
 
 class ClientCodePageTest : public ODBCTest {
@@ -125,21 +125,26 @@ protected:
 
         const std::string expected =
             ODBCTestUtils::Utf8ToCodePage(text.utf8, client_code_page_);
-        ASSERT_NO_FATAL_FAILURE(CheckNarrow(VarcharQuery(text), expected));
+        // Bounded and PLP values are decoded on separate driver paths.
+        for (const char* type : {"varchar(20)", "varchar(max)"}) {
+            SCOPED_TRACE(type);
+            const std::string query = VarcharQuery(text, type);
+            ASSERT_NO_FATAL_FAILURE(CheckNarrow(query, expected));
 
-        ASSERT_EQ(SQL_SUCCESS, Execute(VarcharQuery(text)));
-        ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-        std::vector<SQLWCHAR> output(text.utf16.size() + 1, 0xCCCC);
-        SQLLEN indicator = -1;
-        ASSERT_EQ(SQL_SUCCESS,
-                  SQLGetData(stmt_, 1, SQL_C_WCHAR, output.data(),
-                             static_cast<SQLLEN>(output.size() * sizeof(SQLWCHAR)),
-                             &indicator))
-            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-        EXPECT_EQ(static_cast<SQLLEN>(text.utf16.size() * sizeof(SQLWCHAR)), indicator);
-        EXPECT_TRUE(std::equal(text.utf16.begin(), text.utf16.end(), output.begin()));
-        EXPECT_EQ(0, output.back());
-        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+            ASSERT_EQ(SQL_SUCCESS, Execute(query));
+            ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+            std::vector<SQLWCHAR> output(text.utf16.size() + 1, 0xCCCC);
+            SQLLEN indicator = -1;
+            ASSERT_EQ(SQL_SUCCESS,
+                      SQLGetData(stmt_, 1, SQL_C_WCHAR, output.data(),
+                                 static_cast<SQLLEN>(output.size() * sizeof(SQLWCHAR)),
+                                 &indicator))
+                << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(static_cast<SQLLEN>(text.utf16.size() * sizeof(SQLWCHAR)), indicator);
+            EXPECT_TRUE(std::equal(text.utf16.begin(), text.utf16.end(), output.begin()));
+            EXPECT_EQ(0, output.back());
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        }
     }
 
     unsigned client_code_page_ = 0;
