@@ -43,6 +43,13 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
             ):
                 await asyncio.sleep(0.01)
 
+        async def wait_for_initial_transport_close():
+            while not any(
+                not info.recovery_login and info.transport_closed
+                for info in mock_tds_server.get_connections()
+            ):
+                await asyncio.sleep(0.01)
+
         async def wait_for_recovery_logins():
             while sum(
                 info.recovery_login for info in mock_tds_server.get_connections()
@@ -97,8 +104,7 @@ def test_provider_cancellation_stops_recovery_before_query_submission(
                 await cursor.execute(closing_query, use_prepare=False)
                 assert await cursor.fetchone() == (1,)
                 assert await cursor.fetchone() is None
-                # Wait until teardown has recorded the server-closed transport.
-                await asyncio.wait_for(wait_for_request(False), 3)
+                await asyncio.wait_for(wait_for_initial_transport_close(), 3)
 
                 if operation == "execute":
                     pending = cursor.execute("SELECT 2", use_prepare=use_prepare)

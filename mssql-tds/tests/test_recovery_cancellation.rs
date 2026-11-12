@@ -111,13 +111,12 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
             while client.next_row().await.unwrap().is_some() {}
             client.close_query().await.unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
-                while connections
-                    .lock()
-                    .await
-                    .all()
-                    .values()
-                    .all(|info| info.transaction_descriptor_headers.is_empty())
-                {
+                loop {
+                    let store = connections.lock().await;
+                    if store.all().keys().any(|id| store.is_transport_closed(*id)) {
+                        break;
+                    }
+                    drop(store);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
@@ -154,6 +153,7 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
                     assert!(matches!(error, Error::OperationCancelledError(_)));
                 }
             }
+
             assert_eq!(calls.load(Ordering::SeqCst), if retried { 3 } else { 2 });
             assert_eq!(client.connection_recovery_count(), u32::from(retried));
             assert_eq!(
@@ -197,6 +197,73 @@ async fn recovery_stops_on_cancellation_but_retries_connection_errors() {
             }
             shutdown.send(()).unwrap();
             handle.await.unwrap().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_snapshots_do_not_signal_transport_closure() {
+    for with_shutdown in [false, true] {
+        let server = MockTdsServer::new("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr();
+        let connections = server.connection_store();
+        let closing_query = "SELECT 1 AS close_session";
+        {
+            let registry = server.query_registry();
+            let mut registry = registry.lock().await;
+            registry.register(closing_query, QueryResponse::select_one());
+            registry.close_connection_after(closing_query);
+        }
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if with_shutdown {
+                server.run_with_shutdown(shutdown_rx).await
+            } else {
+                server.run().await
+            }
+        });
+        let mut context = ClientContext::default();
+        context.user_name = "mock-user".into();
+        context.password = "mock-password".into();
+        context.encryption_options.mode = EncryptionSetting::PreferOff;
+        let datasource = format!("tcp:{},{}", addr.ip(), addr.port());
+        let mut client = TdsConnectionProvider {}
+            .create_client(context, &datasource, None)
+            .await
+            .unwrap();
+        client.execute("SELECT 1".into(), ()).await.unwrap();
+        while client.next_row().await.unwrap().is_some() {}
+        client.close_query().await.unwrap();
+        let id = {
+            let store = connections.lock().await;
+            let (&id, info) = store.all().first_key_value().unwrap();
+            assert_eq!(info.transaction_descriptor_headers.len(), 1);
+            assert!(!store.is_transport_closed(id));
+            id
+        };
+        client.execute(closing_query.into(), ()).await.unwrap();
+        while client.next_row().await.unwrap().is_some() {}
+        client.close_query().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !connections.lock().await.is_transport_closed(id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        client.close_connection().await.unwrap();
+        {
+            let mut store = connections.lock().await;
+            store.clear();
+            assert_eq!(store.count(), 0);
+            assert!(!store.is_transport_closed(id));
+        }
+        if with_shutdown {
+            shutdown.send(()).unwrap();
+            handle.await.unwrap().unwrap();
+        } else {
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
         }
     }
 }

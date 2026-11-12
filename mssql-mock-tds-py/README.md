@@ -42,9 +42,11 @@ Keep token values out of logs. For explicit lifecycle management, call
 For recovery tests, call `set_session_recovery(True)` before connecting and
 `close_connection_after(query)` to register a SELECT-1 response followed by
 transport closure. `get_connections()` exposes each connection's `recovery_login`
-flag and `request_count` (received SQL-batch/RPC headers). Request counts are
-updated when the server finishes handling a connection; wait for that update
-before asserting totals.
+flag, `request_count` (received SQL-batch/RPC headers), and `transport_closed`.
+Request counts are published during request processing, before the response is
+sent, and do not establish closure. Before starting recovery, wait with a timeout
+for the initial connection's `transport_closed` flag, which is set only after
+the server's connection handler has released its transport.
 
 These bindings do not expose the full Rust query-registration API. Unregistered
 queries receive an empty DONE response; the default registered queries include

@@ -74,6 +74,9 @@ pub struct PyConnectionInfo {
     /// Whether Login7 carried session-recovery state.
     #[pyo3(get)]
     pub recovery_login: bool,
+    /// Whether the server's connection handler has released its transport.
+    #[pyo3(get)]
+    pub transport_closed: bool,
 }
 
 #[pymethods]
@@ -276,6 +279,7 @@ impl PyMockTdsServer {
                     recovery_login: store
                         .login_details(*id)
                         .is_some_and(|details| details.recovery_login),
+                    transport_closed: store.is_transport_closed(*id),
                 })
                 .collect()
         }))

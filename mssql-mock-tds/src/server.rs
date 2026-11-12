@@ -19,7 +19,7 @@ use crate::query_response::{
 };
 use bytes::BytesMut;
 use native_tls::Identity;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -899,7 +899,7 @@ impl ConnectionProcessor {
 }
 
 /// Store for captured connection processors.
-/// This allows tests to access per-connection state after connections complete.
+/// Snapshots are available during processing and after connections complete.
 #[derive(Debug, Default)]
 pub struct ConnectionStore {
     /// Connection info keyed by unique connection id, ordered so that
@@ -908,6 +908,7 @@ pub struct ConnectionStore {
     /// Login7 details beyond [`ConnectionInfo`], under the same ids. Held
     /// apart so the published `ConnectionInfo` keeps its shape.
     login_details: BTreeMap<u64, LoginDetails>,
+    closed_transports: BTreeSet<u64>,
 }
 
 /// Login7 details captured for a connection, read with
@@ -921,7 +922,7 @@ pub struct LoginDetails {
     pub recovery_login: bool,
 }
 
-/// Captured information from a completed connection
+/// Snapshot of received authentication and request state.
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     /// Client socket address
@@ -976,8 +977,8 @@ impl ConnectionStore {
     }
 
     /// Upsert connection info keyed by the connection's unique id.
-    /// Called both eagerly during login and again at connection teardown;
-    /// both updates target the same entry.
+    /// Called during login, request processing, and connection teardown.
+    /// A snapshot does not indicate that the transport has closed.
     pub fn store(&mut self, processor: &ConnectionProcessor) {
         let info = ConnectionInfo {
             addr: processor.addr(),
@@ -1005,6 +1006,12 @@ impl ConnectionStore {
         self.login_details.get(&conn_id)
     }
 
+    /// Whether the connection handler has finished and released its transport.
+    /// Request snapshots can be published before this becomes true.
+    pub fn is_transport_closed(&self, conn_id: u64) -> bool {
+        self.closed_transports.contains(&conn_id)
+    }
+
     /// Get all connection infos
     pub fn all(&self) -> &BTreeMap<u64, ConnectionInfo> {
         &self.connections
@@ -1019,6 +1026,7 @@ impl ConnectionStore {
     pub fn clear(&mut self) {
         self.connections.clear();
         self.login_details.clear();
+        self.closed_transports.clear();
     }
 }
 
@@ -1208,13 +1216,14 @@ impl MockTdsServer {
                     registry_clone,
                     tls_acceptor_clone,
                     strict_mode,
-                    store_clone,
+                    Arc::clone(&store_clone),
                     redirection_clone,
                 )
                 .await
                 {
                     error!("Error handling connection from {}: {}", addr, e);
                 }
+                store_clone.lock().await.closed_transports.insert(conn_id);
             });
         }
     }
@@ -1248,9 +1257,10 @@ impl MockTdsServer {
                             let redirection_clone = redirection.clone();
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection_with_tls(socket, addr, conn_id, registry_clone, tls_acceptor_clone, strict_mode, store_clone, redirection_clone).await {
+                                if let Err(e) = handle_connection_with_tls(socket, addr, conn_id, registry_clone, tls_acceptor_clone, strict_mode, Arc::clone(&store_clone), redirection_clone).await {
                                     error!("Error handling connection from {}: {}", addr, e);
                                 }
+                                store_clone.lock().await.closed_transports.insert(conn_id);
                             });
                         }
                         Err(e) => {
