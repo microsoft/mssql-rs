@@ -4177,6 +4177,78 @@ pub(crate) mod tests {
             assert_eq!(transport.negotiated_data_classification_version(), None);
         }
 
+        /// A label split across two packets, at every byte offset including
+        /// inside a UTF-16 code unit, decodes the same as one that arrives
+        /// whole, and leaves the DONE after the token in place.
+        #[tokio::test]
+        async fn a_label_split_across_packets_decodes_at_every_offset() {
+            let label = "Confidentiel-機密";
+            let label_units = label.encode_utf16().count();
+            let mut message = vec![TokenType::DataClassification as u8];
+            message.extend_from_slice(&1u16.to_le_bytes()); // label count
+            for value in [label, "L1"] {
+                message.push(u8::try_from(value.encode_utf16().count()).unwrap());
+                message.extend_from_slice(&encode_utf16_le(value));
+            }
+            message.extend_from_slice(&0u16.to_le_bytes()); // information-type count
+            message.extend_from_slice(&40i32.to_le_bytes()); // result-set rank
+            message.extend_from_slice(&1u16.to_le_bytes()); // column count
+            message.extend_from_slice(&1u16.to_le_bytes()); // property count
+            message.extend_from_slice(&0u16.to_le_bytes()); // label index
+            message.extend_from_slice(&u16::MAX.to_le_bytes()); // no information type
+            message.extend_from_slice(&30i32.to_le_bytes()); // property rank
+            message.extend_from_slice(&[TokenType::Done as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            // Token id, label count and the label's length byte precede it.
+            let label_start = 4;
+
+            for split in label_start..=label_start + 2 * label_units {
+                let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+                    .continuation()
+                    .append_bytes(&message[..split])
+                    .build();
+                stream.extend_from_slice(
+                    &TestPacketBuilder::new(PacketType::TabularResult)
+                        .append_bytes(&message[split..])
+                        .build(),
+                );
+                let mut transport = create_network_transport_with_data(&stream);
+                negotiate(&mut transport, &[0x02, 0x01]);
+
+                let token = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                let Tokens::DataClassification(metadata) = token else {
+                    panic!("split at {split}: expected a DataClassification token, got {token:?}");
+                };
+                let parsed = &metadata.sensitivity_labels[0];
+                assert_eq!(
+                    (parsed.name.as_str(), parsed.id.as_str()),
+                    (label, "L1"),
+                    "split at {split}"
+                );
+                assert_eq!(
+                    metadata.rank,
+                    Some(SensitivityRank::Critical),
+                    "split at {split}"
+                );
+                assert_eq!(
+                    metadata.columns[0].properties[0].rank,
+                    Some(SensitivityRank::High),
+                    "split at {split}"
+                );
+
+                let next = transport
+                    .receive_token(&ParserContext::None(()), None, None)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(next, Tokens::Done(_)),
+                    "split at {split}: {next:?}"
+                );
+            }
+        }
+
         /// A cancelled classified result set drains through DONE_ATTN without
         /// retaining its DATACLASSIFICATION tokens for replay.
         #[tokio::test(start_paused = true)]
