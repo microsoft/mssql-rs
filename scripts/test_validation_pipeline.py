@@ -207,6 +207,130 @@ def test_kerberos_archive_flag_matches_bash_comparison():
     assert 'if [ "$USE_ARCHIVE" = "true" ]; then' in template
 
 
+# Stands in for docker against one fake container whose filesystem is
+# $FAKE_CONTAINER_ROOT. A test run fails as nextest does without the workspace.
+_FAKE_DOCKER = r"""#!/bin/bash
+root="$FAKE_CONTAINER_ROOT"
+cmd=$1; shift
+case "$cmd" in
+  ps) echo kerberos-client-ubuntu22 ;;
+  cp)
+    src=$1; dst=$2
+    case "$src" in *:/*) src="$root/${src#*:/}" ;; esac
+    case "$dst" in *:/*) dst="$root/${dst#*:/}" ;; esac
+    cp "$src" "$dst" ;;
+  exec)
+    while [ $# -gt 0 ]; do
+      case "$1" in -i) shift ;; -e) shift 2 ;; *) break ;; esac
+    done
+    shift
+    case "$*" in
+      "mkdir -p /workspace") mkdir -p "$root/workspace" ;;
+      "tar -xf - -C /workspace") tar -xf - -C "$root/workspace" ;;
+      "bash -c cat > /workspace/Cargo.toml") cat > "$root/workspace/Cargo.toml" ;;
+      *"cargo nextest run"*|*"cargo test"*)
+        echo run >> "$FAKE_DOCKER_LOG"
+        if [ ! -f "$root/workspace/Cargo.toml" ]; then
+          echo "error: workspace root manifest at /workspace/Cargo.toml does not exist" >&2
+          exit 101
+        fi
+        if [ ! -f "$root/workspace/.config/nextest.toml" ]; then
+          echo "error: profile ci not found" >&2
+          exit 101
+        fi
+        mkdir -p "$root/workspace/target/nextest/ci"
+        echo "<testsuites/>" > "$root/workspace/target/nextest/ci/junit.xml" ;;
+    esac ;;
+  *) echo "unexpected docker $cmd" >&2; exit 2 ;;
+esac
+"""
+
+
+def _kerberos_runner(tmp_path, *, lockfile=False, archive=True, config=True):
+    repo = tmp_path / "repo"
+    runner = repo / "kerberos-test" / "run-kerberos-tests.sh"
+    runner.parent.mkdir(parents=True)
+    shutil.copyfile(_ROOT / "kerberos-test" / "run-kerberos-tests.sh", runner)
+    (runner.parent / ".env").write_text("KERBEROS_TEST_USER_PASSWORD=pw\n", newline="\n")
+    (repo / "Cargo.toml").write_text("# full workspace manifest\n")
+    for crate in ("mssql-tds", "mssql-tds-cli", "mssql-mock-tds"):
+        (repo / crate / "target").mkdir(parents=True)
+        (repo / crate / "Cargo.toml").write_text(f'[package]\nname = "{crate}"\n')
+        (repo / crate / "target" / "stale").write_text("")
+    if config:
+        (repo / ".config").mkdir()
+        (repo / ".config" / "nextest.toml").write_text("[profile.ci]\n")
+    if lockfile:
+        (repo / "Cargo.lock").write_text("version = 4\n")
+    if archive:
+        (repo / "tdslib-nextest.tar.zst").write_bytes(b"archive")
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "docker").write_text(_FAKE_DOCKER, newline="\n")
+    (stub / "docker").chmod(0o755)
+    (tmp_path / "container").mkdir()
+    env = dict(
+        os.environ,
+        PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
+        FAKE_CONTAINER_ROOT=(tmp_path / "container").as_posix(),
+        FAKE_DOCKER_LOG=(tmp_path / "docker.log").as_posix(),
+    )
+
+    def run(*args):
+        result = subprocess.run(
+            [_BASH, str(runner), "ubuntu22", *args], cwd=tmp_path, env=env,
+            capture_output=True, text=True, timeout=60,
+        )
+        log = tmp_path / "docker.log"
+        runs = len(log.read_text().splitlines()) if log.exists() else 0
+        return result, runs
+
+    return run, tmp_path / "container" / "workspace", runner.parent
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("lockfile", [False, True])
+@pytest.mark.parametrize(("args", "runs"), [(("--ci", "--archive"), 1), (("--ci",), 2)])
+def test_kerberos_runner_stages_workspace_before_tests(tmp_path, args, runs, lockfile):
+    run, workspace, script_dir = _kerberos_runner(tmp_path, lockfile=lockfile)
+    result, test_runs = run(*args)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert test_runs == runs
+    manifest = (workspace / "Cargo.toml").read_text()
+    assert '"mssql-tds",' in manifest and "full workspace manifest" not in manifest
+    assert (workspace / ".config" / "nextest.toml").is_file()
+    assert (workspace / "mssql-tds" / "Cargo.toml").is_file()
+    assert not (workspace / "mssql-tds" / "target").exists()
+    # CI checkouts have no Cargo.lock (it is gitignored); tar must not fail on it.
+    assert (workspace / "Cargo.lock").exists() == lockfile
+    assert "Cannot stat" not in result.stderr
+    assert (workspace / "tdslib-nextest.tar.zst").exists() == ("--archive" in args)
+    assert (script_dir / "test-results" / "ubuntu22" / "junit.xml").is_file()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+def test_kerberos_archive_mode_requires_archive_before_copying(tmp_path):
+    run, workspace, _ = _kerberos_runner(tmp_path, archive=False)
+    result, test_runs = run("--ci", "--archive")
+
+    assert result.returncode == 1
+    assert "ERROR: Archive not found" in result.stdout
+    assert test_runs == 0
+    assert not (workspace / "Cargo.toml").exists()
+
+
+@pytest.mark.skipif(_BASH is None, reason="Bash is required")
+@pytest.mark.parametrize("args", [("--ci", "--archive"), ("--ci",)])
+def test_kerberos_runner_fails_when_workspace_copy_fails(tmp_path, args):
+    run, _, _ = _kerberos_runner(tmp_path, config=False)
+    result, test_runs = run(*args)
+
+    assert result.returncode != 0
+    assert ".config" in result.stderr
+    assert test_runs == 0
+
+
 @pytest.mark.skipif(_BASH is None, reason="Bash is required")
 @pytest.mark.parametrize(
     ("args", "expected"),

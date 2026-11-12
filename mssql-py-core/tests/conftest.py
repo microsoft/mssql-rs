@@ -132,6 +132,44 @@ def get_client_context():
     return builder()
 
 
+def _build_context_async_entra(authentication):
+    _load_env()
+    if os.environ.get("AQE_ENTRA_TEST") != "1":
+        pytest.skip("Live async Entra tests require AQE_ENTRA_TEST=1")
+
+    required = ["SQL_SERVER", "SQL_DATABASE"]
+    if authentication == "ActiveDirectoryServicePrincipal":
+        required.extend(["AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"])
+    missing = [key for key in required if not os.environ.get(key)]
+    if missing:
+        pytest.fail("Live async Entra configuration is missing: " + ", ".join(missing))
+
+    context = {
+        "server": os.environ["SQL_SERVER"],
+        "database": os.environ["SQL_DATABASE"],
+        "authentication": authentication,
+        "encryption": "Mandatory",
+        "trust_server_certificate": False,
+        "connect_timeout": 30,
+        "connect_retry_count": 0,
+    }
+    if authentication == "ActiveDirectoryServicePrincipal":
+        context["user_name"] = os.environ["AZURE_CLIENT_ID"]
+        context["password"] = os.environ["AZURE_CLIENT_SECRET"]
+    elif os.environ.get("MI_CLIENT_ID"):
+        context["user_name"] = os.environ["MI_CLIENT_ID"]
+    return context
+
+
+@pytest.fixture(
+    params=["ActiveDirectoryServicePrincipal", "ActiveDirectoryMSI"],
+    ids=["service-principal", "managed-identity"],
+)
+def async_entra_live_context(request):
+    """Opt-in live login; incomplete enabled configuration is a test failure."""
+    return _build_context_async_entra(request.param)
+
+
 @pytest.fixture
 def client_context():
     """Pytest fixture that provides client context for database connections."""
@@ -139,20 +177,26 @@ def client_context():
 
 
 @pytest.fixture
-def mock_client_context():
-    """Client context backed by an ephemeral mock TDS server."""
+def mock_tds_server():
+    """Ephemeral TLS mock server, including received-token inspection."""
     if mssql_mock_tds is None:
         pytest.skip("mssql_mock_tds is not installed")
 
     server = mssql_mock_tds.PyMockTdsServer(port=0, tls=True)
     with server:
-        yield {
-            "server": server.sql_address,
-            "database": "master",
-            "access_token": "async-cursor-test-token",
-            "encryption": "Optional",
-            "trust_server_certificate": True,
-        }
+        yield server
+
+
+@pytest.fixture
+def mock_client_context(mock_tds_server):
+    """Client context backed by an ephemeral mock TDS server."""
+    return {
+        "server": mock_tds_server.sql_address,
+        "database": "master",
+        "access_token": "async-cursor-test-token",
+        "encryption": "Optional",
+        "trust_server_certificate": True,
+    }
 
 
 @pytest.fixture
