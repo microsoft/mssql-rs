@@ -441,17 +441,20 @@ impl HttpClient for ValidationClient {
 /// is a GUID. The exporter does not check the key's format, so a mistyped key
 /// would otherwise enable collection that the service then rejects.
 fn connection_string_is_valid(connection_string: &str) -> bool {
-    instrumentation_key_is_guid(connection_string)
-        && Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
+    Exporter::new_from_connection_string(connection_string, ValidationClient).is_ok()
+        && instrumentation_key_is_guid(connection_string)
 }
 
+/// Reads the key the way the exporter does, so the key checked is the key used:
+/// names are case-insensitive, nothing is trimmed, and when a name repeats the
+/// last one wins. The exporter has already rejected any part that is not a
+/// single `name=value`.
 fn instrumentation_key_is_guid(connection_string: &str) -> bool {
     connection_string
         .split(';')
         .filter_map(|part| part.split_once('='))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("InstrumentationKey"))
+        .rfind(|(name, _)| name.eq_ignore_ascii_case("InstrumentationKey"))
         .is_some_and(|(_, key)| {
-            let key = key.trim();
             let groups: Vec<&str> = key.split('-').collect();
             groups.len() == 5
                 && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, len)| {
@@ -1136,6 +1139,10 @@ mod tests {
             "InstrumentationKey=broken",
             "InstrumentationKey=00000000-0000-0000-0000-00000000000",
             "InstrumentationKey=00000000-0000-0000-0000-00000000000g",
+            // The exporter uses the last key and does not trim it.
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;InstrumentationKey=broken",
+            "InstrumentationKey= 00000000-0000-0000-0000-000000000000",
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000 ",
             "IngestionEndpoint=https://example.invalid/",
             "not a connection string",
             "   x   ",
