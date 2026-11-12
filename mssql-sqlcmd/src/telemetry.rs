@@ -495,16 +495,22 @@ fn ingestion_endpoint_is_usable(fields: &HashMap<String, &str>) -> bool {
     let Ok(uri) = endpoint.trim_end_matches('/').parse::<http::Uri>() else {
         return false;
     };
-    // What the exporter's `append_v2_track` builds and `expect`s to parse; a
-    // URI near `http`'s length limit parses but not with the path appended.
+    uri.scheme_str() == Some("https")
+        && uri.host().is_some_and(|host| !host.is_empty())
+        && v2_track_parses(&uri)
+}
+
+/// Whether the exporter can build its request URL from `uri`: its
+/// `append_v2_track` (0.46.0 `src/lib.rs`) appends `v2/track` this way and
+/// `expect`s the result to parse. A URI near `http`'s length limit parses
+/// alone but not then.
+fn v2_track_parses(uri: &http::Uri) -> bool {
     let mut track = uri.to_string();
     if !track.ends_with('/') {
         track.push('/');
     }
     track.push_str("v2/track");
-    uri.scheme_str() == Some("https")
-        && uri.host().is_some_and(|host| !host.is_empty())
-        && track.parse::<http::Uri>().is_ok()
+    track.parse::<http::Uri>().is_ok()
 }
 
 /// The destination this run would send to, and only if the exporter accepts it.
@@ -542,14 +548,22 @@ pub fn enabled() -> bool {
 /// The HTTP client needs OpenSSL on 64-bit Linux. Checked without the report
 /// `openssl_runtime` writes, so telemetry adds no output of its own, and after
 /// the destination, so that a run with telemetry off never loads it. Tests send
-/// through their own client.
+/// through their own client, and `TRANSPORT_MISSING` stands in for a host
+/// without OpenSSL.
 fn transport_available() -> bool {
+    #[cfg(test)]
+    if TRANSPORT_MISSING.load(Ordering::Acquire) {
+        return false;
+    }
     #[cfg(all(not(test), target_pointer_width = "64", target_os = "linux"))]
     if !crate::openssl_runtime::is_available() {
         return false;
     }
     true
 }
+
+#[cfg(test)]
+static TRANSPORT_MISSING: AtomicBool = AtomicBool::new(false);
 
 fn os_value() -> &'static str {
     match std::env::consts::OS {
@@ -1246,6 +1260,27 @@ mod tests {
         assert!(connection_string_is_valid(&fits));
     }
 
+    /// A host that cannot send (no OpenSSL) does nothing: no device ID, no server
+    /// query, no event. Without `&& transport_available()` in `enabled()` this
+    /// fails.
+    #[test]
+    fn a_host_that_cannot_send_is_a_no_op_with_no_side_effects() {
+        let guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
+        let requests = guard.capture_requests();
+        TRANSPORT_MISSING.store(true, Ordering::Release);
+        assert!(!enabled());
+        record_usage(Invocation {
+            version: Some("18.5"),
+            command: Command::Diagnose,
+            format: FormatUse::Json,
+        });
+        record_server_info(&server_info_fixture().parsed);
+        assert!(SESSION.lock().expect("session lock").is_none());
+        assert_eq!(DEVICE_ID_READS.load(Ordering::Acquire), 0);
+        assert_eq!(shutdown(Duration::from_secs(1)), FlushOutcome::Completed);
+        assert!(requests.try_recv().is_err());
+    }
+
     #[test]
     fn a_valid_connection_string_is_enabled() {
         let _guard = TestEnv::new(Some(TEST_CONNECTION_STRING));
@@ -1630,6 +1665,7 @@ mod tests {
             *SESSION.lock().unwrap_or_else(|p| p.into_inner()) = None;
             SHUTDOWN_STARTED.store(false, Ordering::Release);
             DEVICE_ID_READS.store(0, Ordering::Release);
+            TRANSPORT_MISSING.store(false, Ordering::Release);
             *ABI_TEST_DELAY.lock().expect("delay lock") = Duration::ZERO;
             *ABI_TEST_RESPONSE.lock().expect("response lock") = (200, "");
             Self { _lock: lock }

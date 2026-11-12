@@ -156,18 +156,18 @@ existing recognized ID is reused; a missing one is generated (a random version
 4 UUID) and stored. A value that is present but unreadable or unrecognized is
 never overwritten. If it cannot be read or stored, the property is omitted.
 When telemetry is off, the ID is not touched. Two first runs at the same moment
-end up with the same ID: on macOS and
-Linux the ID is written to a file of its own and linked into place, which fails
-if the ID file exists, and the loser reads the winner's; on Windows first runs
-take a named mutex that spans all of the user's logon sessions (`Global\` plus
-the user's SID, as the HKCU value is shared across sessions), and the value is
-read back after it is written. A first run that cannot take the mutex within two
-seconds, or cannot read the user's SID, does not create the ID, and the event
-goes without it. Another user can keep a first run from creating the ID only by
-creating that SID-qualified name first, which just omits the property. A tool
-that writes the shared ID without that mutex can still race on Windows; the
-read-back reports the value that survives. The ID is end-user pseudonymized
-information and is sent as the GUID, not hashed.
+end up with the same ID: on macOS and Linux the ID is written to a file of its
+own and linked into place, which fails if the ID file exists, and the loser
+reads the winner's; on Windows first runs take a named mutex that spans all of
+the user's logon sessions (`Global\` plus the user's SID, as the HKCU value is
+shared across sessions), and the value is read back after it is written. A
+first run that cannot take the mutex within two seconds, or cannot read the
+user's SID, does not create the ID, and the event goes without it. Another user
+can keep a first run from creating the ID only by creating that SID-qualified
+name first, which just omits the property. A tool that writes the shared ID
+without that mutex can still race on Windows; the read-back reports the value
+that survives. The ID is end-user pseudonymized information and is sent as the
+GUID, not hashed.
 
 ## Privacy contract
 
@@ -210,21 +210,20 @@ interactive session. A transport failure, a failure in the filter, a response
 that does not match what was sent, and a rejection by the service (any status
 but a 200 or a fully accepted 206: a 204, a 4xx or 5xx, or a 206 that rejected
 the event) are all recorded as a failure, because the SDK's shutdown does not
-hand the export result back. The
-exporter retries throttling, server errors and every error the HTTP client
-returns: a transport failure and, because the filter reports through the same
-error, a filter failure or a response that does not add up. It backs off for up
-to about 35 seconds, and the last attempt decides the outcome, so a retry that
-succeeds is not reported as a failure. Nothing bounds that thread but the
-exporter's own retries; the process waits for it only as long as the bound
-passed to shutdown. If shutdown arrives first, for example during the backoff,
-it reports a timeout, not success, and a failure that the exporter is still
-retrying is also reported as a timeout. An all-filtered or malformed request is
-an error, not a synthetic success. An ingestion response is checked against the
-request first (item counts, and that every error index is present, unique and
-in range) before a partial one's indices are translated back to the original
-batch; a response that does not add up is an error and is never taken as an
-acceptance.
+hand the export result back. The exporter retries throttling, server errors and
+every error the HTTP client returns: a transport failure and, because the filter
+reports through the same error, a filter failure or a response that does not add
+up. It backs off for up to about 35 seconds, and the last attempt decides the
+outcome, so a retry that succeeds is not reported as a failure. Nothing bounds
+that thread but the exporter's own retries; the process waits for it only as
+long as the bound passed to shutdown. If shutdown arrives first, for example
+during the backoff, it reports a timeout, not success, and a failure that the
+exporter is still retrying is also reported as a timeout. An all-filtered or
+malformed request is an error, not a synthetic success. An ingestion response is
+checked against the request first (item counts, and that every error index is
+present, unique and in range) before a partial one's indices are translated
+back to the original batch; a response that does not add up is an error and is
+never taken as an acceptance.
 
 Recording and shutdown are ordered by one lock: a call admitted before shutdown
 is sent by it, and a call after it is not recorded. Shutdown takes that lock
