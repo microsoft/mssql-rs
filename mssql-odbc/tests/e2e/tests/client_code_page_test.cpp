@@ -212,19 +212,20 @@ ODBC_TEST_F(ClientCodePageTest, NarrowChunksFillBufferAndReassemble) {
                                     "A\xF0\x9F\x98\x80" "B";
     const std::string encoded =
         ODBCTestUtils::Utf8ToCodePage(utf8_value, client_code_page_);
-    // AB#47564: UTF-8 SQL_C_CHAR chunks fill the byte capacity even mid-character,
-    // so the 4-byte character splits across the first two chunks.
+    // AB#47564: SQL_C_CHAR chunks fill the byte capacity even mid-character, so
+    // the multibyte character splits across the first two chunks.
+    const bool multibyte_split = client_code_page_ == 65001 || client_code_page_ == 932;
     const std::vector<size_t> chunk_sizes =
         client_code_page_ == 65001 ? std::vector<size_t>{4, 2} :
-        client_code_page_ == 932 ? std::vector<size_t>{3, 1} :
+        client_code_page_ == 932 ? std::vector<size_t>{2, 2} :
                                    std::vector<size_t>{1, 1, 1};
     const SQLLEN buffer_length =
-        client_code_page_ == 65001 ? 5 : client_code_page_ == 932 ? 4 : 2;
-    // msodbcsql's SQLGetData chunk sizes at 65001 are unmeasured; its leg runs
-    // only when the Windows ACP is 65001, so that leg asserts reassembly only.
+        client_code_page_ == 65001 ? 5 : client_code_page_ == 932 ? 3 : 2;
+    // msodbcsql's chunk sizes for a split multibyte character are unmeasured; its
+    // leg runs only when the Windows ACP matches, so that leg asserts reassembly only.
     const char* target = std::getenv("ODBC_TEST_TARGET");
     const bool exact_chunks =
-        client_code_page_ != 65001 || target == nullptr || std::string(target) != "msodbcsql";
+        !multibyte_split || target == nullptr || std::string(target) != "msodbcsql";
     ASSERT_EQ(SQL_SUCCESS, Execute(sql));
     ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
 
