@@ -9,7 +9,7 @@
 //!
 //! | Depth | Checks |
 //! |---|---|
-//! | Connection input | parse the server given to `-S` ([`target`]); no external call |
+//! | Connection input | parse the server given to `-S` ([`target`]) and read a `-G -P` access token file ([`entra`]), which can be on a network share; no name resolution, SQL Server Browser query or connection |
 //! | Endpoint resolution | the client resolves the host name, and asks SQL Server Browser for a named instance's port; it stops there |
 //! | Network reachability | the client also opens its transport (a TCP connection to the first address that accepts, and to every address after it, or a pipe); it stops there |
 //! | Connection attempt | the client also logs in, with its pre-login, TLS and login phases |
@@ -27,9 +27,10 @@
 //! for review before sharing: database and user names become labels unless
 //! local detail is requested ([`redact`]).
 //!
-//! sqlcmd makes no network call of its own. `mssql-tds` makes one connection
-//! attempt, as a normal run does (its name resolution, SQL Server Browser
-//! lookup, protocol order, TCP connects or pipe, TLS and login), through its
+//! sqlcmd makes no network call of its own, other than reading an access token
+//! file that is on a network share. `mssql-tds` makes one connection attempt,
+//! as a normal run does (its name resolution, SQL Server Browser lookup,
+//! protocol order, TCP connects or pipe, TLS and login), through its
 //! diagnostic entry point, which stops where the depth asks and also connects
 //! to the addresses after the one it uses. Its connect-stage spans
 //! ([`stages`]) are the evidence: the checks are read from them and from how

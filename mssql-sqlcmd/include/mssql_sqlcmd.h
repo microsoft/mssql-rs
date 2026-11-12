@@ -193,9 +193,12 @@ void MSSQL_SQLCMD_CALL mssql_sqlcmd_free_text(const uint16_t* text, size_t len);
 #define MSSQL_SQLCMD_REPORT_TEXT 0
 #define MSSQL_SQLCMD_REPORT_JSON 1
 
-/* How far the diagnosis goes; each depth includes the ones before it. */
+/* How far the diagnosis goes; each depth includes the ones before it.
+   Connection input makes no DNS lookup, SQL Server Browser query or
+   connection; it reads a -G -P access token file from the path given, which
+   can be on a network share. */
 #define MSSQL_SQLCMD_DEPTH_DEFAULT -1             /* session validation */
-#define MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT 0     /* parse -S; no external call */
+#define MSSQL_SQLCMD_DEPTH_CONNECTION_INPUT 0     /* parse -S; a -G -P token file */
 #define MSSQL_SQLCMD_DEPTH_ENDPOINT_RESOLUTION 1  /* + DNS, SQL Server Browser */
 #define MSSQL_SQLCMD_DEPTH_NETWORK_REACHABILITY 2 /* + TCP connect */
 #define MSSQL_SQLCMD_DEPTH_CONNECTION_ATTEMPT 3   /* + one connection attempt */

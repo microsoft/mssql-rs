@@ -7,7 +7,7 @@ each includes the ones before it, and the deepest is the default:
 
 | Depth (`--depth`) | Checks |
 |---|---|
-| `connectionInput` | the settings sqlcmd resolved and where each came from (a command-line option, an environment variable, an ODBC data source (DSN) given with `-D`, or the default); the server given to `-S`, or the one the DSN names, checked with the client's rules; with `-G -P <token-file>`, the access token file, read as sqlcmd reads it; local findings for an instance name with a port, for `-F` with `-C`, for a DSN that names no server, and for a login that a DSN's `Trusted_Connection=yes` leaves unused; no external call |
+| `connectionInput` | the settings sqlcmd resolved and where each came from (a command-line option, an environment variable, an ODBC data source (DSN) given with `-D`, or the default); the server given to `-S`, or the one the DSN names, checked with the client's rules; with `-G -P <token-file>`, the access token file, read as sqlcmd reads it; local findings for an instance name with a port, for `-F` with `-C`, for a DSN that names no server, and for a login that a DSN's `Trusted_Connection=yes` leaves unused; no name resolution, SQL Server Browser query or connection, though the access token file is read from the path given, which can be on a network share |
 | `endpointResolution` | the client resolves the host name and asks SQL Server Browser for a named instance's port (never guessing 1433), then stops |
 | `networkReachability` | the client also opens its transport: a TCP connection to the first resolved address that accepts, and to every address after it, or a pipe; then it stops |
 | `connectionAttempt` | the client also logs in, with its pre-login, TLS and login phases |
@@ -36,11 +36,14 @@ as the token: a file that is missing (`accessTokenFileNotFound`), cannot be
 read (`accessTokenFileUnreadable`), is too large (`accessTokenFileTooLarge`)
 or is not UTF-16LE text (`accessTokenFileNotUtf16`), the form in which sqlcmd
 passes the token to the driver, is `diagnosed` with
-`client.inputConfiguration`, and the file is not named. The file is read on a
-thread of its own within the time limit (`-l`), which connection input then
-reports as its `deadlineMs`, its `durationMs` counting the read: a file not
-read in time, such as a pipe no one writes to, is `inconclusive`
-(`accessTokenFileTimedOut`), and a cancel is seen during the read. The
+`client.inputConfiguration`, and the file is not named. The path is opened as
+given, so a file on a network share (a UNC path on Windows, or a network file
+system) is read over the network. The file is read on a thread of its own
+within the time limit (`-l`), which connection input then reports as its
+`deadlineMs`, its `durationMs` counting the read: a file not read in time,
+such as a pipe no one writes to or a share that does not answer, is
+`inconclusive` (`accessTokenFileTimedOut`), and a cancel is seen during the
+read. The
 server's rejection of an Entra login is `diagnosed` with
 `security.authentication.entra` and `"entraStage": "serverRejection"`.
 diagnose does not acquire Entra tokens yet: with `ActiveDirectoryPassword` the
@@ -191,7 +194,8 @@ check reports certificate subject or SAN names or file paths; they would be
 labelled the same way. The password is never part of the report.
 
 The checks observe the client's real connection: sqlcmd makes no network call
-of its own. `mssql-tds` makes one connection attempt, as a normal run does,
+of its own, other than reading an access token file that is on a network
+share. `mssql-tds` makes one connection attempt, as a normal run does,
 through its diagnostic entry point (`TdsConnectionProvider::diagnose_client`):
 it resolves the name, asks SQL Server Browser (past its instance cache)
 whenever the attempt reaches it, follows its protocol order, connects, and
