@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 
 use crate::core::TdsResult;
-use crate::datatypes::column_values::ColumnValues;
+use crate::datatypes::column_values::{ColumnValues, SqlTime};
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_string::{
     EncodingType, NARROW_SUBSTITUTE_BYTE, NarrowEncoded, SqlString, encode_narrow,
@@ -765,6 +765,24 @@ impl TdsValueSerializer {
         Ok(())
     }
 
+    /// A time-of-day in its scale's units, little-endian, and how many of
+    /// those bytes the wire carries. Shared by the TIME, DATETIME2 and
+    /// DATETIMEOFFSET serializers and the synchronous RPC path.
+    pub(crate) fn time_wire_bytes(time: &SqlTime) -> TdsResult<([u8; 8], u8)> {
+        let length = get_time_length_from_scale(time.scale)?;
+        let units = match time.scale {
+            0 => time.time_nanoseconds / 10_000_000,
+            1 => time.time_nanoseconds / 1_000_000,
+            2 => time.time_nanoseconds / 100_000,
+            3 => time.time_nanoseconds / 10_000,
+            4 => time.time_nanoseconds / 1_000,
+            5 => time.time_nanoseconds / 100,
+            6 => time.time_nanoseconds / 10,
+            _ => time.time_nanoseconds,
+        };
+        Ok((units.to_le_bytes(), length))
+    }
+
     #[inline(always)]
     async fn serialize_time<'a, 'b>(
         writer: &'a mut PacketWriter<'b>,
@@ -783,31 +801,7 @@ impl TdsValueSerializer {
         //   - Scale 3-4: 4 bytes
         //   - Scale 5-7: 5 bytes
 
-        // Determine the byte length based on scale
-        let time_length = get_time_length_from_scale(value.scale)?;
-
-        // Scale the time value based on the scale
-        // The time_nanoseconds is always in 100-nanosecond units internally
-        // But SQL Server expects the value to be in units appropriate for the scale:
-        // Scale 0: seconds (divide by 10^7)
-        // Scale 1: tenths of seconds (divide by 10^6)
-        // Scale 2: hundredths of seconds (divide by 10^5)
-        // Scale 3: milliseconds (divide by 10^4)
-        // Scale 4: ten-thousandths (divide by 10^3)
-        // Scale 5: hundred-thousandths (divide by 10^2)
-        // Scale 6: microseconds (divide by 10^1)
-        // Scale 7: 100-nanoseconds (divide by 10^0 = no scaling)
-        let time_value = match value.scale {
-            0 => value.time_nanoseconds / 10_000_000, // Seconds
-            1 => value.time_nanoseconds / 1_000_000,  // Tenths
-            2 => value.time_nanoseconds / 100_000,    // Hundredths
-            3 => value.time_nanoseconds / 10_000,     // Milliseconds
-            4 => value.time_nanoseconds / 1_000,      // Ten-thousandths
-            5 => value.time_nanoseconds / 100,        // Hundred-thousandths
-            6 => value.time_nanoseconds / 10,         // Microseconds
-            7 => value.time_nanoseconds,              // 100-nanoseconds (no scaling)
-            _ => value.time_nanoseconds,
-        };
+        let (time_bytes, time_length) = Self::time_wire_bytes(value)?;
 
         if !ctx.is_fixed_type() && !ctx.is_fixed_length {
             // TimeN with length prefix
@@ -815,17 +809,15 @@ impl TdsValueSerializer {
             match writer.has_space(total_size) {
                 false => {
                     writer.write_byte_async(time_length).await?; // Length byte
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        let byte_val = ((time_value >> (i * 8)) & 0xFF) as u8;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
                         writer.write_byte_async(byte_val).await?;
                     }
                 }
                 true => {
                     writer.write_byte_unchecked(time_length); // Length byte
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        let byte_val = ((time_value >> (i * 8)) & 0xFF) as u8;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
                         writer.write_byte_unchecked(byte_val);
                     }
                 }
@@ -834,15 +826,13 @@ impl TdsValueSerializer {
             // Fixed type (Time, 0x2A) - just write value (3, 4, or 5 bytes)
             match writer.has_space(time_length as usize) {
                 false => {
-                    for i in 0..time_length {
-                        writer
-                            .write_byte_async(((time_value >> (i * 8)) & 0xFF) as u8)
-                            .await?;
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
+                        writer.write_byte_async(byte_val).await?;
                     }
                 }
                 true => {
-                    for i in 0..time_length {
-                        writer.write_byte_unchecked(((time_value >> (i * 8)) & 0xFF) as u8);
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
+                        writer.write_byte_unchecked(byte_val);
                     }
                 }
             }
@@ -1029,24 +1019,10 @@ impl TdsValueSerializer {
         //   - Scale 3-4: 7 bytes (4 for time + 3 for date)
         //   - Scale 5-7: 8 bytes (5 for time + 3 for date)
 
-        // Determine the time length based on scale
-        let time_length = get_time_length_from_scale(value.time.scale)?;
+        let (time_bytes, time_length) = Self::time_wire_bytes(&value.time)?;
 
         let date_length = 3u8;
         let total_value_length = time_length + date_length;
-
-        // Scale the time value based on the scale (same logic as serialize_time)
-        let time_value = match value.time.scale {
-            0 => value.time.time_nanoseconds / 10_000_000, // Seconds
-            1 => value.time.time_nanoseconds / 1_000_000,  // Tenths
-            2 => value.time.time_nanoseconds / 100_000,    // Hundredths
-            3 => value.time.time_nanoseconds / 10_000,     // Milliseconds
-            4 => value.time.time_nanoseconds / 1_000,      // Ten-thousandths
-            5 => value.time.time_nanoseconds / 100,        // Hundred-thousandths
-            6 => value.time.time_nanoseconds / 10,         // Microseconds
-            7 => value.time.time_nanoseconds,              // 100-nanoseconds (no scaling)
-            _ => value.time.time_nanoseconds,
-        };
 
         if !ctx.is_fixed_type() && !ctx.is_fixed_length {
             // DateTime2N with length prefix
@@ -1055,9 +1031,8 @@ impl TdsValueSerializer {
                 false => {
                     writer.write_byte_async(total_value_length).await?; // Length byte
 
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        let byte_val = ((time_value >> (i * 8)) & 0xFF) as u8;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
                         writer.write_byte_async(byte_val).await?;
                     }
 
@@ -1070,9 +1045,8 @@ impl TdsValueSerializer {
                 true => {
                     writer.write_byte_unchecked(total_value_length); // Length byte
 
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        let byte_val = ((time_value >> (i * 8)) & 0xFF) as u8;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
                         writer.write_byte_unchecked(byte_val);
                     }
 
@@ -1087,11 +1061,9 @@ impl TdsValueSerializer {
             // Fixed type - just write value (time + 3-byte date)
             match writer.has_space(total_value_length as usize) {
                 false => {
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        writer
-                            .write_byte_async(((time_value >> (i * 8)) & 0xFF) as u8)
-                            .await?;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
+                        writer.write_byte_async(byte_val).await?;
                     }
 
                     // Write date as 3-byte little-endian unsigned integer
@@ -1101,9 +1073,9 @@ impl TdsValueSerializer {
                     writer.write_byte_async(date_bytes[2]).await?;
                 }
                 true => {
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        writer.write_byte_unchecked(((time_value >> (i * 8)) & 0xFF) as u8);
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
+                        writer.write_byte_unchecked(byte_val);
                     }
 
                     // Write date as 3-byte little-endian unsigned integer
@@ -1147,25 +1119,11 @@ impl TdsValueSerializer {
         //   - Scale 3-4: 9 bytes (4 for time + 3 for date + 2 for offset)
         //   - Scale 5-7: 10 bytes (5 for time + 3 for date + 2 for offset)
 
-        // Determine the time length based on scale
-        let time_length = get_time_length_from_scale(value.datetime2.time.scale)?;
+        let (time_bytes, time_length) = Self::time_wire_bytes(&value.datetime2.time)?;
 
         let date_length = 3u8;
         let offset_length = 2u8;
         let total_value_length = time_length + date_length + offset_length;
-
-        // Scale the time value based on the scale (same logic as serialize_time)
-        let time_value = match value.datetime2.time.scale {
-            0 => value.datetime2.time.time_nanoseconds / 10_000_000, // Seconds
-            1 => value.datetime2.time.time_nanoseconds / 1_000_000,  // Tenths
-            2 => value.datetime2.time.time_nanoseconds / 100_000,    // Hundredths
-            3 => value.datetime2.time.time_nanoseconds / 10_000,     // Milliseconds
-            4 => value.datetime2.time.time_nanoseconds / 1_000,      // Ten-thousandths
-            5 => value.datetime2.time.time_nanoseconds / 100,        // Hundred-thousandths
-            6 => value.datetime2.time.time_nanoseconds / 10,         // Microseconds
-            7 => value.datetime2.time.time_nanoseconds,              // 100-nanoseconds (no scaling)
-            _ => value.datetime2.time.time_nanoseconds,
-        };
 
         if !ctx.is_fixed_type() && !ctx.is_fixed_length {
             // DateTimeOffsetN with length prefix
@@ -1174,9 +1132,8 @@ impl TdsValueSerializer {
                 false => {
                     writer.write_byte_async(total_value_length).await?; // Length byte
 
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        let byte_val = ((time_value >> (i * 8)) & 0xFF) as u8;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
                         writer.write_byte_async(byte_val).await?;
                     }
 
@@ -1194,9 +1151,8 @@ impl TdsValueSerializer {
                 true => {
                     writer.write_byte_unchecked(total_value_length); // Length byte
 
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        let byte_val = ((time_value >> (i * 8)) & 0xFF) as u8;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
                         writer.write_byte_unchecked(byte_val);
                     }
 
@@ -1216,11 +1172,9 @@ impl TdsValueSerializer {
             // Fixed type or sql_variant - just write value (time + date + offset, no length prefix)
             match writer.has_space(total_value_length as usize) {
                 false => {
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        writer
-                            .write_byte_async(((time_value >> (i * 8)) & 0xFF) as u8)
-                            .await?;
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
+                        writer.write_byte_async(byte_val).await?;
                     }
 
                     // Write date as 3-byte little-endian unsigned integer
@@ -1235,9 +1189,9 @@ impl TdsValueSerializer {
                     writer.write_byte_async(offset_bytes[1]).await?;
                 }
                 true => {
-                    // Write time_value in little-endian format (variable bytes)
-                    for i in 0..time_length {
-                        writer.write_byte_unchecked(((time_value >> (i * 8)) & 0xFF) as u8);
+                    // Write the scaled time in little-endian format (variable bytes)
+                    for &byte_val in &time_bytes[..usize::from(time_length)] {
+                        writer.write_byte_unchecked(byte_val);
                     }
 
                     // Write date as 3-byte little-endian unsigned integer
@@ -3283,6 +3237,63 @@ mod serializer_tests {
     }
 
     // ── serialize_time ──
+
+    /// 23:59:59.9999999 at every scale, in the scale's units per MS-TDS, for
+    /// TIME, DATETIME2 and DATETIMEOFFSET; all three share `time_wire_bytes`.
+    #[test]
+    fn time_units_at_every_scale() {
+        use crate::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        let units: [(u64, usize); 8] = [
+            (86_399, 3),
+            (863_999, 3),
+            (8_639_999, 3),
+            (86_399_999, 4),
+            (863_999_999, 4),
+            (8_639_999_999, 5),
+            (86_399_999_999, 5),
+            (863_999_999_999, 5),
+        ];
+        for (scale, (units, len)) in units.into_iter().enumerate() {
+            let time = SqlTime {
+                time_nanoseconds: 863_999_999_999,
+                scale: scale as u8,
+            };
+            let time_bytes = &units.to_le_bytes()[..len];
+            let datetime2 = SqlDateTime2 {
+                days: 0x0A_0B0C,
+                time: time.clone(),
+            };
+            for (tds_type, value, tail) in [
+                (0x29, ColumnValues::Time(time.clone()), &[][..]),
+                (
+                    0x2A,
+                    ColumnValues::DateTime2(datetime2.clone()),
+                    &[0x0C, 0x0B, 0x0A][..],
+                ),
+                (
+                    0x2B,
+                    ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                        datetime2: datetime2.clone(),
+                        offset: -0x0102,
+                    }),
+                    &[0x0C, 0x0B, 0x0A, 0xFE, 0xFE][..],
+                ),
+            ] {
+                let mut mock = MockNetworkWriter::new(64);
+                let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+                block_on(TdsValueSerializer::serialize_value(
+                    &mut w,
+                    &value,
+                    &nullable_ctx(tds_type),
+                ))
+                .unwrap();
+                let mut expected = vec![(len + tail.len()) as u8];
+                expected.extend_from_slice(time_bytes);
+                expected.extend_from_slice(tail);
+                assert_eq!(payload(&w), expected, "type {tds_type:#x} scale {scale}");
+            }
+        }
+    }
 
     #[test]
     fn time_null() {
