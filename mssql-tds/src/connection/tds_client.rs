@@ -2515,17 +2515,17 @@ impl TdsClient {
 
     /// Stamps the diagnostics a drained batch read for one parameter set with
     /// that set, as the row-preserving reader does when each token arrives:
-    /// `errors`, and the messages captured from `first_message` on.
+    /// `errors`, and the messages captured from `first_message_index` on.
     fn file_under_parameter_set(
         &mut self,
         errors: &mut [SqlErrorInfo],
-        first_message: usize,
+        first_message_index: usize,
         parameter_set: usize,
     ) {
         for error in errors {
             error.parameter_set = Some(parameter_set);
         }
-        for message in self.info_messages.iter_mut().skip(first_message) {
+        for message in self.info_messages.iter_mut().skip(first_message_index) {
             message.parameter_set = Some(parameter_set);
         }
     }

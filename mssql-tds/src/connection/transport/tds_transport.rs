@@ -116,6 +116,7 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// `wanted` accepts. The wait ending, or a cancellation, is not a failure
     /// and interrupts nothing. A transport that cannot tell returns `true`, so
     /// the caller reads on.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     async fn wanted_token_within(
         &mut self,
         _wait: Duration,

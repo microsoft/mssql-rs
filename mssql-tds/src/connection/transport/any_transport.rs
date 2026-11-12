@@ -86,7 +86,9 @@ impl AnyTransport {
     ) -> TdsResult<bool> {
         match self {
             Self::Network(transport) => {
-                TdsTransport::wanted_token_within(transport, wait, cancel_handle, wanted).await
+                transport
+                    .wanted_token_within(wait, cancel_handle, wanted)
+                    .await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => {

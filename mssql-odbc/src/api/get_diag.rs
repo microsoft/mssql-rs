@@ -632,7 +632,8 @@ mod tests {
 
     #[test]
     fn record_reads_sort_lazily_by_resource_priority() {
-        let env = alloc_env();
+        let handles = crate::test_support::TestHandles::with_env();
+        let env = handles.env;
         let env_ref = unsafe { handle_from_raw::<EnvHandle>(env) };
         {
             let mut state = env_ref.inner.lock().unwrap();
@@ -679,7 +680,6 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(utf16_to_string(&state), "01003");
         assert_eq!(native, 8153);
-        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
     #[test]
